@@ -111,6 +111,14 @@ class EventPublisher(ABC):
     def __init__(self, data_parallel_rank: int = 0) -> None:
         self._data_parallel_rank = data_parallel_rank
 
+    def start(self) -> None:
+        """Acquire external resources.
+
+        Split from ``__init__`` so constructing a publisher has no side effects: the
+        owner can build it early, finish its own validation, and only then commit to
+        binding sockets and running threads.
+        """
+
     @abstractmethod
     def publish(self, events: EventBatch) -> bool:
         """Enqueue an event batch without blocking the scheduler."""
@@ -170,15 +178,24 @@ class ZmqEventPublisher(EventPublisher):
         self.published_batches = 0
         self._queue_full_drops = 0
         self._send_error_drops = 0
+        self._topic = topic
+        # Nothing is bound and no thread runs until start(); see EventPublisher.start().
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
         try:
             self._socket_setup()
         except Exception:
-            # __init__ never returns on failure, so shutdown() is unreachable;
-            # close the sockets here to avoid leaking them on the shared context.
+            # start() never returns on failure, so close whatever was opened rather
+            # than leaking it on the shared context.
             if self._pub is not None:
                 self._pub.close(linger=0)
+                self._pub = None
             if self._replay is not None:
                 self._replay.close(linger=0)
+                self._replay = None
             raise
         self._thread = threading.Thread(
             target=self._publisher_thread,
@@ -188,7 +205,7 @@ class ZmqEventPublisher(EventPublisher):
         self._thread.start()
         logger.info(
             f"Started streaming KV event publisher rank={self._rank} "
-            f"endpoint={self._endpoint} topic={topic!r}"
+            f"endpoint={self._endpoint} topic={self._topic!r}"
         )
 
     @property
@@ -232,12 +249,13 @@ class ZmqEventPublisher(EventPublisher):
             except queue.Full:
                 # The thread exits after draining the full queue.
                 pass
-        self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
-        if self._thread.is_alive():
-            logger.warning(
-                f"Streaming KV event publisher rank={self._rank} did not stop "
-                f"within {self.SHUTDOWN_TIMEOUT:.1f}s"
-            )
+        if self._thread is not None:
+            self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
+            if self._thread.is_alive():
+                logger.warning(
+                    f"Streaming KV event publisher rank={self._rank} did not stop "
+                    f"within {self.SHUTDOWN_TIMEOUT:.1f}s"
+                )
         logger.info(
             f"Stopped streaming KV event publisher rank={self._rank} "
             f"enqueued_batches={self.enqueued_batches} "
@@ -512,6 +530,15 @@ class StreamingKVCacheEventManager:
         self.enqueued_batches = 0
         self.enqueued_events = 0
         self.dropped_batches = 0
+
+    def start(self) -> None:
+        """Bind the publisher's sockets and start its background thread.
+
+        Construction is side-effect free, so the owner calls this only once every
+        other initialization check has passed. A failure before this point therefore
+        leaves no socket bound and no thread running.
+        """
+        self._publisher.start()
 
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None:
         target_ids = [

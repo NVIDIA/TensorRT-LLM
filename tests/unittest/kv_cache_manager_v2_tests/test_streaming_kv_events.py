@@ -98,6 +98,7 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
                 block_size=4,
                 max_window_size=128,
             )
+            manager.start()
             manager.set_layer_group_window_sizes({0: 128, 1: 64})
 
             root = SimpleNamespace(ordinal=-1)
@@ -188,6 +189,7 @@ def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
         max_window_size=128,
         max_entries=2,
     )
+    manager.start()
     try:
         manager.set_layer_group_window_sizes({0: 128})
 
@@ -232,18 +234,14 @@ def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
 
 def test_dropped_batches_leave_a_sequence_gap() -> None:
     """A batch lost to a full queue must be observable as a missing sequence number."""
+    # Left unstarted on purpose: publish() only touches the queue, so the drop path is
+    # exercised without binding a socket or draining the queue from a live thread.
     publisher = ZmqEventPublisher(
         data_parallel_rank=0,
         endpoint="inproc://kv-events-drop-test",
         max_queue_size=1,
     )
     try:
-        # Stop the publisher thread so the queue stays full and the next publish drops.
-        publisher._running = False
-        publisher._thread.join(timeout=ZmqEventPublisher.SHUTDOWN_TIMEOUT)
-        assert not publisher._thread.is_alive()
-        publisher._running = True
-
         assert publisher.publish(KVEventBatch(ts=0.0, events=[])) is True
         assert publisher.publish(KVEventBatch(ts=1.0, events=[])) is False
         assert publisher.dropped_batches == 1
@@ -258,6 +256,48 @@ def test_dropped_batches_leave_a_sequence_gap() -> None:
         assert next_seq == 2
     finally:
         publisher.shutdown()
+
+
+def test_construction_binds_nothing_until_start() -> None:
+    """A constructed-but-unstarted publisher must hold no socket and no thread."""
+    port = _unused_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="zmq", endpoint=endpoint),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    try:
+        publisher = manager._publisher
+        assert publisher._pub is None
+        assert publisher._thread is None
+        # The endpoint is still free, so an unrelated socket can take it.
+        context = zmq.Context.instance()
+        squatter = context.socket(zmq.PUB)
+        squatter.bind(endpoint)
+        squatter.close(linger=0)
+
+        manager.start()
+        assert publisher._pub is not None
+        assert publisher._thread is not None and publisher._thread.is_alive()
+        # start() is idempotent.
+        manager.start()
+    finally:
+        manager.shutdown()
+
+
+def test_shutdown_without_start_is_safe() -> None:
+    """Tearing down a manager that never started must not raise."""
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="zmq", endpoint="tcp://127.0.0.1:1"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    # Never started, so nothing was bound -- shutdown must still be a clean no-op.
+    manager.shutdown()
+    manager.shutdown()
 
 
 def test_validate_streaming_support_rejects_unsupported_setups() -> None:
@@ -319,6 +359,7 @@ def test_partial_target_page_coverage_is_suppressed_until_fully_covered() -> Non
         block_size=4,
         max_window_size=128,
     )
+    manager.start()
     try:
         manager.set_layer_group_window_sizes({0: 128})
         published: list[object] = []
@@ -362,6 +403,7 @@ def test_life_cycle_hooks_ignore_none_ids() -> None:
         block_size=4,
         max_window_size=128,
     )
+    manager.start()
     try:
         # Before set_layer_group_window_sizes(), and with a None id, both hooks are
         # no-ops rather than raising TypeError.

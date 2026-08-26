@@ -956,7 +956,6 @@ class KVCacheManagerV2(BaseResourceManager):
             for window_size in self.max_attention_window_vec
         )
         self.event_manager: Optional[KVCacheEventManager | StreamingKVCacheEventManager] = None
-        pending_streaming_event_rank: Optional[int] = None
         streaming_events_enabled = (
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
@@ -981,13 +980,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 backend=KV_CACHE_MANAGER_V2_BACKEND,
             )
             if mapping.enable_attention_dp or mpi_rank() == 0:
-                # Do not construct it here: it binds a ZMQ socket and starts a
-                # background thread, and the initialization below still runs asserts
-                # and distributed collectives that can fail. A rank-local failure in
-                # that window would leak the publisher (blocking an in-process retry
-                # from rebinding) and could strand peers in a later collective. Record
-                # the rank and build it inside the protected region instead.
-                pending_streaming_event_rank = mapping.rank if mapping.enable_attention_dp else 0
+                # Constructing it is side-effect free; start() below binds the socket
+                # and starts the publisher thread once every other check has passed.
+                event_rank = mapping.rank if mapping.enable_attention_dp else 0
+                self.event_manager = StreamingKVCacheEventManager(
+                    kv_events_config,
+                    data_parallel_rank=event_rank,
+                    block_size=self.tokens_per_block,
+                    max_window_size=event_window_size,
+                )
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
@@ -1170,109 +1171,84 @@ class KVCacheManagerV2(BaseResourceManager):
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
 
-        # The streaming event manager binds a ZMQ socket and starts a background
-        # thread, so it is created here -- inside the cleanup region -- and torn down if
-        # anything below fails. That includes the rank-coordinated abort paths, where
-        # this rank raises only because a peer failed and so has no local exception of
-        # its own. Otherwise the socket and daemon thread leak and an in-process retry
-        # cannot rebind the same endpoint.
-        try:
-            if pending_streaming_event_rank is not None:
-                assert kv_events_config is not None
-                self.event_manager = StreamingKVCacheEventManager(
-                    kv_events_config,
-                    data_parallel_rank=pending_streaming_event_rank,
-                    block_size=self.tokens_per_block,
-                    max_window_size=event_window_size,
-                )
-                logger.info("Streaming KV event fast path reuses V2 radix block hashes")
-
-            candidate: Optional[KVCacheManagerPy] = None
-            if not has_host_cache_tier:
+        candidate: Optional[KVCacheManagerPy] = None
+        if not has_host_cache_tier:
+            candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+        else:
+            init_error: Optional[Exception] = None
+            local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            try:
                 candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
-            else:
-                init_error: Optional[Exception] = None
-                local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            except Exception as error:
+                if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
+                    local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
+                else:
+                    init_error = error.with_traceback(None)
+                    local_init_status = _KVCacheManagerInitStatus.ABORT
+
+            init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
+
+            if init_status == _KVCacheManagerInitStatus.ABORT:
+                if candidate is not None:
+                    candidate.shutdown()
+                if init_error is not None:
+                    raise init_error
+                raise RuntimeError("KV cache manager initialization failed on another rank")
+
+            if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
+                logger.warning(
+                    "At least one rank could not use the KV cache manager host tier "
+                    "(cuMemHostRegister may have failed). Rebuilding without the "
+                    "host cache tier on all ranks."
+                )
+                fallback_error: Optional[Exception] = None
                 try:
-                    candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
-                except Exception as error:
-                    if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
-                        local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
-                    else:
-                        init_error = error.with_traceback(None)
-                        local_init_status = _KVCacheManagerInitStatus.ABORT
-
-                init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
-
-                if init_status == _KVCacheManagerInitStatus.ABORT:
                     if candidate is not None:
                         candidate.shutdown()
-                    if init_error is not None:
-                        raise init_error
-                    raise RuntimeError("KV cache manager initialization failed on another rank")
-
-                if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
-                    logger.warning(
-                        "At least one rank could not use the KV cache manager host tier "
-                        "(cuMemHostRegister may have failed). Rebuilding without the "
-                        "host cache tier on all ranks."
+                    candidate = None
+                    config = replace(
+                        config,
+                        cache_tiers=[
+                            tier
+                            for tier in config.cache_tiers
+                            if not isinstance(tier, HostCacheTierConfig)
+                        ],
                     )
-                    fallback_error: Optional[Exception] = None
-                    try:
-                        if candidate is not None:
-                            candidate.shutdown()
-                        candidate = None
-                        config = replace(
-                            config,
-                            cache_tiers=[
-                                tier
-                                for tier in config.cache_tiers
-                                if not isinstance(tier, HostCacheTierConfig)
-                            ],
-                        )
-                        candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
-                    except Exception as error:
-                        fallback_error = error.with_traceback(None)
+                    candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                except Exception as error:
+                    fallback_error = error.with_traceback(None)
 
-                    local_fallback_status = (
-                        _KVCacheManagerInitStatus.USE_NO_HOST
-                        if fallback_error is None
-                        else _KVCacheManagerInitStatus.ABORT
-                    )
-                    fallback_status = _sync_kv_cache_manager_init_status(
-                        local_fallback_status, mapping
-                    )
-
-                    if fallback_status == _KVCacheManagerInitStatus.ABORT:
-                        if candidate is not None:
-                            candidate.shutdown()
-                        if fallback_error is not None:
-                            raise fallback_error
-                        raise RuntimeError(
-                            "KV cache manager initialization without the host cache tier "
-                            "failed on another rank"
-                        )
-
-            assert candidate is not None
-            self.kv_cache_manager_py_config = config
-            self.impl = candidate
-            self.can_evict = len(config.cache_tiers) > 1
-            if self.event_manager is not None:
-                self.event_manager.set_layer_group_window_sizes(
-                    self._get_event_window_sizes_by_layer_group(
-                        attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
-                    )
+                local_fallback_status = (
+                    _KVCacheManagerInitStatus.USE_NO_HOST
+                    if fallback_error is None
+                    else _KVCacheManagerInitStatus.ABORT
                 )
-                self.event_manager.add_created_event(
-                    self._get_event_num_blocks_per_cache_level(
-                        config.cache_tiers, tokens_per_block
-                    ),
-                    self._get_event_layer_group_ids(),
+                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
+
+                if fallback_status == _KVCacheManagerInitStatus.ABORT:
+                    if candidate is not None:
+                        candidate.shutdown()
+                    if fallback_error is not None:
+                        raise fallback_error
+                    raise RuntimeError(
+                        "KV cache manager initialization without the host cache tier "
+                        "failed on another rank"
+                    )
+
+        assert candidate is not None
+        self.kv_cache_manager_py_config = config
+        self.impl = candidate
+        self.can_evict = len(config.cache_tiers) > 1
+        if self.event_manager is not None:
+            self.event_manager.set_layer_group_window_sizes(
+                self._get_event_window_sizes_by_layer_group(
+                    attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
                 )
-        except Exception:
-            if isinstance(self.event_manager, StreamingKVCacheEventManager):
-                self.event_manager.shutdown()
-            raise
+            )
+            self.event_manager.add_created_event(
+                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
+                self._get_event_layer_group_ids(),
+            )
 
         # Both backends build layer_grouping on demand, and the layer order
         # within a group is not part of its contract. Cache a stable physical-
@@ -1386,6 +1362,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
+
+        # Last: bind the publisher socket and start its thread only once every check
+        # above has passed. Constructing the manager is side-effect free, so a failure
+        # anywhere earlier -- including the rank-coordinated aborts, where this rank
+        # raises because a peer failed -- leaves nothing bound to clean up.
+        if isinstance(self.event_manager, StreamingKVCacheEventManager):
+            self.event_manager.start()
+            logger.info("Streaming KV event fast path reuses V2 radix block hashes")
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.
