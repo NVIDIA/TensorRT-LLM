@@ -233,6 +233,8 @@ def _started_timer() -> CudaPhaseTimer:
 def _make_pipeline(sampling=None):
     pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
     nn.Module.__init__(pipeline)
+    # __new__ skips BasePipeline.__init__, which is where ``_device`` is set.
+    pipeline._device = torch.device("cpu")
     pipeline.transformer = StubTransformer()
     # __new__ skips __init__, which is where the real pipeline resolves this
     # from the transformer config; the mode-defaults tables are keyed on it.

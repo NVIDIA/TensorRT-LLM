@@ -999,6 +999,7 @@ class TestCosmos3TransferRouting:
         from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
 
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
@@ -1053,6 +1054,7 @@ class TestCosmos3TransferRouting:
         from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
 
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
@@ -1223,6 +1225,8 @@ class TestCosmos3TextGuardrailBlocked:
     @staticmethod
     def _blocked_pipeline():
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        # __new__ skips BasePipeline.__init__, which is where ``_device`` is set.
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
@@ -1230,10 +1234,10 @@ class TestCosmos3TextGuardrailBlocked:
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
         pipeline.default_use_system_prompt = False
-        # ``rank`` and ``device`` are read-only properties: rank resolves to 0
-        # with no distributed init, device comes off the transformer stub.
-        # The guardrail model is not under test, so a checker that reports
-        # "unsafe" for any input drives the path without an unsafe prompt.
+        # ``rank`` is a read-only property that resolves to 0 with no
+        # distributed init. The guardrail model is not under test, so a
+        # checker that reports "unsafe" for any input drives the path
+        # without an unsafe prompt.
         pipeline.safety_checker = SimpleNamespace(check_text_safety=lambda _prompt: False)
         pipeline._scheduler_for = lambda *args, **kwargs: None
         return pipeline
