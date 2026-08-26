@@ -380,6 +380,7 @@ def validate_streaming_support(
     pp_size: int,
     cp_size: int,
     ranks_per_host: int,
+    data_parallel_size: int,
     backend: str,
 ) -> None:
     """Reject streaming-KV-event configurations the engine cannot honour.
@@ -402,29 +403,37 @@ def validate_streaming_support(
             "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python to enable streaming KV events, or "
             "use the buffered path via kv_cache_config.event_buffer_max_size."
         )
-    validate_endpoint_ranges(config, ranks_per_host)
+    validate_endpoint_ranges(config, ranks_per_host, data_parallel_size)
 
 
-def validate_endpoint_ranges(config: KVEventsConfig, ranks_per_host: int) -> None:
+def validate_endpoint_ranges(
+    config: KVEventsConfig, ranks_per_host: int, data_parallel_size: int
+) -> None:
     """Reject configurations whose publish and replay port ranges overlap.
 
-    Every rank binds ``base_port + rank`` on both endpoints, so intersecting spans make
-    one rank's publish bind collide with another's replay bind. Only ranks sharing a
-    host can collide, so the span is the number of ranks per host, not the total: a
-    multi-node deployment legitimately reuses the same port numbers on each node.
-    Catch it before any socket is created rather than as an opaque ``EADDRINUSE``.
+    Ranks bind ``base_port + rank`` using their **global** rank, so each rank's port is
+    distinct cluster-wide and the sockets span ``[base, base + world - 1]``. Only ranks
+    co-located on one host actually contend for a port, and a host holds a contiguous
+    run of ranks, so the required spacing between the two base ports is the per-host
+    rank count rather than the total. Catch it before any socket is created rather than
+    as an opaque ``EADDRINUSE``.
     """
     pub_base = _tcp_base_port(config.endpoint)
     replay_base = _tcp_base_port(config.replay_endpoint)
     if pub_base is None or replay_base is None:
         return
     span = max(1, ranks_per_host)
-    if abs(pub_base - replay_base) < span:
+    distance = abs(pub_base - replay_base)
+    if distance < span:
+        world = max(1, data_parallel_size)
         raise ValueError(
             f"KV event endpoint {config.endpoint!r} and replay_endpoint "
-            f"{config.replay_endpoint!r} overlap: with {span} rank(s) per host the "
-            f"publish range is [{pub_base}, {pub_base + span - 1}] and the replay range "
-            f"is [{replay_base}, {replay_base + span - 1}]. Use base ports {span} apart."
+            f"{config.replay_endpoint!r} overlap: ranks bind base_port+rank by global "
+            f"rank, so with {world} rank(s) the publish sockets span "
+            f"[{pub_base}, {pub_base + world - 1}] and the replay sockets span "
+            f"[{replay_base}, {replay_base + world - 1}]. Ranks co-located on a host "
+            f"contend for ports, so the base ports must be at least {span} apart (the "
+            f"per-host rank count) but are {distance} apart."
         )
 
 
@@ -545,11 +554,21 @@ class StreamingKVCacheEventManager:
         if life_cycle_id >= len(block.storage):
             return
         page_ref = block.storage[life_cycle_id]
-        if page_ref is None or page_ref() is None:
+        page = None if page_ref is None else page_ref()
+        if page is None:
+            return
+        # A non-null page does not imply it covers the whole radix block: V2 can attach
+        # a page adopted from a shorter sibling. Publishing that as a BlockStored would
+        # tell the router the engine holds a prefix it cannot fully reuse. The buffered
+        # manager applies the same rule in _life_cycle_ids_from_radix_block().
+        if page.num_tokens_in_block < len(block.tokens):
+            self.partial_blocks_suppressed += 1
             return
         self._add_full_block(block)
 
     def add_stored_life_cycle_event_from_block(self, block: Any, life_cycle_id: int) -> None:
+        if life_cycle_id is None or self._target_life_cycle_id is None:
+            return
         if int(life_cycle_id) != self._target_life_cycle_id:
             self.non_target_life_cycles_ignored += 1
             return
@@ -641,7 +660,7 @@ class StreamingKVCacheEventManager:
         self._add_removed_hashes(removed_hashes)
 
     def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None:
-        if self._closed:
+        if self._closed or life_cycle_id is None or self._target_life_cycle_id is None:
             return
         if int(life_cycle_id) != self._target_life_cycle_id:
             self.non_target_life_cycles_ignored += 1

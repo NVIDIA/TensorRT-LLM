@@ -103,8 +103,8 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
             root = SimpleNamespace(ordinal=-1)
 
             def block(key: bytes, tokens: list[int], prev: object) -> SimpleNamespace:
-                max_window_page = object()
-                smaller_window_page = object()
+                max_window_page = SimpleNamespace(num_tokens_in_block=len(tokens))
+                smaller_window_page = SimpleNamespace(num_tokens_in_block=len(tokens))
                 return SimpleNamespace(
                     key=key,
                     tokens=tokens,
@@ -199,7 +199,7 @@ def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
         root = SimpleNamespace(ordinal=-1)
 
         def block(key: bytes, tokens: list[int], prev: object) -> SimpleNamespace:
-            page = object()
+            page = SimpleNamespace(num_tokens_in_block=len(tokens))
             return SimpleNamespace(
                 key=key,
                 tokens=tokens,
@@ -262,7 +262,7 @@ def test_dropped_batches_leave_a_sequence_gap() -> None:
 
 def test_validate_streaming_support_rejects_unsupported_setups() -> None:
     config = KVEventsConfig(enable_kv_cache_events=True, endpoint="tcp://*:5557")
-    supported = dict(pp_size=1, cp_size=1, ranks_per_host=1, backend="python")
+    supported = dict(pp_size=1, cp_size=1, ranks_per_host=1, data_parallel_size=1, backend="python")
 
     # The supported baseline must not raise, or the negative cases prove nothing.
     validate_streaming_support(config, **supported)
@@ -306,9 +306,74 @@ def test_validate_endpoint_ranges(endpoint, replay_endpoint, ranks_per_host, ove
     config = KVEventsConfig(enable_kv_cache_events=True, endpoint=endpoint, **kwargs)
     if overlaps:
         with pytest.raises(ValueError, match="overlap"):
-            validate_endpoint_ranges(config, ranks_per_host)
+            validate_endpoint_ranges(config, ranks_per_host, ranks_per_host)
     else:
-        validate_endpoint_ranges(config, ranks_per_host)
+        validate_endpoint_ranges(config, ranks_per_host, ranks_per_host)
+
+
+def test_partial_target_page_coverage_is_suppressed_until_fully_covered() -> None:
+    """A page adopted from a shorter sibling must not be published as a full block."""
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published: list[object] = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+
+        root = SimpleNamespace(ordinal=-1)
+        # The block holds 4 tokens but its target page only covers 2 of them.
+        page = SimpleNamespace(num_tokens_in_block=2)
+        block = SimpleNamespace(
+            key=b"\x01" * 32,
+            tokens=[1, 2, 3, 4],
+            prev=root,
+            ordinal=0,
+            storage=[lambda: page],
+        )
+
+        manager.add_stored_block_event_from_block(block)
+        manager.flush_iteration_events()
+        assert manager.stored_blocks == 0
+        assert manager.partial_blocks_suppressed == 1
+        assert published == []
+
+        # Once the page covers the whole block, the same block is published.
+        page.num_tokens_in_block = 4
+        manager.add_stored_life_cycle_event_from_block(block, 0)
+        manager.flush_iteration_events()
+        assert manager.stored_blocks == 1
+        assert len(published) == 1
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
+        stored = [event for event in decoded[1] if event["type"] == "BlockStored"]
+        assert sum(len(event["block_hashes"]) for event in stored) == 1
+    finally:
+        manager.shutdown()
+
+
+def test_life_cycle_hooks_ignore_none_ids() -> None:
+    """A None life-cycle id must not reach int() before the target is configured."""
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    try:
+        # Before set_layer_group_window_sizes(), and with a None id, both hooks are
+        # no-ops rather than raising TypeError.
+        manager.add_stored_life_cycle_event_from_block(object(), None)
+        manager.add_removed_life_cycle_event(b"\x01" * 32, None)
+        manager.set_layer_group_window_sizes({0: 128})
+        manager.add_stored_life_cycle_event_from_block(object(), None)
+        manager.add_removed_life_cycle_event(b"\x01" * 32, None)
+        assert manager.stored_blocks == 0
+        assert manager.removed_blocks == 0
+    finally:
+        manager.shutdown()
 
 
 def test_kv_events_config_publisher_default() -> None:

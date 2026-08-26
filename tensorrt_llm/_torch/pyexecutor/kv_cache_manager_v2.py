@@ -936,6 +936,7 @@ class KVCacheManagerV2(BaseResourceManager):
             for window_size in self.max_attention_window_vec
         )
         self.event_manager: Optional[KVCacheEventManager | StreamingKVCacheEventManager] = None
+        pending_streaming_event_rank: Optional[int] = None
         streaming_events_enabled = (
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
@@ -954,19 +955,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_events_config,
                 pp_size=mapping.pp_size,
                 cp_size=mapping.cp_size,
-                # Only ranks sharing a host can collide on a port.
+                # Ranks bind by global rank; only those sharing a host can collide.
                 ranks_per_host=min(mapping.dp_size, mapping.gpus_per_node),
+                data_parallel_size=mapping.dp_size,
                 backend=KV_CACHE_MANAGER_V2_BACKEND,
             )
             if mapping.enable_attention_dp or mpi_rank() == 0:
-                event_rank = mapping.rank if mapping.enable_attention_dp else 0
-                self.event_manager = StreamingKVCacheEventManager(
-                    kv_events_config,
-                    data_parallel_rank=event_rank,
-                    block_size=self.tokens_per_block,
-                    max_window_size=event_window_size,
-                )
-                logger.info("Streaming KV event fast path reuses V2 radix block hashes")
+                # Do not construct it here: it binds a ZMQ socket and starts a
+                # background thread, and the initialization below still runs asserts
+                # and distributed collectives that can fail. A rank-local failure in
+                # that window would leak the publisher (blocking an in-process retry
+                # from rebinding) and could strand peers in a later collective. Record
+                # the rank and build it inside the protected region instead.
+                pending_streaming_event_rank = mapping.rank if mapping.enable_attention_dp else 0
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
@@ -1151,11 +1152,20 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        # The streaming event manager has already bound its ZMQ socket and started
-        # its background thread, so tear it down if impl construction or
-        # event-manager setup fails here -- otherwise the socket and daemon
-        # thread leak and an in-process retry cannot rebind the same endpoint.
+        # The streaming event manager binds a ZMQ socket and starts a background
+        # thread, so it is created here -- inside the cleanup region -- and torn down
+        # if anything below fails. Otherwise the socket and daemon thread leak and an
+        # in-process retry cannot rebind the same endpoint.
         try:
+            if pending_streaming_event_rank is not None:
+                assert kv_events_config is not None
+                self.event_manager = StreamingKVCacheEventManager(
+                    kv_events_config,
+                    data_parallel_rank=pending_streaming_event_rank,
+                    block_size=self.tokens_per_block,
+                    max_window_size=event_window_size,
+                )
+                logger.info("Streaming KV event fast path reuses V2 radix block hashes")
             try:
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             except (CuError, KVCacheOutOfMemoryError):

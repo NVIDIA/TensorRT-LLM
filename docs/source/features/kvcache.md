@@ -253,14 +253,17 @@ parallelism and context parallelism are rejected. Events are not published for d
 models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
 returns an empty list rather than raising.
 
-**Endpoint convention.** Every attention-DP rank binds `base_port + rank`, so `N` ranks
-occupy `[base_port, base_port + N - 1]`. Co-located engines — for example disaggregated
-prefill and decode on one host — must use base ports at least `N` apart, and
-```replay_endpoint``` follows the same convention, so its base port must also be at least
-`N` away from ```endpoint```'s. Only ranks sharing a host can collide, so `N` here is the
-number of ranks per host; a multi-node deployment reuses the same port numbers on each
-node. Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints,
-which have no port, each rank appends a `_dp<rank>` suffix instead.
+**Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
+**global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
+each rank's port is distinct — on a multi-node deployment, rank 8 binds `base_port + 8`
+whichever node it runs on. Co-located engines — for example disaggregated prefill and
+decode on one host — must use base ports at least `N` apart.
+
+```replay_endpoint``` follows the same convention. Because only ranks co-located on one
+host actually contend for a port, and a host holds a contiguous run of ranks, its base
+port must be at least *ranks-per-host* away from ```endpoint```'s rather than `N` away.
+Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints, which
+have no port, each rank appends a `_dp<rank>` suffix instead.
 
 **Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
 an 8-byte big-endian sequence number, and a msgpack payload
