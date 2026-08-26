@@ -5643,6 +5643,20 @@ class PyTorchModelEngine(ModelEngine):
                 return full * _helix_phys + min(
                     max(rem - _helix_rank_off, 0), _helix_phys)
 
+            def _helix_pack_extend(request, group: int) -> int:
+                # A helix gen worker's token list is the rank-LOCAL
+                # round-robin subset, so max_beam_num_tokens is not a global
+                # base; rebuild it from the global prompt length plus the
+                # rank-invariant generated count. Also repacks position_ids,
+                # which the caller filled from the local base.
+                generated_len = (request.max_beam_num_tokens -
+                                 request.py_prompt_len)
+                base = request.total_input_len_cp + generated_len - 1
+                helix_position_offsets.extend(range(base, base + group))
+                position_ids[-group:] = range(base, base + group)
+                helix_is_inactive_rank.append(False)
+                return base
+
         spec_config = self.spec_config if self.enable_spec_decode else None
         if not self._disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
@@ -5716,18 +5730,9 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num - request.py_num_compressed_tokens)
                 request.cached_tokens = past_seen_token_num
                 if _has_cp_helix:
-                    # A helix gen worker's token list is the rank-LOCAL
-                    # round-robin subset, so max_beam_num_tokens is not a
-                    # global base; rebuild it from the global prompt length
-                    # plus the rank-invariant generated count.
+                    # No in-flight predecessor, so every value is exact.
                     group = 1 + num_draft_tokens
-                    generated_len = (request.max_beam_num_tokens -
-                                     request.py_prompt_len)
-                    base = request.total_input_len_cp + generated_len - 1
-                    helix_position_offsets.extend(range(base, base + group))
-                    # Repack: the loop above used the local base.
-                    position_ids[-group:] = range(base, base + group)
-                    helix_is_inactive_rank.append(False)
+                    base = _helix_pack_extend(request, group)
                     local_cached = _helix_local_len_host(base)
                     helix_owned_new_tokens.append(
                         _helix_local_len_host(base + group) - local_cached)
@@ -5767,16 +5772,11 @@ class PyTorchModelEngine(ModelEngine):
                                          runtime_tokens_per_gen_step)
                 if _has_cp_helix:
                     # In-flight predecessor: provisional values, per the
-                    # non-helix convention above. Positions use the stale base
-                    # and the KV numbers assume full acceptance; the device
-                    # recompute overrides both. Base is global (see above).
+                    # non-helix convention above. The base is stale and the KV
+                    # numbers assume full acceptance; the device recompute
+                    # overrides both.
                     group = runtime_tokens_per_gen_step
-                    generated_len = (request.max_beam_num_tokens -
-                                     request.py_prompt_len)
-                    base = request.total_input_len_cp + generated_len - 1
-                    helix_position_offsets.extend(range(base, base + group))
-                    position_ids[-group:] = range(base, base + group)
-                    helix_is_inactive_rank.append(False)
+                    base = _helix_pack_extend(request, group)
                     local_full = _helix_local_len_host(base + group)
                     helix_owned_new_tokens.append(0)
                     num_cached_tokens_per_seq[-1] = (
