@@ -265,12 +265,12 @@ def isCbtsStage(String stageName) {
 }
 
 def freezeCbtsCoverage(String stageDir) {
-    // Stop .cbtscov writes and wait for the dir to settle before the results tar reads it.
+    // pytest_sessionfinish already waited for every subscriber to save and leave, so this only
+    // settles the directory against a writer CBTS never knew about.
     sh(
         returnStatus: true,
         script: """
             mkdir -p ${stageDir}
-            touch ${stageDir}/${CBTS_STOP_FILE_NAME}
             prev=\$(stat -c %y ${stageDir} 2>/dev/null || echo unknown)
             for i in \$(seq 1 15); do
                 sleep 1
@@ -443,7 +443,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             pipeline,
                             script: Utils.sshUserCmd(
                                 remote,
-                                "\"cd '${remoteWs}' && touch '${CBTS_STOP_FILE_NAME}' && sleep 2 && " +
+                                "\"cd '${remoteWs}' && sleep 2 && " +
                                 "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
                                 "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
                             ),
@@ -1597,13 +1597,20 @@ def getPytestBaseCommandLine(
     // container is destroyed. Never point this at a bind-mounted / shared path:
     // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
     extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
-    // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
+    // CBTS stages put cbts_plugin/sitecustomize (bare-importable guest hooks) plus the cbts
+    // package itself on PYTHONPATH (via ${VAR:-} for set -u safety), plus the config env vars
+    // sitecustomize.py reads in subprocesses. The context channel's address is created and
+    // exported by the plugin itself.
     if (cbtsMode) {
-        def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"
-        extraInternalEnv += " PYTHONPATH=${cbtsScriptDir}:\${PYTHONPATH:-}"
+        def cbtsDir = "${llmSrc}/jenkins/scripts/cbts"
+        def cbtsInjectorsDir = "${cbtsDir}/cbts_injectors"
+        extraInternalEnv += " PYTHONPATH=${cbtsInjectorsDir}:${cbtsDir}:\${PYTHONPATH:-}"
         extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
-        extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
-        extraInternalEnv += " CBTS_STOP_FILE=${outputPath}/${CBTS_STOP_FILE_NAME}"
+        // Names the stage the coverage is attributed to, and tells sitecustomize.py what this
+        // process is. sitecustomize.py consumes the role, so the pool workers and servers this
+        // pytest spawns start unlabelled and are treated as product processes.
+        extraInternalEnv += " CBTS_STAGE=${stageName}"
+        extraInternalEnv += " CBTS_PROCESS_ROLE=outer_pytest"
     }
 
     // Container port allocation environment variables for avoiding port conflicts
@@ -1902,7 +1909,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (isCbtsStage(stageName)) {
                     // @TRTLLM_WHEEL_PATH@ stays a placeholder; slurm_run.sh substitutes it on the worker.
                     sh """
-                        cp ${llmSrcLocal}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ./.coveragerc
+                        cp ${llmSrcLocal}/jenkins/scripts/cbts/cbts/coverage/collection/coveragerc.template ./.coveragerc
                         sed -i \\
                             -e 's|@JOB_WORKSPACE@|${jobWorkspace}|g' \\
                             -e 's|@STAGE_NAME@|${stageName}|g' \\
@@ -2986,9 +2993,6 @@ def INFRA_DRY_RUN = "infra_dry_run"
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
-// Sentinel in the stage output dir; while it exists no process writes a .cbtscov file.
-@Field
-def CBTS_STOP_FILE_NAME = "cbts_stop"
 @Field
 def testFilter = [
     (REUSE_TEST): null,
@@ -5131,9 +5135,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (isCbtsStage(stageName)) {
             // K8s runner knows TRTLLM_WHL_PATH here, so all placeholders are substituted at controller time (no worker-side sed).
             sh """
-                # A sentinel left in a reused workspace would suppress this stage's writes.
-                mkdir -p ${WORKSPACE}/${stageName} && rm -f ${WORKSPACE}/${stageName}/${CBTS_STOP_FILE_NAME}
-                cp ${llmSrc}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ${coverageConfigFile}
+                mkdir -p ${WORKSPACE}/${stageName}
+                cp ${llmSrc}/jenkins/scripts/cbts/cbts/coverage/collection/coveragerc.template ${coverageConfigFile}
                 sed -i \\
                     -e 's|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHL_PATH}|g' \\
                     -e 's|@JOB_WORKSPACE@|${WORKSPACE}/${stageName}|g' \\
@@ -5314,7 +5317,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (isCbtsStage(stageName)) {
                 sh """
                     cd ${WORKSPACE}/${stageName} && \
-                    python3 ${llmSrc}/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                    PYTHONPATH=${llmSrc}/jenkins/scripts/cbts \
+                    python3 -m cbts.command coverage collection pystart-report \
                         --glob '.cbtscov.${stageName}*' || true
                 """
             }
@@ -6638,7 +6642,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Runs on a CPU node ("build" pod type, kubernetes-cpu cloud) — it needs no
     // GPU and no TRT-LLM wheel, only its own `pip install -e agent-flow[test]`.
     // CBTS narrows this to agent-flow-only changes via
-    // jenkins/scripts/cbts/rules/agent_flow_rule.py; AGENT_FLOW_STAGE in that
+    // jenkins/scripts/cbts/cbts/rules/agent_flow.py; AGENT_FLOW_STAGE in that
     // rule MUST equal the stage name below or CBTS Layer 2 will drop it.
     agentFlowTestSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     // Single source of truth for the stage name: it is both the map key (which

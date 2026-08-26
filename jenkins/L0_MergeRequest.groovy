@@ -919,11 +919,15 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // ============================================================================
 // CBTS (Change-Based Testing Selection)
 //
-// Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
-// a result map (or null = defer to existing filter chain). Result keys:
-// scope, affected_stages, reasons, test_db_dir_override,
-// affected_stage_test_counts, affected_stage_split_counts.
+// Calls `cbts.command main` (jenkins/scripts/cbts/cbts/command/main.py) with PR
+// changed_files + diffs and returns a result map (or null = defer to existing
+// filter chain). Result keys: scope, affected_stages, reasons,
+// test_db_dir_override, affected_stage_test_counts, affected_stage_split_counts.
 // CBTS narrows test cases only — Build always runs. See cbts/README.md.
+//
+// Every `python3 -m cbts.command ...` call below is prefixed with
+// `PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts` — the outer vendor dir, so
+// `import cbts.*` resolves without touching the rest of jenkins/scripts/.
 // ============================================================================
 
 def getCbtsResult(pipeline, testFilter, globalVars)
@@ -966,7 +970,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
+            script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                    "python3 -m cbts.command main --list-needed-diffs",
             returnStdout: true,
         ).trim()
         def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
@@ -994,7 +999,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
 
-        def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
+        def mainCmd = "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                      "python3 -m cbts.command main cbts_input.json"
         if (coverageDb) {
             mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
         }
@@ -1075,14 +1081,16 @@ def _cbtsCoverageAudit(pipeline)
         def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
             prAuthor = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
+                script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                        "python3 -m cbts.command coverage pilot",
                 returnStdout: true,
             ).trim()
             pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
             if (pilotEligible) {
                 readyJson = sh(
-                    script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                    script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                            "python3 -m cbts.command coverage selection artifact " +
                             "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
                     returnStdout: true,
                 ).trim()
@@ -1097,7 +1105,8 @@ def _cbtsCoverageAudit(pipeline)
             return null
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
-        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
+        sh("cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+           "python3 -m cbts.command coverage selection audit --db ${ready.path}")
         return ready
     } catch (InterruptedException e) {
         throw e
@@ -1144,7 +1153,8 @@ def _cbtsReportDecision(pipeline, globalVars, String status, String reason, Stri
         if (prNumber) {
             args += " --pr-number ${prNumber}"
         }
-        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/report_cbts_decision.py ${args}"
+        sh("cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+           "python3 -m cbts.command report-decision ${args}")
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
@@ -1520,7 +1530,8 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                     if (fileCount > 0) {
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         sh """
-                            python3 ${LLM_ROOT}/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                            PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
+                            python3 -m cbts.command coverage collection pystart-report \
                                 --glob 'cov/.cbtscov.*.sqlite' \
                                 --out-sqlite cov/cbts_touchmap.sqlite
                         """
@@ -1641,7 +1652,8 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     }
                     // Merge into the indexed touch DB, a per-file HTML report, and the coverage rate.
                     sh """
-                        python3 llm/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                        PYTHONPATH=llm/jenkins/scripts/cbts \
+                        python3 -m cbts.command coverage collection pystart-report \
                             --glob 'cov/.cbtscov.*.sqlite' \
                             --out-sqlite cov/cbts_touchmap.sqlite \
                             --out-dir cov/cbts_report \
