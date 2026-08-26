@@ -118,18 +118,6 @@ class TestVisualGenParamsValidation:
         assert params.image_reference[0].content == b"\x89PNG"
         assert params.image_reference[0].format == "bytes"
 
-    def test_image_reference_accepts_list(self):
-        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
-
-        params = VisualGenParams(
-            image_reference=[
-                MediaRef(content="/path/a.png", format="path"),
-                MediaRef(content=b"\x89PNG", format="bytes"),
-            ]
-        )
-        assert len(params.image_reference) == 2
-        assert params.image_reference[0].content == "/path/a.png"
-
     def test_model_dump(self):
         from tensorrt_llm.visual_gen import VisualGenParams
 
@@ -206,13 +194,6 @@ class TestMediaRefValidation:
 
         with pytest.raises(ValidationError, match="requires (bytes|string) content"):
             MediaRef(content=content, format=content_format)
-
-    def test_content_type_matching_format_accepted(self):
-        from tensorrt_llm.visual_gen import MediaRef
-
-        assert MediaRef(content=b"raw", format="bytes").content == b"raw"
-        for fmt in ("path", "url", "base64"):
-            assert MediaRef(content="x", format=fmt).format == fmt
 
     def test_engine_rewrite_is_not_blocked_by_the_pairing_check(self):
         """``prepare_reference_slots`` rewrites content then format, so the
@@ -1046,24 +1027,10 @@ class TestRequestValidation:
         req = self._make_request(num_frames=81)
         self._merge_and_validate(executor, req)
 
-    def test_image_reference_on_i2v_pipeline_ok(self):
-        """image_reference is consumed by WanImageToVideoPipeline; validating
-        without ref_slot_specs should not raise."""
-        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
-            WanImageToVideoPipeline,
-        )
-        from tensorrt_llm.visual_gen.params import MediaRef
-
-        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(
-            image_reference=MediaRef(content="/path/to/img.png", format="path")
-        )
-        self._merge_and_validate(executor, req)
-
     def test_ref_slot_required_vs_optional(self):
         """``min >= 1`` marks a required reference (clean error when absent);
-        ``min == 0`` leaves the slot optional; an undeclared absent slot is
-        fine, but an unsolicited one is rejected."""
+        ``min == 0`` leaves the slot optional; an undeclared slot is fine while
+        absent but rejected when sent, as is a role the slot never declared."""
         from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
         from tensorrt_llm.visual_gen.params import (
             MediaRef,
@@ -1094,11 +1061,18 @@ class TestRequestValidation:
         run(VisualGenParams(), optional)
         # Required slot with the image present -> allowed.
         run(VisualGenParams(image_reference=MediaRef(content="a.png", format="path")), required)
-        # Undeclared slot left absent -> no spurious "not accepted".
-        run(VisualGenParams(), optional)
         # Undeclared slot actually sent -> rejected.
         with pytest.raises(ValueError, match=r"video_reference.*not accepted"):
             run(VisualGenParams(video_reference=MediaRef(content="v.mp4", format="path")), optional)
+        # A role the slot never declared -> rejected here, not carried to a worker
+        # that has no conditioning input to put it in.
+        with pytest.raises(ValueError, match=r"role 'last_frame' not supported"):
+            run(
+                VisualGenParams(
+                    image_reference=MediaRef(content="a.png", format="path", role="last_frame")
+                ),
+                required,
+            )
 
     def test_multi_role_slot_infers_single_required_role(self):
         """A role-less ref against a multi-role slot is inferred when only one

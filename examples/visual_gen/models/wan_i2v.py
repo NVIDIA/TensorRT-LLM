@@ -23,7 +23,8 @@ Usage:
 import argparse
 import os
 
-from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
+from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 _DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cat_piano.png")
 

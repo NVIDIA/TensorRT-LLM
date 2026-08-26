@@ -23,7 +23,8 @@ Usage:
 import argparse
 from pathlib import Path
 
-from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
+from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 
 def parse_args() -> argparse.Namespace:

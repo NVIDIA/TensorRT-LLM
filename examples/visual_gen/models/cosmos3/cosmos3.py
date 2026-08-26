@@ -27,8 +27,9 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
+from tensorrt_llm import VisualGen, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
+from tensorrt_llm.visual_gen import MediaRef
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")

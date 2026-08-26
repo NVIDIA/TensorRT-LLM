@@ -13,18 +13,96 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
+import base64
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
+from typing_extensions import Literal
 
+from tensorrt_llm.inputs.media_io import (
+    _safe_read_local_file,
+    _safe_request_get,
+    is_isobmff_image_bytes,
+    sniff_media_kind,
+)
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
-# Defined in a dependency-neutral leaf so the serving protocol can name them
-# without importing VisualGen; re-exported here as their public home.
-from tensorrt_llm.media.reference import MediaContentFormat as MediaContentFormat
-from tensorrt_llm.media.reference import MediaRef as MediaRef
-from tensorrt_llm.media.reference import MediaRole as MediaRole
-from tensorrt_llm.media.reference import reject_bare_refs as _reject_bare_refs
+MediaRole = Literal["reference", "first_frame", "last_frame"]
+
+# Wire form of a reference's ``content``. Declared explicitly rather than
+# sniffed: a bare string is otherwise ambiguous between a local path and
+# base64, and guessing lets a mistyped path silently become base64 (or a
+# malformed base64 silently become a filesystem read).
+MediaContentFormat = Literal["path", "url", "base64", "bytes"]
+
+
+@set_api_status("prototype")
+class MediaRef(StrictBaseModel):
+    """A single media reference (image / video / audio).
+
+    Carried by ``image_reference`` / ``video_reference`` / ``audio_reference``;
+    the field it sits in fixes the modality. ``role`` is required only when the
+    target model accepts that modality in more than one role (e.g. image first +
+    last frame); otherwise the pipeline knows the reference's meaning and
+    ``role`` may be omitted (video/audio are always the single ``reference``).
+    """
+
+    content: Union[str, bytes] = Field(
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: MediaContentFormat = Field(
+        description=(
+            "Wire form of ``content``: ``path`` (local file; a ``file://`` URI is "
+            "also accepted), ``url`` (``http(s)``, fetched through the SSRF-guarded "
+            "loader), ``base64`` (a ``data:`` URI is also accepted), or ``bytes``."
+        )
+    )
+    role: Optional[MediaRole] = Field(
+        default=None,
+        description=(
+            "Which conditioning slot this reference fills. Required only when the "
+            "target model accepts this modality in more than one slot; omit it when "
+            "the model leaves no ambiguity."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_content_matches_format(self):
+        """Reject a ``content`` whose Python type contradicts ``format``.
+
+        ``bytes`` is the only format carrying a binary payload; the other three
+        name a location or an encoding and are therefore strings. Checking the
+        pairing here fails at construction — an HTTP 422 or an immediate
+        ``ValueError`` — instead of deep in the engine's resolve step.
+        """
+        if self.format == "bytes":
+            if not isinstance(self.content, bytes):
+                raise ValueError(
+                    f"format='bytes' requires bytes content, got {type(self.content).__name__}."
+                )
+        elif not isinstance(self.content, str):
+            raise ValueError(
+                f"format={self.format!r} requires string content, got "
+                f"{type(self.content).__name__}."
+            )
+        return self
+
+
+def _reject_bare_refs(value: Any) -> Any:
+    """Reject the bare path/bytes shorthand with an actionable message.
+
+    Runs before coercion, so the caller sees what to do instead of a union
+    mismatch reported against an inner model. A bare string has nowhere to
+    declare its wire form, and guessing is what ``format`` exists to prevent.
+    """
+    for x in value if isinstance(value, list) else [value]:
+        if isinstance(x, (str, bytes)):
+            raise ValueError(
+                "a reference must declare its wire form; a bare "
+                f"{type(x).__name__} is no longer accepted. Pass "
+                'MediaRef(content=..., format="path"|"url"|"base64"|"bytes").'
+            )
+    return value
 
 
 def _normalize_refs(value: Any) -> Optional[list]:
@@ -315,3 +393,119 @@ def validate_visual_gen_params(
         return
 
     raise ValueError("Parameter validation failed:\n" + "\n".join(f"  - {e}" for e in messages))
+
+
+def _read_reference_payload(reference: str) -> bytes:
+    """Decode one base64 (optionally ``data:`` URI) reference string to bytes.
+
+    Payload size is deliberately not checked here: encoded size is not part
+    of the request-validity contract, and body limits belong to the
+    proxy/ASGI deployment layer (HTTP 413). Base64 decodes strictly so
+    malformed encodings — not sizes — are rejected.
+    """
+    data = reference
+    if data.startswith("data:"):
+        comma = data.find(",")
+        if comma == -1:
+            raise ValueError("reference data: URI is malformed (missing comma).")
+        # Match the LLM loader: only base64 payloads are supported, and saying so
+        # beats letting a percent-encoded body fail as "not valid base64".
+        if "base64" not in data[:comma].split(";")[1:]:
+            raise ValueError("only base64 data: URIs are supported for references.")
+        data = data[comma + 1 :]
+    try:
+        return base64.b64decode(data, validate=True)
+    except ValueError as exc:
+        # binascii.Error subclasses ValueError.
+        raise ValueError("reference is not valid base64 data.") from exc
+
+
+def _resolve_reference(content: Any, content_format: str) -> bytes:
+    """Resolve one reference to raw bytes using its declared wire form.
+
+    Dispatch is on the caller-declared ``format``, never on the shape of the
+    value: a bare string is otherwise ambiguous between a local path and
+    base64, and guessing lets a mistyped path become base64 (or a malformed
+    base64 become a filesystem read). Fetch/read/decode failures become
+    ``ValueError`` so a bad reference is a client 400, not a server 500.
+    """
+    if content_format == "bytes":
+        if not isinstance(content, bytes):
+            raise ValueError(
+                f"format='bytes' requires bytes content, got {type(content).__name__}."
+            )
+        return content
+    if not isinstance(content, str):
+        raise ValueError(
+            f"format={content_format!r} requires string content, got {type(content).__name__}."
+        )
+    if content_format == "url":
+        try:
+            return _safe_request_get(content).content
+        except Exception as exc:
+            raise ValueError(f"reference URL could not be fetched: {exc}") from exc
+    if content_format == "path":
+        return _safe_read_local_file(content)
+    if content_format == "base64":
+        return _read_reference_payload(content)
+    raise ValueError(f"unsupported reference format: {content_format!r}")
+
+
+def _validate_reference_payload(payload: bytes, *, modality: str) -> None:
+    """Reject a payload whose container does not match the declared modality.
+
+    HEIF/AVIF images are rejected on signature alone (Pillow support depends
+    on optional plugins the worker need not share). Video acceptance beyond the
+    container signature happens in the worker's NVDEC demux.
+    """
+    if modality == "image":
+        if sniff_media_kind(payload) != "image":
+            raise ValueError(
+                "image_reference is not a recognized image; supported inputs are PNG/JPEG."
+            )
+        if is_isobmff_image_bytes(payload):
+            raise ValueError(
+                "image_reference is a HEIF/AVIF image, which is not a supported "
+                "reference format; convert it to PNG or JPEG."
+            )
+    elif modality == "video":
+        if sniff_media_kind(payload) != "video":
+            raise ValueError(
+                "video_reference is not a recognized media container; supported "
+                "inputs are MP4/AVI video."
+            )
+    elif modality == "audio":
+        if sniff_media_kind(payload) != "audio":
+            raise ValueError(
+                "audio_reference is not a recognized audio container; supported "
+                "inputs are WAV/MP3/FLAC/OGG/M4A/AAC."
+            )
+
+
+def prepare_reference_slots(params: Any) -> None:
+    """Resolve every reference to raw bytes, in place.
+
+    The single reference choke point, used by the engine (``generate_async``)
+    so serve and the standalone Python API share one path. Dispatch is on each
+    reference's declared ``format``, never on the shape of its content: the
+    declared form is resolved to bytes, content-validated against the slot's
+    modality, and written back with ``format`` set to ``"bytes"``.
+
+    ``format`` is rewritten alongside ``content`` because the mutated params
+    object is what gets broadcast to the workers; a stale format would tell a
+    worker it is holding base64 when it is holding raw bytes.
+
+    Bytes are the canonical form all the way to the pipeline, so a reference
+    never touches the filesystem: there is nothing to clean up afterwards, and
+    a worker needs no shared filesystem to read what the coordinator resolved.
+
+    Runs before the coordinator broadcasts the request, so a bad reference
+    raises ``ValueError`` synchronously and serve keeps its immediate 400.
+    """
+    for slot in ("image_reference", "video_reference", "audio_reference"):
+        modality = slot.split("_", 1)[0]
+        for ref in getattr(params, slot, None) or []:
+            data = _resolve_reference(ref.content, ref.format)
+            _validate_reference_payload(data, modality=modality)
+            ref.content = data
+            ref.format = "bytes"

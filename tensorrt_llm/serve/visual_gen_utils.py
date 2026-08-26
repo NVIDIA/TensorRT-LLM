@@ -380,7 +380,7 @@ def _apply_deprecated_input_reference(
     logger.warning("'input_reference' is deprecated; use 'image_reference' / 'video_reference'.")
     if params.image_reference or params.video_reference:
         return
-    from tensorrt_llm.media.reference import MediaRef
+    from tensorrt_llm.visual_gen.params import MediaRef
 
     if hasattr(input_reference, "file"):  # multipart upload — form implied
         payload = input_reference.file.read()
@@ -393,7 +393,7 @@ def _apply_deprecated_input_reference(
                 "file as base64 or upload it via multipart/form-data."
             )
         # Local import, for the reason given at the first one.
-        from tensorrt_llm.visual_gen.media_refs import _resolve_reference
+        from tensorrt_llm.visual_gen.params import _resolve_reference
 
         payload = _resolve_reference(input_reference, input_reference_format)
     kind = sniff_media_kind(payload)

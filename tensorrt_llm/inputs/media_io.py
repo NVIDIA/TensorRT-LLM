@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Executor
 from io import BytesIO
 from pathlib import Path
+from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
@@ -747,6 +748,39 @@ def _normalize_file_uri(uri: str) -> str:
     if parsed.scheme == "file":
         return unquote(parsed.path)
     return uri
+
+
+def _safe_read_local_file(location: str) -> bytes:
+    """Read a local file, refusing anything that has no end.
+
+    Takes a bare path or a ``file://`` URI.
+
+    The counterpart of :func:`_safe_request_get` for the local branch, and it
+    guards the one case that is unbounded rather than merely large: reading a
+    character device never reaches EOF and reading a FIFO blocks, so either
+    turns a caller into a denial of service. A regular file is finite, which is
+    the property required here.
+
+    Size is deliberately not capped: naming a large file of one's own is the
+    normal case for a local caller, and no threshold separates that from an
+    abusive one. This bounds the shape of what may be read, then, not its size
+    or its reach — any regular file the process can read is still readable.
+    """
+    path = Path(_normalize_file_uri(location))
+    try:
+        stat = path.stat()  # follows symlinks, so a link to a device is caught
+    except OSError as exc:
+        raise ValueError(f"file could not be read: {exc}") from exc
+
+    if not S_ISREG(stat.st_mode):
+        raise ValueError(
+            f"path is not a regular file: {location!r}. Character devices, "
+            "FIFOs and directories cannot be read as media."
+        )
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"file could not be read: {exc}") from exc
 
 
 _MediaT = TypeVar("_MediaT")

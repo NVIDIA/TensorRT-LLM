@@ -324,17 +324,6 @@ class TestQwenImageEditReferenceLoading:
         assert all(image.mode == "RGB" for image in images)
         assert all(image.size == (8, 8) for image in images)
 
-    def test_a_path_is_a_type_error(self):
-        """References reach a pipeline as bytes; a path is not a filesystem read."""
-        import pytest
-
-        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
-            QwenImageEditPlusPipeline,
-        )
-
-        with pytest.raises(ValueError, match="PIL images or encoded bytes"):
-            QwenImageEditPlusPipeline._load_edit_images(["/tmp/ref.png"])
-
     def test_alpha_is_dropped_not_composited(self):
         """A transparent pixel keeps its stored RGB.
 

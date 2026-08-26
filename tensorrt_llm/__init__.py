@@ -62,9 +62,9 @@ if TYPE_CHECKING:
     from .mapping import Mapping
     from .models.automodel import AutoConfig, AutoModelForCausalLM
     from .sampling_params import SamplingParams
-    from .visual_gen import (ExtraParamSchema, MediaRef, VisualGen,
-                             VisualGenArgs, VisualGenMetrics, VisualGenOutput,
-                             VisualGenParams, VisualGenResult)
+    from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
+                             VisualGenMetrics, VisualGenOutput, VisualGenParams,
+                             VisualGenResult)
 
 # Public name -> (source module, attribute); attribute None = the module itself.
 _LAZY_ATTRS = {
@@ -105,7 +105,6 @@ _LAZY_ATTRS = {
     'VisualGenMetrics': ('tensorrt_llm.visual_gen', 'VisualGenMetrics'),
     'VisualGenOutput': ('tensorrt_llm.visual_gen', 'VisualGenOutput'),
     'VisualGenParams': ('tensorrt_llm.visual_gen', 'VisualGenParams'),
-    'MediaRef': ('tensorrt_llm.visual_gen', 'MediaRef'),
     'VisualGenResult': ('tensorrt_llm.visual_gen', 'VisualGenResult'),
 }
 
@@ -174,7 +173,6 @@ __all__ = [
     'math_utils',
     'VisualGen',
     'VisualGenParams',
-    'MediaRef',
     '__version__',
 ]
 

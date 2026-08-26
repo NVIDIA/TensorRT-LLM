@@ -25,7 +25,8 @@ Usage:
 import argparse
 from pathlib import Path
 
-from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
+from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 
 def _output_paths(output_path: str, num_images: int) -> str | list[str]:

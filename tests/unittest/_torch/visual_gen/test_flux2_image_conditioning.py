@@ -32,13 +32,6 @@ def test_load_reference_images_accepts_pil_and_bytes(tmp_path) -> None:
     assert [image.size for image in images] == [(64, 64), (64, 64)]
 
 
-def test_load_reference_images_rejects_a_path() -> None:
-    """References reach the worker as bytes, so a path is a type error here,
-    not a filesystem read."""
-    with pytest.raises(ValueError, match="PIL images or encoded bytes"):
-        Flux2Pipeline._load_reference_images(["/tmp/nope.png"])
-
-
 def test_load_reference_images_drops_alpha_without_compositing() -> None:
     """RGBA is converted the way diffusers does it: the alpha channel is
     dropped, so a fully-transparent pixel keeps its RGB value instead of

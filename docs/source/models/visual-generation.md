@@ -135,7 +135,8 @@ Every pipeline declares the reference slots and roles it accepts through `ref_sl
 Most models take a single reference whose role is unambiguous:
 
 ```python
-from tensorrt_llm import VisualGen, MediaRef
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
 
 vg = VisualGen(model="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 params = vg.default_params
@@ -146,7 +147,8 @@ output = vg.generate(inputs="the scene comes alive with gentle motion", params=p
 Models that accept the same modality in more than one role need `role`. Wan 2.1 I2V takes a first frame and an optional last frame:
 
 ```python
-from tensorrt_llm import VisualGen, MediaRef
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
 
 vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
 params = vg.default_params

@@ -31,9 +31,12 @@ from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_vi
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
 from tensorrt_llm.visual_gen.output import VisualGenOutput
-from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+from tensorrt_llm.visual_gen.params import (
+    VisualGenParams,
+    prepare_reference_slots,
+    validate_visual_gen_params,
+)
 
 __all__ = [
     "VisualGen",

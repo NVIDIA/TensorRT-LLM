@@ -35,9 +35,8 @@ from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
-from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
-from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
 
 pytestmark = pytest.mark.cpu_only
 
