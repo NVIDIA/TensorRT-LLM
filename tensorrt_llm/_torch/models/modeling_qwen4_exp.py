@@ -154,7 +154,11 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         self.ple: Optional[Qwen4ExpPLE] = None
         if is_ple_layer:
             self.ple = Qwen4ExpPLE(
-                config, dtype=dtype, ple_layer_index=ple_layer_index, layer_id=layer_idx
+                config,
+                dtype=dtype,
+                ple_layer_index=ple_layer_index,
+                layer_id=layer_idx,
+                mapping=model_config.mapping,
             )
 
         self.enable_tp_output_reduction = _qwen4_exp_tp_output_reduction_enabled(self.mapping)
@@ -214,11 +218,14 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
             )
         if self.attn_allreduce is not None:
             attn_out = self.attn_allreduce(attn_out)
-        hidden_states = self.attn_hyper_connection.combine(attn_out, residual)
+        # The attention combine and MLP grouped norm form one exact fusion
+        # boundary: no PLE update or collective intervenes between them.
+        hidden_states, mixed, residual = self.mlp_hyper_connection.combine_and_mix(
+            attn_out, residual
+        )
 
-        # MoE block: mix -> MoE(routed 512 + shared) -> combine. The MoE owns its
-        # own tensor-parallel reduction of the combined routed+shared output.
-        mixed, residual = self.mlp_hyper_connection.mix(hidden_states)
+        # MoE block: MoE(routed 512 + shared) -> combine. The MoE owns its own
+        # tensor-parallel reduction of the combined routed+shared output.
         moe_out = self.mlp(
             mixed,
             attn_metadata,
@@ -450,6 +457,7 @@ class Qwen4ExpModel(DecoderModel):
             num_contexts=num_contexts,
             use_spec_decoding=use_spec_decoding,
             uniform_row_width=uniform_row_width,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
         )
 
         conv_state, ngram_context = self._resolve_ple_pools(
@@ -882,10 +890,9 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        """Return conservative defaults for hybrid state and QSA."""
+        """Return defaults for hybrid state and QSA."""
         return {
             "kv_cache_config": {"enable_block_reuse": False},
-            "moe_config": {"disable_finalize_fusion": True},
             "sparse_attention_config": {"algorithm": "qsa"},
             "cuda_graph_config": None,
         }

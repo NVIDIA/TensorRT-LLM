@@ -205,6 +205,7 @@ def test_text_model_registration_and_defaults() -> None:
     defaults = Qwen4ExpForCausalLM.get_model_defaults(None)
     assert defaults["sparse_attention_config"] == {"algorithm": "qsa"}
     assert defaults["kv_cache_config"]["enable_block_reuse"] is False
+    assert "moe_config" not in defaults
     assert "allreduce_strategy" not in defaults
     assert Qwen4ExpForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
@@ -410,6 +411,32 @@ def test_mapper_normalizes_bf16_and_per_expert_fp8_weights() -> None:
     }
 
 
+def test_mapper_streams_only_local_ple_row_overlap(monkeypatch) -> None:
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
+        Qwen4ExpHfWeightMapper,
+    )
+
+    module = nn.Module()
+    module.padded_vocab_size = 10
+    module.vocab_start_index = 3
+    module.vocab_end_index = 8
+    module.ngram_embedding = nn.Embedding(5, 2)
+    with torch.no_grad():
+        module.ngram_embedding.weight.fill_(-1)
+
+    mapper = Qwen4ExpHfWeightMapper()
+    monkeypatch.setattr(mapper, "_ngram_module_for_prefix", lambda _prefix: module)
+    full_table = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+    leaves = {
+        "ngram_embedding.shard_0.weight": full_table[:4],
+        "ngram_embedding.shard_1.weight": full_table[4:],
+    }
+
+    mapper._load_ngram_tables({"model.layers.1.ple": leaves})
+
+    torch.testing.assert_close(module.ngram_embedding.weight, full_table[3:8])
+
+
 def test_pipeline_mapper_drops_nonlocal_layer_weights() -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
@@ -547,7 +574,11 @@ def test_mtp_local_full_vocab_head_collapses_hc_streams(monkeypatch) -> None:
             return hidden_states
 
     lm_head = CaptureLMHead()
-    hidden_states = torch.zeros(2, config.hc_count * config.hidden_size)
+    hidden_states = torch.zeros(
+        2,
+        config.hc_count * config.hidden_size,
+        dtype=config.torch_dtype,
+    )
 
     logits = head.forward_local_full_vocab(
         hidden_states, lm_head, attn_metadata=None, return_context_logits=True

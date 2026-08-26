@@ -51,8 +51,9 @@ What differs from the stock HF loader (why a bespoke mapper is required):
   the stock fusion / direct-copy paths.
 * **PLE n-gram embedding (C4)** — the ~100 GB n-gram table is stored as
   ``split_ngram_parts`` (128) equal prime-tiled shards
-  ``ple_embedding.ngram_embedding.shard_{i}.weight``; they are streamed
-  shard-by-shard into the single ``ngram_embedding`` table (no 100 GB concat),
+  ``ple_embedding.ngram_embedding.shard_{i}.weight``; each rank streams only
+  its overlapping row range into the local ``ngram_embedding`` shard (no 100 GB
+  concat or replicated table),
   and the three recurrent-hash metadata buffers (``layer_multipliers`` /
   ``ngram_heads_offsets`` / ``ngram_heads_vocab_sizes``) are copied into the
   module's registered buffers.
@@ -365,20 +366,43 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     buf = getattr(module, leaf)
                     buf.data.copy_(leaves[leaf][:].to(buf.dtype))
 
-            # N-gram table shards: tile them into the single embedding weight.
+            # N-gram table shards: copy only the overlap with this rank's row
+            # partition. This works for replicated, TP, and attention-DP tables
+            # without materialising a global concatenation.
             table = module.ngram_embedding.weight
+            vocab_start = int(getattr(module, "vocab_start_index", 0))
+            vocab_end = int(getattr(module, "vocab_end_index", module.padded_vocab_size))
             shard_leaves = sorted(
                 (leaf for leaf in leaves if leaf.startswith("ngram_embedding.shard_")),
                 key=lambda s: int(s.split(".shard_")[1].split(".")[0]),
             )
             row = 0
+            copied_rows = 0
             for leaf in shard_leaves:
-                shard = leaves[leaf][:]
+                shard = leaves[leaf]
                 rows = shard.shape[0]
-                table.data[row : row + rows].copy_(shard.to(table.dtype))
+                shard_end = row + rows
+                overlap_start = max(row, vocab_start)
+                overlap_end = min(shard_end, vocab_end)
+                if overlap_start < overlap_end:
+                    source_start = overlap_start - row
+                    target_start = overlap_start - vocab_start
+                    overlap_rows = overlap_end - overlap_start
+                    table.data[target_start : target_start + overlap_rows].copy_(
+                        shard[source_start : source_start + overlap_rows].to(table.dtype)
+                    )
+                    copied_rows += overlap_rows
                 row += rows
-            if shard_leaves and row != table.shape[0]:
+            if shard_leaves and row != module.padded_vocab_size:
                 raise ValueError(
                     f"PLE n-gram shards for {ple_prefix} tiled {row} rows, "
-                    f"table expects {table.shape[0]}"
+                    f"global table expects {module.padded_vocab_size}"
                 )
+            if shard_leaves and copied_rows != vocab_end - vocab_start:
+                raise ValueError(
+                    f"PLE n-gram shards for {ple_prefix} loaded {copied_rows} "
+                    f"local rows, expected {vocab_end - vocab_start}"
+                )
+            local_rows = vocab_end - vocab_start
+            if table.shape[0] > local_rows:
+                table.data[local_rows:].zero_()

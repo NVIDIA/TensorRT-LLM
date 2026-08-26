@@ -16,8 +16,9 @@ runtime-decoupled re-implementation of that math:
   * n-gram id hashing — splitmix64 layer multipliers, per-head prime vocab sizes
     (``nth-prime after ngram_vocab_size_base - 1``), eos-segmented right-shift, XOR
     mixing, ``mod prime + offset`` per head;
-  * n-gram embedding lookup into a (replicated) ``VocabParallelEmbedding`` — here
-    the in-tree :class:`Embedding` (TRT-LLM has no ``VocabParallelEmbedding``);
+  * n-gram embedding lookup through the in-tree :class:`Embedding`, row-sharded
+    over TP ranks; attention-DP uses all-gather / reduce-scatter to preserve
+    rank-local token ownership;
   * key/value projection, a per-Hyper-Connection-stream grouped Gemma
     (``weight + 1``) RMSNorm gate (signed-sqrt sigmoid), and a **dilated causal
     depthwise short conv** over the ``hc_count * hidden`` stream with a carried
@@ -57,8 +58,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.distributed import allgather, reducescatter
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm.mapping import Mapping
 
 # --- splitmix64 constants (verbatim from the sglang reference) ---
 _MASK64 = (1 << 64) - 1
@@ -142,6 +145,7 @@ class PLEMetadata:
     state_indices: torch.Tensor  # [num_seq] -> recurrent-state pool slot
     padded_tokens: torch.Tensor  # [num_seq, row_width] eos-padded token ids
     ngram_eos_token_id: int
+    all_rank_num_tokens: Optional[list[int]] = None
     num_contexts: int = 0
     use_spec_decoding: bool = False
 
@@ -158,6 +162,7 @@ class PLEMetadata:
         num_contexts: int = 0,
         use_spec_decoding: bool = False,
         uniform_row_width: Optional[int] = None,
+        all_rank_num_tokens: Optional[list[int]] = None,
     ) -> "PLEMetadata":
         """Construct metadata from packed ``input_ids`` and per-sequence lengths.
 
@@ -226,6 +231,7 @@ class PLEMetadata:
             state_indices=state_indices,
             padded_tokens=padded,
             ngram_eos_token_id=eos_token_id,
+            all_rank_num_tokens=all_rank_num_tokens,
             num_contexts=num_contexts,
             use_spec_decoding=use_spec_decoding,
         )
@@ -271,9 +277,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     The hashing (splitmix64 multipliers, prime head vocab sizes / offsets,
     eos-segmented right-shift, XOR mix) is a verbatim port of the sglang
-    ``Qwen4ExpNGramEmbedding``. The embedding table is a replicated (tp=1) in-tree
-    :class:`Embedding`; TP / prime-sharding of the ~100 GB real table is a node
-    s2 concern and does not change the math.
+    ``Qwen4ExpNGramEmbedding``. The embedding table is row-sharded across the
+    model TP group. Ordinary TP uses masked lookup plus AllReduce; attention-DP
+    uses token AllGather, masked local lookup, and ReduceScatter.
     """
 
     def __init__(
@@ -282,6 +288,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         embedding_dim: int,
         ple_layer_index: int = 0,
         dtype: Optional[torch.dtype] = None,
+        mapping: Optional[Mapping] = None,
     ) -> None:
         super().__init__()
         self.ngram_embed_dim = int(embedding_dim)
@@ -292,6 +299,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.unigram_vocab_size = int(config.vocab_size)
         self.eos_token_id = int(config.eos_token_id)
         self.seed = int(getattr(config, "seed", 1234))
+        self.mapping = mapping
+        self.tp_size = mapping.tp_size if mapping is not None else 1
+        self.tp_rank = mapping.tp_rank if mapping is not None else 0
+        self.use_attention_dp_sharding = bool(
+            mapping is not None and mapping.enable_attention_dp and self.tp_size > 1
+        )
 
         if self.ngram_size < 2:
             raise ValueError(f"ngram_size must be >= 2, got {self.ngram_size}")
@@ -330,11 +343,33 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             // self.make_ngram_vocab_size_divisible_by
         ) * self.make_ngram_vocab_size_divisible_by
         self.padded_vocab_size = padded_vocab_size
-        self.ngram_embedding = Embedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            dtype=dtype,
-        )
+        if self.use_attention_dp_sharding:
+            slice_width = math.ceil(padded_vocab_size / self.tp_size)
+            self.vocab_start_index = self.tp_rank * slice_width
+            self.vocab_end_index = min((self.tp_rank + 1) * slice_width, padded_vocab_size)
+            self.ngram_embedding = Embedding(
+                slice_width,
+                self.head_dim_per_ngram,
+                dtype=dtype,
+            )
+        elif self.tp_size > 1:
+            self.ngram_embedding = Embedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                dtype=dtype,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+            )
+            self.vocab_start_index = self.ngram_embedding.vocab_start_index
+            self.vocab_end_index = self.ngram_embedding.vocab_end_index
+        else:
+            self.vocab_start_index = 0
+            self.vocab_end_index = padded_vocab_size
+            self.ngram_embedding = Embedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                dtype=dtype,
+            )
 
     def _build_layer_multipliers(self, size: int) -> torch.Tensor:
         max_long = (1 << 63) - 1
@@ -408,9 +443,64 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             blocks.append(ngram_ids[:, 0])
         return torch.cat(blocks, dim=-1)
 
-    def embed(self, ngram_ids: torch.Tensor) -> torch.Tensor:
-        """Embed head ids ``[T, ngram_heads]`` -> ``[T, ngram_heads, head_dim]``."""
-        return self.ngram_embedding(ngram_ids)
+    def embed(
+        self,
+        ngram_ids: torch.Tensor,
+        physical_tokens: Optional[int] = None,
+        all_rank_num_tokens: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        """Embed head IDs while preserving each ADP rank's token ownership.
+
+        Ordinary TP ranks process identical tokens, so the in-tree column-sharded
+        :class:`Embedding` performs a masked local lookup followed by AllReduce.
+        Attention-DP ranks process different requests. They therefore all-gather
+        the physical token rows, look up only the locally-owned vocabulary rows,
+        and reduce-scatter the summed embeddings back to the source rank.
+        """
+        if not self.use_attention_dp_sharding:
+            return self.ngram_embedding(ngram_ids)
+
+        if all_rank_num_tokens is None or len(all_rank_num_tokens) != self.tp_size:
+            raise ValueError(
+                "PLE row sharding under attention DP requires one token count per TP rank"
+            )
+        if physical_tokens is None:
+            physical_tokens = ngram_ids.shape[0]
+        if ngram_ids.shape[0] > physical_tokens:
+            raise ValueError(
+                f"PLE semantic token count {ngram_ids.shape[0]} exceeds physical "
+                f"token count {physical_tokens}"
+            )
+        if all_rank_num_tokens[self.tp_rank] != physical_tokens:
+            raise ValueError(
+                "PLE local physical token count does not match attention-DP metadata: "
+                f"{physical_tokens} != {all_rank_num_tokens[self.tp_rank]}"
+            )
+
+        physical_ids = ngram_ids.new_zeros((physical_tokens, ngram_ids.shape[1]))
+        physical_ids[: ngram_ids.shape[0]] = ngram_ids
+        sizes = None if len(set(all_rank_num_tokens)) == 1 else all_rank_num_tokens
+        gathered_ids = allgather(
+            physical_ids,
+            self.mapping,
+            dim=0,
+            sizes=sizes,
+        )
+        owned = (gathered_ids >= self.vocab_start_index) & (gathered_ids < self.vocab_end_index)
+        local_ids = torch.where(
+            owned,
+            gathered_ids - self.vocab_start_index,
+            torch.zeros_like(gathered_ids),
+        )
+        partial = F.embedding(local_ids, self.ngram_embedding.weight)
+        partial.masked_fill_(~owned.unsqueeze(-1), 0)
+        local_embeddings = reducescatter(
+            partial,
+            self.mapping,
+            dim=0,
+            sizes=sizes,
+        )
+        return local_embeddings[: ngram_ids.shape[0]]
 
 
 class Qwen4ExpPLE(nn.Module):
@@ -430,6 +520,7 @@ class Qwen4ExpPLE(nn.Module):
         dtype: Optional[torch.dtype] = None,
         ple_layer_index: int = 0,
         layer_id: Optional[int] = None,
+        mapping: Optional[Mapping] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -444,6 +535,7 @@ class Qwen4ExpPLE(nn.Module):
             self.ple_embed_dim,
             ple_layer_index=ple_layer_index,
             dtype=dtype,
+            mapping=mapping,
         )
         self.ngram_size = self.ple_embedding.ngram_size
         self.short_conv_dilation = self.ngram_size
@@ -636,7 +728,11 @@ class Qwen4ExpPLE(nn.Module):
         windows = combined.unfold(1, self.ngram_size, 1)
         contexts = windows[m.req_indices, m.token_offsets]
         ngram_ids = self.ple_embedding.hash_contexts(contexts)
-        embeddings = self.ple_embedding.embed(ngram_ids).flatten(start_dim=-2)
+        embeddings = self.ple_embedding.embed(
+            ngram_ids,
+            physical_tokens=m.physical_tokens,
+            all_rank_num_tokens=m.all_rank_num_tokens,
+        ).flatten(start_dim=-2)
 
         key = self.key_proj(embeddings)
         value = self.value_proj(embeddings)

@@ -19,11 +19,13 @@ and each block wraps its compute in a Hyper-Connection:
 
 This is a TRT-LLM reimplementation of the sglang reference
 ``GatedResidualSimple`` / ``GroupedGemmaRMSNorm`` (source of truth:
-``sglang/srt/layers/hyperconnection.py``), matching the reference **non-fused
-fallback** math exactly. Its grouped Gemma RMSNorm reuses TRT-LLM's existing
-Mamba Triton kernel with FP32 ``1 + delta_weight`` semantics. The checkpoint
-stores the Qwen4-Exp variant with ``hc_per_branch_norm=True`` (a per-element
-``[10240]`` grouped-RMSNorm weight, grouped by ``hidden_size``).
+``sglang/srt/layers/hyperconnection.py``). Its grouped Gemma RMSNorm reuses
+TRT-LLM's existing Mamba Triton kernel with FP32 ``1 + delta_weight``
+semantics. CUDA execution additionally fuses the gate/stream reduction,
+residual injection, and the layer-internal combine-to-next-norm boundary while
+preserving the reference BF16 materialization point. The checkpoint stores the
+Qwen4-Exp variant with ``hc_per_branch_norm=True`` (a per-element ``[10240]``
+grouped-RMSNorm weight, grouped by ``hidden_size``).
 
 Parameter names (``hc_norm.weight``, ``input_mix_weight_down.weight``,
 ``input_mix_weight_up.weight``, ``block_inject_weight.weight``) mirror the
@@ -41,6 +43,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
+from .qwen4_exp_hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix
 
 __all__ = ["GroupedRMSNorm", "Qwen4ExpHyperConnection"]
 
@@ -107,9 +110,10 @@ class GroupedRMSNorm(TritonRMSNorm):
         return (x_norm * (1.0 + self.weight.float())).to(input_dtype)
 
 
-# The residual state threaded from ``mix`` to ``combine``: the original bundle
-# and its grouped-RMSNorm-normalized form (both are needed by ``combine``).
-HCResidual = Tuple[torch.Tensor, torch.Tensor]
+# The residual state threaded from ``mix`` to ``combine``. Injection logits are
+# computed from the same normalized bundle during mix and consumed only after
+# the wrapped attention/MLP block returns.
+HCResidual = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
 
 
 class Qwen4ExpHyperConnection(nn.Module):
@@ -206,6 +210,33 @@ class Qwen4ExpHyperConnection(nn.Module):
             -2
         )
 
+    @staticmethod
+    def _fused_cuda_eligible(*tensors: torch.Tensor) -> bool:
+        return all(
+            tensor.is_cuda
+            and tensor.dtype in (torch.bfloat16, torch.float16)
+            and tensor.stride(-1) == 1
+            for tensor in tensors
+        )
+
+    def _mix_normed(
+        self,
+        hyper_input: torch.Tensor,
+        normed: torch.Tensor,
+    ) -> Tuple[torch.Tensor, HCResidual]:
+        """Project a normalized HC bundle and retain its combine logits."""
+        hc, hs = self.hc_count, self.hidden_size
+        gate = F.silu(self.input_mix_weight_down(normed) / hc)
+        gate = self.input_mix_weight_up(gate)
+        if self._fused_cuda_eligible(normed, gate):
+            mixed = hc_gate_mix(normed, gate, hc)
+        else:
+            gate = torch.sigmoid(gate).unflatten(-1, (hc, hs))
+            mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
+
+        injection_logits = self.block_inject_weight(normed) if self.use_combine else None
+        return mixed.to(self.params_dtype), (hyper_input, normed, injection_logits)
+
     def mix(self, hyper_input: torch.Tensor) -> Tuple[torch.Tensor, HCResidual]:
         """10240 -> 2560. Returns ``(mixed_input, residual_state)`` where
         ``residual_state = (hyper_input, hyper_input_normed)`` is threaded to
@@ -219,33 +250,76 @@ class Qwen4ExpHyperConnection(nn.Module):
         # trivial residual state, matching the reference guard.
         if hyper_input.shape[0] == 0:
             mixed = hyper_input.new_empty((*hyper_input.shape[:-1], hs), dtype=self.params_dtype)
-            return mixed, (hyper_input, hyper_input)
+            injection_logits = (
+                hyper_input.new_empty((*hyper_input.shape[:-1], hc)) if self.use_combine else None
+            )
+            return mixed, (hyper_input, hyper_input, injection_logits)
 
         normed = self._normed_bundle(hyper_input)
-        # low-rank gate: silu(down(normed)/hc) -> up -> sigmoid, then a
-        # per-(stream,dim) weighted average of the normed streams.
-        gate = F.silu(self.input_mix_weight_down(normed) / hc)
-        gate = self.input_mix_weight_up(gate)
-        gate = torch.sigmoid(gate).unflatten(-1, (hc, hs))
-        mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
-        return mixed.to(self.params_dtype), (hyper_input, normed)
+        return self._mix_normed(hyper_input, normed)
 
     def combine(self, block_output: torch.Tensor, residual: HCResidual) -> torch.Tensor:
         """2560 -> 10240. Injects ``block_output`` into the 4 residual streams
         with a learned per-stream sigmoid gate."""
         assert self.use_combine, "combine() on a mix-only Hyper-Connection"
         hc, hs = self.hc_count, self.hidden_size
-        hyper_input, normed = residual
+        hyper_input, _, injection_logits = residual
         assert hyper_input.shape[-1] == hc * hs
         assert block_output.shape[-1] == hs
         # Empty batch: pass the (untouched) bundle through, matching the reference.
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
+        assert injection_logits is not None
+        if self._fused_cuda_eligible(hyper_input, block_output, injection_logits):
+            return hc_combine(hyper_input, block_output, injection_logits, hc)
         streams = hyper_input.unflatten(-1, (hc, hs))
-        inject_gate = 2.0 * torch.sigmoid(self.block_inject_weight(normed) / hc)
+        inject_gate = 2.0 * torch.sigmoid(injection_logits / hc)
         injection = block_output.unsqueeze(-2) * inject_gate.unsqueeze(-1)
         return (streams + injection).flatten(-2).to(self.params_dtype)
+
+    def combine_and_mix(
+        self,
+        block_output: torch.Tensor,
+        previous_residual: HCResidual,
+    ) -> Tuple[torch.Tensor, torch.Tensor, HCResidual]:
+        """Combine a preceding block and prepare this HC block's input.
+
+        The CUDA path fuses the preceding residual injection with this module's
+        grouped Gemma RMSNorm. This boundary occurs between attention and MLP,
+        where no PLE update or collective intervenes.
+        """
+        hyper_input, _, injection_logits = previous_residual
+        assert injection_logits is not None
+        if block_output.shape[0] == 0:
+            mixed, residual = self.mix(hyper_input)
+            return hyper_input, mixed, residual
+        if self._fused_cuda_eligible(
+            hyper_input,
+            block_output,
+            injection_logits,
+            self.hc_norm.weight,
+        ):
+            hidden_states, normed = hc_combine_norm(
+                hyper_input,
+                block_output,
+                injection_logits,
+                self.hc_norm.weight,
+                self.hc_norm.variance_epsilon,
+                self.hc_count,
+            )
+        else:
+            hc, hs = self.hc_count, self.hidden_size
+            streams = hyper_input.unflatten(-1, (hc, hs))
+            inject_gate = 2.0 * torch.sigmoid(injection_logits / hc)
+            hidden_states = (
+                (streams + block_output.unsqueeze(-2) * inject_gate.unsqueeze(-1))
+                .flatten(-2)
+                .to(self.params_dtype)
+            )
+            normed = self._normed_bundle(hidden_states)
+        mixed, residual = self._mix_normed(hidden_states, normed)
+        return hidden_states, mixed, residual
 
     def extra_repr(self) -> str:
         return (
