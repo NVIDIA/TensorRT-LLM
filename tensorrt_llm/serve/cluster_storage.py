@@ -150,7 +150,7 @@ class ClusterStorage(abc.ABC):
         ...
 
     # get the value of the key, return None if the key does not exist or is expired
-    async def get(self, key: str) -> str:
+    async def get(self, key: str) -> str | None:
         ...
 
     # delete the key, return True if the key is deleted, False otherwise
@@ -265,7 +265,7 @@ class HttpClusterStorageServer(ClusterStorage):
                                            WatchEventType.SET)
             return True
 
-    async def get(self, key: str) -> str:
+    async def get(self, key: str) -> str | None:
         async with self._lock:
             if key in self._storage:
                 item = self._storage[key]
@@ -433,7 +433,7 @@ class HttpClusterStorageClient(ClusterStorage):
                                ttl=str(ttl),
                                ignore_result=True)
 
-    async def get(self, key: str) -> str:
+    async def get(self, key: str) -> str | None:
         return await self._get("get", key=key)
 
     async def get_prefix(self,
@@ -588,7 +588,7 @@ class Etcd3ClusterStorage(ClusterStorage):
             return True
 
     @handle_etcd_error(return_on_error=None)
-    async def get(self, key: str) -> str:
+    async def get(self, key: str) -> str | None:
         data, meta = self.client.get(key)
         return data.decode('utf-8') if data else None
 
