@@ -1157,12 +1157,13 @@ class AutoTuner:
                 logger.warning_once(
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
-            fine_grained_on = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC",
-                                             "0") == "1"
-            logger.debug_once(
-                f"[Autotuner] Inference dispatch: custom_op={custom_op}, runner={best_runner}, "
-                f"tactic={best_tactic}, fine_grained={'ON' if fine_grained_on else 'OFF'}",
-                key=(custom_op, "inference_dispatch_fine_grained"))
+            if logger.level == 'debug':
+                fine_grained_on = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC",
+                                                 "0") == "1"
+                logger.debug_once(
+                    f"[Autotuner] Inference dispatch: custom_op={custom_op}, runner={best_runner}, "
+                    f"tactic={best_tactic}, fine_grained={'ON' if fine_grained_on else 'OFF'}",
+                    key=(custom_op, "inference_dispatch_fine_grained"))
             return (best_runner, best_tactic)
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.

@@ -36,4 +36,4 @@ tllm_add_cubin_archive_sources(
   trtllm_gen_batched_gemm
   "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_bmm_export/cubins"
   NAMESPACE batchedGemm tensorrt_llm ${TRTLLM_ABI_NAMESPACE} kernels
-  ARCHS 100 103 100f)
+  ARCHS 100 103 107 100f)
