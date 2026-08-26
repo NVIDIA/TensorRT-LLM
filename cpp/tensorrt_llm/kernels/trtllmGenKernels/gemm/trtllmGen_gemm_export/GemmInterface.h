@@ -408,9 +408,9 @@ public:
         // Get the number of tiles and number of CTAs for Z dimension.
         auto [gridDimX, gridDimY, gridDimZ] = isFixedGridDim
             ? getFixedGridSize(
-                  options.mClusterDimX, options.mClusterDimY, options.mNumSlicesForSplitK, multiProcessorCount)
+                options.mClusterDimX, options.mClusterDimY, options.mNumSlicesForSplitK, multiProcessorCount)
             : getGridSize(options.mM, options.mN, options.mTileM, options.mTileN, options.mClusterDimX,
-                  options.mClusterDimY, options.mNumSlicesForSplitK);
+                options.mClusterDimY, options.mNumSlicesForSplitK);
 
         // Create kernel params.
         auto kernelParams = gemm::KernelParamsSetup::setKernelParams(options, data.mInputBuffers.mPtrA,

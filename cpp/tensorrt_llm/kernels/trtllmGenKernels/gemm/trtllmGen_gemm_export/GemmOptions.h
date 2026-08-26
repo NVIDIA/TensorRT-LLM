@@ -601,26 +601,47 @@ inline std::string toString(SchedHostTask e)
 inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParams = true)
 {
     std::stringstream ss;
-    ss << "mAllReduceAlgo=" << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo) << ")" << ","
-       << std::endl;
-    ss << "mBiasDtype=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mBiasDtype) << ")" << "," << std::endl;
-    ss << "mBiasType=" << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")" << "," << std::endl;
+    ss << "mAllReduceAlgo="
+       << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo) << ")"
+       << "," << std::endl;
+    ss << "mBiasDtype="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mBiasDtype) << ")"
+       << "," << std::endl;
+    ss << "mBiasType="
+       << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")"
+       << "," << std::endl;
     ss << "mBlockK=" << options.mBlockK << "," << std::endl;
     ss << "mClcFastDrain=" << options.mClcFastDrain << "," << std::endl;
     ss << "mClusterDimX=" << options.mClusterDimX << "," << std::endl;
     ss << "mClusterDimY=" << options.mClusterDimY << "," << std::endl;
     ss << "mClusterDimZ=" << options.mClusterDimZ << "," << std::endl;
-    ss << "mCtaSwizzleType=" << "gemm::CtaSwizzleType(" << static_cast<int32_t>(options.mCtaSwizzleType) << ")" << ","
-       << std::endl;
-    ss << "mDtypeAcc=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")" << "," << std::endl;
-    ss << "mDtypeA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")" << "," << std::endl;
-    ss << "mDtypeB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")" << "," << std::endl;
-    ss << "mDtypeC=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")" << "," << std::endl;
-    ss << "mDtypeMmaA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")" << "," << std::endl;
-    ss << "mDtypeMmaB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")" << "," << std::endl;
-    ss << "mDtypeSfC=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeSfC) << ")" << "," << std::endl;
-    ss << "mEltwiseActType=" << "gemm::EltwiseActType(" << static_cast<int32_t>(options.mEltwiseActType) << ")" << ","
-       << std::endl;
+    ss << "mCtaSwizzleType="
+       << "gemm::CtaSwizzleType(" << static_cast<int32_t>(options.mCtaSwizzleType) << ")"
+       << "," << std::endl;
+    ss << "mDtypeAcc="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
+       << "," << std::endl;
+    ss << "mDtypeA="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")"
+       << "," << std::endl;
+    ss << "mDtypeB="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")"
+       << "," << std::endl;
+    ss << "mDtypeC="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")"
+       << "," << std::endl;
+    ss << "mDtypeMmaA="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
+       << "," << std::endl;
+    ss << "mDtypeMmaB="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
+       << "," << std::endl;
+    ss << "mDtypeSfC="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeSfC) << ")"
+       << "," << std::endl;
+    ss << "mEltwiseActType="
+       << "gemm::EltwiseActType(" << static_cast<int32_t>(options.mEltwiseActType) << ")"
+       << "," << std::endl;
     ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
     ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
     ss << "mEpilogueLdtmDps=" << options.mEpilogueLdtmDps << "," << std::endl;
@@ -630,8 +651,9 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mFallbackClusterDimX=" << options.mFallbackClusterDimX << "," << std::endl;
     ss << "mFallbackClusterDimY=" << options.mFallbackClusterDimY << "," << std::endl;
     ss << "mFallbackClusterDimZ=" << options.mFallbackClusterDimZ << "," << std::endl;
-    ss << "mFusedBiasShuffleMode=" << "gemm::FusedBiasShuffleMode("
-       << static_cast<int32_t>(options.mFusedBiasShuffleMode) << ")" << "," << std::endl;
+    ss << "mFusedBiasShuffleMode="
+       << "gemm::FusedBiasShuffleMode(" << static_cast<int32_t>(options.mFusedBiasShuffleMode) << ")"
+       << "," << std::endl;
     ss << "mFuseLoadSfTask=" << options.mFuseLoadSfTask << "," << std::endl;
     ss << "mFuseUtccpWithUtcmma=" << options.mFuseUtccpWithUtcmma << "," << std::endl;
     ss << "mGridTriggerSecondaryA=" << options.mGridTriggerSecondaryA << "," << std::endl;
@@ -645,15 +667,20 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     {
         ss << "mK=" << options.mK << "," << std::endl;
     }
-    ss << "mKernelTraits={}" << "," << std::endl;
-    ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")" << "," << std::endl;
-    ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")" << "," << std::endl;
+    ss << "mKernelTraits={}"
+       << "," << std::endl;
+    ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
+       << "," << std::endl;
+    ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
+       << "," << std::endl;
     if (dumpRuntimeParams)
     {
         ss << "mM=" << options.mM << "," << std::endl;
     }
     ss << "mMmaK=" << options.mMmaK << "," << std::endl;
-    ss << "mMmaKind=" << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")" << "," << std::endl;
+    ss << "mMmaKind="
+       << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
+       << "," << std::endl;
     ss << "mMmaM=" << options.mMmaM << "," << std::endl;
     ss << "mMmaN=" << options.mMmaN << "," << std::endl;
     ss << "mMmaTileK=" << options.mMmaTileK << "," << std::endl;
@@ -681,28 +708,37 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mNumStagesWorkId=" << options.mNumStagesWorkId << "," << std::endl;
     ss << "mOutputDebugTensors=" << options.mOutputDebugTensors << "," << std::endl;
     ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
-    ss << "mPerTokenSfDtype=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mPerTokenSfDtype) << ")" << ","
-       << std::endl;
-    ss << "mSchedHostTask=" << "gemm::SchedHostTask(" << static_cast<int32_t>(options.mSchedHostTask) << ")" << ","
-       << std::endl;
+    ss << "mPerTokenSfDtype="
+       << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mPerTokenSfDtype) << ")"
+       << "," << std::endl;
+    ss << "mSchedHostTask="
+       << "gemm::SchedHostTask(" << static_cast<int32_t>(options.mSchedHostTask) << ")"
+       << "," << std::endl;
     ss << "mSfBlockSizeA=" << options.mSfBlockSizeA << "," << std::endl;
     ss << "mSfBlockSizeB=" << options.mSfBlockSizeB << "," << std::endl;
     ss << "mSfBlockSizeC=" << options.mSfBlockSizeC << "," << std::endl;
-    ss << "mSfLayoutA=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")" << ","
-       << std::endl;
-    ss << "mSfLayoutB=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")" << ","
-       << std::endl;
-    ss << "mSfLayoutC=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")" << ","
-       << std::endl;
+    ss << "mSfLayoutA="
+       << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
+       << "," << std::endl;
+    ss << "mSfLayoutB="
+       << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
+       << "," << std::endl;
+    ss << "mSfLayoutC="
+       << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
+       << "," << std::endl;
     ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
-    ss << "mSparsityA=" << "trtllm::gen::Sparsity(" << static_cast<int32_t>(options.mSparsityA) << ")" << ","
-       << std::endl;
-    ss << "mSplitK=" << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")" << "," << std::endl;
+    ss << "mSparsityA="
+       << "trtllm::gen::Sparsity(" << static_cast<int32_t>(options.mSparsityA) << ")"
+       << "," << std::endl;
+    ss << "mSplitK="
+       << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
+       << "," << std::endl;
     ss << "mTileK=" << options.mTileK << "," << std::endl;
     ss << "mTileM=" << options.mTileM << "," << std::endl;
     ss << "mTileN=" << options.mTileN << "," << std::endl;
-    ss << "mTileScheduler=" << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")" << ","
-       << std::endl;
+    ss << "mTileScheduler="
+       << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")"
+       << "," << std::endl;
     ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
     ss << "mUseCustomizedMma3xNvFp4=" << options.mUseCustomizedMma3xNvFp4 << "," << std::endl;
     ss << "mUseCustomMmaSchedule=" << options.mUseCustomMmaSchedule << "," << std::endl;
@@ -768,6 +804,7 @@ inline std::vector<int> srcToDstBlk32RowMap =
         6, 14, 22, 30,
         7, 15, 23, 31
       };
+
 // clang-format on
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
