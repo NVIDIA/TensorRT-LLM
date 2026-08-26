@@ -18,8 +18,8 @@
 #
 # This module provides functions to query the OpenSearch database for passed
 # test results from previous pipeline runs. It retrieves test names that have
-# passed for a given commit ID and one or more exact stage names, which can be reused to skip
-# redundant test execution in subsequent runs.
+# passed for a given commit ID and stage-name patterns, which can be reused to
+# skip redundant test execution in subsequent runs.
 #
 # Main functionality:
 # - queryJobEvents: Queries OpenSearch for job events with pagination support
@@ -36,14 +36,13 @@ import sys
 from open_search_db import OpenSearchDB
 
 
-def queryJobEvents(commitID="", stageName="", onlySuccess=True, stageNames=None):
+def queryJobEvents(commitID="", onlySuccess=True, stageNamePatterns=None):
     """Query OpenSearch database for job events with pagination.
 
     Args:
         commitID: Git commit SHA to filter by (optional)
-        stageName: Backward-compatible single exact stage name (optional)
         onlySuccess: If True, only return PASSED tests (default: True)
-        stageNames: Exact stage names to filter by (optional)
+        stageNamePatterns: Non-empty wildcard stage-name patterns to filter by
 
     Returns:
         List of all matching test result records
@@ -51,17 +50,19 @@ def queryJobEvents(commitID="", stageName="", onlySuccess=True, stageNames=None)
     mustConditions = []
     if commitID:
         mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
-    if stageNames is None:
-        stageNames = [stageName] if stageName else []
-    if stageNames:
-        mustConditions.append(
-            {
-                "bool": {
-                    "minimum_should_match": 1,
-                    "should": [{"term": {"s_stage_name": stageName}} for stageName in stageNames],
-                }
+    if not stageNamePatterns or any(not stageNamePattern for stageNamePattern in stageNamePatterns):
+        raise ValueError("stageNamePatterns must contain at least one non-empty pattern")
+    mustConditions.append(
+        {
+            "bool": {
+                "minimum_should_match": 1,
+                "should": [
+                    {"wildcard": {"s_stage_name": stageNamePattern}}
+                    for stageNamePattern in stageNamePatterns
+                ],
             }
-        )
+        }
+    )
     if onlySuccess:
         mustConditions.append({"term": {"s_status": "PASSED"}})
 
@@ -113,12 +114,11 @@ def writeTestListToFile(testList, fileName):
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, stageName, outputFile, stageNames=None):
+def getPassedTestList(commitID, outputFile, stageNamePatterns=None):
     hits = queryJobEvents(
         commitID=commitID,
-        stageName=stageName,
         onlySuccess=True,
-        stageNames=stageNames,
+        stageNamePatterns=stageNamePatterns,
     )
     # Use set to automatically remove duplicates
     testSet = set()
@@ -129,19 +129,20 @@ def getPassedTestList(commitID, stageName, outputFile, stageNames=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--commit-id", required=True, help="Commit ID")
     parser.add_argument(
-        "--stage-name",
+        "--stage-name-pattern",
         action="append",
         required=True,
-        help="Exact stage name to query; repeat for equivalent stage names",
+        help="Wildcard stage-name pattern to query; repeat for multiple patterns",
     )
     parser.add_argument("--output-file", required=True, help="Output File")
     args = parser.parse_args(sys.argv[1:])
+    if any(not stageNamePattern for stageNamePattern in args.stage_name_pattern):
+        parser.error("--stage-name-pattern cannot be empty")
     getPassedTestList(
         commitID=args.commit_id,
-        stageName="",
         outputFile=args.output_file,
-        stageNames=args.stage_name,
+        stageNamePatterns=args.stage_name_pattern,
     )

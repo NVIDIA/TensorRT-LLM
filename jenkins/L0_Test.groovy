@@ -2783,32 +2783,13 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
-// CBTS stages are narrowed executions of their base stages. Their test results
-// are compatible at testcase granularity, but only base-stage results are safe
-// to use for skipping an entire CBTS stage.
-String getBaseStageName(String stageName) {
-    if (stageName.endsWith(CBTS_STAGE_SUFFIX)) {
-        return stageName.substring(0, stageName.length() - CBTS_STAGE_SUFFIX.length())
-    }
-    return stageName
-}
-
-// Return the exact OpenSearch stage names whose passed testcases are reusable
-// for the current stage. A full stage and its CBTS variant are the same logical
-// stage, but no other suffixes are treated as aliases.
-List<String> getTestReuseStageNames(String stageName) {
-    def baseStageName = getBaseStageName(stageName)
-    return [baseStageName, baseStageName + CBTS_STAGE_SUFFIX].unique()
+// Return the OpenSearch wildcard for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    return stageName.replaceFirst(/-\d+(-cbts)?$/, "-*")
 }
 
 boolean shouldReuseStage(String stageName, List reuseStageList) {
-    if (stageName in reuseStageList) {
-        return true
-    }
-    if (stageName.endsWith(CBTS_STAGE_SUFFIX)) {
-        return getBaseStageName(stageName) in reuseStageList
-    }
-    return false
+    return stageName in reuseStageList
 }
 
 // Test filter flags
@@ -2859,7 +2840,8 @@ def CBTS_RESULT = "cbts_result"
 // Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
 @Field
 def CBTS_COVERAGE = "cbts_coverage"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -4490,16 +4472,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + logical stage. CBTS and full-stage results are
-        //    merged because each result represents an individual testcase.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
-        def stageNameArgs = getTestReuseStageNames(stageName).collect { reuseStageName ->
-            "--stage-name '${reuseStageName}'"
-        }.join(' ')
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            ${stageNameArgs} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
