@@ -556,3 +556,37 @@ def test_collect_done_waits_for_physical_drain() -> None:
 
     drained = True
     assert transceiver._collect_done({rid: session}, {rid: object()}) == ([], [rid])
+
+
+@pytest.mark.cpu_only
+def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
+    rid = 85
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        resources_drained=Mock(return_value=False),
+        close=Mock(return_value=True),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._shutdown = False
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: object()}
+    transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
+
+    with pytest.raises(RuntimeError, match="receive resources remain active"):
+        transceiver.shutdown()
+
+    assert not transceiver._shutdown
+    assert transceiver._recv_sessions[rid] is session
+    session.close.assert_not_called()
+    transceiver._transfer_worker.shutdown.assert_not_called()
+
+    session.resources_drained.return_value = True
+    transceiver.shutdown()
+
+    assert transceiver._shutdown
+    assert transceiver._recv_sessions == {}
+    session.close.assert_called_once_with()
+    transceiver._transfer_worker.shutdown.assert_called_once_with()
