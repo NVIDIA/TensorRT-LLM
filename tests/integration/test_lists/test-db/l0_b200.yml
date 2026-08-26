@@ -146,6 +146,9 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
   - unittest/_torch/modules/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
