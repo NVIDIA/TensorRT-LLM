@@ -23,7 +23,7 @@ point the generic path calls.
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from typing import Collection, Mapping, Optional, Protocol
 
 import torch
 
@@ -33,7 +33,23 @@ from tensorrt_llm.bindings import DataType
 from .msa_utils import check_decode_span_shape
 
 
-def _layer_uses_nvfp4(kv_cache_manager, layer_idx: int) -> bool:
+class _MiniMaxM3DenseKVCacheManager(Protocol):
+    """Cache-pool surface consumed by the dense TRTLLM-gen helpers."""
+
+    dtype: DataType
+    layer_offsets: Mapping[int, int]
+    sparse_layer_ids: Collection[int]
+
+    def is_nvfp4_layer(self, layer_idx: int) -> bool: ...
+
+    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str) -> tuple[torch.Tensor, int]: ...
+
+    def get_dense_kv_subpage_pool(self, layer_idx: int) -> tuple[torch.Tensor, int, int]: ...
+
+    def get_dense_kv_scale_subpage_pool(self, layer_idx: int) -> tuple[torch.Tensor, int, int]: ...
+
+
+def _layer_uses_nvfp4(kv_cache_manager: _MiniMaxM3DenseKVCacheManager, layer_idx: int) -> bool:
     predicate = getattr(kv_cache_manager, "is_nvfp4_layer", None)
     if predicate is not None:
         return bool(predicate(layer_idx))
@@ -122,7 +138,7 @@ def _context_workspace(
 
 def _dense_kv_inputs(
     q: torch.Tensor,
-    kv_cache_manager,
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
     *,
     sm_scale: float,
@@ -228,7 +244,9 @@ def write_subpage_block_table(
     torch.add(out[:, 0], pages_per_role, out=out[:, 1])
 
 
-def uniform_subpages_per_slot(kv_cache_manager) -> int:
+def uniform_subpages_per_slot(
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
+) -> int:
     """Sub-pages per slot when every layer of the pool agrees, else 0.
 
     The factor is a property of a layer group, so a single-group model has one
@@ -244,7 +262,9 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     return factors.pop() if len(factors) == 1 else 0
 
 
-def uniform_dense_subpage_geometry(kv_cache_manager) -> tuple[int, int]:
+def uniform_dense_subpage_geometry(
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
+) -> tuple[int, int]:
     """Common dense slot stride and pages per role, or ``(0, 0)``."""
     get_pool = getattr(kv_cache_manager, "get_dense_kv_subpage_pool", None)
     layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
@@ -273,7 +293,7 @@ def uniform_dense_subpage_geometry(kv_cache_manager) -> tuple[int, int]:
 
 def minimax_m3_trtllm_gen_dense_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
-    kv_cache_manager,
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
     block_table: torch.Tensor,  # [batch, max_blocks] slot ids
     seq_lens: torch.Tensor,  # [batch] int32
@@ -362,7 +382,7 @@ def minimax_m3_trtllm_gen_dense_decode(
 
 def minimax_m3_trtllm_gen_dense_context(
     q: torch.Tensor,
-    kv_cache_manager,
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -443,7 +463,7 @@ def minimax_m3_trtllm_gen_dense_context(
 
 def minimax_m3_trtllm_gen_dense_attention(
     q: torch.Tensor,
-    kv_cache_manager,
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
     metadata,
     *,
@@ -523,7 +543,9 @@ def _flashinfer_available() -> bool:
     return True
 
 
-def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
+def dense_decode_unsupported_reason(
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager, head_dim: int
+) -> Optional[str]:
     """Return None when the geometry is supported, else why it is not.
 
     Takes head_dim rather than a query tensor so prepare() can reach the same
