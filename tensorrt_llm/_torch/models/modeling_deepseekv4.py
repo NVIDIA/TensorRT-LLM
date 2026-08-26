@@ -1572,10 +1572,7 @@ class DeepseekV4MoE(nn.Module):
                 moe_cls is TRTLLMGenFusedMoE
                 and experts_quant_config.quant_mode.has_fp8_block_scales()
             )
-            if (
-                supports_swiglu_limit
-                and not requires_scalar_only_swiglu_limit
-            ):
+            if supports_swiglu_limit and not requires_scalar_only_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
                 num_slots = (
                     moe_load_balancer_config.num_slots
