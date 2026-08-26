@@ -48,6 +48,8 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 if TYPE_CHECKING:
@@ -925,6 +927,7 @@ def _build_gemma4_kv_cache_manager(
     tokens_per_block=32,
     batch_size=1,
     enable_swa_eviction: bool = False,
+    quant_config: QuantConfig | None = None,
 ):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
@@ -936,8 +939,9 @@ def _build_gemma4_kv_cache_manager(
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
-    dtype = config.torch_dtype
-    if dtype == torch.half:
+    if quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache():
+        kv_dtype = tensorrt_llm.bindings.DataType.FP8
+    elif config.torch_dtype == torch.half:
         kv_dtype = tensorrt_llm.bindings.DataType.HALF
     else:
         kv_dtype = tensorrt_llm.bindings.DataType.BF16
@@ -1022,7 +1026,12 @@ class TestGemma4HFComparison(unittest.TestCase):
             f"{failed * 100:.2f}% of elements differ (max {max_failed_frac * 100}%)",
         )
 
-    def _make_hf_and_trt_models(self, config_dict=None, attn_backend="FLASHINFER"):
+    def _make_hf_and_trt_models(
+        self,
+        config_dict=None,
+        attn_backend="FLASHINFER",
+        quant_config: QuantConfig | None = None,
+    ):
         """Create paired HF and TRT-LLM models with shared weights."""
         from transformers import Gemma4ForCausalLM as HFGemma4
 
@@ -1036,7 +1045,11 @@ class TestGemma4HFComparison(unittest.TestCase):
         device = torch.device("cuda")
 
         hf_model = HFGemma4(config).to(dtype).to(device).eval()
-        model_config = ModelConfig(pretrained_config=config, attn_backend=attn_backend)
+        model_config = ModelConfig(
+            pretrained_config=config,
+            attn_backend=attn_backend,
+            quant_config=quant_config or QuantConfig(),
+        )
         trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
 
         wm = Gemma4HfWeightMapper()
@@ -1146,6 +1159,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         rtol=0.5,
         max_failed_frac=0.01,
         attn_backend="FLASHINFER",
+        quant_config: QuantConfig | None = None,
     ):
         """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
@@ -1155,7 +1169,9 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         torch.random.manual_seed(42)
         hf, trt, gemma4_config = self._make_hf_and_trt_models(
-            config_dict, attn_backend=attn_backend
+            config_dict,
+            attn_backend=attn_backend,
+            quant_config=quant_config,
         )
         if gemma4_config.enable_moe_block:
             self._stabilize_moe_routing(hf, trt, gemma4_config)
@@ -1165,7 +1181,10 @@ class TestGemma4HFComparison(unittest.TestCase):
         backend = attn_backend
 
         # Set up KV cache
-        kv_cache_manager = self._get_kv_cache_manager(gemma4_config)
+        kv_cache_manager = self._get_kv_cache_manager(
+            gemma4_config,
+            quant_config=quant_config,
+        )
 
         # -- Context phase --
         input_ids = torch.tensor(
@@ -1269,6 +1288,16 @@ class TestGemma4HFComparison(unittest.TestCase):
         self._run_full_model_comparison(
             deepcopy(GEMMA4_HYBRID_HEADDIM_CONFIG),
             attn_backend="TRTLLM",
+        )
+
+    @torch.no_grad()
+    @unittest.skipUnless(is_sm_100f(), "Fused Gemma4 TRTLLM prep requires SM100")
+    def test_real_headdim_config_trtllm_fp8_kv(self):
+        """TRTLLM fused BF16 prep matches HF with an FP8 KV cache."""
+        self._run_full_model_comparison(
+            deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG),
+            attn_backend="TRTLLM",
+            quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
         )
 
     @torch.no_grad()
@@ -2440,6 +2469,123 @@ class TestGemma4HFComparison(unittest.TestCase):
 
 class TestGemma4ModelDefaults(unittest.TestCase):
     """Tests for Gemma4 model defaults (get_model_defaults)."""
+
+    @staticmethod
+    def _make_fused_qkv_prep_case(
+        attn_backend: str,
+        *,
+        flashinfer_backend: str | None = None,
+        has_fp8_kv_cache: bool = True,
+        use_trtllm_fused_qkv_prep: bool = False,
+        head_dim: int = 128,
+    ) -> SimpleNamespace:
+        eps = 1e-6
+        backend = SimpleNamespace(has_fp8_kv_cache=has_fp8_kv_cache)
+        if flashinfer_backend is not None:
+            backend.flashinfer_backend = flashinfer_backend
+        return SimpleNamespace(
+            _fused_qkv_prep=None,
+            _fused_qkv_prep_out_fp8=False,
+            is_kv_shared=False,
+            fuse_qk_norm_rope=False,
+            skip_rope=False,
+            attn_backend=attn_backend,
+            _use_trtllm_fused_qkv_prep=use_trtllm_fused_qkv_prep,
+            attn=backend,
+            rotary_emb=SimpleNamespace(
+                is_neox=True,
+                inverse=False,
+                head_dim=head_dim,
+                rotary_cos_sin=torch.empty(8, 2, head_dim // 2, dtype=torch.float32),
+            ),
+            head_dim=head_dim,
+            q_norm=SimpleNamespace(weight=torch.empty(head_dim), variance_epsilon=eps),
+            k_norm=SimpleNamespace(weight=torch.empty(head_dim), variance_epsilon=eps),
+            v_norm=SimpleNamespace(variance_epsilon=eps),
+        )
+
+    def test_fused_qkv_prep_backend_output_modes(self):
+        """TRTLLM requests BF16 while FlashInfer requests FP8 output."""
+        trtllm = self._make_fused_qkv_prep_case("TRTLLM", use_trtllm_fused_qkv_prep=True)
+        flashinfer = self._make_fused_qkv_prep_case("FLASHINFER", flashinfer_backend="trtllm-gen")
+
+        self.assertTrue(Gemma4Attention._fused_qkv_prep_enabled(trtllm))
+        self.assertFalse(trtllm._fused_qkv_prep_out_fp8)
+        self.assertTrue(Gemma4Attention._fused_qkv_prep_enabled(flashinfer))
+        self.assertTrue(flashinfer._fused_qkv_prep_out_fp8)
+
+        bf16_kv_trtllm = self._make_fused_qkv_prep_case("TRTLLM", has_fp8_kv_cache=False)
+        self.assertFalse(Gemma4Attention._fused_qkv_prep_enabled(bf16_kv_trtllm))
+
+        unsupported_head_dim = self._make_fused_qkv_prep_case(
+            "TRTLLM",
+            use_trtllm_fused_qkv_prep=True,
+            head_dim=192,
+        )
+        self.assertFalse(Gemma4Attention._fused_qkv_prep_enabled(unsupported_head_dim))
+
+    @unittest.mock.patch("tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True)
+    def test_trtllm_fp8_sliding_uses_model_rope(self, _mock_is_sm_100f):
+        """SM100 TRTLLM FP8-KV sliding layers route RoPE through fused prep."""
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        model_config = ModelConfig(
+            pretrained_config=config,
+            quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        )
+
+        attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
+
+        self.assertTrue(attn._use_trtllm_fused_qkv_prep)
+        self.assertFalse(attn.rope_fusion)
+        self.assertIsNotNone(attn.rotary_emb)
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=False
+    )
+    def test_trtllm_fp8_sliding_non_sm100_keeps_backend_rope(self, _mock_is_sm_100f):
+        """TRTLLM FP8-KV keeps the existing backend RoPE path before SM100."""
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        model_config = ModelConfig(
+            pretrained_config=config,
+            quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        )
+
+        attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
+
+        self.assertFalse(attn._use_trtllm_fused_qkv_prep)
+        self.assertTrue(attn.rope_fusion)
+        self.assertIsNone(attn.rotary_emb)
+
+    @unittest.mock.patch("tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True)
+    def test_trtllm_fused_prep_preserves_other_sliding_paths(self, _mock_is_sm_100f):
+        """Non-FP8, FlashInfer, and shared-KV layers retain their RoPE routing."""
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        cases = (
+            ("TRTLLM", QuantConfig(), False),
+            ("FLASHINFER", QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8), False),
+            ("TRTLLM", QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8), True),
+        )
+        for backend, quant_config, is_kv_shared in cases:
+            with self.subTest(backend=backend, is_kv_shared=is_kv_shared):
+                model_config = ModelConfig(
+                    pretrained_config=config,
+                    attn_backend=backend,
+                    quant_config=quant_config,
+                )
+                attn = Gemma4Attention(
+                    model_config,
+                    layer_idx=0,
+                    is_sliding=True,
+                    is_kv_shared=is_kv_shared,
+                )
+                self.assertFalse(attn._use_trtllm_fused_qkv_prep)
+                if backend == "TRTLLM":
+                    self.assertTrue(attn.rope_fusion)
+                    self.assertIsNone(attn.rotary_emb)
+                else:
+                    self.assertFalse(attn.rope_fusion)
+                    self.assertIsNotNone(attn.rotary_emb)
+                    self.assertEqual(attn.attn.flashinfer_backend, "trtllm-gen")
 
     def test_causal_lm_requires_trtllm_backend(self):
         """Gemma4ForCausalLM must default to the TRTLLM attention backend."""
