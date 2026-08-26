@@ -42,7 +42,7 @@ def queryJobEvents(commitID="", onlySuccess=True, stageNamePatterns=None):
     Args:
         commitID: Git commit SHA to filter by (optional)
         onlySuccess: If True, only return PASSED tests (default: True)
-        stageNamePatterns: Non-empty wildcard stage-name patterns to filter by
+        stageNamePatterns: Non-empty regular-expression stage-name patterns to filter by
 
     Returns:
         List of all matching test result records
@@ -57,7 +57,7 @@ def queryJobEvents(commitID="", onlySuccess=True, stageNamePatterns=None):
             "bool": {
                 "minimum_should_match": 1,
                 "should": [
-                    {"wildcard": {"s_stage_name": stageNamePattern}}
+                    {"regexp": {"s_stage_name": stageNamePattern}}
                     for stageNamePattern in stageNamePatterns
                 ],
             }
@@ -135,7 +135,7 @@ if __name__ == "__main__":
         "--stage-name-pattern",
         action="append",
         required=True,
-        help="Wildcard stage-name pattern to query; repeat for multiple patterns",
+        help="Regular-expression stage-name pattern to query; repeat for multiple patterns",
     )
     parser.add_argument("--output-file", required=True, help="Output File")
     args = parser.parse_args(sys.argv[1:])

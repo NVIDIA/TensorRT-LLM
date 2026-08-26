@@ -1071,6 +1071,32 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
 
+    def test_sync_single_rank_ctx_reaps_idle_transfer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+            is_idle=True,
+        )
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_not_called()
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+
     def test_sync_multi_rank_does_not_wait_for_blocked_peer(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1726,6 +1752,7 @@ class _StubADPExecutor:
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
         kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        kv_cache_manager.is_linear_attention = False
         kv_cache_manager.max_seq_len = (
             max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
         )

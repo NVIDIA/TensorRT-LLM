@@ -417,6 +417,9 @@ def _is_fused_q_fp8_quant_enabled(
         return False
     if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
         return False
+    # fp8_ds_mla (FlashInfer sparse MLA) does not use the fused Q FP8 path.
+    if self.kv_cache_dtype == "fp8_ds_mla":
+        return False
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
 
@@ -701,8 +704,9 @@ def forward_generation_sparse_attn(
         "fused Q RoPE drops the kernel that fills cu_q_seqlens; "
         "attention metadata must precompute them"
     )
-    # Both halves already done elsewhere -> nothing left to launch at all.
-    if not (_q_rope_done and _kv_hoisted):
+    # fp8_ds_mla (FlashInfer sparse MLA) owns RoPE itself; both halves already done
+    # elsewhere -> nothing left to launch at all.
+    if self.kv_cache_dtype != "fp8_ds_mla" and not (_q_rope_done and _kv_hoisted):
         self.mqa.mla_rope_generation(
             q,
             q_pe,
@@ -1228,6 +1232,7 @@ def forward_sparse_attn(
 class DeepSeekV4Hooks(MLASparseHooks):
     """Typed DeepSeek-V4 adapter for the shared MLA module."""
 
+    mqa_rope_append = False
     need_absorption = False
     need_dense_mha = False
     need_default_o_proj = False

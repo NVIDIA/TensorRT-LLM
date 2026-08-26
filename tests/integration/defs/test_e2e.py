@@ -1948,8 +1948,23 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
         CudaGraphConfig(),
     }
 
-    # Test prompt
-    prompt = "Who are you?"
+    # Test prompt. It has to go through the chat template: a bare string makes
+    # the model continue arbitrary text instead of answering a turn, so it
+    # never emits <|im_end|> and keeps generating until it hits max_tokens --
+    # by which point it is looping over whatever it last said. That
+    # degeneration comes from the prompt, not from Eagle3, and it is what made
+    # this test flaky (nvbugs/6627979).
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(target_model_dir)
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "Who are you?"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
     sampling_params = SamplingParams(max_tokens=1024, temperature=0)
 
     # Run with Eagle3
