@@ -36,6 +36,7 @@ from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, Schedul
 from .config import MooncakeStoreConnectorConfig
 from .keys import BlockHashChain
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
+from .validation import validate_llm_args
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
@@ -74,6 +75,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
+        validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.from_env()
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
         self._requests: Dict[int, _RequestState] = {}

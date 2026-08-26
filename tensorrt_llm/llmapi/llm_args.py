@@ -1959,7 +1959,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Named connector preset (e.g. 'lmcache'). "
         "When set, connector_module/scheduler_class/worker_class are "
         "auto-populated from the preset registry.",
-        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm'))
+        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm',
+                                             'mooncake-store'))
     connector_module: Optional[str] = Field(
         None,
         description=

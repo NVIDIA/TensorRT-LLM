@@ -48,6 +48,7 @@ from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
 from .keys import KeyNamespace
 from .metadata import MooncakeStoreMetadata, RequestTransfers
+from .validation import validate_layout, validate_llm_args
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
@@ -134,6 +135,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
+        validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.from_env()
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
@@ -196,6 +198,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if self._addressing is not None:
             raise RuntimeError("KV cache layout already registered")
 
+        validate_layout(layout)
         addressing = PageAddressing(layout)
         for start, end in addressing.registration_ranges():
             status = self._store.register_buffer(start, end - start)

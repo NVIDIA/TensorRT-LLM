@@ -35,4 +35,9 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
         "connector_scheduler_class": "DynamoKVBMConnectorLeader",
         "connector_worker_class": "DynamoKVBMConnectorWorker",
     },
+    "mooncake-store": {
+        "connector_module": "tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
+        "connector_scheduler_class": "MooncakeStoreConnectorScheduler",
+        "connector_worker_class": "MooncakeStoreConnectorWorker",
+    },
 }
