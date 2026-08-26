@@ -35,6 +35,13 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_fp4_conv_tactic_state():
+    clear_fp4_conv_tactic_cache()
+    yield
+    clear_fp4_conv_tactic_cache()
+
+
 def _make_fp4_conv_case(channels, input_scale, use_residual):
     torch.manual_seed(7)
     base = WanCausalConv3d(channels, channels, 3, padding=1).cuda().to(torch.bfloat16).eval()
@@ -45,7 +52,7 @@ def _make_fp4_conv_case(channels, input_scale, use_residual):
         dtype=torch.bfloat16,
     )
     residual = torch.randn_like(activation) if use_residual else None
-    expected = F.conv3d(F.pad(activation, (1, 1, 1, 1, 2, 0)), base.weight, base.bias)
+    expected = F.conv3d(F.pad(activation, (1, 1, 1, 1, 2, 0)), conv.weight, conv.bias)
     if residual is not None:
         expected = expected + residual
     return conv, activation, residual, expected
@@ -317,3 +324,47 @@ def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
     finally:
         AutoTuner.get().clear_cache()
         clear_fp4_conv_tactic_cache()
+
+
+@pytest.mark.parametrize("fuse_norm", [False, True])
+def test_fixed_fp4_conv_input_fusions_match_bf16_reference(fuse_norm):
+    """Exercise the fused SiLU and RMSNorm+SiLU paths through the Conv3d wrapper."""
+    if not _supports_nvfp4_device(torch.device("cuda")):
+        pytest.skip("NVFP4 Conv3d requires an SM100-family GPU")
+
+    channels = 128
+    torch.manual_seed(11)
+    base = WanCausalConv3d(channels, channels, 3, padding=1).cuda().to(torch.bfloat16).eval()
+    activation = torch.randn(
+        (1, channels, 1, 4, 6),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gamma = torch.randn((channels,), device="cuda", dtype=torch.bfloat16)
+    norm_scale = channels**0.5
+    fused_input = activation
+    if fuse_norm:
+        fused_input = (
+            F.normalize(fused_input.float(), dim=1).to(torch.bfloat16)
+            * norm_scale
+            * gamma.view(1, -1, 1, 1, 1)
+        )
+    fused_input = F.silu(fused_input)
+    expected = F.conv3d(F.pad(fused_input, (1, 1, 1, 1, 2, 0)), base.weight, base.bias)
+    conv = (
+        NVFP4WanCausalConv3d(
+            base,
+            input_scale=1.0 / 50.0,
+            absorb_silu=True,
+            absorb_norm=fuse_norm,
+            norm_gamma=gamma if fuse_norm else None,
+            norm_scale=norm_scale if fuse_norm else None,
+        )
+        .cuda()
+        .to(torch.bfloat16)
+        .eval()
+    )
+
+    with torch.inference_mode():
+        actual = conv(activation)
+    _assert_fp4_close(actual, expected)

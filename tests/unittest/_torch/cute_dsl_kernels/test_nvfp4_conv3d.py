@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -58,7 +60,8 @@ def test_nvfp4_conv3d_bias_residual_epilogue_matches_reference() -> None:
         skip_ref_check=False,
     )
 
-    assert runtime_us is not None and runtime_us > 0
+    # ``skip_ref_check=False`` validates the result against the provider's BF16 reference.
+    assert runtime_us is not None and math.isfinite(runtime_us) and runtime_us > 0
 
 
 @pytest.mark.parametrize("channels", [128, 192, 512])
@@ -142,12 +145,13 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
         spatial_padding=(1, 0),
         residual=residual,
     )
-    expected = residual + base.bias.view(1, -1, 1, 1, 1)
+    expected = residual + conv.bias.view(1, -1, 1, 1, 1)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     # Exercise product weight prequantization, KTRSC layout, SFB swizzle, and
     # alpha scaling with a nonzero convolution while reusing the same tactic.
+    base = WanCausalConv3d(192, 96, 3, padding=1).cuda().to(torch.bfloat16).eval()
     with torch.no_grad():
         base.weight.normal_(std=0.02)
         base.bias.zero_()
@@ -163,11 +167,11 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
     padded_activation = F.pad(activation, (0, 0, 0, 0, 2, 0))
     expected = F.conv3d(
         padded_activation,
-        base.weight,
-        base.bias,
-        stride=base.stride,
+        conv.weight,
+        conv.bias,
+        stride=conv.stride,
         padding=(0, 1, 0),
-        dilation=base.dilation,
+        dilation=conv.dilation,
     ).float()
     relative_l2_error = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(
         expected
@@ -188,21 +192,29 @@ def test_nvfp4_wan_conv_reuses_cubin_across_runtime_shapes() -> None:
         _fp4_compile_cache,
     )
 
-    _fp4_compile_cache.clear()
-    for input_channels, height, width in ((256, 4, 6), (512, 5, 7)):
-        base = WanCausalConv3d(input_channels, 256, 3, padding=1).cuda().to(torch.bfloat16).eval()
-        with torch.no_grad():
-            base.weight.zero_()
-            base.bias.normal_()
-        conv = NVFP4WanCausalConv3d(base).cuda().to(torch.bfloat16).eval()
-        activation = torch.randn(
-            (1, input_channels, 1, height, width),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
+    saved_cache = dict(_fp4_compile_cache)
+    try:
+        _fp4_compile_cache.clear()
+        initial_size = len(_fp4_compile_cache)
+        for input_channels, height, width in ((256, 4, 6), (512, 5, 7)):
+            base = (
+                WanCausalConv3d(input_channels, 256, 3, padding=1).cuda().to(torch.bfloat16).eval()
+            )
+            with torch.no_grad():
+                base.weight.zero_()
+                base.bias.normal_()
+            conv = NVFP4WanCausalConv3d(base).cuda().to(torch.bfloat16).eval()
+            activation = torch.randn(
+                (1, input_channels, 1, height, width),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
 
-        actual = conv(activation)
-        expected = base.bias.view(1, -1, 1, 1, 1).expand_as(actual)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            actual = conv(activation)
+            expected = conv.bias.view(1, -1, 1, 1, 1).expand_as(actual)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    assert len(_fp4_compile_cache) == 1
+        assert len(_fp4_compile_cache) - initial_size == 1
+    finally:
+        _fp4_compile_cache.clear()
+        _fp4_compile_cache.update(saved_cache)

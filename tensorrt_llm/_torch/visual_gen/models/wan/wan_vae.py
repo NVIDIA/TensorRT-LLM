@@ -970,35 +970,35 @@ def dequant_fp4_conv_weight(
         [e2m1_values[low_nibbles], e2m1_values[high_nibbles]],
         dim=-1,
     ).reshape(output_channels, -1)
-    padded_elements = values.shape[1]
-    if padded_elements % _FP4_SF_VEC != 0:
+    packed_elements = values.shape[1]
+    if packed_elements % _FP4_SF_VEC != 0:
         raise ValueError(
-            f"Packed FP4 weight width must be divisible by {_FP4_SF_VEC}, got {padded_elements}"
+            f"Packed FP4 weight width must be divisible by {_FP4_SF_VEC}, got {packed_elements}"
         )
     expected_elements = input_channels * 27
-    if padded_elements != expected_elements:
+    if packed_elements != expected_elements:
         raise ValueError(
             f"Expected {expected_elements} packed FP4 values for a 3x3x3 weight, "
-            f"got {padded_elements}"
+            f"got {packed_elements}"
         )
-    expected_block_scales = output_channels * padded_elements // _FP4_SF_VEC
+    expected_block_scales = output_channels * packed_elements // _FP4_SF_VEC
     if block_scales.numel() != expected_block_scales:
         raise ValueError(
             f"Expected {expected_block_scales} FP4 weight block scales, got {block_scales.numel()}"
         )
     block_scales = block_scales.reshape(
         output_channels,
-        padded_elements // _FP4_SF_VEC,
+        packed_elements // _FP4_SF_VEC,
     )
     values = (
-        values.reshape(output_channels, padded_elements // _FP4_SF_VEC, _FP4_SF_VEC)
+        values.reshape(output_channels, packed_elements // _FP4_SF_VEC, _FP4_SF_VEC)
         * block_scales.float().unsqueeze(-1)
         * global_scale.float()
     ).reshape(
         output_channels,
-        padded_elements,
+        packed_elements,
     )
-    return values[:, : input_channels * 27]
+    return values
 
 
 def swap_wan_convs_to_fp4(
@@ -1034,6 +1034,7 @@ def swap_wan_convs_to_fp4(
             input_scale = input_scales.get(conv_name)
             gamma = scale = None
             residual_conv = isinstance(parent, WanResidualBlock) and attr in norm_attr
+            fuse_residual_inputs = residual_conv and (not parent.training or parent.dropout.p == 0)
             norm = getattr(parent, norm_attr[attr], None) if residual_conv else None
             if isinstance(norm, WanRMSNorm) and not isinstance(norm.bias, nn.Parameter):
                 gamma = norm.gamma.detach().reshape(-1)
@@ -1041,8 +1042,8 @@ def swap_wan_convs_to_fp4(
             replacement = NVFP4WanCausalConv3d(
                 conv,
                 input_scale=input_scale,
-                absorb_silu=residual_conv,
-                absorb_norm=residual_conv,
+                absorb_silu=fuse_residual_inputs,
+                absorb_norm=fuse_residual_inputs,
                 norm_gamma=gamma,
                 norm_scale=scale,
             ).to(conv.weight.device, conv.weight.dtype)

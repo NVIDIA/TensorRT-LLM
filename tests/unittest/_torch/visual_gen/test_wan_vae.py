@@ -193,6 +193,22 @@ def test_swap_fp4_configures_static_norm_fusion_by_default():
     assert conv2.absorbs_norm
 
 
+def test_swap_fp4_does_not_move_dropout_before_training_input_fusion():
+    block = WanResidualBlock(8, 8, dropout=0.1).train()
+    model = torch.nn.Sequential(block)
+
+    replaced, static = swap_wan_convs_to_fp4(
+        model,
+        {"0.conv1": 1.0 / 50.0, "0.conv2": 1.0 / 50.0},
+    )
+
+    assert replaced == static == 2
+    assert not block.conv1.absorbs_silu
+    assert not block.conv1.absorbs_norm
+    assert not block.conv2.absorbs_silu
+    assert not block.conv2.absorbs_norm
+
+
 def test_fp4_derived_parameters_are_invalidated_by_module_updates():
     conv = NVFP4WanCausalConv3d(WanCausalConv3d(8, 8, 3, padding=1))
     conv._fp4_pq = {}  # type: ignore[typeddict-item]
@@ -337,7 +353,7 @@ def test_bf16_vae_validates_dynamic_modes_after_exclusions(monkeypatch):
 def test_dynamic_weight_request_must_match_checkpoint_source(checkpoint_is_fp4):
     incompatible_request = checkpoint_is_fp4
 
-    with pytest.raises(ValueError, match="weights.dynamic"):
+    with pytest.raises(ValueError, match=r"weights\.dynamic"):
         vae_loader._validate_dynamic_weight_request(
             checkpoint_is_fp4=checkpoint_is_fp4,
             selected={"decoder.conv"},
@@ -352,7 +368,7 @@ def test_dynamic_activation_request_resolves_checkpoint_scales():
     assert vae_loader._resolve_input_scales({"decoder.conv1"}, scales, False) == scales
     assert vae_loader._resolve_input_scales({"decoder.conv1"}, scales, True) == {}
 
-    with pytest.raises(ValueError, match="decoder.conv2"):
+    with pytest.raises(ValueError, match=r"decoder\.conv2"):
         vae_loader._resolve_input_scales(
             {"decoder.conv1", "decoder.conv2"},
             scales,

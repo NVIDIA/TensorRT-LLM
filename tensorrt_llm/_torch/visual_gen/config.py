@@ -403,7 +403,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             dynamic_activation = _dynamic_value("input_activations")
 
         effective_quant_config = dict(quant_config_dict)
-        if "quant_algo" not in effective_quant_config and isinstance(
+        if effective_quant_config.get("quant_algo") is None and isinstance(
             checkpoint_quant_config_dict, dict
         ):
             effective_quant_config["quant_algo"] = checkpoint_quant_config_dict.get("quant_algo")

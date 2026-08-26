@@ -571,7 +571,9 @@ def test_load_cache_skips_non_literal_tactic():
         json.dump(doc, f)
 
     # Must not raise (previously raised SyntaxError out of load_cache).
+    generation_before_load = cache.generation
     cache.load_cache(cache_path, rank=0)
+    assert cache.generation == generation_before_load + 1
 
     # The literal-safe entry survived with its exact tactic ...
     good = ("op_good", "R", "0", ((1, 128), ))
@@ -580,6 +582,46 @@ def test_load_cache_skips_non_literal_tactic():
     # ... and the non-literal entry was skipped, not silently mis-decoded.
     bad = ("op_bad", "R", "0", ((2, 128), ))
     assert bad not in cache.cache
+
+
+def test_load_cache_failure_preserves_live_state(tmp_path):
+    """A failed replacement must not partially mutate the live cache."""
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    old_key = ("old_op", "Runner", "0", ((1, 128), ))
+    cache[old_key] = (0, 7, 0.001)
+    cache.independent_op.add("old_op")
+    cache.lib_version = "preserved-version"
+    cache.creation_timestamp = 123.0
+    cache.device_name = "preserved-device"
+    cache.device_capability = (10, 0)
+
+    old_cache = dict(cache.cache)
+    old_independent_op = set(cache.independent_op)
+    old_metadata = cache._serialize_metadata()
+    old_generation = cache.generation
+    malformed_path = tmp_path / "malformed-cache.json"
+    malformed_path.write_text(
+        json.dumps({
+            "metadata": {
+                "lib_version": "replacement-version",
+                "creation_timestamp": 456.0,
+                "device_name": "replacement-device",
+                "device_capability": [10, 0],
+            },
+            # Cache sections must be mappings. This fails only after the
+            # replacement metadata has been parsed and staged.
+            "shared": [],
+            "rank_0": {},
+        }))
+
+    with pytest.raises(ValueError, match="shared cache must be a JSON object"):
+        cache.load_cache(malformed_path, rank=0)
+
+    assert cache.cache == old_cache
+    assert cache.independent_op == old_independent_op
+    assert cache._serialize_metadata() == old_metadata
+    assert cache.generation == old_generation
 
 
 def test_kernel_testing_single_context():
@@ -818,7 +860,7 @@ def _distributed_worker_function(world_size, strategy):
                          tuning_config=config,
                          inputs=inputs)
         # run another normal gemm with INDEPENDENT strategy
-        tuner.choose_one(custom_op=f"test_distributed_normal_gemm",
+        tuner.choose_one(custom_op="test_distributed_normal_gemm",
                          runners=[runner_independent],
                          tuning_config=config_independent,
                          inputs=inputs)
@@ -870,7 +912,7 @@ def _distributed_worker_function(world_size, strategy):
 
         assert len(
             AutoTuner.get().profiling_cache.independent_op
-        ) == 0, f"Non-INDEPENDENT ops should not be present in the cache"
+        ) == 0, "Non-INDEPENDENT ops should not be present in the cache"
     else:
         # Non-INDEPENDENT ops go to shared section
         assert 'shared' in cache_data, "shared section should be present"
@@ -886,7 +928,7 @@ def _distributed_worker_function(world_size, strategy):
 
         assert "test_distributed_normal_gemm" not in AutoTuner.get().profiling_cache.independent_op and \
             f"test_distributed_{strategy.value}" in AutoTuner.get().profiling_cache.independent_op, \
-            f"Distributed tuning strategy is not recovered correctly from cache"
+            "Distributed tuning strategy is not recovered correctly from cache"
 
     if strategy == DistributedTuningStrategy.BROADCAST:
         # All ranks should select tactic 0
