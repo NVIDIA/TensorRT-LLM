@@ -18,14 +18,17 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -56,6 +59,13 @@ class _BounceProbe:
     def orphan_reservation(self, rid_slice: tuple[int, int]) -> None:
         self.orphaned.append(rid_slice)
 
+    def abort_publication(
+        self,
+        _rid_slice: tuple[int, int],
+        _published_writers: set[int],
+    ) -> None:
+        return
+
     def is_bounced(self, _rid_slice: tuple[int, int]) -> bool:
         return False
 
@@ -69,6 +79,114 @@ class _LateReservationBounce(_BounceProbe):
 
     def release_idle_reservation(self, rid_slice: tuple[int, int]) -> None:
         self.active_reservations.discard(rid_slice)
+
+
+class _PartialFanInBounce(_BounceProbe):
+    """CPU model of one bounced fan-in reservation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.context: TransferContext | None = None
+        self.release_count = 0
+        self.scatter_count = 0
+
+    def reserve(self, receiver_req, num_writers: int, *, extra_bytes: int = 0) -> bool:
+        del extra_bytes
+        self.context = TransferContext(
+            rid_slice=(receiver_req.unique_rid, receiver_req.slice_id),
+            slot_id=0,
+            base_addr=0x1000,
+            per_writer_bytes=0x100,
+            num_writers=num_writers,
+        )
+        return True
+
+    def writer_base(self, rid_slice: tuple[int, int], writer_index: int) -> int | None:
+        if self.context is None or self.context.rid_slice != rid_slice:
+            return None
+        return self.context.writer_base(writer_index)
+
+    def is_bounced(self, rid_slice: tuple[int, int]) -> bool:
+        return self.context is not None and self.context.rid_slice == rid_slice
+
+    def _advance(self) -> None:
+        if self.context is None:
+            return
+        if self.context.ready_to_scatter():
+            self.scatter_count += 1
+            self.context.begin_scatter()
+            self.context.finish_scatter(True)
+        if not self.context.ready_to_settle():
+            return
+        settlement = self.context.settle()
+        self.context = None
+        assert settlement is not None
+        self.release_count += 1
+        if settlement.on_done is not None:
+            settlement.on_done(settlement.success)
+
+    def abort_publication(
+        self,
+        rid_slice: tuple[int, int],
+        published_writers: set[int],
+    ) -> None:
+        assert self.context is not None and self.context.rid_slice == rid_slice
+        self.context.abort_publication(published_writers)
+        self._advance()
+
+    def record_result(
+        self,
+        rid_slice: tuple[int, int],
+        peer_rank: int,
+        dst_ptrs=None,
+        sizes=None,
+        src_base=None,
+        on_done=None,
+    ) -> None:
+        assert self.context is not None and self.context.rid_slice == rid_slice
+        if on_done is not None:
+            self.context.on_done = on_done
+        self.context.record_writer_result(
+            peer_rank,
+            succeeded=True,
+            src_base=src_base,
+            dst_ptrs=dst_ptrs,
+            sizes=sizes,
+        )
+        self._advance()
+
+
+def _start_checked_thread(
+    target: Callable[[], None],
+    results: queue.Queue[Exception | None],
+) -> threading.Thread:
+    """Start a daemon worker and surface expected assertion/runtime failures."""
+
+    def run() -> None:
+        try:
+            target()
+        except (AssertionError, RuntimeError, ValueError) as error:
+            results.put(error)
+        else:
+            results.put(None)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _raise_thread_errors(results: queue.Queue[Exception | None], expected: int) -> None:
+    completed = []
+    for _ in range(expected):
+        try:
+            completed.append(results.get_nowait())
+        except queue.Empty as error:
+            raise AssertionError("worker terminated with an unexpected exception") from error
+    if not results.empty():
+        raise AssertionError("worker reported more than one result")
+    for error in completed:
+        if error is not None:
+            raise error
 
 
 class _TrackingLock:
@@ -117,11 +235,7 @@ class _ReceiverProbe:
     def dispatch_task(self, task: KVRecvTask) -> None:
         assert self._session is not None
         task.expected_transfers = 2
-        assert self._session.try_begin_transfer(
-            task.slice_id,
-            set(),
-            writer_cohort={0, 1},
-        )
+        self._session.mark_transferring(task.slice_id, writer_cohort={0, 1})
 
     def send_cancel_to_senders(self, _unique_rid: int, _sender_endpoints: set[str]) -> None:
         self.cancel_count += 1
@@ -159,7 +273,7 @@ def _make_rx_session(receiver: object, rid: int) -> RxSession:
 def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
     sibling_started = threading.Event()
     release_sibling = threading.Event()
-    sibling_errors: list[Exception] = []
+    thread_results: queue.Queue[Exception | None] = queue.Queue()
     receiver = _ReceiverProbe()
     session = _make_rx_session(receiver, rid=41)
     session.receive(KVSlice(is_last_slice=True))
@@ -176,21 +290,16 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
     allocator = _OneSlotAllocator(owner=41)
 
     def finish_sibling_writer() -> None:
-        try:
-            sibling_started.set()
-            release_sibling.wait()
-            session.process_kv_agent_result(
-                peer_rank=1,
-                sender_slice_id=0,
-                is_last_slice=True,
-                status=AgentResult.SUCCESS,
-            )
-        except Exception as error:
-            sibling_errors.append(error)
+        sibling_started.set()
+        release_sibling.wait()
+        session.process_kv_agent_result(
+            peer_rank=1,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+        )
 
-    sibling_thread = threading.Thread(target=finish_sibling_writer, daemon=True)
-    sibling_thread.start()
-
+    sibling_thread = _start_checked_thread(finish_sibling_writer, thread_results)
     try:
         assert sibling_started.wait(timeout=10)
 
@@ -216,9 +325,8 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
     finally:
         release_sibling.set()
         sibling_thread.join(timeout=10)
-
     assert not sibling_thread.is_alive()
-    assert sibling_errors == []
+    _raise_thread_errors(thread_results, expected=1)
 
     # The allocation becomes reusable only after the remaining writer reports
     # a terminal physical result. Repeated cancellation must not clean it up
@@ -309,6 +417,7 @@ def test_remote_cancelled_session_is_retained_until_writers_drain() -> None:
         enable_attention_dp=False,
         world_size=1,
     )
+    transceiver._dist = SimpleNamespace(rank=0)
     transceiver._gen_allgather = Mock()
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
@@ -342,6 +451,7 @@ def test_failed_receive_session_is_retained_until_writers_drain() -> None:
         enable_attention_dp=False,
         world_size=1,
     )
+    transceiver._dist = SimpleNamespace(rank=0)
     transceiver._gen_allgather = Mock()
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
@@ -383,6 +493,7 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         enable_attention_dp=False,
         world_size=2,
     )
+    transceiver._dist = SimpleNamespace(rank=0)
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
     transceiver._gen_allgather = Mock(
@@ -438,51 +549,147 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
 
 @pytest.mark.cpu_only
-def test_partial_publication_failure_quarantines_destination() -> None:
-    published_writers: list[int] = []
+@pytest.mark.parametrize("writer_settles_before_failure", [False, True])
+def test_partial_bounced_publication_waits_for_queued_writer_success(
+    monkeypatch: pytest.MonkeyPatch,
+    writer_settles_before_failure: bool,
+) -> None:
+    rid = 86
+    queued_endpoints: list[str] = []
+    bounce = _PartialFanInBounce()
+    receiver = object.__new__(Receiver)
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = set()
+    receiver._bounce = bounce
+    receiver._enforce_physical_ownership = True
+    receiver._shutdown = True
+    receiver._dealers = {}
+    receiver_req = SimpleNamespace(
+        unique_rid=rid,
+        slice_id=0,
+        mamba_state_index=None,
+        bounce_dst_base=None,
+        to_bytes=Mock(side_effect=[b"writer-0", b"writer-1"]),
+    )
+    receiver._build_recv_req_info = Mock(return_value=receiver_req)
+    overlap = SimpleNamespace(
+        ranks=[0, 1],
+        duplicate_head_factor=1,
+        overlap_pp_size=1,
+    )
+    receiver._registrar = SimpleNamespace(
+        get_peer_overlap=Mock(return_value=overlap),
+        self_extractor=SimpleNamespace(page_table=None),
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0),
+    )
+    receiver._get_sender_info = Mock(
+        return_value=SimpleNamespace(
+            sender_endpoints={0: "tcp://sender-0", 1: "tcp://sender-1"},
+            page_table=None,
+            dp_size=1,
+        )
+    )
 
-    class _PartialPublicationReceiver(_ReceiverProbe):
-        def dispatch_task(self, task: KVRecvTask) -> None:
-            assert self._session is not None
-            task.expected_transfers = 2
-
-            def publish_prefix_then_fail() -> None:
-                published_writers.append(0)
-                raise RuntimeError("writer 1 publication failed after writer 0")
-
-            self._session.try_begin_transfer(
-                task.slice_id,
-                {"tcp://sender-0", "tcp://sender-1"},
-                writer_cohort={0, 1},
-                publish=publish_prefix_then_fail,
+    def request_sender_data(endpoint: str, _payload: bytes) -> None:
+        if endpoint == "tcp://sender-1":
+            raise RuntimeError("writer 1 publication failed after writer 0")
+        queued_endpoints.append(endpoint)
+        if writer_settles_before_failure:
+            session.process_kv_agent_result(
+                peer_rank=0,
+                sender_slice_id=0,
+                is_last_slice=True,
+                status=AgentResult.SUCCESS,
+                dst_ptrs=np.array([0x2000], dtype=np.int64),
+                sizes=np.array([0x100], dtype=np.int64),
+                src_base=0x1000,
             )
 
-    receiver = _PartialPublicationReceiver()
-    session = _make_rx_session(receiver, rid=86)
+    receiver._request_sender_data = request_sender_data
+    monkeypatch.setattr(
+        transfer_mod.tensorrt_llm.bindings,
+        "global_steady_clock_now",
+        lambda: 0,
+    )
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(disagg_request_id=rid, ctx_dp_rank=0),
+        receiver=receiver,
+    )
 
     with pytest.raises(RuntimeError, match="writer 1 publication failed"):
         session.receive(KVSlice(is_last_slice=True))
 
-    assert published_writers == [0]
-    # The send exception cannot prove which REQUEST_DATA messages reached a
-    # writer. Even terminal evidence from one possible writer must not make
-    # the destination reusable while the other writer remains unproven.
-    session.process_kv_agent_result(
-        peer_rank=0,
-        sender_slice_id=0,
-        is_last_slice=True,
-        status=AgentResult.FAILED,
-    )
+    assert queued_endpoints == ["tcp://sender-0"]
+    if not writer_settles_before_failure:
+        assert bounce.context is not None
+        assert bounce.release_count == 0
+        assert not session.resources_drained()
+
+        # Only writer 0's REQUEST_DATA was successfully queued. The destination
+        # remains owned until that writer reports terminal physical evidence.
+        session.process_kv_agent_result(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            dst_ptrs=np.array([0x2000], dtype=np.int64),
+            sizes=np.array([0x100], dtype=np.int64),
+            src_base=0x1000,
+        )
 
     assert session.status == SessionStatus.ERROR
-    assert not session.resources_drained()
-    assert session.close() is False
-    assert receiver.clear_count == 0
+    assert session.resources_drained()
+    assert bounce.context is None
+    assert bounce.scatter_count == 0
+    assert bounce.release_count == 1
+    assert session.close() is True
+    assert rid not in receiver._sessions
 
-    # Avoid a noisy best-effort destructor close for this deliberately
-    # quarantined, resource-free unit-test fixture.
-    session._closed = True
-    receiver._session = None
+
+@pytest.mark.cpu_only
+def test_aborted_publication_cannot_complete_during_failure_unwind() -> None:
+    published_writers = {0}
+
+    class _FailureWindowReceiver(_ReceiverProbe):
+        def dispatch_task(self, task: KVRecvTask) -> None:
+            assert self._session is not None
+            task.expected_transfers = 1
+            original_abort = task.abort_publication
+
+            def abort_then_deliver_success(writers: set[int]) -> None:
+                original_abort(writers)
+                self._session.process_kv_agent_result(
+                    peer_rank=0,
+                    sender_slice_id=0,
+                    is_last_slice=True,
+                    status=AgentResult.SUCCESS,
+                )
+                assert task.status == transfer_mod.TaskStatus.TRANSFERRING
+
+            task.abort_publication = abort_then_deliver_success
+
+            def fail_after_publication() -> None:
+                raise RuntimeError("publication failed after writer 0 was queued")
+
+            self._session.try_begin_transfer(
+                task.slice_id,
+                {"tcp://sender-0"},
+                writer_cohort={0},
+                publish=fail_after_publication,
+                published_writers=published_writers,
+            )
+
+    receiver = _FailureWindowReceiver()
+    session = _make_rx_session(receiver, rid=91)
+
+    with pytest.raises(RuntimeError, match="publication failed"):
+        session.receive(KVSlice(is_last_slice=True))
+
+    assert session.status == SessionStatus.ERROR
+    assert session.resources_drained()
+    assert session.close() is True
 
 
 @pytest.mark.cpu_only
@@ -515,10 +722,8 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     finish_request_data = threading.Event()
     race_outcomes: queue.Queue[str] = queue.Queue()
     protocol_order: list[str] = []
-    receive_errors: list[Exception] = []
-    cancel_errors: list[Exception] = []
-    result_errors: list[Exception] = []
     initial_cancel_outcome: str | None = None
+    thread_results: queue.Queue[Exception | None] = queue.Queue()
 
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
@@ -582,56 +787,44 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     session._publication_lock = publication_lock
 
     def receive() -> None:
-        try:
-            session.receive(KVSlice(is_last_slice=True))
-        except Exception as error:
-            receive_errors.append(error)
+        session.receive(KVSlice(is_last_slice=True))
 
     def cancel() -> None:
         publication_lock.tracked_thread_id = threading.get_ident()
-        try:
-            session.cancel()
-        except Exception as error:
-            cancel_errors.append(error)
+        session.cancel()
 
     def finish_writer() -> None:
-        try:
-            session.process_kv_agent_result(
-                peer_rank=0,
-                sender_slice_id=0,
-                is_last_slice=True,
-                status=AgentResult.FAILED,
-            )
-        except Exception as error:
-            result_errors.append(error)
+        session.process_kv_agent_result(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.FAILED,
+        )
 
-    receive_thread = threading.Thread(target=receive, daemon=True)
-    cancel_thread = threading.Thread(target=cancel, daemon=True)
-    result_thread = threading.Thread(target=finish_writer, daemon=True)
-    receive_thread.start()
+    receive_thread = _start_checked_thread(receive, thread_results)
+    cancel_thread = None
+    result_thread = None
     try:
         assert request_data_started.wait(timeout=10)
-        cancel_thread.start()
+        cancel_thread = _start_checked_thread(cancel, thread_results)
         initial_cancel_outcome = race_outcomes.get(timeout=10)
-        result_thread.start()
+        result_thread = _start_checked_thread(finish_writer, thread_results)
         result_thread.join(timeout=10)
-        assert not result_thread.is_alive(), (
-            "a blocked REQUEST_DATA send held the session state lock and stalled result handling"
-        )
+        assert not result_thread.is_alive()
         assert not session.resources_drained(), (
             "terminal writer evidence authorized reuse before REQUEST_DATA publication finished"
         )
     finally:
         finish_request_data.set()
         receive_thread.join(timeout=10)
-        cancel_thread.join(timeout=10)
-        result_thread.join(timeout=10)
+        if cancel_thread is not None:
+            cancel_thread.join(timeout=10)
+        if result_thread is not None:
+            result_thread.join(timeout=10)
 
     assert not receive_thread.is_alive()
-    assert not cancel_thread.is_alive()
-    assert receive_errors == []
-    assert cancel_errors == []
-    assert result_errors == []
+    assert cancel_thread is not None and not cancel_thread.is_alive()
+    _raise_thread_errors(thread_results, expected=3)
     assert initial_cancel_outcome == "blocked"
     assert session.resources_drained()
     assert protocol_order == ["request_data_started", "request_data_sent", "cancel_sent"], (
@@ -688,6 +881,119 @@ def test_cancel_request_retains_session_when_close_refuses() -> None:
 
 
 @pytest.mark.cpu_only
+def test_failed_session_is_not_reported_retired_when_close_refuses() -> None:
+    rid = 89
+    initial_state = object()
+    request = SimpleNamespace(state=initial_state)
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        resources_drained=Mock(return_value=True),
+        close=Mock(return_value=False),
+    )
+    sessions = {rid: session}
+    requests = {rid: request}
+    failed = [rid]
+    transceiver = object.__new__(KvCacheTransceiverV2)
+
+    with pytest.raises(RuntimeError, match="session close refused"):
+        transceiver._close_failed_sessions(sessions, requests, failed)
+
+    assert failed == [rid]
+    assert request.state is initial_state
+    assert sessions == {rid: session}
+    assert requests == {rid: request}
+
+    session.close.return_value = True
+    failed = [rid]
+    transceiver._close_failed_sessions(sessions, requests, failed)
+
+    assert failed == [rid]
+    assert request.state is not initial_state
+    assert sessions == {}
+    assert requests == {}
+
+
+@pytest.mark.cpu_only
+def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
+    rid = 90
+    initial_state = object()
+    request = SimpleNamespace(
+        state=initial_state,
+        py_kv_cache_xfer_bytes=0,
+        set_kv_cache_size=Mock(),
+    )
+    session = SimpleNamespace(
+        status=SessionStatus.KV_TRANSFERRED,
+        transfer_end_time=None,
+        kv_cache_size_bytes=0,
+        is_completed=Mock(return_value=True),
+        has_failed=Mock(return_value=False),
+        wait_complete=Mock(return_value=WaitResult.COMPLETED),
+        close=Mock(return_value=False),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._mapping = SimpleNamespace(pp_size=1, enable_attention_dp=False, world_size=1)
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    transceiver._gen_allgather = Mock()
+    transceiver._gen_consensus = Mock(side_effect=lambda rids: rids)
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+
+    with pytest.raises(RuntimeError, match="session close refused"):
+        transceiver.check_gen_transfer_status(None)
+
+    assert request.state is initial_state
+    assert transceiver._recv_sessions == {rid: session}
+    assert transceiver._recv_reqs == {rid: request}
+
+    session.close.return_value = True
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
+
+    assert (completed, failed, cancelled) == ([rid], [], [])
+    assert request.state is not initial_state
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+
+
+@pytest.mark.cpu_only
+def test_cancelled_session_close_refusal_fails_stop_after_consensus() -> None:
+    rid = 92
+    request = SimpleNamespace(state=object())
+    session = SimpleNamespace(
+        status=SessionStatus.CANCELLED,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        wait_complete=Mock(return_value=WaitResult.FAILED),
+        close=Mock(return_value=False),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    transceiver._gen_allgather = Mock()
+    transceiver._gen_consensus = Mock(side_effect=lambda rids: rids)
+
+    with pytest.raises(RuntimeError, match="session close refused"):
+        transceiver.check_gen_transfer_status(None)
+
+    assert transceiver._recv_sessions == {rid: session}
+    assert transceiver._recv_reqs == {rid: request}
+
+    session.close.return_value = True
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
+
+    assert completed == []
+    assert failed == []
+    assert cancelled == [request]
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+
+
+@pytest.mark.cpu_only
 def test_collect_done_waits_for_physical_drain() -> None:
     rid = 84
     drained = False
@@ -722,7 +1028,7 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     transceiver._recv_reqs = {rid: object()}
     transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
 
-    with pytest.raises(RuntimeError, match="receive resources remain active"):
+    with pytest.raises(RuntimeError, match="physical resources remain active"):
         transceiver.shutdown()
 
     assert not transceiver._shutdown
@@ -736,4 +1042,40 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     assert transceiver._shutdown
     assert transceiver._recv_sessions == {}
     session.close.assert_called_once_with()
+    transceiver._transfer_worker.shutdown.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> None:
+    rid = 93
+    send_session = SimpleNamespace(close=Mock(return_value=None))
+    recv_session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        resources_drained=Mock(return_value=True),
+        close=Mock(return_value=False),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._shutdown = False
+    transceiver._send_sessions = {rid + 1: send_session}
+    transceiver._send_reqs = {rid + 1: object()}
+    transceiver._recv_sessions = {rid: recv_session}
+    transceiver._recv_reqs = {rid: object()}
+    transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
+
+    with pytest.raises(RuntimeError, match="session close refused"):
+        transceiver.shutdown()
+
+    assert not transceiver._shutdown
+    assert transceiver._recv_sessions == {rid: recv_session}
+    assert transceiver._send_sessions == {rid + 1: send_session}
+    send_session.close.assert_not_called()
+    transceiver._transfer_worker.shutdown.assert_not_called()
+
+    recv_session.close.return_value = True
+    transceiver.shutdown()
+
+    assert transceiver._shutdown
+    assert transceiver._recv_sessions == {}
+    assert transceiver._send_sessions == {}
+    send_session.close.assert_called_once_with()
     transceiver._transfer_worker.shutdown.assert_called_once_with()
