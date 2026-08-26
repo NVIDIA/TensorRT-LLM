@@ -25,7 +25,7 @@ import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -313,12 +313,111 @@ def test_remote_cancelled_session_is_retained_until_writers_drain() -> None:
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
 
-    completed, failed, cancelled = transceiver.check_gen_transfer_status(0)
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
 
     assert (completed, failed, cancelled) == ([], [], [])
     assert transceiver._recv_sessions[rid] is session
     assert transceiver._recv_reqs[rid] is request
     session.close.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_failed_receive_session_is_retained_until_writers_drain() -> None:
+    rid = 87
+    request = SimpleNamespace(request_id=rid)
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        status=SessionStatus.ERROR,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        wait_complete=Mock(return_value=WaitResult.FAILED),
+        resources_drained=Mock(return_value=False),
+        close=Mock(return_value=True),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._mapping = SimpleNamespace(
+        pp_size=1,
+        enable_attention_dp=False,
+        world_size=1,
+    )
+    transceiver._gen_allgather = Mock()
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
+
+    assert (completed, failed, cancelled) == ([], [], [])
+    assert transceiver._recv_sessions[rid] is session
+    assert transceiver._recv_reqs[rid] is request
+    session.close.assert_not_called()
+
+    session.resources_drained.return_value = True
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
+
+    assert (completed, failed, cancelled) == ([], [rid], [])
+    assert rid not in transceiver._recv_sessions
+    assert rid not in transceiver._recv_reqs
+    session.close.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
+    rid = 88
+    request = SimpleNamespace(request_id=rid)
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        status=SessionStatus.ERROR,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        wait_complete=Mock(return_value=WaitResult.FAILED),
+        resources_drained=Mock(return_value=False),
+        close=Mock(return_value=True),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = True
+    transceiver._mapping = SimpleNamespace(
+        pp_size=1,
+        enable_attention_dp=False,
+        world_size=2,
+    )
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    transceiver._gen_allgather = Mock(
+        side_effect=[
+            [[], []],
+            [
+                [[], [rid], [], [rid]],
+                [[], [], [], []],
+            ],
+        ]
+    )
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
+
+    assert (completed, failed, cancelled) == ([], [], [])
+    assert transceiver._recv_sessions[rid] is session
+    session.close.assert_not_called()
+
+    session.resources_drained.return_value = True
+    transceiver._gen_allgather = Mock(
+        side_effect=[
+            [[rid], [rid]],
+            [
+                [[], [rid], [], [rid]],
+                [[], [rid], [], [rid]],
+            ],
+        ]
+    )
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(None)
+
+    assert (completed, failed, cancelled) == ([], [rid], [])
+    assert rid not in transceiver._recv_sessions
+    assert rid not in transceiver._recv_reqs
+    session.close.assert_called_once_with()
 
 
 @pytest.mark.cpu_only
@@ -336,6 +435,54 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
     assert session.status == SessionStatus.TRANSFERRING
     assert not session.resources_drained()
+
+
+@pytest.mark.cpu_only
+def test_partial_publication_failure_quarantines_destination() -> None:
+    published_writers: list[int] = []
+
+    class _PartialPublicationReceiver(_ReceiverProbe):
+        def dispatch_task(self, task: KVRecvTask) -> None:
+            assert self._session is not None
+            task.expected_transfers = 2
+
+            def publish_prefix_then_fail() -> None:
+                published_writers.append(0)
+                raise RuntimeError("writer 1 publication failed after writer 0")
+
+            self._session.try_begin_transfer(
+                task.slice_id,
+                {"tcp://sender-0", "tcp://sender-1"},
+                writer_cohort={0, 1},
+                publish=publish_prefix_then_fail,
+            )
+
+    receiver = _PartialPublicationReceiver()
+    session = _make_rx_session(receiver, rid=86)
+
+    with pytest.raises(RuntimeError, match="writer 1 publication failed"):
+        session.receive(KVSlice(is_last_slice=True))
+
+    assert published_writers == [0]
+    # The send exception cannot prove which REQUEST_DATA messages reached a
+    # writer. Even terminal evidence from one possible writer must not make
+    # the destination reusable while the other writer remains unproven.
+    session.process_kv_agent_result(
+        peer_rank=0,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.FAILED,
+    )
+
+    assert session.status == SessionStatus.ERROR
+    assert not session.resources_drained()
+    assert session.close() is False
+    assert receiver.clear_count == 0
+
+    # Avoid a noisy best-effort destructor close for this deliberately
+    # quarantined, resource-free unit-test fixture.
+    session._closed = True
+    receiver._session = None
 
 
 @pytest.mark.cpu_only

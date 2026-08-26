@@ -2382,6 +2382,10 @@ class RxSession(RxSessionBase):
                 task.status = TaskStatus.TRANSFERRING
                 self._sender_endpoints.update(sender_endpoints)
             if publish is not None:
+                # A publication exception is ambiguous: REQUEST_DATA may have
+                # reached any prefix of the sealed cohort. Keep publication
+                # pending so the destination remains quarantined; a later
+                # cancellation-ack/deadline layer must resolve that uncertainty.
                 publish()
             task.finish_publication()
             return True

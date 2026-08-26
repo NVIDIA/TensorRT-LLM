@@ -566,8 +566,33 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return new_cancelled, new_failed, new_completed
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
-        return self._consensus_outcome(
-            to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
+        # A failure/cancellation may be global, but reuse is safe only after
+        # every participating rank has drained its local physical accessor.
+        locally_retirable = []
+        for rid in to_process:
+            session = self._recv_sessions[rid]
+            if not getattr(session, "_enforce_physical_ownership", False):
+                locally_retirable.append(rid)
+                continue
+            resources_drained = getattr(session, "resources_drained", None)
+            if resources_drained is not None and resources_drained():
+                locally_retirable.append(rid)
+        new_cancelled, new_failed, new_completed, globally_retirable = (
+            self._consensus_outcome(
+                to_process,
+                cancelled,
+                failed,
+                completed,
+                self._gen_allgather,
+                self._gen_need_sync,
+                locally_retirable,
+            )
+        )
+        retirable = set(globally_retirable)
+        return (
+            [rid for rid in new_cancelled if rid in retirable],
+            [rid for rid in new_failed if rid in retirable],
+            new_completed,
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
@@ -1023,6 +1048,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     req.set_kv_cache_size(session.kv_cache_size_bytes)
                 completed.append(rid)
             elif result == WaitResult.FAILED:
+                # RxSession.wait_complete() already withholds FAILED while an
+                # ownership-enabled accessor remains active. Keep the caller
+                # boundary fail-closed as well so alternate/test session
+                # implementations cannot authorize request retirement early.
+                if getattr(session, "_enforce_physical_ownership", False):
+                    resources_drained = getattr(session, "resources_drained", None)
+                    if resources_drained is None or not resources_drained():
+                        continue
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
 
