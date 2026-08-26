@@ -80,6 +80,43 @@ def page_div(md) -> int:
     return int(getattr(md.kv_cache_manager, "kv_factor", 1))
 
 
+def uses_pool_row(md, layer: int) -> bool:
+    """True when ``layer`` may borrow its pool's shared ``kv_cache_block_offsets``
+    row as its page table.
+
+    Two cases allow the borrow: ``enable_swa_scratch_reuse`` gives every attention
+    op its own row (``pt_row`` returns the offset directly), or the layer's
+    page-index scale already equals its pool's, so the pool-scaled row is correct
+    for this layer. Otherwise main's V2 manager has placed the layer in a pool
+    whose representative scale differs from the layer's (see
+    ``get_layer_page_index_scale`` -- mixed-scale pools are allowed), the borrowed
+    row would recover wrong page addresses, and ``InklingAttentionMetadata`` must
+    stage a private table instead (see ``decode_page_table``).
+    """
+    mgr = md.kv_cache_manager
+    if getattr(mgr, "enable_swa_scratch_reuse", False):
+        return True
+    offset = mgr.layer_offsets[layer]
+    pool_id = int(mgr.layer_to_pool_mapping_dict[offset])
+    return int(mgr.get_layer_page_index_scale(layer)) == int(mgr.index_scales[pool_id])
+
+
+def decode_page_table(md, layer: int, num_req: int):
+    """Decode-row page table and its page divisor for ``layer``.
+
+    Scale-matched layers borrow the graph-stable per-pool row (page indices,
+    divided by ``kv_factor`` downstream, hence divisor :func:`page_div`).
+    Scale-mismatched layers read a private table staged in
+    :meth:`InklingAttentionMetadata.prepare` from the *per-layer* scale via
+    ``get_batch_cache_indices``, which already divides by ``kv_factor``; those are
+    block indices, so their divisor is 1.
+    """
+    fixed = getattr(md, "_scale_fixed_page_tables", None)
+    if fixed is not None and layer in fixed:
+        return fixed[layer][:num_req], 1
+    return gen_page_table(md, layer)[:num_req], page_div(md)
+
+
 def gen_seq_lens(md, num_gen: int) -> torch.Tensor:
     """Total-KV length per generation request, sliced off the base's
     ``kv_lens_cuda``. Deliberately not ``kv_lens``: the host-side twin adds
@@ -111,14 +148,22 @@ def validate_decode_layout(md, layer: int, num_gen: int) -> None:
             "its absence is a setup error worth naming -- without this the next "
             "line reports it as AttributeError on NoneType."
         )
-    row = pt_row(md, layer)
-    if row >= offsets.shape[0]:
+    if uses_pool_row(md, layer):
+        row = pt_row(md, layer)
+        if row >= offsets.shape[0]:
+            raise RuntimeError(
+                f"Inkling needs row {row} of kv_cache_block_offsets but it has "
+                f"only {offsets.shape[0]} (num_attention_op_pools). The leading "
+                "axis is per-pool by default and per-attention-op-layer under "
+                "enable_swa_scratch_reuse; pt_row and the manager disagree about "
+                "which."
+            )
+    elif getattr(md, "_scale_fixed_page_tables", {}).get(layer) is None:
         raise RuntimeError(
-            f"Inkling needs row {row} of kv_cache_block_offsets but it has only "
-            f"{offsets.shape[0]} (num_attention_op_pools). The leading axis is "
-            "per-pool by default and per-attention-op-layer under "
-            "enable_swa_scratch_reuse; pt_row and the manager disagree about "
-            "which."
+            f"Inkling layer {layer} needs a private decode page table -- its "
+            "page-index scale differs from its pool's shared row -- but "
+            "InklingAttentionMetadata.prepare did not stage one. prepare() must "
+            "run (and see this layer as owned) before the decode kernel reads it."
         )
     if num_contexts + num_gen > offsets.shape[1]:
         raise RuntimeError(
@@ -143,10 +188,13 @@ def crosscheck_page_table(md, layers: List[int]) -> None:
     global _INK_XCHK_ANNOUNCED
     mgr = md.kv_cache_manager
     gen_ids = md.request_ids[md.num_contexts :]
-    div = page_div(md)
+    num_gen = len(gen_ids)
     checked = 0
     for layer in layers:
-        borrowed = (gen_page_table(md, layer) // div).tolist()
+        # Per-layer table + divisor: scale-mismatched layers read a private table
+        # (divisor 1) instead of the pool row, so ``div`` is not layer-invariant.
+        pt, div = decode_page_table(md, layer, num_gen)
+        borrowed = (pt // div).tolist()
         for i, blocks in enumerate(mgr.get_batch_cache_indices(gen_ids, layer)):
             want = [int(b) for b in blocks]
             if any(b < 0 for b in want):

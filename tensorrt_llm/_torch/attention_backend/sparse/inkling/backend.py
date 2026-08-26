@@ -27,7 +27,7 @@ from .kernels import (
     write_kv_cache_hnd,
 )
 from .metadata import InklingAttentionMetadata
-from .page_table import gen_page_table, gen_seq_lens, page_div, validate_decode_layout
+from .page_table import decode_page_table, gen_seq_lens, validate_decode_layout
 from .params import InklingBackendForwardArgs
 
 
@@ -220,8 +220,10 @@ class InklingTritonAttention(TrtllmAttention):
         ):
             validate_decode_layout(attn_metadata, cache_layer, num_req)
             sl = gen_seq_lens(attn_metadata, num_req)
-            pt = gen_page_table(attn_metadata, cache_layer)[:num_req]
-            div = page_div(attn_metadata)
+            # Scale-matched layers borrow the pool row (page indices, div =
+            # kv_factor); scale-mismatched layers read a private per-layer table
+            # (block indices, div = 1) staged in InklingAttentionMetadata.prepare.
+            pt, div = decode_page_table(attn_metadata, cache_layer, num_req)
             pos = (sl - 1).long()  # write slot = total_kv_len - 1 = num_cached
             page_row = torch.div(pos, page_size, rounding_mode="floor")
             offs = pos - page_row * page_size
@@ -276,7 +278,7 @@ class InklingTritonAttention(TrtllmAttention):
         total = [int(num_cached[i]) + 1 for i in range(num_req)]
         decode_seq_lens = torch.tensor(total, dtype=torch.int32, device=device)
         max_pages = max(len(b) for b in block_ids)
-        decode_page_table = build_page_table(block_ids, max_pages, device)
+        fallback_page_table = build_page_table(block_ids, max_pages, device)
         # No page_div here: get_batch_cache_indices already divides by kv_factor,
         # so these are block indices rather than page indices.
         return inkling_decode_attention(
@@ -284,7 +286,7 @@ class InklingTritonAttention(TrtllmAttention):
             k_cache,
             v_cache,
             decode_seq_lens,
-            decode_page_table,
+            fallback_page_table,
             page_size,
             self.sm_scale,
             rel_logits,
