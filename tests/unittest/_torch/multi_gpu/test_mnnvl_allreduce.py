@@ -495,7 +495,7 @@ def mnnvl_checkpoint_rejects_wrong_membership(world_size: int,
 @torch.inference_mode()
 def run_mnnvl_rms_norm_single_rank(
     tensor_parallel_size: int,
-    input: torch.Tensor,
+    input_tensor: torch.Tensor,
     norm_weight: torch.Tensor,
     eps: float,
     dtype: torch.dtype,
@@ -504,7 +504,7 @@ def run_mnnvl_rms_norm_single_rank(
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
-        input = input.cuda()
+        input_tensor = input_tensor.cuda()
         norm_weight = norm_weight.cuda()
         reference_output = reference_output.cuda()
 
@@ -523,7 +523,7 @@ def run_mnnvl_rms_norm_single_rank(
         assert allreduce.mnnvl_allreduce is not None
 
         output = allreduce.mnnvl_allreduce(
-            input,
+            input_tensor,
             all_reduce_params=AllReduceParams(
                 fusion_op=AllReduceFusionOp.RMS_NORM,
                 norm_weight=norm_weight,
