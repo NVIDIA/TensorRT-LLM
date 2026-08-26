@@ -722,3 +722,31 @@ def test_bf16_affine_tables() -> None:
     ref = F.layer_norm(x.float(), (1024,), w16.float(), b16.float(), _EPS).to(x.dtype)
     (y,) = fused_norm_producer(x, weight=w16, bias=b16)
     torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_rows_per_cta_bitwise_invariance() -> None:
+    """rows_per_cta changes only the CTA-to-row mapping, never arithmetic
+    order within a row: every output must be bitwise-identical to R=1."""
+    torch.manual_seed(16)
+    device = _require_sm100()
+    hidden_size = 1024
+    x = _make((2, 132, hidden_size))  # M=264, divisible by 4
+    res = _make((2, 132, hidden_size))
+    rows = _make((2, hidden_size))
+    roww = torch.randn(2, hidden_size, dtype=torch.float32, device=device)
+    w = torch.randn(hidden_size, dtype=torch.float32, device=device)
+    b = torch.randn(hidden_size, dtype=torch.float32, device=device)
+    gs = torch.tensor([0.8], dtype=torch.float32, device=device)
+    cases = [
+        dict(shift=rows, scale=rows),
+        dict(residual=res, gate=roww, weight=w, bias=b),
+        dict(residual=res, shift=rows, scale=rows, norm_type="rms", math_mode="bf16"),
+        dict(shift=rows, scale=rows, store="nvfp4_static", global_scale=gs),
+        dict(shift=rows, scale=rows, store="nvfp4_deferred"),
+    ]
+    for R in (2, 4):
+        for kw in cases:
+            ref = fused_norm_producer(x, rows_per_cta=1, **kw)
+            got = fused_norm_producer(x, rows_per_cta=R, **kw)
+            for a, c in zip(ref, got):
+                assert torch.equal(a, c), f"R={R} differs from R=1: {sorted(kw)}"
