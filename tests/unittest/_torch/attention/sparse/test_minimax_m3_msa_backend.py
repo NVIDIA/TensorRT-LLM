@@ -812,6 +812,55 @@ def test_a_span_without_its_buffers_is_not_active():
     assert msa_ported_decode_active(metadata) is False
 
 
+def test_span_bounds_stop_at_the_span_rather_than_the_padded_token_count():
+    """token_last is the span's own end, not the length of the tensor it came
+    with, so a caller can tell a padded step from the bounds alone."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_decode_span_bounds,
+    )
+
+    # Eleven speculative decode requests of 4 query tokens, padded to 512.
+    metadata = SimpleNamespace(
+        msa_decode_span=_MsaDecodeSpan(
+            row_first=0, row_last=11, token_first=0, token_last=44, query_len=4
+        )
+    )
+    bounds = msa_decode_span_bounds(metadata, 512)
+    assert bounds == (0, 44, 0, 11, 4)
+    # Labelled, so a call site taking only some of the five cannot reorder them.
+    assert (bounds.token_first, bounds.token_last) == (0, 44)
+    assert (bounds.row_first, bounds.row_last, bounds.query_len) == (0, 11, 4)
+
+    # No span (the standalone kernel tests, which never run prepare()): the
+    # whole batch is the span, and token_last follows the rows the query length
+    # implies rather than a count that does not divide into them.
+    assert msa_decode_span_bounds(SimpleNamespace(msa_decode_query_len=4), 513) == (
+        0,
+        512,
+        0,
+        128,
+        4,
+    )
+
+    # Neither: every caller is on the fmha_sm100 path and ignores the bounds.
+    assert msa_decode_span_bounds(SimpleNamespace(), 512) == (0, 0, 0, 0, 0)
+
+
+def test_decode_span_shape_check_names_the_kernel_that_rejected_the_q():
+    """The guard both ported decode kernels share. Naming the kernel is the
+    point: the alternative is an assert several frames inside one of them."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        check_decode_span_shape,
+    )
+
+    check_decode_span_shape("kernel", 44, 11, 4)
+
+    # A piecewise CUDA graph's pad folded into the batch: 128 rows, not 11.
+    with pytest.raises(ValueError, match=r"kernel: total_q \(512\) must be batch \(11\)"):
+        check_decode_span_shape("kernel", 512, 11, 4)
+
+
 @pytest.mark.parametrize(
     ("num_contexts", "qo_lens", "kv_lens"),
     [
@@ -945,6 +994,62 @@ def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
         )
 
 
+def test_select_blocks_scores_only_the_span_it_was_given(monkeypatch):
+    """The scorer reads the page table row a query token maps to, so it sees
+    the span alone even when idx_q runs longer. Tokens past the span keep a row
+    in the returned table, selecting nothing."""
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer as indexer_module
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    indexer = indexer_module.MsaIndexer(config)
+    captured = {}
+
+    def fake_cutedsl_score(idx_q, idx_k_paged, max_score, **kwargs):
+        del idx_k_paged, max_score, kwargs
+        captured["scored_tokens"] = int(idx_q.shape[0])
+        return True
+
+    def fake_select_blocks_from_maxscore(max_score_kv, *, topk, n_valid_blocks, **kwargs):
+        del max_score_kv, kwargs
+        captured["selected_tokens"] = int(n_valid_blocks.shape[0])
+        return torch.zeros(n_valid_blocks.shape[0], config.num_kv_heads, topk, dtype=torch.int32)
+
+    monkeypatch.setattr(indexer_module, "_cutedsl_score", fake_cutedsl_score)
+    monkeypatch.setattr(
+        indexer_module, "select_blocks_from_maxscore", fake_select_blocks_from_maxscore
+    )
+
+    # Three decode requests of 4 query tokens inside a 32-token idx_q.
+    total_q, span_tokens = 32, 12
+    table = indexer.select_blocks(
+        torch.zeros(total_q, 4, 128, dtype=torch.bfloat16),
+        torch.zeros(3, 1, 128, 128, dtype=torch.bfloat16),
+        idx_sm_scale=1.0,
+        kv_indices=torch.zeros(3, dtype=torch.int32),
+        max_score=torch.zeros(4, 2, span_tokens),
+        n_valid_blocks=torch.ones(total_q, dtype=torch.int32),
+        block_table=torch.zeros(3, 2, dtype=torch.int32),
+        seq_lens_cuda=torch.full((3,), 8, dtype=torch.int32),
+        decode_query_len=4,
+        require_cutedsl=True,
+        gen_token_last=span_tokens,
+    )
+
+    assert captured["scored_tokens"] == span_tokens
+    assert captured["selected_tokens"] == span_tokens
+    assert table.shape == (total_q, config.num_kv_heads, config.topk)
+    assert torch.equal(table[span_tokens:], torch.full_like(table[span_tokens:], -1))
+
+
 @pytest.mark.parametrize("head_major", [False, True])
 def test_combined_topk_table_preserves_the_requested_backing(head_major):
     """Joining the two halves of a mixed step's table must not change its layout.
@@ -962,13 +1067,34 @@ def test_combined_topk_table_preserves_the_requested_backing(head_major):
     ctx = torch.arange(5 * num_kv_heads * topk, dtype=torch.int32).reshape(5, num_kv_heads, topk)
     gen = -ctx[:3] - 1
 
-    combined = _combined_topk_table(ctx, gen, head_major=head_major)
+    combined = _combined_topk_table(ctx, gen, total_q=8, head_major=head_major)
 
     assert combined.shape == (8, num_kv_heads, topk)
     assert torch.equal(combined[:5], ctx)
     assert torch.equal(combined[5:], gen)
     assert combined.permute(1, 0, 2).is_contiguous() is head_major
     assert combined.is_contiguous() is not head_major
+
+
+@pytest.mark.parametrize("head_major", [False, True])
+def test_combined_topk_table_empties_the_tokens_past_the_span(head_major):
+    """The table keeps a row per token so consumers can address it absolutely.
+    A row beyond the two halves selects nothing rather than carrying whatever
+    the scratch buffer held."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import (
+        _combined_topk_table,
+    )
+
+    num_kv_heads, topk = 2, 16
+    gen = torch.arange(3 * num_kv_heads * topk, dtype=torch.int32).reshape(3, num_kv_heads, topk)
+
+    # No context prefix, three scored tokens, eight rows to fill.
+    combined = _combined_topk_table(None, gen, total_q=8, head_major=head_major)
+
+    assert combined.shape == (8, num_kv_heads, topk)
+    assert torch.equal(combined[:3], gen)
+    assert torch.equal(combined[3:], torch.full_like(combined[3:], -1))
+    assert combined.permute(1, 0, 2).is_contiguous() is head_major
 
 
 def test_paged_gqa_raises_when_a_committed_dense_step_declines():
@@ -1006,6 +1132,48 @@ def test_paged_gqa_raises_when_a_committed_dense_step_declines():
             None,
             metadata,
             torch.zeros(2, num_heads * head_dim),
+            kv_block_indexes=None,
+            plan=None,
+        )
+
+
+def test_paged_gqa_rejects_a_q_that_outruns_the_span():
+    """A q longer than the span no longer describes the batch, so the ported
+    kernels would read rows it does not have. Name that here rather than let it
+    surface as a kernel-internal assert."""
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+
+    num_heads, head_dim, num_pages, page_size = 8, 128, 4, 16
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda layer_idx, kv_layout=None: torch.zeros(
+                num_pages, 2, 1, page_size, head_dim
+            )
+        ),
+        # Two decode requests of one token each, padded up to five tokens.
+        msa_decode_span=_MsaDecodeSpan(
+            row_first=0, row_last=2, token_first=0, token_last=2, query_len=1
+        ),
+        msa_decode_query_len=1,
+        msa_block_table=torch.zeros(2, 1, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.zeros(2, dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match=r"5 query tokens for a span ending at token 2"):
+        run_msa_paged_gqa(
+            attention,
+            torch.zeros(5, num_heads * head_dim),
+            None,
+            None,
+            metadata,
+            torch.zeros(5, num_heads * head_dim),
             kv_block_indexes=None,
             plan=None,
         )
