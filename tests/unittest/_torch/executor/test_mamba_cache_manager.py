@@ -313,6 +313,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert kwargs["layer_mask"] == [False, True, False, True]
     assert kwargs["num_kv_heads"] == 1
     assert kwargs["head_dim"] == 40
+    assert kwargs["max_num_tokens"] == 256
     assert "kda_replay_num_spec" not in kwargs
 
 
@@ -502,9 +503,12 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
 
     assert captured_cpp["use_replay_state_update"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
+    assert captured_cpp["max_num_tokens"] == 256
     assert captured_mixed["use_replay_state_update"] is False
     assert captured_mixed["model_type"] == "qwen3_next"
+    assert captured_mixed["max_num_tokens"] == 256
     assert captured_v2["use_replay_state_update"] is True
+    assert captured_v2["max_num_tokens"] == 256
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
@@ -903,20 +907,25 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
     kv_slice = transceiver._create_kv_slice(request)
 
-    assert kv_slice.mamba_state_index is None
+    # No mamba layer group → no STATE entries in block_ids
+    assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
+    # Provide a mamba layer group so _create_kv_slice places the slot ID
+    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = SimpleNamespace(layer_groups=[])
+    transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
     request = SimpleNamespace(
         is_generation_only_request=lambda: False,
         prompt_len=0,
@@ -925,7 +934,8 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 
     kv_slice = transceiver._create_kv_slice(request)
 
-    assert kv_slice.mamba_state_index == 7
+    # Slot index 7 should be in the STATE group's block_ids
+    assert kv_slice.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 
@@ -1759,6 +1769,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
@@ -1788,6 +1799,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
@@ -1986,6 +1998,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
         mgr.head_dim_per_layer = [64, 64]
         mgr.pp_layers = [0, 1]
@@ -3444,6 +3457,7 @@ def _build_zero_mamba_hybrid(
         head_dim=64,
         tokens_per_block=32,
         max_seq_len=128,
+        max_num_tokens=96,
         max_batch_size=2,
         mapping=mapping,
         spec_config=None,
@@ -3476,6 +3490,7 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     # On the early-exit branch, num_layers is forwarded as-is.
     assert mgr.num_layers == 4
     assert mgr.num_local_layers == 2
+    assert mgr.max_num_tokens == 96
     assert all(
         config.window_size != LinearCacheType.RECURRENT_STATES.value
         for config in mgr.pool_configurations

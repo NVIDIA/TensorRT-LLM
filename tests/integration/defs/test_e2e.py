@@ -987,6 +987,8 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             cmds.append("--kv_cache_fraction=0.6")
         if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
             cmds.append("--max_num_tokens=1024")
+        if "Llama-4" in model_name:
+            cmds.append("--max_seq_len=8192")
         llm_venv.run_cmd(cmds)
 
 
@@ -1877,6 +1879,7 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
             backend='pytorch',
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
+            max_seq_len=8192 if "Llama-4" in model_path else None,
             max_num_tokens=4096,
             max_batch_size=1,
             cuda_graph_config=CudaGraphConfig(),
@@ -1945,8 +1948,23 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
         CudaGraphConfig(),
     }
 
-    # Test prompt
-    prompt = "Who are you?"
+    # Test prompt. It has to go through the chat template: a bare string makes
+    # the model continue arbitrary text instead of answering a turn, so it
+    # never emits <|im_end|> and keeps generating until it hits max_tokens --
+    # by which point it is looping over whatever it last said. That
+    # degeneration comes from the prompt, not from Eagle3, and it is what made
+    # this test flaky (nvbugs/6627979).
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(target_model_dir)
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "Who are you?"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
     sampling_params = SamplingParams(max_tokens=1024, temperature=0)
 
     # Run with Eagle3

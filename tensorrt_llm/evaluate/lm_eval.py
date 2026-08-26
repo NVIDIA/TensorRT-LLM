@@ -16,10 +16,13 @@ import concurrent.futures
 import copy
 import json
 import os
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from types import ModuleType
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Tuple)
 
 import click
 import numpy as np
@@ -69,6 +72,31 @@ MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
 # this flag also opts requests into return_perf_metrics (see
 # _get_sampling_params).
 SPEC_STATS_ENV_VAR = "TLLM_EVAL_SPEC_STATS"
+
+
+@contextmanager
+def _replace_fuzzywuzzy_with_rapidfuzz() -> Iterator[None]:
+    """Provide RapidFuzz under the import name expected by LongBench.
+
+    lm-evaluation-harness and THUDM/LongBench import ``fuzzywuzzy.fuzz``
+    directly, although they only use its ``ratio`` function. Keep that import
+    working while loading their metrics without installing FuzzyWuzzy.
+    """
+    from rapidfuzz import fuzz
+
+    module_name = "fuzzywuzzy"
+    missing = object()
+    original_module = sys.modules.get(module_name, missing)
+    compatibility_module = ModuleType(module_name)
+    compatibility_module.fuzz = fuzz
+    sys.modules[module_name] = compatibility_module
+    try:
+        yield
+    finally:
+        if original_module is missing:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original_module
 
 
 class _RunningScoreTracker:
@@ -1650,7 +1678,8 @@ class LongBenchV1(LmEvalEvaluator):
     """
 
     def __init__(self, **kwargs):
-        super().__init__("longbench", **kwargs)
+        with _replace_fuzzywuzzy_with_rapidfuzz():
+            super().__init__("longbench", **kwargs)
 
     @staticmethod
     def _flatten_task_dict(task_dict: dict) -> List[str]:

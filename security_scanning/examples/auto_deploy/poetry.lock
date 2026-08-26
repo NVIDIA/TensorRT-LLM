@@ -47,18 +47,18 @@ testing = ["bitsandbytes", "datasets", "diffusers", "evaluate", "parameterized",
 
 [[package]]
 name = "ai-edge-model-explorer"
-version = "0.1.32"
+version = "0.1.33"
 description = "A modern model graph visualizer and debugger"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "ai_edge_model_explorer-0.1.32-py3-none-any.whl", hash = "sha256:d7a5d7353f0e9ccd5664c4002bdc700eda3c77285fbfc3d5d15ddeba0e702ed1"},
-    {file = "ai_edge_model_explorer-0.1.32.tar.gz", hash = "sha256:69b0be9f4343365a7e6ce376b02faf3bbdbd75de520a6cb8f6466d7a07fa6423"},
+    {file = "ai_edge_model_explorer-0.1.33-py3-none-any.whl", hash = "sha256:be76638ebe5bd339e5b5e77b46819a34329f87d833c7aabb53f9e47080780ce0"},
+    {file = "ai_edge_model_explorer-0.1.33.tar.gz", hash = "sha256:448fa0e318344a1a48abd2605cb0fa838faf168cfe6f159da4d72877cf6fa3e5"},
 ]
 
 [package.dependencies]
-ai-edge-model-explorer-adapter = {version = ">=0.1.14,<0.2.0", markers = "sys_platform != \"win32\""}
+ai-edge-model-explorer-adapter = {version = ">=0.2.0,<0.3.0", markers = "sys_platform != \"win32\""}
 dacite = "*"
 flask = "*"
 ipython = "*"
@@ -72,28 +72,16 @@ watchdog = "*"
 
 [[package]]
 name = "ai-edge-model-explorer-adapter"
-version = "0.1.14"
-description = "Model Explorer offers an intuitive and hierarchical visualization of model graphs."
+version = "0.2.0"
+description = "Model Explorer backend adapter for model conversion"
 optional = false
-python-versions = "*"
+python-versions = ">=3.9"
 groups = ["main"]
 markers = "sys_platform != \"win32\""
 files = [
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp310-cp310-macosx_12_0_arm64.whl", hash = "sha256:6e7f51aa652ba856554a510b35d2492ddd4a70a1b46349dc6bbd1c51f1164cd0"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp310-cp310-manylinux_2_17_aarch64.whl", hash = "sha256:3c91b2442c1582c5e0f47702026223febc31453929008c531b4f148723f89b49"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp310-cp310-manylinux_2_17_x86_64.whl", hash = "sha256:e42e2f20ed07ea1e69ec67354e3788ed7c9b585c561fc6c62001e551a3d309fa"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp311-cp311-macosx_12_0_arm64.whl", hash = "sha256:d3b37256e2c395b24243ea6c6d6a271a6874e4b9829b82641162bacc70c11237"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp311-cp311-manylinux_2_17_aarch64.whl", hash = "sha256:64817463b65c6e1cb3e6b1d8d04c9bdd1b8c65fb59dce5a76c69a4d9ccd0dd66"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp311-cp311-manylinux_2_17_x86_64.whl", hash = "sha256:9cbed5e74b13244f28c421ff6924e1aa6f6207f6a1a5280fccbc43aa8711888f"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp312-cp312-macosx_12_0_arm64.whl", hash = "sha256:d18d45e176498c59d72742f4ae1531b453d522876645de04e87ec604c800b61b"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp312-cp312-manylinux_2_17_aarch64.whl", hash = "sha256:8861aab647e931dd521e016450780ec108c622e50a6f18f09dbc7af5526cce05"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp312-cp312-manylinux_2_17_x86_64.whl", hash = "sha256:9280eaa3264aa88004930e0da889f2ef7ab14309b9c740f740a52940d08b2c6c"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:a7b5cbca5a2d816369aee637a8eb0158135d37998e405d8bbd7800efd0187752"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp313-cp313-manylinux_2_17_aarch64.whl", hash = "sha256:c57ddbeebe274d9dce63b01eed16dfc7c23c23305bc8bc0f2f72cd29dabf20a4"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:94d39b388ffb1fe73e5a3afa1d7b60902e0b399064f49145c475cec4aec1919c"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp39-cp39-macosx_12_0_arm64.whl", hash = "sha256:78cc494d48ca1d09f04fc6a16b5876ee9176b3bf217d170556a2495311528469"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp39-cp39-manylinux_2_17_aarch64.whl", hash = "sha256:65a9a9b0bc2a93259ceb173580fd572fa396d9be79edf60c6ee633f2835255d2"},
-    {file = "ai_edge_model_explorer_adapter-0.1.14-cp39-cp39-manylinux_2_17_x86_64.whl", hash = "sha256:8469383cb9cce20be8b2b7220ed9169b2b0ac70ba0e84b9fec7b725434c1279a"},
+    {file = "ai_edge_model_explorer_adapter-0.2.0-py3-none-macosx_12_0_arm64.whl", hash = "sha256:8a95a9e24b610189c7258b036634dfc9dc3e768ed622ff750f19459961d26ecd"},
+    {file = "ai_edge_model_explorer_adapter-0.2.0-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:a602424f31cea2646a12296e49b04591edce5ac0936a77046d942207b2c42a91"},
+    {file = "ai_edge_model_explorer_adapter-0.2.0-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:a09ef992bc6de85ba6451dc7fda46d06de339f451561c57e378bd50c478e28cb"},
 ]
 
 [[package]]
@@ -622,14 +610,14 @@ all = ["cuda-toolkit (==13.*)", "cuda-toolkit[cufile] (==13.*) ; sys_platform ==
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.6.1"
+version = "1.7.0"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "platform_system == \"Linux\""
 files = [
-    {file = "cuda_pathfinder-1.6.1-py3-none-any.whl", hash = "sha256:cc8ec4cb0881fa5bcbf96b6dd75d50e55352b74dd33d4f3d884e192e7c2b6ef8"},
+    {file = "cuda_pathfinder-1.7.0-py3-none-any.whl", hash = "sha256:e9d67e950f3d5992b854dfd25917c3719d0c21d3057b11abe86ba6feec526138"},
 ]
 
 [[package]]
@@ -2831,20 +2819,20 @@ ptyprocess = ">=0.5"
 
 [[package]]
 name = "portalocker"
-version = "4.2.0"
+version = "4.3.0"
 description = "Cross-platform file locking, with Redis, PID-file and bounded-semaphore locks"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "portalocker-4.2.0-py3-none-any.whl", hash = "sha256:b33a8ce7d9b74922123a6fe64c2d785c015e5e9049ce7f1db5bd44e288731460"},
-    {file = "portalocker-4.2.0.tar.gz", hash = "sha256:f4c5024903126159c4798e6aec6c32e30a0759db39bf795c0dbeb180a2e8c843"},
+    {file = "portalocker-4.3.0-py3-none-any.whl", hash = "sha256:aa91709ccfc322b8225171392d64a2f9fc833f15f5ab741cfba6d3fba285ce31"},
+    {file = "portalocker-4.3.0.tar.gz", hash = "sha256:69bf8e46769d66eb0a23219b9550253d2c3b5f03400202a2333784c1e6395e32"},
 ]
 
 [package.extras]
 docs = ["furo", "sphinx (>=7)"]
 redis = ["redis (>=5.0)"]
-tests = ["coverage-conditional-plugin (>=0.9)", "fakeredis (>=2.31.0)", "portalocker[redis]", "pytest (>=5.4.1)", "pytest-cov (>=2.8.1)", "pytest-rerunfailures (>=15.1)", "pytest-timeout (>=2.1.0)", "types-pywin32 (>=310.0.0.20250429)"]
+tests = ["coverage-conditional-plugin (>=0.9)", "fakeredis (>=2.31.0)", "portalocker[redis]", "pytest (>=5.4.1)", "pytest-cov (>=2.8.1)", "pytest-rerunfailures (>=15.1)", "pytest-timeout (>=2.1.0)", "types-pywin32 (>=310.0.0.20250429)", "typing-extensions (>=4.4)"]
 win32 = ["pywin32 (>=226) ; sys_platform == \"win32\""]
 
 [[package]]

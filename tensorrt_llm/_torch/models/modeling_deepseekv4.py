@@ -2544,12 +2544,13 @@ class DeepseekV4Model(DecoderModel):
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        return {
-            "kv_cache_config": {
-                "tokens_per_block": 128,
-                "enable_swa_scratch_reuse": True,
-            }
+        kv_cache_defaults = {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
         }
+        if llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
+            kv_cache_defaults["tokens_per_block"] = 256
+        return {"kv_cache_config": kv_cache_defaults}
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

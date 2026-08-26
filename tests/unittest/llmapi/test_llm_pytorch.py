@@ -227,7 +227,9 @@ def test_llm_reward_model():
 @pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config) as llm:
+             kv_cache_config=global_kvcache_config.model_copy(
+                 update={"use_kv_cache_manager_v2": True}),
+             return_perf_metrics=False) as llm:
         sampling_params = SamplingParams(max_tokens=10,
                                          return_perf_metrics=True)
         outputs = llm.generate(prompts, sampling_params)
@@ -265,8 +267,10 @@ def test_llm_prefix_cache_reuse(attn_backend):
     with LLM(
             model=model_path,
             attn_backend=attn_backend,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          use_kv_cache_manager_v2=True),
             cuda_graph_config=None,
+            return_perf_metrics=False,
     ) as llm:
         cold_output = llm.generate(prompt, sampling_params).outputs[0]
         warm_output = llm.generate(prompt, sampling_params).outputs[0]
@@ -607,6 +611,9 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
 
 @skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
+# https://nvbugs/6566707: hung for 2400s in late executor-init/first-generate
+# on a many-times-reused MPI pool; isolate on a private pool until root-caused.
+@pytest.mark.private_mpi_session
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
