@@ -20,6 +20,7 @@ import torch
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
+    _build_layer_group_for_v2_mamba,
     _build_v2_mamba_state_pool,
     build_page_table,
     build_page_table_from_manager,
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_unique_layers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -660,8 +662,6 @@ def test_v2_builder_validates_role_mapper_declaration():
 
 @pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
-    import numpy as np
-
     from tensorrt_llm._torch.disaggregation.resource.page import (
         BUFFER_ENTRY_DTYPE,
         MAMBA_CONV_ROLE,
@@ -685,7 +685,8 @@ def test_mamba_layer_group_serialization():
         PoolView(
             pool_idx=0,
             buffer_entries=np.array(
-                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+                [(lid, lid * conv_slot_bytes, conv_slot_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
             ),
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
@@ -694,11 +695,19 @@ def test_mamba_layer_group_serialization():
         PoolView(
             pool_idx=1,
             buffer_entries=np.array(
-                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+                [(lid, lid * ssm_slot_bytes, ssm_slot_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
             ),
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=2,
+            buffer_entries=np.array([(2, 0, 64)], dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=frozenset({"recurrent_side"}),
+            mapper_kind=MapperKind.REPLICATED,
+            bytes_per_layer=64,
         ),
     ]
     mlg = MambaLayerGroup(
@@ -707,6 +716,7 @@ def test_mamba_layer_group_serialization():
         pool_views=pool_views,
         conv_section_bytes=[512, 256, 256],
         ssm_bytes_per_head=128,
+        slot_major_layout=True,
     )
 
     d = mlg.to_dict()
@@ -716,7 +726,7 @@ def test_mamba_layer_group_serialization():
 
     restored = LayerGroup.from_dict(d)
     assert isinstance(restored, MambaLayerGroup)
-    assert len(restored.pool_views) == 2
+    assert len(restored.pool_views) == 3
     assert restored.pool_views[0].pool_role == MAMBA_CONV_ROLE
     assert restored.pool_views[0].bytes_per_layer == conv_slot_bytes
     assert restored.pool_views[0].mapper_kind == MapperKind.SECTIONED
@@ -730,6 +740,10 @@ def test_mamba_layer_group_serialization():
         (1, 11),
         (2, 12),
     ]
+    assert restored.pool_views[2].pool_role == frozenset({"recurrent_side"})
+    assert restored.pool_views[2].mapper_kind == MapperKind.REPLICATED
+    assert restored.pool_views[2].bytes_per_layer == 64
+    assert restored.slot_major_layout
 
     legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
@@ -749,6 +763,60 @@ def test_v2_mamba_state_pool_uses_affine_layer_and_slot_strides():
     assert pool.num_slots == num_slots
     assert pool.slot_stride_bytes == 4 * state_bytes
     assert pool.layer_stride_bytes == 2 * state_bytes
+
+
+def test_v2_mamba_side_state_pool_allows_unrelated_coalesced_roles():
+    state_bytes = 64
+    storage = torch.empty((3, 7, state_bytes), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 3, :]]
+
+    pool = _build_v2_mamba_state_pool(states)
+
+    assert pool.slot_stride_bytes == 7 * state_bytes
+    assert pool.layer_stride_bytes == 3 * state_bytes
+
+
+def test_v2_mamba_layer_group_includes_recurrent_side_states():
+    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+
+    num_slots = 3
+    conv_storage = torch.empty((num_slots, 2, 4, 3), dtype=torch.float32)
+    ssm_storage = torch.empty((num_slots, 2, 2, 4, 5), dtype=torch.float32)
+    side_storage = torch.empty((num_slots, 3, 8), dtype=torch.int64)
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.mamba_layer_offsets = {10: 0, 11: 1}
+    manager.all_conv_states = [conv_storage[:, 0], conv_storage[:, 1]]
+    manager.all_ssm_states = [ssm_storage[:, 0], ssm_storage[:, 1]]
+    manager.conv_state_shape = [4, 3]
+    manager.conv_section_dims = [1, 1, 2]
+    manager.ssm_state_shape = [2, 4, 5]
+    manager._ple_ngram_contexts = {11: side_storage[:, 1]}
+    manager._ple_conv_states = {}
+
+    layer_group, pool_group = _build_layer_group_for_v2_mamba(manager, pool_group_idx=0)
+
+    role = frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})
+    side_pool_idx, side_view = next(
+        (pool_idx, pool_view)
+        for pool_idx, pool_view in enumerate(layer_group.pool_views)
+        if pool_view.pool_role == role
+    )
+    side_pool = pool_group.pools[side_view.pool_idx]
+    assert side_pool.base_address == side_storage[:, 1].data_ptr()
+    assert side_pool.num_slots == num_slots
+    assert side_pool.slot_bytes == 8 * side_storage.element_size()
+    assert side_view.mapper_kind == MapperKind.REPLICATED
+    assert side_view.buffer_entries.tolist() == [(1, 0, side_pool.slot_bytes)]
+
+    page_table = KVCachePageTable(
+        tokens_per_block=1,
+        layer_groups=[layer_group],
+        pool_groups=[pool_group],
+    )
+    region = KVRegionExtractorV1(page_table).extract_slot(
+        slot_id=2, layer_group_id=0, pool_idx=side_pool_idx
+    )
+    assert region.memory.ptrs.tolist() == [side_storage[2, 1].data_ptr()]
 
 
 def test_v2_mamba_single_layer_pool_preserves_shared_role_footprint():

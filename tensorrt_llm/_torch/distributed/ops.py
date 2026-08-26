@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import os
 import platform
@@ -40,6 +43,29 @@ _ALLREDUCE_AUTOTUNER_TUNING_MODE = False
 
 # Disabled only after the Python/C++ native-tactic contract cannot be honored.
 _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
+
+
+def _detect_nccl_symmetric_auto_tactic_support() -> bool:
+    """Detect whether AUTO may benchmark the NCCL symmetric tactic."""
+    if not torch.cuda.is_available():
+        return True
+    try:
+        # The SM103 NCCL-window tactic can produce non-deterministic output or
+        # stall. Explicit strategy selection remains available for diagnostics.
+        return torch.cuda.get_device_capability() != (10, 3)
+    except (AssertionError, RuntimeError):
+        # Preserve the existing policy when CUDA discovery is unavailable
+        # during import, fake-tensor tracing, or CPU-only tests.
+        return True
+
+
+_NCCL_SYMMETRIC_AUTO_TACTIC_SUPPORTED = (
+    _detect_nccl_symmetric_auto_tactic_support())
+
+
+def _nccl_symmetric_auto_tactic_supported() -> bool:
+    """Return the process-stable NCCL symmetric AUTO policy."""
+    return _NCCL_SYMMETRIC_AUTO_TACTIC_SUPPORTED
 
 
 def disable_native_allreduce_autotuner(reason: str) -> None:
@@ -815,10 +841,13 @@ class AllReduce(nn.Module):
         Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
         strategy AND tp_size > 1 AND MPI not disabled.
         """
-        return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
-                in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
-                    AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
-                and not self._disable_mpi)
+        strategy_supports_window = self.strategy in (
+            AllReduceStrategy.NCCL_SYMMETRIC,
+            AllReduceStrategy.NCCL,
+        ) or (self.strategy == AllReduceStrategy.AUTO
+              and _NCCL_SYMMETRIC_AUTO_TACTIC_SUPPORTED)
+        return (_NCCL_SYMMETRIC_ZERO_COPY and strategy_supports_window
+                and self.mapping.tp_size > 1 and not self._disable_mpi)
 
     @property
     def output_buffer_kind(self) -> int:

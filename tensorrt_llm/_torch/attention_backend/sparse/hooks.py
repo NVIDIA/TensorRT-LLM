@@ -143,6 +143,7 @@ _MLA_HOOK_MODULE_PATHS = {
     "deepseek_v4": ".deepseek_v4.module",
 }
 _ATTENTION_HOOK_MODULE_PATHS = {
+    "qsa": ".qsa.module",
     "rocket": ".rocket.module",
 }
 _MLA_HOOKS: dict[str, type[MLASparseHooks]] = {}

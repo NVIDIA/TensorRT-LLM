@@ -86,7 +86,7 @@ def is_gemma4_hybrid(config):
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
-        is_kimi_linear(config)
+        is_kimi_linear(config) or is_qwen4_exp(config)
 
 
 def is_kimi_linear(config):
@@ -258,6 +258,22 @@ def is_qwen3_hybrid(config):
     return is_qwen3_next(config) or is_qwen3_5(config)
 
 
+def is_qwen4_exp(config):
+    """Return whether this is a Qwen3.8-Flash-Next text or composite config.
+
+    Qwen4-Exp's linear-attention layers are Gated DeltaNet with the same
+    ``linear_*`` config field names and the same explicit ``layer_types`` schema
+    as the Qwen3 hybrids, so it reuses the Qwen3-hybrid layer-type derivation and
+    mamba-state extraction below. It carries additional recurrent state for its
+    PLE n-gram side path (see ``extract_qwen4_exp_ple_cache_params``).
+    """
+    architectures = getattr(config, "architectures", None)
+    return architectures is not None and architectures[0] in {
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+
+
 def get_qwen3_hybrid_layer_types(config):
     """Return per-layer type list for a Qwen3 hybrid model.
 
@@ -303,6 +319,68 @@ def get_qwen3_hybrid_layer_masks(config):
 def get_qwen3_hybrid_num_attention_layers(config):
     layer_mask, _ = get_qwen3_hybrid_layer_masks(config)
     return sum(layer_mask)
+
+
+def get_qwen4_exp_ple_layer_mask(config) -> List[bool]:
+    """Per-layer bool mask: True where the Qwen4-Exp PLE side path is active.
+
+    The PLE n-gram path is active at decoder layer ``layer_id`` when
+    ``(layer_id + 1) in ple_layer_ids``. With ``ple_layer_ids == [2]``, it is active at
+    ``layer_id == 1`` only. Returns an all-False mask when ``ple_layer_ids`` is
+    empty/absent.
+    """
+    ple_layer_ids = set(getattr(config, "ple_layer_ids", None) or [])
+    num_layers = config.num_hidden_layers
+    return [(layer_id + 1) in ple_layer_ids for layer_id in range(num_layers)]
+
+
+@dataclasses.dataclass
+class Qwen4ExpPLECacheParams:
+    """Config-derived PLE (n-gram) side-path recurrent-state pools.
+
+    The PLE layer carries two extra per-layer recurrent state pools beyond the
+    Gated-DeltaNet convolution and SSM state, allocated by
+    KVCacheManagerV2 for the layers named by ``ple_layer_mask``:
+
+      * short_conv_state — a depthwise dilated-causal short conv over the
+        ``hc_count * hidden_size`` Hyper-Connection stream. State window is
+        ``short_conv_state_len = (ple_conv_kernel_size - 1) * ngram_size``
+        columns (dilation equals ``ngram_size``).
+      * ngram_context — a per-sequence int64 token-id history of width
+        ``ngram_context_len = ngram_size - 1``, the n-gram lookback carried
+        across the prefill->decode boundary.
+
+    Field names let the model and cache manager consume the dimensions without
+    re-deriving them from raw configuration.
+    """
+    ple_layer_mask: List[bool]
+    num_ple_layers: int
+    short_conv_channels: int
+    short_conv_state_len: int
+    ngram_context_len: int
+    conv_state_dtype: torch.dtype
+
+
+def extract_qwen4_exp_ple_cache_params(config) -> Qwen4ExpPLECacheParams:
+    """Build the PLE side-path recurrent-state pool descriptors for the V2 cache.
+
+    All shapes are derived purely from config so the declaration is consistent
+    with the PLE module implementation, which derives the same
+    shapes from the same fields.
+    """
+    ple_layer_mask = get_qwen4_exp_ple_layer_mask(config)
+    hc_count = getattr(config, "hc_count", 1) or 1
+    short_conv_channels = hc_count * config.hidden_size
+    short_conv_state_len = (config.ple_conv_kernel_size - 1) * config.ngram_size
+    ngram_context_len = config.ngram_size - 1
+    return Qwen4ExpPLECacheParams(
+        ple_layer_mask=ple_layer_mask,
+        num_ple_layers=sum(ple_layer_mask),
+        short_conv_channels=short_conv_channels,
+        short_conv_state_len=short_conv_state_len,
+        ngram_context_len=ngram_context_len,
+        conv_state_dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
+    )
 
 
 @dataclasses.dataclass
@@ -408,7 +486,12 @@ def extract_mamba_kv_cache_params(
         pattern = config.hybrid_override_pattern
         target_full_attn_mask = [layer_type == "*" for layer_type in pattern]
         mamba_mask = [layer_type == "M" for layer_type in pattern]
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
+        # Qwen4-Exp's Gated-DeltaNet linear-attention layers share Qwen3's
+        # ``linear_*`` field names and explicit ``layer_types`` schema, so the
+        # GDN conv/ssm state extraction and layer-type masks are identical. The
+        # extra PLE side-path state pools are described separately by
+        # ``extract_qwen4_exp_ple_cache_params``.
         state_size = config.linear_key_head_dim
         conv_kernel = config.linear_conv_kernel_dim
         num_heads = config.linear_num_value_heads
@@ -598,6 +681,42 @@ def is_kimi_k3_multimodal_config(config_dict: dict) -> bool:
             and isinstance(vision_config, dict) and bool(vision_config))
 
 
+def is_qwen4_exp_multimodal_config(config_dict: dict) -> bool:
+    """Return whether a checkpoint contains the composite vision model."""
+    text_config = config_dict.get("text_config")
+    vision_config = config_dict.get("vision_config")
+    return (config_dict.get("model_type") == "qwen4_exp"
+            and config_dict.get("language_model_only") is not True
+            and isinstance(text_config, dict) and bool(text_config)
+            and isinstance(vision_config, dict) and bool(vision_config))
+
+
+def _normalize_qwen4_exp_quantization_config(
+        config_dict: dict, text_config: dict) -> Optional[dict]:
+    """Normalize the composite checkpoint's text quantization policy.
+
+    Composite checkpoints may publish the policy at the top level, while the
+    weight mapper materializes the packed linear-attention QKVZ projection in
+    BF16. Normalize names and exclusions before ``ModelConfig`` selects module
+    implementations.
+    """
+    quantization_config = (text_config.get("quantization_config")
+                           or config_dict.get("quantization_config"))
+    if not isinstance(quantization_config, dict):
+        return None
+
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen35ConfigCompat
+
+    normalized = dict(quantization_config)
+    modules = normalized.get("modules_to_not_convert")
+    if isinstance(modules, list):
+        modules = Qwen35ConfigCompat._normalize_exclude_modules(modules)
+        modules = Qwen35ConfigCompat._add_qkvz_bf16_workaround(
+            text_config, modules)
+        normalized["modules_to_not_convert"] = sorted(set(modules))
+    return normalized
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -700,6 +819,36 @@ def load_pretrained_config(model_name_or_path: str,
         text_dict = dict(config_dict.get("text_config") or config_dict)
         model_config = KimiLinearConfig.from_dict(text_dict)
         model_config.architectures = ["KimiLinearForCausalLM"]
+    elif is_qwen4_exp_multimodal_config(config_dict):
+        # Preserve the composite config so the vision tower, multimodal token
+        # IDs, and text configuration reach the VLM wrapper. This branch must
+        # precede the text-only flattening path below.
+        from tensorrt_llm._torch.configs import Qwen4ExpConfig
+        normalized_config = dict(config_dict)
+        text_dict = dict(config_dict["text_config"])
+        quantization_config = _normalize_qwen4_exp_quantization_config(
+            config_dict, text_dict)
+        if quantization_config is not None:
+            text_dict["quantization_config"] = dict(quantization_config)
+            normalized_config["text_config"] = text_dict
+            normalized_config["quantization_config"] = dict(quantization_config)
+        resolved_dtype = _resolve_composite_torch_dtype(config_dict, text_dict)
+        model_config = Qwen4ExpConfig.from_dict(normalized_config, **kwargs)
+        model_config.architectures = ["Qwen4ExpForConditionalGeneration"]
+        model_config.text_config.architectures = ["Qwen4ExpForCausalLM"]
+        model_config.text_config.torch_dtype = resolved_dtype
+        model_config.torch_dtype = resolved_dtype
+    elif model_type in ("qwen4_exp", "qwen4_exp_text"):
+        # Qwen4-Exp text-only (or multimodal explicitly disabled): flatten to the
+        # in-tree Qwen4ExpTextConfig and run the hybrid text core only.
+        from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        quantization_config = _normalize_qwen4_exp_quantization_config(
+            config_dict, text_dict)
+        if quantization_config is not None:
+            text_dict["quantization_config"] = quantization_config
+        model_config = Qwen4ExpTextConfig.from_dict(text_dict)
+        model_config.architectures = ["Qwen4ExpForCausalLM"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
