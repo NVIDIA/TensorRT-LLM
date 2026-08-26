@@ -56,10 +56,11 @@ class _TwoStagePhaseTimer(CudaPhaseTimer):
     """CudaPhaseTimer + the two-stage extras: the stage-2 refinement loop and
     the decode section.
 
-    Inherited marks keep their contract (``denoise`` = the whole stage-1
-    forward; stage 2 folds into ``post_denoise`` on ``PipelineOutput``).
+    ``mark_post_start`` is placed at the decode boundary, so ``denoise``
+    spans stage 1 plus the stage-2 upsample / LoRA bind / refinement loop
+    and ``post_denoise`` is the decode only (matching single-stage models).
     The extra event pair brackets the stage-2 refinement step loop only
-    (upsample / LoRA bind / text-cache prep stay outside).
+    (upsample / LoRA bind / text-cache prep stay outside), for logging.
 
     Event deltas are GPU-stream distances: they include GPU work plus any
     CPU time exposed to the stream, and stay correct under CUDA graphs and
@@ -1356,8 +1357,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         audio_latents = out.audio  # (B, C, F_aud, M) or None
         assert video_latents is not None, "stage-1 latents missing on this rank"
 
-        timer.mark_post_start()
-
         # ================================================================
         # Stage 2: spatial upsample + refinement denoise — all ranks, collectively
         # ================================================================
@@ -1465,6 +1464,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 logger.info("Un-merged distilled LoRA after stage 2")
             else:
                 self._lora_cuda_graph_state = "original"
+
+        # Denoise (stage 1 + stage 2) complete; decode is the post phase.
+        timer.mark_post_start()
 
         # ================================================================
         # Decode

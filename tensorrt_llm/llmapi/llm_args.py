@@ -1873,8 +1873,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "any of these penalties is rejected at admission rather than silently decoded "
         "without them.")
 
-    # If set, drafting is allowed to use chain drafter.
-    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
@@ -5047,6 +5045,13 @@ class BaseLlmArgs(StrictBaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+
+        if self.lora_config is not None and self.backend == 'pytorch':
+            if self.lora_config.cuda_graph_specialize_lora and self.enable_attention_dp:
+                raise ValueError(
+                    "LoRA CUDA graph specialization cannot be used when attention DP is enabled."
+                )
+
         return self
 
     @model_validator(mode="after")
