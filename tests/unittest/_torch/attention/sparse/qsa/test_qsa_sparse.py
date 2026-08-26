@@ -16,10 +16,12 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     expand_qsa_block_indices,
     qsa_sparse_gqa,
     qsa_sparse_gqa_reference,
-    select_qsa_decode_tokens,
+    select_qsa_paged_tokens,
     select_qsa_tokens,
 )
+from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _query_chunk_size
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
 def _params(
@@ -35,6 +37,17 @@ def _params(
         compress_ratio=4,
         seq_len_threshold=seq_len_threshold,
     )
+
+
+def test_qsa_query_chunk_respects_score_workspace(monkeypatch) -> None:
+    monkeypatch.delenv("TRTLLM_QSA_SPARSE_QUERY_CHUNK", raising=False)
+    assert _query_chunk_size(8192, 2310) == 8192
+    assert _query_chunk_size(65536, 16384) == 2048
+
+    monkeypatch.setenv("TRTLLM_QSA_SPARSE_QUERY_CHUNK", "256")
+    assert _query_chunk_size(8192, 2310) == 256
+    monkeypatch.setenv("TRTLLM_QSA_SPARSE_QUERY_CHUNK", "invalid")
+    assert _query_chunk_size(8192, 2310) == 8192
 
 
 def test_qsa_sparse_params_validate_geometry() -> None:
@@ -97,7 +110,7 @@ def test_qsa_selection_is_causal_and_score_ordered() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_decode_selection_supports_multiple_rows_per_request() -> None:
+def test_qsa_paged_selection_supports_multiple_rows_per_request() -> None:
     # Triton's dot primitive requires K >= 16 on SM100+. Production Qwen4
     # uses 128; keep this focused test at the smallest supported dimension.
     params = _params(index_head_dim=16)
@@ -136,7 +149,7 @@ def test_qsa_decode_selection_supports_multiple_rows_per_request() -> None:
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
     )
 
-    actual = select_qsa_decode_tokens(
+    actual = select_qsa_paged_tokens(
         q,
         index_cache,
         query_positions,
@@ -160,7 +173,7 @@ def test_qsa_decode_selection_supports_multiple_rows_per_request() -> None:
         device="cuda",
     )
     top_k_row_starts = torch.zeros(q.shape[0], dtype=torch.int32, device="cuda")
-    actual_radix = select_qsa_decode_tokens(
+    actual_radix = select_qsa_paged_tokens(
         q,
         index_cache,
         query_positions,
@@ -307,6 +320,32 @@ def test_qsa_index_storage_avoids_kv_role_coalescing() -> None:
     buffers = manager._extra_buffers_per_layer(tokens_per_block=128)
 
     assert buffers[2][0].size == 129 * 2 * 128
+
+
+def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
+    calls = []
+
+    class _Impl:
+        def get_mem_pool_base_address(self, layer_idx, role, index_mode):
+            calls.append((layer_idx, role, index_mode))
+            return 0
+
+        def get_page_stride(self, layer_idx, role):
+            del layer_idx, role
+            return 0
+
+    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager.qsa_position_layer_id = 7
+    manager.layer_offsets = {7: 2}
+    manager.impl = _Impl()
+    manager.tokens_per_block = 128
+
+    with pytest.raises(RuntimeError, match="position-cache page stride mismatch"):
+        manager.get_qsa_position_buffer()
+
+    assert len(calls) == 1
+    assert calls[0][0] == 2
+    assert calls[0][2] is PageIndexMode.SHARED
 
 
 def test_qsa_speculative_commit_restores_rejected_side_cache_entries() -> None:

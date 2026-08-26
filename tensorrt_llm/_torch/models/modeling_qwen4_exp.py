@@ -145,10 +145,20 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         self.mlp = Qwen3NextSparseMoeBlock(model_config, aux_stream, layer_idx=layer_idx)
 
         self.attn_hyper_connection = Qwen4ExpHyperConnection.from_config(
-            config, use_mix=True, use_combine=True, dtype=dtype
+            config,
+            use_mix=True,
+            use_combine=True,
+            dtype=dtype,
+            mapping=model_config.mapping,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
         )
         self.mlp_hyper_connection = Qwen4ExpHyperConnection.from_config(
-            config, use_mix=True, use_combine=True, dtype=dtype
+            config,
+            use_mix=True,
+            use_combine=True,
+            dtype=dtype,
+            mapping=model_config.mapping,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
         )
 
         self.ple: Optional[Qwen4ExpPLE] = None
@@ -318,7 +328,12 @@ class Qwen4ExpModel(DecoderModel):
         # The final Hyper-Connection mixer IS the last norm (use_combine=False);
         # there is no separate final RMSNorm (contracts C1/C6).
         self.hyper_connection_mixer = Qwen4ExpHyperConnection.from_config(
-            config, use_mix=True, use_combine=False, dtype=dtype
+            config,
+            use_mix=True,
+            use_combine=False,
+            dtype=dtype,
+            mapping=model_config.mapping,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
         )
 
     def __pp_init__(self) -> None:
@@ -656,7 +671,12 @@ class Qwen4ExpMTPHead(Qwen4ExpLogitsProcessor):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         config = model_config.pretrained_config
         hyper_connection_mixer = Qwen4ExpHyperConnection.from_config(
-            config, use_mix=True, use_combine=False, dtype=config.torch_dtype
+            config,
+            use_mix=True,
+            use_combine=False,
+            dtype=config.torch_dtype,
+            mapping=model_config.mapping,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
         )
         super().__init__(model_config, hyper_connection_mixer)
         self.hyper_connection_mixer = hyper_connection_mixer

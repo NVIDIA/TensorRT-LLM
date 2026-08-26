@@ -601,7 +601,7 @@ def select_qsa_tokens(
     )
 
 
-def select_qsa_decode_tokens(
+def select_qsa_paged_tokens(
     q: torch.Tensor,
     index_cache: torch.Tensor,
     query_positions: torch.Tensor,
@@ -614,7 +614,7 @@ def select_qsa_decode_tokens(
     top_k_output: torch.Tensor | None = None,
     top_k_row_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select decode tokens with fixed-shape paged scoring for graph replay."""
+    """Select tokens with packed, fixed-width paged scoring."""
     from .kernels import triton_qsa_paged_index_scores
 
     logits = triton_qsa_paged_index_scores(
@@ -667,6 +667,6 @@ __all__ = [
     "qsa_sparse_gqa",
     "qsa_sparse_gqa_reference",
     "expand_qsa_block_indices",
-    "select_qsa_decode_tokens",
+    "select_qsa_paged_tokens",
     "select_qsa_tokens",
 ]
