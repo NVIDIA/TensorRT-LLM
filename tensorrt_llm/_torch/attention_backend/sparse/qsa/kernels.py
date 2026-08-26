@@ -518,10 +518,11 @@ def triton_qsa_paged_index_scores(
         dtype=torch.float32,
         device=q.device,
     )
-    # A wider key tile amortizes the query/cache setup for packed prefill and
-    # batched decode. Keep the smallest decode graph on a narrow tile to avoid
-    # adding latency to the single-request path.
+    # Keep single-request decode narrow. Multi-row scoring uses fewer warps so
+    # the wider tile amortizes cache setup without the occupancy regression of
+    # the original 128-wide, 8-warp launch.
     block_n = 32 if rows == 1 else 128
+    num_warps = 8 if rows == 1 else 4
     grid = (rows, triton.cdiv(max_compressed_blocks, block_n))
     _qsa_paged_index_scores_kernel[grid](
         q,
@@ -549,7 +550,7 @@ def triton_qsa_paged_index_scores(
         MAX_COMPRESSED_BLOCKS=max_compressed_blocks,
         BLOCK_H=max(16, triton.next_power_of_2(num_index_heads)),
         BLOCK_N=block_n,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=2,
     )
     return output
