@@ -348,6 +348,7 @@ test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
 test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/6568058)
 unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_kv_lens_rebuilds_stale_map SKIP (https://nvbugs/6574939)
+unittest/_torch/attention/sparse/test_minimax_m3_msa_backend.py::test_msa_paged_hnd_input_materializes_unaligned_outer_stride SKIP (https://nvbugs/6661846)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
 unittest/_torch/executor/test_overlap_scheduler.py::test_overlap_scheduler_block_reuse_cache_hit[TorchSampler] SKIP (https://nvbugs/6608387)
 unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy SKIP (https://nvbugs/6607482)
