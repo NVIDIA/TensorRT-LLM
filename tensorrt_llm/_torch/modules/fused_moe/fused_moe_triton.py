@@ -38,6 +38,7 @@ from triton_kernels.tensor_details import layout
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...model_config import ModelConfig
+from ...utils import ActivationType
 from ..linear import TensorParallelMode, load_weight_shard
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
                             MoERejectReason)
@@ -1550,7 +1551,7 @@ class TritonFusedMoE(MoE):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """Triton MoE: SM90 only, and only the gpt-oss style swiglu.
+        """Triton MoE: SM90 only, SwiGLU family only.
 
         Supports unquantized BF16, FP8 per-tensor QDQ, W4A8_MXFP4_FP8 and
         W4A16_MXFP4.
@@ -1569,11 +1570,18 @@ class TritonFusedMoE(MoE):
                 MoERejectReason.EPLB_UNSUPPORTED,
                 "TritonFusedMoE does not implement the EPLB slot hooks")
 
-        # Require gpt-oss SwiGLU; abstain when the style is unknown.
-        if p.swiglu_gptoss_style is False:
+        # Gate the activation family, NOT ``swiglu_gptoss_style``: every
+        # ``apply`` branches on ``beta == 1.0``, so gpt-oss takes the fused
+        # activation and the plain-SwiGLU alpha=1/beta=0 defaults take
+        # ``swiglu_torch``. Rejecting plain SwiGLU degraded an explicit TRITON
+        # request to Cutlass, which then died loading the MXFP4 scales this
+        # checkpoint spells ``weight_scale`` (nvbugs/6660905).
+        if p.activation_type not in (ActivationType.Swiglu,
+                                     ActivationType.SwigluBias):
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "TritonFusedMoE only supports swiglu_gptoss_style=True")
+                "TritonFusedMoE fuses Swiglu and SwigluBias only, got "
+                f"{p.activation}")
 
         if d.smart_router:
             return _reject(

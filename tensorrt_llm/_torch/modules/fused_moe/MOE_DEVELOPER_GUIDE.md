@@ -159,7 +159,7 @@ Still on old path (standalone, with embedded communication):
 | `mega_moe/mega_moe_deepgemm.py` | `MegaMoEDeepGemm` | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103 | NVFP4 via ported CuteDSL `Sm100MegaMoEKernel` fused dispatch+FC1+act+FC2+combine kernel; requires CUDA 13 Cutlass DSL runtime (PR #14354) and NVSHMEM provider (hard gate); threads per-expert `fc31_alpha`/`fc2_alpha`/`fc1_norm_const` through the kernel ABI and supports SwiGLU clamp via `swiglu_limit`; default deepgemm graph (topk score folded before fc1-out quant, host `combine_output.sum(dim=1)`) | `FUSED_COMM` |
 | `fused_moe_marlin.py` | `MarlinFusedMoE` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); supports attention-DP + EP via external comm (scheduler precomputes routing; dispatch payload is plain BF16, no activation scales); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass in `resolve_moe_impl`, recorded in the layer's `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
-| `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
+| `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS and plain-SwiGLU MXFP4 on Hopper (SwiGLU family only) | (legacy path) |
 | `fused_moe_vanilla.py` | `VanillaMoE` | All devices | Reference / debugging only | (legacy path) |
 
 ### Communication (`fused_moe/communication/`)
@@ -373,6 +373,14 @@ gpt-oss SwiGLU package (per-expert bias plus `swiglu_alpha` / `swiglu_beta` /
 every specialized backend — `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
 `DeepGemmFusedMoE`, `DenseGEMMFusedMoE`, `MarlinFusedMoE` — while
 `TRTLLMGenFusedMoE` accepts only the algorithms in its `_GPTOSS_SUPPORTED_ALGOS`.
+
+`TritonFusedMoE` gates the activation *family* (`Swiglu`, `SwigluBias`), not
+`swiglu_gptoss_style`: each quant method's `apply` branches on `beta == 1.0`,
+serving gpt-oss through the fused Triton activation and plain SwiGLU through
+`swiglu_torch` at the `alpha=1.0` / `beta=0.0` defaults. Gating it on
+`swiglu_gptoss_style` instead degraded explicit `TRITON` requests for
+plain-SwiGLU MXFP4 checkpoints to Cutlass, which cannot load the `weight_scale`
+scale spelling those checkpoints ship (nvbugs/6660905).
 
 Cutlass gates gpt-oss / MiniMax SwiGLU on unquantized, NVFP4, and the MXFP4
 family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `NVFP4`,
