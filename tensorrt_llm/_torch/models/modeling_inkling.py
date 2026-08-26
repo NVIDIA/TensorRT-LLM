@@ -924,20 +924,6 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 f"expert-slot bookkeeping instead of here. Pick a divisor of "
                 f"{num_experts}."
             )
-        # Pure EP (moe_tp_size 1) reproduces the TP-only accuracy per item but
-        # segfaults during CUDA-graph capture; root cause not yet found, so
-        # reject only that combination rather than the whole layout.
-        moe_tp_size = getattr(mapping, "moe_tp_size", None)
-        use_cuda_graph = getattr(model_config, "use_cuda_graph", False)
-        if moe_tp_size is not None and moe_tp_size < 2 and use_cuda_graph:
-            raise ValueError(
-                f"moe_expert_parallel_size={ep_size} leaves moe_tp_size="
-                f"{moe_tp_size}, which segfaults during CUDA-graph capture "
-                f"for Inkling. The same layout runs correctly with CUDA "
-                f"graphs disabled (cuda_graph_config=None), reproducing the "
-                f"TP-only accuracy per item. Either disable CUDA graphs or "
-                f"use moe_expert_parallel_size <= {max(1, ep_size // 2)}."
-            )
 
     def _apply_allreduce_strategy(self) -> None:
         """Keep Inkling's all-reduces off the NCCL_SYMMETRIC tactic.

@@ -1532,9 +1532,10 @@ def test_non_dp_passes_none_and_keeps_the_old_call_shape():
 # Phase 1: expert parallelism
 # ---------------------------------------------------------------------------
 def _ep_model_config(ep_size, n_routed=256, world_size=4, use_cuda_graph=True):
-    """Mapping derives moe_tp_size = world_size // moe_ep_size, so the stub
-    must too -- the guard bounds moe_tp_size, not ep_size directly, and only
-    when CUDA graphs are on."""
+    """Mapping derives moe_tp_size = world_size // moe_ep_size, so the stub must
+    too. The only expert-parallel guard left is divisibility -- ep_size must
+    divide the routed-expert count -- so moe_tp_size and use_cuda_graph are
+    carried only to document the layout, not because the check reads them."""
     return SimpleNamespace(
         mapping=SimpleNamespace(moe_ep_size=ep_size, moe_tp_size=max(1, world_size // ep_size)),
         use_cuda_graph=use_cuda_graph,
@@ -1551,24 +1552,18 @@ def test_expert_parallel_accepts_the_measured_layouts(ep_size):
     InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(ep_size))
 
 
-def test_expert_parallel_rejects_whole_width_experts_under_cuda_graph():
-    """ep_size 4 on 4 GPUs leaves moe_tp_size 1, which segfaults during
-    CUDA-graph capture -- after the model and KV cache are up, with no Python
-    traceback. Refuse that combination rather than hand the user an
-    unexplained SIGSEGV."""
+@pytest.mark.parametrize("use_cuda_graph", [True, False])
+def test_expert_parallel_accepts_whole_width_experts(use_cuda_graph):
+    """ep_size 4 on 4 GPUs leaves moe_tp_size 1 (whole-width experts). With and
+    without CUDA graphs this reproduces the TP-only GSM8K result per item (acc
+    0.9667, zero score flips). The pure-EP + CUDA-graph capture segfault that
+    once made this combination raise is fixed (verified end to end at tp_size=4,
+    moe_ep_size=4, --use_cuda_graph), so no layout is refused here."""
     from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
 
-    with pytest.raises(ValueError, match="CUDA-graph capture"):
-        InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4))
-
-
-def test_expert_parallel_allows_whole_width_experts_without_cuda_graph():
-    """Measured working: ep_size 4 with cuda_graph off reproduces the TP-only
-    GSM8K result per item (acc 0.9667, zero score flips). The guard must not
-    remove a usable layout -- only the combination that crashes."""
-    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
-
-    InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4, use_cuda_graph=False))
+    InklingForCausalLM._assert_inkling_moe_parallel(
+        _ep_model_config(4, use_cuda_graph=use_cuda_graph)
+    )
 
 
 @pytest.mark.parametrize("ep_size", [3, 5, 6, 7, 24])
