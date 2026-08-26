@@ -17,8 +17,8 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
-    IdentityCheckPolicy, PostTransformConfigIdentity, PostTransformFeature,
-    PostTransformProfile, PostTransformProfileRegistry,
+    IdentityCheckPolicy, LazyRootModelClass, PostTransformConfigIdentity,
+    PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     check_weight_sharing_compatibility)
@@ -379,45 +379,40 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
-    _POST_TRANSFORM_PROFILE_REGISTRY: Optional[
-        PostTransformProfileRegistry] = None
+
+    # Root classes are named rather than held, so this table costs no model-zoo
+    # import; qualify() resolves only the profile whose class name matches the
+    # model being loaded.
+    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(profiles=(
+        PostTransformProfile(
+            profile_id="llama-for-causal-lm-target-v1",
+            root_model_class=LazyRootModelClass(
+                "tensorrt_llm._torch.models.modeling_llama",
+                "LlamaForCausalLM"),
+            architecture="LlamaForCausalLM",
+            model_type="llama",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen2-for-causal-lm-bf16-target-v1",
+            root_model_class=LazyRootModelClass(
+                "tensorrt_llm._torch.models.modeling_qwen", "Qwen2ForCausalLM"),
+            architecture="Qwen2ForCausalLM",
+            model_type="qwen2",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+    ))
 
     @classmethod
     def _post_transform_profile_registry(cls) -> PostTransformProfileRegistry:
-        # Built on first use: the profile references a model-zoo class, and
-        # importing it here (not at module level) keeps the zoo lazy for
-        # processes that import model_loader but never qualify a model.
-        if cls._POST_TRANSFORM_PROFILE_REGISTRY is None:
-            from ..models.modeling_llama import LlamaForCausalLM
-            from ..models.modeling_qwen import Qwen2ForCausalLM
-            cls._POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
-                profiles=(
-                    PostTransformProfile(
-                        profile_id="llama-for-causal-lm-target-v1",
-                        root_model_class=LlamaForCausalLM,
-                        architecture="LlamaForCausalLM",
-                        model_type="llama",
-                        speculative_mode=None,
-                        protocol_version=cls.
-                        _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-                        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-                        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-                        runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
-                    ),
-                    PostTransformProfile(
-                        profile_id="qwen2-for-causal-lm-bf16-target-v1",
-                        root_model_class=Qwen2ForCausalLM,
-                        architecture="Qwen2ForCausalLM",
-                        model_type="qwen2",
-                        speculative_mode=None,
-                        protocol_version=cls.
-                        _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-                        transform_abi_id=
-                        QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-                        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-                        runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
-                    ),
-                ))
         return cls._POST_TRANSFORM_PROFILE_REGISTRY
 
     def __init__(self,

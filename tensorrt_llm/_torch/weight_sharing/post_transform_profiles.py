@@ -26,6 +26,8 @@ qualified under the same architecture and lifecycle contract.
 
 from __future__ import annotations
 
+import importlib
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
@@ -323,11 +325,59 @@ class PostTransformQualificationReason(str, Enum):
 
 
 @dataclass(frozen=True)
+class LazyRootModelClass:
+    """A root-model class named now and imported only when a load matches it.
+
+    Profiles name classes from the lazily-imported PyTorch model zoo. Holding
+    the class object would import its module as soon as the registry is built,
+    pulling every profiled model into any process that qualifies any model.
+    ``class_name`` carries enough to answer ``qualify()``'s name filter, and
+    ``resolve()`` imports only when a candidate survives it.
+    """
+
+    module_name: str
+    class_name: str
+
+    def resolve(self) -> type[nn.Module]:
+        """Import the providing module and return the class.
+
+        Repeat calls are cheap; ``sys.modules`` serves the second one onward.
+        """
+        module = importlib.import_module(self.module_name)
+        return getattr(module, self.class_name)
+
+    def matches(self, candidate: type[nn.Module]) -> bool:
+        """Whether ``candidate`` is the very class this reference names.
+
+        Never loads a module, despite calling ``resolve()``: ``candidate`` can
+        only be this class if the defining module has already executed in this
+        interpreter, so the guard below turns every answer that would need a
+        load into a ``False`` and leaves ``resolve()`` reachable only once the
+        module is in ``sys.modules``. Callers can use this to screen candidates
+        while keeping the model zoo unloaded.
+
+        The test is object identity, so a same-named class from anywhere else
+        is rejected however closely it mimics this one; matching on
+        ``__name__`` would answer wrongly for a class exported under an alias.
+        """
+        if self.module_name not in sys.modules:
+            return False
+        # Guarded above, so this resolves out of sys.modules without importing.
+        return self.resolve() is candidate
+
+
+@dataclass(frozen=True)
 class PostTransformProfile:
-    """One exact root-model profile qualified for post-transform sharing."""
+    """One exact root-model profile qualified for post-transform sharing.
+
+    ``root_model_class`` holds the root class either directly or as a
+    ``LazyRootModelClass``. Read it through ``root_model_class_name`` to
+    identify the class without importing anything, or through
+    ``resolved_root_model_class`` to obtain the class itself.
+    """
 
     profile_id: str
-    root_model_class: type[nn.Module]
+    root_model_class: type[nn.Module] | LazyRootModelClass
     architecture: str
     model_type: str
     speculative_mode: str | None
@@ -355,6 +405,19 @@ class PostTransformProfile:
             raise TypeError(
                 "Post-transform runtime_constraints must be PostTransformRuntimeConstraints"
             )
+
+    @property
+    def root_model_class_name(self) -> str:
+        """Name of the profiled root class, readable without importing it."""
+        if isinstance(self.root_model_class, LazyRootModelClass):
+            return self.root_model_class.class_name
+        return self.root_model_class.__name__
+
+    def matches_root_model_class(self, candidate: type[nn.Module]) -> bool:
+        """Whether ``candidate`` is exactly this profile's root class."""
+        if isinstance(self.root_model_class, LazyRootModelClass):
+            return self.root_model_class.matches(candidate)
+        return self.root_model_class is candidate
 
 
 @dataclass(frozen=True)
@@ -427,8 +490,10 @@ class PostTransformProfileRegistry:
         object.__setattr__(self, "profiles", tuple(self.profiles))
 
         profile_ids: set[str] = set()
+        # Keyed by root class *name*: resolving a LazyRootModelClass here would
+        # import every profiled model's module just to construct the registry.
         profile_keys: dict[
-            tuple[type[nn.Module], str, str, str | None, int, PostTransformTransferScope],
+            tuple[str, str, str, str | None, int, PostTransformTransferScope],
             list[PostTransformProfile],
         ] = {}
         for profile in self.profiles:
@@ -437,7 +502,7 @@ class PostTransformProfileRegistry:
             profile_ids.add(profile.profile_id)
 
             key = (
-                profile.root_model_class,
+                profile.root_model_class_name,
                 profile.architecture,
                 profile.model_type,
                 profile.speculative_mode,
@@ -448,7 +513,7 @@ class PostTransformProfileRegistry:
                 if profile.runtime_constraints.overlaps(existing_profile.runtime_constraints):
                     raise ValueError(
                         "Duplicate post-transform profile for "
-                        f"{profile.root_model_class.__name__}/{profile.architecture}/"
+                        f"{profile.root_model_class_name}/{profile.architecture}/"
                         f"{profile.model_type}/{profile.speculative_mode or 'target-only'}/"
                         f"v{profile.protocol_version}/{profile.transfer_scope.value}: "
                         "runtime constraints overlap"
@@ -487,7 +552,9 @@ class PostTransformProfileRegistry:
         """
 
         model_profiles = tuple(
-            profile for profile in self.profiles if profile.root_model_class is root_model_class
+            profile
+            for profile in self.profiles
+            if profile.matches_root_model_class(root_model_class)
         )
         if not model_profiles:
             return PostTransformQualificationDecision(

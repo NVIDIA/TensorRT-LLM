@@ -512,7 +512,7 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
     for profile in profiles:
         scope = profile.transfer_scope.value.replace("_", " ").capitalize()
         expected_row = (
-            f"| `{profile.profile_id}` | `{profile.root_model_class.__name__}` | "
+            f"| `{profile.profile_id}` | `{profile.root_model_class_name}` | "
             f"`{profile.architecture}` / `{profile.model_type}` | {scope} | "
             f"{profile.protocol_version} | `{profile.transform_abi_id}` | "
             f"{_documented_dense_constraints(profile)} |"
