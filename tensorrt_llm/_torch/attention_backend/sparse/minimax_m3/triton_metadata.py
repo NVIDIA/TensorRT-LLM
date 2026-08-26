@@ -324,7 +324,7 @@ def _build_runtime_metadata_fresh(
         prefix_lens_dev = prefix_lens.to(device) if prefix_lens.device != device else prefix_lens
         qo_lens_cpu = torch.tensor([int(x) for x in extend_seq_lens_cpu], dtype=torch.int32)
         qo_offset_cpu = prefix_lens.detach().to(device="cpu", dtype=torch.int32)
-        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+        req_to_token, slot_ids, out_cache_loc, _ = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,
@@ -351,7 +351,7 @@ def _build_runtime_metadata_fresh(
         # Decode: the new token sits at position seq_lens[b] - 1.
         qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
         qo_offset_cpu = seq_lens_cpu.detach().to(device="cpu", dtype=torch.int32) - 1
-        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+        req_to_token, slot_ids, out_cache_loc, _ = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,

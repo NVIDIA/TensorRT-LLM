@@ -11,6 +11,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import maybe_pin_memory
+
 from .common import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
@@ -108,36 +110,36 @@ def write_msa_main_kv(
 
 
 def build_kv_page_indices(
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,
+    block_ids_cpu: torch.Tensor,
     kv_lens_cpu: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Build the flattened per-request page table fmha_sm100 consumes.
+    """Build the flattened per-request page table fmha_sm100 consumes, on the host.
 
-    Returns int32 global page ids concatenated per request. A request's
-    pages come from the first slot of each page in its req_to_token row.
-    Page ids are global and non-contiguous in production, so they are not
-    clamped to a per-request bound.
+    Returns int32 global page ids concatenated per request, request b
+    contributing the first ceil(kv_len / page_size) entries of its
+    block_ids_cpu row. A request with kv_len <= 0 contributes nothing, matching
+    the page count the plan derives from the same lengths. Page ids are global
+    and non-contiguous in production, so they are not clamped to a per-request
+    bound.
+
+    block_ids_cpu is the [batch, max_blocks] host table
+    build_paged_kv_slot_mapping obtains from the cache manager. Both use the
+    manager's tokens_per_block as the page size, so
+    req_to_token[b, p * page_size] // page_size equals block_ids_cpu[b, p] and
+    the page table needs no device work. The result is pinned where that helps,
+    so the caller stages it with one asynchronous copy.
     """
-    device = req_to_token.device
-    req_rows = req_to_token.index_select(0, slot_ids.to(torch.long)).to(torch.long)
-    batch = int(req_rows.shape[0])
-    kv_lens_list = kv_lens_cpu.to(torch.long).tolist()
-
-    page_lists = []
-    for b in range(batch):
-        kv_len = int(kv_lens_list[b])
-        if kv_len <= 0:
-            continue
-        num_pages = (kv_len + page_size - 1) // page_size
-        page_starts = torch.arange(num_pages, device=device, dtype=torch.long) * page_size
-        page_ids = req_rows[b].gather(0, page_starts) // page_size
-        page_lists.append(page_ids.to(torch.int32))
-
-    if page_lists:
-        return torch.cat(page_lists, dim=0)
-    return torch.empty(0, dtype=torch.int32, device=device)
+    pages = (kv_lens_cpu.to(torch.long) + (page_size - 1)) // page_size
+    pages.clamp_(min=0)
+    total_pages = int(pages.sum())
+    if total_pages == 0:
+        return torch.empty(0, dtype=torch.int32)
+    batch = int(pages.shape[0])
+    row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), pages)
+    starts = torch.cumsum(pages, 0) - pages
+    col = torch.arange(total_pages, dtype=torch.long) - starts[row]
+    return maybe_pin_memory(block_ids_cpu[row, col].to(torch.int32))
 
 
 def per_token_valid_blocks(
