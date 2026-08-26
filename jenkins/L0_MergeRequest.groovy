@@ -356,24 +356,6 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def uploadBuildInfo(pipeline, globalVars)
-{
-    try {
-        def branch = globalVars[BUILD_BRANCH]
-        def buildInfo = "commit=${env.gitlabCommit}\n" +
-            "branch=${branch}\n" +
-            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
-            "jenkins_url=${env.BUILD_URL}"
-        writeFile file: 'build_info.txt', text: buildInfo
-        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-        pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception e) {
-        pipeline.echo "Upload Build Info failed: ${e.toString()}"
-    }
-}
-
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     sh "env | sort"
@@ -408,7 +390,20 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
     stage("Upload Build Info") {
-        uploadBuildInfo(pipeline, globalVars)
+        try {
+            def branch = globalVars[BUILD_BRANCH]
+            def buildInfo = "commit=${env.gitlabCommit}\n" +
+                "branch=${branch}\n" +
+                "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                "jenkins_url=${env.BUILD_URL}"
+            writeFile file: 'build_info.txt', text: buildInfo
+            trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+            pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            pipeline.echo "Upload Build Info failed: ${e.toString()}"
+        }
     }
     if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
