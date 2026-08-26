@@ -67,11 +67,32 @@ def _native() -> tuple[SimpleNamespace, MagicMock]:
 
 
 def _policy(native: SimpleNamespace) -> object:
-    return native.create_python_cold_page_codec.call_args.args[1]
+    return native.create_python_cold_page_codec.call_args.args[0]
 
 
-def _plans(native: SimpleNamespace) -> list[object]:
+def _layouts(native: SimpleNamespace) -> list[object]:
     return list(_policy(native)._layer_layouts.values())
+
+
+def _configure_lifecycle(native: SimpleNamespace, layer_bytes: dict[int, dict[str, int]]) -> object:
+    address = 0x10000
+    layers = {}
+    for layer_id, roles in layer_bytes.items():
+        hot = {}
+        for role, raw_bytes in roles.items():
+            hot[role] = SimpleNamespace(
+                raw_base=address,
+                raw_slot_bytes=(raw_bytes + 15) // 16 * 16,
+                raw_bytes=raw_bytes,
+            )
+            address += 0x10000
+        layers[layer_id] = hot
+    _policy(native).configure([SimpleNamespace(layers=layers)])
+    return _policy(native)._lifecycle_metadata[0]
+
+
+def _configure_policy(native: SimpleNamespace, raw_bytes: int) -> object:
+    return _configure_lifecycle(native, {0: {"key": raw_bytes, "value": raw_bytes}})
 
 
 def _write_quant_metadata(directory, algorithm="NVFP4"):
@@ -125,19 +146,31 @@ def test_optional_modelopt_scales_map_pp_layers_and_default_missing_layers(tmp_p
         )
 
     assert result is codec
-    plans = _plans(native)
-    assert [plan.layer_id for plan in plans] == [0, 1, 2]
-    assert [plan.runtime_type for plan in plans] == [1] * 3
+    layouts = _layouts(native)
+    assert [layout.layer_id for layout in layouts] == [0, 1, 2]
+    assert _policy(native)._runtime_type == 1
     assert [
         (
-            tuple(buffer.scales.nvfp4_orig_quant for buffer in plan.buffers),
-            tuple(buffer.scales.nvfp4_quant_orig for buffer in plan.buffers),
+            tuple(buffer.scales.nvfp4_orig_quant for buffer in layout.buffers),
+            tuple(buffer.scales.nvfp4_quant_orig for buffer in layout.buffers),
         )
-        for plan in plans
+        for layout in layouts
     ] == [
         ((2.0, 4.0), (0.5, 0.25)),
         ((8.0, 16.0), (0.125, 0.0625)),
         ((1.0, 1.0), (1.0, 1.0)),
+    ]
+    metadata = _configure_lifecycle(
+        native,
+        {layer_id: {"key": 131072, "value": 131072} for layer_id in range(3)},
+    )
+    assert metadata.scales[:6].tolist() == [
+        [2.0, 0.5, 1.0, 1.0],
+        [4.0, 0.25, 1.0, 1.0],
+        [8.0, 0.125, 1.0, 1.0],
+        [16.0, 0.0625, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
     ]
 
 
@@ -154,7 +187,7 @@ def test_draft_codec_does_not_reuse_target_modelopt_scales(tmp_path) -> None:
             num_kv_heads_per_layer=(8,),
             head_dim_per_layer=(128,),
         )
-        target_plan = _plans(native)[0]
+        target_layout = _layouts(native)[0]
         manager.create_cold_page_codec(
             _cache_config((0, "attention")),
             runtime_dtype=DataType.BF16,
@@ -164,16 +197,16 @@ def test_draft_codec_does_not_reuse_target_modelopt_scales(tmp_path) -> None:
             is_draft=True,
         )
 
-    draft_plan = _plans(native)[0]
-    assert [buffer.scales.nvfp4_orig_quant for buffer in target_plan.buffers] == [
+    draft_layout = _layouts(native)[0]
+    assert [buffer.scales.nvfp4_orig_quant for buffer in target_layout.buffers] == [
         2.0,
         4.0,
     ]
-    assert [buffer.scales.nvfp4_orig_quant for buffer in draft_plan.buffers] == [
+    assert [buffer.scales.nvfp4_orig_quant for buffer in draft_layout.buffers] == [
         1.0,
         1.0,
     ]
-    assert [buffer.scales.nvfp4_quant_orig for buffer in draft_plan.buffers] == [
+    assert [buffer.scales.nvfp4_quant_orig for buffer in draft_layout.buffers] == [
         1.0,
         1.0,
     ]
@@ -193,24 +226,25 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
             head_dim_per_layer=(128,),
         )
 
-    plan = _plans(native)[0]
-    assert [buffer.role for buffer in plan.buffers] == ["key", "value"]
-    assert [buffer.data_offset for buffer in plan.buffers] == [0, 1280]
-    assert [buffer.scale_offset for buffer in plan.buffers] == [2560, 2720]
-    assert plan.cold_page_bytes == 2880
-    assert plan.padding_offset == plan.cold_page_bytes
-    assert plan.runtime_type == 0
-    assert plan.num_kv_heads == 4
-    assert plan.tokens_per_page == 5
-    assert plan.head_dim == 128
-    assert [buffer.scales.nvfp4_orig_quant for buffer in plan.buffers] == [
+    layout = _layouts(native)[0]
+    assert [buffer.role for buffer in layout.buffers] == ["key", "value"]
+    assert layout.num_kv_heads == 4
+    assert layout.tokens_per_page == 5
+    assert layout.head_dim == 128
+    assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         1.0,
         1.0,
     ]
-    assert [buffer.scales.nvfp4_quant_orig for buffer in plan.buffers] == [
+    assert [buffer.scales.nvfp4_quant_orig for buffer in layout.buffers] == [
         1.0,
         1.0,
     ]
+    metadata = _configure_policy(native, raw_bytes=5120)
+    assert metadata.runtime_type == 0
+    assert metadata.cold_page_bytes == 2880
+    assert metadata.wide[:2, 3].tolist() == [0, 1280]
+    assert metadata.wide[:2, 4].tolist() == [2560, 2720]
+    assert metadata.integers[:2, 0].tolist() == [0, 0]
 
 
 def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
@@ -237,12 +271,12 @@ def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
             head_dim_per_layer=(32,),
         )
 
-    plan = _plans(native)[0]
-    assert [buffer.role for buffer in plan.buffers] == ["key", "value"]
-    assert [buffer.data_offset for buffer in plan.buffers] == [0, 80]
-    assert [buffer.scale_offset for buffer in plan.buffers] == [160, 170]
-    assert plan.padding_offset == 180
-    assert plan.cold_page_bytes == 192
+    metadata = _configure_policy(native, raw_bytes=320)
+    assert metadata.cold_page_bytes == 192
+    assert metadata.wide[:2, 3].tolist() == [0, 80]
+    assert metadata.wide[:2, 4].tolist() == [160, 170]
+    assert metadata.wide[1, 5].item() == 180
+    assert metadata.integers[:2, 0].tolist() == [0, 12]
 
 
 def test_provider_creates_one_native_codec_per_kv_cache_manager():
@@ -269,16 +303,8 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
 
 def test_policy_forwards_a_4096_page_batch_through_one_custom_op(monkeypatch) -> None:
     native, _ = _native()
-    program = object()
-    prepare = MagicMock(return_value=program)
     encode = MagicMock()
     decode = MagicMock()
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "prepare_nvfp4_cold_page_program",
-        prepare,
-        raising=False,
-    )
     monkeypatch.setattr(
         torch.ops.trtllm,
         "nvfp4_cold_page_encode",
@@ -311,14 +337,98 @@ def test_policy_forwards_a_4096_page_batch_through_one_custom_op(monkeypatch) ->
         }
         properties = policy.configure([SimpleNamespace(layers={0: hot})])
 
-    assert prepare.call_count == 1
     assert properties[0].cold_page_bytes == 1152
     assert properties[0].page_index_location == "host"
 
     policy.encode(0, 0x3000, 0x4000, 4096, 0x5000)
     policy.decode(0, 0x3000, 0x4000, 4096, 0x5000)
-    encode.assert_called_once_with(program, 0x3000, 0x4000, 4096, 0x5000)
-    decode.assert_called_once_with(program, 0x3000, 0x4000, 4096, 0x5000)
+    metadata = policy._lifecycle_metadata[0]
+    for operation in (encode, decode):
+        operation.assert_called_once()
+        arguments = operation.call_args.args
+        assert arguments[0] is metadata.wide
+        assert arguments[1] is metadata.integers
+        assert arguments[2] is metadata.scales
+        assert arguments[3:] == (2, 128, 1152, 1, 0x3000, 0x4000, 4096, 0x5000)
+
+
+def test_policy_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
+    native, _ = _native()
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager().create_cold_page_codec(
+            _cache_config((0, "attention")),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(16,),
+        )
+
+    with torch.device("meta"):
+        metadata = _configure_policy(native, raw_bytes=2048)
+    assert metadata.wide.device.type == "cpu"
+    assert metadata.integers.device.type == "cpu"
+    assert metadata.scales.device.type == "cpu"
+
+
+def test_policy_rejects_invalid_resolved_hot_buffers() -> None:
+    native, _ = _native()
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager().create_cold_page_codec(
+            _cache_config((0, "attention")),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(16,),
+        )
+
+    policy = _policy(native)
+
+    def hot(raw_base: int = 0x1000, raw_bytes: int = 2048) -> SimpleNamespace:
+        return SimpleNamespace(
+            raw_base=raw_base,
+            raw_slot_bytes=2048,
+            raw_bytes=raw_bytes,
+        )
+
+    with pytest.raises(ValueError, match="roles do not match"):
+        policy.configure(
+            [SimpleNamespace(layers={0: {"key": hot(), "value": hot(), "extra": hot()}})]
+        )
+    with pytest.raises(ValueError, match="size does not match"):
+        policy.configure([SimpleNamespace(layers={0: {"key": hot(raw_bytes=32), "value": hot()}})])
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        policy.configure(
+            [SimpleNamespace(layers={0: {"key": hot(raw_base=0x1001), "value": hot()}})]
+        )
+
+
+def test_policy_rejects_more_than_256_lifecycle_buffers() -> None:
+    native, _ = _native()
+    layers = tuple(
+        AttentionLayerConfig(
+            layer_id=layer_id,
+            buffers=[
+                BufferConfig(role="key", size=32),
+                BufferConfig(role="value", size=32),
+            ],
+        )
+        for layer_id in range(129)
+    )
+    cache_config = SimpleNamespace(tokens_per_block=1, layers=layers)
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager().create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=tuple(range(129)),
+            num_kv_heads_per_layer=(1,) * 129,
+            head_dim_per_layer=(16,) * 129,
+        )
+
+    with pytest.raises(ValueError, match="maximum is 256"):
+        _configure_lifecycle(
+            native,
+            {layer_id: {"key": 32, "value": 32} for layer_id in range(129)},
+        )
 
 
 def test_unsupported_quant_does_not_construct_nvfp4_policy() -> None:
@@ -424,6 +534,13 @@ def test_scale_checkpoint_requires_kv_pair(tmp_path, present_kind):
         _load_modelopt_nvfp4_scales(str(tmp_path))
 
 
+def test_scale_checkpoint_requires_float32_reciprocals(tmp_path) -> None:
+    smallest_subnormal = torch.tensor(1e-45, dtype=torch.float32).item()
+    _write_scales(tmp_path, {7: (smallest_subnormal, smallest_subnormal)})
+    with pytest.raises(ValueError, match="representable as float32"):
+        _load_modelopt_nvfp4_scales(str(tmp_path))
+
+
 def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
     native, codec = _native()
     _write_scales(tmp_path, {4: (0.5, 0.25)})
@@ -435,9 +552,9 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
             num_kv_heads_per_layer=(0, 8),
             head_dim_per_layer=(128, 128),
         )
-        plan = _plans(native)[0]
-        assert plan.layer_id == 1
-        assert [buffer.scales.nvfp4_orig_quant for buffer in plan.buffers] == [
+        layout = _layouts(native)[0]
+        assert layout.layer_id == 1
+        assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
             2.0,
             4.0,
         ]
@@ -451,7 +568,7 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
         )
 
     assert result is codec
-    assert native.create_python_cold_page_codec.call_args.args[0] == ()
+    assert _policy(native).layer_ids == ()
 
 
 def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
@@ -479,21 +596,21 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
         )
 
     assert result is codec
-    plan = _plans(native)[0]
-    assert plan.layer_id == 0
-    assert plan.cold_page_bytes == 29184
-    assert plan.padding_offset == 29184
-    assert [buffer.role for buffer in plan.buffers] == ["key", "index_key"]
-    assert [buffer.scales is not None for buffer in plan.buffers] == [True, False]
-    assert [buffer.data_offset for buffer in plan.buffers] == [0, 20736]
-    assert [buffer.scale_offset for buffer in plan.buffers] == [18432, 0]
-    assert plan.runtime_type == 1
-    assert plan.num_kv_heads == 1
-    assert plan.tokens_per_page == 64
-    assert plan.head_dim == 576
-    scales = plan.buffers[0].scales
+    layout = _layouts(native)[0]
+    assert layout.layer_id == 0
+    assert [buffer.role for buffer in layout.buffers] == ["key", "index_key"]
+    assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
+    assert _policy(native)._runtime_type == 1
+    assert layout.num_kv_heads == 1
+    assert layout.tokens_per_page == 64
+    assert layout.head_dim == 576
+    scales = layout.buffers[0].scales
     assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
-    assert plan.buffers[1].scales is None
+    assert layout.buffers[1].scales is None
+    metadata = _configure_lifecycle(native, {0: {"key": 64 * 576 * 2, "index_key": 64 * 132}})
+    assert metadata.cold_page_bytes == 29184
+    assert metadata.wide[:2, 3].tolist() == [0, 20736]
+    assert metadata.wide[:2, 4].tolist() == [18432, 0]
 
 
 def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
@@ -521,19 +638,21 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
             head_dim_per_layer=(32,),
         )
 
-    plan = _plans(native)[0]
-    assert [buffer.role for buffer in plan.buffers] == [
+    layout = _layouts(native)[0]
+    assert [buffer.role for buffer in layout.buffers] == [
         "key",
         "index_key",
         "rope_state",
     ]
-    assert [buffer.scales is not None for buffer in plan.buffers] == [True, False, False]
-    assert [buffer.data_offset for buffer in plan.buffers] == [0, 90, 158]
-    assert plan.padding_offset == 165
-    assert plan.cold_page_bytes == 176
+    assert [buffer.scales is not None for buffer in layout.buffers] == [True, False, False]
+    metadata = _configure_lifecycle(native, {0: {"key": 320, "index_key": 68, "rope_state": 7}})
+    assert metadata.wide[:3, 3].tolist() == [0, 90, 158]
+    assert metadata.wide[2, 5].item() == 165
+    assert metadata.integers[2, 0].item() == 11
+    assert metadata.cold_page_bytes == 176
 
 
-def test_tokens_per_block_override_expands_lossless_bytes() -> None:
+def test_lossless_layout_uses_resolved_hot_buffer_bytes() -> None:
     native, _ = _native()
     cache_config = SimpleNamespace(
         tokens_per_block=4,
@@ -542,11 +661,7 @@ def test_tokens_per_block_override_expands_lossless_bytes() -> None:
                 layer_id=0,
                 buffers=[
                     BufferConfig(role="key", size=128),
-                    BufferConfig(
-                        role="index_key",
-                        size=3,
-                        tokens_per_block_override=2,
-                    ),
+                    BufferConfig(role="index_key", size=3),
                 ],
             ),
         ),
@@ -561,10 +676,11 @@ def test_tokens_per_block_override_expands_lossless_bytes() -> None:
             head_dim_per_layer=(16,),
         )
 
-    plan = _plans(native)[0]
-    assert [buffer.data_offset for buffer in plan.buffers] == [0, 36]
-    assert plan.padding_offset == 42
-    assert plan.cold_page_bytes == 48
+    metadata = _configure_lifecycle(native, {0: {"key": 128, "index_key": 6}})
+    assert metadata.wide[:2, 3].tolist() == [0, 36]
+    assert metadata.wide[1, 5].item() == 42
+    assert metadata.integers[1, 0].item() == 6
+    assert metadata.cold_page_bytes == 48
 
 
 @pytest.mark.parametrize(
@@ -604,10 +720,17 @@ def test_mla_model_layouts_are_built_in_python(
             head_dim_per_layer=(576,) * expected_layers,
         )
 
-    plans = _plans(native)
-    assert len(plans) == expected_layers
-    assert sum(len(plan.buffers) for plan in plans) == expected_buffers
-    assert sum(plan.cold_page_bytes for plan in plans) == expected_bytes
+    layouts = _layouts(native)
+    assert len(layouts) == expected_layers
+    assert sum(len(layout.buffers) for layout in layouts) == expected_buffers
+    layer_bytes = {
+        layer_id: {
+            "key": 64 * 576 * 2,
+            **({"index_key": 64 * (128 + 4)} if has_index else {}),
+        }
+        for layer_id, has_index in enumerate(owns_index)
+    }
+    assert _configure_lifecycle(native, layer_bytes).cold_page_bytes == expected_bytes
 
 
 def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
@@ -622,19 +745,19 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
             head_dim_per_layer=(128,),
         )
 
-    plan = _plans(native)[0]
-    assert plan.runtime_type == 2
-    assert [buffer.scales.nvfp4_orig_quant for buffer in plan.buffers] == [
+    layout = _layouts(native)[0]
+    assert _policy(native)._runtime_type == 2
+    assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         2.0,
         4.0,
     ]
-    assert [buffer.scales.nvfp4_quant_orig for buffer in plan.buffers] == [
+    assert [buffer.scales.nvfp4_quant_orig for buffer in layout.buffers] == [
         0.5,
         0.25,
     ]
     assert all(
         buffer.scales.fp8_orig_quant == buffer.scales.fp8_quant_orig == 1.0
-        for buffer in plan.buffers
+        for buffer in layout.buffers
     )
 
 

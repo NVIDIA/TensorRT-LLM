@@ -43,17 +43,22 @@ ResolvedHotLifecycle resolveLifecycle(kv::PoolGroupDesc const& gpuDesc, kv::Slot
     return result;
 }
 
-void drainAfterAlgorithmFailure(cudaStream_t stream) noexcept
+void drainAfterPolicyFailure(cudaStream_t stream) noexcept
 {
     auto const status = cudaStreamSynchronize(stream);
     if (status != cudaSuccess)
     {
-        TLLM_LOG_ERROR("Cold-page algorithm rollback drain failed: %s", cudaGetErrorString(status));
+        TLLM_LOG_ERROR("Cold-page policy rollback drain failed: %s", cudaGetErrorString(status));
         std::terminate();
     }
 }
 
 } // namespace
+
+NativeColdPageCodec::NativeColdPageCodec(std::set<kv::LayerId> layerIds)
+    : mLayerIds(std::move(layerIds))
+{
+}
 
 bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept
 {
@@ -65,9 +70,8 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             throw std::invalid_argument("Default lossless codec rejected GPU layouts");
         }
 
-        auto const& algorithmLayerIds = getLayerIds();
         std::map<kv::LayerGroupId, LayerGroupState> pendingGroups;
-        std::vector<ResolvedHotLifecycle> algorithmLifecycles;
+        std::vector<ResolvedHotLifecycle> policyLifecycles;
         std::set<kv::LayerId> consumedLayers;
 
         for (kv::PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numGpuDescs; ++poolGroupIndex)
@@ -76,31 +80,31 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             for (auto const& variant : gpuDesc.slotDesc.variants)
             {
                 auto resolved = resolveLifecycle(gpuDesc, variant);
-                auto const algorithmLayerCount = std::count_if(resolved.layers.begin(), resolved.layers.end(),
-                    [&algorithmLayerIds](auto const& layer) { return algorithmLayerIds.count(layer.first) != 0U; });
+                auto const policyLayerCount = std::count_if(resolved.layers.begin(), resolved.layers.end(),
+                    [this](auto const& layer) { return mLayerIds.count(layer.first) != 0U; });
 
                 LayerGroupState state;
-                if (algorithmLayerCount == 0U)
+                if (policyLayerCount == 0U)
                 {
                     state.coldPageBytes = losslessCodec->queryColdPageBytes(variant.lifeCycleId);
                     state.pageIndexLocation = losslessCodec->queryPageIndexLocation(variant.lifeCycleId);
                 }
                 else
                 {
-                    if (algorithmLayerCount != resolved.layers.size())
+                    if (policyLayerCount != resolved.layers.size())
                     {
-                        throw std::invalid_argument("A lifecycle cannot mix algorithm-owned and fallback layers");
+                        throw std::invalid_argument("A lifecycle cannot mix policy-owned and fallback layers");
                     }
                     for (auto const& [layerId, buffers] : resolved.layers)
                     {
                         static_cast<void>(buffers);
                         if (!consumedLayers.emplace(layerId).second)
                         {
-                            throw std::invalid_argument("An algorithm layer appears in multiple lifecycles");
+                            throw std::invalid_argument("A policy layer appears in multiple lifecycles");
                         }
                     }
-                    state.planIndex = algorithmLifecycles.size();
-                    algorithmLifecycles.push_back(std::move(resolved));
+                    state.lifecycleIndex = policyLifecycles.size();
+                    policyLifecycles.push_back(std::move(resolved));
                 }
 
                 if (!pendingGroups.emplace(variant.lifeCycleId, std::move(state)).second)
@@ -109,24 +113,24 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
                 }
             }
         }
-        if (consumedLayers != algorithmLayerIds)
+        if (consumedLayers != mLayerIds)
         {
-            throw std::invalid_argument("An algorithm layer is absent from all GPU descriptors");
+            throw std::invalid_argument("A policy layer is absent from all GPU descriptors");
         }
 
-        auto const properties = configureAlgorithm(algorithmLifecycles);
-        if (properties.size() != algorithmLifecycles.size())
+        auto const properties = configurePolicy(policyLifecycles);
+        if (properties.size() != policyLifecycles.size())
         {
-            throw std::invalid_argument("Cold-page algorithm returned an unexpected lifecycle count");
+            throw std::invalid_argument("Cold-page policy returned an unexpected lifecycle count");
         }
         for (std::size_t index = 0; index < properties.size(); ++index)
         {
             auto const& lifecycle = properties[index];
             if (lifecycle.coldPageBytes == 0U || lifecycle.pageIndexLocation == kv::PageIndexLocation::kBadLocation)
             {
-                throw std::invalid_argument("Cold-page algorithm returned invalid storage properties");
+                throw std::invalid_argument("Cold-page policy returned invalid storage properties");
             }
-            auto& state = pendingGroups.at(algorithmLifecycles[index].lifeCycleId);
+            auto& state = pendingGroups.at(policyLifecycles[index].lifeCycleId);
             state.coldPageBytes = lifecycle.coldPageBytes;
             state.pageIndexLocation = lifecycle.pageIndexLocation;
         }
@@ -174,7 +178,7 @@ kv::PageIndexLocation NativeColdPageCodec::queryPageIndexLocation(kv::LayerGroup
 bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
     std::size_t numBasePages, cudaStream_t stream) noexcept
 {
-    bool algorithmStarted = false;
+    bool policyStarted = false;
     try
     {
         auto const* state = findLayerGroup(layerGroupId);
@@ -186,28 +190,28 @@ bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr
         {
             return true;
         }
-        if (!state->planIndex)
+        if (!state->lifecycleIndex)
         {
             return mLosslessCodec->encode(layerGroupId, dstBasePtr, pageIndices, numBasePages, stream);
         }
-        algorithmStarted = true;
-        encodeAlgorithm(*state->planIndex, dstBasePtr, pageIndices, numBasePages, stream);
+        policyStarted = true;
+        encodePolicy(*state->lifecycleIndex, dstBasePtr, pageIndices, numBasePages, stream);
         return true;
     }
     catch (std::exception const& error)
     {
-        if (algorithmStarted)
+        if (policyStarted)
         {
-            drainAfterAlgorithmFailure(stream);
+            drainAfterPolicyFailure(stream);
         }
         TLLM_LOG_ERROR("NativeColdPageCodec::encode failed before completion fencing: %s", error.what());
         return false;
     }
     catch (...)
     {
-        if (algorithmStarted)
+        if (policyStarted)
         {
-            drainAfterAlgorithmFailure(stream);
+            drainAfterPolicyFailure(stream);
         }
         TLLM_LOG_ERROR("NativeColdPageCodec::encode failed before completion fencing: unknown error");
         return false;
@@ -217,7 +221,7 @@ bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr
 bool NativeColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr,
     kv::PageIndexPair const* pageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
 {
-    bool algorithmStarted = false;
+    bool policyStarted = false;
     try
     {
         auto const* state = findLayerGroup(layerGroupId);
@@ -229,28 +233,28 @@ bool NativeColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcB
         {
             return true;
         }
-        if (!state->planIndex)
+        if (!state->lifecycleIndex)
         {
             return mLosslessCodec->decode(layerGroupId, srcBasePtr, pageIndices, numBasePages, stream);
         }
-        algorithmStarted = true;
-        decodeAlgorithm(*state->planIndex, srcBasePtr, pageIndices, numBasePages, stream);
+        policyStarted = true;
+        decodePolicy(*state->lifecycleIndex, srcBasePtr, pageIndices, numBasePages, stream);
         return true;
     }
     catch (std::exception const& error)
     {
-        if (algorithmStarted)
+        if (policyStarted)
         {
-            drainAfterAlgorithmFailure(stream);
+            drainAfterPolicyFailure(stream);
         }
         TLLM_LOG_ERROR("NativeColdPageCodec::decode failed before completion fencing: %s", error.what());
         return false;
     }
     catch (...)
     {
-        if (algorithmStarted)
+        if (policyStarted)
         {
-            drainAfterAlgorithmFailure(stream);
+            drainAfterPolicyFailure(stream);
         }
         TLLM_LOG_ERROR("NativeColdPageCodec::decode failed before completion fencing: unknown error");
         return false;

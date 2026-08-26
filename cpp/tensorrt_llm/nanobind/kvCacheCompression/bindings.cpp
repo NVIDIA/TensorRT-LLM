@@ -50,18 +50,10 @@ static_assert(offsetof(kv::PageIndexPair, src) == offsetof(compression::ColdPage
 class PythonColdPageCodec final : public compression::NativeColdPageCodec
 {
 public:
-    PythonColdPageCodec(std::vector<kv::LayerId> layerIds, nb::handle policy)
-        : mLayerIds(layerIds.begin(), layerIds.end())
+    explicit PythonColdPageCodec(nb::handle policy)
+        : NativeColdPageCodec(readLayerIds(policy))
         , mPolicy(policy.ptr())
     {
-        if (mLayerIds.size() != layerIds.size())
-        {
-            throw std::invalid_argument("Cold-page policy layer IDs must be unique");
-        }
-        if (policy.is_none())
-        {
-            throw std::invalid_argument("Cold-page policy must not be None");
-        }
         Py_INCREF(mPolicy);
     }
 
@@ -75,12 +67,22 @@ public:
     }
 
 private:
-    [[nodiscard]] std::set<kv::LayerId> const& getLayerIds() const noexcept override
+    static std::set<kv::LayerId> readLayerIds(nb::handle policy)
     {
-        return mLayerIds;
+        if (policy.is_none())
+        {
+            throw std::invalid_argument("Cold-page policy must not be None");
+        }
+        auto const layerIds = nb::cast<std::vector<kv::LayerId>>(policy.attr("layer_ids"));
+        std::set<kv::LayerId> result(layerIds.begin(), layerIds.end());
+        if (result.size() != layerIds.size())
+        {
+            throw std::invalid_argument("Cold-page policy layer IDs must be unique");
+        }
+        return result;
     }
 
-    std::vector<compression::ColdPageLifecycleProperties> configureAlgorithm(
+    std::vector<compression::ColdPageLifecycleProperties> configurePolicy(
         std::vector<compression::ResolvedHotLifecycle> const& lifecycles) override
     {
         nb::gil_scoped_acquire acquire;
@@ -95,27 +97,27 @@ private:
         }
     }
 
-    void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+    void encodePolicy(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
-        invoke("encode", planIndex, coldBase, pageIndices, numPages, stream);
+        invoke("encode", lifecycleIndex, coldBase, pageIndices, numPages, stream);
     }
 
-    void decodeAlgorithm(std::size_t planIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    void decodePolicy(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
-        invoke("decode", planIndex, coldBase, pageIndices, numPages, stream);
+        invoke("decode", lifecycleIndex, coldBase, pageIndices, numPages, stream);
     }
 
     template <typename ColdPointer>
-    void invoke(char const* method, std::size_t planIndex, ColdPointer coldBase, kv::PageIndexPair const* pageIndices,
-        std::size_t numPages, cudaStream_t stream)
+    void invoke(char const* method, std::size_t lifecycleIndex, ColdPointer coldBase,
+        kv::PageIndexPair const* pageIndices, std::size_t numPages, cudaStream_t stream)
     {
         // Forward the complete KVCM batch once. The method custom op owns any launch chunking.
         nb::gil_scoped_acquire acquire;
         try
         {
-            nb::borrow<nb::object>(mPolicy).attr(method)(planIndex, reinterpret_cast<std::uintptr_t>(coldBase),
+            nb::borrow<nb::object>(mPolicy).attr(method)(lifecycleIndex, reinterpret_cast<std::uintptr_t>(coldBase),
                 reinterpret_cast<std::uintptr_t>(pageIndices), numPages, reinterpret_cast<std::uintptr_t>(stream));
         }
         catch (nb::python_error const& error)
@@ -124,14 +126,12 @@ private:
         }
     }
 
-    std::set<kv::LayerId> mLayerIds;
     PyObject* mPolicy;
 };
 
-std::unique_ptr<kv::IKvCacheColdPageCodec> createPythonColdPageCodec(
-    std::vector<kv::LayerId> layerIds, nb::handle policy)
+std::unique_ptr<kv::IKvCacheColdPageCodec> createPythonColdPageCodec(nb::handle policy)
 {
-    return std::make_unique<PythonColdPageCodec>(std::move(layerIds), policy);
+    return std::make_unique<PythonColdPageCodec>(policy);
 }
 
 } // namespace
@@ -158,7 +158,7 @@ void initBindings(nb::module_& module)
         .def_rw("cold_page_bytes", &compression::ColdPageLifecycleProperties::coldPageBytes)
         .def_rw("page_index_location", &compression::ColdPageLifecycleProperties::pageIndexLocation);
 
-    module.def("create_python_cold_page_codec", &createPythonColdPageCodec, nb::arg("layer_ids"), nb::arg("policy"));
+    module.def("create_python_cold_page_codec", &createPythonColdPageCodec, nb::arg("policy"));
 }
 
 } // namespace tensorrt_llm::nanobind::kv_cache_compression

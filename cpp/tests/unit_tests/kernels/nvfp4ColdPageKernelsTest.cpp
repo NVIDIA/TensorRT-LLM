@@ -41,12 +41,98 @@ namespace
 
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::HostMem;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::MemAddress;
-using tensorrt_llm::kernels::Nvfp4ColdPageBufferPlan;
 using tensorrt_llm::kernels::ColdPageIndexPair;
-using tensorrt_llm::kernels::Nvfp4ColdPageKernelParams;
-using tensorrt_llm::kernels::Nvfp4ColdPagePreparedPlan;
+using tensorrt_llm::kernels::Nvfp4ColdPageIntegerTable;
 using tensorrt_llm::kernels::Nvfp4ColdPageRuntimeType;
-using tensorrt_llm::kernels::Nvfp4ColdPageTransform;
+using tensorrt_llm::kernels::Nvfp4ColdPageScaleTable;
+using tensorrt_llm::kernels::Nvfp4ColdPageWideTable;
+
+struct Nvfp4ColdPageKernelParams
+{
+    std::int32_t numKvHeads;
+    std::int32_t tokensPerPage;
+    std::int32_t headDim;
+    float nvfp4ScaleOrigQuant;
+    float nvfp4ScaleQuantOrig;
+    float fp8ScaleOrigQuant;
+    float fp8ScaleQuantOrig;
+};
+
+enum class Nvfp4ColdPageTransform : std::int32_t
+{
+    kNvfp4 = 0,
+    kLosslessCopy = 1,
+};
+
+struct Nvfp4ColdPageTestBuffer
+{
+    std::uintptr_t rawBase;
+    std::size_t rawSlotBytes;
+    std::size_t rawBytes;
+    std::size_t coldDataOffset;
+    std::size_t coldScaleOffset;
+    std::size_t coldPaddingOffset;
+    std::uint32_t coldPaddingBytes;
+    Nvfp4ColdPageTransform transform;
+    Nvfp4ColdPageKernelParams params;
+};
+
+struct Nvfp4ColdPageTestMetadata
+{
+    Nvfp4ColdPageWideTable wide{};
+    Nvfp4ColdPageIntegerTable integers{};
+    Nvfp4ColdPageScaleTable scales{};
+    std::uint32_t numBuffers{};
+    std::uint32_t maxHalfGroupsPerTile{};
+    std::size_t coldPageBytes{};
+    Nvfp4ColdPageRuntimeType runtimeType{};
+};
+
+Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPageTestBuffer> const& buffers,
+    std::size_t coldPageBytes, Nvfp4ColdPageRuntimeType runtimeType)
+{
+    Nvfp4ColdPageTestMetadata metadata;
+    metadata.numBuffers = static_cast<std::uint32_t>(buffers.size());
+    metadata.coldPageBytes = coldPageBytes;
+    metadata.runtimeType = runtimeType;
+    for (std::size_t index = 0; index < buffers.size(); ++index)
+    {
+        auto const& buffer = buffers[index];
+        metadata.wide[index]
+            = {static_cast<std::int64_t>(buffer.rawBase), static_cast<std::int64_t>(buffer.rawSlotBytes),
+                static_cast<std::int64_t>(buffer.rawBytes), static_cast<std::int64_t>(buffer.coldDataOffset),
+                static_cast<std::int64_t>(buffer.coldScaleOffset), static_cast<std::int64_t>(buffer.coldPaddingOffset)};
+        metadata.integers[index]
+            = {static_cast<std::int32_t>(buffer.coldPaddingBytes), static_cast<std::int32_t>(buffer.transform),
+                buffer.params.numKvHeads, buffer.params.tokensPerPage, buffer.params.headDim};
+        metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
+            buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
+        if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4)
+        {
+            auto const halfGroups = static_cast<std::uint32_t>(buffer.params.numKvHeads)
+                * static_cast<std::uint32_t>(buffer.params.tokensPerPage)
+                * (static_cast<std::uint32_t>(buffer.params.headDim) / 8U);
+            metadata.maxHalfGroupsPerTile = std::max(metadata.maxHalfGroupsPerTile, std::min(halfGroups, 2048U));
+        }
+    }
+    return metadata;
+}
+
+void invokeNvfp4ColdPageEncode(void const* pages, std::size_t numPages, Nvfp4ColdPageTestMetadata const& metadata,
+    void* coldBase, cudaStream_t stream)
+{
+    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(pages, numPages, metadata.wide.front().data(),
+        metadata.integers.front().data(), metadata.scales.front().data(), metadata.numBuffers,
+        metadata.maxHalfGroupsPerTile, metadata.coldPageBytes, metadata.runtimeType, coldBase, stream);
+}
+
+void invokeNvfp4ColdPageDecode(void const* pages, std::size_t numPages, Nvfp4ColdPageTestMetadata const& metadata,
+    void const* coldBase, cudaStream_t stream)
+{
+    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(pages, numPages, metadata.wide.front().data(),
+        metadata.integers.front().data(), metadata.scales.front().data(), metadata.numBuffers,
+        metadata.maxHalfGroupsPerTile, metadata.coldPageBytes, metadata.runtimeType, coldBase, stream);
+}
 
 constexpr std::size_t kGuardBytes = 64;
 constexpr std::uint8_t kCanary = 0xA5;
@@ -516,14 +602,13 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     std::size_t const scale = scaleBytes(geometry);
     std::size_t const payloadBytes = 2U * (packed + scale);
     std::uint32_t const paddingBytes = static_cast<std::uint32_t>(compactSlotBytes - payloadBytes);
-    std::vector<Nvfp4ColdPageBufferPlan> const inputBuffers{
+    std::vector<Nvfp4ColdPageTestBuffer> const inputBuffers{
         {reinterpret_cast<std::uintptr_t>(rawInputK.data()), rawSlotBytes, rawSlotBytes, 0U, 2U * packed, 0U, 0U,
             Nvfp4ColdPageTransform::kNvfp4, params[0]},
         {reinterpret_cast<std::uintptr_t>(rawInputV.data()), rawSlotBytes, rawSlotBytes, packed, 2U * packed + scale,
             payloadBytes, paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params[1]}};
 
-    auto const inputPlan
-        = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(inputBuffers, compactSlotBytes, runtimeType(kind));
+    auto const inputMetadata = makeNvfp4ColdPageTestMetadata(inputBuffers, compactSlotBytes, runtimeType(kind));
     std::vector<std::array<ReferenceNvfp4, 2>> references(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
     {
@@ -558,8 +643,7 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         }
     };
 
-    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
-        offloadTasks.data(), offloadTasks.size(), inputPlan, compactBase, stream);
+    invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), inputMetadata, compactBase, stream);
 
     if (synchronizeBetweenDirections)
     {
@@ -580,8 +664,7 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
             {
                 std::memset(compactBase + (2U * page + 1U) * compactSlotBytes, 0x5A, compactSlotBytes);
             }
-            tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
-                offloadTasks.data(), offloadTasks.size(), inputPlan, compactBase, stream);
+            invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), inputMetadata, compactBase, stream);
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
             EXPECT_EQ(compactPages.payload(), firstSerialization);
             verifyCompressedPages();
@@ -596,15 +679,13 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         std::size_t const coldSlot = rawSlot + 1U;
         onboardTasks.push_back({static_cast<std::int32_t>(rawSlot), static_cast<std::int32_t>(coldSlot)});
     }
-    std::vector<Nvfp4ColdPageBufferPlan> const outputBuffers{
+    std::vector<Nvfp4ColdPageTestBuffer> const outputBuffers{
         {reinterpret_cast<std::uintptr_t>(rawOutputK.data()), rawSlotBytes, rawSlotBytes, 0U, 2U * packed, 0U, 0U,
             Nvfp4ColdPageTransform::kNvfp4, params[0]},
         {reinterpret_cast<std::uintptr_t>(rawOutputV.data()), rawSlotBytes, rawSlotBytes, packed, 2U * packed + scale,
             payloadBytes, paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params[1]}};
-    auto const outputPlan
-        = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(outputBuffers, compactSlotBytes, runtimeType(kind));
-    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
-        onboardTasks.data(), onboardTasks.size(), outputPlan, compactBase, stream);
+    auto const outputMetadata = makeNvfp4ColdPageTestMetadata(outputBuffers, compactSlotBytes, runtimeType(kind));
+    invokeNvfp4ColdPageDecode(onboardTasks.data(), onboardTasks.size(), outputMetadata, compactBase, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     if (!synchronizeBetweenDirections)
@@ -624,10 +705,8 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
                 references[page][role] = compressReference(restored, kind, params[role], geometry);
             }
         }
-        tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
-            offloadTasks.data(), offloadTasks.size(), outputPlan, compactBase, stream);
-        tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
-            onboardTasks.data(), onboardTasks.size(), inputPlan, compactBase, stream);
+        invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), outputMetadata, compactBase, stream);
+        invokeNvfp4ColdPageDecode(onboardTasks.data(), onboardTasks.size(), inputMetadata, compactBase, stream);
         ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         verifyCompressedPages();
     }
@@ -765,22 +844,20 @@ void runPartialPageTailIsolation(RawKind kind)
     std::size_t const payloadBytes = 2U * (packed + scale);
     auto const makeBuffers = [&](DeviceRegion const& rawK, DeviceRegion const& rawV)
     {
-        return std::vector<Nvfp4ColdPageBufferPlan>{
+        return std::vector<Nvfp4ColdPageTestBuffer>{
             {reinterpret_cast<std::uintptr_t>(rawK.data()), rawSlotBytes, rawSlotBytes, 0U, 2U * packed, 0U, 0U,
                 Nvfp4ColdPageTransform::kNvfp4, params[0]},
             {reinterpret_cast<std::uintptr_t>(rawV.data()), rawSlotBytes, rawSlotBytes, packed, 2U * packed + scale,
                 payloadBytes, static_cast<std::uint32_t>(compactSlotBytes - payloadBytes),
                 Nvfp4ColdPageTransform::kNvfp4, params[1]}};
     };
-    auto const inputPlan = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(
-        makeBuffers(rawInputK, rawInputV), compactSlotBytes, runtimeType(kind));
-    auto const outputPlan = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(
-        makeBuffers(rawOutputK, rawOutputV), compactSlotBytes, runtimeType(kind));
+    auto const inputMetadata
+        = makeNvfp4ColdPageTestMetadata(makeBuffers(rawInputK, rawInputV), compactSlotBytes, runtimeType(kind));
+    auto const outputMetadata
+        = makeNvfp4ColdPageTestMetadata(makeBuffers(rawOutputK, rawOutputV), compactSlotBytes, runtimeType(kind));
     CudaStream stream;
-    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
-        offloadTasks.data(), offloadTasks.size(), inputPlan, compactPages.data(), stream);
-    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
-        onboardTasks.data(), onboardTasks.size(), outputPlan, compactPages.data(), stream);
+    invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), inputMetadata, compactPages.data(), stream);
+    invokeNvfp4ColdPageDecode(onboardTasks.data(), onboardTasks.size(), outputMetadata, compactPages.data(), stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     for (std::size_t pair = 0; pair < kValidTokenCounts.size(); ++pair)
@@ -927,23 +1004,21 @@ void runUnaryMlaWithLosslessSideRoundTrip(RawKind kind)
 
     auto const makePlans = [&](DeviceRegion const& mla, DeviceRegion const& side)
     {
-        return std::vector<Nvfp4ColdPageBufferPlan>{
+        return std::vector<Nvfp4ColdPageTestBuffer>{
             {reinterpret_cast<std::uintptr_t>(mla.data()), mlaRawBytes, mlaRawBytes, 0U, mlaPackedBytes,
                 mlaPayloadBytes, static_cast<std::uint32_t>(gapBeforeSide), Nvfp4ColdPageTransform::kNvfp4, params},
             {reinterpret_cast<std::uintptr_t>(side.data()), sideSlotBytes, sideRawBytes, sideColdOffset, 0U,
                 sideColdEnd, static_cast<std::uint32_t>(coldPageBytes - sideColdEnd),
                 Nvfp4ColdPageTransform::kLosslessCopy, {}}};
     };
-    auto const inputPlan = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(
-        makePlans(mlaInput, sideInput), coldPageBytes, runtimeType(kind));
-    auto const outputPlan = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(
-        makePlans(mlaOutput, sideOutput), coldPageBytes, runtimeType(kind));
+    auto const inputMetadata
+        = makeNvfp4ColdPageTestMetadata(makePlans(mlaInput, sideInput), coldPageBytes, runtimeType(kind));
+    auto const outputMetadata
+        = makeNvfp4ColdPageTestMetadata(makePlans(mlaOutput, sideOutput), coldPageBytes, runtimeType(kind));
 
     CudaStream stream;
-    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
-        offloadTasks.data(), offloadTasks.size(), inputPlan, coldBase, stream);
-    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
-        onboardTasks.data(), onboardTasks.size(), outputPlan, coldBase, stream);
+    invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), inputMetadata, coldBase, stream);
+    invokeNvfp4ColdPageDecode(onboardTasks.data(), onboardTasks.size(), outputMetadata, coldBase, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     auto const cold = coldStorage.payload();
@@ -1026,10 +1101,10 @@ TEST(Nvfp4ColdPageWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
 
     std::array<std::array<std::vector<std::uint8_t>, 2>, numLayers> rawHost;
     std::array<std::array<ReferenceNvfp4, 2>, numLayers> references;
-    std::vector<Nvfp4ColdPageBufferPlan> inputPlans;
-    std::vector<Nvfp4ColdPageBufferPlan> outputPlans;
-    inputPlans.reserve(2U * numLayers);
-    outputPlans.reserve(2U * numLayers);
+    std::vector<Nvfp4ColdPageTestBuffer> inputMetadatas;
+    std::vector<Nvfp4ColdPageTestBuffer> outputMetadatas;
+    inputMetadatas.reserve(2U * numLayers);
+    outputMetadatas.reserve(2U * numLayers);
     for (std::size_t layer = 0; layer < numLayers; ++layer)
     {
         rawInputK[layer] = std::make_unique<DeviceRegion>(rawSlotBytes);
@@ -1055,19 +1130,19 @@ TEST(Nvfp4ColdPageWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
                 static_cast<std::uint32_t>(layerRecordStride - layerRecordBytes), Nvfp4ColdPageTransform::kNvfp4,
                 params[layer][1]});
         };
-        appendPlans(inputPlans, *rawInputK[layer], *rawInputV[layer]);
-        appendPlans(outputPlans, *rawOutputK[layer], *rawOutputV[layer]);
+        appendPlans(inputMetadatas, *rawInputK[layer], *rawInputV[layer]);
+        appendPlans(outputMetadatas, *rawOutputK[layer], *rawOutputV[layer]);
     }
 
     MappedHostRegion compactPage(coldPageBytes);
     CudaStream stream;
-    auto const inputPlan = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(
-        inputPlans, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
-    auto const outputPlan = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(
-        outputPlans, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
+    auto const inputMetadata
+        = makeNvfp4ColdPageTestMetadata(inputMetadatas, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
+    auto const outputMetadata
+        = makeNvfp4ColdPageTestMetadata(outputMetadatas, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
     ColdPageIndexPair const page{0, 0};
-    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(&page, 1U, inputPlan, compactPage.data(), stream);
-    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(&page, 1U, outputPlan, compactPage.data(), stream);
+    invokeNvfp4ColdPageEncode(&page, 1U, inputMetadata, compactPage.data(), stream);
+    invokeNvfp4ColdPageDecode(&page, 1U, outputMetadata, compactPage.data(), stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     auto const compact = compactPage.payload();
@@ -1106,7 +1181,7 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
 
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawK;
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawV;
-    std::vector<Nvfp4ColdPageBufferPlan> buffers;
+    std::vector<Nvfp4ColdPageTestBuffer> buffers;
     buffers.reserve(2U * numLayers);
     for (std::size_t layer = 0; layer < numLayers; ++layer)
     {
@@ -1139,8 +1214,7 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
     }
 
     CudaStream stream;
-    auto const plan
-        = tensorrt_llm::kernels::prepareNvfp4ColdPagePlan(buffers, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
+    auto const plan = makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
     auto const expectWholePageKernels = [&](auto const& enqueue)
     {
         cudaGraph_t graph{};
@@ -1176,17 +1250,9 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
     };
 
     expectWholePageKernels(
-        [&]
-        {
-            tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
-                offloadPages.data(), offloadPages.size(), plan, coldPages.data(), stream);
-        });
+        [&] { invokeNvfp4ColdPageEncode(offloadPages.data(), offloadPages.size(), plan, coldPages.data(), stream); });
     expectWholePageKernels(
-        [&]
-        {
-            tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
-                onboardPages.data(), onboardPages.size(), plan, coldPages.data(), stream);
-        });
+        [&] { invokeNvfp4ColdPageDecode(onboardPages.data(), onboardPages.size(), plan, coldPages.data(), stream); });
 }
 
 TEST(Nvfp4ColdPageWholePageTest, TwoHundredFiftySevenPagesUseExactlyTwoWholePageKernelsPerDirection)
@@ -1223,122 +1289,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST(Nvfp4ColdPageValidationTest, EmptyBatchIsAnAsyncNoOp)
 {
-    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(nullptr, 0U, Nvfp4ColdPagePreparedPlan{}, nullptr, nullptr);
-    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(nullptr, 0U, Nvfp4ColdPagePreparedPlan{}, nullptr, nullptr);
-}
-
-TEST(Nvfp4ColdPageValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    if (!tensorrt_llm::common::isSM100Family())
-    {
-        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
-    }
-
-    std::size_t const rawSlotBytes = rawBytes(RawKind::kFloat16, kDefaultGeometry);
-    LayerBuffers buffers(rawSlotBytes);
-    std::size_t const coldPageBytes = 2U * (packedBytes(kDefaultGeometry) + scaleBytes(kDefaultGeometry));
-    auto const prepare =
-        [&](Nvfp4ColdPageKernelParams const& params, Nvfp4ColdPageRuntimeType type = Nvfp4ColdPageRuntimeType::kFloat16)
-    {
-        std::size_t activeRawBytes = rawSlotBytes;
-        std::size_t dataBytes = packedBytes(kDefaultGeometry);
-        std::size_t scales = scaleBytes(kDefaultGeometry);
-        if (params.numKvHeads > 0 && params.tokensPerPage > 0 && params.headDim > 0)
-        {
-            std::uint64_t const elements = static_cast<std::uint64_t>(params.numKvHeads)
-                * static_cast<std::uint64_t>(params.tokensPerPage) * static_cast<std::uint64_t>(params.headDim);
-            std::uint64_t const candidateRawBytes = elements * (type == Nvfp4ColdPageRuntimeType::kFp8E4m3 ? 1U : 2U);
-            if (candidateRawBytes > 0U && candidateRawBytes <= rawSlotBytes)
-            {
-                activeRawBytes = static_cast<std::size_t>(candidateRawBytes);
-                dataBytes = static_cast<std::size_t>(elements / 2U);
-                scales = static_cast<std::size_t>(elements / 16U);
-            }
-        }
-        Nvfp4ColdPageBufferPlan const buffer{reinterpret_cast<std::uintptr_t>(buffers.rawK.data()), rawSlotBytes,
-            activeRawBytes, 0U, dataBytes, dataBytes + scales,
-            static_cast<std::uint32_t>(coldPageBytes - dataBytes - scales), Nvfp4ColdPageTransform::kNvfp4, params};
-        static_cast<void>(tensorrt_llm::kernels::prepareNvfp4ColdPagePlan({buffer}, coldPageBytes, type));
-    };
-    auto const expectInvalid
-        = [&](char const* name, auto const& mutate, Nvfp4ColdPageRuntimeType type = Nvfp4ColdPageRuntimeType::kFloat16)
-    {
-        SCOPED_TRACE(name);
-        auto params = makeParams();
-        mutate(params);
-        EXPECT_ANY_THROW(prepare(params, type));
-    };
-
-    auto valid = makeParams();
-    valid.tokensPerPage = 6;
-    EXPECT_NO_THROW(prepare(valid));
-    EXPECT_NO_THROW(prepare(makeParams(PageGeometry{1, 1, 16})));
-
-    expectInvalid("zero heads", [](auto& params) { params.numKvHeads = 0; });
-    expectInvalid("zero tokens", [](auto& params) { params.tokensPerPage = 0; });
-    expectInvalid("zero head dimension", [](auto& params) { params.headDim = 0; });
-    expectInvalid("unaligned head dimension", [](auto& params) { params.headDim = 24; });
-    expectInvalid(
-        "element count overflow", [](auto& params) { params.numKvHeads = std::numeric_limits<std::int32_t>::max(); });
-    expectInvalid("zero NVFP4 quant scale", [](auto& params) { params.nvfp4ScaleOrigQuant = 0.0F; });
-    expectInvalid("negative NVFP4 dequant scale", [](auto& params) { params.nvfp4ScaleQuantOrig = -1.0F; });
-    expectInvalid("NaN NVFP4 quant scale",
-        [](auto& params) { params.nvfp4ScaleOrigQuant = std::numeric_limits<float>::quiet_NaN(); });
-    expectInvalid("infinite NVFP4 dequant scale",
-        [](auto& params) { params.nvfp4ScaleQuantOrig = std::numeric_limits<float>::infinity(); });
-    expectInvalid(
-        "zero FP8 quant scale", [](auto& params) { params.fp8ScaleOrigQuant = 0.0F; },
-        Nvfp4ColdPageRuntimeType::kFp8E4m3);
-    expectInvalid(
-        "infinite FP8 dequant scale",
-        [](auto& params) { params.fp8ScaleQuantOrig = std::numeric_limits<float>::infinity(); },
-        Nvfp4ColdPageRuntimeType::kFp8E4m3);
-}
-
-TEST(Nvfp4ColdPageValidationTest, RejectsInvalidLaunchDescriptors)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    if (!tensorrt_llm::common::isSM100Family())
-    {
-        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
-    }
-
-    std::size_t const rawSlotBytes = rawBytes(RawKind::kFloat16, kDefaultGeometry);
-    LayerBuffers buffers(rawSlotBytes);
-    ColdPageIndexPair const validPage{0, 0};
-    std::size_t const coldPageBytes = 2U * (packedBytes(kDefaultGeometry) + scaleBytes(kDefaultGeometry));
-    std::size_t const packed = packedBytes(kDefaultGeometry);
-    std::size_t const scale = scaleBytes(kDefaultGeometry);
-    Nvfp4ColdPageBufferPlan const validBuffer{reinterpret_cast<std::uintptr_t>(buffers.rawK.data()), rawSlotBytes,
-        rawSlotBytes, 0U, packed, packed + scale, static_cast<std::uint32_t>(coldPageBytes - packed - scale),
-        Nvfp4ColdPageTransform::kNvfp4, makeParams()};
-    auto const prepare = [&](Nvfp4ColdPageBufferPlan const& buffer, std::size_t pageBytes,
-                             Nvfp4ColdPageRuntimeType type = Nvfp4ColdPageRuntimeType::kFloat16)
-    { return tensorrt_llm::kernels::prepareNvfp4ColdPagePlan({buffer}, pageBytes, type); };
-    auto const expectInvalid
-        = [&](char const* name, auto const& mutate, Nvfp4ColdPageRuntimeType type = Nvfp4ColdPageRuntimeType::kFloat16)
-    {
-        SCOPED_TRACE(name);
-        auto buffer = validBuffer;
-        mutate(buffer);
-        EXPECT_ANY_THROW(static_cast<void>(prepare(buffer, coldPageBytes, type)));
-    };
-    auto const validPlan = prepare(validBuffer, coldPageBytes);
-
-    expectInvalid("unaligned raw base", [](auto& buffer) { buffer.rawBase += 1U; });
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(&validPage, 1U, validPlan, nullptr, nullptr));
-    expectInvalid("unaligned raw stride", [](auto& buffer) { buffer.rawSlotBytes += alignof(uint4) / 2U; });
-    expectInvalid("raw bytes exceed stride", [](auto& buffer) { buffer.rawBytes = buffer.rawSlotBytes + 1U; });
-    expectInvalid("raw bytes mismatch geometry", [](auto& buffer) { buffer.rawBytes -= alignof(uint4); });
-    expectInvalid("cold data interval exceeds page", [&](auto& buffer) { buffer.coldDataOffset = coldPageBytes; });
-    expectInvalid("cold intervals overlap", [](auto& buffer) { buffer.coldScaleOffset = buffer.coldDataOffset; });
-    EXPECT_ANY_THROW(static_cast<void>(prepare(validBuffer, coldPageBytes + alignof(uint4) / 2U)));
-    expectInvalid(
-        "unaligned FP8 raw base", [](auto& buffer) { buffer.rawBase += 1U; }, Nvfp4ColdPageRuntimeType::kFp8E4m3);
-
-    auto const unsupportedType = static_cast<Nvfp4ColdPageRuntimeType>(255);
-    EXPECT_ANY_THROW(static_cast<void>(prepare(validBuffer, coldPageBytes, unsupportedType)));
+    invokeNvfp4ColdPageEncode(nullptr, 0U, Nvfp4ColdPageTestMetadata{}, nullptr, nullptr);
+    invokeNvfp4ColdPageDecode(nullptr, 0U, Nvfp4ColdPageTestMetadata{}, nullptr, nullptr);
 }
 
 } // namespace

@@ -49,6 +49,8 @@ struct ColdPageLifecycleProperties
 class NativeColdPageCodec : public kv::IKvCacheColdPageCodec
 {
 public:
+    explicit NativeColdPageCodec(std::set<kv::LayerId> layerIds);
+
     bool configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept final;
 
     [[nodiscard]] std::size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept final;
@@ -64,30 +66,29 @@ public:
         std::size_t numBasePages, cudaStream_t stream) noexcept final;
 
 private:
-    [[nodiscard]] virtual std::set<kv::LayerId> const& getLayerIds() const noexcept = 0;
-
-    virtual std::vector<ColdPageLifecycleProperties> configureAlgorithm(
+    virtual std::vector<ColdPageLifecycleProperties> configurePolicy(
         std::vector<ResolvedHotLifecycle> const& lifecycles)
         = 0;
 
     //! Enqueue only on stream; this codec drains partial submissions after a throw.
-    virtual void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+    virtual void encodePolicy(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream)
         = 0;
 
-    virtual void decodeAlgorithm(std::size_t planIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    virtual void decodePolicy(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream)
         = 0;
 
     struct LayerGroupState
     {
-        std::optional<std::size_t> planIndex;
+        std::optional<std::size_t> lifecycleIndex;
         std::size_t coldPageBytes = 0;
         kv::PageIndexLocation pageIndexLocation = kv::PageIndexLocation::kBadLocation;
     };
 
     [[nodiscard]] LayerGroupState const* findLayerGroup(kv::LayerGroupId layerGroupId) const noexcept;
 
+    std::set<kv::LayerId> mLayerIds;
     std::map<kv::LayerGroupId, LayerGroupState> mLayerGroups;
     std::unique_ptr<kv::IKvCacheColdPageCodec> mLosslessCodec;
 };

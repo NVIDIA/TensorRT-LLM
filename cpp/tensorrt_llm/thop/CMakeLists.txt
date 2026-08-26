@@ -38,6 +38,9 @@ target_link_libraries(th_utils PUBLIC ${SHARED_TARGET} ${TORCH_LIBRARIES}
                                       ${CUBLAS_LIB} ${CURAND_LIB})
 
 # TODO This does not compile with internal cutlass MOE gemm
+file(GLOB COLD_PAGE_METHOD_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/coldPageMethods/*.cu")
+
 add_library(
   th_common SHARED
   mlaPreprocessOp.cpp
@@ -111,7 +114,7 @@ add_library(
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
-  nvfp4ColdPageOp.cpp
+  ${COLD_PAGE_METHOD_SOURCES}
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
   IndexerKCacheGatherOp.cpp

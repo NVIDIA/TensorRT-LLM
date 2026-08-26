@@ -72,16 +72,11 @@ class RecordingCodec final : public NativeColdPageCodec
 {
 public:
     explicit RecordingCodec(std::set<kv::LayerId> layerIds)
-        : mLayerIds(std::move(layerIds))
+        : NativeColdPageCodec(std::move(layerIds))
     {
     }
 
-    [[nodiscard]] std::set<kv::LayerId> const& getLayerIds() const noexcept override
-    {
-        return mLayerIds;
-    }
-
-    std::vector<ColdPageLifecycleProperties> configureAlgorithm(
+    std::vector<ColdPageLifecycleProperties> configurePolicy(
         std::vector<ResolvedHotLifecycle> const& lifecycles) override
     {
         resolved = lifecycles;
@@ -93,7 +88,7 @@ public:
             lifecycles.size(), ColdPageLifecycleProperties{777U, kv::PageIndexLocation::kHost});
     }
 
-    void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+    void encodePolicy(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
         if (failBatches)
@@ -102,13 +97,13 @@ public:
             throw std::runtime_error("requested batch failure");
         }
         ++encodeCalls;
-        lastPlanIndex = planIndex;
+        lastLifecycleIndex = lifecycleIndex;
         lastColdBase = coldBase;
         lastIndices.assign(pageIndices, pageIndices + numPages);
         lastStream = stream;
     }
 
-    void decodeAlgorithm(std::size_t planIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    void decodePolicy(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
         if (failBatches)
@@ -117,7 +112,7 @@ public:
             throw std::runtime_error("requested batch failure");
         }
         ++decodeCalls;
-        lastPlanIndex = planIndex;
+        lastLifecycleIndex = lifecycleIndex;
         lastColdBase = coldBase;
         lastIndices.assign(pageIndices, pageIndices + numPages);
         lastStream = stream;
@@ -128,7 +123,7 @@ public:
     std::atomic_bool* failureMarker = nullptr;
     int encodeCalls = 0;
     int decodeCalls = 0;
-    std::size_t lastPlanIndex = 0;
+    std::size_t lastLifecycleIndex = 0;
     void const* lastColdBase = nullptr;
     cudaStream_t lastStream{};
     std::vector<kv::PageIndexPair> lastIndices;
@@ -145,8 +140,6 @@ private:
             throw std::runtime_error("failed to enqueue the requested batch failure marker");
         }
     }
-
-    std::set<kv::LayerId> mLayerIds;
 };
 
 TEST(NativeColdPageCodecTest, ResolvesKvcManagerLayoutAndForwardsWholeBatchOnce)
@@ -173,7 +166,7 @@ TEST(NativeColdPageCodecTest, ResolvesKvcManagerLayoutAndForwardsWholeBatchOnce)
     ASSERT_TRUE(
         codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), indices.data(), indices.size(), stream));
     EXPECT_EQ(codec.encodeCalls, 1);
-    EXPECT_EQ(codec.lastPlanIndex, 0U);
+    EXPECT_EQ(codec.lastLifecycleIndex, 0U);
     EXPECT_EQ(codec.lastIndices.size(), 4096U);
     EXPECT_EQ(codec.lastIndices.back().src, 4095);
     EXPECT_EQ(codec.lastColdBase, reinterpret_cast<void*>(kColdBase));
@@ -214,7 +207,7 @@ TEST(NativeColdPageCodecTest, RejectsMixedMissingAndDuplicateLifecycleMappings)
     }
 }
 
-TEST(NativeColdPageCodecTest, CatchesAlgorithmConfigureFailuresAndInvalidBatches)
+TEST(NativeColdPageCodecTest, CatchesPolicyConfigureFailuresAndInvalidBatches)
 {
     RecordingCodec codec{{0}};
     codec.failConfigure = true;
@@ -231,7 +224,7 @@ TEST(NativeColdPageCodecTest, CatchesAlgorithmConfigureFailuresAndInvalidBatches
     EXPECT_EQ(validCodec.decodeCalls, 0);
 }
 
-TEST(NativeColdPageCodecTest, AlgorithmFailureUsesTheSuppliedCudaStreamForRollback)
+TEST(NativeColdPageCodecTest, PolicyFailureUsesTheSuppliedCudaStreamForRollback)
 {
     int deviceCount = 0;
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0)

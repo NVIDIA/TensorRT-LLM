@@ -38,12 +38,12 @@ class ColdPageCodecPolicy(ABC):
 
     @abstractmethod
     def configure(self, lifecycles: Sequence[object]) -> Sequence[object]:
-        """Prepare one immutable method program per owned lifecycle."""
+        """Resolve each owned lifecycle into immutable method metadata."""
 
     @abstractmethod
     def encode(
         self,
-        program_index: int,
+        lifecycle_index: int,
         cold_base: int,
         page_indices: int,
         num_pages: int,
@@ -54,7 +54,7 @@ class ColdPageCodecPolicy(ABC):
     @abstractmethod
     def decode(
         self,
-        program_index: int,
+        lifecycle_index: int,
         cold_base: int,
         page_indices: int,
         num_pages: int,
