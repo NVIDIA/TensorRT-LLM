@@ -91,6 +91,9 @@ class DFlashForCausalLM(nn.Module):
 
         # Remove spec_config to prevent recursive spec-dec initialization
         draft_config_no_spec = replace(draft_config, spec_config=None, lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
