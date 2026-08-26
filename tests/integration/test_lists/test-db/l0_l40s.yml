@@ -34,6 +34,14 @@ l0_l40s:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
   # PyTorch: force NVFP4 Marlin on Ada to cover the SM89-compiled Marlin kernels.
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=1]
+  # Attention backends at head_dim=256 on Ada. This is the only CI arch that runs
+  # the sm86/89/120/121 XQA tiling (cpp/kernels/xqa/mha.cu: cacheVTileSeqLen=32),
+  # where head_dim=256 collapses gemm1NbWarpGrps to 1 and a warp group walks two V
+  # tiles per X iteration. sm90 uses the 64-token tiling and sm100+ never reaches
+  # XQA (mUseTllmGen), so neither l0_h100 nor l0_b200 covers this path. The gen
+  # phase batches 3 sequences with ~1k cached tokens, which clears the XQA
+  # selection heuristic (DecoderXQARunner::mayHavePerfGain) on this GPU.
+  - unittest/_torch/attention/test_attention_backends.py -k "hd256"
   # ------------- Encoder-decoder tests ---------------
   # Representative pre-merge set: eager smoke, CUDA-graph greedy/beam, kv-v2,
   # overlap scheduler, mBART, mixed batches.

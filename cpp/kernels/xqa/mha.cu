@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -2247,10 +2247,17 @@ CUBIN_EXPORT __global__
                   }
                   else
                   {
-                      assert(nbVItersPerXIter == 1);
-                      if ((idxBeam == beamWidth - 1 || isConvergedTile(seqIter)) && vIter == nbVItersPerXIter - 1)
+                      // The loaded page window covers exactly one V tile (nbPagesPerVTile pages starting at
+                      // idxPageBeg), so it must advance once per V tile -- by the per-warp-group V stride, not
+                      // by the whole X-iteration stride. Advancing per X iteration is only equivalent while
+                      // nbVItersPerXIter == 1. With more than one V tile per X iteration (cacheVTileSeqStride
+                      // == 32, i.e. cacheVTileSeqLen == 32 on the sm86/89/120/121 tiling combined with
+                      // gemm1NbWarpGrps == 1 at head_size 256) every tile after the first in an X iteration
+                      // kept the previous tile's pages, silently re-reading its V heads. seqOffset % tokensPerPage
+                      // is 0 for all of those tiles, so the in-page offset did not compensate either.
+                      auto const step = exactDiv(cacheVTileSeqStride, tokensPerPage);
+                      if (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))
                       {
-                          auto const step = exactDiv(xIterSeqStride, tokensPerPage);
                           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step >= nbPagesPerCtaTile
                                   ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
                                   : step);
