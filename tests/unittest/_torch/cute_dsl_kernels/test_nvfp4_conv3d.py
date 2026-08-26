@@ -32,33 +32,77 @@ def _require_sm100() -> None:
         pytest.skip(f"NVFP4 Conv3d requires SM100-family, got sm_{major}{minor}")
 
 
-def test_nvfp4_conv3d_bias_residual_epilogue_matches_reference() -> None:
-    """Exercise the product tactic and BF16 epilogue against the kernel reference."""
+@pytest.mark.parametrize(
+    ("ncdhw", "ktrs", "upper_pad_dhw", "lower_pad_dhw", "tactic"),
+    [
+        pytest.param(
+            (1, 128, 3, 8, 10),
+            (128, 3, 3, 3),
+            (0, 1, 2),
+            (0, 1, 0),
+            {
+                "mma_tiler_mn": (128, 128),
+                "preferred_cluster_shape_mn": (1, 1),
+                "fallback_cluster_shape_mn": (1, 1),
+                "use_2cta_instrs": False,
+            },
+            id="128x128-1cta-asymmetric-padding",
+        ),
+        pytest.param(
+            (1, 256, 3, 12, 16),
+            (256, 3, 3, 3),
+            (0, 1, 1),
+            (0, 1, 1),
+            {
+                "mma_tiler_mn": (256, 256),
+                "preferred_cluster_shape_mn": (2, 1),
+                "fallback_cluster_shape_mn": (2, 1),
+                "use_2cta_instrs": True,
+            },
+            id="256x256-2cta-product-tactic",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("use_bias", "beta"),
+    [
+        pytest.param(False, 0.0, id="no-epilogue"),
+        pytest.param(True, 0.0, id="bias"),
+        pytest.param(False, 1.0, id="residual"),
+        pytest.param(True, 1.0, id="bias-residual"),
+    ],
+)
+def test_nvfp4_conv3d_provider_refcheck(
+    ncdhw: tuple[int, int, int, int, int],
+    ktrs: tuple[int, int, int, int],
+    upper_pad_dhw: tuple[int, int, int],
+    lower_pad_dhw: tuple[int, int, int],
+    tactic: dict[str, object],
+    use_bias: bool,
+    beta: float,
+) -> None:
+    """Validate representative tactics and epilogues with the provider's BF16 reference."""
     _require_sm100()
 
     runtime_us = run(
-        ncdhw=(1, 128, 3, 12, 16),
-        ktrs=(256, 3, 3, 3),
+        ncdhw=ncdhw,
+        ktrs=ktrs,
         stride_dhw=(1, 1, 1),
-        upper_pad_dhw=(0, 1, 1),
-        lower_pad_dhw=(0, 1, 1),
+        upper_pad_dhw=upper_pad_dhw,
+        lower_pad_dhw=lower_pad_dhw,
         dil_dhw=(1, 1, 1),
         ab_dtype=cutlass.Float4E2M1FN,
         d_dtype=cutlass.BFloat16,
         acc_dtype=cutlass.Float32,
         sf_dtype=cutlass.Float8E4M3FN,
         sf_vec_size=16,
-        mma_tiler_mn=(256, 256),
-        preferred_cluster_shape_mn=(2, 1),
-        fallback_cluster_shape_mn=(2, 1),
-        use_2cta_instrs=True,
-        use_bias=True,
-        beta=1.0,
+        use_bias=use_bias,
+        beta=beta,
         tolerance=1e-2,
         warmup_iterations=1,
         iterations=2,
         skip_ref_check=False,
+        **tactic,
     )
 
-    # ``skip_ref_check=False`` validates the result against the provider's BF16 reference.
     assert runtime_us is not None and math.isfinite(runtime_us) and runtime_us > 0
