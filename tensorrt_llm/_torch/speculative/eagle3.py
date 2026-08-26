@@ -1200,20 +1200,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _prepare_flash_mla_generation_layout(self, attn_metadata, num_contexts,
                                              batch_size):
-        """Reorder ``kv_block_ids_per_seq`` so gen requests precede context.
+        """Stage ``kv_block_ids_per_seq`` for the draft step's FlashMLA rows.
 
-        Flash MLA on first-step expects the layout used during normal
-        generation; both Eagle3 and MTP Eagle hit this when context requests
-        share the batch with gen requests.
+        The caller has already set ``num_contexts = 0``, so every row of the
+        batch is a generation row for this step and the block table must be
+        staged in the batch's own order. ``kv_lens_cuda`` is updated in place
+        (also in batch order), and ``_compute_flash_mla_metadata`` slices it
+        from ``num_contexts`` -- now 0. Rotating the block table so gen rows
+        precede context rows would therefore pair each row's kv_len with
+        another row's block pointers, corrupting the drafted tokens.
         """
         if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
             return
-        reorder_block_ids_per_seq = torch.cat([
-            attn_metadata.kv_block_ids_per_seq[num_contexts:batch_size],
-            attn_metadata.kv_block_ids_per_seq[:num_contexts]
-        ])
         attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
-            reorder_block_ids_per_seq, non_blocking=True)
+            attn_metadata.kv_block_ids_per_seq[:batch_size, :],
+            non_blocking=True)
 
     @torch.compile(options={"max-autotune": True})
     def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
