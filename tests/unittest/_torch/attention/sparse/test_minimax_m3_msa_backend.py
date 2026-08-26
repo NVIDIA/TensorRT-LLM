@@ -27,17 +27,6 @@ from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
-def test_sparse_decode_fixed_stride_page_indptr_matches_expanded_rows():
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-        _msa_fixed_stride_page_indptr,
-    )
-
-    indptr = _msa_fixed_stride_page_indptr(
-        torch.tensor([2, 1], dtype=torch.int32), page_table_stride=8
-    )
-    assert indptr.tolist() == [0, 0, 8, 16]
-
-
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
     import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability as avail
 
@@ -195,7 +184,7 @@ def test_msa_metadata_clears_padded_cache_slot_tail():
     metadata.msa_q_intra = torch.zeros(4, dtype=torch.int32)
     metadata.msa_qo_lens_dev = torch.zeros(1, dtype=torch.int32)
     metadata.kv_lens_cuda = None
-    metadata._msa_uses_fixed_stride_page_table = lambda: True
+    metadata._msa_runs_no_fmha = lambda: True
 
     metadata._build_msa_fields()
 
@@ -736,18 +725,17 @@ def _force_cutedsl_supported(monkeypatch):
 
 def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
     """A uniform pure-decode step resolves a span over the whole batch, which is
-    what lets the CuTe scorer, MSA sparse GQA, and trtllm-gen dense paths agree."""
+    what lets prepare() skip the fmha_sm100 plans entirely."""
     _force_cutedsl_supported(monkeypatch)
     metadata = _resolution_metadata()
 
     metadata._resolve_decode_kernels()
 
     assert msa_ported_decode_active(metadata) is True
-    assert metadata._msa_runs_no_fmha() is False
-    assert metadata._msa_uses_fixed_stride_page_table() is True
+    assert metadata._msa_runs_no_fmha() is True
     assert metadata.msa_decode_query_len == 1
     assert metadata.msa_max_kv_len == 11
-    # The whole batch is the span; sparse GQA still runs through fmha_sm100.
+    # The whole batch is the span, so nothing is left for fmha_sm100.
     span = metadata.msa_decode_span
     assert (span.row_first, span.row_last) == (0, 2)
     assert (span.token_first, span.token_last) == (0, 2)
@@ -775,7 +763,6 @@ def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monk
     assert msa_ported_decode_active(metadata) is True
     # fmha_sm100 still runs the context prefix, so its page table stays live.
     assert metadata._msa_runs_no_fmha() is False
-    assert metadata._msa_uses_fixed_stride_page_table() is False
     # The trtllm-gen scheduling bound must come from the span's own rows: the
     # 4096-token context row here would inflate a whole-batch maximum by 100x.
     assert metadata.msa_max_kv_len == 40
@@ -793,7 +780,6 @@ def test_resolve_decode_kernels_resolves_no_span_for_a_pure_prefill(monkeypatch)
     assert metadata.msa_decode_query_len is None
     assert msa_ported_decode_active(metadata) is False
     assert metadata._msa_runs_no_fmha() is False
-    assert metadata._msa_uses_fixed_stride_page_table() is False
 
 
 def test_a_span_without_its_buffers_is_not_active():
@@ -929,8 +915,8 @@ def test_fmha_plan_rows_narrow_to_the_context_prefix(monkeypatch):
     decode = _resolution_metadata()
     decode._msa_live_batch = 2
     decode._resolve_decode_kernels()
-    # Sparse GQA uses the whole-batch decode plan; proxy and dense remain ported.
-    assert decode._msa_fmha_plan_rows() == (0, 2)
+    # Nothing is left to plan on a pure-decode step the kernels fully own.
+    assert decode._msa_fmha_plan_rows() is None
 
     prefill = _resolution_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
     prefill._msa_live_batch = 2
@@ -953,8 +939,9 @@ def test_resolution_must_not_change_under_a_captured_graph(monkeypatch):
     # Same inputs: the replay agrees with the capture.
     _step()
 
-    # A replay whose batch turned mixed. The graph's sparse plan covers a
-    # different row range and the eager context plans were not captured.
+    # A replay whose batch turned mixed. The graph was captured with no
+    # fmha_sm100 plans at all, so the context prefix this step resolves has
+    # nothing to run under.
     metadata._seq_lens = torch.tensor([5, 1, 1], dtype=torch.int32)
     metadata.kv_lens = torch.tensor([5, 9, 11], dtype=torch.int32)
     metadata.num_contexts = 1
@@ -1434,294 +1421,6 @@ def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, to
         max_num_requests=batch,
     )
     return attention, fields, q, head_major.permute(1, 0, 2), int(qo_lens_cpu[0])
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_pure_decode_sparse_gqa_uses_preplanned_msa_and_matches_triton(monkeypatch):
-    """The production pure-decode dispatcher must take the MSA sparse plan.
-
-    Exercise AgentX DQL4, a production-strided FP8 Q view, distinct per-token
-    block-index slices, and CUDA-graph replay. The Triton result remains the
-    numerical reference but is made unavailable at dispatch time, so a silent
-    routing fallback fails the test.
-    """
-    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import triton_sparse_decode
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
-        MSA_REQUIRED_TOPK,
-        msa_package_available,
-        require_msa_module,
-    )
-    from tensorrt_llm._utils import get_sm_version
-
-    if not msa_package_available():
-        pytest.skip("fmha_sm100 (MSA submodule) required")
-    if get_sm_version() not in (100, 103):
-        pytest.skip("fmha_sm100 requires SM100/SM103")
-
-    batch, dql = 8, 4
-    num_heads, num_kv_heads = 64, 4
-    page_size = head_dim = 128
-    seq_len = 4096
-    num_blocks = seq_len // page_size
-    total_q = batch * dql
-    num_pages = batch * num_blocks
-    generator = torch.Generator(device="cuda").manual_seed(20260814)
-
-    block_table = (
-        torch.randperm(num_pages, device="cuda", generator=generator)
-        .to(torch.int32)
-        .reshape(batch, num_blocks)
-    )
-    pool = torch.randn(
-        num_pages,
-        2,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-        generator=generator,
-    ).to(torch.float8_e4m3fn)
-    q_width = num_heads * head_dim
-    kv_width = num_kv_heads * head_dim
-    fused_qkv = torch.randn(
-        total_q,
-        q_width + 2 * kv_width,
-        device="cuda",
-        dtype=torch.bfloat16,
-        generator=generator,
-    ).to(torch.float8_e4m3fn)
-    q = fused_qkv[:, :q_width]
-    q_view = q.reshape(total_q, num_heads, head_dim)
-    assert not q_view.is_contiguous()
-
-    offsets = torch.arange(total_q, device="cuda", dtype=torch.int32) % 4
-    selected = (
-        offsets[:, None]
-        + torch.arange(MSA_REQUIRED_TOPK, device="cuda", dtype=torch.int32)[None, :]
-    )
-    token_major = selected[:, None, :].expand(total_q, num_kv_heads, -1)
-    head_major = token_major.permute(1, 0, 2).contiguous()
-    topk_indices = head_major.permute(1, 0, 2)
-    assert not topk_indices.is_contiguous()
-
-    seq_lens_cuda = torch.full((batch,), seq_len, device="cuda", dtype=torch.int32)
-    qo_lens_cpu = torch.full((batch,), dql, dtype=torch.int32)
-    kv_lens_cpu = torch.full((batch,), seq_len, dtype=torch.int32)
-    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
-    fmha_sm100 = require_msa_module()
-    plan = fmha_sm100.fmha_sm100_plan(
-        qo_lens_cpu,
-        kv_lens_cpu,
-        num_heads,
-        num_kv_heads=num_kv_heads,
-        qo_offset=qo_offset_cpu,
-        page_size=page_size,
-        kv_block_num=MSA_REQUIRED_TOPK,
-        causal=True,
-        num_kv_splits=1,
-        use_fp8_kvcache=True,
-        device=torch.device("cuda", torch.cuda.current_device()),
-    )
-
-    reference = torch.empty(total_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    triton_sparse_decode.minimax_m3_sparse_attn_decode(
-        q_view,
-        pool[:, 0],
-        pool[:, 1],
-        head_major,
-        block_table,
-        seq_lens_cuda,
-        sm_scale=head_dim**-0.5,
-        output=reference,
-        decode_query_len=dql,
-    )
-
-    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
-    attention.layer_idx = 0
-    attention.head_dim = head_dim
-    attention.num_heads = num_heads
-    attention.q_scaling = 1.0
-    metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            tokens_per_block=page_size,
-            get_buffers=lambda layer_idx, kv_layout=None: pool,
-        ),
-        _msa_prewritten_layer=None,
-        msa_decode_query_len=dql,
-        msa_decode_span=_MsaDecodeSpan(0, batch, 0, total_q, dql),
-        msa_block_table=block_table,
-        msa_seq_lens_cuda=seq_lens_cuda,
-        msa_kv_indices=block_table.flatten(),
-        msa_qo_lens_cpu=qo_lens_cpu,
-        msa_kv_lens_cpu=kv_lens_cpu,
-        msa_qo_offset_cpu=qo_offset_cpu,
-    )
-    output = torch.empty(total_q, q_width, device="cuda", dtype=torch.bfloat16)
-
-    def run_candidate():
-        run_msa_paged_gqa(
-            attention,
-            q,
-            None,
-            None,
-            metadata,
-            output,
-            kv_block_indexes=topk_indices,
-            plan=plan,
-        )
-
-    # The reference is complete; any dispatch through Triton from here is a
-    # routing regression rather than a numerical fallback.
-    monkeypatch.setattr(
-        triton_sparse_decode,
-        "minimax_m3_sparse_attn_decode",
-        lambda *args, **kwargs: pytest.fail("pure decode routed to Triton"),
-    )
-    for _ in range(3):
-        run_candidate()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_candidate()
-    graph.replay()
-    torch.cuda.synchronize()
-
-    actual = output.view(total_q, num_heads, head_dim)
-    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_sparse_decode_cached_worklist_matches_fresh_plan_at_new_lengths():
-    """A cached decode worklist plus patched live fields must equal replanning."""
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-        _msa_fixed_stride_page_indptr,
-        _MsaGraphSafePlan,
-    )
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
-        MSA_REQUIRED_TOPK,
-        build_kv_page_indices,
-        msa_package_available,
-        require_msa_module,
-    )
-    from tensorrt_llm._utils import get_sm_version
-
-    if not msa_package_available():
-        pytest.skip("fmha_sm100 (MSA submodule) required")
-    if get_sm_version() not in (100, 103):
-        pytest.skip("fmha_sm100 requires SM100/SM103")
-
-    batch, dql = 2, 4
-    num_heads, num_kv_heads = 64, 4
-    page_size = head_dim = 128
-    total_q = batch * dql
-    first_lens = torch.tensor([4096, 4096], dtype=torch.int32)
-    live_lens = torch.tensor([4096, 8192], dtype=torch.int32)
-    qo_lens = torch.full((batch,), dql, dtype=torch.int32)
-    max_blocks = int((int(live_lens.max()) + page_size - 1) // page_size)
-    num_pages = batch * max_blocks
-    block_table = torch.arange(num_pages, dtype=torch.int32).reshape(batch, max_blocks)
-    compact_indices = build_kv_page_indices(block_table, live_lens, page_size).cuda()
-    fixed_indices = block_table.cuda().flatten()
-
-    generator = torch.Generator(device="cuda").manual_seed(20260814)
-    q = torch.randn(
-        total_q,
-        num_heads,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-        generator=generator,
-    ).to(torch.float8_e4m3fn)
-    k = torch.randn(
-        num_pages,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-        generator=generator,
-    ).to(torch.float8_e4m3fn)
-    v = torch.randn(k.shape, device="cuda", dtype=torch.bfloat16, generator=generator).to(
-        torch.float8_e4m3fn
-    )
-    selected = torch.arange(MSA_REQUIRED_TOPK, device="cuda", dtype=torch.int32)
-    topk = selected.expand(total_q, num_kv_heads, -1)
-
-    fmha_sm100 = require_msa_module()
-
-    def plan_for(kv_lens):
-        return fmha_sm100.fmha_sm100_plan(
-            qo_lens,
-            kv_lens,
-            num_heads,
-            num_kv_heads=num_kv_heads,
-            qo_offset=kv_lens - qo_lens,
-            page_size=page_size,
-            kv_block_num=MSA_REQUIRED_TOPK,
-            causal=True,
-            num_kv_splits=1,
-            use_fp8_kvcache=True,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
-
-    class FakeMetadata:
-        cuda_graph_buffers = {}
-
-        @staticmethod
-        def get_empty(buffers, shape, *, cache_name, dtype, capture_graph):
-            del buffers, cache_name, capture_graph
-            return torch.empty(shape, dtype=dtype, device="cuda")
-
-    first_plan = plan_for(first_lens)
-    fresh_plan = plan_for(live_lens)
-    signature = (
-        tuple(qo_lens.tolist()),
-        num_heads,
-        num_kv_heads,
-        MSA_REQUIRED_TOPK,
-        page_size,
-        True,
-        max_blocks,
-    )
-    owner = _MsaGraphSafePlan(
-        FakeMetadata(),
-        "test_gqa_plan",
-        max_batch=total_q,
-        num_ctas=torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count,
-        capture_graph=False,
-    )
-    fixed_indptr = _msa_fixed_stride_page_indptr(qo_lens, max_blocks)
-    owner.refresh(
-        first_plan,
-        cache_signature=signature,
-        stable_overrides={"kv_page_indptr": fixed_indptr},
-    )
-    cached_plan = owner.reuse_sparse_decode(signature)
-    assert cached_plan is not None
-    # Production's captured on_update_kv_lens() patches these two tensors on
-    # device before forward. Simulate that boundary directly; deliberately do
-    # not patch kv_segment_offsets, which paged sparse load does not consume.
-    for key in ("kv_segment_lens", "qo_offset"):
-        cached_plan[3][key].copy_(fresh_plan[3][key])
-    torch.cuda.synchronize()
-    torch.testing.assert_close(cached_plan[3]["kv_page_indptr"], fixed_indptr.cuda())
-
-    fresh_out = torch.empty(total_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    cached_out = torch.empty_like(fresh_out)
-    common = dict(
-        kv_block_indexes=topk,
-        sm_scale=head_dim**-0.5,
-        output_maxscore=False,
-    )
-    fmha_sm100.fmha_sm100(q, k, v, fresh_plan, kv_indices=compact_indices, out=fresh_out, **common)
-    fmha_sm100.fmha_sm100(q, k, v, cached_plan, kv_indices=fixed_indices, out=cached_out, **common)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(cached_out, fresh_out, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
