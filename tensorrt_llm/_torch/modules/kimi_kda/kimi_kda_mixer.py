@@ -453,7 +453,7 @@ class KimiKDALinearAttention(nn.Module):
         causal_conv1d_fn(
             packed_conv,
             self._packed_conv_weight,
-            query_start_loc=cu_seqlens.to(torch.int32),
+            query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
             cache_indices=mamba_metadata.state_indices[:num_prefills],
             has_initial_state=has_init,
             conv_states=conv_pool,

@@ -126,6 +126,7 @@ def _run_production_prefill(
         use_initial_states=use_initial_states,
         has_initial_states=has_initial_states,
         state_indices=slot_indices.to(torch.int32),
+        query_start_loc=cu_seqlens.to(torch.int32),
     )
     output = attention.forward_prefill(
         hidden_states.reshape(-1, HIDDEN_SIZE),

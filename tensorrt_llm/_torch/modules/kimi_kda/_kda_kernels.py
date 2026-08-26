@@ -69,7 +69,7 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
@@ -92,7 +92,11 @@ def _fused_kda_post_conv_kernel(
 
     feature_offsets = head_idx * HEAD_DIM + dim_offsets
     projection_size = NUM_HEADS * HEAD_DIM
-    source_offsets = feature_offsets[None, :] * num_tokens + token_offsets[:, None]
+    num_tokens_i64 = num_tokens.to(tl.int64)
+    source_offsets = feature_offsets[None, :].to(tl.int64) * num_tokens_i64 + token_offsets[
+        :, None
+    ].to(tl.int64)
+    section_stride = projection_size * num_tokens_i64
     output_offsets = (
         token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
     )
@@ -102,7 +106,7 @@ def _fused_kda_post_conv_kernel(
     tl.store(q_out_ptr + output_offsets, q, mask=mask)
 
     k = tl.load(
-        packed_ptr + projection_size * num_tokens + source_offsets,
+        packed_ptr + section_stride + source_offsets,
         mask=mask,
         other=0.0,
     ).to(tl.float32)
@@ -110,7 +114,7 @@ def _fused_kda_post_conv_kernel(
     tl.store(k_out_ptr + output_offsets, k, mask=mask)
 
     v = tl.load(
-        packed_ptr + 2 * projection_size * num_tokens + source_offsets,
+        packed_ptr + 2 * section_stride + source_offsets,
         mask=mask,
         other=0.0,
     )
