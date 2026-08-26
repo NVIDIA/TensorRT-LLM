@@ -103,15 +103,17 @@ def apply_msa_patch(project_dir: Path) -> None:
             f"MSA sources are missing at {msa_package_dir}; initialize 3rdparty/MSA"
         )
 
-    def patch_cmd(*flags: str):
+    def patch_cmd(*flags: str) -> list[str]:
         # --no-backup-if-mismatch keeps the .orig copy of a hunk applied at an
         # offset out of the packaged submodule.
-        # -l tolerates trailing-whitespace differences in the upstream source
-        # while still requiring every non-whitespace context token to match.
         return [
-            "patch", "-l", "-p1", "--batch", "--no-backup-if-mismatch", *flags,
+            "patch",
+            "-p1",
+            "--batch",
+            "--no-backup-if-mismatch",
+            *flags,
             "-i",
-            str(msa_patch)
+            str(msa_patch),
         ]
 
     forward_check = run(

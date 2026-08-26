@@ -449,7 +449,7 @@ def minimax_m3_trtllm_gen_dense_attention(
     *,
     sm_scale: float,
     output: torch.Tensor,
-    kv_scale_quant_orig: Optional[torch.Tensor],
+    kv_scale_quant_orig: Optional[torch.Tensor] = None,
 ) -> None:
     """Dispatch the packed M3 dense batch by context/generation phase."""
     qo_lens = metadata.msa_qo_lens_cpu

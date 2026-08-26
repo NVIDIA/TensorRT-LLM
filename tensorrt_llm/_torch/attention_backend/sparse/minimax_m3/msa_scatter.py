@@ -429,6 +429,8 @@ def fused_write_layer_caches_nvfp4(
         return False
     if tuple(v_scale_cache.shape) != expected_scale_shape:
         return False
+    if k_scale_cache.stride(-2) != scale_cols or v_scale_cache.stride(-2) != scale_cols:
+        return False
     if physical_tokens_per_block % 4 != 0 or scale_cols % 4 != 0:
         return False
 

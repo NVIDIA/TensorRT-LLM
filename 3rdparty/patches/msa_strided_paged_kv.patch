@@ -9,13 +9,13 @@ index 8b13a0d27e9aacd8dde1f494a63204c9a32d72eb..ad91c432b9755fd35bc9f14fddbb860c
 +        "stage_selected_nvfp4_to_fp8",
      }
  )
-
+ 
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
 index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecbc9de679b 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
 @@ -532,9 +532,8 @@ def _fmha_sm100_plan(
-
+ 
      if kv_block_num > 0 and (sparse_kernel_mode == 'prefill' or (sparse_kernel_mode == 'auto' and max_qo_len_orig > _prefill_qlen_threshold(True))):
          # print("Nv-Prefill")
 -        qo_segment_lens = qo_segment_lens.to(device)
@@ -28,21 +28,21 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
                  num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
 @@ -645,7 +644,7 @@ def _fmha_sm100_plan(
              max_kv_splits = min(2 * max(max_pieces, 1), 64)
-
+ 
              max_work_items = 131072 * max_kv_splits
--
+-            
 +
              packed_work_range = _alloc_perplan_buf(_BuffTag.packed_work_range, num_ctas, device, torch.int64)
              packed_work_info = _alloc_perplan_buf(_BuffTag.packed_work_info, max_work_items, device, torch.int64)
              kv_tile_begin_indices = _alloc_perplan_buf(_BuffTag.kv_tile_begin_indices, max_work_items, device, torch.int32)
 @@ -686,10 +685,10 @@ def _fmha_sm100_plan(
-
+ 
              return _make_plan_info(
                  packed_work_range=packed_work_range, packed_work_info=packed_work_info,
--                kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices,
--                kv_split_indices=kv_split_indices, num_kv_splits=max_kv_splits, workspace_o=workspace_o,
--                workspace_lse=workspace_lse, max_qo_len=max_qo_len, predicted_speedup=predicted_speedup,
--                num_kv_splits_per_row=num_kv_splits_per_row, qo_segment_offsets=qo_segment_offsets,
+-                kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices, 
+-                kv_split_indices=kv_split_indices, num_kv_splits=max_kv_splits, workspace_o=workspace_o, 
+-                workspace_lse=workspace_lse, max_qo_len=max_qo_len, predicted_speedup=predicted_speedup, 
+-                num_kv_splits_per_row=num_kv_splits_per_row, qo_segment_offsets=qo_segment_offsets, 
 +                kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices,
 +                kv_split_indices=kv_split_indices, num_kv_splits=max_kv_splits, workspace_o=workspace_o,
 +                workspace_lse=workspace_lse, max_qo_len=max_qo_len, predicted_speedup=predicted_speedup,
@@ -54,11 +54,11 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
          kv_split_indices = None
          num_kv_splits_per_row = None
          workspace_o = None
--
+-        
 +
          lse_total_size = 0
          workspace_lse = None
-
+ 
 @@ -754,6 +753,10 @@ def _fmha_sm100(
      plan_info,
      kv_indices: Optional[torch.Tensor] = None,
@@ -72,9 +72,9 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
      max_score: Optional[torch.Tensor] = None,
 @@ -768,7 +771,12 @@ def _fmha_sm100(
  ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-
+ 
      if plan_info["MM-SA-Nv"]:
--        return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score,
+-        return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
 +        if kv_physical_block_indexes is not None or sparse_custom_mask is not None:
 +            raise ValueError(
 +                "physical page indexes and sparse custom masks are only supported "
@@ -85,9 +85,9 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
                  kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
                  kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
 @@ -808,6 +816,62 @@ def _fmha_sm100(
-
+ 
      batch_size = qo_segment_lens.shape[0]
-
+ 
 +    if kv_physical_block_indexes is not None:
 +        if kv_block_indexes is None:
 +            raise ValueError(
@@ -160,8 +160,8 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
          torch.cuda.current_stream().cuda_stream,
 @@ -941,6 +1009,62 @@ def _fmha_sm100(
      return out, max_score
-
-
+ 
+ 
 +def _mixed_batch_split(qo_segment_lens, split_threshold, *, enable, sparse):
 +    """Row index splitting a mixed prefill/decode batch, or 0 for no split.
 +
@@ -250,13 +250,13 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
 +        ``sub_plan_hi`` is None when the batch was not split.  Pass this tuple
 +        unchanged as ``plan_info`` to ``fmha_sm100``.
      """
-
+ 
      # assert qo_segment_lens.device.type == 'cpu' \
 @@ -997,31 +1128,23 @@ def fmha_sm100_plan(
          qo_offset = kv_segment_lens - qo_segment_lens
      elif isinstance(qo_offset, int):
          qo_offset = torch.full_like(qo_segment_lens, qo_offset)
--
+-    
 +
      batch_size = qo_segment_lens.shape[0]
 -    has_mixed_prefill = False
@@ -292,11 +292,11 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
 +        _cache_split_boundaries(sub_lo)
 +        return (True, split, batch_size, sub_lo, sub_hi)
      else:
--        plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args,
+-        plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args, 
 +        plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args,
                                      qo_offset=qo_offset, **kwargs)
          return (False, 0, batch_size, plan, None)
-
+ 
 @@ -1032,6 +1155,10 @@ def fmha_sm100(
      plan_info,
      kv_indices: Optional[torch.Tensor] = None,
@@ -385,7 +385,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
              prefill_kv_indices = kv_indices[kv_page_split:]
          else:
 @@ -1119,6 +1277,32 @@ def fmha_sm100(
-
+ 
          decode_block_idx = kv_block_indexes[:decode_nnz] if kv_block_indexes is not None else None
          prefill_block_idx = kv_block_indexes[decode_nnz:] if kv_block_indexes is not None else None
 +        decode_physical_block_idx = (
@@ -420,7 +420,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
 @@ -1129,27 +1313,43 @@ def fmha_sm100(
              decode_qo_offset = None
              prefill_qo_offset = None
-
+ 
 +        # Let each half write straight into its own rows of the caller's buffer.
 +        # Row views of a contiguous [nnz, H, D] output are themselves
 +        # contiguous, which is what the kernels require, so this removes a
@@ -450,7 +450,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
 +            sparse_custom_mask_batch_indices=prefill_sparse_custom_batch_indices,
              q_offset_override=prefill_qo_offset,
              **kwargs)
-
+ 
          # ---- Merge out ----
 -        if decode_out is not None and prefill_out is not None:
 +        if write_in_place:
@@ -459,18 +459,18 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
              combined_out = torch.cat([decode_out, prefill_out], dim=0)
          else:
              combined_out = None
--
+-        
 -        if out is not None and combined_out is not None:
 +
 +        if out is not None and combined_out is not None and combined_out is not out:
              out.copy_(combined_out)
-
+ 
          # ---- Merge max_score ----
 @@ -1261,7 +1461,7 @@ def sparse_topk_select(
      workspace_size = num_qo_heads * max_k_tiles * total_qo_len  # int32 elements
-
+ 
      workspace_buffer = _alloc_workspace_buf(_BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32)
--
+-    
 +
      if output is not None:
          output_indices = output
@@ -561,9 +561,9 @@ index 7e21585130ae020ac88b04939126f0e2f5cbb827..60f08b4087ef9856d2e8d339ba66d52a
 +  int* sparse_custom_mask_batch_indices_ptr = maybe_sparse_custom_mask_batch_indices.has_value()
 +                                  ? static_cast<int*>(maybe_sparse_custom_mask_batch_indices.value().data_ptr())
 +                                  : nullptr;
-
+ 
    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-
+ 
 @@ -124,6 +140,34 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
    params.kv_block_num = maybe_kv_block_indexes.has_value()
                              ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
@@ -596,7 +596,7 @@ index 7e21585130ae020ac88b04939126f0e2f5cbb827..60f08b4087ef9856d2e8d339ba66d52a
 +  params.sparse_custom_mask_batch_indices_ptr = sparse_custom_mask_batch_indices_ptr;
 +  params.sparse_custom_mask_batch_indices_stride_q = maybe_sparse_custom_mask_batch_indices.has_value()
 +                                         ? maybe_sparse_custom_mask_batch_indices.value().stride(0) : 0;
-
+ 
    params.pack_factor = static_cast<int>(pack_factor);
    params.num_ctas = static_cast<int>(packed_work_range.size(0));
 @@ -188,9 +232,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
@@ -745,11 +745,11 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
 +          }
          }
        }}
-
+ 
 @@ -1131,14 +1159,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
      int skip_count, real_masked_count, unmasked_count;
      int effective_end;
-
+ 
 -    int kbi_off_s = 0;
 +    int64_t kbi_off_s = 0;
 +    int sparse_custom_q_index = 0;
@@ -768,10 +768,10 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
 +            * params.load.sparse_custom_mask_q_indices_stride_q]);
 +      }
      }
-
+ 
      if constexpr (kNeedSparse) {
 @@ -1154,7 +1187,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
-
+ 
        // Count padding blocks (backward scan for -1)
        int valid_blks = params.load.kv_block_num;
 -      while (valid_blks > 0 && __ldg(&params.load.kv_block_indexes[kbi_off_s + valid_blks - 1]) < 0)
@@ -780,7 +780,7 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
 +                    + static_cast<int64_t>(valid_blks - 1)
 +                        * params.load.kv_block_indexes_stride_k]) < 0)
          valid_blks--;
-
+ 
        int valid_tiles = (valid_blks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
 @@ -1223,7 +1259,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
            cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
@@ -810,13 +810,13 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
      };
 @@ -2076,7 +2120,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
      pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
-
+ 
      Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
--
+-   
 +
      if constexpr (kNeedOutput)
        copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
-
+ 
 diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
 index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044de72ff09 100644
 --- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
@@ -868,7 +868,7 @@ index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044
      int kv_page_indptr_size = 0;
      int kv_indices_size = 0;
 @@ -218,6 +250,19 @@ struct Sm100FmhaLoadTmaWarpspecialized {
-
+ 
      Params p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
                    args.kv_indices, args.kv_page_indptr, args.kv_block_indexes, args.kv_block_num,
 +                  args.kv_block_indexes_stride_q, args.kv_block_indexes_stride_h,
@@ -890,7 +890,7 @@ index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044
 @@ -525,11 +570,14 @@ struct Sm100FmhaLoadTmaWarpspecialized {
        constexpr int effective_tile_kv = get<1>(TileShapeQK{});
        constexpr int tiles_per_page = KVPageSize / effective_tile_kv;
-
+ 
 -      int kv_block_offset = 0;
 +      int64_t kv_block_offset = 0;
 +      int64_t kv_physical_block_offset = 0;
@@ -904,7 +904,7 @@ index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044
 +            = static_cast<int64_t>(batch_idx) * params.kv_physical_block_indexes_stride_q
 +            + static_cast<int64_t>(kv_head_idx) * params.kv_physical_block_indexes_stride_h;
        }
-
+ 
        // Keep full 4D tensor (page_size, D, H_kv, P) — select head at copy time
 @@ -549,14 +597,18 @@ struct Sm100FmhaLoadTmaWarpspecialized {
          int page_for_lookup;
@@ -954,8 +954,8 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 +++ b/python/fmha_sm100/cute/interface.py
 @@ -136,6 +136,32 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
      return k, v
-
-
+ 
+ 
 +def _prepare_paged_hnd_input(tensor: torch.Tensor, blk_kv: int) -> torch.Tensor:
 +    """Keep TMA-compatible paged HND views strided across physical pages.
 +
@@ -1069,7 +1069,7 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 @@ -405,13 +440,102 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
              if not seqused_k.is_contiguous():
                  raise ValueError("seqused_k must be contiguous")
-
+ 
 -    padded_scale_rows = ((required_scale_rows + 127) // 128) * 128
 -    padded_scale_cols = ((scale_cols + 3) // 4) * 4
 -    for name, scale in (("k_scale_128x4", k_scale_128x4), ("v_scale_128x4", v_scale_128x4)):
@@ -1173,7 +1173,7 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 +                f"{int(data.stride(1))}, stride(2)={int(data.stride(2))}. "
 +                "See nvfp4_kv_cache_kernels.cu:222."
              )
-
+ 
      if k2q_row_ptr.device != q.device or k2q_q_indices.device != q.device:
 @@ -622,6 +746,7 @@ def sparse_atten_func(
      usable_SM_count: int = -1,
@@ -1182,7 +1182,7 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 +    out: Optional[torch.Tensor] = None,
  ):
      """Run SM100 CSR block-sparse varlen attention.
-
+ 
 @@ -691,6 +816,10 @@ def sparse_atten_func(
      pv_dtype : torch.dtype, optional
          Compile-time MMA operand dtype for PV.  Defaults to V storage dtype,
@@ -1191,13 +1191,13 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 +        Destination for the attention output, written in place by the reduction
 +        instead of being allocated here.  Must be contiguous BF16 of shape
 +        ``[total_q, Hq, 128]`` on the same device as ``q``.
-
+ 
      Returns
      -------
 @@ -736,10 +865,21 @@ def sparse_atten_func(
      max_seqlen_q = int(max_seqlen_q)
      max_seqlen_k = int(max_seqlen_k)
-
+ 
 +    k_input = (
 +        k.contiguous()
 +        if page_table is None
@@ -1224,8 +1224,8 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
          pv_dtype,
 +        out=out,
      )
-
-
+ 
+ 
 @@ -769,8 +910,8 @@ def sparse_atten_nvfp4_kv_func(
      q: torch.Tensor,
      k: torch.Tensor,
@@ -1278,7 +1278,7 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 +        tolerance problem.
      schedule : SparseAttentionSchedule, optional
          Prebuilt sparse forward schedule.
-
+ 
 @@ -878,8 +1035,8 @@ def sparse_atten_nvfp4_kv_func(
          q,
          k,
@@ -1293,7 +1293,7 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
 @@ -939,12 +1096,19 @@ def sparse_atten_nvfp4_kv_func(
          k2q_qsplit_indices = schedule.qsplit_indices
          split_counts = schedule.split_counts
-
+ 
 +    # K/V and their block scales are deliberately NOT forced contiguous.  They
 +    # are consumed through TMA descriptors (data) and host-supplied page/head
 +    # strides (scales), both of which handle the strided views vLLM hands in.
@@ -1386,8 +1386,8 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
          torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
 @@ -1807,12 +2010,47 @@ def _call_sparse_forward_sm100_csr_varlen(
      return schedule
-
-
+ 
+ 
 +_INT32_MAX = 2**31 - 1
 +
 +
@@ -1508,10 +1508,10 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 @@ -1,18 +1,68 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
  # SPDX-License-Identifier: MIT
-
+ 
 -"""Transformer Engine NVFP4 quantization helper.
 +"""NVFP4 quantization helpers for the KVFP4 sparse attention kernel.
-
+ 
  This file is intended as a customer-facing example for preparing KV tensors
  for the KVFP4 attention kernel:
    - BF16/FP16 K/V input
@@ -1570,22 +1570,22 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +  The flat swizzle has no production producer (vLLM is paged only); it exists
 +  because flat test inputs are far cheaper to build than paged ones.
  """
-
+ 
  from __future__ import annotations
-
+ 
 +import os
  from dataclasses import dataclass
  from typing import Tuple
-
+ 
 @@ -23,6 +73,10 @@ NVFP4_BLOCK_SIZE = 16
  NVFP4_FP4_MAX = 6.0
  NVFP4_FP8_E4M3_MAX = 448.0
-
+ 
 +#: The only supported scale-factor layouts.  ``"linear"`` for K,
 +#: ``"swizzle4x4"`` for V -- see the module docstring.
 +NVFP4_SCALE_LAYOUTS: Tuple[str, ...] = ("linear", "swizzle4x4")
 +
-
+ 
  @dataclass(frozen=True)
  class Nvfp4QuantizedTensor:
 @@ -31,115 +85,294 @@ class Nvfp4QuantizedTensor:
@@ -1614,7 +1614,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +    layout : str
 +        Scale-factor layout of ``scale``: ``"linear"`` or ``"swizzle4x4"``.
      """
-
+ 
      data: torch.Tensor
 -    scale_128x4: torch.Tensor
 +    scale: torch.Tensor
@@ -1634,18 +1634,18 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +    """
 +
 +    return t * S + s
-
-
+ 
+ 
 -def _round_up(x: int, multiple: int) -> int:
 -    return ((int(x) + multiple - 1) // multiple) * multiple
 +def nvfp4_scale_swizzle4x4_offset(t, s, S):
 +    """Byte offset of scale column ``s`` of token ``t`` in a 4x4-swizzled region.
-
+ 
 +    ``off = (t//4)*(4*S) + 4*s + (t%4)`` -- i.e. a plain row-major
 +    ``[T/4][S][4]`` array indexed by ``(t//4, s, t%4)``.  Matches vLLM's V
 +    scale store (``nvfp4_kv_cache_kernels.cu:25-39``, ``:164-171``); the two
 +    forms are algebraically identical for every ``S`` divisible by 4.
-
+ 
 -def nvfp4_scale_128x4_offset(
 -    row: torch.Tensor,
 -    col: torch.Tensor,
@@ -1702,7 +1702,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
  ) -> torch.Tensor:
 -    """Return flat offsets for cuBLAS/cuDNN 128x4 rowwise scale storage.
 +    """Pack logical per-region block scales into physical scale-factor order.
-
+ 
      Parameters
      ----------
 -    row : torch.Tensor
@@ -1720,7 +1720,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +        of 4.
 +    layout : str
 +        ``"linear"`` or ``"swizzle4x4"``.
-
+ 
      Returns
      -------
      torch.Tensor
@@ -1736,7 +1736,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +    ``"linear"`` is the identity: a row-major ``[n_regions, page_size,
 +    scale_cols]`` array already *is* the linear layout.
      """
-
+ 
 -    tiles_n = _round_up(scale_cols, 4) // 4
 -    tile_m = row // 128
 -    tile_n = col // 4
@@ -1752,7 +1752,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +    page_size = int(page_size)
 +    scale_cols = int(scale_cols)
 +    _validate_region(page_size, scale_cols, layout)
-
+ 
 +    if scale.ndim != 3:
 +        raise ValueError(
 +            "scale must be rank-3 [n_regions, page_size, scale_cols], got shape "
@@ -1827,7 +1827,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +            f"quads, so total_k must be a multiple of 4; got {total_k}"
 +        )
 +    return (total_k // 4) * heads, 4, True
-
+ 
 -def swizzle_nvfp4_scale_to_128x4(
 +
 +def _pack_block_scale(
@@ -1841,7 +1841,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
  ) -> torch.Tensor:
 -    """Convert TE logical rowwise scales to cuBLAS/cuDNN 128x4 tiled layout.
 +    """Pack logical ``[rows, scale_cols]`` block scales into the kernel container.
-
+ 
 -    Parameters
 -    ----------
 -    scale : torch.Tensor
@@ -1859,7 +1859,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +    ``scale`` may be larger than ``[rows, scale_cols]`` (Transformer Engine
 +    returns padded rowwise scales); the excess is dropped.
      """
-
+ 
 +    layout = _check_layout(layout)
 +    shape = tuple(int(v) for v in original_shape)
 +    rows = int(rows)
@@ -1891,7 +1891,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +        regions, page_size=region_tokens, scale_cols=scale_cols, layout=layout
 +    )
 +    return packed.reshape(shape[:-1] + (scale_cols,)).contiguous()
-
+ 
 +
 +def _unpack_block_scale(
 +    packed: torch.Tensor,
@@ -1920,7 +1920,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +            f"packed scale holds {packed.numel()} bytes, need "
 +            f"{rows * scale_cols} for shape {shape}"
          )
-
+ 
 -    logical = scale[:rows, :cols].contiguous()
 -    if logical.shape != (padded_rows, padded_cols):
 -        logical = torch.nn.functional.pad(
@@ -1947,13 +1947,13 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +            .reshape(rows, scale_cols)
 +        )
 +    return logical.reshape(rows, scale_cols)
-
-
+ 
+ 
  def nvfp4_global_scale_from_amax(amax: torch.Tensor) -> torch.Tensor:
 @@ -171,34 +404,182 @@ def _import_te_nvfp4_quantizer():
      return NVFP4Quantizer
-
-
+ 
+ 
 -def quantize_bf16_to_nvfp4_128x4(x: torch.Tensor) -> Nvfp4QuantizedTensor:
 -    """Quantize a BF16/FP16 tensor to NVFP4 using Transformer Engine.
 +# ---------------------------------------------------------------------------
@@ -2086,7 +2086,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +    backend: str = "auto",
 +) -> Nvfp4QuantizedTensor:
 +    """Quantize a BF16/FP16 tensor to NVFP4.
-
+ 
      TE returns rowwise scales in logical padded layout.  This helper returns
 -    the scales in physical 128x4 tiled storage, so the attention kernel can
 -    load them with ``nvfp4_scale_128x4_offset``.
@@ -2102,7 +2102,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +        recipe.  Use it when Transformer Engine is not installed.
 +      * ``"auto"``  - TE if importable, otherwise ``"torch"``.  Override with
 +        the ``MSA_NVFP4_QUANTIZER_BACKEND`` environment variable.
-
+ 
      Parameters
      ----------
      x : torch.Tensor
@@ -2119,7 +2119,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +        plausible-looking but wrong numbers.
 +    backend : str, optional
 +        ``"auto"``, ``"te"`` or ``"torch"``.
-
+ 
      Returns
      -------
      Nvfp4QuantizedTensor
@@ -2129,7 +2129,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +        Packed FP4 data, packed block scales, global scale, and shape metadata
 +        needed by the KVFP4 attention kernel or by reference dequantization.
      """
-
+ 
 +    layout = _check_layout(layout)
      if not x.is_cuda:
          raise ValueError("NVFP4 quantization requires a CUDA tensor")
@@ -2148,7 +2148,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 @@ -213,6 +594,26 @@ def quantize_bf16_to_nvfp4_128x4(x: torch.Tensor) -> Nvfp4QuantizedTensor:
              f"{NVFP4_BLOCK_SIZE}, got {rows}"
          )
-
+ 
 +    scale_cols = int(x.shape[-1]) // NVFP4_BLOCK_SIZE
 +    # Fail here rather than after a full quantization pass.
 +    _scale_region_grid(x.shape, layout)
@@ -2187,7 +2187,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 +        layout=layout,
      )
      global_scale = nvfp4_global_scale_from_amax(amax).contiguous()
-
+ 
      return Nvfp4QuantizedTensor(
          data=data,
 -        scale_128x4=scale_128x4,
@@ -2197,15 +2197,15 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
          original_shape=tuple(int(v) for v in x.shape),
 +        layout=layout,
      )
-
-
+ 
+ 
 -def quantize_kv_bf16_to_nvfp4_128x4(
 +def quantize_kv_bf16_to_nvfp4(
      k: torch.Tensor,
      v: torch.Tensor,
  ) -> tuple[Nvfp4QuantizedTensor, Nvfp4QuantizedTensor]:
      """Quantize BF16/FP16 K and V tensors independently for KVFP4 attention.
-
+ 
 +    K is packed ``"linear"`` and V ``"swizzle4x4"``, which is exactly what the
 +    attention kernel reads and what vLLM's NVFP4 KV-cache store kernel writes.
 +
@@ -2215,14 +2215,14 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 @@ -259,10 +665,13 @@ def quantize_kv_bf16_to_nvfp4_128x4(
          Quantized K and V tensors with independent scales.
      """
-
+ 
 -    return quantize_bf16_to_nvfp4_128x4(k), quantize_bf16_to_nvfp4_128x4(v)
 +    return (
 +        quantize_bf16_to_nvfp4(k, layout="linear"),
 +        quantize_bf16_to_nvfp4(v, layout="swizzle4x4"),
 +    )
-
-
+ 
+ 
 -def dequantize_nvfp4_128x4_to_bf16(
 +def dequantize_nvfp4_to_bf16(
      qx: Nvfp4QuantizedTensor,
@@ -2231,7 +2231,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 @@ -272,10 +681,15 @@ def dequantize_nvfp4_128x4_to_bf16(
      This mirrors the kernel contract:
        x = e2m1 * E4M3_block_scale_1x16 * FP32_global_scale
-
+ 
 +    The scale gather uses ``qx.layout``, so the result is layout-independent:
 +    the same logical block scales give the same BF16 output whether they were
 +    packed ``"linear"`` or ``"swizzle4x4"``.
@@ -2248,7 +2248,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 @@ -286,6 +700,7 @@ def dequantize_nvfp4_128x4_to_bf16(
          BF16 tensor with shape ``qx.original_shape``.
      """
-
+ 
 +    layout = _check_layout(qx.layout)
      data = qx.data if qx.data.dtype is torch.uint8 else qx.data.view(torch.uint8)
      if data.shape[-1] * 2 != qx.original_shape[-1]:
@@ -2256,7 +2256,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 @@ -330,10 +745,13 @@ def dequantize_nvfp4_128x4_to_bf16(
      values[:, 0::2] = fp4_lut[lo.long()]
      values[:, 1::2] = fp4_lut[hi.long()]
-
+ 
 -    row = torch.arange(rows, device=data.device, dtype=torch.int64)[:, None]
 -    col = torch.arange(scale_cols, device=data.device, dtype=torch.int64)[None, :]
 -    offset = nvfp4_scale_128x4_offset(row, col, scale_cols)
@@ -2285,8 +2285,8 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
 -    print("V scale 128x4:", tuple(v_q.scale_128x4.shape), v_q.scale_128x4.dtype)
 +    print("V scale (swizzle4x4):", tuple(v_q.scale.shape), v_q.scale.dtype)
      print("V global scale:", tuple(v_q.global_scale.shape), v_q.global_scale.dtype)
-
-
+ 
+ 
 diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
 index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c698697ad22 100644
 --- a/python/fmha_sm100/cute/src/common/aot_cache.py
@@ -2294,7 +2294,7 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c69
 @@ -6,6 +6,12 @@
  Saves compiled TVM FFI kernels as .o files on first compile,
  loads them on subsequent runs to skip JIT compilation.
-
+ 
 +Cached objects are keyed by the caller's kernel key *and* a build fingerprint
 +covering the target GPU architecture and the kernel sources. Without the
 +fingerprint a .o built for one architecture (or from an older revision of the
@@ -2306,7 +2306,7 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c69
          (default: ~/.cache/minfer/mm_sparse_attn)
 @@ -25,10 +31,64 @@ _AOT_CACHE_DIR = os.environ.get(
  _AOT_DISABLE = os.environ.get("MM_SPARSE_ATTN_AOT_DISABLE", "0") == "1"
-
+ 
  _loaded_modules: dict[str, object] = {}
 +_build_fingerprint_cache: str | None = None
 +
@@ -2360,8 +2360,8 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c69
 +            (_target_arch(), str(cutlass_version), _source_fingerprint())
 +        )
 +    return _build_fingerprint_cache
-
-
+ 
+ 
  def _key_to_path(key: tuple) -> str:
 -    h = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
 +    h = hashlib.sha256(
@@ -2369,7 +2369,7 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c69
 +    ).hexdigest()[:16]
      name = str(key[0]).replace("/", "_")
      return os.path.join(_AOT_CACHE_DIR, f"{name}_{h}")
-
+ 
 diff --git a/python/fmha_sm100/cute/src/common/cuda_toolchain.py b/python/fmha_sm100/cute/src/common/cuda_toolchain.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..80cae6ebae837caf783283e5432679736c5ec2ae
@@ -2571,13 +2571,13 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
 --- a/python/fmha_sm100/cute/src/common/utils.py
 +++ b/python/fmha_sm100/cute/src/common/utils.py
 @@ -17,8 +17,42 @@ from cutlass.cute.runtime import from_dlpack
-
+ 
  import quack.activation
-
+ 
 +from . import cuda_toolchain
 +
  _MIXER_ATTRS = ("__vec_size__",)
-
+ 
 +# Inline-PTX capability gates.
 +#
 +# These instructions are not available in every CUDA toolkit, so each has a
@@ -2614,8 +2614,8 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
  # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
  POLY_EX2 = {
 @@ -153,7 +187,7 @@ def make_tiled_copy_B(
-
-
+ 
+ 
  def mma_make_fragment_A(
 -    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 +    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
@@ -2623,8 +2623,8 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
      if const_expr(swapAB):
          return mma_make_fragment_B(smem, thr_mma)
 @@ -162,7 +196,7 @@ def mma_make_fragment_A(
-
-
+ 
+ 
  def mma_make_fragment_B(
 -    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 +    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
@@ -2634,7 +2634,7 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
 @@ -625,6 +659,59 @@ def cvt_fp4x8_e2m1_f16x8(
  ) -> Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32]:
      """Convert four packed E2M1 bytes into four packed f16x2 registers."""
-
+ 
 +    if not _toolchain_supports(_PTX_PROBE_F16X2_FROM_E2M1):
 +        out = llvm.inline_asm(
 +            llvm.StructType.get_literal(
@@ -2694,7 +2694,7 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
 @@ -657,9 +744,7 @@ def cvt_fp4x8_e2m1_bf16x8(
  ) -> Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32]:
      """Convert four packed E2M1 bytes into four packed bf16x2 registers."""
-
+ 
 -    from cutlass import CUDA_VERSION
 -
 -    if CUDA_VERSION.major > 13 or (CUDA_VERSION.major == 13 and CUDA_VERSION.minor >= 2):
@@ -2705,7 +2705,7 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
 @@ -703,9 +788,7 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
  ) -> Tuple[cutlass.Int32, cutlass.Int32]:
      """Scale eight packed E2M1 values by one E4M3 byte and convert to E4M3."""
-
+ 
 -    from cutlass import CUDA_VERSION
 -
 -    if CUDA_VERSION.major > 13 or (CUDA_VERSION.major == 13 and CUDA_VERSION.minor >= 2):
@@ -2716,7 +2716,7 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
 @@ -731,44 +814,89 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
          out1 = cutlass.Int32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip))
          return out0, out1
-
+ 
 +    # Keep the E4M3 pack in the established operand-constrained helper below.
 +    # CUDA 13.1's embedded NVPTX compiler rejects the equivalent conversion
 +    # when its E4M3x2 destination is a local .b16 register in this larger asm.
@@ -2820,8 +2820,8 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
 +        cvt_fp8x4_e4m3_f32(*values[:4], loc=loc, ip=ip),
 +        cvt_fp8x4_e4m3_f32(*values[4:], loc=loc, ip=ip),
 +    )
-
-
+ 
+ 
  @dsl_user_op
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
 index f5950f3c5552107dcf8d4223383f39811dbed851..caad5947f140bda30e8ec64c87c7014b83916168 100644
@@ -2851,7 +2851,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 +  swizzled, addressed through host-supplied per-page / per-head byte strides
  - FP32 per-tensor K/V global scales
  """
-
+ 
 @@ -297,8 +298,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          self,
          mK: cute.Tensor,            # packed NVFP4: flat [total_k, head_kv, dim/2] or paged [page, head_kv, token, dim/2]
@@ -2893,7 +2893,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 +        # scale readers therefore do raw pointer arithmetic off
 +        # `scale.iterator` and never index the tensor -- keep them that way.
 +        mK, mV = [assume_tensor_aligned(t) for t in (mK, mV)]
-
+ 
          if const_expr(not self.paged_kv):
              # Flat varlen K/V:
 @@ -588,6 +602,8 @@ class SparseAttentionForwardNvfp4KvSm100:
@@ -2938,7 +2938,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 @@ -1193,66 +1218,147 @@ class SparseAttentionForwardNvfp4KvSm100:
      # Warp-specialized helpers
      # ------------------------------------------------------------------
-
+ 
 +    # ------------------------------------------------------------------
 +    # NVFP4 block-scale (scale-factor) addressing
 +    #
@@ -2986,7 +2986,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 +            Int64(page_idx) * Int64(sf_page_stride)
 +            + Int64(head_kv_idx) * Int64(sf_head_stride)
          )
-
+ 
      @cute.jit
 -    def _load_scale_bf16x2(
 +    def _scale_region_base_flat(
@@ -3052,7 +3052,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 -        scale_byte = cute.make_tensor(scale_ptr, cute.make_layout(1))[0]
 -        return utils.cvt_fp8_e4m3_to_bf16x2_replicated(cutlass.Int32(scale_byte))
 +        return cutlass.Int32(cute.make_tensor(scale_ptr, cute.make_layout(1))[0])
-
+ 
      @cute.jit
 -    def _load_scale_e4m3_u8(
 +    def _load_scale_bf16x2_linear(
@@ -3119,13 +3119,13 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
          )
 -        scale_byte = cute.make_tensor(scale_ptr, cute.make_layout(1))[0]
 -        return cutlass.Int32(scale_byte)
-
+ 
      @cute.jit
      def _dequant_fp4x16_to_bf16(
 @@ -1316,25 +1422,6 @@ class SparseAttentionForwardNvfp4KvSm100:
              dst_i32[word_idx * 2 + 4] = fp8_lo
              dst_i32[word_idx * 2 + 5] = fp8_hi
-
+ 
 -    @cute.jit
 -    def _flat_kv_scale_row(
 -        self,
@@ -3408,7 +3408,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 +                for v in cutlass.range_constexpr(elems_per_block // elems_per_store):
 +                    cute.copy(r2s_atom, r_tiles[None, v], s_tiles[None, v])
          cute.arch.fence_view_async_shared()
-
+ 
      @cute.jit
 @@ -1524,11 +1637,29 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
@@ -3647,7 +3647,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
 +                for v in cutlass.range_constexpr(elems_per_block // elems_per_store):
 +                    cute.copy(r2s_atom, r_tiles[None, v], s_tiles[None, v])
          cute.arch.fence_view_async_shared()
-
+ 
      @cute.jit
 @@ -1794,6 +1932,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
@@ -3703,7 +3703,7 @@ index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..daf0e74692096b827844e83838a2cf7d
 @@ -424,7 +424,13 @@ class SparseDecodeAttentionForwardSm100:
          self.tile_scheduler_cls = DecodeTileScheduler
          grid = DecodeTileScheduler.get_grid_shape(tile_sched_params)
-
+ 
 -        clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
 +        # One CLC response record per scheduler stage.  A response is a 16B
 +        # opaque record that `cute.arch.clc_response` reads back with a
@@ -3713,7 +3713,7 @@ index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..daf0e74692096b827844e83838a2cf7d
 +        # makes the copy fail the `cute.copy` verifier).
 +        clc_response_size = self.sched_stages if self.use_clc_scheduler else 0
          clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
-
+ 
          # ------------------------------------------------------------------
 @@ -455,7 +461,7 @@ class SparseDecodeAttentionForwardSm100:
              tmem_dealloc_mbar_ptr: Int64
@@ -3736,7 +3736,7 @@ index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..daf0e74692096b827844e83838a2cf7d
                  scale0 == Float32(0.0) and scale1 == Float32(0.0)
              )
 @@ -1600,8 +1606,7 @@ class SparseDecodeAttentionForwardSm100:
-
+ 
          frg_count: cutlass.Constexpr[int] = self.head_dim // corr_tile_size
          for fi in cutlass.range_constexpr(frg_count):
 -            tOrO_frg = cute.make_fragment(
@@ -3754,13 +3754,13 @@ index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..daf0e74692096b827844e83838a2cf7d
 +        # ``corr_epi_producer_phase`` in correction_loop).
 +        o_acc_producer_phase0 = Int32(1)
 +        o_acc_producer_phase1 = Int32(1)
-
+ 
          work_tile = tile_scheduler.initial_work_tile_info()
          while work_tile.is_valid_tile:
 @@ -1727,6 +1737,52 @@ class SparseDecodeAttentionForwardSm100:
                  block_iter_count_mma = (
                      page_count_mma + Int32(1)) & ~Int32(1)
-
+ 
 +                # ---------------------------------------------------------
 +                # Tile-level O-accumulator acquire.
 +                #
@@ -4180,7 +4180,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 --- a/python/fmha_sm100/cute/test_sparse_atten.py
 +++ b/python/fmha_sm100/cute/test_sparse_atten.py
 @@ -19,9 +19,11 @@ from __future__ import annotations
-
+ 
  import argparse
  import math
 +import os
@@ -4189,12 +4189,12 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
  from contextlib import contextmanager
 +from pathlib import Path
  from typing import Optional
-
+ 
  import pytest
 @@ -61,6 +63,43 @@ DECODE_DIM = 128
  DECODE_KV_TOKEN_SWEEP = tuple(2**exp for exp in range(3, 21))
-
-
+ 
+ 
 +def test_prepare_paged_hnd_input_keeps_aligned_outer_page_stride() -> None:
 +    pages, roles, heads, page_size, head_dim = 5, 3, 2, 128, 128
 +    pool = torch.empty(
@@ -4237,8 +4237,8 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
      torch.cuda.nvtx.range_push(message)
 @@ -435,12 +474,116 @@ def _install_flash_attn3_stub_for_te_import() -> None:
      sys.modules.setdefault("flash_attn_3.flash_attn_interface", interface)
-
-
+ 
+ 
 +# The kernel reads exactly one scale-factor layout pair, unconditionally: K
 +# linear (`t*S + s`) and V in the 4x4 token-quad swizzle
 +# (`(t//4)*(4*S) + 4*s + (t%4)`).  There is no third option, no runtime flag and
@@ -4350,9 +4350,9 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    RNG draws the surrounding input builder happened to make; the golden gate
 +    below depends on that.
 +    """
-
+ 
      from quantize import Nvfp4QuantizedTensor
-
+ 
 @@ -448,21 +591,26 @@ def _make_synthetic_nvfp4_tensor(
          raise ValueError("NVFP4 synthetic shape requires D divisible by 16")
      rows = math.prod(int(dim) for dim in shape[:-1])
@@ -4398,8 +4398,8 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +        original_shape=tuple(shape),
 +        layout=layout,
      )
-
-
+ 
+ 
 -def _quantize_bf16_to_nvfp4_or_skip(x: torch.Tensor) -> object:
 +def _quantize_bf16_to_nvfp4_with_layout(x: torch.Tensor, layout: str) -> object:
 +    """Quantize one tensor to NVFP4 under an explicitly chosen SF layout.
@@ -4414,7 +4414,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    from quantize import quantize_bf16_to_nvfp4
 +
 +    return quantize_bf16_to_nvfp4(x, layout=layout)
-
+ 
 -    try:
 -        return quantize_bf16_to_nvfp4_128x4(x)
 -    except RuntimeError as exc:
@@ -4439,8 +4439,8 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    from quantize import quantize_kv_bf16_to_nvfp4
 +
 +    return quantize_kv_bf16_to_nvfp4(k, v)
-
-
+ 
+ 
  def _dequant_nvfp4_to_bf16(qx: object, *, include_global_scale: bool = True) -> torch.Tensor:
 -    from quantize import dequantize_nvfp4_128x4_to_bf16
 +    """Reference dequantization.
@@ -4453,7 +4453,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    """
 +
 +    from quantize import dequantize_nvfp4_to_bf16
-
+ 
 -    return dequantize_nvfp4_128x4_to_bf16(
 +    return dequantize_nvfp4_to_bf16(
          qx,
@@ -4488,7 +4488,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +                )
                  out_cur += torch.einsum("hst,td->shd", p_unnorm, v_chunk)
              out_cur = out_cur / safe_row_sum.transpose(0, 1).unsqueeze(-1)
-
+ 
 @@ -1342,18 +1538,167 @@ def _assert_fp8_forward_close(
      lse: torch.Tensor,
      lse_ref: torch.Tensor,
@@ -4664,13 +4664,13 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +        f"{gain_tol:.6g} * |mean(out_ref)| {abs(mean_ref):.6g}); the kernel "
 +        f"output carries a systematic offset"
 +    )
-
+ 
      finite = lse_ref.isfinite()
      if finite.any():
 @@ -1786,6 +2131,74 @@ def test_sparse_page_atten(
-
+ 
      _assert_forward_close(out, out_ref, out_pt.float(), lse, lse_ref)
-
+ 
 +
 +def test_sparse_page_atten_strided_outer_page_matches_packed() -> None:
 +    inputs = _build_paged_inputs(
@@ -4745,13 +4745,13 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 @@ -1857,8 +2270,7 @@ def test_sparse_atten_nvfp4_kv_matches_dequantized_bf16(
          k_source = inputs["k"]
          v_source = inputs["v"]
-
+ 
 -    k_q = _quantize_bf16_to_nvfp4_or_skip(k_source)
 -    v_q = _quantize_bf16_to_nvfp4_or_skip(v_source)
 +    k_q, v_q = _quantize_kv_bf16_to_nvfp4(k_source, v_source)
      k_deq = _dequant_nvfp4_to_bf16(k_q)
      v_deq = _dequant_nvfp4_to_bf16(v_q)
-
+ 
 @@ -1886,8 +2298,8 @@ def test_sparse_atten_nvfp4_kv_matches_dequantized_bf16(
          inputs["q"],
          k_q.data,
@@ -4772,7 +4772,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    k_q, v_q = _quantize_kv_bf16_to_nvfp4(inputs["k"], inputs["v"])
      k_deq = _dequant_nvfp4_to_bf16(k_q)
      v_deq = _dequant_nvfp4_to_bf16(v_q)
-
+ 
 @@ -2211,8 +2622,8 @@ def test_sparse_atten_nvfp4_kv_te_quantized_flat_smoke() -> None:
          inputs["q"],
          k_q.data,
@@ -4786,7 +4786,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
          inputs["k2q_row_ptr"],
 @@ -2280,8 +2691,7 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
          v_source = inputs["v"]
-
+ 
      q_fp8 = inputs["q"].to(torch.float8_e4m3fn)
 -    k_q = _quantize_bf16_to_nvfp4_or_skip(k_source)
 -    v_q = _quantize_bf16_to_nvfp4_or_skip(v_source)
@@ -4834,7 +4834,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
          None,
          inputs["k2q_row_ptr"],
 @@ -2560,10 +2976,13 @@ def test_sparse_decode_page_fp8_forward(kv_tokens: int) -> None:
-
+ 
      out, lse = _run_sparse_decode_page_fp8(fn, inputs)
      out_ref, lse_ref = _decode_paged_dense_reference(inputs)
 +    out_ref_exact, _ = _decode_paged_dense_reference(inputs, p_dtype=None)
@@ -4845,8 +4845,8 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    _assert_fp8_forward_close(
 +        out, out_ref, lse, lse_ref, out_ref_unquantized_p=out_ref_exact
 +    )
-
-
+ 
+ 
  def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -> None:
 @@ -2596,7 +3015,10 @@ def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -
          return_softmax_lse=True,
@@ -4857,8 +4857,8 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
 +    _assert_fp8_forward_close(
 +        out, out_ref, lse, lse_ref, out_ref_unquantized_p=out_ref_exact
 +    )
-
-
+ 
+ 
  # ---------------------------------------------------------------------------
 @@ -2943,10 +3365,12 @@ def _build_sparse_nvfp4_kv_benchmark_context(
          raise ValueError(f"Unsupported NVFP4 KV benchmark Q dtype: {q_dtype}")
@@ -4891,7 +4891,7 @@ index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..c4afc8ca5f15625c3c56e2029c2ce885
 @@ -70,6 +70,10 @@ from sparse_index_utils import build_k2q_csr  # noqa: E402
  # SM100 fused CSR builder (cute/src/sm100/prepare_k2q_csr.py).
  from src.sm100.prepare_k2q_csr import SparseK2qCsrBuilderSm100  # noqa: E402
-
+ 
 +from src.sm100.fwd_decode.selected_nvfp4_to_fp8 import (  # noqa: E402
 +    stage_selected_nvfp4_to_fp8,
 +)
@@ -4915,7 +4915,7 @@ index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..c4afc8ca5f15625c3c56e2029c2ce885
 +    quantize_bf16_to_nvfp4,
 +    quantize_kv_bf16_to_nvfp4,
  )
-
+ 
  __all__ = [
 @@ -96,11 +102,14 @@ __all__ = [
      "fp4_indexer_block_scores",
@@ -4944,11 +4944,11 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
      assert page_size >= 1, f"page_size={page_size}"
      assert output_maxscore == False
      assert causal == True
--
+-    
 +
      batch = qo_segment_lens.shape[0]
      gpu_device = torch.device('cuda')
-
+ 
 +    # Stage the host lengths to the device once, asynchronously, and read every
 +    # scalar below from the host copy. Planning runs on the critical path of
 +    # input preparation, where a blocking copy or a device .item() would drain
@@ -4960,32 +4960,32 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
      cu_seqlens_q = torch.zeros(batch + 1, dtype=torch.int32, device=gpu_device)
 -    cu_seqlens_q[1:] = torch.cumsum(qo_segment_lens.to(torch.int32).to(gpu_device), dim=0)
 +    cu_seqlens_q[1:] = torch.cumsum(qo_lens_gpu, dim=0)
-
+ 
      cu_seqlens_k = torch.zeros(batch + 1, dtype=torch.int32, device=gpu_device)
 -    cu_seqlens_k[1:] = torch.cumsum(kv_segment_lens.to(torch.int32).to(gpu_device), dim=0)
 +    cu_seqlens_k[1:] = torch.cumsum(kv_lens_gpu, dim=0)
-
+ 
      max_seqlen_q = int(qo_segment_lens.max().item())
      max_seqlen_k = int(kv_segment_lens.max().item())
 @@ -144,11 +152,12 @@ def sparse_fmha_plan(
      total_rows = sum((int(kl) + blk_kv - 1) // blk_kv for kl in kv_lens)
-
+ 
      if qo_offset is not None:
 -        seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device)
 +        seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device, non_blocking=True)
      else:
 -        seqused_k = kv_segment_lens.to(torch.int32).to(gpu_device)
 +        seqused_k = kv_lens_gpu.clone()
-
+ 
 -    total_q = int(cu_seqlens_q[-1].item())
 +    # Equals cu_seqlens_q[-1], read on the host.
 +    total_q = int(qo_segment_lens.sum())
      qhead_per_kv = num_qo_heads // num_kv_heads if num_kv_heads > 0 else 1
-
+ 
      target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(
 @@ -169,11 +178,14 @@ def sparse_fmha_plan(
      )
-
+ 
      return {
 -        "qo_segment_lens": qo_segment_lens,
 +        "qo_segment_lens": qo_lens_gpu,
@@ -5097,41 +5097,41 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
 -        page_table[b, :n] = kv_indices[offset : offset + n].to(torch.int32)
 -        offset += n
      return page_table
-
-
+ 
+ 
 @@ -310,7 +382,7 @@ def sparse_fmha(
      """
      if kv_block_indexes is None:
          raise ValueError("sparse_fmha requires kv_block_indexes")
--
+-    
 +
-
+ 
      qo_segment_lens = plan_info["qo_segment_lens"]
      cu_seqlens_q = plan_info["cu_seqlens_q"]
 @@ -335,7 +407,7 @@ def sparse_fmha(
          q_offset_override = torch.full_like(qo_segment_lens, q_offset_override)
      elif q_offset_override is not None:
          assert q_offset_override.device == qo_segment_lens.device
--
+-    
 +
      if q_offset_override is not None:
          seqused_k = (qo_segment_lens + q_offset_override).to(torch.int32).to(qo_segment_lens.device)
      else:
 @@ -351,8 +423,8 @@ def sparse_fmha(
      if is_paged:
-
+ 
          if kv_indices is not None:
 -            page_table = _build_page_table(
 -                kv_indices, kv_segment_lens, page_size, batch,
 +            page_table = _page_table_for_plan(
 +                plan_info, kv_indices, kv_segment_lens, page_size, batch,
              )
-
+ 
      # build_k2q_csr(return_schedule=True) builds schedule using hardware SM count internally
 @@ -382,6 +454,17 @@ def sparse_fmha(
-
+ 
      softmax_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
-
+ 
 +    # Hand the caller's buffer to the kernel when its layout already matches
 +    # what `combine` produces, so the result does not have to be copied into
 +    # place afterwards. Anything else falls back to allocate-then-copy.
@@ -5152,7 +5152,7 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
          usable_SM_count=usable_SM_count,
 +        out=out if writable_out else None,
      )
-
+ 
 -    if out is not None:
 +    if out is not None and not writable_out:
          out.copy_(result)

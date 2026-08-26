@@ -101,6 +101,19 @@ def test_apply_msa_patch_reports_conflict(tmp_path):
         apply_msa_patch(project_dir)
 
 
+def test_apply_msa_patch_rejects_indentation_mismatch(tmp_path: Path) -> None:
+    """Python context with a changed scope must not match permissively."""
+    project_dir = _stage_project(tmp_path)
+    interface = project_dir / "3rdparty" / "MSA" / MSA_INTERFACE
+    source = interface.read_text()
+    context = "\ndef _validate_cu_seqlens("
+    assert context in source
+    interface.write_text(source.replace(context, "\n def _validate_cu_seqlens(", 1))
+
+    with pytest.raises(RuntimeError, match="Cannot apply"):
+        apply_msa_patch(project_dir)
+
+
 def test_apply_msa_patch_requires_initialized_submodule(tmp_path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()
