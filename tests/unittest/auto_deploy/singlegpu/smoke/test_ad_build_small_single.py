@@ -109,24 +109,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {

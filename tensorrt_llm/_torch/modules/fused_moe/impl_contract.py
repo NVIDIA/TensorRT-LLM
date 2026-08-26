@@ -468,11 +468,20 @@ def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:
     return ctx.comm_plan
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class MoEEplbBinding:
-    """EPLB expert layout required before weight creation."""
+    """EPLB expert layout required before weight creation.
+
+    Keyword-only on purpose: the leading fields are all ``int``, so positional
+    construction would let a field inserted in the middle silently shift every
+    later argument, surfacing only as wrong expert-weight shapes.
+    """
 
     layer_idx: int
+    # The checkpoint expert count, not a slot-layout value, but needed here for
+    # the same reason: ``register_all_parameter_slot_and_to_fix_weight_fns``
+    # iterates over it to set up host-tensor sharing before weights exist.
+    num_experts: int
     num_slots: int
     slot_start: int
     slot_end: int

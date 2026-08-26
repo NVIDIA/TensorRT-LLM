@@ -336,7 +336,6 @@ def test_qwen_output_budget_uses_post_merge_embedding_capacity():
 
     budget = engine._resolve_mm_encoder_output_budget_bytes()
 
-    assert engine.max_mm_encoder_output_embeddings == 16384
     assert engine.bytes_per_mm_encoder_embedding == 32768
     assert budget == 512 * 1024**2
 

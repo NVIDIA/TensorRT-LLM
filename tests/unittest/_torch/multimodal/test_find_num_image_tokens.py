@@ -245,6 +245,8 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
                     video=video_data.frames,
                     video_grid_thw=processed_inputs["video_grid_thw"])
+            else:
+                raise ValueError(f"Unsupported model type: {model_type}")
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \

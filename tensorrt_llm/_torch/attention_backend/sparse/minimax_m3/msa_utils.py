@@ -11,7 +11,9 @@ from typing import Optional, Tuple
 
 import torch
 
-from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
+from tensorrt_llm._utils import maybe_pin_memory
+
+from .common import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
@@ -108,36 +110,36 @@ def write_msa_main_kv(
 
 
 def build_kv_page_indices(
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,
+    block_ids_cpu: torch.Tensor,
     kv_lens_cpu: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Build the flattened per-request page table fmha_sm100 consumes.
+    """Build the flattened per-request page table fmha_sm100 consumes, on the host.
 
-    Returns int32 global page ids concatenated per request. A request's
-    pages come from the first slot of each page in its req_to_token row.
-    Page ids are global and non-contiguous in production, so they are not
-    clamped to a per-request bound.
+    Returns int32 global page ids concatenated per request, request b
+    contributing the first ceil(kv_len / page_size) entries of its
+    block_ids_cpu row. A request with kv_len <= 0 contributes nothing, matching
+    the page count the plan derives from the same lengths. Page ids are global
+    and non-contiguous in production, so they are not clamped to a per-request
+    bound.
+
+    block_ids_cpu is the [batch, max_blocks] host table
+    build_paged_kv_slot_mapping obtains from the cache manager. Both use the
+    manager's tokens_per_block as the page size, so
+    req_to_token[b, p * page_size] // page_size equals block_ids_cpu[b, p] and
+    the page table needs no device work. The result is pinned where that helps,
+    so the caller stages it with one asynchronous copy.
     """
-    device = req_to_token.device
-    req_rows = req_to_token.index_select(0, slot_ids.to(torch.long)).to(torch.long)
-    batch = int(req_rows.shape[0])
-    kv_lens_list = kv_lens_cpu.to(torch.long).tolist()
-
-    page_lists = []
-    for b in range(batch):
-        kv_len = int(kv_lens_list[b])
-        if kv_len <= 0:
-            continue
-        num_pages = (kv_len + page_size - 1) // page_size
-        page_starts = torch.arange(num_pages, device=device, dtype=torch.long) * page_size
-        page_ids = req_rows[b].gather(0, page_starts) // page_size
-        page_lists.append(page_ids.to(torch.int32))
-
-    if page_lists:
-        return torch.cat(page_lists, dim=0)
-    return torch.empty(0, dtype=torch.int32, device=device)
+    pages = (kv_lens_cpu.to(torch.long) + (page_size - 1)) // page_size
+    pages.clamp_(min=0)
+    total_pages = int(pages.sum())
+    if total_pages == 0:
+        return torch.empty(0, dtype=torch.int32)
+    batch = int(pages.shape[0])
+    row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), pages)
+    starts = torch.cumsum(pages, 0) - pages
+    col = torch.arange(total_pages, dtype=torch.long) - starts[row]
+    return maybe_pin_memory(block_ids_cpu[row, col].to(torch.int32))
 
 
 def per_token_valid_blocks(
@@ -183,42 +185,26 @@ def select_blocks_from_maxscore(
     n_valid_blocks: torch.Tensor,
     init_blocks: int,
     local_blocks: int,
+    head_major_output: bool = False,
 ) -> torch.Tensor:
     """Select per-query top-k blocks from per-KV-head block scores.
 
     Applies init and local forced blocks and per-query valid-block masking
     on the amax-reduced scores [num_kv_heads, n_blocks, total_q]. Returns
     [total_q, num_kv_heads, topk] int32 ascending block ids with -1 tail
-    padding.
+    padding. When ``head_major_output`` is set, the logical result uses a
+    head-major backing so ``result.permute(1, 0, 2)`` is contiguous without a
+    copy.
     """
-    num_kv_heads, n_blocks, total_q = max_score_kv.shape
-    device = max_score_kv.device
-    scores = max_score_kv.permute(2, 0, 1).to(torch.float32).clone()
-    block_ids = torch.arange(n_blocks, device=device, dtype=torch.long)
-    nvb = n_valid_blocks.to(device=device, dtype=torch.long)
-
-    if init_blocks > 0:
-        init_mask = block_ids.view(1, 1, -1) < init_blocks
-        scores = torch.where(init_mask, torch.full_like(scores, _INIT_SCORE), scores)
-    if local_blocks > 0:
-        local_start = (nvb - local_blocks).clamp_min(0)
-        local_mask = (block_ids.view(1, -1) >= local_start.view(-1, 1)) & (
-            block_ids.view(1, -1) < nvb.view(-1, 1)
-        )
-        scores = torch.where(local_mask.unsqueeze(1), torch.full_like(scores, _LOCAL_SCORE), scores)
-    block_valid = block_ids.view(1, -1) < nvb.view(-1, 1)
-    scores = scores.masked_fill(~block_valid.unsqueeze(1), float("-inf"))
-
-    k = min(topk, n_blocks)
-    vals, idx = scores.topk(k=k, dim=-1)
-    idx = torch.where(vals != float("-inf"), idx, torch.full_like(idx, -1))
-    sort_key = torch.where(idx < 0, torch.full_like(idx, n_blocks), idx)
-    sort_key, _ = torch.sort(sort_key, dim=-1)
-    idx = torch.where(sort_key >= n_blocks, torch.full_like(sort_key, -1), sort_key)
-    if k < topk:
-        pad = torch.full((total_q, num_kv_heads, topk - k), -1, dtype=idx.dtype, device=device)
-        idx = torch.cat([idx, pad], dim=-1)
-    return idx.to(torch.int32)
+    nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    return torch.ops.trtllm.minimax_m3_select_blocks(
+        max_score_kv,
+        nvb,
+        topk,
+        init_blocks,
+        local_blocks,
+        head_major_output,
+    )
 
 
 __all__ = [

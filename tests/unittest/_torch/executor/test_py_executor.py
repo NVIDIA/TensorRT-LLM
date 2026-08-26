@@ -24,6 +24,7 @@ import torch
 import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 
+from tensorrt_llm._torch.disaggregation.executor.admission import DisaggTransferAdmissionController
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
@@ -37,7 +38,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
-    DisaggTransferAdmissionController,
     EncoderStepResult,
     PyExecutor,
     _ADPForwardIntent,
@@ -1167,6 +1167,32 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
 
+    def test_sync_single_rank_ctx_reaps_idle_transfer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+            is_idle=True,
+        )
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_not_called()
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+
     def test_sync_multi_rank_does_not_wait_for_blocked_peer(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1822,6 +1848,7 @@ class _StubADPExecutor:
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
         kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        kv_cache_manager.is_linear_attention = False
         kv_cache_manager.max_seq_len = (
             max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
         )
@@ -3123,3 +3150,92 @@ class TestOneModelMTPDraftTokenScheduling:
 
         assert gen.py_draft_tokens == sampler_drafts
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+
+
+class TestAdpBalanceExcludesPadDummies:
+    """The low-occupancy test must look at real decode work, not batch size.
+
+    `_pad_attention_dp_dummy_request` gives an otherwise idle rank exactly one
+    generation request so attention DP can make progress. Counting that dummy
+    as decode work makes the rank look busy, which is precisely wrong for a
+    check whose job is to notice idle ranks.
+    """
+
+    @staticmethod
+    def _make_executor(per_rank, threshold):
+        """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock()
+        executor.dist.tp_allgather = Mock(
+            return_value=[[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank]
+        )
+        executor.max_batch_size = 64
+        executor.attention_dp_enable_balance = True
+        executor.attention_dp_time_out_iters = 60
+        executor.attention_dp_batching_wait_iters = 10
+        executor.attention_dp_min_generation_requests = threshold
+        executor.attention_dp_low_occupancy_timeout_iters = 0
+        executor.adp_ctx_waiting_iters_count = 0
+        executor.adp_ctx_batching_wait_iters_count = 0
+        return executor
+
+    @staticmethod
+    def _make_generation_request(is_dummy):
+        request = Mock()
+        request.is_attention_dp_dummy = is_dummy
+        return request
+
+    @staticmethod
+    def _make_context_request(num_tokens=4):
+        request = Mock()
+        request.get_tokens.return_value = [0] * num_tokens
+        return request
+
+    def test_padded_rank_counts_as_under_occupied(self):
+        """A rank holding only a pad dummy has zero real decode work.
+
+        Peer rank is padded: it reports one scheduled generation request and
+        zero real ones. With a threshold of 1 the low-occupancy timeout of 0
+        must be selected so the withheld context is released on this very
+        iteration. Counting the dummy would leave the cross-rank minimum at 1,
+        keep the 60-iteration timeout, and strand the context batch.
+        """
+        context_requests = [self._make_context_request()]
+        # This rank has context and decode work; the peer is padded and has
+        # no context request, so the batch is not aligned and the balancer
+        # takes the timeout branch.
+        executor = self._make_executor([(1, 4, 4), (0, 1, 0)], threshold=1)
+
+        balanced = executor._balance_adp_requests(
+            context_requests, [self._make_generation_request(False)]
+        )
+
+        assert balanced == context_requests
+        assert executor.adp_ctx_waiting_iters_count == 0
+
+    def test_busy_ranks_still_wait(self):
+        """No rank is under-occupied, so the configured timeout still applies."""
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=1)
+
+        balanced = executor._balance_adp_requests(
+            [self._make_context_request()], [self._make_generation_request(False)]
+        )
+
+        assert balanced == []
+        assert executor.adp_ctx_waiting_iters_count == 1
+
+    def test_real_count_excludes_dummies(self):
+        """The allgathered real count must not include the pad dummy."""
+        executor = self._make_executor([(1, 2, 1)], threshold=0)
+
+        executor._balance_adp_requests(
+            [self._make_context_request()],
+            [
+                self._make_generation_request(True),
+                self._make_generation_request(False),
+            ],
+        )
+
+        gathered = executor.dist.tp_allgather.call_args[0][0]
+        assert gathered[1] == 2, "scheduled count keeps counting the dummy"
+        assert gathered[3] == 1, "real count must exclude the dummy"

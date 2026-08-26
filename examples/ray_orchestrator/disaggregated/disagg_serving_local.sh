@@ -177,7 +177,7 @@ trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cac
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."
-trtllm-serve disaggregated -c disagg_config_local.yaml
+trtllm-serve disaggregated -c disagg_config_local.yaml -t 300
 
 # Cleanup
 if [[ "$RAY_STARTED" == "true" && "$ATTACH_MODE" != "true" ]]; then
