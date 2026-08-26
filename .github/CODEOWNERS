@@ -16,6 +16,7 @@
 #   Disaggregated Serving    			  @NVIDIA/trt-llm-disagg-devs
 #   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
 #   MoE                      			  @NVIDIA/trt-llm-moe-devs
+#   Top-K                     			  @longcheng-nv @limin2021
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
 #   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
@@ -378,6 +379,13 @@
 /tests/unittest/_torch/thop/parallel/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
+
+# ===== TOP-K =====
+/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k @longcheng-nv @limin2021
+/tensorrt_llm/_torch/modules/top_k.py @longcheng-nv @limin2021 @lfr-0531
+/tests/scripts/cute_dsl_kernels/top_k @longcheng-nv @limin2021
+/tests/unittest/_torch/attention/sparse/*topk* @longcheng-nv @limin2021
+/tests/unittest/_torch/modules/test_top_k.py @longcheng-nv @limin2021 @lfr-0531
 
 # ===== VisualGen / AIGV =====
 /cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-torch-visual-gen-devs
