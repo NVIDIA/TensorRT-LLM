@@ -46,6 +46,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
+from tensorrt_llm._torch.route_capture import RouteCapture  # R3
 
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -406,6 +407,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
+            RouteCapture.capture(moe.layer_idx, token_selected_experts)  # R3 device-buffer capture
 
             assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
@@ -1159,6 +1161,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 router_logits_chunk_real, input_ids_chunk_real
             )
             token_selected_experts = token_selected_experts.to(torch.int32)
+            RouteCapture.capture(moe.layer_idx, token_selected_experts)  # R3 device-buffer capture
             token_final_scales = token_final_scales.to(torch.float32)
         else:
             device = x.device

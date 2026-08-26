@@ -64,6 +64,7 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
+from ..route_capture import RouteCapture
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -7526,6 +7527,9 @@ class PyExecutor:
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
+        RouteCapture.set_iter(self.iter_counter)
+        if not self.model_engine.is_warmup:
+            RouteCapture.prepare(scheduled_requests, getattr(getattr(self, 'kv_cache_manager', None), 'tokens_per_block', 0))
 
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)
@@ -7570,6 +7574,7 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+            RouteCapture.finish_forward()  # R3: disarm between forwards
 
             return outputs
         except Exception as e:
@@ -8267,6 +8272,8 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
+            if request.is_finished:
+                RouteCapture.attach_routes(request)  # R3: append routes
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
                            or request.py_decoding_iter % self.stream_interval
                            == 0)
@@ -8496,6 +8503,7 @@ class PyExecutor:
         self.kv_cache_manager.reset_reuse_state()
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.reset_reuse_state()
+        RouteCapture.clear_shared()  # R3: invalidate cached routes with KV
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
