@@ -31,6 +31,7 @@ def _engine(
     dwdp_size: int = 0,
     tp_size: int = 1,
     tp_peer_values: tuple[int, ...] = (),
+    peer_values: tuple[int, ...] | None = None,
     with_dist: bool = True,
 ) -> PyTorchModelEngine:
     """Build an engine carrying only what the warmup policy reads.
@@ -39,15 +40,23 @@ def _engine(
     ``DummyModelEngine`` construct without a communicator -- so ``with_dist``
     covers that state too.
 
-    ``tp_allgather`` returns this rank's value followed by ``tp_peer_values``,
-    which is enough for the TP agreement check to see an asymmetric world.
+    ``tp_allgather`` returns this rank's value followed by ``tp_peer_values``;
+    ``allgather`` does the same over ``peer_values`` for the forward group.
+    ``peer_values`` defaults to peers that mirror this rank, i.e. a world that
+    agrees with whatever this rank reports.
     """
     engine = object.__new__(PyTorchModelEngine)
+
+    def _allgather(value):
+        peers = [value] * (world_size - 1) if peer_values is None else list(peer_values)
+        return [value, *peers]
+
     engine.dist = (
         SimpleNamespace(
             world_size=world_size,
             rank=3,
             tp_allgather=lambda value: [value, *tp_peer_values],
+            allgather=_allgather,
         )
         if with_dist
         else None
@@ -136,7 +145,12 @@ def test_guard_leaves_teardown_signals_unarmed(signal: type) -> None:
     "world_size,dwdp_size,has_batch,expected",
     [
         (1, 0, False, False),
-        (2, 0, False, None),
+        # Every rank in the forward group lacks a batch. The allgather proves
+        # nobody is left inside the collective, so skipping strands no one --
+        # this is the shape a max_batch_size=1 config simply cannot build.
+        (2, 0, False, False),
+        # DWDP peers live outside `self.dist`, so unanimity cannot be observed
+        # and the shape stays fatal.
         (1, 4, False, None),
         (2, 0, True, True),
     ],
@@ -151,6 +165,85 @@ def test_warmup_batch_policy(
             engine._should_run_warmup_batch(batch, 128, "general")
     else:
         assert engine._should_run_warmup_batch(batch, 128, "general") is expected
+
+
+def test_symmetric_absence_skips_instead_of_failing_the_world() -> None:
+    """The regression this fix exists for.
+
+    `max_batch_size=1` cannot build the mixed context+generation attention
+    shape, on any rank, at any KV cache size. Every rank reaches the same
+    verdict from configuration alone, so the group agrees and skips. Failing
+    here took down ten multi-GPU tests that had always skipped this shape.
+    """
+    engine = _engine(world_size=2, tp_size=2, peer_values=(0,))
+
+    assert (
+        engine._should_run_warmup_batch(None, 2, "attention, num_tokens=2, num_gen_requests=1")
+        is False
+    )
+
+
+def test_group_disagreement_still_fails_with_the_ranks_named() -> None:
+    """Asymmetric capacity is the deadlock the agreement exists to catch."""
+    engine = _engine(world_size=3, peer_values=(1, 0))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        engine._should_run_warmup_batch(None, 128, "general")
+
+    message = str(excinfo.value)
+    assert "rank(s) [0, 2]" in message
+    assert "would deadlock" in message
+
+
+def test_pipeline_only_world_agrees_without_a_tp_group() -> None:
+    """TP=1 with pipeline peers is where the TP-only check gathered nothing.
+
+    Three of the ten failures were disaggregated context servers at
+    `tensor_parallel_size: 1, pipeline_parallel_size: 2`.
+    """
+    engine = _engine(world_size=2, tp_size=1, peer_values=(0,))
+
+    assert engine._should_run_warmup_batch(None, 128, "general") is False
+
+
+def test_agreement_group_is_absent_for_dwdp() -> None:
+    engine = _engine(world_size=4, dwdp_size=4)
+
+    assert engine._warmup_agreement_allgather() is None
+
+
+@pytest.mark.parametrize(
+    "world_size,peer_values,flag,expected",
+    [
+        (1, None, True, True),
+        (2, (1,), True, True),
+        # One pipeline stage owns the guided decoder and opts out; the group
+        # follows it rather than letting the others enter alone.
+        (2, (0,), True, False),
+        (2, (1,), False, False),
+    ],
+)
+def test_phase_entry_flag_is_agreed(
+    world_size: int, peer_values: tuple[int, ...] | None, flag: bool, expected: bool
+) -> None:
+    engine = _engine(world_size=world_size, peer_values=peer_values)
+
+    assert engine._agree_warmup_flag(flag) is expected
+
+
+def test_shape_list_narrows_to_what_every_rank_proposed() -> None:
+    """Attention-DP gives ranks different capacities and so different shapes."""
+    engine = _engine(world_size=2)
+    engine.dist.allgather = lambda value: [value, [[1, 0], [2, 0]]]
+
+    assert engine._agree_warmup_shapes([(1, 0), (2, 0), (4096, 0)]) == [(1, 0), (2, 0)]
+
+
+def test_shape_list_is_untouched_without_a_group() -> None:
+    engine = _engine(world_size=1)
+    configs = [(1, 0), (128, 0)]
+
+    assert engine._agree_warmup_shapes(configs) == configs
 
 
 def test_warmup_batch_policy_without_communicator() -> None:
@@ -178,8 +271,13 @@ def test_tp_disagreement_reports_the_ranks_that_lost_their_batch() -> None:
     The rank that still has a batch must not walk into a forward its peer
     will never join, and the failure has to name the peer so the KV cache
     fraction can be raised.
+
+    DWDP is what still reaches the TP-only check: its peers are outside
+    ``self.dist``, so no group agreement is available and the narrower TP
+    check remains the only thing standing between an asymmetric world and a
+    deadlock.
     """
-    engine = _engine(world_size=2, tp_size=2, tp_peer_values=(0,))
+    engine = _engine(world_size=2, dwdp_size=4, tp_size=2, tp_peer_values=(0,))
 
     with pytest.raises(RuntimeError) as excinfo:
         engine._should_run_warmup_batch(object(), 128, "general")

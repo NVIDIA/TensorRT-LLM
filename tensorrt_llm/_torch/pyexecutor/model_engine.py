@@ -1409,7 +1409,10 @@ class PyTorchModelEngine(ModelEngine):
         # trigger non-traceable code (time.time(), torch.cuda.*) in the cache.
         AutoTuner.get()
 
-        can_run_general_warmup = (
+        # ``guided_decoder`` is installed only on the last pipeline rank, so
+        # this predicate is not rank-uniform on its own. Agree it before it
+        # gates either the attention or the general phase.
+        can_run_general_warmup = self._agree_warmup_flag(
             not is_enc_dec and not self.is_draft_model
             and not self.mapping.has_cp_helix() and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
@@ -1425,8 +1428,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
-            warmup_requests_configs = self._get_full_general_warmup_requests(
-                resource_manager)
+            warmup_requests_configs = self._agree_warmup_shapes(
+                self._get_full_general_warmup_requests(resource_manager))
             # Currently graph has not been captured, disable cuda graph for this warmup.
             with self.no_cuda_graph():
                 self._general_warmup(resource_manager, warmup_requests_configs)
@@ -1710,37 +1713,128 @@ class PyTorchModelEngine(ModelEngine):
             return False
         return self.dist.world_size > 1 or self.mapping.dwdp_enabled
 
+    def _warmup_agreement_allgather(
+            self) -> Optional[Callable[[int], List[int]]]:
+        """Return an allgather over the ranks this warmup forward synchronizes with.
+
+        ``None`` means agreement cannot be established here, so a missing batch
+        stays fatal rather than being skipped unilaterally.
+
+        DWDP is the case that cannot be answered: its peers are reached through
+        a ``COMM_WORLD``-derived subgroup built in ``dwdp.py``, not through
+        ``self.dist``, so a ``self.dist`` allgather would report a unanimity it
+        never observed.
+        """
+        if self.dist is None or self.mapping.dwdp_enabled:
+            return None
+        if self.dist.world_size <= 1:
+            return None
+        return self.dist.allgather
+
+    def _agree_warmup_flag(self, flag: bool) -> bool:
+        """Reduce a phase-entry decision to one the whole forward group shares.
+
+        Several predicates that gate a warmup phase are rank-local. The
+        capturable guided decoder is installed only on the last pipeline rank,
+        so ``guided_decoder is None`` -- and through it
+        ``can_run_general_warmup`` -- differs across pipeline stages. Mamba's
+        entry test reads this rank's free KV capacity. Letting one rank enter a
+        phase its peers skip strands whoever enters the collective, and it also
+        unbalances the per-shape agreement below.
+
+        Any rank opting out takes the whole group out with it.
+        """
+        allgather = self._warmup_agreement_allgather()
+        if allgather is None:
+            return flag
+        return all(allgather(int(flag)))
+
+    def _agree_warmup_shapes(
+            self, configs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Reduce warmup shapes to the ones every rank in the group proposed.
+
+        ``_get_max_shape_warmup_requests`` derives shapes from this rank's free
+        KV capacity, so under attention-DP the values -- and, once
+        ``dict.fromkeys`` drops a collision, the length -- differ per rank.
+        Ranks would then walk different loops and meet in different forwards.
+
+        The intersection keeps rank 0's ordering, which matters because the
+        general warmup list is ordered for torch.compile specialization.
+        """
+        allgather = self._warmup_agreement_allgather()
+        if allgather is None:
+            return configs
+        per_rank = allgather([list(config) for config in configs])
+        shared = set.intersection(*({tuple(config)
+                                     for config in rank_configs}
+                                    for rank_configs in per_rank))
+        agreed = [config for config in configs if config in shared]
+        dropped = [config for config in configs if config not in shared]
+        if dropped:
+            logger.warning(
+                f"Dropping warmup shapes {dropped} that not every rank could "
+                f"propose; per-rank KV capacity differs. Remaining: {agreed}.")
+        return agreed
+
     def _should_run_warmup_batch(self, batch: Optional[ScheduledRequests],
                                  num_tokens: int, shape: str) -> bool:
         """Decide whether this warmup shape runs, is skipped, or fails the rank.
 
         A rank that skips a shape its peers run leaves them blocked in that
-        forward's collectives for the rest of the job, so a missing batch is
-        only skippable when this rank has no peers at all.
+        forward's collectives for the rest of the job. Skipping is therefore
+        safe exactly when every rank in the forward group skips too, and an
+        allgather establishes that before any rank enters the forward.
 
-        With peers, ``_assert_all_tp_ranks_have_warmup_batch`` turns the TP
-        case into a symmetric error carrying per-rank diagnostics. No such
-        check exists for the other topologies (PP, CP, DWDP), so there the
-        shape fails this rank and the warmup boundary guard in ``PyExecutor``
-        tears the world down.
+        The plan agreed by ``_agree_warmup_plan`` is what makes that allgather
+        safe: every rank walks the same shape list, so this runs the same
+        number of times everywhere.
         """
-        if batch is None and not self._is_distributed_forward():
+        if not self._is_distributed_forward():
+            if batch is not None:
+                return True
             # Safe to skip, but never silently: a skip during KV cache
             # estimation makes the profiling peak unrepresentative of
             # this shape.
             logger.warning(f"Skipping warmup shape ({shape}): not enough KV "
                            f"cache space.")
             return False
-        self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
-        if batch is None:
-            raise RuntimeError(
-                f"Warmup batch creation failed for shape ({shape}) on "
-                f"global_rank={global_mpi_rank()}, "
-                f"model_rank={self.dist.rank}. Peer workers may already be "
-                f"inside the matching forward, so this rank cannot skip the "
-                f"shape without stranding them. Consider increasing "
-                f"--kv_cache_free_gpu_mem_fraction.")
-        return True
+
+        allgather = self._warmup_agreement_allgather()
+        if allgather is None:
+            # No reachable group to agree with. Keep the TP-only check, which
+            # still catches the attention-DP asymmetry it was written for.
+            self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+            if batch is None:
+                raise RuntimeError(
+                    f"Warmup batch creation failed for shape ({shape}) on "
+                    f"global_rank={global_mpi_rank()}, "
+                    f"model_rank={self.dist.rank}, and this topology offers no "
+                    f"way to confirm that peers are skipping it too. They may "
+                    f"already be inside the matching forward, so this rank "
+                    f"cannot skip the shape without stranding them.")
+            return True
+
+        flags = list(allgather(int(batch is not None)))
+        if all(flags):
+            return True
+        if not any(flags):
+            # Every rank in the forward group is skipping, so none of them is
+            # left inside a collective. This is the ordinary outcome for a
+            # shape that does not fit the configuration at all, such as a
+            # mixed context+generation shape under ``max_batch_size=1``.
+            logger.warning(f"Skipping warmup shape ({shape}) on all "
+                           f"{len(flags)} ranks: not enough KV cache space.")
+            return False
+
+        all_tokens = list(allgather(num_tokens))
+        failed_ranks = [i for i, flag in enumerate(flags) if not flag]
+        raise RuntimeError(
+            f"Warmup batch creation failed for shape ({shape}) on rank(s) "
+            f"{failed_ranks} but succeeded on others, so entering this forward "
+            f"would deadlock the ranks that still hold a batch. Per-rank "
+            f"curr_max_num_tokens: {all_tokens}. This indicates asymmetric KV "
+            f"cache capacity across ranks. Consider increasing "
+            f"--kv_cache_free_gpu_mem_fraction.")
 
     def _assert_all_tp_ranks_have_warmup_batch(self, batch,
                                                num_tokens: int) -> None:
@@ -2031,7 +2125,9 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
-        if curr_max_num_tokens < 4:
+        # Rank-local capacity, so peers can disagree. Leaving the phase alone
+        # would unbalance the per-shape agreement inside it.
+        if not self._agree_warmup_flag(curr_max_num_tokens >= 4):
             return
 
         # Cap the multi-seq warmup token count so we don't fill the KV cache
