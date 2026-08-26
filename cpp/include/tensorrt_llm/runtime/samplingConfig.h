@@ -368,7 +368,7 @@ public:
     OptVec<SizeType32> earlyStopping;               // [1] or [batchSize]
     OptVec<std::vector<SizeType32>> beamWidthArray; // [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength]
 
-    // speculative decoding, only the first value is used (in gptDecoderBatched.cpp)
+    // speculative decoding
     OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batchSize]
 
     // medusa params

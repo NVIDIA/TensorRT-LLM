@@ -65,7 +65,7 @@ def test_noop_without_totals():
 
 
 def test_noop_when_section_already_populated():
-    # TRT-engine / TRTLLMSampler paths populate the section runtime-side
+    # The TRT-engine path populates the section runtime-side
     # (updateNumTokensPerIteration); the backfill must not overwrite it.
     pm = tllm.RequestPerfMetrics()
     spec_dec = tllm.SpeculativeDecodingMetrics()

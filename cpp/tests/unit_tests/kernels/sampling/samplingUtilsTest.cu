@@ -15,8 +15,8 @@
  */
 
 #include "tensorrt_llm/common/tllmDataType.h"
-#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tests/unit_tests/kernels/sampling/samplingTest.h"
+#include <numeric>
 #include <random>
 
 using namespace tensorrt_llm::tests::kernels::sampling;
@@ -27,6 +27,15 @@ namespace tk = tensorrt_llm::kernels;
 
 namespace
 {
+
+/// @brief Helper function to produce batch slots [0, 1, ..., batchSize - 1].
+ITensor::SharedConstPtr getDefaultBatchSlots(SizeType32 batchSize)
+{
+    auto defaultBatchSlots = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), TRTDataType<SizeType32>::value);
+    auto range = BufferRange<SizeType32>(*defaultBatchSlots);
+    std::iota(range.begin(), range.end(), 0);
+    return defaultBatchSlots;
+}
 
 __global__ void generateRandomNumber(
     SizeType32* vals, SizeType32 const* batchSlots, curandState_t* states, SizeType32 batchSize)

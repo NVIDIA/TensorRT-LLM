@@ -19,14 +19,12 @@
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -740,82 +738,6 @@ void initBindings(nb::module_& m)
         nb::arg("encoder_kv_lengths"), nb::arg("previous_batch_indices"), nb::arg("position_id_offset") = 0,
         nb::call_guard<nb::gil_scoped_release>(),
         "Prepare the persistent CPU input buffers for a simple encoder-decoder batch.");
-
-    m.def(
-        "make_decoding_batch_input",
-        [](tb::DecoderInputBuffers& decoderInputBuffers, runtime::decoder::DecoderState& decoderState,
-            std::vector<std::shared_ptr<tb::LlmRequest>> const& contextRequests,
-            std::vector<std::shared_ptr<tb::LlmRequest>> const& genRequests, tr::ITensor::SharedPtr const& logits,
-            int beamWidth, std::vector<int> const& numContextLogitsPrefixSum, tr::BufferManager const& manager)
-        {
-            std::vector<int> activeSlots;
-            std::vector<int> generationSteps;
-            std::vector<std::vector<tr::ITensor::SharedConstPtr>> logitsVec = {{}};
-
-            for (int i = 0; i < contextRequests.size(); ++i)
-            {
-                if (contextRequests[i]->isLastContextChunk())
-                {
-                    activeSlots.push_back(*contextRequests[i]->mSeqSlot);
-                    generationSteps.push_back(contextRequests[i]->getDecodingIter());
-                    auto contextLogitsOffset = numContextLogitsPrefixSum[i + 1] - 1;
-                    tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, contextLogitsOffset, 1);
-
-                    if (beamWidth > 1)
-                    {
-                        // Tile logits of context requests
-                        auto const logitsShape = logitsView->getShape();
-                        auto const logitsType = logitsView->getDataType();
-                        auto decoderLogits = manager.gpu(ITensor::makeShape({beamWidth, logitsShape.d[1]}), logitsType);
-                        tensorrt_llm::runtime::kernels::tileTensor(
-                            *decoderLogits, *logitsView, beamWidth, manager.getStream());
-                        decoderLogits->unsqueeze(0);
-                        logitsVec[0].push_back(std::move(decoderLogits));
-                    }
-                    else
-                    {
-                        logitsView->unsqueeze(1);
-                        logitsVec[0].push_back(std::move(logitsView));
-                    }
-                }
-            }
-
-            auto genLogitsOffset = numContextLogitsPrefixSum.back();
-            for (int i = 0; i < genRequests.size(); ++i)
-            {
-                if (genRequests[i]->isGenerationInProgressState())
-                {
-                    activeSlots.push_back(*genRequests[i]->mSeqSlot);
-                    generationSteps.push_back(genRequests[i]->getDecodingIter());
-
-                    auto logitsOffset = genLogitsOffset + i * beamWidth;
-                    auto numberOfLogits = beamWidth;
-                    tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, logitsOffset, numberOfLogits);
-                    logitsView->unsqueeze(0);
-                    logitsVec[0].push_back(std::move(logitsView));
-                }
-            }
-
-            auto& batchSlots = decoderInputBuffers.forwardBatchSlots;
-            batchSlots[0]->resize(activeSlots.size());
-            auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots[0]);
-            for (int i = 0; i < activeSlots.size(); ++i)
-            {
-                batchSlotsRange[i] = activeSlots[i];
-            }
-
-            decoderInputBuffers.batchLogits = logitsVec;
-
-            auto const maxBeamWidth = decoderState.getMaxBeamWidth();
-            if (maxBeamWidth > 1)
-            {
-                // For Variable-Beam-Width-Search
-                decoderState.getJointDecodingInput().generationSteps = generationSteps;
-            }
-        },
-        nb::arg("decoder_input_buffers"), nb::arg("decoder_state"), nb::arg("context_requests"),
-        nb::arg("generation_requests"), nb::arg("logits"), nb::arg("beam_width"),
-        nb::arg("num_context_logits_prefix_sum"), nb::arg("buffer_manager"), "Make decoding batch input.");
 }
 
 } // namespace tensorrt_llm::nanobind::batch_manager

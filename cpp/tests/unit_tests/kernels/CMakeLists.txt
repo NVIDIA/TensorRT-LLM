@@ -14,7 +14,6 @@
 # the License.
 
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
-add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
 add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
 add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
@@ -110,6 +109,5 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
 endif()
 
-add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)

@@ -15,10 +15,7 @@
 
 add_gtest(bufferManagerTest bufferManagerTest.cpp)
 add_gtest(cudaMemPoolTest cudaMemPoolTest.cpp)
-add_gtest(decodingLayerWorkspaceTest decodingLayerWorkspaceTest.cpp)
 add_gtest(gdrcopyTest gdrcopyTest.cpp)
-add_gtest(gptDecoderBatchedTest gptDecoderBatchedTest.cpp)
-add_gtest(gptDecoderTest gptDecoderTest.cpp)
 add_gtest(hostAccessibleDeviceAllocatorTest
           hostAccessibleDeviceAllocatorTest.cu)
 add_gtest(iBufferTest iBufferTest.cpp)
@@ -32,7 +29,6 @@ add_gtest(moeLoadBalancerTest moeLoadBalancerTest.cpp)
 add_gtest(runtimeMpiUtilsTest mpiUtilsTest.cpp)
 add_gtest(runtimeKernelTest runtimeKernelTest.cpp)
 add_gtest(samplingConfigTest samplingConfigTest.cpp)
-add_gtest(samplingTest samplingTest.cpp)
 add_gtest(sanitizerTest sanitizerTest.cpp)
 add_gtest(tllmBuffersTest tllmBuffersTest.cpp)
 add_gtest(transposeKVKernelTest transposeKVKernelTest.cpp)

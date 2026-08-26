@@ -27,13 +27,7 @@
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/decoderState.h"
-#include "tensorrt_llm/runtime/decodingInput.h"
-#include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/gptDecoder.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
@@ -59,44 +53,6 @@
 #include <torch/extension.h>
 namespace tr = tensorrt_llm::runtime;
 namespace te = tensorrt_llm::executor;
-
-class PyIGptDecoder : public tr::IGptDecoder
-{
-public:
-    NB_TRAMPOLINE(tr::IGptDecoder, 5);
-
-    void setup(tr::SamplingConfig const& samplingConfig, size_t batchSize,
-        tr::DecodingInput::TensorConstPtr const& batchSlots,
-        std::optional<tr::DecodingOutput> const& output = std::nullopt,
-        std::optional<tensorrt_llm::DataType> explicitDraftTokensDType = std::nullopt,
-        std::optional<std::vector<tr::ITensor::SharedConstPtr>> const& lookaheadPrompt = std::nullopt,
-        std::optional<std::vector<te::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs = std::nullopt) override
-    {
-        NB_OVERRIDE_PURE(setup, samplingConfig, batchSize, batchSlots, output, explicitDraftTokensDType,
-            lookaheadPrompt, lookaheadAlgoConfigs);
-    }
-
-    void forwardAsync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
-    {
-        NB_OVERRIDE_PURE(forwardAsync, output, input);
-    }
-
-    void forwardSync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
-    {
-        NB_OVERRIDE_PURE(forwardSync, output, input);
-    }
-
-    tr::SamplingConfig const& getSamplingConfig() override
-    {
-        NB_OVERRIDE_PURE(getSamplingConfig);
-    }
-
-    void disableLookahead(std::optional<tr::SamplingConfig> const& samplingConfig, tr::SizeType32 batchSize,
-        tr::DecodingInput::TensorConstPtr batchSlots) override
-    {
-        NB_OVERRIDE_PURE(disableLookahead, samplingConfig, batchSize, batchSlots);
-    }
-};
 
 namespace tensorrt_llm::nanobind::runtime
 {
@@ -133,123 +89,10 @@ void initBindings(nb::module_& m)
         .def_rw("packed_masks", &tr::LookaheadDecodingBuffers::packedMasks)
         .def_rw("position_ids", &tr::LookaheadDecodingBuffers::positionIds);
 
-    nb::class_<tr::ExplicitDraftTokensBuffers::Inputs>(m, "ExplicitDraftTokensBuffersInputs")
-        .def("create", &tr::ExplicitDraftTokensBuffers::Inputs::create, nb::arg("max_num_sequences"),
-            nb::arg("runtime"), nb::arg("model_config"), nb::arg("world_config"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_rw("temperatures", &tr::ExplicitDraftTokensBuffers::Inputs::temperatures)
-        .def_rw("position_ids_base", &tr::ExplicitDraftTokensBuffers::Inputs::positionIdsBase)
-        .def_rw("generation_lengths", &tr::ExplicitDraftTokensBuffers::Inputs::generationLengths)
-        .def_rw("random_data_sample", &tr::ExplicitDraftTokensBuffers::Inputs::randomDataSample)
-        .def_rw("random_data_validation", &tr::ExplicitDraftTokensBuffers::Inputs::randomDataValidation)
-        .def_rw("draft_tokens", &tr::ExplicitDraftTokensBuffers::Inputs::draftTokens)
-        .def_rw("draft_indices", &tr::ExplicitDraftTokensBuffers::Inputs::draftIndices)
-        .def_rw("draft_probs", &tr::ExplicitDraftTokensBuffers::Inputs::draftProbs)
-        .def_rw("packed_masks", &tr::ExplicitDraftTokensBuffers::Inputs::packedMasks)
-        .def_rw("position_ids", &tr::ExplicitDraftTokensBuffers::Inputs::positionIds)
-        .def_rw("max_gen_length_host", &tr::ExplicitDraftTokensBuffers::Inputs::maxGenLengthHost)
-        .def_rw("generation_lengths_host", &tr::ExplicitDraftTokensBuffers::Inputs::generationLengthsHost);
-
-    nb::class_<tr::DecodingInput>(m, "DecodingInput");
-    nb::class_<tr::DecodingOutput>(m, "DecodingOutput");
-
     nb::class_<tr::CudaEvent>(m, "CudaEvent")
         .def(nb::init<unsigned int>(), nb::arg("flags") = cudaEventDisableTiming,
             nb::call_guard<nb::gil_scoped_release>())
         .def("synchronize", &tr::CudaEvent::synchronize, nb::call_guard<nb::gil_scoped_release>());
-
-    nb::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
-        .def(
-            "setup",
-            [](tr::IGptDecoder& self, tr::SamplingConfig const& samplingConfig, size_t batchSize,
-                at::Tensor const& batchSlots, std::optional<tr::DecodingOutput> const& output = std::nullopt,
-                std::optional<tensorrt_llm::DataType> explicitDraftTokensDType = std::nullopt,
-                std::optional<std::vector<tr::ITensor::SharedConstPtr>> const& lookaheadPrompt = std::nullopt,
-                std::optional<std::vector<te::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs = std::nullopt)
-            {
-                auto tensorPtrBatchSlots = tr::TorchView::of(batchSlots);
-                self.setup(samplingConfig, batchSize, std::move(tensorPtrBatchSlots), output, explicitDraftTokensDType,
-                    lookaheadPrompt, lookaheadAlgoConfigs);
-            },
-            nb::arg("sampling_config"), nb::arg("batch_size"), nb::arg("batch_slots"), nb::arg("output") = std::nullopt,
-            nb::arg("explicit_draft_tokens_d_type") = std::nullopt, nb::arg("lookahead_prompt") = std::nullopt,
-            nb::arg("lookahead_algo_configs") = std::nullopt, nb::call_guard<nb::gil_scoped_release>());
-
-    nb::class_<tr::decoder::DecoderState>(m, "DecoderState")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
-        .def("setup", &tr::decoder::DecoderState::setup, nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
-            nb::arg("max_attention_window"), nb::arg("sink_token_length"), nb::arg("max_sequence_length"),
-            nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, nb::arg("max_num_sequences"),
-            nb::arg("max_beam_width"), nb::arg("max_attention_window"), nb::arg("buffer_manager"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
-            nb::arg("speculative_decoding_mode"), nb::arg("max_tokens_per_engine_step"), nb::arg("dtype"),
-            nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
-        .def_prop_ro("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
-        .def_prop_ro("cache_indirection_input", &tr::decoder::DecoderState::getCacheIndirectionInput)
-        .def_prop_ro("cache_indirection_output", &tr::decoder::DecoderState::getCacheIndirectionOutput)
-        .def_prop_ro(
-            "sequence_lengths", nb::overload_cast<>(&tr::decoder::DecoderState::getSequenceLengths, nb::const_))
-        .def("get_sequence_lengths",
-            nb::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getSequenceLengths, nb::const_),
-            nb::arg("batch_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("all_new_tokens", &tr::decoder::DecoderState::getAllNewTokens)
-        .def_prop_ro("finished_sum", &tr::decoder::DecoderState::getFinishedSum)
-        .def_prop_ro("finish_reasons", &tr::decoder::DecoderState::getFinishReasons)
-        .def_prop_ro("ids", nb::overload_cast<>(&tr::decoder::DecoderState::getIds, nb::const_))
-        .def("get_ids", nb::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getIds, nb::const_),
-            nb::arg("batch_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("gathered_ids", nb::overload_cast<>(&tr::decoder::DecoderState::getGatheredIds, nb::const_))
-        .def("get_gathered_ids",
-            nb::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getGatheredIds, nb::const_),
-            nb::arg("batch_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("parent_ids", &tr::decoder::DecoderState::getParentIds)
-        .def_prop_ro("cum_log_probs", nb::overload_cast<>(&tr::decoder::DecoderState::getCumLogProbs, nb::const_))
-        .def("get_cum_log_probs",
-            nb::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getCumLogProbs, nb::const_),
-            nb::arg("batch_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("log_probs", nb::overload_cast<>(&tr::decoder::DecoderState::getLogProbs, nb::const_))
-        .def("get_log_probs", nb::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getLogProbs, nb::const_),
-            nb::arg("batch_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("next_draft_tokens", &tr::decoder::DecoderState::getNextDraftTokens)
-        .def_prop_ro("prev_draft_tokens_lengths", &tr::decoder::DecoderState::getPrevDraftTokensLengths)
-        .def_prop_ro("next_draft_tokens_lengths", &tr::decoder::DecoderState::getNextDraftTokensLengths)
-        .def_prop_ro("accepted_lengths_cum_sum", &tr::decoder::DecoderState::getAcceptedLengthsCumSum)
-        .def_prop_ro("accepted_packed_paths", &tr::decoder::DecoderState::getAcceptedPackedPaths)
-        .def_prop_ro("max_beam_width", &tr::decoder::DecoderState::getMaxBeamWidth)
-        .def_prop_ro("max_sequence_length", &tr::decoder::DecoderState::getMaxSequenceLength)
-        .def_prop_ro("max_decoding_decoder_tokens", &tr::decoder::DecoderState::getMaxDecodingDecoderTokens)
-        .def_prop_ro("max_decoding_engine_tokens", &tr::decoder::DecoderState::getMaxDecodingEngineTokens)
-        .def_prop_ro("num_decoding_engine_tokens",
-            nb::overload_cast<>(&tr::decoder::DecoderState::getNumDecodingEngineTokens, nb::const_))
-        .def("get_num_decoding_engine_tokens",
-            nb::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getNumDecodingEngineTokens, nb::const_),
-            nb::arg("batch_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def("set_num_decoding_engine_tokens", &tr::decoder::DecoderState::setNumDecodingEngineTokens,
-            nb::arg("batch_idx"), nb::arg("num_tokens"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("speculative_decoding_mode", &tr::decoder::DecoderState::getSpeculativeDecodingMode)
-        .def_prop_rw("generation_steps", &tr::decoder::DecoderState::getGenerationSteps,
-            &tr::decoder::DecoderState::setGenerationSteps);
-
-    nb::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(nb::init<tr::GptDecoderBatched::CudaStreamPtr>(), nb::arg("stream"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("setup", &tr::GptDecoderBatched::setup, nb::arg("mode"), nb::arg("max_num_sequences"),
-            nb::arg("max_beam_width"), nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, nb::arg("decoder_state"), nb::arg("input"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, nb::rv_policy::reference)
-        .def("finalize", &tr::GptDecoderBatched::finalize, nb::arg("decoder_state"), nb::arg("batch_idx"),
-            nb::arg("sampling_config"), nb::arg("streaming"), nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro(
-            "decoder_stream",
-            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
-            nb::rv_policy::reference);
 
     m.def(
         "lamport_initialize_all",

@@ -22,18 +22,11 @@ set(SRCS
     utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
-    decodingLayerWorkspace.cpp
-    eagleBuffers.cpp
-    explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
-    decodingOutput.cpp
-    decoderState.cpp
-    gptDecoder.cpp
-    gptDecoderBatched.cpp
     gptJsonConfig.cpp
     iBuffer.cpp
     iTensor.cpp

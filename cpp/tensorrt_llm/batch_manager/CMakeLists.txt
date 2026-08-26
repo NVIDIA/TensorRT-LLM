@@ -28,18 +28,15 @@ set(SRCS
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp
-    createNewDecoderRequests.cpp
     contextProgress.cpp
     contextTransferCoordinator.cpp
     dataTransceiver.cpp
-    decoderBuffers.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
-    medusaBuffers.cpp
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp

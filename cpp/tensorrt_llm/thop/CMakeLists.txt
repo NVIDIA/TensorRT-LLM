@@ -57,7 +57,6 @@ add_library(
   marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
-  dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp
@@ -90,7 +89,6 @@ add_library(
   fusedGatedRMSNormQuant.cpp
   rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
-  gatherTreeOp.cpp
   groupRmsNormOp.cpp
   helixPostProcessOp.cpp
   llama4MinLatency.cpp
