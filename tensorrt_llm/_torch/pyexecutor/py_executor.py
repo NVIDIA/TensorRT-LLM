@@ -2659,6 +2659,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                self._finalize_adp_dummy_allocation(can_queue)
                 if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
@@ -3618,7 +3619,7 @@ class PyExecutor:
             # A single-rank CTX worker cannot diverge on a collective. Reap
             # completed sends while it is idle so their pinned KV blocks can
             # be reused by the next context requests.
-            if (is_idle and self._dist_size(self.dist, "world_size") == 1 and
+            if (self._dist_size(self.dist, "world_size") == 1 and
                     self.async_transfer_manager.has_any_inflight_requests()):
                 self._check_disagg_ctx_cache_transfer_status(0)
             return
@@ -7045,29 +7046,43 @@ class PyExecutor:
         draft_kv_cache_manager = self.resource_manager.get_resource_manager(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
-        if (not self._enable_adp_dummy_fixes
-                or self.kv_cache_transceiver is None):
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=dummy_request_ids,
-                token_nums=token_nums,
-                is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-            )[0]
-            llm_request.is_attention_dp_dummy = True
-            spec_resource_manager = self.resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(dummy_request_ids)
-            self.active_requests.append(llm_request)
-            return
-
-        assert self._pending_adp_dummy_request is None
         has_live_adp_dummy = any(
             request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
             for request in self.active_requests)
         if has_live_adp_dummy:
+            return
+        assert self._pending_adp_dummy_request is None
+
+        if (not self._enable_adp_dummy_fixes
+                or self.kv_cache_transceiver is None):
+            try:
+                dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                    request_ids=dummy_request_ids,
+                    token_nums=token_nums,
+                    is_gen=self._adp_dummy_is_gen,
+                    prepare_resource=True,
+                    max_num_draft_tokens=self.max_total_draft_tokens,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                )
+            except (OutOfPagesError, NoFreeSlotsError):
+                dummy_requests = None
+            if not dummy_requests:
+                logger.warning("Cannot allocate ADP pad dummy; rank schedules "
+                               "an empty batch and the fleet will retry.")
+                return
+
+            dummy_request = dummy_requests[0]
+            spec_resource_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_resource_manager is not None:
+                try:
+                    spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                except NoFreeSlotsError:
+                    self._free_adp_dummy_kv_resources(dummy_request)
+                    return
+            dummy_request.is_attention_dp_dummy = True
+            self.active_requests.append(dummy_request)
+            self._pending_adp_dummy_request = dummy_request
             return
 
         try:
@@ -7079,7 +7094,7 @@ class PyExecutor:
                 max_num_draft_tokens=self.max_total_draft_tokens,
                 draft_kv_cache_manager=draft_kv_cache_manager,
             )
-        except OutOfPagesError:
+        except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
         if not dummy_requests:
             logger.warning("Cannot allocate ADP pad dummy; rank schedules "
