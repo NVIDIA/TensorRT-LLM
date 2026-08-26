@@ -255,6 +255,38 @@ if args.replay_file_path:
         replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
     else:
         replay_start_iter, replay_stop_iter = args.replay_start_iter, args.replay_stop_iter
+        # Check the requested window against the calibration that was just loaded,
+        # before the first pre_step() reaches into it. Without this, asking for an
+        # iteration the file does not hold surfaces as
+        #
+        #     File ".../layer_wise_benchmarks/calibrator.py", line 516, in pre_step
+        #         self._cur_iter_metadata = self._replay_db[iteration]["metadata"]
+        #     KeyError: 105
+        #
+        # thousands of lines into an interleaved multi-rank log, naming neither the
+        # range that was asked for nor the range that exists. Every caller that
+        # passes these flags reads them from somewhere else -- a scheduler, an index,
+        # a copied command line -- so being out of step with the pack is the ordinary
+        # way for them to be wrong, not an exotic one.
+        #
+        # get_replay_iteration_range() also rejects a non-contiguous calibration.
+        # That is not this check's business: a caller naming a contiguous window
+        # inside a gappy pack works today and has to keep working, so a range that
+        # cannot be computed means only that there is nothing to compare against.
+        try:
+            available_range = calibrator.get_replay_iteration_range()
+        except ValueError:
+            available_range = None
+        if available_range is not None:
+            available_start, available_stop = available_range
+            if replay_start_iter < available_start or replay_stop_iter > available_stop:
+                parser.error(
+                    f"--replay-start-iter/--replay-stop-iter ask for iterations "
+                    f"[{replay_start_iter}, {replay_stop_iter}], but "
+                    f"{args.replay_file_path} holds only "
+                    f"[{available_start}, {available_stop}]. Drop both flags to "
+                    f"replay whatever the calibration contains."
+                )
     logger.info(
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
