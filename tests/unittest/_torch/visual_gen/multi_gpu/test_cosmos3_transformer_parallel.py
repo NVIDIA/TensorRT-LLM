@@ -462,6 +462,29 @@ def _forward_with_audio(
     return out.video, out.audio
 
 
+def _forward_multi_control(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> torch.Tensor:
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed
+    )
+    control_latents = [torch.full_like(hs, -0.05), torch.full_like(hs, 0.05)]
+    model.reset_cache()
+    with torch.inference_mode():
+        return model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+            control_latents=control_latents,
+            control_weights=[1.0, 3.0],
+        ).video
+
+
 def _build_ref_and_parallel(
     *,
     tp_size: int = 1,
@@ -597,6 +620,20 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_multi_control_ulysses_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward_multi_control(ref_model, device, text_seed)
+    ulysses_out = _forward_multi_control(ulysses_model, device, text_seed)
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: multi-control Ulysses output differs from single-GPU reference",
+    )
+
+
 def _logic_cosmos3_ulysses_audio_vs_single_gpu(rank, world_size):
     ref_model, ulysses_model, _, device = _build_ref_and_parallel(
         ulysses_size=world_size, pretrained_dict=_COSMOS3_AUDIO_CONFIG
@@ -651,6 +688,24 @@ def _logic_cosmos3_tp_ulysses_vs_single_gpu(rank, world_size):
         combined_out,
         ref_out,
         msg=f"Rank {rank}: TP+Ulysses output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu(rank, world_size):
+    tp_size = 2
+    ulysses_size = 2
+    ref_model, combined_model, _, device = _build_ref_and_parallel(
+        tp_size=tp_size, ulysses_size=ulysses_size
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=tp_size, ulysses_size=ulysses_size, cfg_size=1)
+
+    ref_out = _forward_multi_control(ref_model, device, text_seed)
+    combined_out = _forward_multi_control(combined_model, device, text_seed)
+
+    _assert_parity(
+        combined_out,
+        ref_out,
+        msg=f"Rank {rank}: multi-control TP+Ulysses output differs from single-GPU reference",
     )
 
 
@@ -771,6 +826,13 @@ class TestCosmos3TransformerParallel:
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
 
+    def test_multi_control_ulysses2_vs_single_gpu(self):
+        """Multi-control keeps each [control, target] sequence replicated per rank."""
+        self._skip_if_unavailable()
+        run_test_in_distributed(
+            world_size=2, test_fn=_logic_cosmos3_multi_control_ulysses_vs_single_gpu
+        )
+
     def test_edge_tp2_vs_single_gpu(self):
         """Edge's non-gated relu² MLP shards without the gate_up fusion the
         Qwen recipe uses, so column/row splitting takes a different path."""
@@ -793,6 +855,13 @@ class TestCosmos3TransformerParallel:
     def test_tp2_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_tp_ulysses_vs_single_gpu)
+
+    @pytest.mark.gpu4
+    def test_multi_control_tp2_ulysses2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        run_test_in_distributed(
+            world_size=4, test_fn=_logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu
+        )
 
     @pytest.mark.gpu4
     def test_cfg2_ulysses2_vs_single_gpu(self):
