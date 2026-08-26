@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 Model Recipes
 ================
 
@@ -35,6 +38,7 @@ The deployment guides below provide more detailed instructions for serving speci
    deployment-guide-for-gpt-oss-on-trtllm.md
    deployment-guide-for-qwen3-on-trtllm.md
    deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.md
+   qwen3.8-flash-next-feature-support.md
    deployment-guide-for-kimi-k2-thinking-on-trtllm.md
    deployment-guide-for-kimi-k3-on-trtllm.md
    deployment-guide-for-glm-5-on-trtllm.md
