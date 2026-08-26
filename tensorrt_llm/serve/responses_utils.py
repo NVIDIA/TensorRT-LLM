@@ -161,11 +161,23 @@ def _parse_response_input(
             input_msg["output"])
     elif input_msg["type"] == "reasoning":
         content = input_msg.get("content") or []
-        if len(content) != 1:
+        if not content:
+            # The Responses API allows reasoning items without 'content'
+            # (e.g. when a prior turn is replayed and the reasoning text
+            # would have to be inferred from 'id' or recovered from
+            # 'encrypted_content', which is not implemented). Follow the
+            # standard fallback behavior and ignore such items.
+            logger.debug(
+                "Responses API: ignoring reasoning input item without "
+                "'content'")
+            msg = None
+        elif len(content) > 1:
             raise ValueError(
-                "Input item of type 'reasoning' must have exactly one "
+                "Input item of type 'reasoning' must have at most one "
                 f"'content' element, got {len(content)}")
-        msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
+        else:
+            msg = Message.from_role_and_content(Role.ASSISTANT,
+                                                content[0]["text"])
     elif input_msg["type"] == "function_call":
         msg = Message.from_role_and_content(Role.ASSISTANT,
                                             input_msg["arguments"])
