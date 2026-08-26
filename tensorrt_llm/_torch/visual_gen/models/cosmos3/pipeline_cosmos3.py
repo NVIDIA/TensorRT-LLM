@@ -247,9 +247,13 @@ def _load_reference_image(data: bytes):
     upload would be reported as a server fault.
     """
     try:
-        # convert_image_mode, not convert("RGB"): it composites RGBA onto white,
-        # which is what this pipeline's references went through before.
-        return convert_image_mode(PIL.Image.open(BytesIO(data)), "RGB")
+        image = PIL.Image.open(BytesIO(data))
+        # open() reads the header only. Truncated pixel data raises here and
+        # nowhere else: an already-RGB image never reaches a decoding convert.
+        image.load()
+        # convert_image_mode composites RGBA onto white, which is what this
+        # pipeline's references went through before.
+        return convert_image_mode(image, "RGB")
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "
