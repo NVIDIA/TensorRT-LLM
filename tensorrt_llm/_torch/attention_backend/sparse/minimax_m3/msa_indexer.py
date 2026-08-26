@@ -162,28 +162,34 @@ def _proxy_max_score(
 
 
 def _combined_topk_table(
-    ctx_table: torch.Tensor,
+    ctx_table: Optional[torch.Tensor],
     gen_table: torch.Tensor,
     *,
+    total_q: int,
     head_major: bool,
 ) -> torch.Tensor:
-    """Concatenate the context and generation top-k tables along the token axis.
+    """Lay the context and generation top-k tables out over the whole token axis.
 
-    Both halves are [tokens, num_kv_heads, topk]. `head_major` reproduces the
-    head-major backing select_blocks_from_maxscore gives its own output, so the
-    combined table permutes to a contiguous [num_kv_heads, total_q, topk]
-    exactly as an unsplit one would and the Triton decode kernel sees the
-    layout it expects.
+    Both halves are [tokens, num_kv_heads, topk], `ctx_table` absent on a step
+    with no context prefix. A token beyond the two gets an all -1 row, the same
+    empty selection the selector itself emits, so the result stays addressable
+    by absolute token index as every consumer slices it. `head_major` reproduces
+    the head-major backing select_blocks_from_maxscore gives its own output, so
+    the combined table permutes to a contiguous [num_kv_heads, total_q, topk]
+    exactly as an unsplit one would and the Triton decode kernel sees the layout
+    it expects.
     """
-    ctx_tokens = int(ctx_table.shape[0])
-    total_q = ctx_tokens + int(gen_table.shape[0])
-    num_kv_heads, topk = int(ctx_table.shape[1]), int(ctx_table.shape[2])
+    ctx_tokens = 0 if ctx_table is None else int(ctx_table.shape[0])
+    gen_last = ctx_tokens + int(gen_table.shape[0])
+    num_kv_heads, topk = int(gen_table.shape[1]), int(gen_table.shape[2])
     shape = (num_kv_heads, total_q, topk) if head_major else (total_q, num_kv_heads, topk)
-    out = torch.empty(shape, dtype=ctx_table.dtype, device=ctx_table.device)
+    out = torch.empty(shape, dtype=gen_table.dtype, device=gen_table.device)
     if head_major:
         out = out.transpose(0, 1)
-    out[:ctx_tokens].copy_(ctx_table)
-    out[ctx_tokens:].copy_(gen_table)
+    if ctx_table is not None:
+        out[:ctx_tokens].copy_(ctx_table)
+    out[ctx_tokens:gen_last].copy_(gen_table)
+    out[gen_last:].fill_(-1)
     return out
 
 
@@ -240,6 +246,7 @@ class MsaIndexer:
         decode_query_len: Optional[int] = None,
         require_cutedsl: bool = False,
         gen_token_first: int = 0,
+        gen_token_last: Optional[int] = None,
         ctx_rows: int = 0,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
@@ -257,14 +264,15 @@ class MsaIndexer:
         such step does, from prepare(); a caller that leaves them unset (the
         standalone kernel tests) gets the proxy over the whole batch.
 
-        `gen_token_first` and `ctx_rows` are where the span starts: the scorer
-        takes query tokens [gen_token_first, total_q) and rows
+        `gen_token_first`, `gen_token_last` and `ctx_rows` bound the span: the
+        scorer takes query tokens [gen_token_first, gen_token_last) and rows
         [ctx_rows, batch), and the proxy keeps the context prefix ahead of both
-        under the plan prepare() built over exactly those rows. Both are 0 on a
-        pure-decode step, where the scorer owns everything. The two halves are
-        scored into separate buffers rather than one, because fmha_sm100 writes
-        a contiguous [heads, k_tiles, tokens] block and so cannot fill a slice
-        of the scorer's; they are selected separately and the tables joined.
+        under the plan prepare() built over exactly those rows. The two starts
+        are 0 on a pure-decode step, where the scorer owns everything, and
+        `gen_token_last` defaults to total_q. The two halves are scored into
+        separate buffers rather than one, because fmha_sm100 writes a contiguous
+        [heads, k_tiles, tokens] block and so cannot fill a slice of the
+        scorer's; they are selected separately and the tables joined.
 
         `require_cutedsl` says prepare() committed to the scorer and narrowed
         the proxy plan to the context prefix, leaving the span nothing to
@@ -274,6 +282,7 @@ class MsaIndexer:
         total_q = int(idx_q.shape[0])
         page_size = int(idx_k_paged.shape[2])
         gen_first = int(gen_token_first)
+        gen_last = total_q if gen_token_last is None else int(gen_token_last)
 
         scored = False
         if (
@@ -289,7 +298,7 @@ class MsaIndexer:
             # select_blocks_from_maxscore, are both invariant under a positive
             # scale, so neither depends on the omission.
             scored = _cutedsl_score(
-                idx_q[gen_first:],
+                idx_q[gen_first:gen_last],
                 idx_k_paged,
                 max_score,
                 block_table=block_table,
@@ -310,6 +319,7 @@ class MsaIndexer:
         # split: the plan it was handed covers the whole batch.
         if not scored:
             gen_first = 0
+            gen_last = total_q
             max_score = self._proxy_scores(
                 idx_q,
                 idx_k_paged,
@@ -348,30 +358,35 @@ class MsaIndexer:
 
         gen_table = self._select(
             max_score,
-            n_valid_blocks[gen_first:],
+            n_valid_blocks[gen_first:gen_last],
             head_major_output=head_major_output,
         )
-        if gen_first == 0:
+        if gen_first == 0 and gen_last == total_q:
             return gen_table
-        # The context prefix, whose scores the proxy produces into its own
-        # buffer under the plan built over rows [0, ctx_rows). Context pages are
-        # the prefix of the flattened page table, so kv_indices needs no slice.
-        ctx_table = self._select(
-            self._proxy_scores(
-                idx_q[:gen_first],
-                idx_k_paged,
-                proxy_plan=proxy_plan,
-                max_score=None,
-                qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
-                kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
-                qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
-                kv_indices=kv_indices,
-                idx_sm_scale=idx_sm_scale,
-            ),
-            n_valid_blocks[:gen_first],
-            head_major_output=head_major_output,
+        ctx_table = None
+        if gen_first > 0:
+            # The context prefix, whose scores the proxy produces into its own
+            # buffer under the plan built over rows [0, ctx_rows). Context pages
+            # are the prefix of the flattened page table, so kv_indices needs no
+            # slice.
+            ctx_table = self._select(
+                self._proxy_scores(
+                    idx_q[:gen_first],
+                    idx_k_paged,
+                    proxy_plan=proxy_plan,
+                    max_score=None,
+                    qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
+                    kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
+                    qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
+                    kv_indices=kv_indices,
+                    idx_sm_scale=idx_sm_scale,
+                ),
+                n_valid_blocks[:gen_first],
+                head_major_output=head_major_output,
+            )
+        return _combined_topk_table(
+            ctx_table, gen_table, total_q=total_q, head_major=head_major_output
         )
-        return _combined_topk_table(ctx_table, gen_table, head_major=head_major_output)
 
     def _proxy_scores(
         self,
