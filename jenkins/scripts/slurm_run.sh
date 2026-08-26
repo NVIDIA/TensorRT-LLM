@@ -151,8 +151,10 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-python3 "$llmSrcNode/tests/test_common/s3_output.py" \
-    --drain-spool "$jobWorkspace" || true
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
