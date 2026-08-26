@@ -41,6 +41,7 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
                                                    supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -2786,7 +2787,18 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
-    if config.algorithm == "triattention" and not is_sm_100f():
+    if config.algorithm == "quantization_for_cold_page":
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
+
+        if _BACKEND == "python":
+            raise ValueError(
+                "Cold-page quantization requires the C++ KVCacheManagerV2 backend"
+            )
+        if config.quant == "nvfp4" and not is_sm_100f():
+            raise RuntimeError(
+                "NVFP4 cold-page quantization requires an SM100-family device "
+                "(SM100 or SM103).")
+    elif config.algorithm == "triattention" and not is_sm_100f():
         raise RuntimeError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")
 
@@ -2800,13 +2812,18 @@ def validate_kv_cache_compression_compatibility(
     if not config.supports_speculative_decoding():
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
-            "support speculative decoding with its current configuration; "
-            "TriAttention requires eviction_mode='union'")
+            "support speculative decoding with its current configuration")
     mode = spec_config.spec_dec_mode
-    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+    if config.algorithm == "quantization_for_cold_page":
+        supported = mode.is_mtp_eagle_one_model() or mode.is_eagle3_one_model()
+        guidance = "one-model MTP-EAGLE or EAGLE3"
+    else:
+        supported = mode.is_mtp_one_model() or mode.is_eagle3_one_model()
+        guidance = "one-model MTP or EAGLE3"
+    if not supported:
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
-            f"mode {mode.name}; use one-model MTP or EAGLE3")
+            f"mode {mode.name}; use {guidance}")
 
 
 def create_kv_cache_compression_manager(
@@ -2825,16 +2842,25 @@ def create_kv_cache_compression_manager(
             "KV-cache compression does not support HELIX context parallelism.")
 
     if config.algorithm == "quantization_for_cold_page":
-        from ..kv_cache_compression.quantization_for_cold_page import \
-            quantization_for_cold_page as cold_page_quantization
+        if config.quant != "nvfp4":
+            raise NotImplementedError(
+                f"Unsupported cold-page quantization format {config.quant!r}")
+        if estimating_kv_cache:
+            return None
+        quant_config = model_engine.model.model_config.quant_config
+        if (quant_config is not None and getattr(
+                quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
+            logger.info(
+                "Skipping cold-page NVFP4 quantization because the active KV "
+                "cache already uses NVFP4; KVCM will migrate it losslessly.")
+            return None
 
-        return cold_page_quantization.create_cold_page_quantization_manager(
-            config,
-            model_config=model_engine.model.model_config,
-            kv_cache_config=kv_cache_config,
-            spec_config=model_engine.spec_config,
-            estimating_kv_cache=estimating_kv_cache,
-        )
+        validate_kv_cache_compression_compatibility(config, kv_cache_config,
+                                                    model_engine.spec_config)
+        from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
+            Nvfp4ColdPageQuantizationCompression
+
+        return Nvfp4ColdPageQuantizationCompression(config)
 
     if config.algorithm == "triattention":
         validate_kv_cache_compression_compatibility(config, kv_cache_config,

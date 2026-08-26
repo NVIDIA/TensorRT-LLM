@@ -10,16 +10,12 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
-    quantization_for_cold_page as cold_quant_mod,
-)
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
     _load_modelopt_nvfp4_scales,
 )
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
     ColdPageQuantizationCompression,
-    validate_cold_page_quantization_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
@@ -86,12 +82,12 @@ def _native() -> tuple[SimpleNamespace, MagicMock]:
     return module, codec
 
 
-def _policy(native: SimpleNamespace) -> object:
+def _callback(native: SimpleNamespace) -> object:
     return native.create_python_cold_page_codec.call_args.args[0]
 
 
 def _layouts(native: SimpleNamespace) -> list[object]:
-    return list(_policy(native)._layer_layouts.values())
+    return list(_callback(native)._layer_layouts.values())
 
 
 def _configure_lifecycle(native: SimpleNamespace, layer_bytes: dict[int, dict[str, int]]) -> object:
@@ -107,11 +103,11 @@ def _configure_lifecycle(native: SimpleNamespace, layer_bytes: dict[int, dict[st
             )
             address += 0x10000
         layers[layer_id] = hot
-    _policy(native).configure([SimpleNamespace(layers=layers)])
-    return _policy(native)._lifecycle_metadata[0]
+    _callback(native).configure([SimpleNamespace(layers=layers)])
+    return _callback(native)._lifecycle_metadata[0]
 
 
-def _configure_policy(native: SimpleNamespace, raw_bytes: int) -> object:
+def _configure_callback(native: SimpleNamespace, raw_bytes: int) -> object:
     return _configure_lifecycle(native, {0: {"key": raw_bytes, "value": raw_bytes}})
 
 
@@ -135,11 +131,12 @@ def _write_scales(directory, scales_by_layer, *, filename="model.safetensors", p
 
 def _validate_compression(mode: object | None = None) -> None:
     spec_config = None if mode is None else SimpleNamespace(spec_dec_mode=mode)
-    validate_cold_page_quantization_compatibility(
-        ColdPageQuantizationCompressionConfig(),
-        SimpleNamespace(enable_block_reuse=False),
-        spec_config,
-    )
+    with patch.object(util_mod, "is_sm_100f", return_value=True):
+        util_mod.validate_kv_cache_compression_compatibility(
+            ColdPageQuantizationCompressionConfig(),
+            SimpleNamespace(enable_block_reuse=False),
+            spec_config,
+        )
 
 
 def test_optional_modelopt_scales_map_pp_layers_and_default_missing_layers(tmp_path):
@@ -168,7 +165,7 @@ def test_optional_modelopt_scales_map_pp_layers_and_default_missing_layers(tmp_p
     assert result is codec
     layouts = _layouts(native)
     assert [layout.layer_id for layout in layouts] == [0, 1, 2]
-    assert _policy(native)._runtime_type == 1
+    assert _callback(native)._runtime_type == 1
     assert [
         (
             tuple(buffer.scales.nvfp4_orig_quant for buffer in layout.buffers),
@@ -259,7 +256,7 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
         1.0,
         1.0,
     ]
-    metadata = _configure_policy(native, raw_bytes=5120)
+    metadata = _configure_callback(native, raw_bytes=5120)
     assert metadata.cold_page_bytes == 2880
     assert metadata.wide[:2, 3].tolist() == [0, 1280]
     assert metadata.wide[:2, 4].tolist() == [2560, 2720]
@@ -290,7 +287,7 @@ def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
             head_dim_per_layer=(32,),
         )
 
-    metadata = _configure_policy(native, raw_bytes=320)
+    metadata = _configure_callback(native, raw_bytes=320)
     assert metadata.cold_page_bytes == 192
     assert metadata.wide[:2, 3].tolist() == [0, 80]
     assert metadata.wide[:2, 4].tolist() == [160, 170]
@@ -318,9 +315,15 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
 
     assert results == codecs
     assert native.create_python_cold_page_codec.call_count == 2
+    target_callback, draft_callback = (
+        call.args[0] for call in native.create_python_cold_page_codec.call_args_list
+    )
+    assert target_callback is not draft_callback
+    assert target_callback is not provider
+    assert draft_callback is not provider
 
 
-def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
+def test_callback_forwards_a_4096_page_batch_through_one_native_launch() -> None:
     native, _ = _native()
 
     with (
@@ -335,7 +338,7 @@ def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
             num_kv_heads_per_layer=(1,),
             head_dim_per_layer=(16,),
         )
-        policy = _policy(native)
+        callback = _callback(native)
         hot = {
             role: SimpleNamespace(
                 raw_base=0x1000 + index * 0x1000,
@@ -344,13 +347,13 @@ def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
             )
             for index, role in enumerate(("key", "value"))
         }
-        properties = policy.configure([SimpleNamespace(layers={0: hot})])
-        policy.encode(0, 0x3000, 0x4000, 4096, 0x5000)
-        policy.decode(0, 0x3000, 0x4000, 4096, 0x5000)
+        properties = callback.configure([SimpleNamespace(layers={0: hot})])
+        callback.encode(0, 0x3000, 0x4000, 4096, 0x5000)
+        callback.decode(0, 0x3000, 0x4000, 4096, 0x5000)
 
     assert properties[0].cold_page_bytes == 1152
     assert properties[0].page_index_location == "host"
-    metadata = policy._lifecycle_metadata[0]
+    metadata = callback._lifecycle_metadata[0]
     for operation in (encode, decode):
         operation.assert_called_once()
         arguments = operation.call_args.args
@@ -369,7 +372,7 @@ def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
         )
 
 
-def test_policy_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
+def test_callback_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
     native, _ = _native()
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
@@ -381,7 +384,7 @@ def test_policy_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
         )
 
     with torch.device("meta"):
-        metadata = _configure_policy(native, raw_bytes=2048)
+        metadata = _configure_callback(native, raw_bytes=2048)
     for tensor, dtype, shape in (
         (metadata.wide, torch.int64, (256, 6)),
         (metadata.integers, torch.int32, (256, 5)),
@@ -393,7 +396,7 @@ def test_policy_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
         assert tensor.is_contiguous()
 
 
-def test_policy_rejects_invalid_resolved_hot_buffers() -> None:
+def test_callback_rejects_invalid_resolved_hot_buffers() -> None:
     native, _ = _native()
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
@@ -404,7 +407,7 @@ def test_policy_rejects_invalid_resolved_hot_buffers() -> None:
             head_dim_per_layer=(16,),
         )
 
-    policy = _policy(native)
+    callback = _callback(native)
 
     def hot(raw_base: int = 0x1000, raw_bytes: int = 2048) -> SimpleNamespace:
         return SimpleNamespace(
@@ -414,18 +417,20 @@ def test_policy_rejects_invalid_resolved_hot_buffers() -> None:
         )
 
     with pytest.raises(ValueError, match="roles do not match"):
-        policy.configure(
+        callback.configure(
             [SimpleNamespace(layers={0: {"key": hot(), "value": hot(), "extra": hot()}})]
         )
     with pytest.raises(ValueError, match="size does not match"):
-        policy.configure([SimpleNamespace(layers={0: {"key": hot(raw_bytes=32), "value": hot()}})])
+        callback.configure(
+            [SimpleNamespace(layers={0: {"key": hot(raw_bytes=32), "value": hot()}})]
+        )
     with pytest.raises(ValueError, match="16-byte aligned"):
-        policy.configure(
+        callback.configure(
             [SimpleNamespace(layers={0: {"key": hot(raw_base=0x1001), "value": hot()}})]
         )
 
 
-def test_policy_rejects_more_than_256_lifecycle_buffers() -> None:
+def test_callback_rejects_more_than_256_lifecycle_buffers() -> None:
     native, _ = _native()
     layers = tuple(
         AttentionLayerConfig(
@@ -591,7 +596,7 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
         )
 
     assert result is codec
-    assert _policy(native).layer_ids == ()
+    assert _callback(native).layer_ids == ()
 
 
 def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
@@ -623,7 +628,7 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
     assert layout.layer_id == 0
     assert [buffer.role for buffer in layout.buffers] == ["key", "index_key"]
     assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
-    assert _policy(native)._runtime_type == 1
+    assert _callback(native)._runtime_type == 1
     assert layout.num_kv_heads == 1
     assert layout.tokens_per_page == 64
     assert layout.head_dim == 576
@@ -769,7 +774,7 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
         )
 
     layout = _layouts(native)[0]
-    assert _policy(native)._runtime_type == 2
+    assert _callback(native)._runtime_type == 2
     assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         2.0,
         4.0,
@@ -790,22 +795,20 @@ def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> No
         _validate_compression()
 
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-    monkeypatch.setattr(cold_quant_mod, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: False)
     with pytest.raises(RuntimeError, match="requires an SM100-family device"):
-        cold_quant_mod.create_cold_page_quantization_manager(
+        util_mod.create_kv_cache_compression_manager(
             ColdPageQuantizationCompressionConfig(),
-            model_config=_factory_model_engine().model.model_config,
+            model_engine=_factory_model_engine(),
             kv_cache_config=SimpleNamespace(enable_block_reuse=False),
-            spec_config=None,
         )
 
-    monkeypatch.setattr(cold_quant_mod, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
     assert isinstance(
-        cold_quant_mod.create_cold_page_quantization_manager(
+        util_mod.create_kv_cache_compression_manager(
             ColdPageQuantizationCompressionConfig(),
-            model_config=_factory_model_engine().model.model_config,
+            model_engine=_factory_model_engine(),
             kv_cache_config=SimpleNamespace(enable_block_reuse=False),
-            spec_config=None,
         ),
         Nvfp4ColdPageQuantizationCompression,
     )
@@ -837,16 +840,17 @@ def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch) -> None:
 
     assert spec_config.spec_dec_mode is SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
     assert spec_config.max_draft_len == 3
-    validate_cold_page_quantization_compatibility(
-        ColdPageQuantizationCompressionConfig(),
-        SimpleNamespace(enable_block_reuse=False),
-        spec_config,
-    )
+    with patch.object(util_mod, "is_sm_100f", return_value=True):
+        util_mod.validate_kv_cache_compression_compatibility(
+            ColdPageQuantizationCompressionConfig(),
+            SimpleNamespace(enable_block_reuse=False),
+            spec_config,
+        )
 
 
 def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -> None:
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-    monkeypatch.setattr(cold_quant_mod, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
 
     def build(
         *,
@@ -857,7 +861,11 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         creator = object.__new__(util_mod.KvCacheCreator)
         creator._skip_est = skip_est
         creator._max_seq_len = 1024
-        creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
+        creator._kv_cache_config = SimpleNamespace(
+            host_cache_size=None,
+            disk_cache_size=None,
+            enable_block_reuse=False,
+        )
         creator._llm_args = SimpleNamespace(
             kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
         )
@@ -890,7 +898,7 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         skip_est_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"],
         Nvfp4ColdPageQuantizationCompression,
     )
-    with patch.object(cold_quant_mod.logger, "info") as log:
+    with patch.object(util_mod.logger, "info") as log:
         active_resources, active_creator = build(
             active_kv_quant=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
         )
