@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodecBackend.h"
+#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.h"
 
 #include "tensorrt_llm/kv_cache_compression/nativeColdPageCodec.h"
 
@@ -35,10 +35,10 @@ kernels::Nvfp4ColdPageKernelParams makeKernelParams(
         scales.nvfp4ScaleOrigQuant, scales.nvfp4ScaleQuantOrig, scales.fp8ScaleOrigQuant, scales.fp8ScaleQuantOrig};
 }
 
-class Nvfp4ColdPageCodecBackend final : public IColdPageCodecBackend
+class Nvfp4ColdPageCodec final : public NativeColdPageCodec
 {
 public:
-    explicit Nvfp4ColdPageCodecBackend(std::vector<Nvfp4ColdPageLayerLayout> layerLayouts)
+    explicit Nvfp4ColdPageCodec(std::vector<Nvfp4ColdPageLayerLayout> layerLayouts)
     {
         for (auto& layout : layerLayouts)
         {
@@ -68,12 +68,13 @@ public:
         return mLayerIds;
     }
 
-    std::vector<ColdPageLifecycleConfig> configure(std::vector<ResolvedColdPageLifecycle> const& lifecycles) override
+    std::vector<ColdPageLifecycleProperties> configureAlgorithm(
+        std::vector<ResolvedHotLifecycle> const& lifecycles) override
     {
         std::vector<kernels::Nvfp4ColdPagePreparedPlan> preparedPlans;
-        std::vector<ColdPageLifecycleConfig> configs;
+        std::vector<ColdPageLifecycleProperties> properties;
         preparedPlans.reserve(lifecycles.size());
-        configs.reserve(lifecycles.size());
+        properties.reserve(lifecycles.size());
 
         for (auto const& lifecycle : lifecycles)
         {
@@ -81,7 +82,7 @@ public:
             std::optional<kernels::Nvfp4ColdPageRuntimeType> runtimeType;
             std::size_t coldPageBytes = 0;
 
-            for (auto const& [layerId, resolvedBuffers] : lifecycle)
+            for (auto const& [layerId, resolvedBuffers] : lifecycle.layers)
             {
                 auto const& layout = mLayerLayouts.at(layerId);
                 if (layout.buffers.size() != resolvedBuffers.size())
@@ -129,18 +130,18 @@ public:
 
             if (!runtimeType)
             {
-                throw std::invalid_argument("NVFP4 backend received an empty lifecycle");
+                throw std::invalid_argument("NVFP4 received an empty lifecycle");
             }
             preparedPlans.push_back(kernels::prepareNvfp4ColdPagePlan(buffers, coldPageBytes, *runtimeType));
-            configs.push_back({coldPageBytes, kv::PageIndexLocation::kHost});
+            properties.push_back({coldPageBytes, kv::PageIndexLocation::kHost});
         }
 
         mPreparedPlans = std::move(preparedPlans);
-        return configs;
+        return properties;
     }
 
-    void encode(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices, std::size_t numPages,
-        cudaStream_t stream) override
+    void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+        std::size_t numPages, cudaStream_t stream) override
     {
         thread_local std::vector<kernels::Nvfp4ColdPageOffloadPageTask> pages;
         pages.clear();
@@ -149,10 +150,10 @@ public:
         {
             pages.push_back({pageIndices[page].src, pageIndices[page].dst});
         }
-        kernels::invokeNvfp4ColdPageEncode(pages, mPreparedPlans.at(lifecycleIndex), coldBase, stream);
+        kernels::invokeNvfp4ColdPageEncode(pages, mPreparedPlans.at(planIndex), coldBase, stream);
     }
 
-    void decode(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    void decodeAlgorithm(std::size_t planIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
         thread_local std::vector<kernels::Nvfp4ColdPageOnboardPageTask> pages;
@@ -162,7 +163,7 @@ public:
         {
             pages.push_back({pageIndices[page].dst, pageIndices[page].src});
         }
-        kernels::invokeNvfp4ColdPageDecode(pages, mPreparedPlans.at(lifecycleIndex), coldBase, stream);
+        kernels::invokeNvfp4ColdPageDecode(pages, mPreparedPlans.at(planIndex), coldBase, stream);
     }
 
 private:
@@ -175,7 +176,7 @@ private:
 
 std::unique_ptr<kv::IKvCacheColdPageCodec> createNvfp4ColdPageCodec(std::vector<Nvfp4ColdPageLayerLayout> layerLayouts)
 {
-    return std::make_unique<NativeColdPageCodec>(std::make_unique<Nvfp4ColdPageCodecBackend>(std::move(layerLayouts)));
+    return std::make_unique<Nvfp4ColdPageCodec>(std::move(layerLayouts));
 }
 
 } // namespace tensorrt_llm::kv_cache_compression

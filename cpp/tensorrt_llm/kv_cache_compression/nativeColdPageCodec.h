@@ -22,74 +22,72 @@ namespace tensorrt_llm::kv_cache_compression
 namespace kv = batch_manager::kv_cache_manager_v2;
 
 //! One hot buffer resolved from KVCM's authoritative pool descriptors.
-struct ResolvedColdPageBuffer
+struct ResolvedHotBuffer
 {
     std::uintptr_t rawBase = 0;
     std::size_t rawSlotBytes = 0;
     std::size_t rawBytes = 0;
 };
 
-using ResolvedColdPageLayer = std::map<kv::DataRole, ResolvedColdPageBuffer>;
-using ResolvedColdPageLifecycle = std::map<kv::LayerId, ResolvedColdPageLayer>;
+using ResolvedHotLayer = std::map<kv::DataRole, ResolvedHotBuffer>;
 
-//! Storage properties produced while a backend prepares one lifecycle.
-struct ColdPageLifecycleConfig
+//! One KVCM lifecycle resolved into its hot buffers.
+struct ResolvedHotLifecycle
+{
+    kv::LifeCycleId lifeCycleId{-1};
+    std::map<kv::LayerId, ResolvedHotLayer> layers;
+};
+
+//! Storage properties produced while an algorithm prepares one lifecycle.
+struct ColdPageLifecycleProperties
 {
     std::size_t coldPageBytes = 0;
     kv::PageIndexLocation pageIndexLocation = kv::PageIndexLocation::kBadLocation;
 };
 
-//! Native algorithm backend retained by the generic KVCM codec adapter.
-class IColdPageCodecBackend
+//! Resolves KVCM layouts and routes lifecycles for one native compression method.
+class NativeColdPageCodec : public kv::IKvCacheColdPageCodec
 {
 public:
-    virtual ~IColdPageCodecBackend() = default;
+    bool configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept final;
 
-    [[nodiscard]] virtual std::set<kv::LayerId> const& getLayerIds() const noexcept = 0;
+    [[nodiscard]] std::size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept final;
 
-    virtual std::vector<ColdPageLifecycleConfig> configure(std::vector<ResolvedColdPageLifecycle> const& lifecycles)
-        = 0;
+    [[nodiscard]] kv::LayerGroupId getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept final;
 
-    virtual void encode(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
-        std::size_t numPages, cudaStream_t stream)
-        = 0;
-
-    virtual void decode(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
-        std::size_t numPages, cudaStream_t stream)
-        = 0;
-};
-
-//! Resolves KVCM layouts, routes lifecycles, and owns one native backend.
-class NativeColdPageCodec final : public kv::IKvCacheColdPageCodec
-{
-public:
-    explicit NativeColdPageCodec(std::unique_ptr<IColdPageCodecBackend> backend);
-
-    bool configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept override;
-
-    [[nodiscard]] std::size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept override;
-
-    [[nodiscard]] kv::LayerGroupId getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept override;
-
-    [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept override;
+    [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept final;
 
     bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
-        std::size_t numBasePages, cudaStream_t stream) noexcept override;
+        std::size_t numBasePages, cudaStream_t stream) noexcept final;
 
     bool decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr, kv::PageIndexPair const* pageIndices,
-        std::size_t numBasePages, cudaStream_t stream) noexcept override;
+        std::size_t numBasePages, cudaStream_t stream) noexcept final;
 
 private:
+    [[nodiscard]] virtual std::set<kv::LayerId> const& getLayerIds() const noexcept = 0;
+
+    virtual std::vector<ColdPageLifecycleProperties> configureAlgorithm(
+        std::vector<ResolvedHotLifecycle> const& lifecycles)
+        = 0;
+
+    //! Enqueue only on stream; drain earlier partial submissions before throwing.
+    virtual void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+        std::size_t numPages, cudaStream_t stream)
+        = 0;
+
+    virtual void decodeAlgorithm(std::size_t planIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+        std::size_t numPages, cudaStream_t stream)
+        = 0;
+
     struct LayerGroupState
     {
-        std::optional<std::size_t> backendIndex;
+        std::optional<std::size_t> planIndex;
         std::size_t coldPageBytes = 0;
         kv::PageIndexLocation pageIndexLocation = kv::PageIndexLocation::kBadLocation;
     };
 
     [[nodiscard]] LayerGroupState const* findLayerGroup(kv::LayerGroupId layerGroupId) const noexcept;
 
-    std::unique_ptr<IColdPageCodecBackend> mBackend;
     std::map<kv::LayerGroupId, LayerGroupState> mLayerGroups;
     std::unique_ptr<kv::IKvCacheColdPageCodec> mLosslessCodec;
 };

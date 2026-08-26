@@ -17,7 +17,7 @@
  */
 
 #include "bindings.h"
-#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodecBackend.h"
+#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>

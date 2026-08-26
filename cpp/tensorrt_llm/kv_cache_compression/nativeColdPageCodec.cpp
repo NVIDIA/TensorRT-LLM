@@ -9,7 +9,6 @@
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
-#include <limits>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -19,27 +18,9 @@ namespace tensorrt_llm::kv_cache_compression
 namespace
 {
 
-std::size_t checkedAdd(std::size_t lhs, std::size_t rhs)
+ResolvedHotLifecycle resolveLifecycle(kv::PoolGroupDesc const& gpuDesc, kv::SlotDescVariant const& variant)
 {
-    if (lhs > std::numeric_limits<std::size_t>::max() - rhs)
-    {
-        throw std::overflow_error("GPU Slot buffer offsets overflow size_t");
-    }
-    return lhs + rhs;
-}
-
-std::uintptr_t checkedAddress(std::uintptr_t base, std::size_t offset)
-{
-    if (offset > std::numeric_limits<std::uintptr_t>::max() - base)
-    {
-        throw std::overflow_error("GPU buffer address overflows uintptr_t");
-    }
-    return base + offset;
-}
-
-ResolvedColdPageLifecycle resolveLifecycle(kv::PoolGroupDesc const& gpuDesc, kv::SlotDescVariant const& variant)
-{
-    ResolvedColdPageLifecycle result;
+    ResolvedHotLifecycle result{variant.lifeCycleId, {}};
     for (kv::PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
     {
         auto const& coalesced = variant.coalescedBuffers.at(poolIndex);
@@ -47,31 +28,21 @@ ResolvedColdPageLifecycle resolveLifecycle(kv::PoolGroupDesc const& gpuDesc, kv:
         std::size_t offset = 0;
         for (auto const& bufferId : coalesced.bufferIds)
         {
-            auto& layer = result[bufferId.layerId];
+            auto& layer = result.layers[bufferId.layerId];
             if (!layer
                      .emplace(bufferId.role,
-                         ResolvedColdPageBuffer{
-                             checkedAddress(pool.baseAddress, offset), pool.slotBytes, coalesced.singleBufferSize})
+                         ResolvedHotBuffer{pool.baseAddress + offset, pool.slotBytes, coalesced.singleBufferSize})
                      .second)
             {
                 throw std::invalid_argument("GPU lifecycle contains a duplicate buffer role");
             }
-            offset = checkedAdd(offset, coalesced.singleBufferSize);
+            offset += coalesced.singleBufferSize;
         }
     }
     return result;
 }
 
 } // namespace
-
-NativeColdPageCodec::NativeColdPageCodec(std::unique_ptr<IColdPageCodecBackend> backend)
-    : mBackend(std::move(backend))
-{
-    if (!mBackend)
-    {
-        throw std::invalid_argument("NativeColdPageCodec requires a backend");
-    }
-}
 
 bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept
 {
@@ -83,10 +54,9 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             throw std::invalid_argument("Default lossless codec rejected GPU layouts");
         }
 
-        auto const& backendLayerIds = mBackend->getLayerIds();
+        auto const& algorithmLayerIds = getLayerIds();
         std::map<kv::LayerGroupId, LayerGroupState> pendingGroups;
-        std::vector<ResolvedColdPageLifecycle> backendLifecycles;
-        std::vector<kv::LayerGroupId> backendLayerGroups;
+        std::vector<ResolvedHotLifecycle> algorithmLifecycles;
         std::set<kv::LayerId> consumedLayers;
 
         for (kv::PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numGpuDescs; ++poolGroupIndex)
@@ -95,32 +65,31 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             for (auto const& variant : gpuDesc.slotDesc.variants)
             {
                 auto resolved = resolveLifecycle(gpuDesc, variant);
-                auto const backendLayerCount = std::count_if(resolved.begin(), resolved.end(),
-                    [&backendLayerIds](auto const& layer) { return backendLayerIds.count(layer.first) != 0U; });
+                auto const algorithmLayerCount = std::count_if(resolved.layers.begin(), resolved.layers.end(),
+                    [&algorithmLayerIds](auto const& layer) { return algorithmLayerIds.count(layer.first) != 0U; });
 
                 LayerGroupState state;
-                if (backendLayerCount == 0U)
+                if (algorithmLayerCount == 0U)
                 {
                     state.coldPageBytes = losslessCodec->queryColdPageBytes(variant.lifeCycleId);
                     state.pageIndexLocation = losslessCodec->queryPageIndexLocation(variant.lifeCycleId);
                 }
                 else
                 {
-                    if (backendLayerCount != resolved.size())
+                    if (algorithmLayerCount != resolved.layers.size())
                     {
-                        throw std::invalid_argument("A lifecycle cannot mix backend-owned and fallback layers");
+                        throw std::invalid_argument("A lifecycle cannot mix algorithm-owned and fallback layers");
                     }
-                    for (auto const& [layerId, buffers] : resolved)
+                    for (auto const& [layerId, buffers] : resolved.layers)
                     {
                         static_cast<void>(buffers);
                         if (!consumedLayers.emplace(layerId).second)
                         {
-                            throw std::invalid_argument("A backend layer appears in multiple lifecycles");
+                            throw std::invalid_argument("An algorithm layer appears in multiple lifecycles");
                         }
                     }
-                    state.backendIndex = backendLifecycles.size();
-                    backendLayerGroups.push_back(variant.lifeCycleId);
-                    backendLifecycles.push_back(std::move(resolved));
+                    state.planIndex = algorithmLifecycles.size();
+                    algorithmLifecycles.push_back(std::move(resolved));
                 }
 
                 if (!pendingGroups.emplace(variant.lifeCycleId, std::move(state)).second)
@@ -129,26 +98,26 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
                 }
             }
         }
-        if (consumedLayers != backendLayerIds)
+        if (consumedLayers != algorithmLayerIds)
         {
-            throw std::invalid_argument("A backend layer is absent from all GPU descriptors");
+            throw std::invalid_argument("An algorithm layer is absent from all GPU descriptors");
         }
 
-        auto const backendConfigs = mBackend->configure(backendLifecycles);
-        if (backendConfigs.size() != backendLifecycles.size())
+        auto const properties = configureAlgorithm(algorithmLifecycles);
+        if (properties.size() != algorithmLifecycles.size())
         {
-            throw std::invalid_argument("Cold-page backend returned an unexpected lifecycle count");
+            throw std::invalid_argument("Cold-page algorithm returned an unexpected lifecycle count");
         }
-        for (std::size_t index = 0; index < backendConfigs.size(); ++index)
+        for (std::size_t index = 0; index < properties.size(); ++index)
         {
-            auto const& config = backendConfigs[index];
-            if (config.coldPageBytes == 0U || config.pageIndexLocation == kv::PageIndexLocation::kBadLocation)
+            auto const& lifecycle = properties[index];
+            if (lifecycle.coldPageBytes == 0U || lifecycle.pageIndexLocation == kv::PageIndexLocation::kBadLocation)
             {
-                throw std::invalid_argument("Cold-page backend returned invalid storage properties");
+                throw std::invalid_argument("Cold-page algorithm returned invalid storage properties");
             }
-            auto& state = pendingGroups.at(backendLayerGroups[index]);
-            state.coldPageBytes = config.coldPageBytes;
-            state.pageIndexLocation = config.pageIndexLocation;
+            auto& state = pendingGroups.at(algorithmLifecycles[index].lifeCycleId);
+            state.coldPageBytes = lifecycle.coldPageBytes;
+            state.pageIndexLocation = lifecycle.pageIndexLocation;
         }
 
         mLayerGroups = std::move(pendingGroups);
@@ -205,11 +174,11 @@ bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr
         {
             return true;
         }
-        if (!state->backendIndex)
+        if (!state->planIndex)
         {
             return mLosslessCodec->encode(layerGroupId, dstBasePtr, pageIndices, numBasePages, stream);
         }
-        mBackend->encode(*state->backendIndex, dstBasePtr, pageIndices, numBasePages, stream);
+        encodeAlgorithm(*state->planIndex, dstBasePtr, pageIndices, numBasePages, stream);
         return true;
     }
     catch (std::exception const& error)
@@ -238,11 +207,11 @@ bool NativeColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcB
         {
             return true;
         }
-        if (!state->backendIndex)
+        if (!state->planIndex)
         {
             return mLosslessCodec->decode(layerGroupId, srcBasePtr, pageIndices, numBasePages, stream);
         }
-        mBackend->decode(*state->backendIndex, srcBasePtr, pageIndices, numBasePages, stream);
+        decodeAlgorithm(*state->planIndex, srcBasePtr, pageIndices, numBasePages, stream);
         return true;
     }
     catch (std::exception const& error)

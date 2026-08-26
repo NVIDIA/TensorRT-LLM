@@ -5,7 +5,7 @@
  */
 
 #include "tensorrt_llm/kv_cache_compression/nativeColdPageCodec.h"
-#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodecBackend.h"
+#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.h"
 
 #include <gtest/gtest.h>
 
@@ -13,7 +13,6 @@
 #include <array>
 #include <cstdint>
 #include <iterator>
-#include <memory>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -27,6 +26,7 @@ namespace
 
 namespace kv = batch_manager::kv_cache_manager_v2;
 
+static_assert(std::is_abstract_v<NativeColdPageCodec>);
 static_assert(std::is_base_of_v<kv::IKvCacheColdPageCodec, NativeColdPageCodec>);
 
 constexpr std::uintptr_t kGpuKBase = 0x100000;
@@ -81,10 +81,10 @@ bool configureOne(kv::IKvCacheColdPageCodec& codec, kv::PoolGroupDesc const& des
     return codec.configure(&desc, kv::PoolGroupIndex{1});
 }
 
-class RecordingBackend final : public IColdPageCodecBackend
+class RecordingCodec final : public NativeColdPageCodec
 {
 public:
-    explicit RecordingBackend(std::set<kv::LayerId> layerIds)
+    explicit RecordingCodec(std::set<kv::LayerId> layerIds)
         : mLayerIds(std::move(layerIds))
     {
     }
@@ -94,45 +94,55 @@ public:
         return mLayerIds;
     }
 
-    std::vector<ColdPageLifecycleConfig> configure(std::vector<ResolvedColdPageLifecycle> const& lifecycles) override
+    std::vector<ColdPageLifecycleProperties> configureAlgorithm(
+        std::vector<ResolvedHotLifecycle> const& lifecycles) override
     {
         resolved = lifecycles;
         if (failConfigure)
         {
             throw std::runtime_error("requested configure failure");
         }
-        return std::vector<ColdPageLifecycleConfig>(
-            lifecycles.size(), ColdPageLifecycleConfig{777U, kv::PageIndexLocation::kHost});
+        return std::vector<ColdPageLifecycleProperties>(
+            lifecycles.size(), ColdPageLifecycleProperties{777U, kv::PageIndexLocation::kHost});
     }
 
-    void encode(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices, std::size_t numPages,
-        cudaStream_t stream) override
+    void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+        std::size_t numPages, cudaStream_t stream) override
     {
+        if (failBatches)
+        {
+            throw std::runtime_error("requested batch failure");
+        }
         ++encodeCalls;
-        lastLifecycleIndex = lifecycleIndex;
+        lastPlanIndex = planIndex;
         lastColdBase = coldBase;
         lastIndices.assign(pageIndices, pageIndices + numPages);
         lastStream = stream;
     }
 
-    void decode(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    void decodeAlgorithm(std::size_t planIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
+        if (failBatches)
+        {
+            throw std::runtime_error("requested batch failure");
+        }
         ++decodeCalls;
-        lastLifecycleIndex = lifecycleIndex;
+        lastPlanIndex = planIndex;
         lastColdBase = coldBase;
         lastIndices.assign(pageIndices, pageIndices + numPages);
         lastStream = stream;
     }
 
     bool failConfigure = false;
+    bool failBatches = false;
     int encodeCalls = 0;
     int decodeCalls = 0;
-    std::size_t lastLifecycleIndex = 0;
+    std::size_t lastPlanIndex = 0;
     void const* lastColdBase = nullptr;
     cudaStream_t lastStream{};
     std::vector<kv::PageIndexPair> lastIndices;
-    std::vector<ResolvedColdPageLifecycle> resolved;
+    std::vector<ResolvedHotLifecycle> resolved;
 
 private:
     std::set<kv::LayerId> mLayerIds;
@@ -140,13 +150,12 @@ private:
 
 TEST(NativeColdPageCodecTest, ResolvesKvcManagerLayoutAndForwardsBatches)
 {
-    auto backend = std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0, 1});
-    auto* recorder = backend.get();
-    NativeColdPageCodec codec{std::move(backend)};
+    RecordingCodec codec{{0, 1}};
 
     ASSERT_TRUE(configureOne(codec, makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{3}, 2U)));
-    ASSERT_EQ(recorder->resolved.size(), 1U);
-    auto const& layers = recorder->resolved.front();
+    ASSERT_EQ(codec.resolved.size(), 1U);
+    EXPECT_EQ(codec.resolved.front().lifeCycleId, kv::LifeCycleId{3});
+    auto const& layers = codec.resolved.front().layers;
     EXPECT_EQ(layers.at(0).at("key").rawBase, kGpuKBase);
     EXPECT_EQ(layers.at(0).at("value").rawBase, kGpuVBase);
     EXPECT_EQ(layers.at(1).at("key").rawBase, kGpuKBase + kRawBytes);
@@ -158,26 +167,24 @@ TEST(NativeColdPageCodecTest, ResolvesKvcManagerLayoutAndForwardsBatches)
     auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
     ASSERT_TRUE(
         codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), indices, std::size(indices), stream));
-    EXPECT_EQ(recorder->encodeCalls, 1);
-    EXPECT_EQ(recorder->lastLifecycleIndex, 0U);
-    EXPECT_EQ(recorder->lastIndices[1].src, 3);
-    EXPECT_EQ(recorder->lastColdBase, reinterpret_cast<void*>(kColdBase));
-    EXPECT_EQ(recorder->lastStream, stream);
+    EXPECT_EQ(codec.encodeCalls, 1);
+    EXPECT_EQ(codec.lastPlanIndex, 0U);
+    EXPECT_EQ(codec.lastIndices[1].src, 3);
+    EXPECT_EQ(codec.lastColdBase, reinterpret_cast<void*>(kColdBase));
+    EXPECT_EQ(codec.lastStream, stream);
 
     ASSERT_TRUE(codec.decode(
         kv::LayerGroupId{3}, reinterpret_cast<void const*>(kColdBase), indices, std::size(indices), stream));
-    EXPECT_EQ(recorder->decodeCalls, 1);
+    EXPECT_EQ(codec.decodeCalls, 1);
 }
 
 TEST(NativeColdPageCodecTest, UnownedLifecycleUsesLosslessFallback)
 {
-    auto backend = std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0});
-    auto* recorder = backend.get();
-    NativeColdPageCodec codec{std::move(backend)};
+    RecordingCodec codec{{0}};
     std::array descs{makeAttentionDesc(), makeLosslessDesc(kv::PoolGroupIndex{1}, kv::LayerGroupId{1})};
 
     ASSERT_TRUE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
-    EXPECT_EQ(recorder->resolved.size(), 1U);
+    EXPECT_EQ(codec.resolved.size(), 1U);
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 777U);
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{1}), 96U);
     EXPECT_EQ(codec.queryPageIndexLocation(kv::LayerGroupId{1}), kv::PageIndexLocation::kHost);
@@ -186,44 +193,45 @@ TEST(NativeColdPageCodecTest, UnownedLifecycleUsesLosslessFallback)
 TEST(NativeColdPageCodecTest, RejectsMixedMissingAndDuplicateLifecycleMappings)
 {
     {
-        NativeColdPageCodec codec{std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0})};
+        RecordingCodec codec{{0}};
         EXPECT_FALSE(configureOne(codec, makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 2U)));
     }
     {
-        NativeColdPageCodec codec{std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0, 1})};
+        RecordingCodec codec{{0, 1}};
         EXPECT_FALSE(configureOne(codec, makeAttentionDesc()));
     }
     {
-        NativeColdPageCodec codec{std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0, 1})};
+        RecordingCodec codec{{0, 1}};
         std::array descs{makeAttentionDesc(),
             makeAttentionDesc(kv::PoolGroupIndex{1}, kv::LayerGroupId{0}, 1U, 1, 0x600000, 0x700000)};
         EXPECT_FALSE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
     }
 }
 
-TEST(NativeColdPageCodecTest, CatchesBackendConfigureAndBatchFailures)
+TEST(NativeColdPageCodecTest, CatchesAlgorithmConfigureAndBatchFailures)
 {
-    auto backend = std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0});
-    backend->failConfigure = true;
-    NativeColdPageCodec codec{std::move(backend)};
+    RecordingCodec codec{{0}};
+    codec.failConfigure = true;
     EXPECT_FALSE(configureOne(codec, makeAttentionDesc()));
 
-    auto validBackend = std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0});
-    auto* recorder = validBackend.get();
-    NativeColdPageCodec validCodec{std::move(validBackend)};
+    RecordingCodec validCodec{{0}};
     ASSERT_TRUE(configureOne(validCodec, makeAttentionDesc()));
     EXPECT_TRUE(validCodec.encode(kv::LayerGroupId{0}, nullptr, nullptr, 0U, nullptr));
     EXPECT_TRUE(validCodec.decode(kv::LayerGroupId{0}, nullptr, nullptr, 0U, nullptr));
     kv::PageIndexPair const indices[]{{0, 0}};
     EXPECT_FALSE(validCodec.encode(kv::LayerGroupId{0}, nullptr, indices, 1U, nullptr));
     EXPECT_FALSE(validCodec.decode(kv::LayerGroupId{0}, nullptr, indices, 1U, nullptr));
-    EXPECT_EQ(recorder->encodeCalls, 0);
-    EXPECT_EQ(recorder->decodeCalls, 0);
+    validCodec.failBatches = true;
+    EXPECT_FALSE(validCodec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    EXPECT_FALSE(
+        validCodec.decode(kv::LayerGroupId{0}, reinterpret_cast<void const*>(kColdBase), indices, 1U, nullptr));
+    EXPECT_EQ(validCodec.encodeCalls, 0);
+    EXPECT_EQ(validCodec.decodeCalls, 0);
 }
 
 TEST(NativeColdPageCodecTest, UnknownLifecycleUsesFailureSentinels)
 {
-    NativeColdPageCodec codec{std::make_unique<RecordingBackend>(std::set<kv::LayerId>{0})};
+    RecordingCodec codec{{0}};
     ASSERT_TRUE(configureOne(codec, makeAttentionDesc()));
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{99}), 0U);
     EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{99}), kv::LayerGroupId{-1});
@@ -264,7 +272,7 @@ struct RecordedLaunch
 
 RecordedLaunch gLaunch;
 
-TEST(Nvfp4ColdPageCodecBackendTest, LowersMhaLayoutOnceAndDispatchesEncodeDecode)
+TEST(Nvfp4ColdPageCodecTest, LowersMhaLayoutOnceAndDispatchesEncodeDecode)
 {
     gLaunch = {};
     auto codec = createNvfp4ColdPageCodec({makeAttentionLayout(0, 2.0F, 3.0F), makeAttentionLayout(1, 4.0F, 5.0F)});
@@ -296,7 +304,7 @@ TEST(Nvfp4ColdPageCodecBackendTest, LowersMhaLayoutOnceAndDispatchesEncodeDecode
     EXPECT_EQ(gLaunch.decodePages[0].coldPageIndex, 1);
 }
 
-TEST(Nvfp4ColdPageCodecBackendTest, PreservesMlaSideBufferLosslessly)
+TEST(Nvfp4ColdPageCodecTest, PreservesMlaSideBufferLosslessly)
 {
     gLaunch = {};
     auto codec = createNvfp4ColdPageCodec({makeMlaLayout()});
@@ -314,7 +322,7 @@ TEST(Nvfp4ColdPageCodecBackendTest, PreservesMlaSideBufferLosslessly)
     EXPECT_EQ(gLaunch.plan.buffers[1].coldPaddingBytes, 2U);
 }
 
-TEST(Nvfp4ColdPageCodecBackendTest, RejectsDuplicateLayoutsAndMissingRoles)
+TEST(Nvfp4ColdPageCodecTest, RejectsDuplicateLayoutsAndMissingRoles)
 {
     EXPECT_THROW(
         {
