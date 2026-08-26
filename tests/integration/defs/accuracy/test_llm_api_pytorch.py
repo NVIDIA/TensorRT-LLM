@@ -8538,6 +8538,12 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
         post_process_fn=extract_inkling_content,
         keep_special_tokens=True,
         preserve_caller_max_tokens=True,
+        # Inkling is a reasoning model: apply its chat template so the
+        # "Thinking effort level" system message is injected (the template
+        # defaults reasoning_effort to 0.9=high). Without it the harness sends
+        # raw few-shot prompts, the model never enters deep-CoT mode, and GSM8K
+        # drops from ~96 to ~89.
+        apply_chat_template=True,
     )
 
     @skip_pre_blackwell
