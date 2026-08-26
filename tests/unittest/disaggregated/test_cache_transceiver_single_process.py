@@ -21,8 +21,6 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
 import os
-import subprocess
-import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -1578,10 +1576,7 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
     )
 
 
-_NIXL_BOUNCE_SUBPROCESS_ENV = "TRTLLM_TEST_NIXL_BOUNCE_SUBPROCESS"
-
-
-@pytest.mark.timeout(240)
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     (
         "ctx_tp",
@@ -1607,73 +1602,33 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     is_mla: bool,
     use_v2: bool,
     enable_indexer_k_cache: bool,
-    request: pytest.FixtureRequest,
 ) -> None:
-    """Exercise C++ bounce v2 through representative Python NIXL transceiver paths."""
+    """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
+
+    Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb) and tuned
+    (agent_bounce_params) via CacheTransceiverConfig inside run_transfer_test, covering
+    the config plumbing end-to-end; engagement is asserted programmatically there
+    (agent.bounce_enabled / bounce_submit_count).
+    """
     # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
     # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
     from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus
 
     assert hasattr(TransferStatus, "get_last_status_str")
 
-    if os.environ.get(_NIXL_BOUNCE_SUBPROCESS_ENV) == "1":
-        run_transfer_test(
-            ctx_tp=ctx_tp,
-            ctx_pp=ctx_pp,
-            gen_tp=gen_tp,
-            gen_pp=gen_pp,
-            ctx_enable_dp=False,
-            gen_enable_dp=False,
-            is_mla=is_mla,
-            use_v2=use_v2,
-            request_lengths=[30, 60],
-            enable_indexer_k_cache=enable_indexer_k_cache,
-            expect_cpp_bounce=True,
-        )
-        return
-
-    env = os.environ.copy()
-    for name in tuple(env):
-        if name.startswith("TRTLLM_NIXL_BOUNCE_"):
-            del env[name]
-    env.update(
-        {
-            _NIXL_BOUNCE_SUBPROCESS_ENV: "1",
-            "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
-            # Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb)
-            # and tuned (expert knobs) via CacheTransceiverConfig / agent_bounce_params inside
-            # run_transfer_test — no TRTLLM_NIXL_BOUNCE_* environment variables —
-            # covering the config path end-to-end.
-            # Pin the transport deterministically: the child would otherwise inherit
-            # developer/CI UCX settings (an injected UCX_NET_DEVICES or differing
-            # UCX_TLS can fail the transfer or oversubscribe CPUs).
-            "UCX_TLS": "^ib,gdr_copy",
-            "TRTLLM_NIXL_NUM_THREADS": "1",
-        }
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=is_mla,
+        use_v2=use_v2,
+        request_lengths=[30, 60],
+        enable_indexer_k_cache=enable_indexer_k_cache,
+        expect_cpp_bounce=True,
     )
-    # Deliberately NOT setting TLLM_LOG_LEVEL_BY_MODULE: bounce engagement is verified
-    # programmatically inside the child (agent.bounce_enabled / bounce_submit_count),
-    # and a non-empty per-module level map can hang the child at exit (static-destruction
-    # order: CudaMemPool's deleter logs through an already-destroyed Logger module map).
-    env.pop("TLLM_LOG_LEVEL_BY_MODULE", None)
-    env.pop("UCX_NET_DEVICES", None)
-    # Do not override TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY: the test must
-    # exercise the production default, including automatic cudaMalloc fallback
-    # on devices without fabric-memory support.
-    env.pop("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", None)
-
-    node_id = f"{__file__}::{request.node.name}"
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-s", "-q", node_id],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    # A skipped child exits successfully too; require the selected bounce case to run.
-    assert "1 passed" in output, f"Child pytest did not run the bounce case:\n{output}"
 
 
 if __name__ == "__main__":

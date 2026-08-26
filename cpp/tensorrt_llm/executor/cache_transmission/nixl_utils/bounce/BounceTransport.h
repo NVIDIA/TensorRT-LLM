@@ -90,8 +90,9 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // "peer\x1f rid" so multiple concurrent requests from one peer are independent flows.
 //
 // Lifetime: submit() returns a shared_future<BounceResult>; it resolves SUCCESS on full ACK and
-// FAILURE on transfer error, peer invalidation, shutdown, or request timeout. Setting
-// requestTimeoutMs to 0 intentionally disables timeout-based failure.
+// FAILURE on transfer error, peer invalidation, shutdown, or request timeout. requestTimeoutMs must
+// be > 0 (the config layer enforces this): abandoned-flow resolution and the receiver lease both
+// hang off this timer, so disabling it would let a protocol-error flow hold wait() forever.
 //
 // The agent (data plane) & ControlChannel are injected (not owned) so the same reactor runs
 // unchanged in tests and production (both over the real NIXL/zmq stack; failure tests subclass
@@ -389,8 +390,10 @@ private:
 
     /// GRANT-mispair guard shared by attachCredits()/pumpRequest(): a credit smaller than its chunk
     /// would make the RDMA write overflow the granted region into an adjacent flow's region on the
-    /// peer. On a mispair it abandons the flow (kProtocolError; the request then fails via
-    /// checkTimeouts) and returns true — the caller stops consuming credits. Caller MUST hold mReqMu.
+    /// peer. On a mispair it abandons the flow (kProtocolError) and returns true — the caller stops
+    /// consuming credits and pumpRequest ignores the request from then on, so checkTimeouts fails it
+    /// within one requestTimeoutMs of its pre-abandon in-flight chunks draining. Caller MUST hold
+    /// mReqMu.
     [[nodiscard]] bool abandonOnCreditMispair(
         std::uint64_t rid, Request& req, std::uint32_t chunkIdx, std::uint64_t packedBytes, std::uint32_t creditLen);
     /// Attach parked credits to already-posted chunks (eager gather posted them credit-less), in

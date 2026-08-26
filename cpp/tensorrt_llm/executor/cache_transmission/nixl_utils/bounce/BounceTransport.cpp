@@ -513,7 +513,10 @@ void BounceReceiver::checkTimeouts()
     mCtx.sendGrants(mCtx.scheduler.reapQuarantine());
     if (mCtx.cfg.receiverFlowTimeoutMs <= 0)
     {
-        return; // lease disabled (mirror of requestTimeoutMs <= 0 on the sender)
+        // Defensive only, mirroring BounceSender::checkTimeouts(): the config layer rejects
+        // request_timeout_ms <= 0 and the lease is derived from it, so this is reachable only
+        // through a directly-constructed BounceConfig.
+        return;
     }
     for (auto const& flow : mCtx.scheduler.staleFlows(std::chrono::milliseconds(mCtx.cfg.receiverFlowTimeoutMs)))
     {
@@ -832,7 +835,9 @@ bool BounceSender::abandonOnCreditMispair(
     // chunkBytes[chunkIdx] in WANT, so packedBytes always fits when the channel honors its FIFO
     // contract. A malformed or misordered GRANT would make us RDMA-write packedBytes into a smaller
     // region, overflowing into an adjacent flow's region on the peer. Detect that protocol violation
-    // and abandon the flow (it then fails via checkTimeouts) rather than corrupt the peer.
+    // and abandon the flow rather than corrupt the peer: pumpRequest stops touching an abandoned
+    // request, so once its pre-abandon in-flight chunks drain, lastProgress freezes and
+    // checkTimeouts fails it within one requestTimeoutMs.
     if (packedBytes <= creditLen)
     {
         return false;
@@ -904,8 +909,22 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
 
 void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
 {
+    if (req.abandonReason != BounceFailReason::kNone)
+    {
+        // Abandoned (GRANT mispair / plan overflow): stop attaching credits and launching gathers.
+        // Chunks credited BEFORE the abandon still drain normally (drainGatherReady/onAck may refresh
+        // lastProgress a bounded number of times), but no new credit can ever attach, so checkTimeouts
+        // fails the request within one requestTimeoutMs of the last pre-abandon chunk's completion —
+        // instead of being revived indefinitely by later GRANTs on a flow already known dead.
+        // Drop credits a post-abandon GRANT parked (onGrant appends before calling here), keeping the
+        // abandon sites' "no parked credits" invariant; they are plain POD, and the receiver reclaims
+        // the regions behind them via the cancel that failRequest sends.
+        req.pendingCredits.clear();
+        return;
+    }
     attachCredits(rid, req);
-    while (req.nextPost < req.numChunks)
+    // Re-checked in the loop condition: attachCredits (or a later iteration) may abandon mid-pass.
+    while (req.abandonReason == BounceFailReason::kNone && req.nextPost < req.numChunks)
     {
         std::uint32_t const chunkIdx = req.nextPost;
         auto const& chunk = req.plan.chunks()[chunkIdx];
@@ -981,7 +1000,9 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             mCtx.exec->release(ctx);
             mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
             req.abandonReason = BounceFailReason::kProtocolError;
-            req.pendingCredits.clear(); // abandon: the request then fails via checkTimeouts
+            // Abandon: pumpRequest ignores the request from now on; once its in-flight chunks
+            // drain, lastProgress freezes and checkTimeouts fails it within one requestTimeoutMs.
+            req.pendingCredits.clear();
             break;
         }
         auto const bufs = planBufs(ctx, nTotal);
@@ -1288,7 +1309,10 @@ void BounceSender::checkTimeouts()
 {
     if (mCtx.cfg.requestTimeoutMs <= 0)
     {
-        return; // timeout disabled (e.g. tests that intentionally wait forever)
+        // Defensive only: the config layer rejects request_timeout_ms <= 0 (abandoned-flow
+        // resolution and the receiver lease both hang off this timer), so this is reachable only
+        // through a directly-constructed BounceConfig.
+        return;
     }
     auto const now = std::chrono::steady_clock::now();
     auto const limit = std::chrono::milliseconds(mCtx.cfg.requestTimeoutMs);

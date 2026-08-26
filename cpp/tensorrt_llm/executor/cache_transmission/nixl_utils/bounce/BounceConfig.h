@@ -153,8 +153,10 @@ struct BounceConfig
     std::uint32_t scatterWorkerCount{4};                     // scatter_worker_count
     std::size_t minDescriptorCount{1024};                    // min_descriptor_count
     std::size_t maxAverageDescriptorSizeBytes{16ULL << 10};  // max_average_descriptor_size
-    int requestTimeoutMs{30000};                             // request_timeout_ms; <=0 DISABLES the timeout
-                                 // (checkTimeouts no-ops; used by tests that intentionally wait)
+    int requestTimeoutMs{30000}; // request_timeout_ms; must be > 0 — the whole failure model
+                                 // (abandoned-flow resolution, receiver lease, quarantine) hangs off
+                                 // this timer, so applyParam rejects 0 (negatives already fail the
+                                 // strict unsigned parse) and keeps the current value.
     // Receiver-side lease on granted regions — DERIVED in deriveDependentTimeouts() as
     // 2 x requestTimeoutMs, not an independent knob (tests may still set the field directly). A
     // dead sender emits neither DATA nor a cancel, which is unobservable through the protocol
@@ -183,7 +185,8 @@ struct BounceConfig
 
     /// Re-derive the lease/quarantine values from the one user-visible timeout (see the field
     /// comments): the lease must exceed the peers' request timeout, and time is the only write
-    /// barrier for a reclaimed region. Disabling the request timeout (<=0) disables both. Must be
+    /// barrier for a reclaimed region. The config layer guarantees requestTimeoutMs > 0 (applyParam
+    /// rejects 0); the > 0 guard below only matters for directly-constructed configs. Must be
     /// re-run whenever requestTimeoutMs changes: fromEnv() always calls it, fromParams() only when
     /// the dict actually provides request_timeout_ms — so a caller-tweaked receiverFlowTimeoutMs /
     /// quarantineMs on the base config (tests set the fields directly) survives an unrelated dict.
@@ -257,10 +260,10 @@ struct BounceConfig
                 warnBad();
             }
         };
-        auto setInt = [&](int& field)
+        auto setPositiveInt = [&](int& field)
         {
             auto const v = parseU64Value(value);
-            if (v.has_value() && *v <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+            if (v.has_value() && *v != 0 && *v <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
             {
                 field = static_cast<int>(*v);
             }
@@ -300,7 +303,7 @@ struct BounceConfig
         }
         else if (key == "request_timeout_ms")
         {
-            setInt(cfg.requestTimeoutMs);
+            setPositiveInt(cfg.requestTimeoutMs);
         }
         else if (key == "disable_fabric_memory")
         {
@@ -378,7 +381,8 @@ struct BounceConfig
         if (it != params.end())
         {
             auto const parsed = parseU64Value(it->second);
-            if (parsed.has_value() && *parsed <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+            if (parsed.has_value() && *parsed != 0
+                && *parsed <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
             {
                 base.deriveDependentTimeouts();
             }
