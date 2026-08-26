@@ -298,7 +298,6 @@ tensorrt_llm/_torch/pyexecutor/handle_logits.py
 tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py
 tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py
 tensorrt_llm/_torch/pyexecutor/llm_request.py
-tensorrt_llm/_torch/pyexecutor/make_decoding_batch_input_output.py
 tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py
 tensorrt_llm/_torch/pyexecutor/model_engine.py
 tensorrt_llm/_torch/pyexecutor/model_loader.py
@@ -611,7 +610,6 @@ tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py
 tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
 tests/unittest/_torch/sampler/test_beam_search.py
 tests/unittest/_torch/sampler/test_best_of_n.py
-tests/unittest/_torch/sampler/test_trtllm_sampler.py
 tests/unittest/_torch/speculative/test_eagle3.py
 tests/unittest/_torch/test_connector.py
 tests/unittest/_torch/test_torch_multi_arange.py
