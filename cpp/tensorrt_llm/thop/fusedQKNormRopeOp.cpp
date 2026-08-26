@@ -315,6 +315,8 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
         packed.size(1) == totalHeads * headDim, "Packed tensor width must equal (Q + 2*KV + index-Q + 1) * head_dim");
     TORCH_CHECK(outCacheLoc.numel() >= numTokens, "out_cache_loc is shorter than num_tokens");
     TORCH_CHECK(positionIds.numel() == numTokens, "position_ids length must equal num_tokens");
+    TORCH_CHECK(qWeight.dim() == 1 && kWeight.dim() == 1 && indexQWeight.dim() == 1 && indexKWeight.dim() == 1,
+        "All norm weights must be one-dimensional");
     TORCH_CHECK(qWeight.numel() == headDim && kWeight.numel() == headDim && indexQWeight.numel() == headDim
             && indexKWeight.numel() == headDim,
         "All norm weights must contain head_dim elements");
