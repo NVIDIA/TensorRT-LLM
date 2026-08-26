@@ -8,6 +8,21 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
 
+- **KV Cache Manager**
+  - Enabled KV cache manager V2 by default for:
+    - DeepSeek V3, DeepSeek R1, and DeepSeek V3 Lite
+    - DeepSeek V3.2
+    - DeepSeek V4
+    - GLM-5
+    - GPT-OSS
+    - Mistral Large 3
+    - Kimi K2, Kimi K2.5, and Kimi K3
+    - MiniMax M2 and MiniMax M3
+    - Nemotron H and Nemotron H Puzzle
+    - Qwen3-Next, Qwen3.5, and Qwen3.8
+    - Gemma 3 and Gemma 4
+  - KV cache manager V2 is the recommended architecture, with improved scalability and stability. All new models will use V2 by default, existing models will be migrated to V2 gradually, and V1 will be deprecated.
+
 - **DGX Spark Support (Beta)**
   - Added beta support for single-node DGX Spark.
   - Validated models and precision formats:
