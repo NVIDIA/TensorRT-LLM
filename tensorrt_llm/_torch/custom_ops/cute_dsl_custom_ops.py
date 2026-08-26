@@ -9698,8 +9698,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
-        softmax_stats: Optional[torch.Tensor] = None,
+        # Keep the last two arguments required in the custom-op schema. PyTorch
+        # elides trailing default-valued arguments before its mutation fallback,
+        # while mutates_args retains their positional indices.
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
         """
@@ -9756,8 +9759,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
-        softmax_stats: Optional[torch.Tensor] = None,
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         return None
 
@@ -9780,8 +9783,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
-        softmax_stats: Optional[torch.Tensor] = None,
+        # See the FP8 op above: these must remain required schema arguments.
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
         """
@@ -9855,7 +9859,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        max_batch_size: int = 0,
-        softmax_stats: Optional[torch.Tensor] = None,
+        max_batch_size: int,
+        softmax_stats: Optional[torch.Tensor],
     ) -> None:
         return None
