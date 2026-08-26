@@ -1155,10 +1155,6 @@ private:
         {
             sstream << "\"skipsFirstProdAcquiresLastConsReleases\": false,\n";
         }
-        // Reduce the number of anti-dependencies in the generated code.
-        // See https://nvbugs/4940327
-        // WARNING: Increase this might lead to more register usage and even spills. Please finetune it carefully.
-        sstream << "\"antiDepWeight\": 25,\n";
 
         sstream << "\"usesNvRtc\": "
                 << "true"
