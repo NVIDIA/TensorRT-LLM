@@ -78,6 +78,8 @@ private:
     Localization* mImpl;
 };
 
+bool deviceSupportsLocalization(int device) noexcept;
+
 } // namespace locality_domain
 
 } // namespace tensorrt_llm

@@ -1114,4 +1114,29 @@ CUstream LocalizationHandle::getReservedRemainderStream()
     return mImpl->getReservedRemainderStream();
 }
 
+bool deviceSupportsLocalization(int device) noexcept
+{
+#if CUDA_VERSION >= 13040
+    // cuInit() is idempotent and does not create a context.
+    if (cuInit(0) != CUDA_SUCCESS)
+    {
+        return false;
+    }
+
+    CUdevice cuDevice{};
+    if (cuDeviceGet(&cuDevice, device) != CUDA_SUCCESS)
+    {
+        return false;
+    }
+
+    int localityDomainCount{};
+    CUresult const result
+        = cuDeviceGetAttribute(&localityDomainCount, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, cuDevice);
+    return result == CUDA_SUCCESS && localityDomainCount >= kLocalityDomainCount;
+#else
+    static_cast<void>(device);
+    return false;
+#endif
+}
+
 } // namespace tensorrt_llm::locality_domain

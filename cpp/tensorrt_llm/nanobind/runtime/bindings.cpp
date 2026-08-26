@@ -448,6 +448,12 @@ void initBindings(nb::module_& m)
             "Get the borrowed process-lifetime remainder Green Context stream, or 0 when unavailable",
             nb::call_guard<nb::gil_scoped_release>());
 
+    m.def("device_supports_locality_domain", &tensorrt_llm::locality_domain::deviceSupportsLocalization,
+        nb::arg("device"),
+        "Return whether the device exposes public locality domains. Performs a driver attribute query only: it "
+        "creates no CUDA context and does not partition the device, so it is safe to call before selecting a device.",
+        nb::call_guard<nb::gil_scoped_release>());
+
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);
     // Initialize HostFunc bindings
