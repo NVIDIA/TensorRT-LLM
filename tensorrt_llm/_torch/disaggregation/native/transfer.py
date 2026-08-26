@@ -204,6 +204,7 @@ class _ReceiveOperationOwner:
         self._expected_writers: Optional[int] = None
         self._writer_cohort: Optional[frozenset[int]] = None
         self._writer_results: dict[int, bool] = {}
+        self._publication_failed = False
         self._local_completion_pending = False
         self._invalid_evidence = False
 
@@ -236,6 +237,21 @@ class _ReceiveOperationOwner:
     def finish_publication(self) -> None:
         """Record that every authorized REQUEST_DATA message was sent."""
         with self._lock:
+            self._publication_pending = False
+
+    def abort_publication(self, published_writers: set[int]) -> None:
+        """Close a failed fan-out around the writers whose sends succeeded."""
+        with self._lock:
+            published = frozenset(published_writers)
+            if self._writer_cohort is not None and not published.issubset(self._writer_cohort):
+                self._invalid_evidence = True
+                raise RuntimeError("publication recorded a writer outside the sealed cohort")
+            if not self._writer_results.keys() <= published:
+                self._invalid_evidence = True
+                raise RuntimeError("terminal evidence came from an unpublished writer")
+            self._expected_writers = len(published)
+            self._writer_cohort = frozenset(published)
+            self._publication_failed = True
             self._publication_pending = False
 
     def cancel_unpublished(self) -> bool:
@@ -278,7 +294,9 @@ class _ReceiveOperationOwner:
                 return False, False
             self._writer_results[peer_rank] = succeeded
             all_reported = len(self._writer_results) == self._expected_writers
-            all_succeeded = all_reported and all(self._writer_results.values())
+            all_succeeded = (
+                all_reported and not self._publication_failed and all(self._writer_results.values())
+            )
             if all_succeeded and wait_for_local_completion:
                 self._local_completion_pending = True
             return True, all_succeeded
@@ -1701,6 +1719,9 @@ class KVRecvTask:
     def finish_publication(self) -> None:
         self._get_physical_owner().finish_publication()
 
+    def abort_publication(self, published_writers: set[int]) -> None:
+        self._get_physical_owner().abort_publication(published_writers)
+
     def cancel_unpublished(self) -> bool:
         return self._get_physical_owner().cancel_unpublished()
 
@@ -2027,17 +2048,25 @@ class Receiver(ReceiverBase):
                 payload = receiver_req_bytes
             serialized_requests.append((rank, payload))
 
+        published_writers: set[int] = set()
+
         def publish_requests() -> None:
             for rank, payload in serialized_requests:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
-                self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
+                published_writers.add(rank)
+                try:
+                    self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
+                except Exception:
+                    published_writers.discard(rank)
+                    raise
 
         if not session.try_begin_transfer(
             task.slice_id,
             sender_endpoints,
             set(peer_ranks),
             publish=publish_requests,
+            published_writers=published_writers,
         ):
             self._bounce.release_idle_reservation(key)
             task.cancel_unpublished()
@@ -2303,8 +2332,11 @@ class RxSession(RxSessionBase):
         writer_cohort: Optional[set[int]] = None,
         *,
         publish: Optional[Callable[[], None]] = None,
+        published_writers: Optional[set[int]] = None,
     ) -> bool:
         """Seal and publish a writer cohort unless cancellation won first."""
+        if publish is not None and published_writers is None:
+            raise ValueError("publication must track successfully queued writers")
         with self._publication_lock:
             with self.lock:
                 if self._closed or self._terminal_status is not None:
@@ -2314,11 +2346,22 @@ class RxSession(RxSessionBase):
                 task.status = TaskStatus.TRANSFERRING
                 self._sender_endpoints.update(sender_endpoints)
             if publish is not None:
-                # A publication exception is ambiguous: REQUEST_DATA may have
-                # reached any prefix of the sealed cohort. Keep publication
-                # pending so the destination remains quarantined; a later
-                # cancellation-ack/deadline layer must resolve that uncertainty.
-                publish()
+                assert published_writers is not None
+                try:
+                    publish()
+                    if writer_cohort is not None and published_writers != writer_cohort:
+                        raise RuntimeError("publication did not queue the complete writer cohort")
+                except Exception:
+                    # ZMQ delivers multipart messages atomically. A successful
+                    # send transfers responsibility to that writer; a failed
+                    # send does not. Retain only the successfully queued prefix
+                    # and wait for each of those writers to settle.
+                    self._receiver._bounce.abort_publication(
+                        (self.disagg_request_id, task.slice_id),
+                        published_writers,
+                    )
+                    task.abort_publication(published_writers)
+                    raise
             task.finish_publication()
             return True
 

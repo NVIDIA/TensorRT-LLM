@@ -246,30 +246,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def shutdown(self):
         if getattr(self, "_shutdown", False):
             return
-        blocked_recv_rids = [
-            rid
-            for rid, session in self._recv_sessions.items()
-            if getattr(session, "_enforce_physical_ownership", False)
-            and (
-                getattr(session, "resources_drained", None) is None
-                or not session.resources_drained()
-            )
-        ]
-        if blocked_recv_rids:
-            raise RuntimeError(
-                "refusing KV transceiver shutdown while receive resources remain active: "
-                f"rids={blocked_recv_rids}"
-            )
-        self._shutdown = True
-        for session in list(self._send_sessions.values()):
-            session.close()
-        for session in list(self._recv_sessions.values()):
-            session.close()
+        # Close receive owners before touching send-side or worker state. The
+        # separate drain snapshot would not be sufficient: late evidence can make an
+        # owner unretirable before close() acquires its lock.
+        for rid, session in list(self._recv_sessions.items()):
+            self._close_session_or_raise(session, rid, "shutdown")
+        for rid, session in list(self._send_sessions.items()):
+            self._close_session_or_raise(session, rid, "shutdown")
         self._send_sessions.clear()
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
+        self._shutdown = True
 
     def __enter__(self):
         return self
@@ -564,11 +553,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_retirable = []
         for rid in to_process:
             session = self._recv_sessions[rid]
-            if not getattr(session, "_enforce_physical_ownership", False):
-                locally_retirable.append(rid)
-                continue
-            resources_drained = getattr(session, "resources_drained", None)
-            if resources_drained is not None and resources_drained():
+            if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
         return self._consensus_outcome(
             to_process,
@@ -654,10 +639,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session.is_completed():
                 completed.append(rid)
             elif session.has_failed():
-                if getattr(session, "_enforce_physical_ownership", False):
-                    resources_drained = getattr(session, "resources_drained", None)
-                    if resources_drained is None or not resources_drained():
-                        continue
+                if self._ownership_blocks_retirement(session):
+                    continue
                 failed.append(rid)
         return completed, failed
 
@@ -677,15 +660,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
         for rid in failed:
             session = sessions[rid]
-            if getattr(session, "_enforce_physical_ownership", False):
-                resources_drained = getattr(session, "resources_drained", None)
-                if resources_drained is None or not resources_drained():
-                    continue
+            self._close_session_or_raise(session, rid, "failed")
             reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
-            if session.close() is False:
-                continue
             del reqs[rid]
             del sessions[rid]
+
+    @staticmethod
+    def _ownership_blocks_retirement(session: object) -> bool:
+        """Whether an ownership-enabled session still holds physical resources."""
+        if not getattr(session, "_enforce_physical_ownership", False):
+            return False
+        resources_drained = getattr(session, "resources_drained", None)
+        return resources_drained is None or not resources_drained()
+
+    def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
+        """Close one terminal session or fail-stop instead of diverging locally."""
+        if self._ownership_blocks_retirement(session):
+            raise RuntimeError(
+                f"refusing to retire {outcome} KV transfer rid={rid}: "
+                "physical resources remain active"
+            )
+        if session.close() is False:
+            raise RuntimeError(
+                f"refusing to retire {outcome} KV transfer rid={rid}: session close refused"
+            )
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
@@ -742,6 +740,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
         rid = get_unique_rid(req)
+        self._ever_had_recv_session = True
         if rid in self._recv_sessions:
             logger.warning(
                 f"request_and_receive_sync: rid={rid} already has a recv session, skipping"
@@ -894,10 +893,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
-                if getattr(session, "_enforce_physical_ownership", False):
-                    resources_drained = getattr(session, "resources_drained", None)
-                    if resources_drained is None or not resources_drained():
-                        continue
+                if self._ownership_blocks_retirement(session):
+                    continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
                 # server timeout).  Return the req objects so the caller can
@@ -915,10 +912,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # ownership-enabled accessor remains active. Keep the caller
                 # boundary fail-closed as well so alternate/test session
                 # implementations cannot authorize request retirement early.
-                if getattr(session, "_enforce_physical_ownership", False):
-                    resources_drained = getattr(session, "resources_drained", None)
-                    if resources_drained is None or not resources_drained():
-                        continue
+                if self._ownership_blocks_retirement(session):
+                    continue
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
 
@@ -930,8 +925,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled_reqs = []
         for rid in cancelled:
             session = self._recv_sessions[rid]
-            if session.close() is False:
-                continue
+            self._close_session_or_raise(session, rid, "cancelled")
             cancelled_reqs.append(self._recv_reqs[rid])
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
@@ -958,8 +952,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
+            self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
         if failed:
