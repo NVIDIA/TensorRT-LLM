@@ -421,6 +421,7 @@ class KVCacheManager:
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> _KVCache:
         """
         Args:
@@ -440,6 +441,9 @@ class KVCacheManager:
                 token IDs; ``False`` permits digest tokens but is invalid when the
                 manager is configured with ``text_only=True``; ``None`` inherits
                 the manager setting.
+            enable_request_stats: Whether to collect request-level allocation and
+                reuse counters for this cache. Manager-level global and iteration
+                statistics remain controlled by ``KVCacheManagerConfig.enable_stats``.
 
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
@@ -464,6 +468,7 @@ class KVCacheManager:
             custom_priority_callback,
             expected_prompt_length,
             text_only,
+            enable_request_stats,
         )
 
     def _match_reuse(

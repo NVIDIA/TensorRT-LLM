@@ -182,6 +182,7 @@ set(TRTLLM_LINK_LIBS
     decoder_attention_src
     trtllm_gen_fmha
     trtllm_gen_fp8_block_scale_moe
+    trtllm_gen_fp8_block_scale_moe_routing
     trtllm_gen_gemm
     trtllm_gen_gemm_gated_act
     trtllm_gen_batched_gemm

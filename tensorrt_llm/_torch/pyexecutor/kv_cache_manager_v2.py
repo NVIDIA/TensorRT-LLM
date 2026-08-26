@@ -18,6 +18,7 @@ import os
 import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
+from enum import IntEnum
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -80,7 +81,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
 from ...logger import logger
-from ...mapping import CpType, Mapping
+from ...mapping import Mapping
 from ..utils import maybe_compile
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -298,6 +299,25 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     if mapping.world_size > 1:
         host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
     return host_quota
+
+
+class _KVCacheManagerInitStatus(IntEnum):
+    # The numeric order is part of the allreduce(MAX) protocol: more severe
+    # outcomes must have larger values.
+    KEEP_HOST = 0
+    USE_NO_HOST = 1
+    ABORT = 2
+
+
+def _sync_kv_cache_manager_init_status(
+    local_status: _KVCacheManagerInitStatus, mapping: Mapping
+) -> _KVCacheManagerInitStatus:
+    """Return the most severe initialization status across all ranks."""
+    if mapping.world_size > 1:
+        local_status = _KVCacheManagerInitStatus(
+            Distributed.get(mapping).allreduce(int(local_status), op=ReduceOp.MAX)
+        )
+    return local_status
 
 
 def _estimate_swa_cache_size(
@@ -799,7 +819,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
-        cold_page_codec_provider=None,
+        cold_page_codec_provider: Optional[object] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -810,9 +830,6 @@ class KVCacheManagerV2(BaseResourceManager):
             "kv_connector_manager is not supported for KVCacheManagerV2"
         )
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
-        assert not (mapping.cp_config.get("cp_type") == CpType.STAR), (
-            "Star attention is not supported for KVCacheManagerV2"
-        )
 
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(
@@ -1118,57 +1135,97 @@ class KVCacheManagerV2(BaseResourceManager):
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
 
-        self.kv_cache_manager_py_config = config
-
-        try:
-            cold_page_codec = (
-                cold_page_codec_provider.create_cold_page_codec(
-                    config,
-                    runtime_dtype=self.dtype,
-                    pp_layers=self.pp_layers,
-                    num_kv_heads_per_layer=self.num_kv_heads_per_layer,
-                    head_dim_per_layer=self.head_dim_per_layer,
-                    is_draft=self.is_draft,
-                )
-                if cold_page_codec_provider is not None
-                else None
+        def create_cold_page_codec(cache_config: object) -> Optional[object]:
+            if cold_page_codec_provider is None:
+                return None
+            return cold_page_codec_provider.create_cold_page_codec(
+                cache_config,
+                runtime_dtype=self.dtype,
+                pp_layers=self.pp_layers,
+                num_kv_heads_per_layer=self.num_kv_heads_per_layer,
+                head_dim_per_layer=self.head_dim_per_layer,
+                is_draft=self.is_draft,
             )
-            self.impl = KVCacheManagerPy(
+
+        candidate: Optional[KVCacheManagerPy] = None
+        if not has_host_cache_tier:
+            candidate = KVCacheManagerPy(
                 config,
                 event_manager=self.event_manager,
-                cold_page_codec=cold_page_codec,
+                cold_page_codec=create_cold_page_codec(config),
             )
-        except (CuError, KVCacheOutOfMemoryError):
-            if has_host_cache_tier:
-                logger.warning(
-                    "Failed to initialize KV cache manager with host cache "
-                    "tier (cuMemHostRegister may have failed). "
-                    "Retrying without host cache tier."
-                )
-                cache_tiers_without_host = [
-                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
-                ]
-                config = replace(config, cache_tiers=cache_tiers_without_host)
-                self.kv_cache_manager_py_config = config
-                cold_page_codec = (
-                    cold_page_codec_provider.create_cold_page_codec(
-                        config,
-                        runtime_dtype=self.dtype,
-                        pp_layers=self.pp_layers,
-                        num_kv_heads_per_layer=self.num_kv_heads_per_layer,
-                        head_dim_per_layer=self.head_dim_per_layer,
-                        is_draft=self.is_draft,
-                    )
-                    if cold_page_codec_provider is not None
-                    else None
-                )
-                self.impl = KVCacheManagerPy(
+        else:
+            init_error: Optional[Exception] = None
+            local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            try:
+                candidate = KVCacheManagerPy(
                     config,
                     event_manager=self.event_manager,
-                    cold_page_codec=cold_page_codec,
+                    cold_page_codec=create_cold_page_codec(config),
                 )
-            else:
-                raise
+            except Exception as error:
+                if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
+                    local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
+                else:
+                    init_error = error.with_traceback(None)
+                    local_init_status = _KVCacheManagerInitStatus.ABORT
+
+            init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
+
+            if init_status == _KVCacheManagerInitStatus.ABORT:
+                if candidate is not None:
+                    candidate.shutdown()
+                if init_error is not None:
+                    raise init_error
+                raise RuntimeError("KV cache manager initialization failed on another rank")
+
+            if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
+                logger.warning(
+                    "At least one rank could not use the KV cache manager host tier "
+                    "(cuMemHostRegister may have failed). Rebuilding without the "
+                    "host cache tier on all ranks."
+                )
+                fallback_error: Optional[Exception] = None
+                try:
+                    if candidate is not None:
+                        candidate.shutdown()
+                    candidate = None
+                    config = replace(
+                        config,
+                        cache_tiers=[
+                            tier
+                            for tier in config.cache_tiers
+                            if not isinstance(tier, HostCacheTierConfig)
+                        ],
+                    )
+                    candidate = KVCacheManagerPy(
+                        config,
+                        event_manager=self.event_manager,
+                        cold_page_codec=create_cold_page_codec(config),
+                    )
+                except Exception as error:
+                    fallback_error = error.with_traceback(None)
+
+                local_fallback_status = (
+                    _KVCacheManagerInitStatus.USE_NO_HOST
+                    if fallback_error is None
+                    else _KVCacheManagerInitStatus.ABORT
+                )
+                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
+
+                if fallback_status == _KVCacheManagerInitStatus.ABORT:
+                    if candidate is not None:
+                        candidate.shutdown()
+                    if fallback_error is not None:
+                        raise fallback_error
+                    raise RuntimeError(
+                        "KV cache manager initialization without the host cache tier "
+                        "failed on another rank"
+                    )
+
+        assert candidate is not None
+        self.kv_cache_manager_py_config = config
+        self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -1208,6 +1265,7 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._request_stats_enabled_ids: set[int] = set()
 
         # Tracks the draft length allocated by try_allocate_generation per
         # request.  Used by extend_capacity_for_tokens to compute the exact
@@ -2287,7 +2345,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return max_num_pages // self.kv_factor
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
-        if self.is_draft or not self.enable_stats:
+        if self.is_draft or (not self.enable_stats and not self._request_stats_enabled_ids):
             return
         dirty_req_ids = self.impl.get_dirty_stats_kv_cache_ids()
         for req in scheduled_batch.all_requests():
@@ -2296,7 +2354,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache is None:
                     continue
                 request_stats = kv_cache.commit_pending_stats()
-                if not req.is_dummy and not request_stats.empty:
+                if (
+                    (self.enable_stats or req.return_perf_metrics)
+                    and not req.is_dummy
+                    and not request_stats.empty
+                ):
                     req.update_kv_cache_perf_metrics(
                         request_stats.alloc_total_blocks,
                         request_stats.alloc_new_blocks,
@@ -2514,6 +2576,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     tokens,
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
+                    enable_request_stats=req.return_perf_metrics,
                     expected_prompt_length=(
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     )
@@ -3387,7 +3450,6 @@ class KVCacheManagerV2(BaseResourceManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
     ):
         _kv_draft = (
@@ -3460,7 +3522,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     release_resources(req)
                     return None
                 kv_cache.stop_committing()
-                dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                dummy_capacity = token_num + self.num_extra_kv_tokens
                 if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
@@ -3569,6 +3631,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._request_stats_enabled_ids.discard(request.py_request_id)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -3812,6 +3875,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._request_stats_enabled_ids.clear()
         self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
@@ -4008,6 +4072,7 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         cache_salt: str | None = None,
         is_dummy: bool = False,
+        enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
@@ -4024,13 +4089,17 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
+        enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
+            enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
         )
         self.kv_cache_map[request_id] = kv_cache
+        if enable_request_stats and not self.enable_stats:
+            self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()

@@ -1370,14 +1370,6 @@ def qcache_dir_without_install_package(llm_venv, llm_root):
     )
 
 
-@pytest.fixture(scope="module")
-def star_attention_input_root(llm_root):
-    "Get star attention input file dir"
-    star_attention_input_root = unittest_path() / "_torch" / "multi_gpu"
-
-    return star_attention_input_root
-
-
 def parametrize_with_ids(
     argnames: str | Sequence[str],
     argvalues: Iterable[ParameterSet | Sequence[object] | object],
@@ -1558,6 +1550,11 @@ skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
     reason="This test is not supported on ARM architecture",
+)
+
+skip_x86 = pytest.mark.skipif(
+    "x86_64" in platform.machine(),
+    reason="This test is not supported on x86 architecture",
 )
 
 

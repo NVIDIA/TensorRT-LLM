@@ -140,7 +140,10 @@ def _load_modelopt_nvfp4_scales(
             raise ValueError(
                 f"ModelOpt KV scales for layer {layer_id} are not representable as float32"
             )
-        result[layer_id] = (orig_quant, quant_orig)
+        result[layer_id] = (
+            (stored_scales[0], stored_scales[1]),
+            (stored_scales[2], stored_scales[3]),
+        )
     return result
 
 
