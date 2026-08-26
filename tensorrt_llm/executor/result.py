@@ -159,6 +159,25 @@ class CompletionOutput:
         return len(self.token_ids)
 
     @property
+    def routed_experts(self) -> Optional[torch.Tensor]:
+        """Router Replay (R3): per-token pre-EPLB logical top-k MoE expert ids,
+        shape ``[seq_len - 1, num_moe_layers, top_k]``, when requested via
+        ``SamplingParams.return_routed_experts`` (with the engine-level
+        ``enable_return_routed_experts``). ``None`` otherwise.
+
+        Surfaced from ``additional_generation_outputs["routed_experts"]`` (which
+        holds one whole-sequence tensor per request)."""
+        outs = self.additional_generation_outputs
+        if not outs or "routed_experts" not in outs:
+            return None
+        val = outs["routed_experts"]
+        if isinstance(val, (list, tuple)):
+            if not val:
+                return None
+            return val[0] if len(val) == 1 else torch.cat(list(val), dim=0)
+        return val
+
+    @property
     def text_diff(self) -> str:
         return self.text[self._last_text_len:]
 

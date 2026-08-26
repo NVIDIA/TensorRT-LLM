@@ -56,6 +56,7 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..route_capture import RouteCapture
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -452,6 +453,7 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
+            RouteCapture.create(rank=self.dist.rank, model_engine=self)  # R3 router-replay
         self.llm_args = llm_args
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
