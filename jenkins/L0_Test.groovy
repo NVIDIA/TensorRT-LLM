@@ -614,9 +614,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
 
     def shardTestList = []
 
-    if (!cleanedTestLines) {
-        echo "No tests selected - skipping pytest collection"
-    } else if (perfMode) {
+    if (perfMode) {
         // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
         // Instead, use all tests from the original testDBList
         echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
@@ -4861,7 +4859,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     }
 
                     if (noRegularTests && noIsolateTests) {
-                        echo "No tests were selected for stage ${stageName}; skipping"
+                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                     }
                 } finally {
                     if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
