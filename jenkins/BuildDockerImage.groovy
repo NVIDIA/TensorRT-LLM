@@ -47,6 +47,19 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+// >>> BOLT profile-bundle overlay -- ships INERT (dead code) >>>
+// Master gate. While false (the default, i.e. the scaffolding PR), buildImage
+// behaves EXACTLY as before: the raw build is published straight to the canonical
+// tag and NONE of the overlay code runs. The follow-up "enable BOLT" PR flips this
+// on (defaultValue below and/or the release/nightly trigger passing it true).
+BOLT_OVERLAY_ENABLED = (params.boltOverlayEnabled ?: env.boltOverlayEnabled ?: "false").toString() == "true"
+// When enabled, a missing/empty bundle is FATAL rather than silently shipping a
+// profile-less canonical image (the contract: a canonical image, if produced,
+// carries profiles). Left false until the enable PR wires it true for the
+// release/nightly path; premerge/new-branch stays lenient (retag plain build).
+BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequired ?: "false").toString() == "true"
+// <<< BOLT profile-bundle overlay <<<
+
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
@@ -277,6 +290,119 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
+// Produce each CANONICAL image from its raw `-noprofiles` build by
+// overlaying the merged LLVM BOLT profile bundle as a thin layer (docker/
+// Dockerfile.bolt via the docker/Makefile `bolt_overlay` target). Canonical is
+// written ONLY here, so a profile-less image can never masquerade as canonical.
+// Called from buildImage AFTER the raw build+push and BEFORE the pipeline's nspect
+// scan/register stage, so the scanned+registered artifact already carries the
+// bundle (no republish of an already-released image).
+//
+// `pairs` is a list of [raw: <-noprofiles tag>, canon: <canonical tag>]. Per pair:
+//   - bundle present  -> overlay raw -> canon (canonical carries profiles)
+//   - no bundle + BOLT_PROFILES_REQUIRED -> FATAL: refuse to publish a profile-less
+//       canonical (enforces the contract; no silent profile-less release)
+//   - no bundle + not required (pre-enable / BOLT off) -> retag raw -> canon so a
+//       canonical still exists (expected: profiles not required yet)
+//
+// The bundle is arch-specific (only aarch64-linux-gnu today) but baked into every
+// variant by design -- on x86 the files are inert until an x86/merged bundle
+// exists. Fetched via anonymous curl (artifactory.sh pull-latest) WITH RETRIES, so
+// a transient miss isn't mistaken for "no bundle".
+def overlayBoltBundle(pairs, arch, action) {
+    if (!pairs) { return }
+    def triple = "aarch64-linux-gnu"
+    def llmAbs = sh(script: "cd ${LLM_ROOT} && pwd", returnStdout: true).trim()
+    def ctxDir = "${llmAbs}/bolt_overlay_ctx"
+    def bundleSub = "bolt_bundle"
+    def push = (action == "push") ? "1" : "0"
+
+    // Which branch's promoted bundle to consume. The BuildDockerImages helper job is
+    // branch-agnostic; the branch is a RUNTIME value, resolved in order:
+    //   1) boltProfileBranch param -- explicit override; the parent (which has the
+    //      full git context) may pass the MR target branch here;
+    //   2) LLM_BRANCH -- the build's own branch (already correct via params.branch);
+    //      has a promoted bundle for main/release, or a dev branch that gen-promoted
+    //      to itself;
+    //   3) "main" -- mainline fallback, so a dev/PR branch with NO bundle of its own
+    //      still gets profiles.
+    // Profiles are host-layout-stable + .yaml (function-name-keyed, -infer-stale), so
+    // consuming a nearby branch's bundle is valid; the bolt-profiles-ref LABEL records
+    // exactly which commit's profiles were baked in.
+    def candidates = [params.boltProfileBranch, LLM_BRANCH, "main"]
+        .collect { it?.toString()?.trim() }
+        .findAll { it }
+        .unique()
+
+    // 1) Try each candidate branch in order (with retries per branch so a transient
+    //    network/Artifactory blip isn't misread as "no bundle"). Verify non-empty
+    //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
+    def haveBundle = false
+    def branch = null
+    for (cand in candidates) {
+        for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
+            def rc = sh(script: """
+                rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
+            """, returnStatus: true)
+            if (rc == 0) {
+                def ok = sh(script: """
+                    test -f ${ctxDir}/${bundleSub}/manifest.json && \
+                    test -n "\$(find ${ctxDir}/${bundleSub} -type f \\( -name '*.yaml' -o -name '*.fdata' \\) 2>/dev/null | head -1)"
+                """, returnStatus: true)
+                if (ok == 0) { haveBundle = true; branch = cand; break }
+                echo "[BOLT] bundle for ${cand}/${triple} pulled but empty/invalid (attempt ${attempt})"
+            } else {
+                echo "[BOLT] pull-latest ${cand}/${triple} failed (attempt ${attempt}, rc=${rc})"
+            }
+        }
+        if (haveBundle) { break }
+        echo "[BOLT] no usable bundle for ${cand}/${triple}; trying next candidate branch"
+    }
+
+    // 2) No usable bundle from ANY candidate: fail-closed when required, else retag
+    //    raw -> canonical (so a canonical image still exists; expected pre-enable /
+    //    when BOLT off / dev-PR with no promoted profiles anywhere).
+    if (!haveBundle) {
+        def tried = candidates.join(", ")
+        if (BOLT_PROFILES_REQUIRED) {
+            error("[BOLT] required profile bundle missing for ${triple} (tried branches: ${tried}) -- refusing to publish a profile-less canonical image " +
+                  "(promote a bundle via BoltProfileGen, or set boltProfilesRequired=false to allow a plain canonical)")
+        }
+        echo "[BOLT] no bundle for ${triple} (tried: ${tried}); profiles not required -> canonical = plain build"
+        pairs.each { p ->
+            stage ("BOLT retag (no bundle) (${arch}): ${p.canon}") {
+                def retagCmd = "docker tag ${p.raw} ${p.canon}"
+                if (push == "1") { retagCmd += " && docker push ${p.canon}" }
+                trtllm_utils.llmExecStepWithRetry(this, script: retagCmd, numRetries: 3)
+            }
+        }
+        return
+    }
+    echo "[BOLT] using promoted bundle from ${branch}/${triple} for overlay"
+
+    // 3) Provenance: record the bundle's source ref (manifest.json). python3 may be
+    //    absent on the build pod -> fall back to "unknown".
+    def ref = sh(
+        script: "cd ${ctxDir}/${bundleSub} && (python3 -c \"import json;print(json.load(open('manifest.json'))['ref'])\" 2>/dev/null || echo unknown)",
+        returnStdout: true).trim()
+
+    // 4) Overlay each raw image into its CANONICAL tag (canonical carries profiles).
+    pairs.each { p ->
+        stage ("BOLT overlay (${arch}): ${p.canon}") {
+            trtllm_utils.llmExecStepWithRetry(this, script: """
+            cd ${LLM_ROOT} && make -C docker bolt_overlay \
+                BOLT_BASE_IMAGE=${p.raw} \
+                BOLT_OUTPUT_IMAGE=${p.canon} \
+                BOLT_CTX_DIR=${ctxDir} \
+                BOLT_BUNDLE_DIR=${bundleSub} \
+                BOLT_PROFILES_REF=${ref} \
+                BOLT_PUSH=${push}
+            """, numRetries: 3)
+        }
+    }
+}
+
 def buildImage(config, imageKeyToTag, versionOverride)
 {
     def target = config.target
@@ -402,6 +528,16 @@ def buildImage(config, imageKeyToTag, versionOverride)
         BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
+        // Gated by BOLT_OVERLAY_ENABLED: when the overlay is enabled the
+        // raw build is published to <tag>-noprofiles and the CANONICAL <tag> is
+        // produced ONLY by the overlay (below), so a profile-less image can never
+        // masquerade as canonical. When disabled (default), the suffix is empty ->
+        // raw == canonical -> byte-for-byte the pre-BOLT behavior (dead code).
+        def noprofilesSuffix = BOLT_OVERLAY_ENABLED ? "-noprofiles" : ""
+        def rawImageTag = "${imageWithTag}${noprofilesSuffix}"
+        def rawDependentTag = "${dependentImageWithTag}${noprofilesSuffix}"
+        def rawCustomTag = "${customImageWithTag}${noprofilesSuffix}"
+
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
                 def randomSleep = (Math.random() * 600 + 600).toInteger()
@@ -411,11 +547,11 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${dependentImageWithTag} \
+                IMAGE_WITH_TAG=${rawDependentTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-                args += " DEVEL_IMAGE=${dependentImageWithTag}"
+                args += " DEVEL_IMAGE=${rawDependentTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
                 }
@@ -441,7 +577,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -458,7 +594,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -475,11 +611,33 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${customImageWithTag} \
+                IMAGE_WITH_TAG=${rawCustomTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
+        }
+
+        // Gated: produce the CANONICAL tag(s) from the raw -noprofiles
+        // build by overlaying the BOLT profile bundle. When BOLT_OVERLAY_ENABLED is
+        // false this whole block is skipped and the raw build above already IS the
+        // canonical image (rawImageTag == imageWithTag) -- i.e. inert dead code.
+        // When enabled, canonical is written EXCLUSIVELY here, so it always carries
+        // profiles (or, when required and no bundle exists, the build fails rather
+        // than silently shipping a profile-less canonical). Runs inside the
+        // docker-login scope and before the pipeline's nspect stage.
+        //
+        // Applied to EVERY image variant this job builds (NGC devel/release,
+        // internal release, and all CI/OS-variant images) by DESIGN -- deliberately
+        // not scoped, to avoid maintaining an allowlist. On images with no BOLT
+        // consumer the bundle is just an inert extra layer. If that proves
+        // undesirable, add a per-config opt-out here (e.g. a `boltOverlay` field on
+        // buildConfigs) rather than special-casing targets.
+        if (BOLT_OVERLAY_ENABLED) {
+            def boltPairs = [[raw: rawImageTag, canon: imageWithTag]]
+            if (dependent) { boltPairs.add([raw: rawDependentTag, canon: dependentImageWithTag]) }
+            if (customTag) { boltPairs.add([raw: rawCustomTag, canon: customImageWithTag]) }
+            overlayBoltBundle(boltPairs, arch, action)
         }
     }
 }
@@ -690,6 +848,21 @@ pipeline {
             name: "buildNgcRelease",
             defaultValue: true,
             description: "Build NGC devel and release images (x86_64 and SBSA)"
+        )
+        booleanParam(
+            name: "boltOverlayEnabled",
+            defaultValue: false,
+            description: "Publish the raw build as <tag>-noprofiles and produce the canonical <tag> by overlaying the merged BOLT profile bundle. While false (the default), images are built exactly as before and none of the overlay code runs."
+        )
+        booleanParam(
+            name: "boltProfilesRequired",
+            defaultValue: false,
+            description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
+        )
+        string(
+            name: "boltProfileBranch",
+            defaultValue: "",
+            description: "Branch whose promoted BOLT bundle the overlay should consume. Empty -> resolve automatically: try the build branch (LLM_BRANCH), then fall back to main. Set explicitly (e.g. the MR target branch, passed by the parent) to consume a specific branch's profiles. Only used when boltOverlayEnabled is true."
         )
     }
     options {

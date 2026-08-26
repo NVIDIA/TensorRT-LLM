@@ -46,7 +46,7 @@ from ..conftest import (check_device_contain, get_device_count,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
+                        skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length)
@@ -5363,6 +5363,9 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
+                 moe_config=MoeConfig(
+                     backend="TRTLLM" if get_sm_version() in (100,
+                                                              103) else "AUTO"),
                  max_batch_size=256,
                  max_num_tokens=100000,
                  kv_cache_config=kv_cache_config,
@@ -5399,6 +5402,9 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
+                 moe_config=MoeConfig(
+                     backend="TRTLLM" if get_sm_version() in (100,
+                                                              103) else "AUTO"),
                  max_batch_size=256,
                  max_num_tokens=100000,
                  tensor_parallel_size=4,
@@ -6527,11 +6533,18 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  max_batch_size=32,
                  kv_cache_config=self.kv_cache_config,
                  cuda_graph_config=self.cuda_graph_config,
-                 speculative_config=spec_config) as llm:
+                 speculative_config=spec_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            acceptance_length = _compute_acceptance_length(llm)
+            print(
+                f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length("TestQwen3_5_4B::test_dflash",
+                                     acceptance_length)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -6951,6 +6964,143 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         self._run_nvfp4_4gpus_eplb(eplb_config, moe_backend, mocker)
+
+
+@pytest.mark.timeout(28800)
+class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.8-2.4T-A95B"
+    GSM8K_MAX_OUTPUT_LEN = 512
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=("Use at most three short reasoning sentences, then "
+                       "end with `#### NUMBER`. Do not restate the problem."),
+        chat_template_kwargs=dict(enable_thinking=True,
+                                  reasoning_effort="xhigh"),
+    )
+
+    def _run_fp8_block_scales(self, tensor_parallel_size,
+                              pipeline_parallel_size, ep_size, attention_dp,
+                              moe_backend, max_draft_len, mocker):
+        model_path = f"{llm_models_root()}/Qwen3.8-2.4T-A95B-FP8"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        max_batch_size = 4 if attention_dp else 32
+        kv_cache_fraction = 0.5 if max_draft_len is not None else 0.75
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=kv_cache_fraction,
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="bfloat16")
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
+                                            enable_padding=True)
+        if max_draft_len is None:
+            mtp_config = None
+        else:
+            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=tensor_parallel_size,
+                 pipeline_parallel_size=pipeline_parallel_size,
+                 moe_expert_parallel_size=ep_size,
+                 max_seq_len=8192,
+                 max_num_tokens=8192,
+                 max_batch_size=max_batch_size,
+                 enable_attention_dp=attention_dp,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_x86
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+    def test_fp8_tp16_mtp3_trtllm(self, mocker):
+        # The default AUTO uses MNNVL only when all TP ranks share one NVL72 fabric.
+        self._run_fp8_block_scales(tensor_parallel_size=16,
+                                   pipeline_parallel_size=1,
+                                   ep_size=1,
+                                   attention_dp=False,
+                                   moe_backend="TRTLLM",
+                                   max_draft_len=3,
+                                   mocker=mocker)
+
+    @skip_x86
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_device_not_contain(["GB300"])
+    def test_fp8_adp16_deepgemm(self, mocker):
+        self._run_fp8_block_scales(tensor_parallel_size=16,
+                                   pipeline_parallel_size=1,
+                                   ep_size=16,
+                                   attention_dp=True,
+                                   moe_backend="DEEPGEMM",
+                                   max_draft_len=None,
+                                   mocker=mocker)
+
+    def _run_nvfp4(self, tensor_parallel_size, ep_size, attention_dp,
+                   moe_backend, max_draft_len, mocker):
+        model_path = f"{llm_models_root()}/Inferact-Qwen3.8-2.4T-A95B-NVFP4"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="bfloat16")
+        max_batch_size = 4 if attention_dp else 32
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
+                                            enable_padding=True)
+        if max_draft_len is None:
+            mtp_config = None
+        else:
+            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=tensor_parallel_size,
+                 moe_expert_parallel_size=ep_size,
+                 max_seq_len=8192,
+                 max_num_tokens=8192,
+                 max_batch_size=max_batch_size,
+                 enable_attention_dp=attention_dp,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_x86
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_device_not_contain(["GB300"])
+    def test_nvfp4_tp8_mtp3_trtllm(self, mocker):
+        self._run_nvfp4(tensor_parallel_size=8,
+                        ep_size=1,
+                        attention_dp=False,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        mocker=mocker)
+
+    @skip_x86
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_device_not_contain(["GB300"])
+    def test_nvfp4_adp16_cutedsl(self, mocker):
+        self._run_nvfp4(tensor_parallel_size=16,
+                        ep_size=16,
+                        attention_dp=True,
+                        moe_backend="CUTEDSL",
+                        max_draft_len=None,
+                        mocker=mocker)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
@@ -8039,6 +8189,55 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTEDSL"),
         ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestNemotron35Lightning(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-3.5-Lightning"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+    # Test with no thinking to save time.
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    @skip_no_hopper
+    def test_nvfp4_marlin_mtp3_chunked_prefill(self):
+        """Single-GPU Hopper guard for the Marlin NVFP4 path.
+
+        The checkpoint is MIXED_PRECISION: routed experts, shared experts and
+        lm_head are W4A16_NVFP4, the Mamba projections are FP8 and the MTP
+        layers are left unquantized. ``moe_config.backend=MARLIN`` plus
+        ``nvfp4_gemm_config.allowed_backends=['marlin']`` pin both the MoE and
+        the dense NVFP4 GEMMs to Marlin, which is Ada/Hopper only. Chunked
+        prefill, CUDA graphs and the overlap scheduler are enabled together so
+        the combination with MTP drafting is covered end to end.
+        """
+        max_batch_size = 32
+        mtp_config = MTPDecodingConfig(max_draft_len=3)
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                    free_gpu_memory_fraction=0.7,
+                ),
+                max_batch_size=max_batch_size,
+                # Chunk size below the evaluation prompt lengths so the
+                # multi-chunk Mamba/attention prefill path is actually taken.
+                enable_chunked_prefill=True,
+                max_num_tokens=1024,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="MARLIN"),
+                nvfp4_gemm_config={"allowed_backends": ["marlin"]},
+                speculative_config=mtp_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)

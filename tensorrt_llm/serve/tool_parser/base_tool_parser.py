@@ -85,7 +85,7 @@ class BaseToolParser(ABC):
                         -1,  # Caller should update this based on the actual tools array called
                         name=name,
                         parameters=json.dumps(
-                            act.get("parameters") or act.get("arguments", {}),
+                            act.get("parameters") or act.get("arguments") or {},
                             ensure_ascii=False,
                         ),
                     ))
@@ -239,7 +239,19 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                # A finished call may carry no "arguments" key at all, or an
+                # explicit null. Both mean "no arguments" and are normalized to
+                # {} so the call still completes, matching what parse_base_json
+                # returns on the non-streaming path. While the JSON is still
+                # partial a missing key only means "not streamed yet", so it is
+                # left alone and the elif prev_arguments branch keeps handling it.
+                if is_current_complete and cur_arguments is None:
+                    cur_arguments = {}
+
+                # An empty argument object is falsy but still has to be streamed and
+                # completed, otherwise a zero-argument tool call never finishes and its
+                # text stays in the buffer forever.
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
