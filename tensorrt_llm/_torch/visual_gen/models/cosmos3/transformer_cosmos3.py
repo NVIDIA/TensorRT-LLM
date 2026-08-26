@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
+from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -66,6 +67,33 @@ def _noop_offload_context(_tower_name: str) -> ContextManager:
 
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+
+
+def _normalize_control_weights(
+    num_controls: int,
+    control_weights: list[float] | tuple[float, ...] | None,
+) -> tuple[float, ...]:
+    """Validate and normalize internal Cosmos3 transfer-control weights."""
+    if control_weights is None:
+        if num_controls == 0:
+            return ()
+        return (1.0 / num_controls,) * num_controls
+
+    weights = tuple(float(weight) for weight in control_weights)
+    if len(weights) != num_controls:
+        raise ValueError(
+            "Cosmos3 transfer control_weights length must match control_latents: "
+            f"weights={len(weights)}, controls={num_controls}."
+        )
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
+        raise ValueError(
+            "Cosmos3 transfer control_weights must be finite and non-negative, "
+            f"got {list(weights)}."
+        )
+    total = sum(weights)
+    if total <= 0.0:
+        raise ValueError("Cosmos3 transfer control_weights must have a positive sum.")
+    return tuple(weight / total for weight in weights)
 
 
 def resolve_rope_axes_dim(pretrained_config) -> list:
@@ -648,10 +676,132 @@ class Cosmos3CrossAttention(Attention):
         eps = model_config.pretrained_config.rms_norm_eps
         self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        # Multi-control pairs stay replicated across sequence-parallel ranks;
+        # this backend deliberately has no Ulysses/Ring/Attention2D wrapper.
+        self.multi_control_attn = create_attention(
+            backend="VANILLA",
+            layer_idx=self.layer_idx,
+            num_heads=self.local_num_attention_heads,
+            head_dim=self.head_dim,
+            num_kv_heads=self.local_num_key_value_heads,
+            quant_config=self.quant_config,
+            dtype=self.dtype,
+            attention_config=model_config.attention,
+        )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
         return self.norm_q(q), self.norm_k(k)
+
+    def _run_multi_control_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        out = self.multi_control_attn.forward(
+            q=q.transpose(1, 2),
+            k=k.transpose(1, 2),
+            v=v.transpose(1, 2),
+            attention_mask=PredefinedAttentionMask.FULL,
+            timestep=timestep,
+        )
+        return out.transpose(1, 2)
+
+    def _forward_multi_control(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        control_token_sizes: tuple[int, ...],
+        control_weights: tuple[float, ...],
+        timestep: Optional[torch.Tensor],
+        real_text_lens: Optional[list[int]],
+    ) -> torch.Tensor:
+        """Run independent attention per control and weight target outputs."""
+        if len(control_token_sizes) != len(control_weights):
+            raise ValueError(
+                "Cosmos3 control token sizes and weights must have the same length: "
+                f"sizes={len(control_token_sizes)}, weights={len(control_weights)}."
+            )
+        control_tokens = sum(control_token_sizes)
+        if control_tokens <= 0 or control_tokens >= q.shape[1]:
+            raise ValueError(
+                "Cosmos3 multi-control attention requires non-empty control and target "
+                f"token ranges, got control_tokens={control_tokens}, total_tokens={q.shape[1]}."
+            )
+
+        q_target = q[:, control_tokens:]
+        k_target = k[:, control_tokens:]
+        v_target = v[:, control_tokens:]
+        control_outputs: list[torch.Tensor] = []
+        target_output: Optional[torch.Tensor] = None
+        start = 0
+        for size, weight in zip(control_token_sizes, control_weights, strict=True):
+            if size <= 0:
+                raise ValueError(
+                    f"Cosmos3 control token sizes must be positive, got {control_token_sizes}."
+                )
+            end = start + size
+            q_control = q[:, start:end]
+            k_control = k[:, start:end]
+            v_control = v[:, start:end]
+            q_pair = torch.cat([q_control, q_target], dim=1)
+
+            if real_text_lens is not None and len(set(real_text_lens)) > 1:
+                pair_outputs = []
+                for batch_idx, text_len in enumerate(real_text_lens):
+                    k_pair = torch.cat(
+                        [
+                            k_und[batch_idx : batch_idx + 1, : int(text_len)],
+                            k_control[batch_idx : batch_idx + 1],
+                            k_target[batch_idx : batch_idx + 1],
+                        ],
+                        dim=1,
+                    )
+                    v_pair = torch.cat(
+                        [
+                            v_und[batch_idx : batch_idx + 1, : int(text_len)],
+                            v_control[batch_idx : batch_idx + 1],
+                            v_target[batch_idx : batch_idx + 1],
+                        ],
+                        dim=1,
+                    )
+                    pair_outputs.append(
+                        self._run_multi_control_attention(
+                            q_pair[batch_idx : batch_idx + 1],
+                            k_pair,
+                            v_pair,
+                            timestep,
+                        )
+                    )
+                pair_output = torch.cat(pair_outputs, dim=0)
+            else:
+                text_len = int(real_text_lens[0]) if real_text_lens is not None else k_und.shape[1]
+                k_pair = torch.cat([k_und[:, :text_len], k_control, k_target], dim=1)
+                v_pair = torch.cat([v_und[:, :text_len], v_control, v_target], dim=1)
+                pair_output = self._run_multi_control_attention(
+                    q_pair,
+                    k_pair,
+                    v_pair,
+                    timestep,
+                )
+
+            control_outputs.append(pair_output[:, :size])
+            weighted_target = pair_output[:, size:] * weight
+            target_output = (
+                weighted_target if target_output is None else target_output + weighted_target
+            )
+            start = end
+
+        if start != control_tokens or target_output is None:
+            raise RuntimeError(
+                "Cosmos3 multi-control attention failed to cover all control token ranges."
+            )
+        return torch.cat([*control_outputs, target_output], dim=1).flatten(2)
 
     def forward(
         self,
@@ -662,6 +812,8 @@ class Cosmos3CrossAttention(Attention):
         freqs_sin: torch.Tensor,
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        control_token_sizes: Optional[tuple[int, ...]] = None,
+        control_weights: Optional[tuple[float, ...]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -685,7 +837,23 @@ class Cosmos3CrossAttention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if real_text_lens is not None and batch_size > 1:
+        if control_token_sizes is not None or control_weights is not None:
+            if control_token_sizes is None or control_weights is None:
+                raise ValueError(
+                    "Cosmos3 multi-control attention requires both control token sizes and weights."
+                )
+            out = self._forward_multi_control(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                control_token_sizes,
+                control_weights,
+                timestep,
+                real_text_lens,
+            )
+        elif real_text_lens is not None and batch_size > 1:
             outs = []
             for b in range(batch_size):
                 Lb = int(real_text_lens[b])
@@ -853,6 +1021,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        control_token_sizes: Optional[tuple[int, ...]] = None,
+        control_weights: Optional[tuple[float, ...]] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -866,6 +1036,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=sin,
             timestep=timestep,
             real_text_lens=real_text_lens,
+            control_token_sizes=control_token_sizes,
+            control_weights=control_weights,
         )
         hidden_states = residual + hidden_states
 
@@ -1470,6 +1642,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         action_start_frame_offset: int = 1,
         action_fps: float | None = None,
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        control_weights: list[float] | tuple[float, ...] | None = None,
         transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> "TransformerOutput":
@@ -1503,6 +1676,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             control_latents: Optional transfer-control latents. Controls are
                 clean (un-noised) vision context and are packed before the
                 noisy target; their outputs are discarded.
+            control_weights: Optional non-negative relative weights for transfer
+                controls. Values are normalized to sum to one.
             transfer_share_vision_temporal_positions: When True (the default),
                 control tokens reuse the target frames' mRoPE temporal
                 coordinates, so a control patch sits at zero displacement from
@@ -1546,6 +1721,17 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             control_lantent_list = [control_latents]
         else:
             control_lantent_list = list(control_latents)
+        normalized_control_weights = _normalize_control_weights(
+            len(control_lantent_list), control_weights
+        )
+        use_multi_control_attention = len(control_lantent_list) > 1
+
+        if use_multi_control_attention and self.sharder.is_active:
+            logger.warning_once(
+                "Cosmos3 multi-control attention requires full [control_i, target] sequences, "
+                "so the generator runs replicated across sequence-parallel ranks.",
+                key="cosmos3_multi_control_replicated_sequence",
+            )
 
         if noisy_frame_mask is not None:
             # Build per-token mask from per-frame mask.
@@ -1582,7 +1768,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 )
             self.cached_freqs_gen = freqs_gen
 
-            if self.sharder.is_active:
+            if self.sharder.is_active and not use_multi_control_attention:
                 # Round max_real_len up to next multiple of sharder.size.
                 # At most size-1 extra positions, negligible softmax dilution.
                 val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
@@ -1716,16 +1902,20 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         # --------------------------------------------------------------------------
 
         S_gen = hidden_gen.shape[1]
-        hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
+        control_token_sizes = tuple(control.shape[1] for control in hidden_controls)
+        multi_control_token_sizes = control_token_sizes if use_multi_control_attention else None
+        multi_control_weights = normalized_control_weights if use_multi_control_attention else None
         cos, sin = freqs_gen_combined
-        cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
-        sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
+        if not use_multi_control_attention:
+            hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
+            cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
+            sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
 
         with offload_context("generator"):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
-                if not self.sharder.is_active:
+                if not self.sharder.is_active or use_multi_control_attention:
                     k_und = k_und[:, :max_real_len]
                     v_und = v_und[:, :max_real_len]
                     hidden_gen = layer(
@@ -1735,6 +1925,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         freqs_gen,
                         timestep=timestep,
                         real_text_lens=real_text_lens,
+                        control_token_sizes=multi_control_token_sizes,
+                        control_weights=multi_control_weights,
                     )
                 else:
                     hidden_gen = layer(
@@ -1745,7 +1937,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         timestep=timestep,
                     )
 
-        hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
+        if not use_multi_control_attention:
+            hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
