@@ -328,6 +328,182 @@ def triton_qsa_decode_pre_indexer(
 
 
 @triton.jit
+def _qsa_prefill_compress_kernel(
+    logical_positions,
+    request_indices,
+    block_table,
+    index_cache,
+    position_cache,
+    k_norm_weight,
+    cos_sin,
+    eps,
+    block_table_stride_request: tl.constexpr,
+    block_table_stride_page: tl.constexpr,
+    cache_stride_page: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    position_cache_stride_page: tl.constexpr,
+    position_cache_stride_token: tl.constexpr,
+    position_cache_stride_axis: tl.constexpr,
+    cos_sin_stride: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTARY_PAIRS: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    IS_MROPE: tl.constexpr,
+    MROPE_H: tl.constexpr,
+    MROPE_W: tl.constexpr,
+):
+    """Compress completed QSA groups without data-dependent Torch indexing."""
+    row = tl.program_id(0)
+    logical = tl.load(logical_positions + row).to(tl.int64)
+    if (logical + 1) % COMPRESS_RATIO == 0:
+        request = tl.load(request_indices + row).to(tl.int64)
+        dims = tl.arange(0, HEAD_DIM)
+        group_offsets = tl.arange(0, COMPRESS_RATIO)
+        group_positions = logical - (COMPRESS_RATIO - 1) + group_offsets
+        group_logical_pages = group_positions // TOKENS_PER_BLOCK
+        group_tokens_in_page = group_positions % TOKENS_PER_BLOCK
+        group_physical_pages = tl.load(
+            block_table
+            + request * block_table_stride_request
+            + group_logical_pages * block_table_stride_page
+        ).to(tl.int64)
+        group_values = tl.load(
+            index_cache
+            + group_physical_pages[:, None] * cache_stride_page
+            + group_tokens_in_page[:, None] * cache_stride_token
+            + dims[None, :] * cache_stride_dim
+        )
+        # Match the eager reference's BF16 materialization between FP32
+        # pooling and Gemma RMSNorm.
+        pooled = (tl.sum(group_values.to(tl.float32), axis=0) / COMPRESS_RATIO).to(tl.bfloat16)
+
+        first_position = logical - (COMPRESS_RATIO - 1)
+        first_logical_page = first_position // TOKENS_PER_BLOCK
+        first_token = first_position % TOKENS_PER_BLOCK
+        first_page = tl.load(
+            block_table
+            + request * block_table_stride_request
+            + first_logical_page * block_table_stride_page
+        ).to(tl.int64)
+        first_pos_t = tl.load(
+            position_cache
+            + first_page * position_cache_stride_page
+            + first_token * position_cache_stride_token
+        )
+        first_pos_h = tl.load(
+            position_cache
+            + first_page * position_cache_stride_page
+            + first_token * position_cache_stride_token
+            + position_cache_stride_axis
+        )
+        first_pos_w = tl.load(
+            position_cache
+            + first_page * position_cache_stride_page
+            + first_token * position_cache_stride_token
+            + 2 * position_cache_stride_axis
+        )
+        compressed = tl.reshape(
+            _qsa_gemma_norm_rope(
+                pooled[None, :],
+                first_pos_t,
+                first_pos_h,
+                first_pos_w,
+                cos_sin,
+                cos_sin_stride,
+                k_norm_weight,
+                eps,
+                NUM_ROWS=1,
+                HEAD_DIM=HEAD_DIM,
+                ROTARY_PAIRS=ROTARY_PAIRS,
+                IS_MROPE=IS_MROPE,
+                MROPE_H=MROPE_H,
+                MROPE_W=MROPE_W,
+            ),
+            (HEAD_DIM,),
+        )
+        anchor_logical_page = logical // TOKENS_PER_BLOCK
+        anchor_token = logical % TOKENS_PER_BLOCK
+        anchor_page = tl.load(
+            block_table
+            + request * block_table_stride_request
+            + anchor_logical_page * block_table_stride_page
+        ).to(tl.int64)
+        tl.store(
+            index_cache
+            + anchor_page * cache_stride_page
+            + anchor_token * cache_stride_token
+            + dims * cache_stride_dim,
+            compressed,
+        )
+
+
+def triton_qsa_prefill_compress(
+    *,
+    logical_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    index_cache: torch.Tensor,
+    position_cache: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    eps: float,
+    tokens_per_block: int,
+    compress_ratio: int,
+    mrope_section: tuple[int, int, int] | None,
+) -> None:
+    """Compress QSA prefill groups with a fixed-shape, graph-safe launch."""
+    rows = logical_positions.numel()
+    if request_indices.shape != logical_positions.shape:
+        raise ValueError("QSA prefill request indices must match logical positions")
+    if index_cache.ndim != 4 or index_cache.shape[2] != 1:
+        raise ValueError("QSA prefill index cache must have one KV head")
+    if position_cache.ndim != 3 or position_cache.shape[2] < 3:
+        raise ValueError("QSA prefill position cache must contain three axes")
+    if cos_sin.ndim != 2 or cos_sin.shape[1] % 2 != 0:
+        raise ValueError("QSA RoPE cache must be a packed 2D cos/sin tensor")
+    head_dim = index_cache.shape[3]
+    rotary_pairs = cos_sin.shape[1] // 2
+    if 4 * rotary_pairs != head_dim:
+        raise ValueError("QSA fused prefill requires half-width rotary embedding")
+    head_dim_is_power_of_two = head_dim > 0 and (head_dim & (head_dim - 1)) == 0
+    ratio_is_power_of_two = compress_ratio > 0 and (compress_ratio & (compress_ratio - 1)) == 0
+    if not head_dim_is_power_of_two or not ratio_is_power_of_two:
+        raise ValueError("QSA fused prefill requires power-of-two head and compression widths")
+    if rows == 0:
+        return
+    section = mrope_section if mrope_section is not None else (0, 0, 0)
+    _qsa_prefill_compress_kernel[(rows,)](
+        logical_positions,
+        request_indices,
+        block_table,
+        index_cache,
+        position_cache,
+        k_norm_weight,
+        cos_sin,
+        eps,
+        block_table.stride(0),
+        block_table.stride(1),
+        index_cache.stride(0),
+        index_cache.stride(1),
+        index_cache.stride(3),
+        position_cache.stride(0),
+        position_cache.stride(1),
+        position_cache.stride(2),
+        cos_sin.stride(0),
+        HEAD_DIM=head_dim,
+        ROTARY_PAIRS=rotary_pairs,
+        TOKENS_PER_BLOCK=tokens_per_block,
+        COMPRESS_RATIO=compress_ratio,
+        IS_MROPE=mrope_section is not None,
+        MROPE_H=section[1],
+        MROPE_W=section[2],
+        num_warps=1,
+    )
+
+
+@triton.jit
 def _expand_qsa_block_indices_kernel(
     block_indices,
     query_positions,
@@ -1058,5 +1234,6 @@ __all__ = [
     "triton_qsa_decode_pre_indexer",
     "triton_qsa_paged_index_scores",
     "triton_qsa_paged_sparse_gqa",
+    "triton_qsa_prefill_compress",
     "triton_expand_qsa_block_indices",
 ]

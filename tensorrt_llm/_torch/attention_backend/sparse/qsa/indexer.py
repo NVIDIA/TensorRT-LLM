@@ -358,6 +358,50 @@ class QSAIndexer(nn.Module):
         index_cache[pages, within, 0] = token_k[:, 0].to(index_cache.dtype)
         position_cache[pages, within] = position_coordinates.to(position_cache.dtype)
 
+        rotary_cache = self.rotary_emb.rotary_cos_sin
+        mrope_section = None
+        supported_mrope = True
+        if isinstance(self.rotary_emb, MRotaryEmbedding):
+            supported_mrope = self.rotary_emb.mrope_interleaved
+            if supported_mrope:
+                mrope_section = tuple(self.rotary_emb.mrope_section)
+        fused_prefill_compress = (
+            os.environ.get("TRTLLM_QSA_FUSED_PREFILL_COMPRESS", "1") != "0"
+            and token_k.is_cuda
+            and token_k.dtype == torch.bfloat16
+            and token_k.shape[1] == 1
+            and index_cache.dtype == torch.bfloat16
+            and position_cache.is_cuda
+            and supported_mrope
+            and rotary_cache.ndim == 3
+            and rotary_cache.shape[1] == 2
+            and rotary_cache.shape[2] * 4 == self.params.index_head_dim
+            and self.params.index_head_dim > 0
+            and (self.params.index_head_dim & (self.params.index_head_dim - 1)) == 0
+            and (self.params.compress_ratio & (self.params.compress_ratio - 1)) == 0
+        )
+        if fused_prefill_compress:
+            from .kernels import triton_qsa_prefill_compress
+
+            logger.info_once(
+                "QSA fused prefill compression Triton kernel is active",
+                key="qsa_fused_prefill_compress_active",
+            )
+            triton_qsa_prefill_compress(
+                logical_positions=logical,
+                request_indices=req_idx,
+                block_table=metadata.qsa_block_table,
+                index_cache=index_cache,
+                position_cache=position_cache,
+                k_norm_weight=self.k_layernorm.weight,
+                cos_sin=rotary_cache.view(rotary_cache.shape[0], -1),
+                eps=self.k_layernorm.variance_epsilon,
+                tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+                compress_ratio=self.params.compress_ratio,
+                mrope_section=mrope_section,
+            )
+            return
+
         boundaries = ((logical + 1) % self.params.compress_ratio) == 0
         if metadata.is_cuda_graph and metadata.num_contexts == 0:
             group_offsets = torch.arange(
