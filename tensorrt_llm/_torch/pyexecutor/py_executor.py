@@ -3623,12 +3623,7 @@ class PyExecutor:
         return [local_status]
 
     def _check_disagg_transfer_progress_when_idle(self) -> None:
-        """Reap completed context KV transfers so their blocks can be freed.
-
-        Generation transfers are not polled here: the loop head already ran
-        `_check_disagg_gen_transfer_status`, and any receive issued since then
-        by `_prepare_disagg_gen_init` is polled by `_recv_disagg_gen_cache`.
-        """
+        """Reap completed context KV transfers so their blocks can be freed."""
         # A synchronous GEN receive is rank-local and blocking, so entering
         # the context progress collective is unsafe unless GEN transfer is
         # async, context is skipped entirely (gen-only-no-context bench), or
