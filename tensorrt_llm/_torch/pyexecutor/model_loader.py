@@ -1807,9 +1807,9 @@ class ModelLoader:
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
                 **load_weights_kwargs) as weights:
             weights_preloaded = checkpoint_loader.is_weights_preloaded()
+            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                model, config)
             if weights:
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
                         self._metrics):

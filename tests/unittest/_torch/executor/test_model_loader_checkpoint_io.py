@@ -308,29 +308,6 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     assert "weight_population_seconds" in loader.metrics
 
 
-def test_preloaded_empty_weights_do_not_initialize_mapper() -> None:
-    events = []
-    checkpoint_loader = _SessionCheckpointLoader(events, weights={})
-    checkpoint_loader.is_weights_preloaded = MagicMock(return_value=True)
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
-    loader.weight_mapper = None
-    loader._call_load_weights = MagicMock()
-
-    weights_preloaded = loader._materialize_checkpoint_weights(
-        checkpoint_loader,
-        "/checkpoint",
-        MagicMock(),
-        object(),
-        {"mapping": object()},
-    )
-
-    assert weights_preloaded
-    assert loader.weight_mapper is None
-    assert "mapper_init" not in events
-    loader._call_load_weights.assert_not_called()
-
-
 def test_draft_session_spans_mapper_and_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
