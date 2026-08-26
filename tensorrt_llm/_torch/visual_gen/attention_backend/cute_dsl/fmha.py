@@ -489,11 +489,11 @@ def _quantize_fp8_v(
 ) -> Tuple[torch.Tensor, float | torch.Tensor, torch.Tensor | None]:
     """Quantize V to FP8 with either one tensor scale or an (H, D) scale tensor."""
     if per_head_channel:
-        v_qscale = _FP8_E4M3_MAX / v_bshd.float().abs().amax(dim=(0, 1)).clamp(min=1e-3)
+        v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax(dim=(0, 1)).float().clamp(min=1e-3)
         v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
         return v_quantized, 1.0, v_qscale.reciprocal().contiguous()
 
-    v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().clamp(min=1e-3)
+    v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().float().clamp(min=1e-3)
     v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
     return v_quantized, v_qscale.reciprocal(), None
 
@@ -686,7 +686,7 @@ class CuTeDSLAttention(AttentionBackend):
         )
 
         # Set v_block_size=1 use an (H, D) scale for V (recommended);
-        # Set v_block_size=0 to per-tensor quantize V (deprecated. Induces extra sync);
+        # Set v_block_size=0 to per-tensor quantize V (introduces extra device-host sync);
         scale_v = kwargs.get("scale_v", 1.0)
         scale_q = kwargs.get("scale_q", 1.0)
         scale_k = kwargs.get("scale_k", 1.0)

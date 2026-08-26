@@ -82,7 +82,8 @@ class QuantAttentionConfig(StrictBaseModel):
         ge=0,
         status="prototype",
         description=(
-            "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
+            "V quantization block size on the hidden dimension; 1 for per-channel quantization; "
+            "0 for per-tensor quantization."
         ),
     )
 

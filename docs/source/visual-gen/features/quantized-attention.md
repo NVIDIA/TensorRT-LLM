@@ -101,7 +101,7 @@ attention_config:
 
 - Blackwell GPU.
 - The recommended `qk_dtype: "int8"` is only supported on `sm_100a`.
-  - `sm_103a` can use `qk_dtype: "fp8"` but its accuracy could be worse than `dk_dtype: "int8"`.
+  - `sm_103a` can use `qk_dtype: "fp8"` but its accuracy could be worse than `qk_dtype: "int8"`.
 
 **Configuration.**
 
@@ -140,8 +140,3 @@ attention_config:
 - **Linear-layer quantization** (`VisualGenArgs.quant_config`, e.g. FP8 block scales or NVFP4) is independent and can be combined with any attention recipe.
 - **Sparse attention.** On `CUTEDSL`, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On `TRTLLM`, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together.
 - **Parallelism.** SageAttention is covered by a multi-GPU Ulysses test (`tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py`). The CuTe DSL dense backend produces LSE, so it also composes with Attention2D / Ring context parallelism; the TRTLLM Sage path does not expose LSE through this wrapper.
-
-## Performance and Quality
-
-_(TODO: fill in measured speedups and quality metrics per model, GPU, and recipe — these require
-running the stack and are intentionally left blank.)_
