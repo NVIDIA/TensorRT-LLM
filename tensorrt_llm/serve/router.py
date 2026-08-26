@@ -342,6 +342,10 @@ class Router(ABC):
         self._server_role = server_role
         self._lock = asyncio.Lock()
         self._monitor_task = None
+        # Wall-clock of the last poll that completed without error, used by
+        # ``monitoring_is_stale()``. ``None`` means monitoring was never
+        # started (a static server list), which is not staleness.
+        self._last_successful_poll: Optional[float] = None
         self._session = None
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
@@ -377,6 +381,26 @@ class Router(ABC):
     @property
     def num_prepared_servers(self) -> int:
         return len(self._prepared_ready_servers)
+
+    def monitoring_is_stale(self, max_age_secs: float) -> bool:
+        """Whether metadata-driven monitoring has stopped keeping up.
+
+        True when the monitor task has ended, or when no poll has completed
+        within ``max_age_secs``. Both mean ``servers`` is no longer a
+        statement about the cluster, so a readiness probe must not trust it.
+
+        Always False when monitoring was never started -- a static server list
+        has no monitor to go stale, and its list is correct by construction.
+        """
+        if self._monitor_task is None:
+            return False
+        if self._monitor_task.done():
+            return True
+        if self._last_successful_poll is None:
+            # Started, but the first poll has not landed yet. Treat the task's
+            # own start as the reference point rather than reporting stale.
+            return False
+        return (time.monotonic() - self._last_successful_poll) > max_age_secs
 
     @property
     def prepared_servers(self) -> set[str]:
@@ -532,10 +556,15 @@ class Router(ABC):
                 role_specific_servers = self._filter_servers_by_role(
                     live_servers, server_key_map)
 
-                # Use filtered servers if available
+                # Use filtered servers if available. An empty list is a valid
+                # state -- every worker of this role is gone -- and must be
+                # published so readiness reflects it. Asserting here instead
+                # would kill the loop and leave a stale, healthy-looking list.
                 final_servers = role_specific_servers
-
-                assert final_servers, f"No {self._server_role} servers available"
+                if not final_servers:
+                    logger.warning(
+                        f"No live {self._server_role} servers; publishing an "
+                        "empty server list for this role")
 
                 # Update server list
                 async with self._lock:
@@ -562,17 +591,32 @@ class Router(ABC):
                         logger.debug(
                             f"No change in {self._server_role} server list: {len(self._servers)} servers"
                         )
-            except Exception as e:
-                logger.error(f"Error in server monitoring: {e}")
+                self._last_successful_poll = time.monotonic()
+            except asyncio.CancelledError:
                 raise
+            except Exception as e:
+                # Keep polling. Re-raising ends the loop, and a monitor that is
+                # no longer running leaves ``self._servers`` frozen on its last
+                # value -- which readiness would then read as healthy forever.
+                # ``_last_successful_poll`` is deliberately not updated, so
+                # ``monitoring_is_stale()`` starts reporting the gap.
+                logger.error(f"Error in server monitoring: {e}")
 
             # Wait before next poll
             await asyncio.sleep(poll_interval)
 
     def _filter_servers_by_role(self, servers, server_key_map):
-        """Filter servers by role (context or generation)"""
+        """Filter servers by role (context or generation)
+
+        Returns an empty list when no server of this role is live. That is a
+        legitimate observation, not an error: callers such as a readiness
+        probe need to be able to see "this role has no workers left". Raising
+        here instead would kill the monitor loop and freeze ``self._servers``
+        on its last known-good value, which reports the role as healthy
+        forever.
+        """
         if not servers:
-            raise RuntimeError("No servers available")
+            return []
 
         filtered_servers = []
         # Invert to get {url: key} for lookup
