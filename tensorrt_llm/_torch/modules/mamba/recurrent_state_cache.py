@@ -52,8 +52,8 @@ def reset_recurrent_state_rows(
     """Zero fresh-request rows in recurrent and optional convolution pools.
 
     Invalid or negative slot indices are ignored, matching the cache-manager
-    reset contract used by GDN. The launch is ordered on PyTorch's current
-    stream, so a following indexed recurrence observes the zeroed rows.
+    reset contract used by GDN and KDA. The launch is ordered on PyTorch's
+    current stream, so a following indexed recurrence observes the zeroed rows.
     """
     num_requests = state_indices.shape[0]
     if num_requests == 0:

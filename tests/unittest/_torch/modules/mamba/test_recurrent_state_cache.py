@@ -53,59 +53,48 @@ def test_reset_recurrent_state_rows(index_dtype: torch.dtype) -> None:
 
 
 @torch.no_grad()
-def test_reset_recurrent_state_rows_rejects_noncontiguous_rows() -> None:
+@pytest.mark.parametrize("state_kind", ["recurrent", "convolution"])
+@pytest.mark.parametrize("overlapping", [False, True], ids=["noncontiguous", "overlapping"])
+def test_reset_recurrent_state_rows_rejects_invalid_rows(
+    state_kind: str,
+    overlapping: bool,
+) -> None:
     state_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
     has_initial_states = torch.tensor([False], device="cuda")
     recurrent_states = torch.ones(2, 2, 3, 4, dtype=torch.float32, device="cuda")
     conv_states = torch.ones(2, 3, 2, dtype=torch.bfloat16, device="cuda")
 
-    noncontiguous_recurrent = torch.ones(
-        2,
-        2,
-        3,
-        8,
-        dtype=torch.float32,
-        device="cuda",
-    )[..., ::2]
-    with pytest.raises(ValueError, match="recurrent state rows must be contiguous"):
-        reset_recurrent_state_rows(
-            noncontiguous_recurrent,
-            state_indices,
-            has_initial_states,
-            conv_states,
+    if state_kind == "recurrent":
+        if overlapping:
+            recurrent_states = torch.as_strided(
+                torch.ones(36, dtype=torch.float32, device="cuda"),
+                size=(2, 2, 3, 4),
+                stride=(12, 12, 4, 1),
+            )
+        else:
+            recurrent_states = torch.ones(
+                2,
+                2,
+                3,
+                8,
+                dtype=torch.float32,
+                device="cuda",
+            )[..., ::2]
+    elif overlapping:
+        conv_states = torch.as_strided(
+            torch.ones(9, dtype=torch.bfloat16, device="cuda"),
+            size=(2, 3, 2),
+            stride=(3, 2, 1),
         )
+    else:
+        conv_states = torch.ones(2, 3, 4, dtype=torch.bfloat16, device="cuda")[..., ::2]
 
-    noncontiguous_conv = torch.ones(2, 3, 4, dtype=torch.bfloat16, device="cuda")[..., ::2]
-    with pytest.raises(ValueError, match="convolution state rows must be contiguous"):
+    state_name = "recurrent" if state_kind == "recurrent" else "convolution"
+    constraint = "must not overlap" if overlapping else "must be contiguous"
+    with pytest.raises(ValueError, match=f"{state_name} state rows {constraint}"):
         reset_recurrent_state_rows(
             recurrent_states,
             state_indices,
             has_initial_states,
-            noncontiguous_conv,
-        )
-
-    overlapping_recurrent = torch.as_strided(
-        torch.ones(36, dtype=torch.float32, device="cuda"),
-        size=(2, 2, 3, 4),
-        stride=(12, 12, 4, 1),
-    )
-    with pytest.raises(ValueError, match="recurrent state rows must not overlap"):
-        reset_recurrent_state_rows(
-            overlapping_recurrent,
-            state_indices,
-            has_initial_states,
             conv_states,
-        )
-
-    overlapping_conv = torch.as_strided(
-        torch.ones(9, dtype=torch.bfloat16, device="cuda"),
-        size=(2, 3, 2),
-        stride=(3, 2, 1),
-    )
-    with pytest.raises(ValueError, match="convolution state rows must not overlap"):
-        reset_recurrent_state_rows(
-            recurrent_states,
-            state_indices,
-            has_initial_states,
-            overlapping_conv,
         )
