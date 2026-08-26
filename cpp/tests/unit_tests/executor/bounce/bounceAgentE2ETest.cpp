@@ -31,7 +31,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
@@ -141,15 +140,13 @@ std::unique_ptr<kvc::NixlTransferAgent> tryMakeAgent(kvc::BaseAgentConfig cfg, s
 
 // BaseAgentConfig::agentBufferSizeMb (derived from CacheTransceiverConfig's
 // agent_bounce_buffer_enable + kv_cache_bounce_size_mb) is the
-// ONLY on/off switch: 0 keeps bounce disabled, >0 enables it. The legacy TRTLLM_NIXL_BOUNCE_ENABLE
-// environment variable must have no effect anymore.
+// ONLY on/off switch: 0 keeps bounce disabled, >0 enables it.
 TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
 {
     if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
     try
     {
         EXPECT_FALSE(std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cfgOffAgent", 0))->isBounceEnabled());
@@ -163,10 +160,8 @@ TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
     }
     catch (std::exception const& e)
     {
-        unsetenv("TRTLLM_NIXL_BOUNCE_ENABLE");
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
-    unsetenv("TRTLLM_NIXL_BOUNCE_ENABLE");
 }
 
 TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
