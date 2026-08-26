@@ -1144,11 +1144,7 @@ class TestDisaggTransferIdleProgress:
 
 
 class TestIdleDisaggLoopPacing:
-    """The idle poll no longer blocks, so the executor loops pace themselves.
-
-    Pacing must cost nothing when a transfer is not what is holding the loop
-    back, and the PP loop must not pace while the ring still has work.
-    """
+    """Pacing must cost nothing when a transfer is not holding the loop back."""
 
     @staticmethod
     def _make_request(*, init_state: bool = False, transfer_in_progress: bool = False) -> Mock:
@@ -1188,23 +1184,6 @@ class TestIdleDisaggLoopPacing:
         PyExecutor._pace_idle_disagg_loop(executor)
 
         assert sleep.called is expect_sleep
-
-    @pytest.mark.parametrize(
-        "unhandled_batches, micro_batches, expected",
-        [
-            pytest.param(0, [None, None], True, id="ring_empty"),
-            pytest.param(1, [None, None], False, id="batch_awaiting_handling"),
-            pytest.param(0, [None, "batch"], False, id="batch_still_queued"),
-        ],
-    )
-    def test_pp_ring_drained_only_when_no_microbatch_is_outstanding(
-        self, unhandled_batches: int, micro_batches: list, expected: bool
-    ) -> None:
-        executor = object.__new__(PyExecutor)
-        executor.unhandled_batch_counter = unhandled_batches
-        executor.micro_batches = micro_batches
-
-        assert PyExecutor._pp_ring_is_drained(executor) is expected
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")

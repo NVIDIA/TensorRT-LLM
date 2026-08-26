@@ -2671,7 +2671,8 @@ class PyExecutor:
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
-                    self._check_disagg_transfer_progress_when_idle()
+                    self._check_disagg_transfer_progress_when_idle(
+                        is_idle=scheduled_batch.batch_size == 0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -3622,31 +3623,22 @@ class PyExecutor:
             return self.dist.tp_allgather(local_status)
         return [local_status]
 
-    def _check_disagg_transfer_progress_when_idle(self) -> None:
+    def _check_disagg_transfer_progress_when_idle(self,
+                                                  is_idle: bool = False
+                                                  ) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
 
-        The poll is non-blocking and rank-symmetric: every rank enters it
-        unconditionally on every disagg iteration, so the consensus performed
-        inside the status call stays aligned without an extra collective here.
-        Ranks with nothing in flight simply reap nothing.
-
-        Generation transfers are deliberately not polled here: the loop head
-        already ran `_check_disagg_gen_transfer_status` this iteration, and any
-        receive started since then by `_prepare_disagg_gen_init` is polled by
-        `_recv_disagg_gen_cache` right after it is issued. A poll here would
-        only repeat the GEN status call and its consensus.
+        Generation transfers are not polled here: the loop head already ran
+        `_check_disagg_gen_transfer_status`, and any receive issued since then
+        by `_prepare_disagg_gen_init` is polled by `_recv_disagg_gen_cache`.
         """
-        # A synchronous GEN receive is rank-local and blocking. One rank can
-        # still be receiving while another is idle, so entering the context
-        # progress collective here is unsafe. The gen-only-no-context
-        # benchmark skips KV transfer entirely, so its ranks remain aligned
-        # and may safely poll context progress.
+        # A synchronous GEN receive is rank-local and blocking, so entering
+        # the context progress collective is unsafe unless GEN transfer is
+        # async or context is skipped entirely (gen-only-no-context bench).
         if (not self._uses_async_disagg_gen_transfer()
                 and not self._is_disagg_gen_only_no_context_benchmark()):
-            # A single-rank CTX worker cannot diverge on a collective. Reap
-            # completed sends while it is idle so their pinned KV blocks can
-            # be reused by the next context requests.
-            if (self._dist_size(self.dist, "world_size") == 1 and
+            # A single-rank CTX worker cannot diverge on a collective.
+            if (is_idle and self._dist_size(self.dist, "world_size") == 1 and
                     self.async_transfer_manager.has_any_inflight_requests()):
                 self._check_disagg_ctx_cache_transfer_status(0)
             return
@@ -3654,28 +3646,15 @@ class PyExecutor:
         self._check_disagg_ctx_cache_transfer_status(0)
 
     def _pace_idle_disagg_loop(self) -> None:
-        """Sleep briefly when only a KV transfer completing can make progress.
+        """Sleep briefly when nothing but a KV transfer can make progress.
 
-        Dropping the blocking `atLeastNum=1` wait also dropped the only pacing
-        for the idle-blocked case: `_fetch_and_enqueue_requests` uses a zero
-        timeout while any request is active, so the loop would otherwise re-run
-        the schedule pass and its collectives at full speed until a transfer
-        lands.
-
-        Call this at the end of an iteration that queued nothing, once the pass
-        has drained its ready work. Request updates, KV sends and responses
-        must not be held behind the sleep, and running them first means the
-        pending-transfer check below sees the state they left behind rather
-        than a stale one.
-
-        That check is rank-local. The sleep only paces and never gates a
-        collective, so ranks taking it on different iterations is safe.
+        Call at the end of an iteration that queued nothing, after pending
+        request updates/sends/responses have been handled, so the sleep
+        doesn't hold up work that's already finished.
         """
         if self.kv_cache_transceiver is None:
             return
 
-        # Context sends are tracked by the transfer manager; generation
-        # receives live in the request state, so both directions are covered.
         waiting_on_transfer = (
             self.async_transfer_manager.has_any_inflight_requests()
             or any(req.is_disagg_generation_init_state
@@ -3685,12 +3664,7 @@ class PyExecutor:
             time.sleep(0.001)
 
     def _pp_ring_is_drained(self) -> bool:
-        """Return whether no microbatch is queued or awaiting handling.
-
-        While microbatches are still in flight `fetch_executed_batches` blocks
-        on the response queue, which paces the loop on its own; sleeping on top
-        of that would only delay their relay.
-        """
+        """Return whether no microbatch is queued or awaiting handling."""
         return (self.unhandled_batch_counter == 0
                 and all(batch is None for batch in self.micro_batches))
 
@@ -3850,7 +3824,8 @@ class PyExecutor:
             # into the transfer window this iteration.
             self._prepare_disagg_gen_init(admitted_disagg_gen_init_requests)
 
-            self._check_disagg_transfer_progress_when_idle()
+            self._check_disagg_transfer_progress_when_idle(
+                is_idle=scheduled_batch.batch_size == 0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
