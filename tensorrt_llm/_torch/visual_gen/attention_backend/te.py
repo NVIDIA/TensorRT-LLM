@@ -15,7 +15,7 @@
 """TransformerEngine FP8 attention backend for visual generation (diffusion) models.
 
 Uses TransformerEngine's ``DotProductAttention`` under ``fp8_autocast`` with
-``DelayedScaling(fp8_dpa=True, fp8_mha=True)``.  Operates in NHD layout
+``Float8CurrentScaling(fp8_dpa=True, fp8_mha=True)``.  Operates in NHD layout
 ([B, S, H, D]) which maps directly to TE's ``qkv_format="bshd"`` -- no
 transpose overhead.
 
@@ -32,7 +32,7 @@ from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 try:
-    from transformer_engine.common.recipe import DelayedScaling
+    from transformer_engine.common.recipe import Float8CurrentScaling
     from transformer_engine.pytorch import DotProductAttention, fp8_autocast
 
     _TE_AVAILABLE = True
@@ -75,7 +75,7 @@ class TEAttention(AttentionBackend):
             # TE drives its own FP8 recipe; swallowing this would hide a config mistake.
             raise NotImplementedError(
                 "TE attention backend does not honor quant_attention_config -- it always "
-                "runs FP8 via its own DelayedScaling recipe. Drop quant_attention_config "
+                "runs FP8 via its own Float8CurrentScaling recipe. Drop quant_attention_config "
                 "or pick a backend that applies it."
             )
         self.layer_idx = layer_idx
@@ -84,10 +84,11 @@ class TEAttention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
-        self.recipe = DelayedScaling(fp8_dpa=True, fp8_mha=True)
+        # Current scaling: TE gates delayed scaling's update on grad, so it never calibrates here.
+        self.recipe = Float8CurrentScaling(fp8_dpa=True, fp8_mha=True)
         # None = no amax reduction: per-rank scales, no world-wide collective per call.
         self.fp8_group = fp8_group
-        # Cache per trait: DotProductAttention holds amax history; rebuilding loses calibration.
+        # Cache per trait: avoids rebuilding a DotProductAttention on every forward.
         self._attn_ops: dict[tuple, Any] = {}
 
     def _get_attn_op(self, num_gqa_groups: Optional[int], attn_mask_type: str) -> Any:

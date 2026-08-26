@@ -130,7 +130,7 @@ def test_attention_mask_handling(make_te_attn):
         out_none = attn(q, k, v, attention_mask=None)
         out_causal = attn(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
 
-    # FP8 tolerance, not exact: DelayedScaling updates amax history on every call.
+    # FP8 tolerance, not exact: current scaling rederives the scale on every call.
     _assert_close_fp8(out_none, out_full, "attention_mask=None must mean FULL")
     _assert_close_fp8(out_causal, _reference(q, k, v, D, is_causal=True), "causal")
     assert not torch.allclose(out_full, out_causal, atol=1e-3), "causal must differ from full"
