@@ -261,15 +261,21 @@ TEST(BounceConfig, ParamsRequestTimeoutRederivesLease)
     EXPECT_EQ(bigCfg.receiverFlowTimeoutMs, std::numeric_limits<int>::max());
     EXPECT_EQ(bigCfg.quarantineMs, 2000000000);
 
-    // Edge values: "0" is accepted (timeout disabled, derived values 0), "-1" is rejected (strict
-    // unsigned parsing) and keeps the base value untouched.
-    auto const zeroCfg = b::BounceConfig::fromParams({{"request_timeout_ms", "0"}}, b::BounceConfig{});
-    EXPECT_EQ(zeroCfg.requestTimeoutMs, 0);
-    EXPECT_EQ(zeroCfg.receiverFlowTimeoutMs, 0);
-    EXPECT_EQ(zeroCfg.quarantineMs, 0);
-    auto const negCfg = b::BounceConfig::fromParams({{"request_timeout_ms", "-1"}}, b::BounceConfig{});
-    EXPECT_EQ(negCfg.requestTimeoutMs, b::BounceConfig{}.requestTimeoutMs);
-    EXPECT_EQ(negCfg.receiverFlowTimeoutMs, b::BounceConfig{}.receiverFlowTimeoutMs);
+    // Edge values: both "0" and "-1" are rejected (the timeout must stay > 0 — abandoned-flow
+    // resolution and the receiver lease hang off it) and keep the base value untouched, including
+    // the derived lease/quarantine (a rejected value must not trigger re-derivation). Sentinel
+    // lease/quarantine values on the base make the no-re-derivation assertion non-vacuous: on a
+    // default base deriveDependentTimeouts() is a fixed point and would mask the regression.
+    for (auto const* bad : {"0", "-1"})
+    {
+        b::BounceConfig base;
+        base.receiverFlowTimeoutMs = 123456;
+        base.quarantineMs = 654321;
+        auto const rejected = b::BounceConfig::fromParams({{"request_timeout_ms", bad}}, base);
+        EXPECT_EQ(rejected.requestTimeoutMs, base.requestTimeoutMs) << bad;
+        EXPECT_EQ(rejected.receiverFlowTimeoutMs, 123456) << bad;
+        EXPECT_EQ(rejected.quarantineMs, 654321) << bad;
+    }
 }
 
 // A dict WITHOUT request_timeout_ms must not re-derive: an env-derived lease survives, and

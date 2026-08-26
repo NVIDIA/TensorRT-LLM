@@ -562,6 +562,50 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     bounce_test::freeXferBufs(bufs);
 }
 
+// A GRANT whose credit is smaller than its chunk (mispair/reorder) abandons the flow. Abandon must
+// be terminal: pumpRequest ignores the request from then on, so (a) a LATER well-formed GRANT must
+// not resurrect it — pre-fix it would attach, post the RDMA write, and refresh lastProgress, pushing
+// the failure out by one extra timeout period per revived chunk (up to numChunks periods on a
+// multi-chunk request with a peer that keeps granting) — and (b) checkTimeouts resolves the future
+// kFAILURE with the abandon reason (kProtocolError, not the generic timeout).
+TEST(BounceTransportFailure, CreditMispairAbandonIsTerminalAndIgnoresLaterGrants)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    // Generous timeout: the mispair GRANT must be DELIVERED and dispatched before checkTimeouts
+    // can fire kNoProgressTimeout, or the reason assertion below flakes on a loaded machine.
+    auto c = cfg(/*timeoutMs=*/2000);
+    capRegions(c, c.maxInflightChunksPerRequest);
+    b::ZmqControlChannel peer("mispairPeer");
+    auto ctl = std::make_shared<XferControls>(); // defaults: writes complete instantly
+    auto sender = makeFakeNode("mispairSender", c, ctl);
+    if (!sender)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender->tx->addPeer("mispairPeer", peer.localEndpoint()));
+    ASSERT_TRUE(peer.addPeer("mispairSender", sender->ch->localEndpoint()));
+
+    // One 256-byte chunk (packedBytes = 256).
+    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/6);
+    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "mispairPeer");
+
+    // Undersized credit (128 < 256) -> mispair -> abandon; then a well-formed one that pre-fix
+    // would attach and post. FIFO ordering to the single reactor consumer guarantees the mispair
+    // is processed first.
+    peer.sendTo(
+        "mispairSender", b::encodeGrant(/*requestId=*/1, {{/*addr=*/0, /*len=*/128, /*devId=*/0, /*regionHandle=*/7}}));
+    peer.sendTo(
+        "mispairSender", b::encodeGrant(/*requestId=*/1, {{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/8}}));
+
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "abandoned flow never resolved";
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kProtocolError);
+    // The later valid GRANT must not have resurrected the abandoned flow into posting a write.
+    EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u) << "abandoned flow posted an RDMA write";
+
+    sender->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}
+
 // shutdown() with an in-flight (stuck) request must resolve its future FAILURE, never leave wait() hanging.
 TEST(BounceTransportFailure, ShutdownFailsInflight)
 {
