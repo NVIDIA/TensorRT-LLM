@@ -247,6 +247,31 @@ class PersistentDenseGemmKernelDynamicPreferredCluster(PersistentDenseGemmKernel
         self.cta_sync_bar_id = 0
         # tmem_alloc_sync_bar_id, tmem_dealloc_sync_bar_id already set by parent
 
+    def check_mma_tiler_and_cluster_shape(self):
+        """Validate the MMA tiler and both preferred and fallback clusters."""
+        super().check_mma_tiler_and_cluster_shape()
+
+        def is_power_of_2(value: int) -> bool:
+            return value > 0 and (value & (value - 1)) == 0
+
+        preferred_m, preferred_n = self.preferred_cluster_shape_mn
+        fallback_m, fallback_n = self.fallback_cluster_shape_mn
+        if (
+            not is_power_of_2(preferred_m)
+            or not is_power_of_2(preferred_n)
+            or preferred_m * preferred_n > 16
+        ):
+            raise testing.CantImplementError(
+                f"Invalid preferred cluster shape: {self.preferred_cluster_shape_mn}"
+            )
+        if preferred_m % (2 if self.use_2cta_instrs else 1) != 0:
+            raise testing.CantImplementError(f"Invalid preferred cluster shape M: {preferred_m}")
+        if preferred_m % fallback_m != 0 or preferred_n % fallback_n != 0:
+            raise testing.CantImplementError(
+                f"Preferred cluster shape {self.preferred_cluster_shape_mn} must be "
+                f"a multiple of fallback cluster shape {self.fallback_cluster_shape_mn}"
+            )
+
     def _create_tiled_mma(self):
         return utils.sm100.make_trivial_tiled_mma(
             self.a_dtype,
@@ -583,7 +608,7 @@ class PersistentDenseGemmKernelDynamicPreferredCluster(PersistentDenseGemmKernel
         # Setup cta/thread coordinates
         #
         # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _bidy, _bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -832,7 +857,7 @@ class PersistentDenseGemmKernelDynamicPreferredCluster(PersistentDenseGemmKernel
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
@@ -1386,8 +1411,10 @@ def run(
 def _parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
     try:
         return tuple(int(x.strip()) for x in s.split(","))
-    except ValueError:
-        raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Invalid format. Expected comma-separated integers."
+        ) from error
 
 
 def prepare_parser():

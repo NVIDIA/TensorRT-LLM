@@ -322,6 +322,12 @@ def test_vae_quant_config_dict_inherits_checkpoint_algorithm():
     assert dynamic_weight is None
     assert dynamic_activation is None
 
+    explicit_none, _, _ = DiffusionPipelineConfig.load_vae_quant_config(
+        {"quant_algo": None},
+        {"quant_algo": "NVFP4"},
+    )
+    assert explicit_none.quant_algo == QuantAlgo.NVFP4
+
 
 @pytest.mark.parametrize(
     ("raw", "message"),
@@ -340,6 +346,18 @@ def test_vae_quant_config_dict_inherits_checkpoint_algorithm():
                 "config_groups": {"first": {}, "second": {}},
             },
             "exactly one",
+        ),
+        ({"quant_algo": "NVFP4", "config_groups": []}, "exactly one"),
+        (
+            {"quant_algo": "NVFP4", "config_groups": {"default": True}},
+            "must contain a dictionary",
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"default": {"weights": True}},
+            },
+            "section 'weights' must contain a dictionary",
         ),
         ({"quant_algo": "NVFP4", "dynamic": 1}, "must be a boolean"),
         ({"quant_algo": "FP8", "dynamic": True}, "require quant_algo='NVFP4'"),

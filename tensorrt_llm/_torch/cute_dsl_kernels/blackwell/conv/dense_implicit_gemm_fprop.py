@@ -44,7 +44,6 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
-from functools import lru_cache
 from typing import Literal, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -61,6 +60,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.torch import dtype as torch_dtype
 from cutlass.utils import is_fp8_dtype
+
+from tensorrt_llm.logger import logger
 
 from .dense_gemm_persistent_dynamic import _compute_stages
 from .dense_gemm_persistent_dynamic_preferred_cluster import (
@@ -92,7 +93,7 @@ To run this example:
 
 .. code-block:: bash
 
-    python examples/CuTeDSL/cute/blackwell/kernel/conv/dense_implicit_gemm_fprop.py            \
+    python -m tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_implicit_gemm_fprop \
       --ncdhw 1,128,32,32,32 --ktrs 256,3,3,3                         \
       --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32        \
       --use_2cta_instrs --mma_tiler_mn 256,128                        \
@@ -104,7 +105,7 @@ To collect performance with NCU profiler:
 
 .. code-block:: bash
 
-    ncu python examples/CuTeDSL/cute/blackwell/kernel/conv/dense_implicit_gemm_fprop.py        \
+    ncu python -m tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_implicit_gemm_fprop \
       --ncdhw 1,128,32,32,32 --ktrs 256,3,3,3                         \
       --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32        \
       --use_2cta_instrs --mma_tiler_mn 256,128                        \
@@ -617,6 +618,7 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         self.num_fallback_mcast_ctas_b = self.num_mcast_ctas_b
         self.is_fallback_a_mcast = self.is_a_mcast
         self.is_fallback_b_mcast = self.is_b_mcast
+        return tiled_mma
 
     @cute.jit
     def __call__(
@@ -653,7 +655,7 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         """
         self._setup_conv_input_attrs(a, b, c)
-        self._setup_attributes()
+        tiled_mma = self._setup_attributes()
 
         # Pack the runtime pad/stride/dilation scalars into (D, H, W) tuples that
         # feed the im2col A descriptor corners. Keeping them as runtime Int32 lets
@@ -662,15 +664,6 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         lower_pad_op = (rt_lower_pad_d, rt_lower_pad_h, rt_lower_pad_w)
         stride_op = (rt_stride_d, rt_stride_h, rt_stride_w)
         dil_op = (rt_dil_d, rt_dil_h, rt_dil_w)
-
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.acc_dtype,
-            self.cta_group,
-            self.mma_tiler[:2],
-        )
 
         (
             tma_atom_a_preferred,
@@ -766,8 +759,8 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
                 self.swizzle_size,
                 self.raster_along,
             )
-        except testing.CantImplementError as e:
-            print(e)
+        except testing.CantImplementError as error:
+            logger.debug(f"PersistentConvKernel cannot implement this config: {error}")
             return False
         return True
 
@@ -891,7 +884,7 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         # Setup cta/thread coordinates
         #
         # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _bidy, _bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1151,7 +1144,7 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
                     k_shape_orig[0],
                 )
                 coord_perm = cute.repeat_like(0, k_shape_perm)
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
@@ -1392,7 +1385,6 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
             tmem.free(tmem_ptr)
 
 
-@lru_cache(maxsize=1)
 def compile_conv(
     ncdhw: Tuple[int, int, int, int, int],
     ktrs: Tuple[int, int, int, int],
@@ -1512,7 +1504,7 @@ def compute_zpq(
 def create_cute_tensor(
     source_f32_tensor: torch.Tensor,
     dtype: Type[cutlass.Numeric],
-    leading_dim: int = None,
+    leading_dim: int | None = None,
 ) -> Tuple[cute.Tensor, torch.Tensor]:
     """Create a cute tensor with dynamic layout from a source f32 tensor.
 
@@ -1854,8 +1846,10 @@ def run(
 def _parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
     try:
         return tuple(int(x.strip()) for x in s.split(","))
-    except ValueError:
-        raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Invalid format. Expected comma-separated integers."
+        ) from error
 
 
 if __name__ == "__main__":
@@ -2010,25 +2004,25 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run(
-        args.ncdhw,
-        args.ktrs,
-        args.stride_dhw,
-        args.upper_pad_dhw,
-        args.lower_pad_dhw,
-        args.dil_dhw,
-        args.ab_dtype,
-        args.c_dtype,
-        args.acc_dtype,
-        args.mma_tiler_mn,
-        args.preferred_cluster_shape_mn,
-        args.fallback_cluster_shape_mn,
-        args.swizzle_size,
-        args.raster_order,
-        args.use_2cta_instrs,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.use_cold_l2,
-        args.skip_ref_check,
+        ncdhw=args.ncdhw,
+        ktrs=args.ktrs,
+        stride_dhw=args.stride_dhw,
+        upper_pad_dhw=args.upper_pad_dhw,
+        lower_pad_dhw=args.lower_pad_dhw,
+        dil_dhw=args.dil_dhw,
+        ab_dtype=args.ab_dtype,
+        c_dtype=args.c_dtype,
+        acc_dtype=args.acc_dtype,
+        mma_tiler_mn=args.mma_tiler_mn,
+        preferred_cluster_shape_mn=args.preferred_cluster_shape_mn,
+        fallback_cluster_shape_mn=args.fallback_cluster_shape_mn,
+        swizzle_size=args.swizzle_size,
+        raster_along=args.raster_order,
+        use_2cta_instrs=args.use_2cta_instrs,
+        tolerance=args.tolerance,
+        warmup_iterations=args.warmup_iterations,
+        iterations=args.iterations,
+        use_cold_l2=args.use_cold_l2,
+        skip_ref_check=args.skip_ref_check,
     )
     print("PASS")

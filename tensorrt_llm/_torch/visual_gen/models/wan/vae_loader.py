@@ -169,13 +169,14 @@ def _load_nvfp4_wan_vae(
     this path is accuracy-gated as a TensorRT-LLM implementation rather than
     expected to preserve ModelOpt's original packed bytes.
     """
-    from safetensors.torch import load_file
-
     from .wan_vae import WanCausalConv3d, dequant_fp4_conv_weight, swap_wan_convs_to_fp4
 
     vae_dir = Path(checkpoint_dir) / "vae"
     wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
-    raw_state_dict = load_file(str(vae_dir / "diffusion_pytorch_model.safetensors"))
+    raw_state_dict = WeightLoader(components=PipelineComponent.VAE).load_weights(
+        checkpoint_dir,
+        Mapping(),
+    )
     conv_modules = {
         name: module
         for name, module in wan_vae.named_modules()
@@ -309,6 +310,24 @@ def load_wan_vae(
     dynamic_weight_quant: bool | None = None,
     dynamic_activation_quant: bool | None = None,
 ) -> nn.Module:
+    """Load the native or Diffusers Wan VAE with optional NVFP4 execution.
+
+    Args:
+        checkpoint_dir: Pipeline checkpoint root containing the ``vae`` component.
+        device: Device on which the loaded VAE will execute.
+        dtype: Floating-point dtype for VAE parameters and activations.
+        quant_config: Optional VAE quantization selection and exclusion rules.
+            ``None`` follows the checkpoint's quantization metadata.
+        dynamic_weight_quant: Optional override for runtime weight quantization.
+        dynamic_activation_quant: Optional override for runtime activation scales.
+
+    Returns:
+        The loaded native ``WanVAE`` or Diffusers ``AutoencoderKLWan`` module.
+
+    Raises:
+        ValueError: If the requested quantization mode, checkpoint, device, or
+            backend combination is unsupported.
+    """
     requested_algo = quant_config.quant_algo if quant_config is not None else None
     if requested_algo not in (None, QuantAlgo.NVFP4):
         raise ValueError(
@@ -359,6 +378,8 @@ def load_wan_vae(
             dynamic_weight_quant=dynamic_weight_quant,
         )
         _resolve_input_scales(selected, {}, dynamic_activation_quant)
+        # The explicit request makes this a validation-only call: unsupported
+        # devices raise instead of selecting the BF16 fallback.
         _nvfp4_enabled_for_device(device, selected, explicit_request=True)
         n, n_static = swap_wan_convs_to_fp4(wan_vae, only_names=selected)
         if n != len(selected):

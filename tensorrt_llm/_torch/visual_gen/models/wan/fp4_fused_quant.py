@@ -43,7 +43,7 @@ def _lazy_triton() -> tuple[Any, Any]:
     return triton, tl
 
 
-_KERNEL_CACHE: dict[str, object] = {}
+_KERNEL_CACHE: dict[str, tuple[Any, Any, Any]] = {}
 
 
 def _build_kernel() -> tuple[Any, Any, Any]:

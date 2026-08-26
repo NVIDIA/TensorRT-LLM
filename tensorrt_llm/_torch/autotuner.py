@@ -390,7 +390,7 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += f"    - Failed profiling combinations:\n"
+                    stats_str += "    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
 
@@ -440,6 +440,11 @@ class AutoTunerProfilingCache:
         - Ops with INDEPENDENT strategy are stored per-rank (rank_0, rank_1, ...)
         - Ops with non-INDEPENDENT strategy (BROADCAST, MERGE, PARALLEL) are stored
           in a shared dict since all ranks share the same tuning results
+
+    Attributes:
+        generation: Monotonically increasing version of the in-memory cache.
+            Consumers may use it to invalidate derived selections after cache
+            mutation, replacement, or merging.
     """
 
     # Key for shared cache entries (non-INDEPENDENT ops)
@@ -447,8 +452,6 @@ class AutoTunerProfilingCache:
 
     def __init__(self):
         self.cache: Dict[Tuple, Tuple] = dict()
-        # Monotonically identifies cache contents for lightweight derived
-        # caches that need to reject stale selections after clear/load/merge.
         self.generation = 0
 
         # Track which ops use which distributed strategy
@@ -728,21 +731,35 @@ class AutoTunerProfilingCache:
             with _exclusive_cache_lock(lock_path):
                 with open(file_path, "r") as f:
                     current_cache_contents = json.load(f)
-            self._deserialize_metadata(
-                current_cache_contents.get("metadata", {}))
+            if not isinstance(current_cache_contents, dict):
+                raise ValueError("AutoTuner cache root must be a JSON object")
 
-            # Start with empty cache and independent ops set
-            self.cache = {}
-            self.independent_op = set()
+            # Deserialize the complete document before changing live state. A
+            # failed load must not leave a partial cache behind with an old
+            # generation, which could make derived selections appear current.
+            metadata = current_cache_contents.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ValueError(
+                    "AutoTuner cache metadata must be a JSON object")
+            staged_lib_version = metadata["lib_version"]
+            staged_creation_timestamp = metadata["creation_timestamp"]
+            staged_device_name = metadata["device_name"]
+            staged_device_capability = metadata["device_capability"]
+            staged_cache = {}
+            staged_independent_op = set()
 
             # Load shared cache entries (non-INDEPENDENT ops)
             if self.SHARED_CACHE_KEY in current_cache_contents:
+                if not isinstance(current_cache_contents[self.SHARED_CACHE_KEY],
+                                  dict):
+                    raise ValueError(
+                        "AutoTuner shared cache must be a JSON object")
                 shared_cache = self._deserialize_cache_data(
                     current_cache_contents[self.SHARED_CACHE_KEY])
-                self.cache.update(shared_cache)
+                staged_cache.update(shared_cache)
                 # add custom op in shared cache to independent ops set
                 for key in shared_cache.keys():
-                    self.independent_op.add(key[0])
+                    staged_independent_op.add(key[0])
                 logger.debug(
                     f"[AutoTuner] Loaded {len(shared_cache)} shared cache entries"
                 )
@@ -750,13 +767,22 @@ class AutoTunerProfilingCache:
             # Load rank-specific cache entries (INDEPENDENT ops)
             rank_key = f"rank_{rank}"
             if rank_key in current_cache_contents:
+                if not isinstance(current_cache_contents[rank_key], dict):
+                    raise ValueError(
+                        f"AutoTuner {rank_key} cache must be a JSON object")
                 rank_cache = self._deserialize_cache_data(
                     current_cache_contents[rank_key])
-                self.cache.update(rank_cache)
+                staged_cache.update(rank_cache)
                 logger.debug(
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
 
+            self.lib_version = staged_lib_version
+            self.creation_timestamp = staged_creation_timestamp
+            self.device_name = staged_device_name
+            self.device_capability = staged_device_capability
+            self.cache = staged_cache
+            self.independent_op = staged_independent_op
             self.generation += 1
 
             logger.info(
@@ -777,12 +803,6 @@ class AutoTunerProfilingCache:
             "device_name": self.device_name,
             "device_capability": self.device_capability,
         }
-
-    def _deserialize_metadata(self, metadata: Dict[str, Any]) -> None:
-        self.lib_version = metadata["lib_version"]
-        self.creation_timestamp = metadata["creation_timestamp"]
-        self.device_name = metadata["device_name"]
-        self.device_capability = metadata["device_capability"]
 
     def _serialize_cache_data(self,
                               cache: Optional[Dict[Tuple, Tuple]] = None
@@ -820,7 +840,7 @@ class AutoTunerProfilingCache:
                 # value we store, not the enum member — else non-IntEnum fails).
                 assert tactic_check == ast.literal_eval(
                     tactic_str
-                ), f"Tactic is not compatible with json.dumps/json.loads"
+                ), "Tactic is not compatible with json.dumps/json.loads"
             except Exception as e:
                 logger.warning_once(
                     f"[AutoTuner] Could not serialize tactic: {tactic_str} for cache key {key_str} due to {e}. Deserialization may fail.",
@@ -1827,9 +1847,9 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def print_profiling_cache(self):
-        self._debug_logger(f"[Autotuner] The profiling_cache entries:")
+        self._debug_logger("[Autotuner] The profiling_cache entries:")
         self._debug_logger(
-            f"[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
+            "[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
         )
         for key, value in self.profiling_cache.cache.items():
             runner_id, tactic, min_time = value
@@ -1840,7 +1860,7 @@ class AutoTuner:
         self.print_statistics()
 
     def print_statistics(self):
-        self._debug_logger(f"[Autotuner] The statistics:")
+        self._debug_logger("[Autotuner] The statistics:")
         for line in self.stats.__str__().split("\n"):
             self._debug_logger(line)
 
