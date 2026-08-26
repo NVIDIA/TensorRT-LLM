@@ -64,6 +64,11 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Called at initialization. Provides the worker with the GPU KV cache tensors.
   * **Arguments**: `kv_cache_tensor` is the underlying storage tensor for the KV cache.
 
+* **`register_kv_cache_layout(self, layout: KvCacheLayout)`**
+  * **Description**: Called at initialization **instead of** `register_kv_caches` when the KV cache manager is `KVCacheManagerV2`, whose memory cannot be expressed as one tensor: there is one slot address space per pool and one page-index space per layer group. The default implementation raises, so a connector that does not implement it can only run on V1.
+  * **Arguments**: `layout` describes the byte ranges that repeat per page slot. Each `KvCacheLayerGroupLayout` carries a tuple of `KvCacheRegion`s, and the bytes for page slot `i` of a region live at `region.base + region.stride * i` for `region.size` bytes -- or equivalently at `region.as_tensor()[i]`. Page indices arriving in `RequestData.new_block_ids_by_layer_group` are scoped to a layer group and index that group's regions.
+  * **Why regions rather than a tensor**: because the ranges are described rather than implied, the same structure covers MLA (a pool simply has no `value` buffer), sliding-window and hybrid models (one layer group per window size), and non-uniform slots such as MiniMax-M3's index-K buffer sitting beside K/V, without any of them being a special case.
+
 * **`start_load_kv(self, stream: torch.cuda.Stream)`**
   * **Description**: Initiates the loading of KV blocks from the external source into the GPU memory.
   * **Arguments**: `stream` is the CUDA stream where the forward pass is executed in.
@@ -80,6 +85,86 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished(self, finished_gen_req_ids, started_loading_req_ids) -> tuple[list[int], list[int]]`**
   * **Description**: Polled by the runtime to check the status of asynchronous operations.
   * **Returns**: Two lists of request IDs: those that have finished saving, and those that have finished loading.
+
+## Built-in Connectors
+
+Named presets can be selected without naming a module or class:
+
+```python
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+
+kv_connector_config = KvCacheConnectorConfig(connector="mooncake-store")
+```
+
+The available presets are `lmcache`, `lmcache-mp`, `kvbm` and `mooncake-store`. The first three are external packages; `mooncake-store` ships with TensorRT-LLM and is described below.
+
+### Mooncake distributed store (`mooncake-store`)
+
+Publishes KV pages into a [Mooncake](https://github.com/kvcache-ai/Mooncake) store -- a shared CPU memory pool addressed by content -- so a prefix computed by one engine can be replayed by another. Regular block reuse cannot do this, because it never leaves the instance that computed the prefix.
+
+This is a **different component** from the Mooncake transfer engine that the C++ cache transceiver uses for disaggregated prefill/decode handoff. That moves KV point to point between two known peers; this publishes pages into a pool that any peer can read. The two compose: a context server can write pages into the store and still hand off to a generation server over NIXL.
+
+#### Requirements
+
+* `KVCacheManagerV2` (`kv_cache_config.use_kv_cache_manager_v2: true`), since that is the manager that can describe its pools through `register_kv_cache_layout`.
+* The Mooncake Python bindings: `pip install mooncake-transfer-engine`. These are installed in the release container; the source build of the C++ transfer engine does not provide them.
+* A running Mooncake master (and metadata server, unless using `P2PHANDSHAKE`). See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/).
+* GPU-only KV cache tiers: set `kv_cache_config.host_cache_size: 0` and `disk_cache_size: 0`. A page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store.
+
+#### Configuration
+
+Topology comes from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same schema as the vLLM Mooncake store connector so one deployment can point both engines at the same pool:
+
+```json
+{
+  "metadata_server": "http://127.0.0.1:8080/metadata",
+  "master_server_address": "127.0.0.1:50051",
+  "protocol": "rdma",
+  "device_name": "mlx5_0",
+  "global_segment_size": "32GiB",
+  "local_buffer_size": "1GiB"
+}
+```
+
+Two further settings are TensorRT-LLM's rather than Mooncake's, and are read from the environment because `KvCacheConnectorConfig` carries no free-form dictionary:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TRTLLM_MOONCAKE_STORE_ROLE` | `both` | `producer` writes only, `consumer` reads only, `both` does both. |
+| `TRTLLM_MOONCAKE_STORE_PREFIX` | `trtllm` | Leading component of every key, for isolating deployments that share a pool. |
+| `TRTLLM_MOONCAKE_STORE_MODEL_KEY` | model directory basename | Identity keys are namespaced by. Two engines share cache only when they agree on it, so the default is the basename rather than the full path -- the same checkpoint is routinely mounted elsewhere on another host, which is exactly what sharing is for. |
+
+In a disaggregated deployment, run context servers as `both` and leave generation servers unconfigured. Generated tokens are rarely a reused prefix, so writing them costs bandwidth for no hit rate.
+
+#### How it keys pages
+
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
+
+The value for one key is the concatenation of that layer group's regions for one page slot, handed to Mooncake's multi-buffer batch APIs as a list of `(address, size)` pairs.
+
+#### Transfer behavior
+
+* **Loads are synchronous**, performed in `start_load_kv` before the forward pass. A failed load raises: the runtime has already counted those tokens as computed, so a partial load is a wrong answer rather than a slow one.
+* **Saves are asynchronous**, handed to a background thread behind a CUDA event recorded on the forward stream. The pages are only complete once the pass that wrote them retires, and blocking the executor loop on an RDMA write is the cost the store exists to avoid. The leader reports such requests as saving asynchronously, so their pages stay pinned until `get_finished` confirms the writes landed. A dropped save is logged rather than raised -- it only costs a future cache miss.
+* Pages the store already holds are skipped, so several ranks or instances converging on the same prefix write it once.
+
+#### Unsupported configurations
+
+These are rejected at startup, before any request is admitted:
+
+| Configuration | Reason |
+|---|---|
+| Context parallelism | A rank holds a slice of the sequence rather than whole blocks of it, so one key would name different bytes on different ranks. |
+| Sliding-window attention / VSWA | A page's validity depends on where the window sits, which is a property of the request that read it rather than of the tokens it holds. |
+| MiniMax-M3 with `sparse_disable_index_value: false` | The index-V cache is a plain tensor outside the paged pools, so a replayed prefix would pair stored index-K with stale index-V. Disaggregated serving applies the same restriction. |
+| Pipeline parallelism | Untested rather than unsound. Use tensor parallelism. |
+| `KVCacheManagerV1` | Identity here is a per-layer-group hash chain; V1 supplies real block hashes over a single flat block space. |
+
+Beam search, attention data parallelism, non-GPU cache tiers and Mamba caches are rejected for all connectors by the executor.
+
+#### Example
+
+`examples/llm-api/configs/trtllm_mooncake_store_connector_extra.yaml` is a starting point for `trtllm-serve`.
 
 ## Example Implementation
 
