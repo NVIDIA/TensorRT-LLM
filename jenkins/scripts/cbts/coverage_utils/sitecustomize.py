@@ -17,27 +17,59 @@ import os
 import sys
 
 
-def _parent_is_pytest():
-    """Return True if our parent process is also running pytest."""
-    try:
-        with open(f"/proc/{os.getppid()}/cmdline", "rb") as f:
-            parent_cmdline = f.read().split(b"\x00")
-    except OSError:
-        return False
-    return any(b"pytest" in part for part in parent_cmdline)
+# Interpreter options that consume the token after them, so the scan below can tell a script
+# path from an option argument (``python -X importtime -m pytest`` must still yield "pytest").
+_OPTIONS_WITH_ARGUMENT = frozenset(("-W", "-X", "--check-hash-based-pycs"))
+
+
+def _launch_target():
+    """How this interpreter was started, as ``(module, script_basename)``.
+
+    Exactly one is set: ``module`` for ``-m pkg.mod``, ``script_basename`` for a
+    script or console-script path. Both are ``None`` for ``-c`` and for a bare
+    REPL. Parsing stops at the launch target, so a program's own arguments can
+    never be mistaken for the interpreter's.
+    """
+    argv = list(getattr(sys, "orig_argv", sys.argv) or [""])[1:]
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "-m":
+            return (argv[index + 1] if index + 1 < len(argv) else None), None
+        if token == "-c":
+            return None, None
+        if token in _OPTIONS_WITH_ARGUMENT:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return None, os.path.basename(token)
+    return None, None
 
 
 def _is_dependency_build_process():
-    """Return True for pip / setuptools / native build-tool processes, which opt the subtree out."""
-    argv = getattr(sys, "orig_argv", sys.argv) or [""]
-    # Scan each token's basename: the tool may be in argv[0] (bare) or argv[1] (shebang / setup.py).
-    tools = {"pip", "pip3", "cmake", "ninja", "ninja-build", "meson"}
-    for a in argv:
-        base = os.path.basename(a or "").lower()
-        if base in tools or base == "setup.py" or (a or "").endswith("setup.py"):
-            return True
-    joined = " ".join(argv)
-    return any(n in joined for n in ("-m pip", "-m build", "_in_process", "pyproject_hooks"))
+    """Return True for pip / setuptools / native build-tool processes, which opt the subtree out.
+
+    These are spawned by pip and the PEP 517 backend rather than by our own code, so there is
+    nobody to hand them an explicit role; the launch target is the available signal.
+    """
+    module, script = _launch_target()
+    if module is not None:
+        return module.split(".", 1)[0] in {"pip", "build", "pyproject_hooks", "setuptools"}
+    if script is None:
+        return False
+    script = script.lower()
+    return script in {
+        "pip",
+        "pip3",
+        "cmake",
+        "ninja",
+        "ninja-build",
+        "meson",
+        "setup.py",
+        "_in_process.py",
+    }
 
 
 def _is_ray_infra_process():
@@ -54,23 +86,33 @@ def _is_ray_infra_process():
     (observed in test_disaggregated_* under the Ray orchestrator stage). Opt out here so Ray's
     hot spawn path stays fast; the mpi4py pool worker still records coverage for the LLM API surface,
     and the RayGPUWorker actor itself lives inside a ``default_worker.py`` so it's uninstrumented too.
-    """
-    argv = getattr(sys, "orig_argv", sys.argv) or [""]
-    # Match on filename / module tokens Ray uses when it spawns Python children.
-    indicators = (
-        "default_worker.py",
-        "setup_worker.py",
-        "ray.autoscaler",
-        "ray.dashboard",
-        "ray._private.log_monitor",
-        "ray._private.runtime_env.agent",
-        "ray._private.workers",
-        "/ray/dashboard/",
-        "/ray/autoscaler/",
-    )
-    joined = " ".join(argv)
-    return any(ind in joined for ind in indicators)
 
+    raylet spawns these, not our own code, so there is nobody to hand them an explicit role;
+    the launch target is the available signal.
+    """
+    module, script = _launch_target()
+    if module is not None:
+        # Dotted-prefix match over the module namespace, so e.g.
+        # ray.autoscaler._private.monitor is covered without matching a path that
+        # merely contains the text.
+        return module == "ray" or module.startswith(
+            ("ray.autoscaler.", "ray.dashboard.", "ray._private.")
+        )
+    return script in {"default_worker.py", "setup_worker.py"}
+
+
+# What this process is, told to us by whoever launched it: "outer_pytest" (the stage's pytest,
+# set by jenkins/L0_Test.groovy) or "inner_pytest" (the unit-test batch, set by
+# tests/integration/defs/test_unittests.py). Anything else -- MPI pool workers, trtllm-serve,
+# helper subprocesses -- runs unlabelled and is treated as a product process.
+#
+# Popped rather than read: a role describes one process, while everything else CBTS puts in the
+# environment (CBTS_COVERAGE_CONFIG, CBTS_TEST_ID, ...) is meant to be inherited. Consuming it
+# here, before this process can spawn anything, keeps a child from answering to its parent's role.
+_ROLE = os.environ.pop("CBTS_PROCESS_ROLE", "").strip()
+_OUTER_PYTEST = "outer_pytest"
+_INNER_PYTEST = "inner_pytest"
+_IS_PYTEST_PROCESS = _ROLE in (_OUTER_PYTEST, _INNER_PYTEST)
 
 # Drop the gate var so build tooling / Ray infra and everything they spawn opt out of instrumentation.
 if os.getenv("CBTS_COVERAGE_CONFIG") and (
@@ -82,6 +124,8 @@ if os.getenv("CBTS_COVERAGE_CONFIG") and (
 if os.getenv("CBTS_COVERAGE_CONFIG"):
     import atexit
     import configparser
+    import importlib.abc
+    import importlib.util
     import threading
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -95,27 +139,22 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         try:
             cp.read(path)
         except configparser.Error:
-            return [], ".", "stage"
+            return [], "."
         src = [ln.strip() for ln in cp.get("run", "source", fallback="").splitlines() if ln.strip()]
         data_file = cp.get("run", "data_file", fallback="")
         data_dir = os.path.dirname(data_file) or "."
-        base = os.path.basename(data_file)
-        stage = base.split(".coverage.", 1)[1] if ".coverage." in base else "stage"
-        return src, data_dir, stage
+        return src, data_dir
 
-    _src, _data_dir, _stage = _read_config(_CONFIG)
+    _src, _data_dir = _read_config(_CONFIG)
+    # Named by whoever renders the rcfile (make_coveragerc.sh writes it into data_file too, but
+    # that copy is a filename, not an interface).
+    _stage = os.environ.get("CBTS_STAGE", "").strip() or "stage"
 
     try:
         _PERIODIC_SAVE_SECONDS = max(0.1, float(os.environ.get("CBTS_PERIODIC_SAVE_SECONDS", "5")))
     except ValueError:
         _PERIODIC_SAVE_SECONDS = 5.0
     _stop_event = threading.Event()
-
-    # While this file exists (created by result collection) no process saves.
-    _STOP_FILE = os.environ.get("CBTS_STOP_FILE", "")
-
-    def _frozen():
-        return bool(_STOP_FILE) and os.path.exists(_STOP_FILE)
 
     _tracker = PyStartTracker(_src, _data_dir, _stage)
 
@@ -138,7 +177,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         _tracker.note_expected_workers(nodeid or "", n)
 
     def _save_active():
-        if _frozen():
+        if _stop_event.is_set():
             return
         try:
             _tracker.save()
@@ -146,41 +185,33 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             print(f"[cbts] periodic save failed in pid {os.getpid()}: {e!r}", file=sys.stderr)
 
     def _final_save():
+        """Last save for this process; idempotent, so STOP and atexit can both call it."""
+        if _stop_event.is_set():
+            return
         _stop_event.set()
         try:
-            if not _frozen():
-                _tracker.save()
+            _tracker.save()
             _tracker.stop()
         except Exception as e:
             print(f"[cbts] final save failed in pid {os.getpid()}: {e!r}", file=sys.stderr)
 
     atexit.register(_final_save)
 
-    # sys.orig_argv preserves the launching cmdline; sys.argv has not yet gained "pytest" when sitecustomize runs.
-    _orig_argv = getattr(sys, "orig_argv", sys.argv)
-    _is_pytest_main = any("pytest" in a for a in _orig_argv[:4])
-    _is_nested_pytest = _parent_is_pytest() and _is_pytest_main
-    # mpi4py.futures pool workers don't spawn pools (so they skip the mpi patcher) but still run the
-    # periodic saver and the marker poller so their per-test coverage is saved and attributed.
-    _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
-    _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
-
     # Subprocesses inherit the current nodeid via CBTS_TEST_ID; the outer pytest re-switches per test via the plugin.
     _initial_nodeid = os.environ.get("CBTS_TEST_ID", "").strip()
     if _initial_nodeid:
         switch_test_context(_initial_nodeid)
 
-    # mpi4py.futures pool workers enable PY_START only after the product framework's first import
-    # settles (or CBTS_WORKER_ACTIVATE_MAX_SECONDS); every other process enables it now. Deferring
-    # keeps a wait_shutdown MpiPoolSession identity barrier from timing out on the instrumented cold
-    # import; coverage is unaffected since functions a test exercises are re-entered after activation.
-    _defer_worker_activation = _is_mpi_pool_worker and os.environ.get(
-        "CBTS_DEFER_WORKER_ACTIVATION", "1"
-    ) not in ("0", "false", "False", "")
-
-    if not _defer_worker_activation:
+    if _IS_PYTEST_PROCESS:
+        # A pytest process is already running product-independent code worth recording (collection,
+        # fixtures), and an inner pytest carries a real CBTS_TEST_ID from the start, so its import
+        # phase belongs to that entry.
         _tracker.start()
     else:
+        # Product processes enable PY_START only once the framework's first import has finished (or
+        # CBTS_WORKER_ACTIVATE_MAX_SECONDS elapses). Instrumenting that cold import is slow enough to
+        # time out an MpiPoolSession wait_shutdown identity barrier. Module and class bodies executed
+        # before activation go unrecorded here; functions a test exercises are re-entered afterwards.
         try:
             _activate_max = max(
                 1.0, float(os.environ.get("CBTS_WORKER_ACTIVATE_MAX_SECONDS", "120"))
@@ -189,25 +220,127 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             _activate_max = 120.0
         # Product top-level import names taken from the coverage source roots (e.g. "tensorrt_llm").
         _product_tops = {os.path.basename(p.rstrip("/")) for p in _src if p}
+        _framework_ready = threading.Event()
+        _activation_lock = threading.Lock()
 
-        def _framework_imported():
-            for _name in _product_tops:
-                _mod = sys.modules.get(_name)
-                _spec = getattr(_mod, "__spec__", None) if _mod is not None else None
-                if _mod is not None and not getattr(_spec, "_initializing", False):
-                    return True
-            return False
+        def _subscribe_to_context_channel():
+            """Join the outer pytest's channel, landing this process on the current test.
+
+            Deferred to here rather than run at bootstrap: an mpi4py pool worker only
+            learns the channel address from the env payload its sync handshake applies,
+            which is after interpreter startup but before it runs any task.
+            """
+            try:
+                from cbts_channel import ContextSubscriber
+
+                ContextSubscriber.subscribe(
+                    on_context=switch_test_context,
+                    on_stop=_final_save,
+                )
+            except Exception as exc:
+                print(
+                    f"[cbts] context subscribe failed in pid {os.getpid()}: {exc!r}",
+                    file=sys.stderr,
+                )
+
+        def _activate_tracker():
+            """Enable PY_START once, from whichever of the two paths below arrives first."""
+            with _activation_lock:
+                if _framework_ready.is_set() or _stop_event.is_set():
+                    return
+                _framework_ready.set()
+                # Subscribe first: recording must not start on a stale context.
+                _subscribe_to_context_channel()
+                _tracker.start()
+
+        _resolving = threading.local()
+
+        class _ImportCompletionWatcher(importlib.abc.MetaPathFinder):
+            """Meta-path finder that runs a hook once a watched module finishes executing.
+
+            Hands resolution back to ``importlib.util.find_spec`` and swaps the resolved
+            loader for one that calls back after ``exec_module`` returns, so a hook keys off
+            the actual end of the module body rather than sampling import state. Running on
+            the importing thread leaves no window between a module becoming usable and its
+            hook having run.
+
+            ``callbacks`` maps module name to hook. Entries are dropped as they fire, so each
+            hook runs once and every later import costs one dict miss; the finder stays in
+            ``sys.meta_path`` rather than removing itself, which would mutate that list
+            mid-import while another thread may be walking it.
+            """
+
+            def __init__(self, callbacks):
+                self._callbacks = callbacks
+
+            def find_spec(self, fullname, path=None, target=None):
+                # The delegated lookup walks sys.meta_path again and arrives back here; the
+                # thread-local flag makes that second pass decline instead of recursing.
+                if fullname not in self._callbacks or getattr(_resolving, "active", False):
+                    return None
+                _resolving.active = True
+                try:
+                    spec = importlib.util.find_spec(fullname)
+                except (ImportError, ValueError):
+                    return None
+                finally:
+                    _resolving.active = False
+                if spec is None or not hasattr(spec.loader, "exec_module"):
+                    return spec
+                spec.loader = _WatchedLoader(spec.loader, fullname, self.fire)
+                return spec
+
+            def fire(self, fullname):
+                callback = self._callbacks.pop(fullname, None)
+                if callback is None:
+                    return
+                try:
+                    callback()
+                except Exception as exc:
+                    print(
+                        f"[cbts] import hook for {fullname} failed in pid {os.getpid()}: {exc!r}",
+                        file=sys.stderr,
+                    )
+
+        class _WatchedLoader(importlib.abc.Loader):
+            """Loader proxy that calls back once the wrapped ``exec_module`` returns."""
+
+            def __init__(self, inner, fullname, fire):
+                self._inner = inner
+                self._fullname = fullname
+                self._fire = fire
+
+            def create_module(self, spec):
+                return self._inner.create_module(spec)
+
+            def exec_module(self, module):
+                try:
+                    self._inner.exec_module(module)
+                finally:
+                    # fire() swallows hook failures; an import must not break over coverage.
+                    self._fire(self._fullname)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        def _install_pool_patch():
+            from cbts_pool import install_expected_workers_patch
+
+            install_expected_workers_patch()
+
+        # The pool accounting patch goes on as mpi4py.futures lands, before any MPIPoolExecutor
+        # can be constructed. Both pytest roles are covered already -- the outer one by the
+        # plugin's pytest_configure, the inner one above -- and a process that never builds a
+        # pool just leaves the patch unused.
+        _watched_imports = dict.fromkeys(_product_tops, _activate_tracker)
+        _watched_imports["mpi4py.futures"] = _install_pool_patch
+        sys.meta_path.insert(0, _ImportCompletionWatcher(_watched_imports))
 
         def _deferred_activate():
-            _waited = 0.0
-            _step = 0.2
-            while not _stop_event.is_set() and _waited < _activate_max:
-                if _framework_imported():
-                    break
-                _stop_event.wait(_step)
-                _waited += _step
-            if not _stop_event.is_set():
-                _tracker.start()
+            # Backstop for a process that never imports the framework; no-ops once the
+            # watcher above has already activated.
+            _framework_ready.wait(_activate_max)
+            _activate_tracker()
 
         threading.Thread(
             target=_deferred_activate,
@@ -215,15 +348,16 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             name="cbts-deferred-activate",
         ).start()
 
-    if _is_nested_pytest:
-        # Inner pytest: install the pool accounting/env patch synchronously instead of via the watcher.
+    if _ROLE == _INNER_PYTEST:
+        # The inner pytest runs without -p cbts_plugin, so nothing else will install the pool
+        # accounting patch for it; do it here rather than through the watcher thread below.
         try:
-            from cbts_plugin import install_expected_workers_patch
+            from cbts_pool import install_expected_workers_patch
 
             install_expected_workers_patch()
         except Exception as _exc:
             print(
-                f"[cbts] nested-pytest mpi patch skipped in pid {os.getpid()}: {_exc!r}",
+                f"[cbts] inner-pytest mpi patch skipped in pid {os.getpid()}: {_exc!r}",
                 file=sys.stderr,
             )
 
@@ -231,9 +365,6 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     # pool workers in particular lose their atexit save when the pool is torn down at test end.
     def _periodic_save():
         while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
-            if _frozen():
-                _stop_event.set()
-                return
             _save_active()
 
     threading.Thread(
@@ -241,56 +372,3 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         daemon=True,
         name="cbts-periodic-save",
     ).start()
-
-    if not _skip_daemons:
-        # Coordinator / long-lived non-pytest processes install the pool accounting/env patch before
-        # they spawn a pool; pool workers and the outer pytest don't spawn pools, so they skip this.
-
-        def _watch_mpi_pool():
-            # Wait until mpi4py.futures is imported so installing the patch triggers no racing import.
-            while not _stop_event.is_set():
-                if "mpi4py.futures" in sys.modules:
-                    try:
-                        from cbts_plugin import install_expected_workers_patch
-
-                        install_expected_workers_patch()
-                    except Exception as exc:
-                        print(
-                            f"[cbts] pool patch in pid {os.getpid()} failed: {exc!r}",
-                            file=sys.stderr,
-                        )
-                    return
-                _stop_event.wait(0.1)
-
-        threading.Thread(
-            target=_watch_mpi_pool,
-            daemon=True,
-            name="cbts-pool-patcher",
-        ).start()
-
-    # Pool workers and long-lived non-pytest processes follow the per-test marker file to switch
-    # context; a pool worker would otherwise record every test it serves under one inherited (often
-    # empty) context. The outer pytest switches context via the plugin instead.
-    if not _is_pytest_main:
-        from cbts_plugin import DEFAULT_MARKER_FILE
-
-        _MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", DEFAULT_MARKER_FILE)
-
-        def _poll_marker():
-            last_seen = _initial_nodeid
-            while not _stop_event.is_set():
-                try:
-                    with open(_MARKER_FILE) as f:
-                        nodeid = f.read().strip()
-                    if nodeid and nodeid != last_seen:
-                        switch_test_context(nodeid)
-                        last_seen = nodeid
-                except (FileNotFoundError, OSError):
-                    pass
-                _stop_event.wait(0.1)
-
-        threading.Thread(
-            target=_poll_marker,
-            daemon=True,
-            name="cbts-context-poller",
-        ).start()

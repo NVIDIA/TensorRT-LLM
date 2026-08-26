@@ -37,18 +37,23 @@ def _on_py_start(self, code, offset):
 
 ## 3. Crossing processes
 
-Three environment variables (`CBTS_COVERAGE_CONFIG` / `PYTHONPATH` / `CBTS_MARKER_FILE`) are
+Three environment variables (`CBTS_COVERAGE_CONFIG` / `PYTHONPATH` / `CBTS_CONTEXT_SOCKET`) are
 inherited by child processes by default, and `sitecustomize.py` installs the tracker in every
 Python process at startup. No product code is modified.
 
-| Process | Context source | Activation |
-|---|---|---|
-| Outer pytest | `cbts_plugin`'s `pytest_runtest_protocol` switches it directly | at interpreter startup |
-| MPI pool worker | inherited `CBTS_TEST_ID`, then polls the marker file (0.1s) | **deferred** until `tensorrt_llm` finishes importing |
-| Other subprocesses (serve / example / inner pytest) | same as above | at interpreter startup |
+A process learns what it is from `CBTS_PROCESS_ROLE`, set by whoever launches it and consumed
+by `sitecustomize.py` so it is never inherited:
+
+| Role | Set by | Context source | Activation |
+|---|---|---|---|
+| `outer_pytest` | `jenkins/L0_Test.groovy` | `cbts_plugin`'s `pytest_runtest_protocol` switches it directly | at interpreter startup |
+| `inner_pytest` | `tests/integration/defs/test_unittests.py` | inherited `CBTS_TEST_ID`, held for the whole batch | at interpreter startup |
+| *(unset)* — pool workers, `trtllm-serve`, helper subprocesses | — | inherited `CBTS_TEST_ID` until it subscribes to the context channel, then every announcement | **deferred** until `tensorrt_llm` finishes importing, via an import hook |
 
 Processes that opt themselves out: `pip` / `setup.py` / `cmake` / `ninja` and everything they
-spawn, plus Ray infrastructure processes (`default_worker.py` and friends).
+spawn, plus Ray infrastructure processes (`default_worker.py` and friends). These are spawned by
+pip and raylet rather than by our own code, so they are recognised from their launch target
+(`-m` module or script name) instead of a role.
 
 ## 4. Persistence and merge
 
@@ -94,10 +99,10 @@ full (`../coverage_selection/SELECTION.md` §4.1); **the collection side itself 
 fix means having the producer record closure frames (the `<locals>` segments in `co_qualname` can
 be kept or folded), which is follow-up work.
 
-### 5.2 Import phase is lost inside pool workers
+### 5.2 Import phase is lost inside product processes
 
-A worker's `tensorrt_llm` import happens **before deferred activation**, so module bodies
-(`<module>`) and class bodies (`ClassName`) get no rows at all in a worker.
+Their `tensorrt_llm` import happens **before deferred activation**, so module bodies
+(`<module>`) and class bodies (`ClassName`) get no rows at all in a pool worker or a server.
 
 The outer pytest's import happens before any test, under the empty context, and the merge filters
 it out with `WHERE test != ''`.

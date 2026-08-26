@@ -341,6 +341,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     def run_command(cmd, num_workers=1):
         try:
             env = {'PYTHONPATH': build_pythonpath()}
+            # This batch runs without -p cbts_plugin, so name the role for the CBTS coverage
+            # bootstrap instead of leaving it to guess. Ignored when coverage is not enabled;
+            # the bootstrap consumes the variable, so the pools this batch spawns do not
+            # inherit it.
+            env['CBTS_PROCESS_ROLE'] = 'inner_pytest'
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
