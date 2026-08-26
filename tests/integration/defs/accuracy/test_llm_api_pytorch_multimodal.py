@@ -233,7 +233,6 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
     reason="Gemma4 shared-KV MTP requires FlashInfer trtllm-gen on SM100/SM103",
 )
 @pytest.mark.skip_less_device(1)
-@pytest.mark.skip_device_not_contain(["B200", "B300"])
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
