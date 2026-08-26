@@ -64,21 +64,21 @@ A typical result has the following structure:
 ```json
 {
   "py_executor": {
-    "total_executor_creation_seconds": 12.341,
-    "model_engine_creation_seconds": 5.241,
-    "final_kv_cache_creation_seconds": 0.421,
-    "final_py_executor_creation_seconds": 4.317
+    "total_executor_creation_seconds": 41.747,
+    "model_engine_creation_seconds": 1.802,
+    "final_kv_cache_creation_seconds": 0.068,
+    "final_py_executor_creation_seconds": 18.203
   },
   "final_model_engine": {
-    "total_warmup_seconds": 4.217,
-    "attention_warmup_seconds": 0.301,
-    "autotuner_warmup_seconds": 1.732,
-    "cuda_graph_capture_seconds": 1.105
+    "total_warmup_seconds": 16.885,
+    "attention_warmup_seconds": 0.884,
+    "autotuner_warmup_seconds": 0.030,
+    "cuda_graph_capture_seconds": 8.143
   },
   "model_loader": {
-    "total_model_loading_seconds":  1.971,
-    "checkpoint_preparation_seconds": 1.177,
-    "weight_population_seconds": 0.598,
+    "total_model_loading_seconds": 1.765,
+    "checkpoint_preparation_seconds": 1.001,
+    "weight_population_seconds": 0.495,
     "post_load_processing_seconds": 0.005
   }
 }
@@ -91,12 +91,7 @@ estimation creates a temporary PyExecutor before constructing the final PyExecut
 `final_model_engine` appears. The model-engine dictionaries are promoted alongside `py_executor` in
 the startup metrics payload so callers do not need to traverse another nesting level. Legacy
 two-model speculative decoding can likewise produce `initial_draft_model_engine` and
-`final_draft_model_engine`. When estimation is enabled, each pass performs a complete model-engine
-warmup, so both the initial and final dictionaries include the cost of a full warmup.
-
-Executor scope names describe the constructed component rather than the internal memory-category
-enum. The initial KV cache and PyExecutor scopes are temporary resources used for KV cache capacity
-estimation; their final counterparts are the resources retained for serving.
+`final_draft_model_engine`.
 
 | PyExecutor metric | Scope |
 |-----------------|-------|
@@ -157,7 +152,7 @@ curl http://localhost:8000/server_info
 {
   "startup_metrics": {
     "model_loader": {
-      "total_model_loading_seconds": 1.971,
+      "total_model_loading_seconds": 1.765,
       ...
     }
   }
