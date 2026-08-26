@@ -36,13 +36,13 @@ import sys
 from open_search_db import OpenSearchDB
 
 
-def queryJobEvents(commitID="", onlySuccess=True, stageNamePatterns=None):
+def queryJobEvents(commitID="", onlySuccess=True, stageNamePattern=""):
     """Query OpenSearch database for job events with pagination.
 
     Args:
         commitID: Git commit SHA to filter by (optional)
         onlySuccess: If True, only return PASSED tests (default: True)
-        stageNamePatterns: Non-empty regular-expression stage-name patterns to filter by
+        stageNamePattern: Non-empty regular-expression stage-name pattern to filter by
 
     Returns:
         List of all matching test result records
@@ -50,19 +50,9 @@ def queryJobEvents(commitID="", onlySuccess=True, stageNamePatterns=None):
     mustConditions = []
     if commitID:
         mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
-    if not stageNamePatterns or any(not stageNamePattern for stageNamePattern in stageNamePatterns):
-        raise ValueError("stageNamePatterns must contain at least one non-empty pattern")
-    mustConditions.append(
-        {
-            "bool": {
-                "minimum_should_match": 1,
-                "should": [
-                    {"regexp": {"s_stage_name": stageNamePattern}}
-                    for stageNamePattern in stageNamePatterns
-                ],
-            }
-        }
-    )
+    if not stageNamePattern:
+        raise ValueError("stageNamePattern cannot be empty")
+    mustConditions.append({"regexp": {"s_stage_name": stageNamePattern}})
     if onlySuccess:
         mustConditions.append({"term": {"s_status": "PASSED"}})
 
@@ -114,11 +104,11 @@ def writeTestListToFile(testList, fileName):
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, outputFile, stageNamePatterns=None):
+def getPassedTestList(commitID, outputFile, stageNamePattern=""):
     hits = queryJobEvents(
         commitID=commitID,
         onlySuccess=True,
-        stageNamePatterns=stageNamePatterns,
+        stageNamePattern=stageNamePattern,
     )
     # Use set to automatically remove duplicates
     testSet = set()
@@ -133,16 +123,15 @@ if __name__ == "__main__":
     parser.add_argument("--commit-id", required=True, help="Commit ID")
     parser.add_argument(
         "--stage-name-pattern",
-        action="append",
         required=True,
-        help="Regular-expression stage-name pattern to query; repeat for multiple patterns",
+        help="Regular-expression stage-name pattern to query",
     )
     parser.add_argument("--output-file", required=True, help="Output File")
     args = parser.parse_args(sys.argv[1:])
-    if any(not stageNamePattern for stageNamePattern in args.stage_name_pattern):
+    if not args.stage_name_pattern:
         parser.error("--stage-name-pattern cannot be empty")
     getPassedTestList(
         commitID=args.commit_id,
         outputFile=args.output_file,
-        stageNamePatterns=args.stage_name_pattern,
+        stageNamePattern=args.stage_name_pattern,
     )
