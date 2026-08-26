@@ -225,6 +225,16 @@ class TestBaseToolParser:
         assert len(results) == 1
         assert json.loads(results[0].parameters) == {}
 
+    def test_parse_base_json_null_arguments(self, sample_tools):
+        """Test parse_base_json handles an explicit null arguments value."""
+        parser = ConcreteToolParser()
+        action = {"name": "get_weather", "arguments": None}
+
+        results = parser.parse_base_json(action, sample_tools)
+
+        assert len(results) == 1
+        assert json.loads(results[0].parameters) == {}
+
     def test_ends_with_partial_token(self):
         """Test _ends_with_partial_token detection."""
         parser = ConcreteToolParser()
@@ -1034,6 +1044,58 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
             ',"arguments":{"location":"SF"}}\n</tool_call>', sample_tools)
         assert len(r_args.calls) == 1
         assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
+
+    @pytest.mark.parametrize(
+        "arguments_chunk",
+        [', "arguments": {}}', "}", ', "arguments": null}'],
+        ids=["empty_object", "key_absent", "explicit_null"],
+    )
+    def test_streaming_zero_arg_tool(self, parser, arguments_chunk):
+        """Test streaming a zero-argument tool call.
+
+        A model can express "no arguments" as an empty object, by omitting the
+        key, or as an explicit null. All three have to complete the call and
+        stream "{}".
+        """
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        chunks = [
+            "<tool_call>\n",
+            '{"name": "get_time"',
+            arguments_chunk,
+            "\n</tool_call>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+
+        names = [c.name for r in results for c in r.calls if c.name]
+        assert "get_time" in names
+
+        # A zero-argument call still has to stream its arguments, otherwise the
+        # client is left with arguments="", which is not valid JSON.
+        params = "".join(c.parameters for r in results for c in r.calls)
+        assert params == "{}", f"Expected '{{}}', got {params!r}"
+
+        # The one-shot path resolves all three shapes to the same "{}".
+        oneshot = parser.detect_and_parse("".join(chunks), tools)
+        assert oneshot.calls[0].parameters == "{}"
+
+        # The completed call must also be consumed from the buffer, otherwise the
+        # parser stays in the tool-call branch and swallows the rest of the output.
+        assert "<tool_call>" not in parser._buffer
 
 
 class TestQwen3CoderToolParser(BaseToolParserTestClass):

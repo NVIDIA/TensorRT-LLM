@@ -8375,6 +8375,7 @@ class PyExecutor:
         )
 
         batch_token_time = self.perf_manager.get_timestamp()
+        gpu_times_cache = {}
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -8447,7 +8448,8 @@ class PyExecutor:
             if should_emit:
                 if request.return_perf_metrics:
                     # Response creation may finalize and copy scalar ctx GPU totals.
-                    self.perf_manager.compute_batch_gpu_times([request])
+                    self.perf_manager.compute_batch_gpu_times(
+                        [request], gpu_times_cache=gpu_times_cache)
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished

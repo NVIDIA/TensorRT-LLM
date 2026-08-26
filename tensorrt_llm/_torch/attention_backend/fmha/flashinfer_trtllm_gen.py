@@ -729,6 +729,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         else:
             return False, f"invalid FMHA phase: {phase}."
 
+        if has_context_phase and q.dtype == torch.bfloat16 and 0 < meta.num_contexts <= 4:
+            # NVBug 6579626: the per-layer host overhead of the FlashInfer
+            # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
+            # Let the FMHA selector choose the fallback implementation only
+            # for that affected regime.
+            return False, (
+                "small-batch BF16 context attention uses the fallback FMHA for "
+                "performance because the FlashInfer TRTLLM-Gen context path "
+                "regresses TTFT due to per-layer host overhead."
+            )
+
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
