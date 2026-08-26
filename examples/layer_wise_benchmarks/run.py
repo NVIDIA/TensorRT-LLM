@@ -290,6 +290,37 @@ if args.replay_file_path:
     logger.info(
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
+    # The replay has to put the same number of tokens through MoE that the
+    # calibration recorded. Nothing on the GEN path notices when it does not:
+    # pre_step's size check derives both sides from the recorded metadata, so it is
+    # self-consistent and never fires, and the only check that compares the shape
+    # ACTUALLY executed against the shape recorded is the deferred one, which runs
+    # only under --replay-verify-metadata. Run without that flag and a mismatch does
+    # not raise -- it profiles the wrong routing and reports a number.
+    #
+    # Deliberately not gated on --replay-verify-metadata. That flag asks whether to
+    # re-check every iteration's metadata at the end, which is a runtime cost. This
+    # is a question about the configuration, answerable before any of it runs, and a
+    # caller who turned the expensive check off did not ask to be handed a silently
+    # wrong measurement.
+    recorded_tokens = calibrator.get_replay_token_count()
+    if recorded_tokens is not None:
+        mismatched = [
+            (b, s)
+            for b in args.batch_size_list
+            for s in args.seq_len_q_list
+            if b * s != recorded_tokens
+        ]
+        if mismatched:
+            parser.error(
+                f"{args.replay_file_path} recorded {recorded_tokens} tokens per "
+                f"iteration, but --batch-size/--seq-len-q ask for "
+                f"{', '.join(f'{b}x{s}={b * s}' for b, s in mismatched)}. "
+                f"seq_len_q > 1 is MTP and also needs --spec-max-draft-len "
+                f"seq_len_q-1; examples/layer_wise_benchmarks does not currently "
+                f"ship a way to discover the recorded count, so read it off the "
+                f"calibration's token_selected_slots_shape."
+            )
 else:
     calibrator.init("NONE", None, None)
     replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics

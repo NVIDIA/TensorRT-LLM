@@ -680,6 +680,36 @@ class Calibrator:
             f" and {chunk_count} chunks"
         )
 
+    def get_replay_token_count(self):
+        """Tokens per iteration the calibration recorded, for the sliced layers.
+
+        This is what the replay has to reproduce: layer-wise puts
+        `batch_size * seq_len_q` tokens through MoE, and the recorded routing was
+        captured at whatever count the engine was running. If the two differ, the
+        replay is profiling a different workload than the one calibrated.
+
+        Returns:
+            int: the token count, when every recorded layer agrees on it.
+            None: when they do not. A calibration whose layers disagree cannot be
+                replayed under one CUDA graph either, and that is a separate
+                complaint from this one -- returning None leaves it to the caller
+                rather than raising a second error about the first problem.
+
+        Raises:
+            ValueError: If mode is not REPLAY.
+        """
+        if self.mode != Mode.REPLAY:
+            raise ValueError(
+                f"get_replay_token_count() is only valid in REPLAY mode, "
+                f"current mode is {self.mode.name}"
+            )
+        counts = {
+            m["token_selected_slots_shape"][0]
+            for entry in self._replay_db.values()
+            for m in entry["metadata"]
+        }
+        return counts.pop() if len(counts) == 1 else None
+
     def get_replay_iteration_range(self):
         """Get the valid iteration range for REPLAY mode.
 
