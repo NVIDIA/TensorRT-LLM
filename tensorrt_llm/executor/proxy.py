@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import weakref
 from queue import Empty
 from typing import Dict, List, Optional, Union
@@ -35,7 +36,8 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   validate_session_world_size)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, logger_debug, print_colored)
+                            enable_llm_debug, env_timeout_seconds, logger_debug,
+                            print_colored)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
@@ -62,6 +64,23 @@ __all__ = [
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
 _MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+
+_DEFAULT_WORKER_INIT_TIMEOUT = 3600.0
+
+
+def _worker_init_timeout() -> float:
+    """Budget for a single stretch of silence during worker init, in seconds.
+
+    Bounds the gap *between* status messages rather than the whole bootstrap,
+    so it does not have to be sized against total startup cost -- which is
+    large and workload-dependent (multi-hundred-GiB weight loads plus per-rank
+    kernel JIT). The ceiling exists only so that a world which stops reporting
+    entirely is reported as a failure instead of waited on forever; it is
+    deliberately far above any healthy inter-message gap.
+    ``TRTLLM_WORKER_INIT_TIMEOUT`` overrides it.
+    """
+    return env_timeout_seconds("TRTLLM_WORKER_INIT_TIMEOUT",
+                               _DEFAULT_WORKER_INIT_TIMEOUT)
 
 
 def _check_collective_rpc_guard(
@@ -736,8 +755,22 @@ class GenerationExecutorProxy(GenerationExecutor):
             fut.add_done_callback(mpi_done_callback)
 
     def _wait_for_executor_workers_ready(self) -> tuple:
-        """Wait for worker readiness while monitoring published processes."""
+        """Wait for worker readiness while monitoring published processes.
+
+        Bounded by a silence budget, because every death-detection channel
+        below can be blind at once. On an externally launched world (the
+        ``trtllm-llmapi-launch`` / multi-node path) the process monitor is
+        never registered (see _can_monitor_worker_processes) and is in any case
+        scoped to this host's pid namespace; RemoteMpiCommSessionClient.submit()
+        returns no futures to watch; and check_worker_error() only reports a
+        death the server observed as a *failed* future, which a rank that dies
+        and returns normally never produces. With all three silent this loop
+        would spin until the job's own timeout, leaving the surviving ranks
+        wedged in the init collective still holding their share of the weights.
+        """
         worker_processes_registered = False
+        timeout = _worker_init_timeout()
+        last_progress = time.monotonic()  # Re-armed by every status message.
 
         while True:
             if self.worker_init_status_queue.poll(1):
@@ -745,6 +778,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
                 logger.info("get signal from executor worker")
+                last_progress = time.monotonic()
 
                 signal = status[0]
                 if signal == self.WORKER_PROCESS_IDENTITIES_SIGNAL:
@@ -774,6 +808,16 @@ class GenerationExecutorProxy(GenerationExecutor):
                 # shutdown() hang instead of reporting this failure.
                 self._fail_initialization(RuntimeError(message), death)
             self._handle_background_error()
+
+            if time.monotonic() - last_progress >= timeout:
+                message = (
+                    f"Executor workers did not report readiness within "
+                    f"{timeout:g}s of the last progress; the world is "
+                    "presumed wedged during initialization. Raise "
+                    "TRTLLM_WORKER_INIT_TIMEOUT if worker startup is merely "
+                    "slow.")
+                logger.error(message)
+                self._fail_initialization(RuntimeError(message))
 
     def _register_worker_processes(self, status: tuple) -> None:
         """Register identities returned by locally spawned MPI workers.

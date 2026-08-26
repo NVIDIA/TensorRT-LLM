@@ -385,6 +385,28 @@ def enable_worker_single_process_for_tp1() -> bool:
     return os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS", "0") == "1"
 
 
+def env_timeout_seconds(env_name: str, default: float) -> float:
+    """Read a positive, finite timeout in seconds from ``env_name``.
+
+    Shared by the bounds that keep a blocking wait from becoming unbounded, so
+    they all reject the same unusable values. ``float()`` accepts "nan" and
+    "inf", and both defeat such a bound -- every nan comparison is False, and
+    inf never elapses -- as do non-positive values, so all of them fall back
+    to ``default`` with a warning instead.
+    """
+    raw = os.environ.get(env_name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(f"Ignoring invalid {env_name}={raw!r}; using {default:g}s")
+    return default
+
+
 class AsyncQueue:
     """
     A queue-style container that provides both sync and async interface.

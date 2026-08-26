@@ -976,3 +976,117 @@ def test_non_ready_status_during_init_does_not_abort_borrowed_session():
     assert proxy._engine_dead is True
     proxy.mpi_session.shutdown_abort.assert_not_called()
     proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+# --- The init wait is bounded even when every detection channel is silent ---
+# See _wait_for_executor_workers_ready for why all three can be blind at once
+# on an externally launched world. The fixture's default (finished-successfully
+# future, monitor reporting nothing, queue never signalling ready) is exactly
+# that state.
+
+
+def _proxy_awaiting_worker_init_with_silent_channels(owns_session: bool):
+    """Fixture default, narrowed to the remote path's three silent channels."""
+    proxy = _proxy_awaiting_worker_init(owns_session=owns_session)
+    # No futures to scan, seeded on both entry paths: _start_executor_workers
+    # assigns mpi_futures from submit(), and tests that call the wait loop
+    # directly bypass it.
+    proxy.mpi_session.submit.return_value = []
+    proxy.mpi_futures = []
+    proxy.mpi_session.check_worker_error.return_value = None
+    return proxy
+
+
+def test_silent_init_times_out_instead_of_waiting_forever(monkeypatch):
+    """With no channel reporting, the wait must still end in a failure."""
+    monkeypatch.setenv("TRTLLM_WORKER_INIT_TIMEOUT", "0.05")
+    proxy = _proxy_awaiting_worker_init_with_silent_channels(owns_session=True)
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="did not report readiness"):
+        proxy._start_executor_workers({})
+
+    # Same ordered teardown as a detected death: the wedged ranks are released
+    # rather than left holding their weights until the job ends.
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_silent_init_timeout_does_not_abort_borrowed_session(monkeypatch):
+    monkeypatch.setenv("TRTLLM_WORKER_INIT_TIMEOUT", "0.05")
+    proxy = _proxy_awaiting_worker_init_with_silent_channels(owns_session=False)
+
+    with pytest.raises(RuntimeError, match="did not report readiness"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_init_deadline_rearms_on_progress(monkeypatch):
+    """A world that keeps reporting is never cut off, however slow overall.
+
+    The budget bounds a stretch of silence, not the bootstrap, so the run below
+    separates the two: every individual silence stays under the budget while
+    the total elapsed time runs well over it. An absolute deadline -- or a
+    re-arm that never fires -- cuts this healthy world off; only re-arming on
+    each message carries it to READY.
+
+    The empty polls are what make that observable: the deadline is only
+    consulted on a poll that finds nothing, so a queue that always reports a
+    waiting message never reaches the check at all.
+    """
+    budget = 0.05
+    monkeypatch.setenv("TRTLLM_WORKER_INIT_TIMEOUT", str(budget))
+    proxy = _proxy_awaiting_worker_init_with_silent_channels(owns_session=True)
+    ready_status = (GenerationExecutorProxy.READY_SIGNAL, None)
+    messages = [
+        (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, []),
+        ready_status,
+    ]
+    # Two quiet polls before each message: 6 polls * 0.4 = 2.4x the budget
+    # overall, yet no silence exceeds 0.8x of it at any deadline check.
+    quantum = budget * 0.4
+    poll_results = [False, False, True, False, False, True]
+
+    def poll(_timeout=None):
+        _time.sleep(quantum)
+        return poll_results.pop(0)
+
+    proxy.worker_init_status_queue.poll.side_effect = poll
+    proxy.worker_init_status_queue.get.side_effect = lambda: messages.pop(0)
+
+    assert proxy._wait_for_executor_workers_ready() == ready_status
+    # Every scripted poll was consumed, so the run really did span the quiet
+    # stretches rather than short-circuiting on an early message.
+    assert poll_results == []
+    # Reported ready, so nothing was torn down.
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, proxy_module._DEFAULT_WORKER_INIT_TIMEOUT),
+        ("120.5", 120.5),
+        # Values this wait cannot use fall back rather than un-bounding it
+        # again: "inf" never elapses and a non-positive budget would report a
+        # healthy world dead on its first quiet poll.
+        ("not-a-number", proxy_module._DEFAULT_WORKER_INIT_TIMEOUT),
+        ("0", proxy_module._DEFAULT_WORKER_INIT_TIMEOUT),
+        ("-5", proxy_module._DEFAULT_WORKER_INIT_TIMEOUT),
+        ("inf", proxy_module._DEFAULT_WORKER_INIT_TIMEOUT),
+    ],
+)
+def test_worker_init_timeout_env_override(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("TRTLLM_WORKER_INIT_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_WORKER_INIT_TIMEOUT", raw)
+
+    assert proxy_module._worker_init_timeout() == expected

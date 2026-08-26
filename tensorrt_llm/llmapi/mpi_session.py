@@ -3,7 +3,6 @@
 
 import abc
 import itertools
-import math
 import os
 import socket
 import sys
@@ -21,7 +20,7 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
 from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
-from .utils import logger_debug, print_colored
+from .utils import env_timeout_seconds, logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
     import mpi4py
@@ -325,18 +324,8 @@ def _identity_barrier_timeout() -> float:
     a bootstrap that this layer still considers healthy.
     ``TRTLLM_MPI_IDENTITY_TIMEOUT`` overrides it.
     """
-    raw = os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT")
-    if not raw:
-        return _DEFAULT_IDENTITY_TIMEOUT
-    try:
-        value = float(raw)
-        if math.isfinite(value) and value > 0:
-            return value
-    except ValueError:
-        pass
-    logger.warning(f"Ignoring invalid TRTLLM_MPI_IDENTITY_TIMEOUT={raw!r}; "
-                   f"using {_DEFAULT_IDENTITY_TIMEOUT}s")
-    return _DEFAULT_IDENTITY_TIMEOUT
+    return env_timeout_seconds("TRTLLM_MPI_IDENTITY_TIMEOUT",
+                               _DEFAULT_IDENTITY_TIMEOUT)
 
 
 def _worker_identity_barrier():
