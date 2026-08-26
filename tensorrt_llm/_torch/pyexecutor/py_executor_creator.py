@@ -590,7 +590,9 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            draft_llm_args = _get_draft_llm_args(llm_args, spec_config)
+            draft_llm_args = copy.copy(llm_args)
+            if spec_config.load_format == "dummy":
+                draft_llm_args.load_format = LoadFormat.DUMMY
 
             model_weights_memory_tag = None
             model_weights_restore_mode = None

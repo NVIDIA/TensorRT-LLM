@@ -1193,6 +1193,9 @@ class PARDForCausalLM(nn.Module):
         draft_config_no_spec = replace(draft_config,
                                        spec_config=None,
                                        lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -1680,8 +1683,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = dict(
-                        model_config.extra_attrs)
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
                             2 * spec_config.tokens_per_gen_step)

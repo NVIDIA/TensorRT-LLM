@@ -1665,6 +1665,9 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
             pretrained_config=assistant_text_config,
             spec_config=None,
         )
+        # extra_attrs is init=False and would otherwise be reset by replace(),
+        # disconnecting the assistant's custom-op registries from the engine.
+        text_model_config.extra_attrs = model_config.extra_attrs
         super().__init__(
             Gemma4TextModel(text_model_config),
             config=model_config,

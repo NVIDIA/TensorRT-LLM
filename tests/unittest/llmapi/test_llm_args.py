@@ -173,9 +173,7 @@ moe_backend: TRTLLM
         assert restored.model_dump()["moe_backend"] == "TRTLLM"
 
     def test_autodeploy_rejects_override(self):
-        spec_config = MTPDecodingConfig(max_draft_len=1,
-                                        moe_backend="CUTLASS",
-                                        mtp_eagle_one_model=False)
+        spec_config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
 
         with pytest.raises(ValidationError,
                            match="available only with the PyTorch backend"):
@@ -198,15 +196,12 @@ moe_backend: TRTLLM
 
         assert llm_args.speculative_config.moe_backend == "CUTLASS"
 
-    def test_accepts_two_engine_mtp_override(self):
+    def test_deprecated_two_engine_mtp_is_normalized_to_one_engine(self):
         spec_config = MTPDecodingConfig(max_draft_len=1,
-                                        moe_backend="CUTLASS",
                                         mtp_eagle_one_model=False)
 
-        llm_args = TorchLlmArgs(model=llama_model_path,
-                                speculative_config=spec_config)
-
-        assert llm_args.speculative_config.moe_backend == "CUTLASS"
+        assert spec_config.mtp_eagle_one_model
+        assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
 
     def test_rejects_override_without_neural_drafter(self):
         spec_config = NGramDecodingConfig(max_draft_len=1,

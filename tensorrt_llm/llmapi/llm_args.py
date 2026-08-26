@@ -1838,7 +1838,7 @@ class DecodingBaseConfig(StrictBaseModel):
     moe_backend: Optional[_MoeBackend] = Field(
         default=None,
         description=
-        "MoE backend override for the speculative (draft) model on the PyTorch backend. None preserves the existing behavior, AUTO selects a backend from the draft model configuration, and a concrete backend applies only to the draft model. The resolved backend may fall back based on model, quantization, and hardware support. One-engine MTP backed by target-checkpoint draft layers does not support this override because target and draft layers share quantization metadata; shared-KV external assistants are supported."
+        "MoE backend override for the speculative (draft) model on the PyTorch backend. None preserves the existing behavior, AUTO selects a backend from the draft model configuration, and a concrete backend applies only to the draft model. The resolved backend may fall back based on model, quantization, and hardware support. Vanilla MTP and one-engine MTP-EAGLE backed by target-checkpoint or replacement-head draft layers do not support this override because target and draft layers share quantization metadata; full external MTP-EAGLE draft models are supported."
     )
 
     max_concurrency: Optional[PositiveInt] = Field(
@@ -2052,14 +2052,16 @@ class DecodingBaseConfig(StrictBaseModel):
         unsupported_internal_mtp = (spec_mode.is_mtp_vanilla()
                                     or (model_config_resolved
                                         and spec_mode.is_mtp_eagle_one_model()
-                                        and not self._use_shared_kv_cache))
+                                        and not self.uses_external_draft_model))
         if unsupported_internal_mtp:
             raise ValueError(
-                "speculative_config.moe_backend does not support "
-                "one-engine MTP backed by target-checkpoint draft layers "
+                "speculative_config.moe_backend does not support one-engine MTP "
+                "backed by target-checkpoint or replacement-head draft layers; "
+                "vanilla MTP is also unsupported "
                 "because target and draft layers share quantization metadata. "
                 "Leave moe_backend unset to inherit the target backend, or "
-                "use a separate draft checkpoint.")
+                "for one-engine MTP-EAGLE, use a full external draft-model "
+                "checkpoint.")
 
         has_neural_drafter = (spec_mode.has_draft_model()
                               or (spec_mode.use_one_engine()

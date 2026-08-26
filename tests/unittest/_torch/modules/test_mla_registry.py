@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -65,7 +66,7 @@ def _make_mla(config: ModelConfig) -> MLA:
     )
 
 
-def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:
+def test_duplicate_layer_ids_preserve_all_registrations() -> None:
     target_config = ModelConfig(skip_create_weights_in_init=True)
     draft_config = ModelConfig(skip_create_weights_in_init=True)
     next_config = ModelConfig(skip_create_weights_in_init=True)
@@ -88,6 +89,15 @@ def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:
     assert registry["0"]() is target_mla
     assert registry["0_0"]() is draft_mla
     assert registry["0_1"]() is next_mla
+
+    moe_layers = [nn.Module() for _ in range(3)]
+    for layer in moe_layers:
+        layer.layer_idx = 0
+        layer.layer_idx_str = "0"
+        MoE._register_layer(layer, target_config)
+
+    assert [layer.layer_idx_str for layer in moe_layers] == ["0", "0_0", "0_1"]
+    assert [ref() for ref in target_config.extra_attrs["moe_layers"].values()] == moe_layers
 
 
 def _make_dsv4_epilogue_layer() -> SimpleNamespace:
