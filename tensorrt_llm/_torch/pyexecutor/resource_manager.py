@@ -494,9 +494,6 @@ class KVCacheManager(BaseResourceManager):
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
-        # FIXME: flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool
-        # This dependency should be adjusted as it only covers the single window
-        # case and not VSWA scheme.
         if is_estimating_kv_cache:
             # If this is an estimation dry run, we have already calculated the
             # max_tokens under _util.py::try_prepare_estimation
