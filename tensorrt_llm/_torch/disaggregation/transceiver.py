@@ -259,6 +259,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def shutdown(self) -> None:
         if getattr(self, "_shutdown", False):
             return
+        blocked_recv_rids = [
+            rid
+            for rid, session in self._recv_sessions.items()
+            if getattr(session, "_enforce_physical_ownership", False)
+            and (
+                getattr(session, "resources_drained", None) is None
+                or not session.resources_drained()
+            )
+        ]
+        if blocked_recv_rids:
+            raise RuntimeError(
+                "refusing KV transceiver shutdown while receive resources remain active: "
+                f"rids={blocked_recv_rids}"
+            )
         self._shutdown = True
         for session in list(self._send_sessions.values()):
             session.close()
