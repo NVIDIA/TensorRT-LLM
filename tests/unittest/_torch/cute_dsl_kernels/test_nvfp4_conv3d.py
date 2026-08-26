@@ -41,12 +41,12 @@ def _require_sm100() -> None:
             (0, 1, 2),
             (0, 1, 0),
             {
-                "mma_tiler_mn": (128, 128),
+                "mma_tiler_mn": (128, 64),
                 "preferred_cluster_shape_mn": (1, 1),
                 "fallback_cluster_shape_mn": (1, 1),
                 "use_2cta_instrs": False,
             },
-            id="128x128-1cta-asymmetric-padding",
+            id="128x64-1cta-asymmetric-padding",
         ),
         pytest.param(
             (1, 256, 3, 12, 16),
