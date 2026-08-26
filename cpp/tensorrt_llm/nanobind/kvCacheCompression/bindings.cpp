@@ -17,7 +17,6 @@
  */
 
 #include "bindings.h"
-#include "tensorrt_llm/kv_cache_compression/coldPageCallbackAbi.h"
 #include "tensorrt_llm/kv_cache_compression/nativeColdPageCodec.h"
 
 #include <nanobind/nanobind.h>
@@ -30,6 +29,7 @@
 #include <cstdint>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace nb = nanobind;
@@ -41,10 +41,11 @@ namespace tensorrt_llm::nanobind::kv_cache_compression
 namespace
 {
 
-static_assert(sizeof(kv::PageIndexPair) == sizeof(compression::ColdPageIndexPair));
-static_assert(alignof(kv::PageIndexPair) == alignof(compression::ColdPageIndexPair));
-static_assert(offsetof(kv::PageIndexPair, dst) == offsetof(compression::ColdPageIndexPair, dst));
-static_assert(offsetof(kv::PageIndexPair, src) == offsetof(compression::ColdPageIndexPair, src));
+static_assert(sizeof(kv::PageIndexPair) == 8);
+static_assert(alignof(kv::PageIndexPair) == 8);
+static_assert(offsetof(kv::PageIndexPair, dst) == 0);
+static_assert(offsetof(kv::PageIndexPair, src) == 4);
+static_assert(std::is_trivially_copyable_v<kv::PageIndexPair>);
 
 //! Algorithm-neutral adapter from KVCM's native codec calls to one Python policy.
 class PythonColdPageCodec final : public compression::NativeColdPageCodec

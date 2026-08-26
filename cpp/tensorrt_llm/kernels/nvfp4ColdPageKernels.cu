@@ -112,6 +112,19 @@ struct Nvfp4ColdPageBuffer
     Nvfp4ColdPageKernelParams params;
 };
 
+// Private KVCM Page-index view; its matching layout is asserted here and at the callback boundary.
+struct alignas(8) PageIndexPairView
+{
+    std::int32_t dst;
+    std::int32_t src;
+};
+
+static_assert(sizeof(PageIndexPairView) == 8);
+static_assert(alignof(PageIndexPairView) == 8);
+static_assert(offsetof(PageIndexPairView, dst) == 0);
+static_assert(offsetof(PageIndexPairView, src) == 4);
+static_assert(std::is_trivially_copyable_v<PageIndexPairView>);
+
 // Keep every CTA iteration and shared-memory tile on complete 16-value scale groups.
 static_assert(kElementsPerScaleGroup % kElementsPerHalfGroup == 0,
     "An NVFP4 scale group must contain a whole number of half-groups");
@@ -121,7 +134,7 @@ static_assert(
     kMaxScaleBytesPerTile % sizeof(uint4) == 0, "A full scale tile must preserve the 16-byte transfer fast path");
 
 // Keep both kernel argument packs within CUDA's modern 32,764-byte limit.
-static_assert(sizeof(std::array<ColdPageIndexPair, kMaxTasksPerLaunch>) + sizeof(Nvfp4ColdPageWideTable)
+static_assert(sizeof(std::array<PageIndexPairView, kMaxTasksPerLaunch>) + sizeof(Nvfp4ColdPageWideTable)
             + sizeof(Nvfp4ColdPageIntegerTable) + sizeof(Nvfp4ColdPageScaleTable) + 2U * sizeof(std::uintptr_t)
         <= kKernelParameterLimitBytes,
     "Cold-page kernel arguments exceed CUDA's parameter limit");
@@ -172,7 +185,7 @@ __device__ Nvfp4ColdPageBuffer loadBuffer(std::uint32_t index, Nvfp4ColdPageWide
 }
 
 __device__ OffloadBufferTask resolveOffloadTask(
-    ColdPageIndexPair const& page, Nvfp4ColdPageBuffer const& buffer, std::uint8_t* coldBase, std::size_t coldPageBytes)
+    PageIndexPairView const& page, Nvfp4ColdPageBuffer const& buffer, std::uint8_t* coldBase, std::size_t coldPageBytes)
 {
     std::size_t const gpuPage = static_cast<std::size_t>(page.src);
     auto* coldPage = coldBase + static_cast<std::size_t>(page.dst) * coldPageBytes;
@@ -180,7 +193,7 @@ __device__ OffloadBufferTask resolveOffloadTask(
         coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + buffer.coldPaddingOffset};
 }
 
-__device__ OnboardBufferTask resolveOnboardTask(ColdPageIndexPair const& page, Nvfp4ColdPageBuffer const& buffer,
+__device__ OnboardBufferTask resolveOnboardTask(PageIndexPairView const& page, Nvfp4ColdPageBuffer const& buffer,
     std::uint8_t const* coldBase, std::size_t coldPageBytes)
 {
     std::size_t const gpuPage = static_cast<std::size_t>(page.dst);
@@ -466,7 +479,7 @@ __device__ void restoreNvfp4Pair(uint2 packedPair, T* output, std::uint32_t firs
 // FP16/BF16 GPU Page -> mapped-Host NVFP4 in bounded tiles.
 template <typename T>
 __global__ void offloadFrom16BitTiledKernel(
-    std::array<ColdPageIndexPair, kMaxTasksPerLaunch> const __grid_constant__ pages,
+    std::array<PageIndexPairView, kMaxTasksPerLaunch> const __grid_constant__ pages,
     Nvfp4ColdPageWideTable const __grid_constant__ wide, Nvfp4ColdPageIntegerTable const __grid_constant__ integers,
     Nvfp4ColdPageScaleTable const __grid_constant__ scales, std::uint8_t* coldBase, std::size_t coldPageBytes)
 {
@@ -546,7 +559,7 @@ __global__ void offloadFrom16BitTiledKernel(
 
 // FP8 E4M3 GPU Page -> mapped-Host NVFP4 in bounded tiles.
 __global__ void offloadFromFp8TiledKernel(
-    std::array<ColdPageIndexPair, kMaxTasksPerLaunch> const __grid_constant__ pages,
+    std::array<PageIndexPairView, kMaxTasksPerLaunch> const __grid_constant__ pages,
     Nvfp4ColdPageWideTable const __grid_constant__ wide, Nvfp4ColdPageIntegerTable const __grid_constant__ integers,
     Nvfp4ColdPageScaleTable const __grid_constant__ scales, std::uint8_t* coldBase, std::size_t coldPageBytes)
 {
@@ -688,7 +701,7 @@ __device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardBuf
 
 // Mapped-Host NVFP4 -> runtime GPU Page in bounded tiles.
 template <typename T>
-__global__ void onboardTiledKernel(std::array<ColdPageIndexPair, kMaxTasksPerLaunch> const __grid_constant__ pages,
+__global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLaunch> const __grid_constant__ pages,
     Nvfp4ColdPageWideTable const __grid_constant__ wide, Nvfp4ColdPageIntegerTable const __grid_constant__ integers,
     Nvfp4ColdPageScaleTable const __grid_constant__ scales, std::uint8_t const* coldBase, std::size_t coldPageBytes)
 {
@@ -768,13 +781,13 @@ void launchPageChunks(Kernel kernel, void const* pages, std::size_t numPages, st
     {
         std::uint32_t const numChunkPages
             = static_cast<std::uint32_t>(std::min<std::size_t>(numPages - offset, kMaxTasksPerLaunch));
-        auto const* chunkPages = pageBytes + offset * sizeof(ColdPageIndexPair);
+        auto const* chunkPages = pageBytes + offset * sizeof(PageIndexPairView);
 
         // CUDA copies the full by-value array, so pad only the final partial chunk.
-        std::array<ColdPageIndexPair, kMaxTasksPerLaunch> paddedPages{};
+        std::array<PageIndexPairView, kMaxTasksPerLaunch> paddedPages{};
         if (numChunkPages < kMaxTasksPerLaunch)
         {
-            std::memcpy(paddedPages.data(), chunkPages, numChunkPages * sizeof(ColdPageIndexPair));
+            std::memcpy(paddedPages.data(), chunkPages, numChunkPages * sizeof(PageIndexPairView));
             chunkPages = reinterpret_cast<std::byte const*>(paddedPages.data());
         }
 

@@ -19,7 +19,6 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kv_cache_compression/coldPageCallbackAbi.h"
 
 #include <array>
 #include <cstddef>
@@ -38,8 +37,6 @@ enum class Nvfp4ColdPageRuntimeType : std::uint8_t
     kBfloat16 = 1,
     kFp8E4m3 = 2,
 };
-
-using ColdPageIndexPair = ::tensorrt_llm::kv_cache_compression::ColdPageIndexPair;
 
 inline constexpr std::uint32_t kNvfp4ColdPageMaxBuffersPerLaunch = 256;
 inline constexpr std::uint32_t kNvfp4ColdPageWideFields = 6;

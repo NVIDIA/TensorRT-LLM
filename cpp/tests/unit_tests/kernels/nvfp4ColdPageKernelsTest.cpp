@@ -17,6 +17,7 @@
  */
 
 #include "tensorrt_llm/kernels/nvfp4ColdPageKernels.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
@@ -41,7 +42,7 @@ namespace
 
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::HostMem;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::MemAddress;
-using tensorrt_llm::kernels::ColdPageIndexPair;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::PageIndexPair;
 using tensorrt_llm::kernels::Nvfp4ColdPageIntegerTable;
 using tensorrt_llm::kernels::Nvfp4ColdPageRuntimeType;
 using tensorrt_llm::kernels::Nvfp4ColdPageScaleTable;
@@ -585,7 +586,7 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     MappedHostRegion compactPages(coldBaseOffset + slotCapacity * compactSlotBytes);
     auto* compactBase = compactPages.bytes() + coldBaseOffset;
     std::vector<std::array<std::vector<std::uint8_t>, 2>> rawHost(numPages);
-    std::vector<ColdPageIndexPair> offloadTasks;
+    std::vector<PageIndexPair> offloadTasks;
     offloadTasks.reserve(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
     {
@@ -671,7 +672,7 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         }
     }
 
-    std::vector<ColdPageIndexPair> onboardTasks;
+    std::vector<PageIndexPair> onboardTasks;
     onboardTasks.reserve(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
     {
@@ -822,8 +823,8 @@ void runPartialPageTailIsolation(RawKind kind)
     DeviceRegion rawOutputK(numPages * rawSlotBytes);
     DeviceRegion rawOutputV(numPages * rawSlotBytes);
     MappedHostRegion compactPages(numPages * compactSlotBytes);
-    std::vector<ColdPageIndexPair> offloadTasks;
-    std::vector<ColdPageIndexPair> onboardTasks;
+    std::vector<PageIndexPair> offloadTasks;
+    std::vector<PageIndexPair> onboardTasks;
     offloadTasks.reserve(numPages);
     onboardTasks.reserve(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
@@ -984,8 +985,8 @@ void runUnaryMlaWithLosslessSideRoundTrip(RawKind kind)
     std::array<std::vector<std::uint8_t>, numPages> mlaHost;
     std::array<std::vector<std::uint8_t>, numPages> sideHost;
     std::array<ReferenceNvfp4, numPages> references;
-    std::vector<ColdPageIndexPair> offloadTasks;
-    std::vector<ColdPageIndexPair> onboardTasks;
+    std::vector<PageIndexPair> offloadTasks;
+    std::vector<PageIndexPair> onboardTasks;
     for (std::size_t page = 0; page < numPages; ++page)
     {
         mlaHost[page] = makeRawPage(kind, page, 0U, params, geometry, InputPattern::kDense);
@@ -1140,7 +1141,7 @@ TEST(Nvfp4ColdPageWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
         = makeNvfp4ColdPageTestMetadata(inputMetadatas, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
     auto const outputMetadata
         = makeNvfp4ColdPageTestMetadata(outputMetadatas, coldPageBytes, Nvfp4ColdPageRuntimeType::kBfloat16);
-    ColdPageIndexPair const page{0, 0};
+    PageIndexPair const page{0, 0};
     invokeNvfp4ColdPageEncode(&page, 1U, inputMetadata, compactPage.data(), stream);
     invokeNvfp4ColdPageDecode(&page, 1U, outputMetadata, compactPage.data(), stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
@@ -1202,8 +1203,8 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
     }
 
     MappedHostRegion coldPages(numPages * coldPageBytes);
-    std::vector<ColdPageIndexPair> offloadPages;
-    std::vector<ColdPageIndexPair> onboardPages;
+    std::vector<PageIndexPair> offloadPages;
+    std::vector<PageIndexPair> onboardPages;
     offloadPages.reserve(numPages);
     onboardPages.reserve(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
