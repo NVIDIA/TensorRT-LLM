@@ -1908,6 +1908,7 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.max_seq_len == 32
 
     def test_encoder_decoder_cuda_graph_user_interface(self):
+        """EncodeCudaGraphConfig round-trips through TorchLlmArgs as the user writes it."""
         encoder_config = EncodeCudaGraphConfig(
             batch_sizes=[1, 4],
             num_tokens=[16, 64],
@@ -1958,6 +1959,7 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert not feature_args.encoder_cuda_graph_config.seq_lens
 
     def test_encoder_cuda_graph_config_validation(self):
+        """encoder_cuda_graph_config is rejected without encoder_max_batch_size."""
         with pytest.raises(
                 ValidationError,
                 match="encoder_cuda_graph_config requires encoder_max_batch_size"
@@ -2009,6 +2011,8 @@ class TestTorchLlmArgsCudaGraphSettings:
 
     def test_token_encoder_without_buckets_is_rejected_before_weights_load(
             self):
+        """A token encoder missing buckets is rejected at config time, before weights load."""
+
         # The model class settles token-vs-feature without an instance, so
         # the user learns now rather than after weights load.
         class _TokenEncoder:
@@ -2023,11 +2027,14 @@ class TestTorchLlmArgsCudaGraphSettings:
                 llm._reject_token_encoder_config_without_buckets()
 
     def test_feature_encoder_without_buckets_is_accepted(self):
+        """A feature encoder may omit num_tokens/seq_lens; it derives both from the model."""
+
         # Whisper derives both lists from the model: the same config is
         # complete for it, and rejecting it would break every Whisper run.
         class _FeatureEncoder:
 
             def encoder_graph_spec(self):
+                """Stand-in Whisper-shaped encoder contract."""
                 return ((480000, ), torch.float32, 1500)
 
         llm = self._bucketless_encoder_llm(["WhisperForConditionalGeneration"])
@@ -2040,6 +2047,7 @@ class TestTorchLlmArgsCudaGraphSettings:
     @pytest.mark.parametrize("architectures", [[], ["SomeUnregisteredArch"]])
     def test_an_unresolved_architecture_defers_to_the_model_engine(
             self, architectures):
+        """An unregistered architecture defers the bucket check to the model engine."""
         # Out-of-tree models register in the worker, not here. Guessing would
         # reject a feature encoder the engine goes on to accept.
         llm = self._bucketless_encoder_llm(architectures)
@@ -2058,6 +2066,7 @@ class TestTorchLlmArgsCudaGraphSettings:
     ])
     def test_a_loader_that_picks_the_class_is_never_second_guessed(
             self, field, value):
+        """When a checkpoint loader picks the class, the registry must not be consulted."""
         # These all reach `checkpoint_loader.load_config()`, where the engine
         # gets its class, so the on-disk architecture may not be the one it
         # builds. The registry must not even be consulted.
@@ -2069,6 +2078,7 @@ class TestTorchLlmArgsCudaGraphSettings:
         resolve.assert_not_called()
 
     def test_a_decoder_only_model_is_left_to_the_model_engine(self):
+        """A decoder-only model skips the encoder bucket check entirely."""
         # No encoder at all: the engine's "consumes packed tokens" wording
         # would only mislead, and skipping keeps the model import off this path.
         llm = self._bucketless_encoder_llm(["LlamaForCausalLM"],

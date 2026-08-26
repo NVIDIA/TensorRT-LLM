@@ -116,6 +116,7 @@ def _make_llm(
     tensor_parallel_size: int = 1,
     encoder_graphs: bool = False,
 ) -> LLM:
+    """Build a Whisper LLM for the test matrix, optionally with encoder CUDA graphs."""
     # CudaGraphConfig captures the decode step; the enc-dec encoder step opts in
     # separately through `encoder_cuda_graph_config`. Requesting decoder graphs
     # must work for every dtype.

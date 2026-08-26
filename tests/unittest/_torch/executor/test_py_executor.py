@@ -209,6 +209,7 @@ def _make_async_encoder_executor(future):
 
 
 def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
+    """Build a PyExecutor stub wired for token-path encoder batch-wait admission."""
     executor = object.__new__(PyExecutor)
     executor.max_batch_size = 32
     batch_sizes = batch_sizes or [1, 2, 4, 8]
@@ -259,6 +260,7 @@ def _make_feature_encoder_batch_wait_executor(
 
 
 def _make_encoder_fallback_batch_wait_executor():
+    """Build a PyExecutor stub with no encoder graph config, for the fallback path."""
     executor = object.__new__(PyExecutor)
     executor.llm_args = types.SimpleNamespace(
         encoder_cuda_graph_config=None,
@@ -318,6 +320,7 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
 def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
     runner_batch_sizes, config_batch_sizes, num_requests, expected
 ):
+    """Feature admission targets the runner's resolved sizes, not the configured ones."""
     executor = _make_feature_encoder_batch_wait_executor(runner_batch_sizes)
     if config_batch_sizes is not None:
         executor.llm_args.encoder_cuda_graph_config.batch_sizes = config_batch_sizes
@@ -334,6 +337,7 @@ def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
 
 
 def test_encoder_microbatch_admission_skips_uncaptured_padded_size():
+    """Feature admission never targets a batch size the runner did not capture."""
     # An `encoder_max_batch_size` above `max_batch_size` leaves a captured
     # bucket beyond the admission limit. Padding admission up to the limit
     # itself is a token-path move: a feature batch of 8 would have to pad to
@@ -349,6 +353,7 @@ def test_encoder_microbatch_admission_skips_uncaptured_padded_size():
 
 
 def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
+    """A runner that declined capture must not make admission wait on unreplayable shapes."""
     # supported_batch_sizes stays populated from the config even when capture
     # was declined (TP > 1, or no bucket fits), so waiting on those shapes
     # would stall a batch that can only ever run eager. With no decoder work

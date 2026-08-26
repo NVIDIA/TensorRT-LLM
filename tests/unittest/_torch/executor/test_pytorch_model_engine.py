@@ -1224,6 +1224,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         return EncoderCUDAGraphRunner(config)
 
     def test_feature_encoder_capture_keys_are_all_reachable(self) -> None:
+        """Every feature capture key matches a batch shape the runtime can actually produce."""
         # Every request contributes exactly fixed_seq_len positions, so the
         # only reachable key per batch size is (bs, bs * fixed, fixed), and
         # every slot in that layout is a full fixed_seq_len sequence. The token
@@ -1259,6 +1260,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
                 def encoder_graph_spec(
                         self) -> Tuple[Tuple[int, ...], torch.dtype, int]:
+                    """Stand-in fixed-shape encoder contract for the test model."""
                     return spec
 
         engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
@@ -1270,6 +1272,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         return engine, spec
 
     def test_encoder_graph_spec_selection(self) -> None:
+        """The model, not the config, selects feature mode; TP > 1 stays eager."""
         # The model selects feature mode, not the config: an encoder either
         # takes fixed-shape features or it does not. TP > 1 is gated off
         # because allreduce inside encoder capture is unverified.
@@ -1295,6 +1298,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_encoder_graph_bucket_config_is_required_for_token_encoders(
             self) -> None:
+        """A token encoder missing its bucket lists fails loudly instead of silently running eager."""
         # A token encoder's num_tokens/seq_lens buckets are the whole key
         # space, so a config missing them can only run eager — a loud failure,
         # not a silent perf regression. A feature encoder derives both from the
@@ -1330,6 +1334,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     num_tokens or [], seq_lens or [])
 
     def test_encoder_graph_bucket_config_warns_for_encode_only(self) -> None:
+        """An encode-only model warns and stays eager rather than raising."""
         # An encode-only model receives its buckets through `cuda_graph_config`,
         # a slot that has always accepted a batch-sizes-only
         # EncodeCudaGraphConfig and run eager. Raising there would break
@@ -1346,6 +1351,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_feature_encoder_batch_sizes_drop_past_the_token_budget(
             self) -> None:
+        """The encoder token budget caps feature bucket sizes; an empty list means stay eager."""
         # A feature request costs a whole fixed_seq_len against the encoder
         # token budget, so the budget caps the bucket list far below
         # encoder_max_batch_size. An empty result is the signal to stay eager;
@@ -1368,6 +1374,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     expected)
 
     def test_feature_pad_batch_refuses_wide_bucket_gaps(self) -> None:
+        """Feature padding is refused once it would cost more than 12.5% extra work."""
         # A feature pad slot is a full fixed_seq_len encoder forward, unlike the
         # 1-token pads of the token path, so padding is bounded at 12.5% extra
         # work. Consecutive powers of two never clear that bound; a batch of 8
@@ -1389,6 +1396,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_captured_graph_metadata_skips_the_eager_metadata_build(
             self) -> None:
+        """A graph hit resolves captured metadata without an eager attn_metadata build."""
         # The runtime path asks for captured metadata before building any, so a
         # graph hit must not need an attn_metadata argument at all: on a hit
         # `maybe_get_cuda_graph` only reads it for a backend check.

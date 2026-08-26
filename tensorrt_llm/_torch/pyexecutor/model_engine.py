@@ -8369,6 +8369,18 @@ class PyTorchModelEngine(ModelEngine):
 
     def _enc_dec_encoder_graph_forward_fn(
             self, capture_inputs: Dict[str, Any]) -> torch.Tensor:
+        """Run the encoder step over a graph runner's capture inputs.
+
+        Adapts the runner's flat capture dict to `_forward_step_encoder`'s
+        keyword names. Passed to `EncoderCUDAGraphRunner.capture` so the body
+        traced into the graph is the same code path a replay stands in for.
+
+        Args:
+            capture_inputs: Padded encoder inputs owned by the graph runner.
+
+        Returns:
+            Encoder hidden states, `[padded_batch, fixed_seq_len, hidden]`.
+        """
         return self._forward_step_encoder({
             'input_features':
             capture_inputs['input_features'],

@@ -2026,6 +2026,7 @@ class EncoderCUDAGraphRunner:
         attn_md = capture_inputs["attn_metadata"]
 
         def copy_inputs() -> None:
+            """Refill the captured device token inputs from their host mirrors."""
             capture_inputs["input_ids"].copy_(
                 sliced_static_tensors_cpu["input_ids"], non_blocking=True)
             capture_inputs["position_ids"].copy_(
@@ -2046,6 +2047,11 @@ class EncoderCUDAGraphRunner:
             return capture_inputs, None
 
         def capture_h2d() -> None:
+            """Stage this replay's token inputs and sequence lengths onto the device.
+
+            Returned to the caller so the copies are issued per replay, outside
+            the captured graph, rather than being baked into it.
+            """
             copy_inputs()
             attn_md._seq_lens_cuda.copy_(attn_md._seq_lens, non_blocking=True)
 
