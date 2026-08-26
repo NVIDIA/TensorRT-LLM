@@ -23,7 +23,6 @@ from typing import Any, Iterable, List, Optional, Union
 import PIL.Image
 import torch
 import torch.nn as nn
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer
@@ -36,6 +35,7 @@ except ImportError:  # pragma: no cover - tqdm is optional at runtime.
         return iterable
 
 
+from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import load_wan_vae
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -477,11 +477,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 if PipelineComponent.VAE.value in self.offloader.requested_components()
                 else device
             )
-            self.vae = AutoencoderKLWan.from_pretrained(
+            self.vae = load_wan_vae(
                 checkpoint_dir,
-                subfolder=PipelineComponent.VAE,
-                torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(vae_device)
+                vae_device,
+                dtype=torch.bfloat16,
+            )
 
             self.vae_scale_factor_temporal = getattr(
                 self.vae.config, "scale_factor_temporal", self.vae_scale_factor_temporal
@@ -1101,7 +1101,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 )
             latents = (latents * self._latents_std) + self._latents_mean
         else:
-            scaling_factor = self.vae.config.get("scaling_factor", 1.0)
+            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latents = latents / scaling_factor
 
         with self.offloader.context_if_requested(PipelineComponent.VAE.value):
