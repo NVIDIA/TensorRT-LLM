@@ -441,6 +441,53 @@ def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
     )
 
 
+def _shard_head_major_param(
+    name: str,
+    src: torch.Tensor,
+    param: torch.nn.Parameter,
+    *,
+    kda_tp_size: int,
+    kda_tp_rank: int,
+    model_tp_rank: int,
+) -> torch.Tensor:
+    """TP-shard a KDA ``linear_attn`` or shared-expert / dense-MLP
+    ``down_proj`` checkpoint tensor down to this rank's local slice.
+
+    Returns ``src`` unchanged when it already matches ``param`` (replicated or
+    single-rank tensors) and for every other name — the caller then routes
+    MLA head-shards and the shape-match copy. The actual slicing is delegated
+    to :func:`load_weight_shard` so the framework owns the ceil-divide
+    semantics.
+
+    - ``.linear_attn.`` names are KDA head-major tensors (``linear_attn``
+      exists only on KDA layers): ``o_proj`` shards its input columns (ROW),
+      every other projection its output rows (COLUMN), by ``kda_tp_size``.
+    - a shared-expert / dense-MLP ``down_proj`` is ROW-sharded on its input
+      columns; the fused ``gate_up_proj`` is row-concatenated and returns
+      before this helper, so ``down_proj`` is the only half that reaches here.
+      The TP factor comes from the checkpoint-vs-param shapes; a subgroup
+      smaller than model TP repeats, so the shard index is ``model_tp_rank``
+      modulo the parameter's shard count.
+    """
+    if src.shape == param.shape:
+        return src
+    if ".linear_attn." in name:
+        mode = (
+            TensorParallelMode.ROW if name.endswith(".o_proj.weight") else TensorParallelMode.COLUMN
+        )
+        return load_weight_shard(src, kda_tp_size, kda_tp_rank, mode, device=param.device)
+    if name.endswith(".down_proj.weight") and (".shared_experts." in name or ".mlp." in name):
+        assert src.shape[1] % param.shape[1] == 0, (
+            f"{name}: checkpoint input dim {src.shape[1]} is not "
+            f"divisible by param input dim {param.shape[1]}"
+        )
+        tp = src.shape[1] // param.shape[1]
+        return load_weight_shard(
+            src, tp, model_tp_rank % tp, TensorParallelMode.ROW, device=param.device
+        )
+    return src
+
+
 # ---------------------------------------------------------------------------
 # FP8 block-scale weight read for the replicated MoE-layer MLP projections.
 # ---------------------------------------------------------------------------
@@ -2202,15 +2249,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 kda_tp_rank = layer.linear_attn._kda_tp_rank
                 break
 
-        COL = TensorParallelMode.COLUMN  # shards output rows (dim 0)
-        ROW = TensorParallelMode.ROW  # shards input columns (dim 1)
-        is_kda_by_layer = [getattr(layer, "is_kda", False) for layer in self.model.layers]
+        COL = TensorParallelMode.COLUMN  # gate/up column shard (output rows)
 
-        def _layer_is_kda(name: str) -> bool:
-            idx = int(name.split("layers.", 1)[1].split(".", 1)[0])
-            return is_kda_by_layer[idx]
-
-        def load_param(name: str, param: torch.nn.Parameter):
+        def load_param(name: str, param: torch.nn.Parameter) -> None:
             if device.type == "cuda":
                 torch.cuda.set_device(device)
             if name.endswith(_GATE_UP_FUSED_SUFFIX):
@@ -2228,13 +2269,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     gate_key, _materialize(weights[gate_key]), weights
                 )
                 tp = gate_full.shape[0] // inter
-                rk = (model_tp_rank % tp) if tp > 1 else 0
-                gate = load_weight_shard(gate_full, tp, rk, COL)
+                # load_weight_shard returns the whole tensor when tp <= 1, so
+                # the rank needs no tp > 1 guard.
+                rk = model_tp_rank % tp
+                gate = load_weight_shard(gate_full, tp, rk, COL, device=param.device)
                 up = load_weight_shard(
                     _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights),
                     tp,
                     rk,
                     COL,
+                    device=param.device,
                 )
                 if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
                     raise ValueError(
@@ -2298,26 +2342,18 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                             f"{param.numel()} entries, got nonzero tail"
                         )
                     src = src[: param.numel()]
-            if ".linear_attn." in name and _layer_is_kda(name):
-                # KDA head-shard: the checkpoint is an exact kda_tp_size
-                # multiple on the head-major axis. Replicated projections
-                # (f_a/g_a, o_norm) already match and are copied as-is;
-                # o_proj shards its input columns (ROW), every other
-                # head-major projection its output rows (COLUMN). MLA
-                # projections are head-sharded by their own Linear modules
-                # (mla_head_shard_linears) in the shape-mismatch block below.
-                if src.shape != param.shape:
-                    mode = ROW if name.endswith(".o_proj.weight") else COL
-                    src = load_weight_shard(src, kda_tp_size, kda_tp_rank, mode)
-            elif ".shared_experts." in name or ".mlp." in name:
-                # Shared-expert / dense-MLP: gate/up column, down row; TP factor
-                # from the shapes (the module is built at the per-rank dim). A
-                # subgroup smaller than model TP repeats, so the shard index is
-                # model tp_rank modulo the parameter's shard count.
-                if src.shape != param.shape:
-                    mode, axis = (ROW, 1) if name.endswith(".down_proj.weight") else (COL, 0)
-                    tp = src.shape[axis] // param.shape[axis]
-                    src = load_weight_shard(src, tp, (model_tp_rank % tp) if tp > 1 else 0, mode)
+            # KDA ``linear_attn`` (head-major) and shared-expert / dense-MLP
+            # ``down_proj`` shards are shape-derived; replicated tensors and
+            # every other name pass through unchanged. MLA head-shards and the
+            # shape-match copy are handled by the block below.
+            src = _shard_head_major_param(
+                name,
+                src,
+                param,
+                kda_tp_size=kda_tp_size,
+                kda_tp_rank=kda_tp_rank,
+                model_tp_rank=model_tp_rank,
+            )
 
             if src.shape != param.shape:
                 # MLA q_b/g/o head-shard: delegate to the same Linear modules
