@@ -3624,15 +3624,6 @@ class PyExecutor:
 
     def _check_disagg_transfer_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed."""
-        # A synchronous GEN receive is rank-local and blocking, so entering
-        # the context progress collective is unsafe unless GEN transfer is
-        # async, context is skipped entirely (gen-only-no-context bench), or
-        # there's only one rank to diverge from.
-        if (not self._uses_async_disagg_gen_transfer()
-                and not self._is_disagg_gen_only_no_context_benchmark()
-                and self._dist_size(self.dist, "world_size") > 1):
-            return
-
         self._check_disagg_ctx_cache_transfer_status(0)
 
     def _pace_idle_disagg_loop(self) -> None:
