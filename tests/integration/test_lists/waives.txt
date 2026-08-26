@@ -220,6 +220,7 @@ full:H100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:H100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:H100/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
 full:H100/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress] SKIP (https://nvbugs/6312828)
+full:H100_PCIe/unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests SKIP (https://nvbugs/6672542)
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
 full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False] SKIP (https://nvbugs/6345827)
 full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] SKIP (https://nvbugs/6345827)
