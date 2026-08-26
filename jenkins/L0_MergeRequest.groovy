@@ -960,13 +960,34 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
         def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
-        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output)
+        def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
+        def multiGpuLabelGateOpen = multiGpuRequired &&
+            _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                            multiGpuRequired, multiGpuLabelGateOpen)
         return result
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
+    }
+}
+
+// Observe the multi-GPU approval gate at CBTS decision time. This is telemetry
+// only: a later dispatch re-checks the label so this snapshot cannot change CI
+// behavior. Match the dispatch policy and fail open on non-interruption errors.
+def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+{
+    try {
+        def blockReason = requireMultiGpuApprovalLabel(
+            pipeline, globalVars, "CBTS telemetry")
+        return !blockReason
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: multi-GPU label telemetry check failed (${e.message}); failing open")
+        return true
     }
 }
 
@@ -1018,10 +1039,19 @@ def _cbtsCoverageAudit(pipeline)
 
 // Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
 // decisionJson null for deferred; reason used only then. Context/creds via env.
-def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson)
+// Multi-GPU enters the pre-merge denominator only when normal CI requires it
+// and the approval-label gate is open at CBTS decision time.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson,
+                        boolean multiGpuRequired = false, boolean multiGpuLabelGateOpen = false)
 {
     try {
         def args = "--status ${status}"
+        if (multiGpuRequired) {
+            args += " --multi-gpu-required"
+        }
+        if (multiGpuLabelGateOpen) {
+            args += " --multi-gpu-label-gate-open"
+        }
         if (decisionJson != null) {
             pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
             args += " --decision cbts_decision.json"
