@@ -1703,15 +1703,6 @@ class TritonFusedMoE(MoE):
         else:
             return TritonUnquantizedFusedMoEMethod()
 
-    def create_weights(self):
-        if self._weights_created:
-            return
-
-        self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
-
-        self._weights_created = True
-
     def forward_impl(
         self,
         x: torch.Tensor,

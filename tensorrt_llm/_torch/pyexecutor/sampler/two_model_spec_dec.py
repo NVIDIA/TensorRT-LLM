@@ -248,11 +248,7 @@ class TwoModelSpecDecHandler:
         #        filtering of vocab_size logits, out of vocab_size in
         #        total. The 'sample' below should generally be avoided
         #        by retaining the draft_probs during drafting (TRTLLM-7772).
-        draft_sampling_strategy = (
-            GREEDY
-            if request.py_draft_use_greedy_sampling
-            else _request_strategy(request, vocab_size=2**31)
-        )
+        draft_sampling_strategy = _request_strategy(request, vocab_size=2**31)
         generator = self._sampler.get_generator(request.py_draft_logits.device)
         _, draft_probs, _ = sample(
             draft_sampling_strategy,

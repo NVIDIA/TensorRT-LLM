@@ -152,6 +152,8 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def DISABLE_CBTS = "disable_cbts"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
@@ -191,6 +193,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
+    (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -209,6 +212,8 @@ def TARGET_BRANCH = "target_branch"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def BUILD_BRANCH = "build_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -218,6 +223,7 @@ def globalVars = [
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
 ]
+globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -226,6 +232,7 @@ if (runMode == "nightly_release") {
 // GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
     !GEN_POST_MERGE_BUILDS_ONLY &&
+    !testFilter[INFRA_DRY_RUN] &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -382,16 +389,23 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+    if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
     }
-    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-    testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
-    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-    // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-    // Coverage runs only on the official post-merge pipeline.
-    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (testFilter[INFRA_DRY_RUN]) {
+        pipeline.echo("Changed-file analysis is skipped for the infrastructure dry run.")
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = false
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = ""
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = []
+        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
+    } else {
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
     getContainerURIs().each { k, v ->
@@ -492,7 +506,11 @@ def preparation(pipeline, testFilter, globalVars)
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
         stage("Merge Test Waive List") {
-            mergeWaiveList(pipeline, globalVars)
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Merge Test Waive List for the infrastructure dry run."
+            } else {
+                mergeWaiveList(pipeline, globalVars)
+            }
         }
     })
 }
@@ -746,7 +764,8 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file list to empty list.")
@@ -782,7 +801,8 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     // Note: This function intentionally propagates exceptions to the caller.
     // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file diff to empty string.")
@@ -1642,6 +1662,14 @@ def collectTestResults(pipeline, testFilter, globalVars)
     })
 }
 
+def resolveBuildBranch(globalVars)
+{
+    if (globalVars[GITHUB_PR_API_URL]) {
+        return "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+    }
+    return env.gitlabBranch ? env.gitlabBranch : "main"
+}
+
 def getCommonParameters()
 {
     return [
@@ -1676,7 +1704,8 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
         ]
     }
 
-    if (env.testPhase2StageName) {
+    // Preserve an explicit empty phase override from the dry-run helper.
+    if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
         parameters += [
             'testPhase2StageName': env.testPhase2StageName,
         ]
@@ -1721,12 +1750,28 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     return buildStatus
 }
 
+def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, imageParameters)
+{
+    String testFilterJson = writeJSON returnText: true, json: testFilter
+    def additionalParameters = [
+        'testFilter': testFilterJson,
+        // Keep all synthetic GPU-count stages in this helper.
+        'testPhase2StageName': '',
+    ] + imageParameters
+    stage("[Test-${arch}-Single-GPU] Remote Run") {
+        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
+    }
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release-Check": {
             script {
-                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Release-Check for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
                     return
                 }
@@ -1812,6 +1857,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
                 if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
                     echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
                     return
                 }
 
@@ -1966,6 +2020,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
+                    return
+                }
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -2095,10 +2157,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
 
                         // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
                         // instead of the BuildDockerImages helper job's own counter.
@@ -2165,10 +2224,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 stage("[Build-Release-Docker-Images] Remote Run") {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
 
                         // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
                         // instead of the BuildDockerImages helper job's own counter.
@@ -2272,7 +2328,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    parallelJobs.failFast = enableFailFast
+    // Preserve both architecture tracks during dry acceptance.
+    def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
+    parallelJobs.failFast = effectiveFailFast
     pipeline.parallel parallelJobs
 }
 
@@ -2296,24 +2354,26 @@ pipeline {
     post {
         unsuccessful {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "failed", GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }
         success {
             script {
-                if (enableUpdateGitlabStatus) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
-                } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
-                    trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                if (!testFilter[INFRA_DRY_RUN]) {
+                    if (enableUpdateGitlabStatus) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
+                        trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    }
                 }
             }
         }
         aborted {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'canceled', GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
@@ -2322,10 +2382,7 @@ pipeline {
             script {
                 stage("Upload Build Info") {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
                         def buildInfo = "commit=${env.gitlabCommit}\n" +
                             "branch=${branch}\n" +
                             "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
@@ -2366,7 +2423,11 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this, globalVars)
+                                if (testFilter[INFRA_DRY_RUN]) {
+                                    echo "Skipping Release-Check for the infrastructure dry run."
+                                } else {
+                                    launchReleaseCheck(this, globalVars)
+                                }
                             }
                         }
                     } else {

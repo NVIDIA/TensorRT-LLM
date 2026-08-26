@@ -15,7 +15,7 @@
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
 import math
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -40,12 +40,13 @@ from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
+    MoEImplClass,
     RoutingMethodType,
     create_moe,
     resolve_moe_cls,
 )
-from ..moe.fused_moe.interface import MoE, MoEWeightLoadingMode
-from ..moe.fused_moe.interface import MoE as MoEInterface
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
@@ -66,8 +67,8 @@ class LagunaGate(nn.Module):
         num_experts: int,
         top_k: int,
         dtype: Optional[torch.dtype] = None,
-        moe_backend_cls: Type[MoE] = None,
-    ):
+        moe_backend_cls: Optional[MoEImplClass] = None,
+    ) -> None:
         super().__init__()
         self.top_k = top_k
         self.moe_backend_cls = moe_backend_cls
@@ -667,7 +668,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         return weights
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoEInterface)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
         self,
@@ -676,7 +677,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoEInterface):
+        if is_moe_weight_owner(module):
             # DeepSeekFP8 block-scales MoE expects "weight_scale_inv" but NVFP4
             # MoE expects the original "weight_scale" (plus "weight_scale_2").
             use_fp8_block_rename = (

@@ -20,7 +20,7 @@ combine) from
 ``tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
-``tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py``. This
+``tensorrt_llm/_torch/custom_ops/cute_dsl_megamoe_custom_op.py``. This
 file only owns:
 
   * capability gating (``can_implement``)
@@ -77,10 +77,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.model_config import ModelConfig
-
 # ``megamoe_activation_sf_bytes_per_row`` lives at module top of the
 # custom-op file (NOT inside its ``IS_MEGAMOE_OP_AVAILABLE`` gate), so
 # it is always importable. The provider / shared-workspace helpers used
@@ -89,12 +85,16 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
-from tensorrt_llm._torch.utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+from ....autotuner import AutoTuner
+from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ....model_config import ModelConfig
+from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -103,7 +103,7 @@ from ..impl_contract import (
     MoERunContext,
 )
 from ..impl_environment import MoEDep
-from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
 
@@ -323,7 +323,7 @@ class _MegaMoeBuffers:
 # ---------------------------------------------------------------------------
 
 
-class MegaMoECuteDsl(MoE):
+class MegaMoECuteDsl(MoEImplBase):
     """MoE backend wrapping the ported MegaMoE CuteDSL NVFP4 fused kernel.
 
     Capability gate (``can_implement``): SM100 family + NVFP4 +
@@ -466,7 +466,7 @@ class MegaMoECuteDsl(MoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: Optional[torch.Tensor] = None,
         # ``activation=None`` infers Kimi K3 SiTU from the pretrained config and
@@ -480,7 +480,9 @@ class MegaMoECuteDsl(MoE):
         # uniformity but ignored: FUSED_COMM kernels must not use the chunk
         # overlap stream because launch order must be lockstep across EP.
         del aux_stream_dict
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,

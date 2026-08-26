@@ -434,7 +434,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         swiglu_limit_scalar: Optional[float] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
