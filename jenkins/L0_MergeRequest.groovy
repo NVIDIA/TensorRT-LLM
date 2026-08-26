@@ -409,10 +409,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-        stage("Upload Build Info") {
-            env.BUILD_INFO_UPLOADED = uploadBuildInfo(pipeline, globalVars).toString()
-        }
+    stage("Upload Build Info") {
+        env.BUILD_INFO_UPLOADED = uploadBuildInfo(pipeline, globalVars).toString()
     }
     if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
