@@ -34,6 +34,6 @@
   "torch_version": "2.12.0+cu130",
   "tensorrt_llm_version": "1.3.0rc25",
   "tensorrt_llm_commit": "a4ed9a9c13a69b3c024debd0d83e12c8c734bf95",
-  "environment": "Native build, no container; NVIDIA B300 (sm103). Portable by construction: generation pins float32_matmul_precision('highest') (see _lpips_pinned_fp32_matmul_precision), under which the trajectory measured bit-stable across torch 2.11/2.12 and B200/B300.",
+  "environment": "Native build, no container; NVIDIA B300 (sm103). Generation pins float32_matmul_precision('highest') (see _lpips_pinned_fp32_matmul_precision), which does not carry a golden across GPU architectures (nvbugs/6655359); this gate runs on B200 and measures inside threshold against this sm103 cut, so the media is not re-cut.",
   "sha256": "32c080983eb8d94d1da5d21378ea87912dadf018f00f15123a33f000640341ad"
 }

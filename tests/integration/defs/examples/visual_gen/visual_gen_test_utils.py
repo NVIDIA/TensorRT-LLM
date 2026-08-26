@@ -411,7 +411,7 @@ def _cleanup_cuda():
 
 @contextlib.contextmanager
 def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
-    """Pin fp32-matmul arithmetic so LPIPS goldens are portable across hosts.
+    """Pin fp32-matmul arithmetic so LPIPS goldens survive a torch-stack change.
 
     NGC PyTorch containers default matmul TF32 on (``float32_matmul_precision
     == "high"``); PyPI torch defaults it off (``"highest"``). A model with fp32
@@ -420,9 +420,18 @@ def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
     ``transformer_cosmos3.py``) therefore produces a different trajectory under
     each default, and a golden cut under one fails under the other -- measured
     LPIPS-to-golden moved 0.132 -> 0.054 from this single flag. Pin "highest"
-    (IEEE fp32, measured bit-stable across torch 2.11/2.12 and B200/B300), and
-    pin cuDNN TF32 to its universal default so the second knob cannot drift.
-    bf16 compute -- all of the heavy kernels -- is unaffected by either knob.
+    (IEEE fp32, measured bit-stable across torch 2.11/2.12), and pin cuDNN TF32
+    to its universal default so the second knob cannot drift. bf16 compute --
+    all of the heavy kernels -- is unaffected by either knob.
+
+    The pin does NOT make a golden portable across GPU architectures, not even
+    across steppings of one family: it fixes the arithmetic each kernel uses,
+    not the reduction order a kernel picks for a given SM count. A B300 (sm103)
+    cut of the Cosmos3-Nano goldens drifted against the B200 gate under this
+    same pin by an amount that grew with temporal extent (0.15 at 189 frames
+    versus a 0.05 gate, while the 1-frame sibling from that cut stayed green) --
+    reduction-order drift, which no knob pins. Cut each golden on the GPU its
+    gate runs on (see ``test-db/l0_*.yml``); nvbugs/6655359.
 
     Applied per generation path rather than from
     ``_lpips_deterministic_algorithms``: that helper also wraps generation for
