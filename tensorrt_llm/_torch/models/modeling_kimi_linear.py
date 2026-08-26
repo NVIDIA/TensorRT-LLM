@@ -120,7 +120,6 @@ from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -1763,17 +1762,6 @@ class KimiLinearModel(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
-
-        # Graph-disabled warmups still inherit the runner's padded token
-        # bucket. Eager KDA/MLA attention returns only real tokens, so trim the
-        # input too and keep the attention-residual stack at the same shape.
-        # BCG and generation CUDA graphs retain their static padded tensors:
-        # their attention cores consume only the ``num_tokens`` real prefix and
-        # the causal-LM wrapper slices logits back before sampling.
-        if attn_metadata.padded_num_tokens is not None and not (
-            attn_metadata.is_cuda_graph or is_in_breakable_cuda_graph()
-        ):
-            hidden_states = hidden_states[: attn_metadata.num_tokens]
 
         block_residual = hidden_states.new_empty(
             self.num_attn_res_snapshots,
