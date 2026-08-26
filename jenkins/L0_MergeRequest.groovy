@@ -1321,7 +1321,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
         "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
         "tests/integration/defs/examples/test_ray.py",
-        "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
         "tests/unittest/llmapi/test_async_llm.py",
         "docker/common/install_ucx.sh",
         "docker/common/install_nixl.sh",

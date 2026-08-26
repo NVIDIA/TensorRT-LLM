@@ -4033,10 +4033,6 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-FMHA-", add "backend=fmha" to makoArgs
         // At this point, only tests with backend=fmha or unspecified backend will be run
         makoArgs += ["backend=fmha"]
-    } else if (stageName.contains("-AutoDeploy-")) {
-        // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
-        // At this point, only tests with backend=autodeploy or unspecified backend will be run
-        makoArgs += ["backend=autodeploy"]
     } else if (stageName.contains("-Generic-")) {
         // Generic stages select tests by marker expression rather than backend ownership.
         makoArgs += ["backend=generic"]
@@ -4045,7 +4041,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // At this point, only tests with backend=verl or unspecified backend will be run
         makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", "-AutoDeploy-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", or "-Verl-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
