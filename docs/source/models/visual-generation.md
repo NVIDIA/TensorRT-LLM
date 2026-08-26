@@ -187,15 +187,28 @@ Omit `quant_config` for BF16/FP16 baseline.
 
 Transformer and VAE quantization are selected independently. Use
 `quant_config` for transformer layers and `vae_quant_config` for the VAE.
-NVFP4 VAE execution currently supports native Wan-family VAEs on SM100-family
-GPUs. Unsupported pipelines and algorithms fail before pipeline construction.
-An explicit NVFP4 request fails on an unsupported device; checkpoint-driven
-NVFP4 instead warns and runs dequantized BF16 operators.
+NVFP4 VAE execution currently supports native Wan-family VAEs on GPUs with CUDA
+compute capability 10.x. Unsupported pipelines and algorithms fail before
+pipeline construction. On an unsupported device, an explicit NVFP4 request
+fails; checkpoint-driven NVFP4 instead uses dequantized BF16 operators.
 
-If `vae_quant_config` is omitted, the VAE follows its checkpoint metadata: a
-packed NVFP4 checkpoint uses its stored weights and activation scales, while a
-high-precision checkpoint remains high precision. To quantize a high-precision
-Wan VAE at load time and derive activation scales dynamically, configure:
+By default, `vae_quant_config` is unset (`None`) and the VAE follows its
+checkpoint metadata. A high-precision checkpoint remains high precision. A
+packed NVFP4 checkpoint selects NVFP4 execution automatically and reuses any
+valid calibrated activation scales; layers without one derive it dynamically.
+
+To quantize eligible Wan Conv3d layers from a high-precision checkpoint and
+derive activation scales dynamically, use the shorthand configuration:
+
+```yaml
+vae_quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+```
+
+The top-level `dynamic` value sets both weight and activation modes. Configure
+them independently when their sources differ. For example, packed NVFP4 weights
+with rank-local dynamic activation scales use:
 
 ```yaml
 vae_quant_config:
@@ -203,22 +216,21 @@ vae_quant_config:
   config_groups:
     default:
       weights:
-        dynamic: true
+        dynamic: false
       input_activations:
         dynamic: true
 ```
 
-For a packed NVFP4 checkpoint, set `weights.dynamic: false`. Set
-`input_activations.dynamic: false` to use calibrated checkpoint scales, or
-`true` to derive rank-local activation scales at runtime. A top-level
-`dynamic` boolean remains shorthand for setting both values, but the grouped
-form makes the weight and activation sources explicit.
+`weights.dynamic: true` requires high-precision checkpoint weights, while
+`false` requires packed NVFP4 weights. `input_activations.dynamic: false`
+requires a valid calibrated checkpoint scale for every selected convolution;
+`true` derives rank-local activation scales at runtime. Do not specify both the
+top-level shorthand and `config_groups`.
 
 The optional ModelOpt `ignore` list excludes matching VAE modules. With a
 high-precision checkpoint, excluded convolutions remain in BF16. With a packed
 NVFP4 checkpoint, their weights can only be dequantized back to BF16; the
-original high-precision weights cannot be recovered, so TensorRT-LLM emits a
-warning.
+original high-precision weights cannot be recovered.
 
 ### Runtime LoRA
 
