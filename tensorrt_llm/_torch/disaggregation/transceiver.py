@@ -631,6 +631,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session.is_completed():
                 completed.append(rid)
             elif session.has_failed():
+                if getattr(session, "_enforce_physical_ownership", False):
+                    resources_drained = getattr(session, "resources_drained", None)
+                    if resources_drained is None or not resources_drained():
+                        continue
                 failed.append(rid)
         return completed, failed
 
@@ -850,10 +854,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             raise
         finally:
-            if session is not None:
-                session.close()
-            self._recv_sessions.pop(rid, None)
-            self._recv_reqs.pop(rid, None)
+            close_succeeded = session is None or session.close() is not False
+            if close_succeeded:
+                self._recv_sessions.pop(rid, None)
+                self._recv_reqs.pop(rid, None)
+            else:
+                logger.error(
+                    f"request_and_receive_sync: retaining rid={rid} because receive "
+                    "resources remain active"
+                )
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest) -> None:
@@ -1152,8 +1161,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_sessions[rid].cancel()
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
+            elif self._recv_sessions[rid].close() is False:
+                has_transferring = True
             else:
-                self._recv_sessions[rid].close()
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
 
