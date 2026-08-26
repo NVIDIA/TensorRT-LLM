@@ -181,6 +181,56 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
+def test_plain_decode_direct_pool_matches_fallback():
+    """The production decode path updates packed live pools by slot."""
+    torch.manual_seed(4)
+    batch, slots = 4, 7
+    runtime = _make_runtime(seed=5)
+    runtime.finalize_decode_weights()
+    slot_indices = torch.tensor([6, 1, 4, 2], dtype=torch.long, device="cuda")
+    state_indices = slot_indices.to(torch.int32)
+    conv_direct, ssm_direct = _make_pools(slots, seed=6)
+    conv_fallback = conv_direct.clone()
+    ssm_fallback = ssm_direct.clone()
+    hidden = torch.randn(batch, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    with torch.no_grad():
+        expected = runtime.forward_decode_fallback(
+            hidden,
+            conv_fallback,
+            ssm_fallback,
+            slot_indices,
+        )
+        actual = runtime.forward_decode(
+            hidden,
+            conv_direct,
+            ssm_direct,
+            slot_indices,
+            mamba_metadata=SimpleNamespace(
+                _arange_buffer=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+            ),
+            ssm_state_indices=state_indices,
+        )
+
+    assert _rep("plain decode output", actual, expected)
+    torch.testing.assert_close(
+        conv_direct.index_select(0, slot_indices),
+        conv_fallback.index_select(0, slot_indices),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        ssm_direct.index_select(0, slot_indices),
+        ssm_fallback.index_select(0, slot_indices),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
+    untouched[slot_indices] = False
+    assert torch.equal(conv_direct[untouched], conv_fallback[untouched])
+    assert torch.equal(ssm_direct[untouched], ssm_fallback[untouched])
+
+
 @torch.no_grad()
 def test_fused_vs_sequential_two_rounds():
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream

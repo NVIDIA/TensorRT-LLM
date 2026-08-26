@@ -389,6 +389,7 @@ def _register_fake():
           lower_bound: float,
           scale: float,
           onorm_eps: float,
+          enable_pdl: bool = True,
           output: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Mirror the CUDA impl: write into the caller-provided output when
         # given (schema returns Tensor(e!)), else allocate.
