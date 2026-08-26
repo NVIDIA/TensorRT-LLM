@@ -33,6 +33,21 @@ if TYPE_CHECKING:
 # the established preplanned MSA consumer. Keep this opt-in until its serving
 # A/B and CUDA-graph coverage are accepted.
 _MSA_NVFP4_STANDARD_STAGE_ENABLED = os.environ.get("TRTLLM_M3_NVFP4_STANDARD_STAGE", "0") == "1"
+_MSA_NVFP4_STANDARD_STAGE_MAX_DQL = 8
+
+
+def _nvfp4_standard_stage_capacity(metadata: "TrtllmAttentionMetadata") -> int:
+    """Bound selected-page scratch by the largest accepted decode step.
+
+    ``msa_q_batch_row`` is sized from ``max_num_tokens`` because it is shared
+    with context execution.  The staged-standard route is pure decode only,
+    however, and accepts at most eight query tokens for each request row.
+    Allocating from the context-sized buffer can otherwise reserve tens of
+    GiB on a server configured for large chunked prefill.
+    """
+    token_capacity = int(metadata.msa_q_batch_row.shape[0])
+    request_capacity = int(metadata.msa_block_table.shape[0])
+    return min(token_capacity, request_capacity * _MSA_NVFP4_STANDARD_STAGE_MAX_DQL)
 
 
 def run_msa_sparse_gqa(
@@ -512,7 +527,7 @@ def run_msa_nvfp4_sparse_gqa(
     stage_ready = (
         _MSA_NVFP4_STANDARD_STAGE_ENABLED
         and pure_decode
-        and 1 <= int(metadata._msa_max_q_len) <= 8
+        and 1 <= int(metadata._msa_max_q_len) <= _MSA_NVFP4_STANDARD_STAGE_MAX_DQL
         and int(k_paged.shape[1]) > 0
         and int(q.shape[1]) == 16 * int(k_paged.shape[1])
         and page_size == 128
@@ -542,7 +557,7 @@ def run_msa_nvfp4_sparse_gqa(
         total_q = int(q.shape[0])
         kv_heads = int(k_paged.shape[1])
         head_dim = int(q.shape[2])
-        capacity = int(metadata.msa_q_batch_row.shape[0])
+        capacity = _nvfp4_standard_stage_capacity(metadata)
         if total_q > capacity:
             raise RuntimeError(
                 "MiniMax-M3 staged NVFP4 query count exceeds its graph-stable "

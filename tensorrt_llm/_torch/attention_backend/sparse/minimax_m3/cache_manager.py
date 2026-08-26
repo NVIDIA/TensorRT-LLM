@@ -659,7 +659,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         assert addr_key + page_stride_key == addr_value, (
             f"MiniMaxM3 requires addr_K + page_stride "
             f"== addr_V (V immediately after K in slot); got "
-            f"addr_K={addr_key} page_stride_V={page_stride_value} "
+            f"addr_K={addr_key} page_stride_K={page_stride_key} "
             f"addr_V={addr_value} for layer {layer_idx}."
         )
         assert page_stride_key == page_stride_value, (

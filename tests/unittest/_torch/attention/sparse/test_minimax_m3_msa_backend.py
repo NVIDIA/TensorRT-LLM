@@ -1401,6 +1401,18 @@ def test_nvfp4_standard_stage_uses_preplanned_msa_and_stable_scratch(
     assert len(metadata.kv_cache_manager._msa_nvfp4_selected_scratch_cache) == 1
 
 
+def test_nvfp4_standard_stage_capacity_ignores_context_token_capacity():
+    """Pure-decode scratch is request-bound, not chunked-prefill-bound."""
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
+
+    metadata = SimpleNamespace(
+        msa_q_batch_row=torch.empty(16384, dtype=torch.int32),
+        msa_block_table=torch.empty(128, 1024, dtype=torch.int32),
+    )
+
+    assert msa_gqa._nvfp4_standard_stage_capacity(metadata) == 128 * 8
+
+
 def test_per_token_valid_blocks_multi_token_decode():
     """Spec-verify decode rows expose one entry per query TOKEN, walking the
     causal ladder within the verify window."""
