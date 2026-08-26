@@ -69,8 +69,21 @@ def _make_hf_config(**values):
     return SimpleNamespace(get_text_config=lambda: text_config)
 
 
+def _factory_model_engine(pretrained_config: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: False),
+        spec_config=None,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=pretrained_config,
+                quant_config=None,
+            )
+        ),
+    )
+
+
 class TestConfigAndFactory:
-    def test_factory_allows_block_reuse_and_propagates_config_fields(self):
+    def test_factory_allows_block_reuse_and_propagates_config_fields(self) -> None:
         # The factory contract is independent of GPU-owned persistent buffers.
         fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
@@ -83,14 +96,10 @@ class TestConfigAndFactory:
                 TriAttentionCompressionManager, "_initialize_eviction_state"
             ) as initialize,
         ):
-            validate_kv_cache_compression_compatibility(
-                cfg,
-                SimpleNamespace(enable_block_reuse=True),
-                None,
-            )
             mgr = create_kv_cache_compression_manager(
                 cfg,
-                pretrained_config=_make_test_pretrained_config(),
+                model_engine=_factory_model_engine(_make_test_pretrained_config()),
+                kv_cache_config=SimpleNamespace(enable_block_reuse=True),
             )
             mgr.bind_kv_cache_managers(fake_v2)
         assert isinstance(mgr, TriAttentionCompressionManager)
@@ -447,7 +456,6 @@ class TestEvictionLifecycle:
             )
             manager.bind_kv_cache_managers(_make_fake_v2(), draft_manager)
 
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
         spec_config = (

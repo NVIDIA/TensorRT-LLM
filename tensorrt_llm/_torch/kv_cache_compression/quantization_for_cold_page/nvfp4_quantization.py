@@ -300,10 +300,8 @@ class _Nvfp4ColdPagePolicy:
         num_pages: int,
         stream: int,
     ) -> None:
-        from tensorrt_llm.bindings.internal import kv_cache_compression as native
-
         metadata = self._lifecycle_metadata[lifecycle_index]
-        native.invoke_nvfp4_cold_page_encode(
+        torch.ops.trtllm.nvfp4_cold_page_encode(
             page_indices,
             num_pages,
             metadata.wide.data_ptr(),
@@ -325,10 +323,8 @@ class _Nvfp4ColdPagePolicy:
         num_pages: int,
         stream: int,
     ) -> None:
-        from tensorrt_llm.bindings.internal import kv_cache_compression as native
-
         metadata = self._lifecycle_metadata[lifecycle_index]
-        native.invoke_nvfp4_cold_page_decode(
+        torch.ops.trtllm.nvfp4_cold_page_decode(
             page_indices,
             num_pages,
             metadata.wide.data_ptr(),
@@ -350,7 +346,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         super().__init__(config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
-    def create_cold_page_codec(
+    def _create_cold_page_policy(
         self,
         cache_config: object,
         *,
@@ -360,7 +356,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
     ) -> object:
-        from tensorrt_llm.bindings.internal import kv_cache_compression as native
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
         runtime_type = {
@@ -423,7 +418,4 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 )
             )
 
-        policy = _Nvfp4ColdPagePolicy(
-            layer_layouts, runtime_type if runtime_type is not None else 0
-        )
-        return native.create_python_cold_page_codec(policy)
+        return _Nvfp4ColdPagePolicy(layer_layouts, runtime_type if runtime_type is not None else 0)

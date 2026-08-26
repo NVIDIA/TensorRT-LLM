@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -41,7 +41,6 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
                                                    supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -80,9 +79,6 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
-
-if TYPE_CHECKING:
-    import transformers
 
 GB = 1 << 30
 
@@ -2055,19 +2051,13 @@ class KvCacheCreator:
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
-        compression_manager = None
         compression_config = self._llm_args.kv_cache_compression_config
-        is_cold_quantization = (compression_config is not None
-                                and compression_config.algorithm
-                                == "quantization_for_cold_page")
-        skip_compression_manager = is_cold_quantization and (
-            (estimating_kv_cache and not self._skip_est)
-            or _uses_nvfp4_kv_cache(self._model_engine))
-        if compression_config is not None and not skip_compression_manager:
-            model_config = self._model_engine.model.model_config
-            compression_manager = create_kv_cache_compression_manager(
-                compression_config,
-                pretrained_config=model_config.pretrained_config)
+        compression_manager = create_kv_cache_compression_manager(
+            compression_config,
+            model_engine=self._model_engine,
+            kv_cache_config=self_kv_cache_config,
+            estimating_kv_cache=estimating_kv_cache and not self._skip_est,
+        )
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
@@ -2130,7 +2120,8 @@ class KvCacheCreator:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
         resources[
             ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
-        if compression_manager is not None:
+        if (compression_manager is not None
+                and compression_manager.uses_iteration_lifecycle):
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
 
@@ -2795,18 +2786,7 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
-    if config.algorithm == "quantization_for_cold_page":
-        from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
-
-        if _BACKEND == "python":
-            raise ValueError(
-                "Cold-page quantization requires the C++ KVCacheManagerV2 backend"
-            )
-        if not is_sm_100f():
-            raise RuntimeError(
-                "NVFP4 cold-page compression requires an SM100-family device "
-                "(SM100 or SM103).")
-    elif config.algorithm == "triattention" and not is_sm_100f():
+    if config.algorithm == "triattention" and not is_sm_100f():
         raise RuntimeError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")
 
@@ -2823,46 +2803,49 @@ def validate_kv_cache_compression_compatibility(
             "support speculative decoding with its current configuration; "
             "TriAttention requires eviction_mode='union'")
     mode = spec_config.spec_dec_mode
-    if config.algorithm == "quantization_for_cold_page":
-        if not (mode.is_eagle3_one_model() or mode.is_mtp_eagle_one_model()):
-            raise ValueError(
-                "Cold-page quantization supports speculative decoding only "
-                f"with one-model MTP-EAGLE or EAGLE3, not {mode.name}")
-        return
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
             f"mode {mode.name}; use one-model MTP or EAGLE3")
 
 
-def _uses_nvfp4_kv_cache(model_engine: PyTorchModelEngine) -> bool:
-    quant_config = model_engine.model.model_config.quant_config
-    return (quant_config is not None
-            and quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4)
-
-
 def create_kv_cache_compression_manager(
-    config: KvCacheCompressionConfig,
-    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
+    config: Optional[KvCacheCompressionConfig],
+    *,
+    model_engine: PyTorchModelEngine,
+    kv_cache_config: KvCacheConfig,
+    estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
-    """Construct the configured compression manager before KVCM."""
-    if config.algorithm == "quantization_for_cold_page":
-        if config.quant == "nvfp4":
-            from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
-                Nvfp4ColdPageQuantizationCompression  # noqa: E501
+    """Validate, select, and construct the configured manager before KVCM."""
+    if config is None:
+        return None
+    if model_engine.mapping.has_cp_helix():
+        # TODO: Revisit after KVCC validates HELIX-sharded Page ownership and migration.
+        raise ValueError(
+            "KV-cache compression does not support HELIX context parallelism.")
 
-            return Nvfp4ColdPageQuantizationCompression(config)
-        raise NotImplementedError(
-            f"Unsupported cold-page quantization format {config.quant!r}")
+    if config.algorithm == "quantization_for_cold_page":
+        from ..kv_cache_compression.quantization_for_cold_page import \
+            quantization_for_cold_page as cold_page_quantization
+
+        return cold_page_quantization.create_cold_page_quantization_manager(
+            config,
+            model_config=model_engine.model.model_config,
+            kv_cache_config=kv_cache_config,
+            spec_config=model_engine.spec_config,
+            estimating_kv_cache=estimating_kv_cache,
+        )
 
     if config.algorithm == "triattention":
+        validate_kv_cache_compression_compatibility(config, kv_cache_config,
+                                                    model_engine.spec_config)
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from ..kv_cache_compression.triattention.triattention import \
             TriAttentionCompressionManager
 
         return TriAttentionCompressionManager(
             config,
-            pretrained_config=pretrained_config,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
 
     logger.warning(
@@ -3139,8 +3122,6 @@ def create_py_executor_instance(
             resources[ResourceManagerType.KV_CACHE_MANAGER],
             resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
         )
-        if not compression_manager.uses_iteration_lifecycle:
-            resources.pop(ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
     resource_manager = ResourceManager(resources)
 
     # KV cache manager runs last (others may depend on it), except the
@@ -3639,27 +3620,6 @@ def _adjust_torch_mem_fraction():
 
 def validate_feature_combination(llm_args, model_engine, sampler_type):
     # Validate the flags for features' combination
-    compression_config = llm_args.kv_cache_compression_config
-    if (compression_config is not None and model_engine.mapping.has_cp_helix()):
-        # TODO: Revisit after KVCC validates HELIX-sharded Page ownership and migration.
-        raise ValueError(
-            "KV-cache compression does not support HELIX context parallelism.")
-    cold_compression_is_redundant = (compression_config is not None
-                                     and compression_config.algorithm
-                                     == "quantization_for_cold_page"
-                                     and _uses_nvfp4_kv_cache(model_engine))
-    if cold_compression_is_redundant:
-        logger.info(
-            "Skipping cold-page NVFP4 quantization because the active KV cache "
-            "already uses NVFP4; KVCM will migrate its native data and "
-            "block-scale buffers losslessly.")
-    elif compression_config is not None:
-        validate_kv_cache_compression_compatibility(
-            compression_config,
-            llm_args.kv_cache_config,
-            model_engine.spec_config,
-        )
-
     def init_feature_status(llm_args) -> Dict[str, bool]:
         assert isinstance(
             llm_args, TorchLlmArgs

@@ -146,8 +146,11 @@ add_library(
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
-  compressorOp.cpp)
+  compressorOp.cpp
+  ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(th_common
+                           PRIVATE TRTLLM_ENABLE_NVFP4_COLD_PAGE_TORCH_OP)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)

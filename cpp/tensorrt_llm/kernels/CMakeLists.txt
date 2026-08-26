@@ -67,6 +67,9 @@ list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+# This TU registers its Torch op in th_common; exclude it here to avoid
+# duplicate symbols.
+list(FILTER SRC_CU EXCLUDE REGEX "nvfp4ColdPageKernels\\.cu$")
 # Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")

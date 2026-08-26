@@ -33,6 +33,10 @@
 #include <cuda_fp8.h>
 #include <type_traits>
 
+#if defined(TRTLLM_ENABLE_NVFP4_COLD_PAGE_TORCH_OP)
+#include <torch/library.h>
+#endif
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -871,3 +875,56 @@ void invokeNvfp4ColdPageDecode(void const* pages, std::size_t numPages, std::int
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
+
+#if defined(TRTLLM_ENABLE_NVFP4_COLD_PAGE_TORCH_OP)
+namespace
+{
+
+void nvfp4ColdPageEncode(std::int64_t pageIndices, std::int64_t numPages, std::int64_t wide, std::int64_t integers,
+    std::int64_t scales, std::int64_t numBuffers, std::int64_t maxHalfGroupsPerTile, std::int64_t coldPageBytes,
+    std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream)
+{
+    tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
+        reinterpret_cast<void const*>(static_cast<std::uintptr_t>(pageIndices)), static_cast<std::size_t>(numPages),
+        reinterpret_cast<std::int64_t const*>(static_cast<std::uintptr_t>(wide)),
+        reinterpret_cast<std::int32_t const*>(static_cast<std::uintptr_t>(integers)),
+        reinterpret_cast<float const*>(static_cast<std::uintptr_t>(scales)), static_cast<std::uint32_t>(numBuffers),
+        static_cast<std::uint32_t>(maxHalfGroupsPerTile), static_cast<std::size_t>(coldPageBytes),
+        static_cast<tensorrt_llm::kernels::Nvfp4ColdPageRuntimeType>(runtimeType),
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(coldBase)),
+        reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(stream)));
+}
+
+void nvfp4ColdPageDecode(std::int64_t pageIndices, std::int64_t numPages, std::int64_t wide, std::int64_t integers,
+    std::int64_t scales, std::int64_t numBuffers, std::int64_t maxHalfGroupsPerTile, std::int64_t coldPageBytes,
+    std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream)
+{
+    tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
+        reinterpret_cast<void const*>(static_cast<std::uintptr_t>(pageIndices)), static_cast<std::size_t>(numPages),
+        reinterpret_cast<std::int64_t const*>(static_cast<std::uintptr_t>(wide)),
+        reinterpret_cast<std::int32_t const*>(static_cast<std::uintptr_t>(integers)),
+        reinterpret_cast<float const*>(static_cast<std::uintptr_t>(scales)), static_cast<std::uint32_t>(numBuffers),
+        static_cast<std::uint32_t>(maxHalfGroupsPerTile), static_cast<std::size_t>(coldPageBytes),
+        static_cast<tensorrt_llm::kernels::Nvfp4ColdPageRuntimeType>(runtimeType),
+        reinterpret_cast<void const*>(static_cast<std::uintptr_t>(coldBase)),
+        reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(stream)));
+}
+
+} // namespace
+
+TORCH_LIBRARY_FRAGMENT(trtllm, module)
+{
+    module.def(
+        "nvfp4_cold_page_encode(int page_indices, int num_pages, int wide, int integers, int scales, int num_buffers, "
+        "int max_half_groups_per_tile, int cold_page_bytes, int runtime_type, int cold_base, int stream) -> ()");
+    module.def(
+        "nvfp4_cold_page_decode(int page_indices, int num_pages, int wide, int integers, int scales, int num_buffers, "
+        "int max_half_groups_per_tile, int cold_page_bytes, int runtime_type, int cold_base, int stream) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, module)
+{
+    module.impl("nvfp4_cold_page_encode", &nvfp4ColdPageEncode);
+    module.impl("nvfp4_cold_page_decode", &nvfp4ColdPageDecode);
+}
+#endif

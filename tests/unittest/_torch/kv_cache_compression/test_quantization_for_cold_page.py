@@ -10,12 +10,16 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
+    quantization_for_cold_page as cold_quant_mod,
+)
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
     _load_modelopt_nvfp4_scales,
 )
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
     ColdPageQuantizationCompression,
+    validate_cold_page_quantization_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
@@ -43,6 +47,21 @@ def _manager(scale_checkpoint_path=None):
     return Nvfp4ColdPageQuantizationCompression(config)
 
 
+def _factory_model_engine(
+    *, active_kv_quant: object | None = None, helix: bool = False
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        spec_config=None,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                quant_config=active_kv_quant,
+                pretrained_config=object(),
+            )
+        ),
+    )
+
+
 def _cache_config(*layers):
     configs = []
     for layer_id, kind in layers:
@@ -63,8 +82,6 @@ def _native() -> tuple[SimpleNamespace, MagicMock]:
         ColdPageLifecycleProperties=lambda: SimpleNamespace(),
         ColdPageIndexLocation=SimpleNamespace(HOST="host"),
         create_python_cold_page_codec=MagicMock(return_value=codec),
-        invoke_nvfp4_cold_page_encode=MagicMock(),
-        invoke_nvfp4_cold_page_decode=MagicMock(),
     )
     return module, codec
 
@@ -116,9 +133,9 @@ def _write_scales(directory, scales_by_layer, *, filename="model.safetensors", p
     save_file(tensors, str(directory / filename))
 
 
-def _validate_compression(mode=None):
+def _validate_compression(mode: object | None = None) -> None:
     spec_config = None if mode is None else SimpleNamespace(spec_dec_mode=mode)
-    util_mod.validate_kv_cache_compression_compatibility(
+    validate_cold_page_quantization_compatibility(
         ColdPageQuantizationCompressionConfig(),
         SimpleNamespace(enable_block_reuse=False),
         spec_config,
@@ -306,7 +323,11 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
 def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
     native, _ = _native()
 
-    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+    with (
+        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
+        patch.object(torch.ops.trtllm, "nvfp4_cold_page_encode", create=True) as encode,
+        patch.object(torch.ops.trtllm, "nvfp4_cold_page_decode", create=True) as decode,
+    ):
         _manager().create_cold_page_codec(
             _cache_config((0, "attention")),
             runtime_dtype=DataType.BF16,
@@ -330,10 +351,7 @@ def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
     assert properties[0].cold_page_bytes == 1152
     assert properties[0].page_index_location == "host"
     metadata = policy._lifecycle_metadata[0]
-    for operation in (
-        native.invoke_nvfp4_cold_page_encode,
-        native.invoke_nvfp4_cold_page_decode,
-    ):
+    for operation in (encode, decode):
         operation.assert_called_once()
         arguments = operation.call_args.args
         assert arguments == (
@@ -443,7 +461,11 @@ def test_unsupported_quant_is_rejected_before_manager_construction() -> None:
         scale_checkpoint_path="/not/a/checkpoint",
     )
     with pytest.raises(NotImplementedError, match="future-format"):
-        util_mod.create_kv_cache_compression_manager(config)
+        util_mod.create_kv_cache_compression_manager(
+            config,
+            model_engine=_factory_model_engine(),
+            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+        )
 
 
 def test_scale_loader_matches_hf_shard_and_consolidated_policy(tmp_path):
@@ -762,23 +784,35 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
     )
 
 
-def test_runtime_admission_is_checked_in_utils_before_manager_creation(monkeypatch):
+def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> None:
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "python")
     with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
         _validate_compression()
 
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(cold_quant_mod, "is_sm_100f", lambda: False)
     with pytest.raises(RuntimeError, match="requires an SM100-family device"):
-        _validate_compression()
+        cold_quant_mod.create_cold_page_quantization_manager(
+            ColdPageQuantizationCompressionConfig(),
+            model_config=_factory_model_engine().model.model_config,
+            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+            spec_config=None,
+        )
 
-    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
-    _validate_compression()
+    monkeypatch.setattr(cold_quant_mod, "is_sm_100f", lambda: True)
+    assert isinstance(
+        cold_quant_mod.create_cold_page_quantization_manager(
+            ColdPageQuantizationCompressionConfig(),
+            model_config=_factory_model_engine().model.model_config,
+            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+            spec_config=None,
+        ),
+        Nvfp4ColdPageQuantizationCompression,
+    )
 
 
-def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch):
+def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch) -> None:
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
 
     _validate_compression(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
     _validate_compression(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
@@ -792,9 +826,8 @@ def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch):
             _validate_compression(mode)
 
 
-def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch):
+def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch) -> None:
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
 
     spec_config = MTPDecodingConfig(max_draft_len=3)
     update_spec_config_from_model_config(
@@ -804,42 +837,65 @@ def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch):
 
     assert spec_config.spec_dec_mode is SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
     assert spec_config.max_draft_len == 3
-    util_mod.validate_kv_cache_compression_compatibility(
+    validate_cold_page_quantization_compatibility(
         ColdPageQuantizationCompressionConfig(),
         SimpleNamespace(enable_block_reuse=False),
         spec_config,
     )
 
 
-def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
-    def build(*, estimating=False, active_kv_quant=None):
+def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
+    monkeypatch.setattr(cold_quant_mod, "is_sm_100f", lambda: True)
+
+    def build(
+        *,
+        estimating: bool = False,
+        skip_est: bool = False,
+        active_kv_quant: object | None = None,
+    ) -> tuple[dict, util_mod.KvCacheCreator]:
         creator = object.__new__(util_mod.KvCacheCreator)
-        creator._skip_est = False
+        creator._skip_est = skip_est
         creator._max_seq_len = 1024
         creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
         creator._llm_args = SimpleNamespace(
             kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
         )
-        model_config = SimpleNamespace(quant_config=active_kv_quant, pretrained_config=object())
-        creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+        creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
         creator._draft_model_engine = None
         creator._kv_connector_manager = None
         creator._fp8_ctx_mla_kv_len_cap = None
         creator._is_encoder_decoder = MagicMock(return_value=False)
         creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
         creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
+        creator.configure_kv_cache_capacity = MagicMock()
         resources = {}
         creator.build_managers(resources, estimating_kv_cache=estimating)
-        return resources
+        return resources, creator
 
-    resources = build()
-    manager = resources[util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER]
+    resources, creator = build()
+    manager = creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
     assert isinstance(manager, Nvfp4ColdPageQuantizationCompression)
     assert isinstance(manager, ColdPageQuantizationCompression)
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle
-    for kwargs in (
-        {"estimating": True},
-        {"active_kv_quant": QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)},
-    ):
-        assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in build(**kwargs)
+    assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
+    _, estimation_creator = build(estimating=True)
+    assert (
+        estimation_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
+        is None
+    )
+    _, skip_est_creator = build(estimating=True, skip_est=True)
+    assert isinstance(
+        skip_est_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"],
+        Nvfp4ColdPageQuantizationCompression,
+    )
+    with patch.object(cold_quant_mod.logger, "info") as log:
+        active_resources, active_creator = build(
+            active_kv_quant=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
+        )
+    assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in active_resources
+    assert (
+        active_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is None
+    )
+    log.assert_called_once()
