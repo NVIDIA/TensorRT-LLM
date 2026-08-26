@@ -154,12 +154,69 @@ def test_in_proj_perm_quantized_dtypes():
 # ---- Tests for the multi-row gated RMSNorm ----
 
 
-def _ref_gated_rmsnorm(x, w, z, eps):
+def test_grouped_gemma_rmsnorm_meta_init():
+    """The optimized HC norm must retain TRT-LLM's meta construction path."""
+    from tensorrt_llm._torch.modules.qwen4_exp_hyper_connection import GroupedRMSNorm
+
+    norm = GroupedRMSNorm(
+        16,
+        group_size=4,
+        dtype=torch.bfloat16,
+        device=torch.device("meta"),
+    )
+
+    assert norm.weight.is_meta
+    assert norm.weight.shape == (16,)
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("num_tokens", [1, 4, 2048])
+def test_grouped_gemma_rmsnorm_delta_weight(num_tokens):
+    """Qwen4-Exp HC must preserve FP32 ``1 + delta`` at actual model shapes."""
+    from tensorrt_llm._torch.modules.qwen4_exp_hyper_connection import GroupedRMSNorm
+
+    torch.manual_seed(42 + num_tokens)
+    hidden_size = 2560
+    hc_count = 4
+    norm = GroupedRMSNorm(
+        hidden_size * hc_count,
+        eps=1e-6,
+        group_size=hidden_size,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    with torch.no_grad():
+        norm.weight.copy_(0.05 * torch.randn_like(norm.weight))
+    x = torch.randn(
+        num_tokens,
+        hidden_size * hc_count,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    actual = norm(x)
+    grouped = x.float().unflatten(-1, (hc_count, hidden_size))
+    variance = grouped.pow(2).mean(dim=-1, keepdim=True)
+    expected = (
+        (
+            grouped
+            * torch.rsqrt(variance + norm.variance_epsilon)
+            * (1.0 + norm.weight.float().unflatten(-1, (hc_count, hidden_size)))
+        )
+        .flatten(-2)
+        .to(x.dtype)
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def _ref_gated_rmsnorm(x, w, z, eps, gate_is_sigmoid=False):
     xf = x.float()
     rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     y = xf * rstd * w.float()
     zf = z.float()
-    return (y * zf * torch.sigmoid(zf)).to(x.dtype)
+    gate = torch.sigmoid(zf) if gate_is_sigmoid else zf * torch.sigmoid(zf)
+    return (y * gate).to(x.dtype)
 
 
 @skip_no_cuda
@@ -167,7 +224,8 @@ def _ref_gated_rmsnorm(x, w, z, eps):
     "num_tokens,heads,N",
     [(8192, 32, 128), (7, 32, 128), (1, 1, 128), (333, 4, 64), (1024, 16, 256)],
 )
-def test_rms_norm_gated_token_major(num_tokens, heads, N):
+@pytest.mark.parametrize("gate_is_sigmoid", [False, True])
+def test_rms_norm_gated_token_major(num_tokens, heads, N, gate_is_sigmoid):
     """Token-major z (a column-slice view of a wider projection) must match
     the reference on both the multi-row fast path and the generic fallback."""
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import (
@@ -183,8 +241,20 @@ def test_rms_norm_gated_token_major(num_tokens, heads, N):
     wide = torch.randn(num_tokens, heads * N + 512, dtype=torch.bfloat16, device=device)
     z = wide[:, 512:].view(num_tokens, heads, N)
 
-    y = rms_norm_gated_token_major(x, z, w, 1e-6)
-    ref = _ref_gated_rmsnorm(x, w, z.reshape(M, N), 1e-6)
+    y = rms_norm_gated_token_major(
+        x,
+        z,
+        w,
+        1e-6,
+        gate_is_sigmoid=gate_is_sigmoid,
+    )
+    ref = _ref_gated_rmsnorm(
+        x,
+        w,
+        z.reshape(M, N),
+        1e-6,
+        gate_is_sigmoid=gate_is_sigmoid,
+    )
     torch.testing.assert_close(y, ref, rtol=1e-2, atol=1e-2)
 
     # The dense-z dispatch of the generic entry point must agree bitwise.
@@ -196,6 +266,7 @@ def test_rms_norm_gated_token_major(num_tokens, heads, N):
         z=z.reshape(M, N).contiguous(),
         norm_before_gate=True,
         is_rms_norm=True,
+        gate_is_sigmoid=gate_is_sigmoid,
     )
     assert torch.equal(y, y_dense)
 

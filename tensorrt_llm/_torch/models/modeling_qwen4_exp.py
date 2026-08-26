@@ -37,6 +37,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.qwen4_exp_hyper_connection import Qwen4ExpHyperConnection
@@ -76,10 +77,9 @@ class Qwen4ExpGatedDeltaNet(Qwen3NextGatedDeltaNet):
     ``chunk_gated_delta_rule`` prefill, carried-state decode, in-proj / out-proj)
     unchanged, and only replaces the gated output RMSNorm: Qwen4-Exp sets
     ``output_gate_type="sigmoid"`` so the gate is ``sigmoid(z)`` rather than the
-    ``silu(z)`` baked into ``rms_norm_gated_token_major``. It is implemented as
-    native torch (``rmsnorm(x) * weight * sigmoid(z)``,
-    ``norm_before_gate=True``, fp32 accumulation) — parity-first and CUDA-graph
-    capturable; the fused kernel is a perf variant reserved for a later stage.
+    ``silu(z)`` used by Qwen3-Next. The shared token-major gated RMSNorm kernel
+    selects its sigmoid-gate variant, retaining fp32 accumulation without
+    packing the row-strided gate projection.
     """
 
     def _postprocess_gdn_output(
@@ -88,13 +88,13 @@ class Qwen4ExpGatedDeltaNet(Qwen3NextGatedDeltaNet):
         z: torch.Tensor,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
-        head_v = self.head_v_dim
-        x = attn_out.reshape(-1, head_v).float()
-        gate = z.reshape(-1, head_v).float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x * torch.rsqrt(variance + self.norm.eps)
-        out = x_norm * self.norm.weight.float() * torch.sigmoid(gate)
-        out = out.to(attn_out.dtype).reshape(-1, self.value_dim_per_tp)
+        out = rms_norm_gated_token_major(
+            attn_out.reshape(-1, self.head_v_dim),
+            z,
+            self.norm.weight,
+            self.norm.eps,
+            gate_is_sigmoid=True,
+        ).reshape(-1, self.value_dim_per_tp)
         return self.out_proj(out, all_reduce_params=all_reduce_params)
 
 

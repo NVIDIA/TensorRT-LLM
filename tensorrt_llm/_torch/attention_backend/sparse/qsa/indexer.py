@@ -14,6 +14,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm.logger import logger
 
 from .params import QSASparseParams
@@ -181,6 +182,12 @@ class QSAIndexer(nn.Module):
                 is_neox=pos.is_neox,
             )
         self._pending_speculative_cache = None
+        self.top_k = TopK(
+            params.block_topk,
+            prefill_implementation=TopKImplementation.CUDA_RADIX,
+            decode_implementation=TopKImplementation.CUDA_RADIX,
+            compress_ratio=params.compress_ratio,
+        )
 
     def _apply_rope(
         self,
@@ -540,6 +547,10 @@ def select_qsa_tokens(
     query_positions: torch.Tensor,
     sequence_length: int,
     params: QSASparseParams,
+    *,
+    top_k: TopK | None = None,
+    top_k_output: torch.Tensor | None = None,
+    top_k_row_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score complete groups and return fixed-width logical token indices."""
     rows = q.shape[0]
@@ -558,16 +569,28 @@ def select_qsa_tokens(
         )
         scores = torch.relu(scores).sum(dim=-1) / math.sqrt(params.index_head_dim)
         visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.long)
-        columns = torch.arange(total_blocks, device=q.device).unsqueeze(0)
-        scores.masked_fill_(columns >= visible_blocks.unsqueeze(1), -float("inf"))
-        width = min(params.block_topk, total_blocks)
-        values, indices = torch.topk(scores, width, dim=-1)
-        indices = torch.where(
-            torch.isfinite(values),
-            indices,
-            torch.full_like(indices, -1),
-        )
-        block_indices[:, :width] = indices.to(torch.int32)
+        if top_k is not None and scores.is_cuda:
+            if top_k_output is None or top_k_row_starts is None:
+                raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
+            block_indices = top_k_output[:rows]
+            top_k(
+                scores,
+                block_indices,
+                is_prefill=True,
+                row_starts=top_k_row_starts[:rows],
+                row_ends=visible_blocks.to(torch.int32),
+            )
+        else:
+            columns = torch.arange(total_blocks, device=q.device).unsqueeze(0)
+            scores.masked_fill_(columns >= visible_blocks.unsqueeze(1), -float("inf"))
+            width = min(params.block_topk, total_blocks)
+            values, indices = torch.topk(scores, width, dim=-1)
+            indices = torch.where(
+                torch.isfinite(values),
+                indices,
+                torch.full_like(indices, -1),
+            )
+            block_indices[:, :width] = indices.to(torch.int32)
     sequence_lengths = torch.full_like(query_positions, sequence_length)
     return expand_qsa_block_indices(
         block_indices,
@@ -586,6 +609,10 @@ def select_qsa_decode_tokens(
     request_indices: torch.Tensor,
     metadata: "QSAAttentionMetadata",
     params: QSASparseParams,
+    *,
+    top_k: TopK | None = None,
+    top_k_output: torch.Tensor | None = None,
+    top_k_row_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select decode tokens with fixed-shape paged scoring for graph replay."""
     from .kernels import triton_qsa_paged_index_scores
@@ -599,19 +626,32 @@ def select_qsa_decode_tokens(
         tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
         compress_ratio=params.compress_ratio,
     )
-    width = min(params.block_topk, logits.shape[1])
-    values, indices = torch.topk(logits, width, dim=-1)
-    indices = torch.where(
-        torch.isfinite(values),
-        indices,
-        torch.full_like(indices, -1),
-    ).to(torch.int32)
-    if width < params.block_topk:
-        indices = torch.nn.functional.pad(
+    if top_k is not None and logits.is_cuda:
+        if top_k_output is None or top_k_row_starts is None:
+            raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
+        indices = top_k_output[: q.shape[0]]
+        visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
+        top_k(
+            logits,
             indices,
-            (0, params.block_topk - width),
-            value=-1,
+            is_prefill=True,
+            row_starts=top_k_row_starts[: q.shape[0]],
+            row_ends=visible_blocks,
         )
+    else:
+        width = min(params.block_topk, logits.shape[1])
+        values, indices = torch.topk(logits, width, dim=-1)
+        indices = torch.where(
+            torch.isfinite(values),
+            indices,
+            torch.full_like(indices, -1),
+        ).to(torch.int32)
+        if width < params.block_topk:
+            indices = torch.nn.functional.pad(
+                indices,
+                (0, params.block_topk - width),
+                value=-1,
+            )
     return expand_qsa_block_indices(
         indices,
         query_positions,

@@ -83,6 +83,25 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         self._qsa_cu_seq_lens.zero_()
+        self.qsa_topk_indices = self.get_empty(
+            buffers,
+            (
+                self.max_num_tokens,
+                self.sparse_metadata_params.token_topk
+                // self.sparse_metadata_params.compress_ratio,
+            ),
+            cache_name="qsa_topk_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.qsa_topk_row_starts = self.get_empty(
+            buffers,
+            (self.max_num_tokens,),
+            cache_name="qsa_topk_row_starts",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.qsa_topk_row_starts.zero_()
 
     def _refresh_qsa_token_mapping(self) -> None:
         num_seqs = self.num_seqs

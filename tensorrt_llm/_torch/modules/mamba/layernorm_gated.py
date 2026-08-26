@@ -67,6 +67,8 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    GATE_IS_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -88,7 +90,8 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=cols < N).to(tl.float32)
-        x *= z * tl.sigmoid(z)
+        gate = tl.sigmoid(z) if GATE_IS_SIGMOID else z * tl.sigmoid(z)
+        x *= gate
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
         tl.store(Mean + row, mean)
@@ -102,13 +105,16 @@ def _layer_norm_fwd_1pass_kernel(
     # Normalize and apply linear transformation
     mask = cols < N
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     if HAS_BIAS:
         b = tl.load(B + cols, mask=mask).to(tl.float32)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
-        y *= z * tl.sigmoid(z)
+        gate = tl.sigmoid(z) if GATE_IS_SIGMOID else z * tl.sigmoid(z)
+        y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
         # input dtype, then static quantization reloads and multiplies by the
@@ -148,8 +154,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
     HEADS_PER_TOK: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    GATE_IS_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
 ):
-    """rmsnorm(x) * silu(z), several short rows per program.
+    """Gated rmsnorm(x), several short rows per program.
 
     Z is addressed token-major: row r reads z at
     (r // HEADS_PER_TOK) * stride_z_tok + (r % HEADS_PER_TOK) * N. With
@@ -169,13 +177,16 @@ def _rms_norm_gated_fwd_multirow_kernel(
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
     w = tl.load(W + cols).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
     z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
              cols[None, :])
     z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
-    y *= z * tl.sigmoid(z)
+    gate = tl.sigmoid(z) if GATE_IS_SIGMOID else z * tl.sigmoid(z)
+    y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
         # input dtype, then static quantization reloads and multiplies by the
@@ -199,8 +210,9 @@ def rms_norm_gated_token_major(
     weight: torch.Tensor,
     eps: float,
     fp8_scale: torch.Tensor | None = None,
+    gate_is_sigmoid: bool = False,
 ) -> torch.Tensor:
-    """rmsnorm(x) * silu(z) with z read in place from a 3D token-major view.
+    """Gated rmsnorm(x) with z read in place from a 3D token-major view.
 
     x: [num_tokens * heads, N] with contiguous rows. z: [num_tokens, heads, N]
     whose (heads, N) block is contiguous per token and whose token stride is
@@ -210,7 +222,8 @@ def rms_norm_gated_token_major(
 
     When fp8_scale (a scalar fp32 tensor holding the downstream static input
     scale) is given, the output is quantized to float8_e4m3fn in the same
-    kernel.
+    kernel. The default gate is SiLU. Set ``gate_is_sigmoid`` for checkpoints
+    whose output gate is sigmoid(z), such as Qwen4-Exp.
     """
     M, N = x.shape
     num_tokens, heads, n_z = z.shape
@@ -229,6 +242,7 @@ def rms_norm_gated_token_major(
             norm_before_gate=True,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
+            gate_is_sigmoid=gate_is_sigmoid,
         )
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
@@ -250,6 +264,8 @@ def rms_norm_gated_token_major(
             N=N,
             ROWS=_MULTIROW_ROWS,
             HEADS_PER_TOK=heads,
+            GATE_IS_SIGMOID=gate_is_sigmoid,
+            WEIGHT_IS_DELTA=False,
             num_warps=_MULTIROW_NUM_WARPS,
         )
     return out
@@ -262,8 +278,9 @@ def _(
     weight: torch.Tensor,
     eps: float,
     fp8_scale: torch.Tensor | None = None,
+    gate_is_sigmoid: bool = False,
 ) -> torch.Tensor:
-    del z, weight, eps
+    del z, weight, eps, gate_is_sigmoid
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     return torch.empty_like(x, dtype=out_dtype)
 
@@ -279,6 +296,8 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     fp8_scale=None,
+    gate_is_sigmoid=False,
+    weight_is_delta=False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -327,6 +346,8 @@ def _layer_norm_fwd(
                 N=group_size,
                 ROWS=_MULTIROW_ROWS,
                 HEADS_PER_TOK=1,
+                GATE_IS_SIGMOID=gate_is_sigmoid,
+                WEIGHT_IS_DELTA=weight_is_delta,
                 num_warps=_MULTIROW_NUM_WARPS,
             )
         return out, mean, rstd
@@ -358,6 +379,8 @@ def _layer_norm_fwd(
             BLOCK_N=BLOCK_N,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
+            GATE_IS_SIGMOID=gate_is_sigmoid,
+            WEIGHT_IS_DELTA=weight_is_delta,
             num_warps=num_warps,
         )
     return out, mean, rstd
@@ -374,6 +397,7 @@ class RMSNorm(torch.nn.Module):
         device=None,
         dtype=None,
         is_nvfp4: bool = False,
+        weight_is_delta: bool = False,
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -387,8 +411,12 @@ class RMSNorm(torch.nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size if group_size is not None else hidden_size
         self.norm_before_gate = norm_before_gate
+        self.weight_is_delta = weight_is_delta
 
         self.is_nvfp4 = is_nvfp4
+        if self.is_nvfp4 and self.weight_is_delta:
+            raise ValueError(
+                "NVFP4 RMSNorm does not support delta-form weights")
         # nvfp4_scale will be set externally if is_nvfp4 is True
         self.nvfp4_scale: torch.Tensor | None = None
         # fp8_scale will be attached from the downstream static FP8 linear.
@@ -455,5 +483,6 @@ class RMSNorm(torch.nn.Module):
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
+            weight_is_delta=self.weight_is_delta,
         )
         return y.reshape(x_shape_og)
