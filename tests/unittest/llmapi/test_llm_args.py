@@ -62,6 +62,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           update_llm_args_with_extra_options)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_swa_scratch_reuse_auto,
                                            _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
@@ -607,6 +608,166 @@ class TestModelDefaults:
 
 
 @pytest.mark.cpu_only
+class TestSwaScratchReuseAutoResolution:
+    """SWA scratch reuse is on by default wherever the engine can run it."""
+
+    @staticmethod
+    def _args(**kwargs):
+        kv_cache_config = KvCacheConfig(
+            **{
+                k: kwargs.pop(k)
+                for k in ("enable_swa_scratch_reuse", "use_kv_cache_manager_v2")
+                if k in kwargs
+            })
+        return TorchLlmArgs(model="/tmp/dummy_model",
+                            kv_cache_config=kv_cache_config,
+                            **kwargs)
+
+    @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+    def test_auto_enables_on_v2_with_capable_backend(self, attn_backend):
+        llm_args = self._args(use_kv_cache_manager_v2=True,
+                              attn_backend=attn_backend)
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is True
+        assert llm_args.kv_cache_config.enable_swa_scratch_reuse is True
+
+    @pytest.mark.parametrize("attn_backend",
+                             ["VANILLA", "FLASHINFER_STAR_ATTENTION"])
+    def test_auto_disables_on_backend_that_cannot_address_scratch(
+            self, attn_backend):
+        # A backend reading raw base page indices sees a scratch block as an
+        # invalid page. Turning the feature off beats failing the run.
+        llm_args = self._args(use_kv_cache_manager_v2=True,
+                              attn_backend=attn_backend)
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is False
+        assert llm_args.kv_cache_config.enable_swa_scratch_reuse is False
+
+    def test_auto_disables_on_v1(self):
+        # Scratch reuse is a V2-only feature.
+        llm_args = self._args(use_kv_cache_manager_v2=False,
+                              attn_backend="TRTLLM")
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is False
+        assert llm_args.kv_cache_config.enable_swa_scratch_reuse is False
+
+    def test_auto_disables_when_manager_version_unresolved(self):
+        # 'auto' must be resolved to a bool first; anything else is treated as
+        # "not V2" rather than silently enabling the feature.
+        llm_args = self._args(attn_backend="TRTLLM")
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 == "auto"
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is False
+
+    def test_auto_follows_a_declared_v2_preference(self):
+        """Sparse models keep a v2 manager even when the flag says v1.
+
+        get_sparse_attn_kv_cache_manager picks DeepseekV4CacheManager /
+        MiniMaxM3KVCacheManagerV2 from the algorithm alone, so a v2 manager can
+        outlive a demoted use_kv_cache_manager_v2 (disagg on a non-Python
+        transceiver, two-model speculative decoding). The declared preference is
+        what survives that.
+        """
+
+        class _PrefersV2:
+
+            @classmethod
+            def get_preferred_kv_cache_manager_version(cls,
+                                                       pretrained_config=None):
+                return "V2"
+
+        llm_args = self._args(use_kv_cache_manager_v2=False,
+                              attn_backend="TRTLLM")
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args, _PrefersV2) is True
+
+    def test_auto_ignores_a_v1_preference(self):
+
+        class _PrefersV1:
+
+            @classmethod
+            def get_preferred_kv_cache_manager_version(cls,
+                                                       pretrained_config=None):
+                return "V1"
+
+        llm_args = self._args(use_kv_cache_manager_v2=False,
+                              attn_backend="TRTLLM")
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args, _PrefersV1) is False
+
+    @pytest.mark.parametrize("architecture", [
+        "DeepseekV4ForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+    ])
+    def test_structurally_v2_models_keep_scratch_reuse(self, architecture):
+        """Regression guard for the models the sparse registry pins to v2."""
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        model_cls = get_registered_model_class(architecture)
+        assert model_cls is not None, f"{architecture} is not registered"
+
+        llm_args = self._args(use_kv_cache_manager_v2=False,
+                              attn_backend="TRTLLM")
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args, model_cls) is True
+
+    @pytest.mark.parametrize("user_setting", [True, False])
+    def test_explicit_value_is_untouched(self, user_setting):
+        llm_args = self._args(enable_swa_scratch_reuse=user_setting,
+                              use_kv_cache_manager_v2=True,
+                              attn_backend="TRTLLM")
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is user_setting
+        assert (llm_args.kv_cache_config.enable_swa_scratch_reuse
+                is user_setting)
+
+    def test_resolution_is_idempotent(self):
+        llm_args = self._args(use_kv_cache_manager_v2=True,
+                              attn_backend="TRTLLM")
+
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is True
+        assert _resolve_swa_scratch_reuse_auto(llm_args) is True
+
+    def test_explicit_true_rejects_incapable_backend(self):
+        # The default degrades quietly; an explicit request must not.
+        with pytest.raises(ValidationError, match="enable_swa_scratch_reuse"):
+            self._args(enable_swa_scratch_reuse=True, attn_backend="VANILLA")
+
+    def test_auto_does_not_reject_incapable_backend(self):
+        # Same config, default value: constructing it must still work.
+        self._args(attn_backend="VANILLA")
+
+    @pytest.mark.parametrize("architecture", [
+        "Gemma3ForCausalLM",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "GptOssForCausalLM",
+        "DeepseekV4ForCausalLM",
+    ])
+    def test_no_model_declares_a_per_model_opt_in(self, architecture):
+        """Enablement lives in one place: the 'auto' resolution above.
+
+        A model that repeats ``enable_swa_scratch_reuse`` in
+        ``get_model_defaults`` would reintroduce a second, silently diverging
+        source of truth -- and, being an explicit value, would turn an
+        unsupported attention backend into a hard error for that model.
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        model_cls = get_registered_model_class(architecture)
+        assert model_cls is not None, f"{architecture} is not registered"
+
+        defaults = getattr(model_cls, "get_model_defaults",
+                           lambda _: {})(None) or {}
+        assert "enable_swa_scratch_reuse" not in (
+            defaults.get("kv_cache_config") or {}), (
+                f"{architecture} pins enable_swa_scratch_reuse in "
+                "get_model_defaults; remove it and rely on the global default")
+
+
+@pytest.mark.cpu_only
 class TestKvCacheManagerV2AutoResolution:
     """Test model preferences for the KV cache manager version."""
 
@@ -774,7 +935,13 @@ def test_KvCacheConfig_declaration():
     assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig().block_reuse_config == BlockReuseConfig()
-    assert KvCacheConfig().enable_swa_scratch_reuse is False
+    assert KvCacheConfig().enable_swa_scratch_reuse == "auto"
+    assert KvCacheConfig(
+        enable_swa_scratch_reuse=True).enable_swa_scratch_reuse is True
+    assert KvCacheConfig(
+        enable_swa_scratch_reuse=False).enable_swa_scratch_reuse is False
+    with pytest.raises(ValidationError, match="enable_swa_scratch_reuse"):
+        KvCacheConfig(enable_swa_scratch_reuse="invalid")
     assert KvCacheConfig().use_kv_cache_manager_v2 == "auto"
     assert KvCacheConfig(
         use_kv_cache_manager_v2=True).use_kv_cache_manager_v2 is True
@@ -819,7 +986,7 @@ def test_KvCacheConfig_declaration():
     assert config.disk_cache_size == 2048
     assert config.disk_cache_path == "/tmp"
     assert config.enable_swa_scratch_reuse is True
-    assert KvCacheConfig().enable_swa_scratch_reuse is False
+    assert KvCacheConfig().enable_swa_scratch_reuse == "auto"
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0

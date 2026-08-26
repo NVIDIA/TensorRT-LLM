@@ -25,7 +25,8 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             read_modelopt_quant_config,
                                             warn_if_inline_diverges)
 # yapf: disable
-from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
+from .llm_args import (SWA_SCRATCH_CAPABLE_ATTN_BACKENDS, CalibConfig,
+                       CudaGraphConfig, DecodeCudaGraphConfig,
                        DraftTargetDecodingConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
                        KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
@@ -673,6 +674,47 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
     return use_v2
+
+
+def _resolve_swa_scratch_reuse_auto(llm_args: 'TorchLlmArgs',
+                                    model_cls: Optional[type] = None,
+                                    pretrained_config: Any = None) -> bool:
+    """Resolve the 'auto' sentinel in kv_cache_config.enable_swa_scratch_reuse.
+
+    'auto' turns SWA scratch reuse on wherever the engine can actually run it:
+    a V2 KV cache manager and a scratch-capable attention backend. Whether the
+    model has sliding-window layers at all is decided by the manager, which is
+    the first place the per-layer window vector exists; without them the
+    feature is inert rather than wrong.
+
+    ``use_kv_cache_manager_v2`` alone is not the right question. Some models are
+    routed to a V2 manager structurally: the sparse-attention registry picks
+    ``DeepseekV4CacheManager`` / ``MiniMaxM3KVCacheManagerV2`` from the
+    algorithm, ignoring the flag, and those models keep a V2 manager even when
+    the flag is demoted to False (disaggregated serving on a non-Python
+    transceiver, two-model speculative decoding). A declared ``"V2"`` preference
+    is the signal that survives that demotion.
+
+    Must run after model defaults are applied (a model may select the attention
+    backend) and after ``_resolve_kv_cache_manager_v2_auto``, so both inputs are
+    concrete. An explicit user value is returned untouched.
+    """
+    kv_cache_config = llm_args.kv_cache_config
+    setting = kv_cache_config.enable_swa_scratch_reuse
+    if setting != "auto":
+        return setting
+
+    uses_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
+    if not uses_v2 and model_cls is not None:
+        get_preferred = getattr(model_cls,
+                                'get_preferred_kv_cache_manager_version', None)
+        uses_v2 = (get_preferred is not None
+                   and get_preferred(pretrained_config) == "V2")
+
+    enable = (uses_v2
+              and llm_args.attn_backend in SWA_SCRATCH_CAPABLE_ATTN_BACKENDS)
+    kv_cache_config.enable_swa_scratch_reuse = enable
+    return enable
 
 
 def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',

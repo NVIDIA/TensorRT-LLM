@@ -577,6 +577,59 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, "auto"])
+def test_connector_with_kv_cache_manager_v2(enforce_single_worker,
+                                            model_with_connector,
+                                            use_kv_cache_manager_v2):
+    """The connector and KV cache manager v2 must produce a working engine.
+
+    v2 cannot drive the connector's per-block load/save hooks, so
+    `_validate_or_fallback_kv_cache_manager_v2` selects v1 instead. That is a
+    fallback, not an error: the run must still come up and generate, and the
+    connector must be driven exactly as it is without the v2 request.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+        KVCacheManagerV2
+
+    NUM_TOKENS = 8
+
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(kv_cache_config=KvCacheConfig(
+        free_gpu_memory_fraction=0.1,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2))
+
+    # The connector is registered against the selected manager's pool, so this
+    # asserts the fallback actually happened rather than that it was requested.
+    assert worker.register_kv_caches.call_count == 1
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
+    outputs = generate_and_sleep(model, ["Hello, world"], sampling_params)
+
+    assert len(outputs[0].outputs[0].token_ids) == NUM_TOKENS
+
+    # The connector still sees the whole request lifecycle.
+    assert scheduler.update_state_after_alloc.call_count == 1
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
+    assert scheduler.request_finished.call_count == 1
+
+    kv_cache_manager = _get_kv_cache_manager(model)
+    assert not isinstance(kv_cache_manager, KVCacheManagerV2), (
+        "KVCacheManagerV2 cannot serve the KV connector: it exposes no "
+        "single primary pool to register, no per-request block hashes, and no "
+        "block priorities. Selecting it here would hand the connector worker "
+        "block ids it cannot address.")
+
+
+def _get_kv_cache_manager(model):
+    """The KV cache manager actually built for this engine."""
+    return model._executor.engine.kv_cache_manager
+
+
+@pytest.mark.threadleak(enabled=False)
 def test_connector_e2e_persistent_cache(enforce_single_worker):
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 
