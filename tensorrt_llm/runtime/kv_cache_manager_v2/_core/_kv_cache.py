@@ -1214,7 +1214,12 @@ class _KVCache:
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
         self._status = self.Status.SUSPENDED
-        if self._should_record_stats():
+        # Manager-level counter, so gate on the manager predicate: it also honours
+        # the per-cache stats exclusion (dummy / CUDA-graph caches). C++ spells the
+        # gate _shouldRecordStats() (manager OR request); the two are equivalent
+        # here because KVCacheManager.record_request_suspended already returns
+        # early when stats are disabled.
+        if self._should_record_manager_stats():
             self.manager.record_request_suspended()
 
     # Resume, migrate buffers to GPU memory.
@@ -1412,7 +1417,7 @@ class _KVCache:
         first_activation = self._never_resumed
         self._never_resumed = False
         self._status = self.Status.ACTIVE
-        if not first_activation and self._should_record_stats():
+        if not first_activation and self._should_record_manager_stats():
             self.manager.record_request_resumed()
         return True
 
