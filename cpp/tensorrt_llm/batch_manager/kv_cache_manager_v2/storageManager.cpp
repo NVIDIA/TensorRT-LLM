@@ -16,7 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/storageManager.h"
-#include "kv_cache_manager_v2/coldPageCopy.h"
+#include "kv_cache_manager_v2/batchedPageCopy.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -455,31 +455,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             = std::make_unique<StagingBufferManager>(pageStagingBytes, StagingBufferMemory::kPinnedHost);
     }
 
-    // cuMemcpyBatchAsync cannot copy across adjacent HostMem registrations in one batch entry. The default codec needs
-    // the owning HostMem objects to split copies at registration boundaries on linux kernels that require chunked
-    // pinning.
-    if (detail::needsHostMemRegistration(codec))
-    {
-        for (CacheLevel level{0}; level < mLevels.size(); ++level)
-        {
-            if (cacheTier(level) != CacheTier::HOST_MEM)
-            {
-                continue;
-            }
-            for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numPoolGroups(level); ++poolGroupIndex)
-            {
-                auto const& hostPoolGroup = static_cast<HostPoolGroup const&>(poolGroup(level, poolGroupIndex));
-                for (PoolIndex poolIndex{0}; poolIndex < numPools(level, poolGroupIndex); ++poolIndex)
-                {
-                    detail::registerHostMem(codec, hostPoolGroup.hostMem(poolIndex));
-                }
-            }
-        }
-        if (mPageStagingManager)
-        {
-            detail::registerHostMem(codec, mPageStagingManager->hostMem());
-        }
-    }
     mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
 }
 
@@ -687,7 +662,10 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
             ? std::numeric_limits<size_t>::max()
             : coldPageBytes * remaining;
-        auto staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 1, stream);
+        // 16-byte alignment: the cold-page codec's copy path uses 16-byte vector accesses and
+        // requires its base pointer to be 16-aligned. Nothing here needs finer granularity, so
+        // this is a floor rather than a computed requirement.
+        auto staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
         size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 

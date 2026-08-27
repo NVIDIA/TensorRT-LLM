@@ -16,9 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/coldPageCodec.h"
-#include "kv_cache_manager_v2/coldPageCopy.h"
-#include "kv_cache_manager_v2/utils/funcGuard.h"
-#include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/batchedPageCopy.h"
 
 #include "tensorrt_llm/common/logger.h"
 
@@ -55,13 +53,6 @@ public:
         TypedVec<PoolIndex, PoolCopyPlan> copyPlans;
     };
 
-    void registerHostMem(HostMem const* memory)
-    {
-        TLLM_CHECK(
-            memory != nullptr && std::find(mHostMemories.begin(), mHostMemories.end(), memory) == mHostMemories.end());
-        mHostMemories.push_back(memory);
-    }
-
     bool configure(PoolGroupDesc const* gpuDescs, PoolGroupIndex numGpuDescs) noexcept override
     {
         try
@@ -95,7 +86,7 @@ public:
 
     [[nodiscard]] PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept override
     {
-        return findGroup(layerGroupId) == nullptr ? PageIndexLocation::kBadLocation : PageIndexLocation::kHost;
+        return findGroup(layerGroupId) == nullptr ? PageIndexLocation::kBadLocation : mCopier.pageIndexLocation();
     }
 
     bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices, size_t numBasePages,
@@ -209,17 +200,6 @@ private:
         return mGroups.at(groupIndex).get();
     }
 
-    [[nodiscard]] HostMem const* findHostMem(MemAddress address) const noexcept
-    {
-        auto const memory = std::find_if(mHostMemories.begin(), mHostMemories.end(),
-            [address](HostMem const* candidate)
-            {
-                MemAddress const begin = candidate->address();
-                return begin <= address && address - begin < candidate->size();
-            });
-        return memory == mHostMemories.end() ? nullptr : *memory;
-    }
-
     template <bool isEncode>
     bool dispatch(GroupConfig const* group, void* dstBasePtr, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) const
@@ -233,120 +213,64 @@ private:
         {
             return false;
         }
-
-        thread_local std::vector<CUdeviceptr> dsts;
-        thread_local std::vector<CUdeviceptr> srcs;
-        thread_local std::vector<size_t> sizes;
-        dsts.clear();
-        srcs.clear();
-        sizes.clear();
-        size_t const numCopies = group->copyPlans.stdSize() * numBasePages;
-        dsts.reserve(numCopies);
-        srcs.reserve(numCopies);
-        sizes.reserve(numCopies);
-        auto const releaseCopyVectors = FuncGuard(
-            [&]() noexcept
-            {
-                constexpr size_t kMaxRetainedCopyEntries = 128U << 10U;
-                if (numCopies > kMaxRetainedCopyEntries)
-                {
-                    std::vector<CUdeviceptr>().swap(dsts);
-                    std::vector<CUdeviceptr>().swap(srcs);
-                    std::vector<size_t>().swap(sizes);
-                }
-            });
-
-        // Work around the interaction of two independent bugs. Linux kernels 6.11 through 6.13 cannot reliably pin
-        // more than 2 GiB in one call, so HostMem registers a large allocation as adjacent 2 GiB regions. Separately,
-        // cuMemcpyBatchAsync cannot handle one copy entry that spans two such registrations. The cold pointer can be a
-        // subrange of a larger staging allocation, so calculate boundaries relative to its owning HostMem span.
-        auto const* const coldBase
-            = isEncode ? static_cast<std::byte const*>(dstBasePtr) : static_cast<std::byte const*>(srcBasePtr);
-        MemAddress const coldBaseAddress = reinterpret_cast<MemAddress>(coldBase);
-        HostMem const* const hostMem = findHostMem(coldBaseAddress);
-        bool const splitRegistrationChunks = hostMem != nullptr && hostMem->size() > HostMem::kChunkSize;
-        size_t const coldBaseOffset = splitRegistrationChunks ? coldBaseAddress - hostMem->address() : 0;
-        auto appendCopy = [&](std::byte* dst, std::byte const* src, size_t pinnedOffset, size_t numBytes)
+        // KVCM never submits a negative index, so this is a debug-only sanity check rather than a
+        // validated precondition -- an O(numBasePages) host scan does not belong on the eviction
+        // critical path. The copy path carries matching assertions.
+#ifndef NDEBUG
+        if (mCopier.pageIndexLocation() == PageIndexLocation::kHost)
         {
-            if (splitRegistrationChunks)
+            for (size_t page = 0; page < numBasePages; ++page)
             {
-                TLLM_CHECK(pinnedOffset <= hostMem->size() && numBytes <= hostMem->size() - pinnedOffset);
+                TLLM_CHECK_DEBUG(pageIndices[page].dst >= 0 && pageIndices[page].src >= 0);
             }
-            do
-            {
-                size_t copyBytes = numBytes;
-                if (splitRegistrationChunks)
-                {
-                    size_t const bytesUntilBoundary = HostMem::kChunkSize - pinnedOffset % HostMem::kChunkSize;
-                    copyBytes = std::min(copyBytes, bytesUntilBoundary);
-                }
-                dsts.push_back(reinterpret_cast<CUdeviceptr>(dst));
-                srcs.push_back(reinterpret_cast<CUdeviceptr>(src));
-                sizes.push_back(copyBytes);
-                dst += copyBytes;
-                src += copyBytes;
-                pinnedOffset += copyBytes;
-                numBytes -= copyBytes;
-            } while (numBytes != 0);
-        };
+        }
+#endif
 
+        // One dispatcher launch per pool, all on the same stream. Stream ordering serialises them,
+        // so each may use the full grid. The dispatcher picks the copy kernel or cuMemcpyBatchAsync
+        // and, when the kernel is selected, tolerates pages that straddle a HostMem registration
+        // chunk -- so the per-page splitting this used to do is no longer needed.
         auto* const coldDstBase = static_cast<std::byte*>(dstBasePtr);
         auto const* const coldSrcBase = static_cast<std::byte const*>(srcBasePtr);
-        for (size_t page = 0; page < numBasePages; ++page)
         {
-            PageIndexPair const pageIndex = pageIndices[page];
-            if (pageIndex.dst < 0 || pageIndex.src < 0)
-            {
-                return false;
-            }
+            // PoolCopyArgs is a 32-bit interface; numBasePages in particular is unbounded on the
+            // HOST tier path, so narrow explicitly rather than silently.
+            TLLM_CHECK(numBasePages <= std::numeric_limits<uint32_t>::max());
             for (PoolCopyPlan const& plan : group->copyPlans)
             {
-                auto* const hotBase
-                    = plan.hotBase + static_cast<size_t>(isEncode ? pageIndex.src : pageIndex.dst) * plan.hotPageBytes;
-                size_t const coldOffset
-                    = static_cast<size_t>(isEncode ? pageIndex.dst : pageIndex.src) * group->coldPageBytes
-                    + plan.coldPageOffset;
-                size_t const pinnedOffset = coldBaseOffset + coldOffset;
+                TLLM_CHECK(plan.hotPageBytes <= std::numeric_limits<uint32_t>::max());
+                PoolCopyArgs args{};
+                args.bytesPerPage = static_cast<uint32_t>(plan.hotPageBytes);
+                args.pairs = pageIndices;
+                args.numPairs = static_cast<uint32_t>(numBasePages);
                 if constexpr (isEncode)
                 {
-                    appendCopy(coldDstBase + coldOffset, hotBase, pinnedOffset, plan.hotPageBytes);
+                    args.dstBase = reinterpret_cast<CUdeviceptr>(coldDstBase + plan.coldPageOffset);
+                    args.dstStride = group->coldPageBytes;
+                    args.srcBase = reinterpret_cast<CUdeviceptr>(plan.hotBase);
+                    args.srcStride = plan.hotPageBytes;
                 }
                 else
                 {
-                    appendCopy(hotBase, coldSrcBase + coldOffset, pinnedOffset, plan.hotPageBytes);
+                    args.dstBase = reinterpret_cast<CUdeviceptr>(plan.hotBase);
+                    args.dstStride = plan.hotPageBytes;
+                    args.srcBase = reinterpret_cast<CUdeviceptr>(coldSrcBase + plan.coldPageOffset);
+                    args.srcStride = group->coldPageBytes;
                 }
+                mCopier.launch(
+                    args, isEncode ? CopyDirection::kD2H : CopyDirection::kH2D, reinterpret_cast<CUstream>(stream));
             }
         }
-
-        detail::copyColdPageDataBatch(
-            dsts.data(), srcs.data(), sizes.data(), dsts.size(), reinterpret_cast<CUstream>(stream));
         return true;
     }
 
+    //! Mutable: launch() reuses per-dispatcher descriptor scratch, and dispatch() is const.
+    mutable BatchedPageCopier mCopier;
     TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> mGroups;
     TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleToGroup;
-    std::vector<HostMem const*> mHostMemories;
 };
 
 } // namespace
-
-namespace detail
-{
-
-bool needsHostMemRegistration(IKvCacheColdPageCodec const& codec) noexcept
-{
-    return HostMem::shouldUseChunkedRegistration()
-        && dynamic_cast<ConcatKvCacheColdPageCodec const*>(&codec) != nullptr;
-}
-
-void registerHostMem(IKvCacheColdPageCodec& codec, HostMem const* memory)
-{
-    auto* concatCodec = dynamic_cast<ConcatKvCacheColdPageCodec*>(&codec);
-    TLLM_CHECK(concatCodec != nullptr);
-    concatCodec->registerHostMem(memory);
-}
-
-} // namespace detail
 
 IKvCacheColdPageCodec::IKvCacheColdPageCodec() = default;
 IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
