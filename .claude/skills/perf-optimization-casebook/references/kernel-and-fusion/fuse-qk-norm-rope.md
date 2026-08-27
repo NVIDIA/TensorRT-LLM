@@ -33,4 +33,4 @@ measured: []
 - **Accuracy risk:** lossless in principle (same QK-norm+RoPE math, one kernel) but bf16-only and layout-sensitive — enabling on a non-bf16/interleaved-rope model without kernel support is a correctness risk; parity-check Q/K on a new model.
 - **Verify:** kernel count / nsys (one fused op vs two norms + rope); Q/K output parity vs unfused; downstream accuracy.
 - **Rollback:** `fuse_qk_norm_rope=False` (falls back to separate `apply_qk_norm` + `rotary_emb`). Trigger: Q/K parity mismatch, non-bf16 dtype, unsupported rope variant.
-- **Prior art:** PR #4611. Files: `_torch/attention/attention.py` (`apply_qk_norm_rope`), `modeling_qwen3.py`, `_torch/compilation/utils.py` (in-place reg). Owning specialist: **kernel-cuda-specialist**.
+- **Prior art:** PR #4611. Files: `_torch/attention/qk_norm_attention.py` (`apply_qk_norm_rope`), `modeling_qwen3.py`, `_torch/compilation/utils.py` (in-place reg). Owning specialist: **kernel-cuda-specialist**.

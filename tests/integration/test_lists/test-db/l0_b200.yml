@@ -95,17 +95,14 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
-  # Everything under attention/ runs from this single entry. Three sub-trees are worth
-  # knowing about even though they are no longer split out:
-  #   kernels/parallel_hw_agnostic/       carries no skipif at all -- the suffix means the
-  #                                       kernels are hardware-agnostic, so these used to be
-  #                                       listed on one stage only
-  #   kernels/test_deepseek_v4_q_norm.py  gated by a plain CUDA-availability pytestmark plus
-  #                                       per-parameter skips; used to carry TIMEOUT (15)
-  #   multi_gpu/                          helix tests: they rebind mpi4py's serializer at
-  #                                       import time and each case spawns a 2-rank
-  #                                       MPIPoolExecutor (helix_test_utils.py:322);
-  #                                       they self-skip on device_count() < 2
+  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
+  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
+  # is what picks them up:
+  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
+  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
+  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
+  #               rebind mpi4py's serializer at import time, which applies process-wide on
+  #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation

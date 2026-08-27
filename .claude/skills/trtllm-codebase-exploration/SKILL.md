@@ -178,7 +178,7 @@ grep -n "forward_context_default" tensorrt_llm/_torch/attention/attention.py
 | Area | Key files to read |
 |------|-------------------|
 | Attention modules | `tensorrt_llm/_torch/attention/attention.py` |
-| Attention backends | `tensorrt_llm/_torch/attention/backends/` (trtllm_attention.py, sparse/) |
+| Attention backends | `tensorrt_llm/_torch/attention/backends/` (trtllm.py, sparse/) |
 | Model definitions | `tensorrt_llm/_torch/models/modeling_*.py` |
 | Utilities | `tensorrt_llm/_torch/utils.py` |
 | RoPE | `tensorrt_llm/_torch/attention/rotary_embedding.py` |
