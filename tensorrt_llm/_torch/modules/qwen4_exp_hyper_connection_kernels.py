@@ -368,7 +368,8 @@ def hc_combine_norm(
             block_size=block_size,
             padded_tiles=padded_tiles,
             launch_with_pdl=launch_with_pdl,
-            num_warps=8,
+            # Four warps avoid oversubscribing the fixed-width HC reduction.
+            num_warps=4,
             launch_pdl=launch_with_pdl,
         )
     return output, normed

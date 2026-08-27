@@ -82,7 +82,7 @@ def test_combine_and_mix_matches_unfused_reference_cpu(rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("rows", [1, 4, 16, 128])
+@pytest.mark.parametrize("rows", [1, 4, 16, 128, 320])
 @torch.inference_mode()
 def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows, monkeypatch):
     monkeypatch.setenv("TRTLLM_QWEN4_EXP_HC_DIRECT_SKINNY_GEMM", "1")
