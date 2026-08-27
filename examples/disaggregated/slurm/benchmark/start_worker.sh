@@ -54,6 +54,16 @@ fi
 
 echo "config_file: ${config_file}"
 
+# The mooncake-store KV connector reads its pool topology from
+# MOONCAKE_CONFIG_PATH. disaggr_torch.slurm generates one per job in the log
+# directory, whose path is not known when submit.py builds the worker
+# environment; an explicit setting still wins, so pointing at an externally
+# managed pool remains possible.
+if [ -z "${MOONCAKE_CONFIG_PATH:-}" ] && [ -f "${log_dir}/mooncake.json" ]; then
+    export MOONCAKE_CONFIG_PATH="${log_dir}/mooncake.json"
+    echo "MOONCAKE_CONFIG_PATH: ${MOONCAKE_CONFIG_PATH}"
+fi
+
 nsys_prefix=""
 if [ "${enable_nsys}" != "true" ]; then
     echo "nsys is not enabled, start normal flow"

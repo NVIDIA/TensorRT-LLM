@@ -262,19 +262,19 @@ pytest tests/unittest/_torch/executor/test_mooncake_store_connector.py
 
 ```
                        mooncake_master (1 CPU core, its own job)
-                              ^         ^
-              register/put/get|         |
-        ┌─────────────────────┴──┐   ┌──┴──────────────────────┐
-        │  CTX instance 0  TP=4  │   │  CTX instance 1  TP=4   │   store: role=both
-        └────────────┬───────────┘   └───────────┬─────────────┘
-                     │      NIXL KV handoff      │
-                     └──────────┬────────────────┘
-                                v
-                     ┌──────────────────────────┐
-                     │   GEN instance   TP=4    │   no connector at all
-                     └──────────────────────────┘
-                                ^
-                     round-robin│
+                              ^         ^                    ^
+              register/put/get|         |                    |mount segment only
+        ┌─────────────────────┴──┐   ┌──┴──────────────────────┐   │
+        │  CTX instance 0  TP=4  │   │  CTX instance 1  TP=4   │   │ store: role=both
+        └────────────┬───────────┘   └───────────┬─────────────┘   │
+                     │      NIXL KV handoff      │                 │
+                     └──────────┬────────────────┘                 │
+                                v                                  │
+                     ┌──────────────────────────┐   ┌──────────────┴────────────┐
+                     │   GEN instance   TP=4    │   │ segment donor (same node) │
+                     └──────────────────────────┘   └───────────────────────────┘
+                                ^                     no connector, no put/get,
+                     round-robin│                     contributes host memory
                      ┌──────────┴───────────┐
                      │  trtllm-serve disagg │  <- benchmark_serving client
                      └──────────────────────┘
@@ -286,13 +286,58 @@ absence is the only way to express "off" (`StoreRole` has no off value). It also
 lets the generation worker keep its host cache tier and `MAX_UTILIZATION`
 scheduler, both of which the connector would forbid.
 
+### Why the generation node still needs a donor process
+
+Pool capacity comes only from processes that open a store handle: `setup`
+registers `global_segment_size` bytes of the calling process's host memory, and
+the master then places blocks in it. Since only the context workers configure
+the connector, only they contribute memory — so by default every byte of the
+pool is prefill-node DRAM, and the store is a prefill-DRAM-caches-prefill-GPU
+tier that largely duplicates TensorRT-LLM's native host offload. Confirm this on
+any run by grouping the master's `allocation_succeeded ... segment=<ip>:<port>`
+lines by host: a single host means a prefill-only pool.
+
+`mooncake_segment_donor.py` closes that gap. One donor per generation node opens
+a handle, contributes memory, and then idles forever without a single put or get,
+so the pool spans both sides while the generation engine stays connector-free
+and keeps its cache transceiver for the KV handoff. A donor is deliberately not
+a `StoreRole`: the roles describe traffic (`producer` writes, `consumer` reads,
+`both`), and none of them means "contribute memory only", so capacity and
+traffic have to be separate processes.
+
+`disaggr_torch.slurm` starts the donors automatically, reading the generation
+nodes off the generated worker commands and waiting for each segment to mount
+before any worker starts — so the first blocks prefill writes can already land
+on a decode node. Tune with `MOONCAKE_DONOR_SEGMENT_SIZE` (default `32GiB`, set
+`0` to keep the pool prefill-only) and `MOONCAKE_DONOR_NODES` to override node
+selection.
+
+The donated memory is charged to the donor process and competes with the
+generation worker's own `kv_cache_config.host_cache_size` on that node, so size
+the two together. The worker logs its own share as `KV cache manager v2 host
+cache quota set to N GiB`, **per rank**, against the `available host memory` it
+reports on the same line.
+
 ## 4. Step 1 -- run the Mooncake master
 
 `master_server_address` is mandatory, so a master must exist and be reachable
-from every worker. The benchmark harness has no hook for launching a side
-process, and the workers read `MOONCAKE_CONFIG_PATH` at startup, so the master's
-address has to be known *before* the benchmark job is submitted. Run it as its
-own long-lived job:
+from every worker.
+
+**For a single-job experiment you can skip this section.**
+`disaggr_torch.slurm` now starts a `mooncake_master` on the first node of the
+allocation, waits for its port to accept connections, and writes
+`<log_dir>/mooncake.json` naming it; `start_worker.sh` then resolves
+`MOONCAKE_CONFIG_PATH` from the log directory, which is why the harness config
+does not set it. Defaults are the bring-up ones (TCP, 16GiB per worker);
+`MOONCAKE_PROTOCOL`, `MOONCAKE_DEVICE_NAME`, `MOONCAKE_GLOBAL_SEGMENT_SIZE` and
+`MOONCAKE_LOCAL_BUFFER_SIZE` in the submitting environment override them, and
+the master's own log lands in `<log_dir>/2_mooncake_master.log`.
+
+That master dies with the job, so read on if you need a pool that outlives one
+allocation -- which experiment 3 does, by construction. Run it as its own
+long-lived job and export `MOONCAKE_MASTER_ADDRESS=<host>:50051` before
+`submit.py`; the harness then skips launching one and only writes the client
+config pointing at yours.
 
 ```bash
 # mooncake_master.sbatch
@@ -323,7 +368,8 @@ Keeping the master in a separate job is what makes experiment 3 (§7) possible:
 the pool outlives the engines, so a second benchmark job finds a warm store.
 
 Then write the client config, substituting the address the master job just
-recorded. The schema is vLLM's, so one pool can serve both engines:
+recorded -- or let `disaggr_torch.slurm` generate it, as above. The schema is
+vLLM's, so one pool can serve both engines:
 
 ```bash
 MASTER_IP=$(cat $WORK_DIR/master.addr)
@@ -415,8 +461,10 @@ environment:
   trtllm_wheel_path: ""
   work_dir: "<work_dir>"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0"
-  # Only the context workers open a store handle.
-  ctx_worker_env_var: "MOONCAKE_CONFIG_PATH=<work_dir>/mooncake.json TRTLLM_MOONCAKE_STORE_ROLE=both TRTLLM_MOONCAKE_STORE_PREFIX=trtllm-m3-run1"
+  # Only the context workers open a store handle. MOONCAKE_CONFIG_PATH is
+  # deliberately absent: the harness generates the file per job in the log
+  # directory, whose path is not known when submit.py builds this environment.
+  ctx_worker_env_var: "TRTLLM_MOONCAKE_STORE_ROLE=both TRTLLM_MOONCAKE_STORE_PREFIX=trtllm-m3-run1"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
 profiling:
@@ -687,6 +735,29 @@ mooncake-store rank K loaded P pages                        # worker, a load
 The store's own counters are the alternative that costs nothing at runtime:
 `mooncake_master --metrics_port=9004` exposes pool-level statistics over HTTP.
 Scrape it before and after a run and diff.
+
+### Where did the pages land?
+
+Page counts alone do not say whether the pool is doing anything the native host
+offload tier could not. For that, group the master's allocations by segment host
+— a segment is one client process's donated memory, so the host tells you which
+node the block physically lives on:
+
+```bash
+grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" 2_mooncake_master.log \
+  | awk '{sub(/size=/,"",$2); sub(/segment=/,"",$3); split($3,p,":");
+          n[p[1]]++; b[p[1]]+=$2}
+         END {for (h in n) printf "%-16s pages=%-7d %.2f GiB\n", h, n[h], b[h]/1073741824}'
+```
+
+One host means a prefill-only pool (see §3). Two or more, with the generation
+node among them, means blocks written by prefill are living on decode-side DRAM
+and being read back from there. `disaggr_torch.slurm` writes this breakdown into
+`9_mooncake_summary.log` at the end of every run, alongside the donor hosts, so
+it needs running by hand only when diagnosing a partial run.
+
+Requires `GLOG_v=1` on the master, which `disaggr_torch.slurm` sets; raise it
+with `MOONCAKE_MASTER_GLOG_V`.
 
 ### Which reuse number means what
 
