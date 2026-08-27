@@ -346,6 +346,11 @@ class Router(ABC):
         # ``monitoring_is_stale()``. ``None`` means monitoring was never
         # started (a static server list), which is not staleness.
         self._last_successful_poll: Optional[float] = None
+        # When the monitor task was created. Stands in for
+        # ``_last_successful_poll`` until the first poll lands, so a monitor
+        # whose every poll has failed still ages into staleness instead of
+        # holding the initial server list healthy forever.
+        self._monitor_started_at: Optional[float] = None
         self._session = None
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
@@ -389,6 +394,12 @@ class Router(ABC):
         within ``max_age_secs``. Both mean ``servers`` is no longer a
         statement about the cluster, so a readiness probe must not trust it.
 
+        Before the first poll lands, the monitor's own start time is the
+        reference point. Otherwise a monitor whose every poll has failed since
+        startup would never age into staleness, and readiness would keep
+        trusting the initial server list -- the same fail-open this is meant
+        to close, just entered from startup rather than from a later death.
+
         Always False when monitoring was never started -- a static server list
         has no monitor to go stale, and its list is correct by construction.
         """
@@ -396,11 +407,16 @@ class Router(ABC):
             return False
         if self._monitor_task.done():
             return True
-        if self._last_successful_poll is None:
-            # Started, but the first poll has not landed yet. Treat the task's
-            # own start as the reference point rather than reporting stale.
+        # Explicit None checks throughout: 0.0 is a legitimate
+        # ``time.monotonic()`` value, and `or` would silently discard it.
+        reference = self._last_successful_poll
+        if reference is None:
+            reference = self._monitor_started_at
+        if reference is None:
+            # Task exists but was not created by ``start_server_monitoring()``.
+            # Nothing to measure against; do not invent staleness.
             return False
-        return (time.monotonic() - self._last_successful_poll) > max_age_secs
+        return (time.monotonic() - reference) > max_age_secs
 
     @property
     def prepared_servers(self) -> set[str]:
@@ -526,6 +542,10 @@ class Router(ABC):
 
         logger.info(
             f"Starting server monitoring for {self._server_role} servers")
+        # Set before the task exists so staleness has a reference point from
+        # the very first poll onwards, including the polls that fail.
+        self._monitor_started_at = time.monotonic()
+        self._last_successful_poll = None
         self._monitor_task = asyncio.create_task(
             self._monitor_servers(poll_interval))
 

@@ -198,10 +198,10 @@ class TestMonitorDrivesReadiness:
     """
 
     @staticmethod
-    def _router(servers, healthy):
+    def _router(servers, healthy, role=ServerRole.CONTEXT):
         """A real RoundRobinRouter whose health check answers from `healthy`."""
         router = RoundRobinRouter(
-            server_role=ServerRole.CONTEXT,
+            server_role=role,
             servers=list(servers),
             metadata_server_cfg=None,
             metadata_server=_StubMetadataServer({f"trtllm/{s}": {"url": s} for s in servers}),
@@ -301,3 +301,58 @@ class TestMonitorDrivesReadiness:
         router = self._router(["ctx0"], healthy={"ctx0"})
         assert router._monitor_task is None
         assert router.monitoring_is_stale(0.0) is False
+
+    def test_monitoring_that_never_succeeds_ages_into_staleness(self):
+        """Failing from the very first poll must still fail closed.
+
+        Routers are built with the static list from the disagg config even
+        when a metadata server is configured, so ``servers`` starts non-empty.
+        If metadata is unreachable from startup onwards, no poll ever
+        succeeds. Keying staleness only off the last *successful* poll would
+        leave the reference point unset forever, the monitor would never look
+        stale, and readiness would keep trusting that never-updated list --
+        the same fail-open this PR closes, entered from startup instead of
+        from a worker dying later.
+        """
+
+        async def scenario():
+            router = self._router(["gen0"], healthy={"gen0"}, role=ServerRole.GENERATION)
+
+            async def always_fails():
+                raise RuntimeError("metadata server unreachable")
+
+            router.fetch_live_servers = always_fails
+            # The real entry point: it is what records the monitor's start.
+            await router.start_server_monitoring(poll_interval=0.01)
+            await asyncio.sleep(0.1)
+
+            # The precondition for the fail-open: alive, never succeeded, and
+            # still holding the list it was constructed with.
+            alive = not router._monitor_task.done()
+            never_succeeded = router._last_successful_poll is None
+            servers = list(router.servers)
+
+            c = _coordinator(["ctx0"], [])
+            c._gen_router = router
+            c._monitor_staleness_secs = 0.05
+            ready = await c.is_ready()
+
+            # A generous window must NOT report stale, or a merely slow first
+            # poll would flap /health during startup.
+            c._monitor_staleness_secs = 30.0
+            ready_in_generous_window = await c.is_ready()
+
+            await router.stop_server_monitoring()
+            return alive, never_succeeded, servers, ready, ready_in_generous_window
+
+        alive, never_succeeded, servers, ready, generous = asyncio.run(scenario())
+        assert alive, "monitor died; this test is meant to cover the still-running case"
+        assert never_succeeded, "no poll should have succeeded"
+        assert servers == ["gen0"], "the un-refreshed initial list is what readiness must not trust"
+        assert ready is False, (
+            "monitoring never succeeded past the staleness bound, yet /health "
+            "still promised readiness"
+        )
+        assert generous is True, (
+            "within the staleness bound a not-yet-landed first poll must not report not-ready"
+        )
