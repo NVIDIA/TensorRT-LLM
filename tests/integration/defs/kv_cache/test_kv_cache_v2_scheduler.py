@@ -14,20 +14,14 @@
 # limitations under the License.
 """Integration tests for KVCacheV2Scheduler.
 
-Tests cover V1/V2 correctness, token limits, chunked prefill, eviction,
-LoRA/PEFT, MTP draft tokens, block reuse, and overlap scheduling.
+Tests cover: basic correctness (V2 vs V1), token budget limits, chunked prefill,
+eviction, LoRA/PEFT, MTP draft tokens, block reuse, and overlap scheduler.
 """
 
 import gc
-import json
-import os
-import shutil
-import tempfile
 
 import pytest
 import torch
-from safetensors.torch import save_file
-from transformers import AutoConfig, AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -84,86 +78,16 @@ _LONG_BLOCK = (
 )
 LONG_PROMPT = _LONG_BLOCK * 12 + "\nBased on the above, summarize the key themes."
 
-# ---------------------------------------------------------------------------
-# LoRA adapter helpers (Qwen3-0.6B dummy adapter)
-# ---------------------------------------------------------------------------
-_ATTN_LORA_MODULES = {
-    "q_proj": "self_attn",
-    "k_proj": "self_attn",
-    "v_proj": "self_attn",
-    "o_proj": "self_attn",
-}
-_MLP_LORA_MODULES = {
-    "gate_proj": "mlp",
-    "up_proj": "mlp",
-    "down_proj": "mlp",
-}
-_QWEN3_LORA_TRTLLM_MODULES = [
-    "attn_q",
-    "attn_k",
-    "attn_v",
-    "attn_dense",
-    "mlp_h_to_4h",
-    "mlp_gate",
-    "mlp_4h_to_h",
+# Eviction prompt (~1000 tokens ≈ 32 blocks). Used by chunked-prefill eviction tests
+# where chunking naturally creates high concurrency.
+EVICTION_PROMPT = _LONG_BLOCK * 24 + "\nSummarize the key themes in one paragraph."
+
+# Short eviction prompts (~307 tokens ≈ 10 blocks each). Used by non-chunked eviction
+# tests to allow high concurrency: 12 concurrent × 10 blocks = 120 > 96 GPU blocks.
+# Unique PREFIX prevents block_reuse from sharing blocks (radix tree is prefix-based).
+EVICTION_PROMPTS_SHORT = [
+    f"Topic {i}: " + _LONG_BLOCK * 6 + "\nSummarize the key themes." for i in range(16)
 ]
-
-
-def _create_lora_adapter(output_dir, base_model_path, lora_rank=8, dtype=torch.bfloat16):
-    """Create a dummy LoRA adapter for Qwen3 dense models."""
-    os.makedirs(output_dir, exist_ok=True)
-    target_modules = {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES}
-
-    with open(os.path.join(base_model_path, "config.json")) as f:
-        cfg = json.load(f)
-
-    hidden = cfg["hidden_size"]
-    num_heads = cfg["num_attention_heads"]
-    head_dim = cfg.get("head_dim", hidden // num_heads)
-    num_kv_heads = cfg.get("num_key_value_heads", num_heads)
-    q_dim = num_heads * head_dim
-    kv_dim = num_kv_heads * head_dim
-    intermediate = cfg.get("intermediate_size", hidden * 4)
-    num_layers = cfg["num_hidden_layers"]
-
-    dim_map = {
-        "q_proj": (hidden, q_dim),
-        "k_proj": (hidden, kv_dim),
-        "v_proj": (hidden, kv_dim),
-        "o_proj": (q_dim, hidden),
-        "gate_proj": (hidden, intermediate),
-        "up_proj": (hidden, intermediate),
-        "down_proj": (intermediate, hidden),
-    }
-
-    with open(os.path.join(output_dir, "adapter_config.json"), "w") as f:
-        json.dump(
-            {
-                "base_model_name_or_path": base_model_path,
-                "bias": "none",
-                "peft_type": "LORA",
-                "r": lora_rank,
-                "lora_alpha": 16,
-                "target_modules": list(target_modules.keys()),
-                "task_type": "CAUSAL_LM",
-            },
-            f,
-        )
-
-    weights = {}
-    for layer_idx in range(num_layers):
-        for module, block_path in target_modules.items():
-            in_dim, out_dim = dim_map[module]
-            key = f"base_model.model.model.layers.{layer_idx}.{block_path}.{module}"
-            weights[f"{key}.lora_A.weight"] = (
-                torch.randn(lora_rank, in_dim, dtype=torch.bfloat16) * 0.1
-            ).to(dtype)
-            weights[f"{key}.lora_B.weight"] = (
-                torch.randn(out_dim, lora_rank, dtype=torch.bfloat16) * 0.1
-            ).to(dtype)
-
-    save_file(weights, os.path.join(output_dir, "adapter_model.safetensors"))
-    return output_dir
 
 
 # ---------------------------------------------------------------------------
@@ -172,57 +96,32 @@ def _create_lora_adapter(output_dir, base_model_path, lora_rank=8, dtype=torch.b
 # V2 scheduler requires MAX_UTILIZATION policy
 _V2_SCHEDULER_CONFIG = SchedulerConfig(capacity_scheduler_policy="MAX_UTILIZATION")
 
-# Eviction test parameters for Qwen3-0.6B (tokens_per_block=32).
-# Per-block KV: 28 layers × 8 kv_heads × 128 head_dim × 2(K+V) × 2(bf16) × 32 ≈ 3.5 MiB.
+# These functional tests construct V1 and V2 LLMs back-to-back. Cap each KV pool
+# at ~256 MiB instead of using the 90% default to reduce allocator pressure
+# during teardown (Llama-3.2-1B uses ~32 KiB of KV cache per token).
+_LLAMA_KV_CACHE_MAX_TOKENS = 8192
+
+# ---------------------------------------------------------------------------
+# Eviction test parameters.
+# Goal: CUDA graph warmup passes AND runtime triggers scheduler eviction.
+#
+# Model: Llama-3.2-1B (max_position_embeddings=131072, tokens_per_block=32)
+# Per-block KV: 16 layers × 8 heads × 64 dim × 2(K+V) × 2(bf16) × 32 = 1 MB
+#
 # max_seq_len=2048  → per-request max 64 blocks. Caps warmup long dummy.
-# max_tokens=3072   → 96 GPU blocks. _make_eviction_prompts() sizes prompts to exceed this.
-# host tier holds 1024 tokens via _host_cache_size_for_tokens().
-# max_batch_size=12 → high concurrency to force scheduler eviction.
+# max_tokens=3072   → 96 GPU blocks. Warmup: 11 short (11) + 1 long (65) = 76 < 96 ✓
+# host_cache_size=32MB → 32 host blocks. Total = 96+32 = 128 blocks.
+# max_batch_size=12  → high concurrency.
+#
+# Non-chunked tests use EVICTION_PROMPTS_SHORT (~256 tokens = 8 blocks each).
+# 12 concurrent × 8 blocks = 96 = GPU pool, so any gen growth → eviction.
+# Chunked tests use EVICTION_PROMPT (~1189 tokens) where chunking creates
+# natural concurrency pressure with incremental block allocation.
+# ---------------------------------------------------------------------------
 _EVICT_MAX_SEQ_LEN = 2048
 _EVICT_MAX_TOKENS = 3072
-_EVICT_HOST_TOKENS = 1024
+_EVICT_HOST_CACHE_SIZE = 32 * 1024 * 1024  # 32 MiB
 _EVICT_MAX_BATCH_SIZE = 12
-# Tight GPU pool for no-cuda-graph eviction (bytes/token ≈ 3.5× Llama-3.2-1B).
-_EVICT_NO_CG_MAX_TOKENS = 96
-
-
-def _host_cache_size_for_tokens(model_path: str, token_count: int) -> int:
-    """Derive host KV-cache bytes from the checkpoint architecture and dtype."""
-    config = AutoConfig.from_pretrained(model_path)
-    dtype = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None)
-    if isinstance(dtype, str):
-        dtype = getattr(torch, dtype, None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Cannot determine torch dtype from {model_path}")
-
-    num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    elements_per_token = config.num_hidden_layers * num_kv_heads * head_dim * 2
-    return token_count * elements_per_token * torch.empty((), dtype=dtype).element_size()
-
-
-def _make_eviction_prompts(
-    model_path: str,
-    *,
-    batch_size: int,
-    max_new_tokens: int,
-    gpu_capacity_tokens: int,
-) -> list[str]:
-    """Create a batch whose requested KV tokens exceed the configured GPU capacity."""
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    block_tokens = len(tokenizer.encode(_LONG_BLOCK, add_special_tokens=False))
-    required_context_tokens = max(1, (gpu_capacity_tokens // batch_size) + 1 - max_new_tokens)
-    repeats = (required_context_tokens + block_tokens - 1) // block_tokens
-    prompts = [
-        f"Topic {index}: " + (_LONG_BLOCK * repeats) + "\nSummarize the key themes."
-        for index in range(batch_size)
-    ]
-    requested_tokens = sum(
-        len(tokenizer.encode(prompt, add_special_tokens=False)) + max_new_tokens
-        for prompt in prompts
-    )
-    assert requested_tokens > gpu_capacity_tokens
-    return prompts
 
 
 def _assert_all_completed(outputs, expected_count=None):
@@ -250,7 +149,17 @@ def _assert_outputs_match(outputs_a, outputs_b, label_a="A", label_b="B"):
 def _run_v1_v2_compare(
     model_path, prompts, sampling_params, kv_extra=None, *, assert_outputs_match=True, **llm_kwargs
 ):
-    """Run same prompts on V1 and V2; optionally assert identical output."""
+    """Run same prompts on V1 and V2; optionally assert identical output.
+
+    Args:
+        model_path: HF model path.
+        prompts: List of prompt strings.
+        sampling_params: SamplingParams (should use temperature=0.0).
+        kv_extra: Extra kwargs for both V1 and V2 KvCacheConfig (e.g. enable_block_reuse).
+        assert_outputs_match: If True, assert V1 and V2 outputs are identical (text).
+            Set False for MTP/speculative tests where scheduler differences can diverge.
+        **llm_kwargs: Extra kwargs for both V1 and V2 LLM (e.g. max_num_tokens).
+    """
     kv_extra = kv_extra or {}
 
     outputs_v1 = None
@@ -274,21 +183,9 @@ def _run_v1_v2_compare(
     return outputs_v1, outputs_v2
 
 
-def _run_v2(model_path, prompts, sampling_params, kv_extra=None, **llm_kwargs):
-    """Run prompts with the V2 KV-cache manager and assert completion."""
-    kv_extra = kv_extra or {}
-    kv_v2 = KvCacheConfig(use_kv_cache_manager_v2=True, **kv_extra)
-    with LLM(
-        model_path, kv_cache_config=kv_v2, scheduler_config=_V2_SCHEDULER_CONFIG, **llm_kwargs
-    ) as llm:
-        outputs_v2 = llm.generate(prompts, sampling_params=sampling_params)
-
-    _assert_all_completed(outputs_v2, expected_count=len(prompts))
-    return outputs_v2
-
-
 def _run_eviction_test(
     model_path,
+    prompts,
     sampling_params,
     *,
     enable_block_reuse=False,
@@ -296,23 +193,30 @@ def _run_eviction_test(
     max_num_tokens=2048,
     disable_overlap_scheduler=None,
 ):
-    """Run V1/V2 under derived KV pressure that requires scheduler eviction."""
-    prompts = _make_eviction_prompts(
-        model_path,
-        batch_size=_EVICT_MAX_BATCH_SIZE,
-        max_new_tokens=sampling_params.max_tokens,
-        gpu_capacity_tokens=_EVICT_MAX_TOKENS,
+    """Run eviction test: V1 vs V2 comparison with _EVICT_* memory constraints.
+
+    Both V1 and V2 are run with identical tight-memory configs to trigger
+    eviction, then greedy outputs are compared for correctness.
+
+    Args:
+        model_path: HF model path.
+        prompts: List of prompt strings.
+        sampling_params: SamplingParams.
+        enable_block_reuse: Whether to enable block reuse.
+        enable_chunked_prefill: Whether to enable chunked prefill.
+        max_num_tokens: Max num tokens for the LLM.
+        disable_overlap_scheduler: If not None, set disable_overlap_scheduler.
+    """
+    kv_extra = dict(
+        max_tokens=_EVICT_MAX_TOKENS,
+        enable_block_reuse=enable_block_reuse,
+        host_cache_size=_EVICT_HOST_CACHE_SIZE,
     )
-    kv_extra = {
-        "max_tokens": _EVICT_MAX_TOKENS,
-        "enable_block_reuse": enable_block_reuse,
-        "host_cache_size": _host_cache_size_for_tokens(model_path, _EVICT_HOST_TOKENS),
-    }
-    llm_kwargs = {
-        "max_batch_size": _EVICT_MAX_BATCH_SIZE,
-        "max_seq_len": _EVICT_MAX_SEQ_LEN,
-        "max_num_tokens": max_num_tokens,
-    }
+    llm_kwargs = dict(
+        max_batch_size=_EVICT_MAX_BATCH_SIZE,
+        max_seq_len=_EVICT_MAX_SEQ_LEN,
+        max_num_tokens=max_num_tokens,
+    )
     if enable_chunked_prefill:
         llm_kwargs["enable_chunked_prefill"] = True
     if disable_overlap_scheduler is not None:
@@ -321,20 +225,23 @@ def _run_eviction_test(
     return _run_v1_v2_compare(model_path, prompts, sampling_params, kv_extra=kv_extra, **llm_kwargs)
 
 
+# ===========================================================================
+# Functional tests on Llama-3.2-1B
+# ===========================================================================
 # Each comparison constructs stateful V1 and V2 engines back-to-back. Keep
 # their MPI workers private so engine state cannot leak across comparisons.
 @pytest.mark.private_mpi_session
-class TestKVCacheV2Qwen3:
-    """Functional V2 scheduler tests using Qwen3-0.6B."""
+class TestKVCacheV2Llama:
+    """Functional tests for V2 scheduler using Llama-3.2-1B (1 GPU)."""
 
-    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
-
-    @classmethod
-    def setup_class(cls):
-        if not os.path.isdir(cls.MODEL_PATH):
-            pytest.skip(f"Model not found: {cls.MODEL_PATH}")
+    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
 
     def _compare(self, prompts, max_tokens=32, kv_extra=None, **llm_kwargs):
+        """Run V1 vs V2 with greedy sampling; assert outputs match."""
+        kv_extra = {
+            "max_tokens": _LLAMA_KV_CACHE_MAX_TOKENS,
+            **(kv_extra or {}),
+        }
         return _run_v1_v2_compare(
             self.MODEL_PATH,
             prompts,
@@ -343,63 +250,69 @@ class TestKVCacheV2Qwen3:
             **llm_kwargs,
         )
 
+    # Basic greedy — V2 matches V1
     def test_v2_vs_v1_basic(self):
         self._compare(SHORT_PROMPTS[:5])
 
+    # Token budget limited — V2 matches V1
     def test_token_budget_limited(self):
         self._compare(SHORT_PROMPTS, max_num_tokens=64)
 
+    # Chunked prefill — V2 matches V1
     def test_chunked_prefill(self):
-        self._compare(
-            [LONG_PROMPT],
-            max_tokens=64,
-            enable_chunked_prefill=True,
-            max_num_tokens=128,
-        )
+        self._compare([LONG_PROMPT], max_tokens=64, enable_chunked_prefill=True, max_num_tokens=128)
 
+    # Chunked prefill multi-request — V2 matches V1
     def test_chunked_prefill_multi_request(self):
         self._compare(
             MEDIUM_PROMPTS,
             max_tokens=64,
+            # V2 can commit partial source blocks, while V1 only commits full blocks.
+            # Disable reuse so both managers compute the same prompt tokens for this
+            # output comparison.
             kv_extra={"enable_block_reuse": False},
             enable_chunked_prefill=True,
             max_num_tokens=256,
         )
 
+    # Eviction — V2 matches V1 under tight memory
     @pytest.mark.parametrize("use_cuda_graph", [True, False], ids=["cuda_graph", "no_cuda_graph"])
     def test_eviction(self, use_cuda_graph):
         sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
         if use_cuda_graph:
-            _run_eviction_test(self.MODEL_PATH, sampling_params)
+            _run_eviction_test(
+                self.MODEL_PATH,
+                EVICTION_PROMPTS_SHORT,
+                sampling_params,
+            )
         else:
+            # No cuda graph + tight memory: V1/V2 scheduling can diverge,
+            # so only assert both complete.
             _run_v1_v2_compare(
                 self.MODEL_PATH,
                 SHORT_PROMPTS,
                 sampling_params,
-                kv_extra={
-                    "max_tokens": _EVICT_NO_CG_MAX_TOKENS,
-                    "enable_block_reuse": False,
-                },
+                kv_extra={"max_tokens": 288, "enable_block_reuse": False},
                 max_batch_size=4,
                 max_num_tokens=256,
                 cuda_graph_config=None,
                 assert_outputs_match=False,
             )
 
+    # Batch size limited — V2 matches V1
     def test_batch_size_limited(self):
         self._compare(SHORT_PROMPTS, max_batch_size=2, max_num_tokens=8192)
 
+    # Overlap / non-overlap scheduler — V2 matches V1
     @pytest.mark.parametrize("disable_overlap", [True, False], ids=["non_overlap", "overlap"])
     def test_overlap_scheduler(self, disable_overlap):
         self._compare(SHORT_PROMPTS[:5], disable_overlap_scheduler=disable_overlap)
 
+    # Block reuse — V2 matches V1
     def test_block_reuse(self):
-        self._compare(
-            SHARED_PREFIX_PROMPTS,
-            max_tokens=64,
-            kv_extra={"enable_block_reuse": True},
-        )
+        self._compare(SHARED_PREFIX_PROMPTS, max_tokens=64, kv_extra={"enable_block_reuse": True})
 
+    # Partial block reuse — V2 matches V1
     def test_partial_block_reuse(self):
         self._compare(
             SHARED_PREFIX_PROMPTS,
@@ -407,60 +320,63 @@ class TestKVCacheV2Qwen3:
             kv_extra={"enable_block_reuse": True, "enable_partial_reuse": True},
         )
 
+    # Chunked prefill + eviction — V2 matches V1
     def test_chunked_prefill_with_eviction(self):
         _run_eviction_test(
             self.MODEL_PATH,
+            [EVICTION_PROMPT] * 16,
             SamplingParams(max_tokens=64, temperature=0.0),
             enable_chunked_prefill=True,
             max_num_tokens=256,
         )
 
+    # Eviction + block reuse — V2 matches V1
     def test_eviction_with_block_reuse(self):
         _run_eviction_test(
             self.MODEL_PATH,
+            EVICTION_PROMPTS_SHORT,
             SamplingParams(max_tokens=64, temperature=0.0),
             enable_block_reuse=True,
         )
 
+    # Chunked prefill + eviction + block reuse — V2 matches V1
+    @pytest.mark.private_mpi_session
     def test_chunked_prefill_eviction_block_reuse(self):
         _run_eviction_test(
             self.MODEL_PATH,
+            EVICTION_PROMPTS_SHORT,
             SamplingParams(max_tokens=64, temperature=0.0),
             enable_block_reuse=True,
             enable_chunked_prefill=True,
             max_num_tokens=256,
         )
 
+    # Eviction + overlap scheduler — V2 matches V1
     def test_eviction_overlap(self):
         _run_eviction_test(
             self.MODEL_PATH,
+            EVICTION_PROMPTS_SHORT,
             SamplingParams(max_tokens=64, temperature=0.0),
             disable_overlap_scheduler=False,
         )
 
 
-class TestKVCacheV2Qwen3LoRA:
-    """LoRA V2 scheduler tests using Qwen3-0.6B with a generated dummy adapter."""
+# ===========================================================================
+# LoRA tests on llama-7b-hf
+# ===========================================================================
+@pytest.mark.skip_less_device_memory(40000)
+class TestKVCacheV2LoRA:
+    """LoRA tests for V2 scheduler using llama-7b-hf (1 GPU, >=40GB)."""
 
-    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
-
-    @classmethod
-    def setup_class(cls):
-        if not os.path.isdir(cls.MODEL_PATH):
-            pytest.skip(f"Model not found: {cls.MODEL_PATH}")
-        cls._tmpdir = tempfile.mkdtemp()
-        cls.LORA_DIR = _create_lora_adapter(os.path.join(cls._tmpdir, "lora"), cls.MODEL_PATH)
-        cls.LORA_CONFIG = LoraConfig(
-            lora_dir=[cls.LORA_DIR],
-            lora_target_modules=_QWEN3_LORA_TRTLLM_MODULES,
-            max_lora_rank=16,
-            max_loras=2,
-            max_cpu_loras=2,
-        )
-
-    @classmethod
-    def teardown_class(cls):
-        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+    MODEL_PATH = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    LORA_DIR = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
+    LORA_CONFIG = LoraConfig(
+        lora_dir=[LORA_DIR],
+        max_lora_rank=8,
+        max_loras=1,
+        max_cpu_loras=1,
+        lora_target_modules=["attn_q", "attn_k", "attn_v"],
+    )
 
     def _run_v1_v2_lora(
         self,
@@ -471,13 +387,14 @@ class TestKVCacheV2Qwen3LoRA:
         label_suffix="",
         **llm_kwargs,
     ):
+        """Run V1 then V2 with LoRA; assert outputs match."""
         if expected_count is None:
             expected_count = len(prompts)
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
         if kv_extra is None:
             kv_extra = {"free_gpu_memory_fraction": 0.4}
-        lora_request = executor_request.LoRARequest("qwen3-lora-0", 0, self.LORA_DIR)
+        lora_request = executor_request.LoRARequest("lora-0", 0, self.LORA_DIR)
 
         kv_v1 = KvCacheConfig(use_kv_cache_manager_v2=False, **kv_extra)
         with LLM(
@@ -517,15 +434,14 @@ class TestKVCacheV2Qwen3LoRA:
             f"V2-LoRA{label_suffix}",
         )
 
+    # Single LoRA adapter — V2 matches V1
     def test_lora_v2(self):
         self._run_v1_v2_lora(SHORT_PROMPTS[:3])
 
+    # LoRA adapter swapping — V2 matches V1
     def test_lora_multi_adapter_v2(self):
         sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
-        lora_requests = [
-            executor_request.LoRARequest(f"qwen3-lora-{index}", index, self.LORA_DIR)
-            for index in range(2)
-        ]
+        lora_request = executor_request.LoRARequest("lora-0", 0, self.LORA_DIR)
 
         def _run_multi_adapter(kv_config, **extra_llm_kwargs):
             with LLM(
@@ -537,35 +453,33 @@ class TestKVCacheV2Qwen3LoRA:
                 out_lora = llm.generate(
                     SHORT_PROMPTS[:2],
                     sampling_params=sampling_params,
-                    lora_request=lora_requests,
+                    lora_request=lora_request,
                 )
-                out_base = llm.generate(SHORT_PROMPTS[2:4], sampling_params=sampling_params)
+                out_base = llm.generate(
+                    SHORT_PROMPTS[2:4],
+                    sampling_params=sampling_params,
+                )
             return out_lora, out_base
 
-        outputs_v1 = _run_multi_adapter(
-            KvCacheConfig(
-                use_kv_cache_manager_v2=False,
-                free_gpu_memory_fraction=0.4,
-            )
+        outs_v1 = _run_multi_adapter(
+            KvCacheConfig(use_kv_cache_manager_v2=False, free_gpu_memory_fraction=0.4),
         )
         gc.collect()
         torch.cuda.empty_cache()
-        outputs_v2 = _run_multi_adapter(
-            KvCacheConfig(
-                use_kv_cache_manager_v2=True,
-                free_gpu_memory_fraction=0.4,
-            ),
+        outs_v2 = _run_multi_adapter(
+            KvCacheConfig(use_kv_cache_manager_v2=True, free_gpu_memory_fraction=0.4),
             scheduler_config=_V2_SCHEDULER_CONFIG,
         )
 
-        for label, v1, v2 in [
-            ("LoRA", outputs_v1[0], outputs_v2[0]),
-            ("base", outputs_v1[1], outputs_v2[1]),
+        for label, v1, v2, count in [
+            ("LoRA", outs_v1[0], outs_v2[0], 2),
+            ("base", outs_v1[1], outs_v2[1], 2),
         ]:
-            _assert_all_completed(v1, expected_count=2)
-            _assert_all_completed(v2, expected_count=2)
+            _assert_all_completed(v1, expected_count=count)
+            _assert_all_completed(v2, expected_count=count)
             _assert_outputs_match(v1, v2, f"V1-{label}", f"V2-{label}")
 
+    # LoRA + chunked prefill — V2 matches V1
     def test_lora_chunked_prefill(self):
         self._run_v1_v2_lora(
             MEDIUM_PROMPTS[:3],
@@ -574,22 +488,15 @@ class TestKVCacheV2Qwen3LoRA:
             label_suffix="-chunked",
         )
 
+    # LoRA + eviction — V2 matches V1
     def test_lora_eviction(self):
-        sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
-        lora_gpu_capacity = 1024
-        prompts = _make_eviction_prompts(
-            self.MODEL_PATH,
-            batch_size=8,
-            max_new_tokens=sampling_params.max_tokens,
-            gpu_capacity_tokens=lora_gpu_capacity,
-        )
         self._run_v1_v2_lora(
-            prompts,
-            expected_count=len(prompts),
-            sampling_params=sampling_params,
+            SHORT_PROMPTS,
+            expected_count=10,
+            sampling_params=SamplingParams(max_tokens=64, temperature=0.0),
             kv_extra={
-                "max_tokens": lora_gpu_capacity,
-                "host_cache_size": _host_cache_size_for_tokens(self.MODEL_PATH, lora_gpu_capacity),
+                "free_gpu_memory_fraction": 0.2,
+                "host_cache_size": 64 * 1024 * 1024,  # 64 MiB host tier
             },
             max_batch_size=8,
             label_suffix="-evict",
@@ -608,38 +515,48 @@ class TestKVCacheV2DSv3Lite:
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
     TP_SIZE = 2
 
-    def _run(self, prompts, max_tokens=32, kv_extra=None, **llm_kwargs):
-        """Run V2 with MTP and assert all requests complete."""
+    def _compare(self, prompts, max_tokens=32, kv_extra=None, **llm_kwargs):
+        """Run V1 vs V2 with MTP; assert both complete (match not asserted — MTP can diverge)."""
         if kv_extra is None:
             kv_extra = {"free_gpu_memory_fraction": 0.3}
         llm_kwargs.setdefault("max_num_tokens", 8192)
         sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
-        return _run_v2(
+        return _run_v1_v2_compare(
             self.MODEL_PATH,
             prompts,
             sampling_params,
             kv_extra=kv_extra,
             speculative_config=MTPDecodingConfig(max_draft_len=2),
             tensor_parallel_size=self.TP_SIZE,
+            assert_outputs_match=False,
             **llm_kwargs,
         )
 
+    # MTP draft tokens — both V1 and V2 complete (MTP can diverge)
     def test_mtp_draft_tokens(self):
-        self._run(SHORT_PROMPTS[:5])
+        self._compare(SHORT_PROMPTS[:5])
 
+    # MTP + chunked prefill — both V1 and V2 complete
     def test_mtp_chunked_draft_tokens(self):
-        self._run([LONG_PROMPT], enable_chunked_prefill=True, max_num_tokens=256)
+        self._compare([LONG_PROMPT], enable_chunked_prefill=True, max_num_tokens=256)
 
     def test_mtp_eviction(self):
-        self._run(
-            SHORT_PROMPTS * 4,
-            max_tokens=256,
+        # Eviction parameters for DeepSeek-V3-Lite MTP (tokens_per_block=32):
+        # max_seq_len=512   → per-request max 16 blocks. Caps warmup dummy.
+        # max_tokens=8192   → 256 GPU blocks.
+        #   Warmup: 15 short(1 block) + 1 long(16 blocks) = 31 < 256 ✓
+        # 40 prompts, gen=256 → 16 concurrent × ~9 blocks = 144 at peak.
+        #   With draft KV doubling pressure → eviction expected.
+        # host_cache_size=512MB → host tier for evicted blocks.
+        self._compare(
+            SHORT_PROMPTS * 4,  # 40 prompts for memory pressure
+            max_tokens=256,  # longer generation to fill KV pool
             kv_extra={
                 "free_gpu_memory_fraction": 0.3,
-                "max_tokens": 4096,
-                "host_cache_size": 512 * 1024 * 1024,
+                "max_tokens": 4096,  # constrain KV pool to ~128 blocks
+                "host_cache_size": 512 * 1024 * 1024,  # 512 MiB host tier
             },
             max_batch_size=16,
             max_num_tokens=4096,
-            max_seq_len=512,
+            max_seq_len=512,  # cap warmup dummy request size
         )

@@ -325,16 +325,16 @@ class TestProtoMessages:
     def test_model_info_response(self):
         """Test GetModelInfoResponse message."""
         response = pb2.GetModelInfoResponse(
-            model_id="meta-llama/Llama-3.1-8B-Instruct",
+            model_id="Qwen/Qwen3.5-4B",
             max_input_len=4096,
             max_seq_len=8192,
-            vocab_size=32000,
+            vocab_size=248320,
         )
 
-        assert response.model_id == "meta-llama/Llama-3.1-8B-Instruct"
+        assert response.model_id == "Qwen/Qwen3.5-4B"
         assert response.max_input_len == 4096
         assert response.max_seq_len == 8192
-        assert response.vocab_size == 32000
+        assert response.vocab_size == 248320
 
     def test_server_info_response(self):
         """Test GetServerInfoResponse message."""
@@ -642,7 +642,7 @@ class TestGenerateValidation:
 # End-to-end gRPC service tests (with real model)
 # ============================================================================
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3.5-4B"
 
 
 def get_model_path(model_name):
@@ -656,7 +656,7 @@ def get_model_path(model_name):
 def grpc_service():
     """Create a real LLM, request manager, and servicer for e2e testing.
 
-    Uses TinyLlama-1.1B for minimal GPU resource usage.
+    Uses Qwen3.5-4B for GPU end-to-end coverage.
     Shared across all tests in the class; class scope (not module) so the
     LLM is shut down and its GPU memory released before the multimodal
     class below creates its own LLM — with module scope both models are
@@ -707,7 +707,7 @@ class TestGrpcServiceEndToEnd:
     """End-to-end tests for the gRPC service flow.
 
     Tests the full pipeline: gRPC request -> servicer -> request manager -> LLM -> response.
-    Uses TinyLlama-1.1B for minimal GPU resource usage.
+    Uses Qwen3.5-4B for GPU end-to-end coverage.
     """
 
     def test_generate_non_streaming(self, grpc_service):

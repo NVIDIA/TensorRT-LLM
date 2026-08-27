@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import pytest
-from utils.llm_data import llm_models_root
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
@@ -24,14 +23,14 @@ from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .lora_test_utils import (
-    check_llama3_1_multi_lora_from_request_test_harness,
+    check_qwen3_5_multi_lora_from_request_test_harness,
     test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness,
                        tinyllama_logits_processor_test_harness)
-from .test_llm_pytorch import llama3_1_lora_from_dir_test_harness
+from .test_llm_pytorch import qwen3_5_lora_from_dir_test_harness
 
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
@@ -58,8 +57,8 @@ def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
 
 
 @pytest.mark.gpu2
-def test_llama3_1_lora_tp2():
-    llama3_1_lora_from_dir_test_harness(
+def test_qwen3_5_lora_tp2():
+    qwen3_5_lora_from_dir_test_harness(
         tensor_parallel_size=2,
         kv_cache_config=global_kv_cache_config,
     )
@@ -68,15 +67,14 @@ def test_llama3_1_lora_tp2():
 @pytest.mark.gpu4
 @skip_ray  # https://nvbugs/5682551
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_multi_lora_tp4(cuda_graph_config):
-    lora_dir = (f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora")
+def test_qwen3_5_multi_lora_tp4(cuda_graph_config):
     lora_config = LoraConfig(
-        lora_dir=[lora_dir],
-        max_lora_rank=64,
+        lora_target_modules=["attn_dense"],
+        max_lora_rank=8,
         max_loras=1,
         max_cpu_loras=8,
     )
-    check_llama3_1_multi_lora_from_request_test_harness(
+    check_qwen3_5_multi_lora_from_request_test_harness(
         LLM,
         lora_config=lora_config,
         tensor_parallel_size=4,

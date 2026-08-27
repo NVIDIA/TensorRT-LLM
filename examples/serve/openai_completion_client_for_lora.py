@@ -24,17 +24,19 @@ client = OpenAI(
     api_key="tensorrt_llm",
 )
 
-lora_path = (Path(os.environ.get("LLM_MODELS_ROOT")) / "lora" /
-             "llama-3-chinese-8b-instruct-v2-lora")
+lora_path_override = os.environ.get("TRTLLM_LORA_PATH")
+if not lora_path_override:
+    raise RuntimeError("TRTLLM_LORA_PATH must point to a LoRA adapter")
+lora_path = Path(lora_path_override)
 assert lora_path.exists(), f"Lora path {lora_path} does not exist"
 
 response = client.completions.create(
-    model="Llama-3.1-8B-Instruct",
-    prompt="美国的首都在哪里? \n答案:",
+    model=os.environ.get("TRTLLM_LORA_MODEL", "Qwen3.5-4B"),
+    prompt="The capital of France is",
     max_tokens=20,
     extra_body={
         "lora_request": {
-            "lora_name": "llama-3-chinese-8b-instruct-v2-lora",
+            "lora_name": lora_path.name,
             "lora_int_id": 0,
             "lora_path": str(lora_path)
         }

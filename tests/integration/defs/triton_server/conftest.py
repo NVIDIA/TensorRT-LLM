@@ -424,19 +424,6 @@ def mllama_model_root():
 
 
 @pytest.fixture(scope="session")
-def llama_v3_70b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                    "Llama-3-70B-Instruct-Gradient-1048k")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="session")
 def vicuna_7b_model_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"

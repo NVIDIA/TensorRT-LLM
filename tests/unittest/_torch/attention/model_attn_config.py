@@ -227,27 +227,6 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "llama2_13b_mha",
-        "Llama-2-13B",
-        num_heads=40,
-        num_kv_heads=40,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "llama_30b_mha",
-        "Llama-30B",
-        num_heads=52,
-        num_kv_heads=52,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "llama_65b_mha",
-        "Llama-65B",
-        num_heads=64,
-        num_kv_heads=64,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
         "generic_16h_mha_hd64",
         "Generic RoPE MHA backend shape retained for head-dimension coverage",
         num_heads=16,

@@ -16,42 +16,43 @@
 import os
 import tempfile
 from dataclasses import asdict
-from typing import Optional
 
 import openai
 import pytest
 import yaml
-from utils.llm_data import llm_models_root
 
 from tensorrt_llm.executor.request import LoRARequest
 
+from ..lora_test_utils import qwen3_5_lora_adapter
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-_CHINESE_LORA_ADAPTER = "lora/llama-3-chinese-8b-instruct-v2-lora"
+_LORA_ADAPTER_NAME = "qwen3.5-test-lora"
 
 
-def _get_lora_adapter_path(adapter_name: str) -> str:
-    """Resolve LoRA adapters under LLM_MODELS_ROOT, ignoring LLM_ENGINE_DIR."""
-    return str(llm_models_root() / adapter_name)
-
-
-@pytest.fixture(scope="module", ids=["Llama-3.1-8B-Instruct"])
+@pytest.fixture(scope="module", ids=["Qwen3.5-4B"])
 def model_name() -> str:
-    return "Llama-3.1-8B-Instruct"
+    return "Qwen3.5-4B"
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file():
+def lora_adapter_path():
+    with qwen3_5_lora_adapter() as adapter_path:
+        yield adapter_path
+
+
+@pytest.fixture(scope="module")
+def temp_extra_llm_api_options_file(lora_adapter_path: str):
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
         extra_llm_api_options_dict = {
             "lora_config": {
-                "lora_dir": [_get_lora_adapter_path(_CHINESE_LORA_ADAPTER)],
-                "max_lora_rank": 64,
+                "lora_dir": [lora_adapter_path],
+                "lora_target_modules": ["attn_dense"],
+                "max_lora_rank": 8,
                 "max_loras": 4,
                 "max_cpu_loras": 4,
             },
@@ -72,7 +73,7 @@ def temp_extra_llm_api_options_file():
 @pytest.fixture(scope="module")
 def server(model_name: str,
            temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
-    model_path = get_model_path(f"llama-3.1-model/{model_name}")
+    model_path = get_model_path(model_name)
     args = []
     args.extend(["--backend", "pytorch"])
     args.extend(["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -86,52 +87,54 @@ def client(server: RemoteOpenAIServer) -> openai.OpenAI:
 
 
 @pytest.mark.parametrize(
-    "prompt,reference,lora_adapter_name",
+    "prompt,use_lora",
     [
         pytest.param(
-            "美国的首都在哪里? \n答案:",
-            "华盛顿特区",
-            None,
-            id="chinese-prompt-base",
+            "The capital of France is",
+            False,
+            id="capital-prompt-base",
         ),
         pytest.param(
-            "美国的首都在哪里? \n答案:",
-            "华盛顿特区",
-            _CHINESE_LORA_ADAPTER,
-            id="chinese-prompt-lora-first-load",
+            "The capital of France is",
+            True,
+            id="capital-prompt-lora-first-load",
         ),
         pytest.param(
-            "美国的首都在哪里? \n答案:",
-            "华盛顿特区",
-            _CHINESE_LORA_ADAPTER,
-            id="chinese-prompt-lora-reuse",
+            "The capital of France is",
+            True,
+            id="capital-prompt-lora-reuse",
         ),
         pytest.param(
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "ワシントン",
-            None,
-            id="japanese-prompt-base",
+            "Two plus two equals",
+            False,
+            id="arithmetic-prompt-base",
         ),
         pytest.param(
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "ワシントン",
-            _CHINESE_LORA_ADAPTER,
-            id="japanese-prompt-lora-first-load",
+            "Two plus two equals",
+            True,
+            id="arithmetic-prompt-lora-first-load",
         ),
         pytest.param(
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "ワシントン",
-            _CHINESE_LORA_ADAPTER,
-            id="japanese-prompt-lora-reuse",
+            "Two plus two equals",
+            True,
+            id="arithmetic-prompt-lora-reuse",
         ),
     ],
 )
-def test_lora(client: openai.OpenAI, model_name: str, prompt: str,
-              reference: str, lora_adapter_name: Optional[str]):
+def test_lora(client: openai.OpenAI, model_name: str, lora_adapter_path: str,
+              prompt: str, use_lora: bool):
+    base_response = None
+    if use_lora:
+        base_response = client.completions.create(
+            model=model_name,
+            prompt=prompt,
+            max_tokens=20,
+            temperature=0.0,
+            logprobs=1,
+        )
     extra_body = {}
-    if lora_adapter_name is not None:
-        lora_req = LoRARequest(lora_adapter_name, 1,
-                               _get_lora_adapter_path(lora_adapter_name))
+    if use_lora:
+        lora_req = LoRARequest(_LORA_ADAPTER_NAME, 1, lora_adapter_path)
         extra_body["lora_request"] = asdict(lora_req)
 
     response = client.completions.create(
@@ -139,10 +142,15 @@ def test_lora(client: openai.OpenAI, model_name: str, prompt: str,
         prompt=prompt,
         max_tokens=20,
         temperature=0.0,
+        logprobs=1,
         extra_body=extra_body,
     )
-    output = response.choices[0].text
-    assert reference in output, (
-        f"Unexpected completion for LoRA adapter {lora_adapter_name!r}.\n"
-        f"Response: {output!r}\n"
-        f"Expected response to contain: {reference!r}")
+    assert response.choices
+    assert response.usage.completion_tokens > 0
+    if use_lora:
+        assert base_response is not None
+        lora_choice = response.choices[0]
+        base_choice = base_response.choices[0]
+        assert (lora_choice.text != base_choice.text
+                or lora_choice.logprobs.token_logprobs
+                != base_choice.logprobs.token_logprobs)

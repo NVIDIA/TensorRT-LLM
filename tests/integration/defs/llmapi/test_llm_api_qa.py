@@ -22,8 +22,7 @@ from ..conftest import llm_models_root
 
 model_path = os.path.join(
     llm_models_root(),
-    "llama-3.1-model",
-    "Llama-3.1-8B-Instruct",
+    "Qwen3.5-4B",
 )
 
 

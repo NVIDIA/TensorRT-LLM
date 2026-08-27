@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, NGramDecodingConfig
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
@@ -40,16 +40,22 @@ def enforce_single_worker(monkeypatch):
 # # ============================================================================
 # # test 1:  Generation correctness check
 # # ============================================================================
+@pytest.mark.parametrize(
+    "drafter_type,schedule",
+    [
+        ("ngram", {1: 3, 4: 2, 8: 1}),
+    ],
+)
 @pytest.mark.high_cuda_memory
-def test_correctness_across_batch_sizes() -> None:
-    schedule = {1: 3, 4: 2, 8: 1}
+def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    memory_required = 20
+    memory_required = 30 if drafter_type == "model_drafter" else 20
     if total_mem_gb < memory_required:
         pytest.skip(f"Not enough memory (need {memory_required}GB, have {total_mem_gb:.1f}GB)")
 
     models_path = llm_models_root()
-    target_model = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    target_model = f"{models_path}/Qwen3.5-4B"
+    draft_model = f"{models_path}/Qwen3.5-4B"
 
     max_batch_size = 8
     max_draft_len = max(schedule.values())  # Use max from schedule
@@ -68,14 +74,21 @@ def test_correctness_across_batch_sizes() -> None:
         max_num_tokens=1024,
     )
 
-    spec_config = NGramDecodingConfig(
-        max_draft_len=max_draft_len,
-        max_matching_ngram_size=2,
-        draft_len_schedule=schedule,
-        is_keep_all=True,
-        is_use_oldest=True,
-        is_public_pool=False,
-    )
+    if drafter_type == "ngram":
+        spec_config = NGramDecodingConfig(
+            max_draft_len=max_draft_len,
+            max_matching_ngram_size=2,
+            draft_len_schedule=schedule,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=False,
+        )
+    else:
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=str(draft_model),
+            draft_len_schedule=schedule,
+        )
 
     prompts = [
         "The capital of France is",
@@ -107,14 +120,22 @@ def test_correctness_across_batch_sizes() -> None:
     generated_text_with_schedule = [result.outputs[0].text for result in results_with_schedule]
     llm_with_schedule.shutdown()
     # Reference: spec decode with fixed max_draft_len (no schedule)
-    spec_config_fixed = NGramDecodingConfig(
-        max_draft_len=max_draft_len,
-        max_matching_ngram_size=2,
-        draft_len_schedule=None,  # No schedule - fixed draft length
-        is_keep_all=True,
-        is_use_oldest=True,
-        is_public_pool=False,
-    )
+    if drafter_type == "ngram":
+        spec_config_fixed = NGramDecodingConfig(
+            max_draft_len=max_draft_len,
+            max_matching_ngram_size=2,
+            draft_len_schedule=None,  # No schedule - fixed draft length
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=False,
+        )
+    else:
+        # skipped for move to 1 model
+        spec_config_fixed = DraftTargetDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=str(draft_model),
+            draft_len_schedule=None,  # No schedule - fixed draft length
+        )
     llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
     results_fixed = llm_fixed.generate(prompts, sampling_params_list)
     generated_text_fixed = [result.outputs[0].text for result in results_fixed]
@@ -123,7 +144,7 @@ def test_correctness_across_batch_sizes() -> None:
     # Verify correctness: spec decode with schedule should match spec decode without schedule
     for text_schedule, text_fixed in zip(generated_text_with_schedule, generated_text_fixed):
         assert similar(text_schedule, text_fixed), (
-            "NGram output with draft_len_schedule should match output with fixed draft_len. Got:\n"
+            f"{drafter_type} output with draft_len_schedule should match output with fixed draft_len. Got:\n"
             f"With schedule: {text_schedule}\n"
             f"Fixed:         {text_fixed}"
         )
@@ -132,14 +153,23 @@ def test_correctness_across_batch_sizes() -> None:
 # # ============================================================================
 # # test 2:  Drafting side functionality check
 # # ============================================================================
+@pytest.mark.parametrize(
+    "drafter_type,draft_schedule",
+    [
+        ("ngram", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
+    ],
+)
 @pytest.mark.high_cuda_memory
-def test_draft_len_schedule_functionality(enforce_single_worker) -> None:
-    draft_schedule = {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}
+def test_draft_len_schedule_functionality(
+    enforce_single_worker, drafter_type: str, draft_schedule: dict
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 20:
+    if drafter_type == "model_drafter" and total_mem_gb < 30:
+        pytest.skip("Not enough memory for 2-model setup")
+    elif total_mem_gb < 20:
         pytest.skip("Not enough memory")
     max_batch_size = 7
 
@@ -148,7 +178,7 @@ def test_draft_len_schedule_functionality(enforce_single_worker) -> None:
     )
 
     llm_common_config = dict(
-        model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
+        model=llm_models_root() / "Qwen3.5-4B",
         backend="pytorch",
         attn_backend="TRTLLM",
         disable_overlap_scheduler=True,
@@ -157,12 +187,20 @@ def test_draft_len_schedule_functionality(enforce_single_worker) -> None:
         max_num_tokens=1024,
     )
 
-    spec_config = NGramDecodingConfig(
-        max_draft_len=5,
-        max_matching_ngram_size=2,
-        draft_len_schedule=draft_schedule,
-    )
-    prompts = ["The capital of France is" for _ in range(7)]
+    if drafter_type == "ngram":
+        spec_config = NGramDecodingConfig(
+            max_draft_len=5,
+            max_matching_ngram_size=2,
+            draft_len_schedule=draft_schedule,
+        )
+    else:
+        # skipped for move to 1 model
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=5,
+            speculative_model=str(llm_models_root() / "Qwen3.5-4B"),
+            draft_len_schedule=draft_schedule,
+        )
+    prompts = ["The capital of France is" for i in range(7)]
     # Give each request different max_tokens so they finish at different times
     # This creates batch size transitions: 7 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1
     sampling_params_list = [
@@ -267,11 +305,26 @@ def test_draft_len_schedule_functionality(enforce_single_worker) -> None:
     # ========================================================================
     # Verification Rule 2: actual_draft_lens (req.py_draft_tokens) vs drafter_max_draft_tokens
     # ========================================================================
-    # NGram drafting length depends on ngram context, so it may be less than
-    # drafter_max_draft_tokens.
-    for idx, it in enumerate(iteration_data):
-        drafter_tokens = it["drafter_max_draft_tokens"]
-        for req_idx, actual_len in enumerate(it["actual_draft_lens"]):
-            assert actual_len <= drafter_tokens, (
-                f"Iter {idx}, req {req_idx}: NGram produced {actual_len} > max {drafter_tokens}"
-            )
+    if drafter_type == "ngram":
+        # NGram: all actual_draft_lens <= drafter_max_draft_tokens
+        # ngram drafting length is based on ngram context
+        # so it's not necessary to be the same as drafter_max_draft_tokens
+        for idx, it in enumerate(iteration_data):
+            drafter_tokens = it["drafter_max_draft_tokens"]
+            for req_idx, actual_len in enumerate(it["actual_draft_lens"]):
+                assert actual_len <= drafter_tokens, (
+                    f"Iter {idx}, req {req_idx}: NGram produced {actual_len} > max {drafter_tokens}"
+                )
+
+    elif drafter_type == "model_drafter":
+        # ModelDrafter: all actual_draft_lens == drafter_max_draft_tokens
+        for idx, it in enumerate(iteration_data):
+            drafter_tokens = it["drafter_max_draft_tokens"]
+            actual_lens = it["actual_draft_lens"]
+
+            if drafter_tokens > 0:
+                for req_idx, actual_len in enumerate(actual_lens):
+                    assert actual_len == drafter_tokens, (
+                        f"Iter {idx}, req {req_idx}: ModelDrafter produced {actual_len} "
+                        f"!= max_draft_tokens {drafter_tokens}"
+                    )

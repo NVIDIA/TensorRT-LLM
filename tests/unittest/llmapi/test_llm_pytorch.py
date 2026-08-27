@@ -10,6 +10,7 @@ from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import pytest
+from safetensors.torch import load_file
 
 from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -23,10 +24,12 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from .lora_test_utils import (
-    check_llama3_1_multi_lora_from_request_test_harness,
-    check_llama3_1_multi_unique_lora_adapters_from_request,
-    create_mock_nemo_lora_checkpoint, compare_cuda_graph_lora_params_filler,
-    CUDAGraphLoRATestParams, test_lora_with_and_without_cuda_graph)
+    QWEN3_5_MODEL_DIR, assert_lora_changes_output,
+    check_qwen3_5_multi_lora_from_request_test_harness,
+    check_qwen3_5_multi_unique_lora_adapters_from_request,
+    create_mock_nemo_lora_checkpoint, create_qwen3_5_lora_adapter,
+    compare_cuda_graph_lora_params_filler, CUDAGraphLoRATestParams,
+    qwen3_5_lora_adapter, test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, global_kvcache_config_no_reuse,
                        llama_model_path, llm_get_stats_async_test_harness,
@@ -36,9 +39,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
-                        skip_gpu_memory_less_than_80gb, skip_ray)
+from utils.util import (force_ampere, skip_gpu_memory_less_than_40gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -379,75 +380,135 @@ def test_lora_cuda_graph_params_filling_kernel_special_cases():
     compare_cuda_graph_lora_params_filler(test_params6)
 
 
-def llama3_1_lora_from_dir_test_harness(**llm_kwargs) -> None:
-    skip_fp8_pre_ada(use_fp8=True)
-    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    lora_config = LoraConfig(lora_dir=[lora_dir],
-                             max_lora_rank=64,
-                             max_loras=2,
-                             max_cpu_loras=2)
-    lora_request = LoRARequest("llama31-chinese", 0, lora_dir)
-    with LLM(model=model_dir, lora_config=lora_config, **llm_kwargs) as llm:
-        output = llm.generate(
-            "美国的首都是哪里？",
-            SamplingParams(max_tokens=20, temperature=0.0),
-            lora_request=[lora_request],
-        )
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-    assert similar(output.outputs[0].text, reference)
+@pytest.mark.cpu_only
+def test_create_qwen3_5_lora_adapter(tmp_path: pathlib.Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config = {
+        "text_config": {
+            "hidden_size": 64,
+            "head_dim": 16,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 4,
+            "full_attention_interval": 2,
+        }
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    adapter_dir = create_qwen3_5_lora_adapter(str(tmp_path / "adapter"),
+                                              str(model_dir))
+    weights = load_file(f"{adapter_dir}/adapter_model.safetensors")
+
+    assert len(weights) == 4
+    assert all(".layers.1." in key or ".layers.3." in key for key in weights)
+    assert weights[next(key for key in weights
+                        if key.endswith("lora_A.weight"))].shape == (8, 64)
+    assert weights[next(key for key in weights
+                        if key.endswith("lora_B.weight"))].shape == (64, 8)
 
 
-@skip_gpu_memory_less_than_80gb
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layer_types,error",
+    [
+        (["full_attention"], "must match num_hidden_layers"),
+        (["linear_attention", "linear_attention"
+          ], "requires full-attention layers"),
+    ],
+)
+def test_create_qwen3_5_lora_adapter_rejects_invalid_layers(
+        tmp_path: pathlib.Path, layer_types: list[str], error: str) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config = {
+        "text_config": {
+            "hidden_size": 64,
+            "head_dim": 16,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "layer_types": layer_types,
+        }
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match=error):
+        create_qwen3_5_lora_adapter(str(tmp_path / "adapter"), str(model_dir))
+
+
+def qwen3_5_lora_from_dir_test_harness(**llm_kwargs) -> None:
+    with qwen3_5_lora_adapter() as lora_dir:
+        lora_config = LoraConfig(lora_dir=[lora_dir],
+                                 lora_target_modules=["attn_dense"],
+                                 max_lora_rank=8,
+                                 max_loras=2,
+                                 max_cpu_loras=2)
+        lora_request = LoRARequest("qwen35", 0, lora_dir)
+        with LLM(model=QWEN3_5_MODEL_DIR, lora_config=lora_config,
+                 **llm_kwargs) as llm:
+            sampling_params = SamplingParams(max_tokens=20,
+                                             temperature=0.0,
+                                             logprobs=0)
+            output = llm.generate(
+                "The capital of France is",
+                sampling_params,
+                lora_request=[lora_request],
+            )
+            base_output = llm.generate("The capital of France is",
+                                       sampling_params)
+    assert_lora_changes_output([output], [base_output])
+
+
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
 @pytest.mark.parametrize("use_speculative", [True, False])
-def test_llama3_1_lora(cuda_graph_config, use_speculative):
-    llama3_1_lora_from_dir_test_harness(
+def test_qwen3_5_lora(cuda_graph_config, use_speculative):
+    qwen3_5_lora_from_dir_test_harness(
         cuda_graph_config=cuda_graph_config,
         speculative_config=(NGramDecodingConfig(
             max_draft_len=5) if use_speculative else None),
     )
 
 
-@skip_gpu_memory_less_than_80gb
 @test_lora_with_and_without_cuda_graph
 @pytest.mark.parametrize("use_speculative", [True, False])
-def test_llama3_1_lora_default_modules(cuda_graph_config,
-                                       use_speculative) -> None:
-    skip_fp8_pre_ada(use_fp8=True)
-    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
-    lora_request = LoRARequest("llama31-chinese", 0, lora_dir)
-    with LLM(
-            model=model_dir,
-            lora_config=lora_config,
-            speculative_config=(NGramDecodingConfig(
-                max_draft_len=5) if use_speculative else None),
-            cuda_graph_config=cuda_graph_config,
-    ) as llm:
-        output = llm.generate(
-            "美国的首都是哪里？",
-            SamplingParams(max_tokens=20,
-                           temperature=0.0,
-                           add_special_tokens=False),
-            lora_request=[lora_request],
-        )
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-    assert similar(output.outputs[0].text, reference)
+def test_qwen3_5_lora_default_modules(cuda_graph_config,
+                                      use_speculative) -> None:
+    with qwen3_5_lora_adapter() as lora_dir:
+        lora_config = LoraConfig(lora_dir=[lora_dir],
+                                 max_lora_rank=8,
+                                 max_loras=2,
+                                 max_cpu_loras=2)
+        lora_request = LoRARequest("qwen35", 0, lora_dir)
+        with LLM(
+                model=QWEN3_5_MODEL_DIR,
+                lora_config=lora_config,
+                speculative_config=(NGramDecodingConfig(
+                    max_draft_len=5) if use_speculative else None),
+                cuda_graph_config=cuda_graph_config,
+        ) as llm:
+            sampling_params = SamplingParams(max_tokens=20,
+                                             temperature=0.0,
+                                             add_special_tokens=False,
+                                             logprobs=0)
+            output = llm.generate(
+                "The capital of France is",
+                sampling_params,
+                lora_request=[lora_request],
+            )
+            base_output = llm.generate("The capital of France is",
+                                       sampling_params)
+    assert_lora_changes_output([output], [base_output])
 
 
-def _check_llama3_1_multi_lora_evict_load_new_adapters(
+def _check_qwen3_5_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeat_calls: int, repeats_per_call: int,
         **llm_kwargs):
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    lora_config = LoraConfig(lora_dir=[lora_dir],
-                             max_lora_rank=64,
+    lora_config = LoraConfig(lora_target_modules=["attn_dense"],
+                             max_lora_rank=8,
                              max_loras=max_loras,
                              max_cpu_loras=max_cpu_loras)
-    check_llama3_1_multi_unique_lora_adapters_from_request(
+    check_qwen3_5_multi_unique_lora_adapters_from_request(
         lora_adapter_count_per_call,
         repeat_calls,
         repeats_per_call,
@@ -456,12 +517,11 @@ def _check_llama3_1_multi_lora_evict_load_new_adapters(
         **llm_kwargs)
 
 
-@skip_gpu_memory_less_than_80gb
 @skip_ray  # https://nvbugs/5682551
 @pytest.mark.part3
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
-    _check_llama3_1_multi_lora_evict_load_new_adapters(
+def test_qwen3_5_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
+    _check_qwen3_5_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[2],
         max_loras=1,
         max_cpu_loras=2,
@@ -470,12 +530,11 @@ def test_llama3_1_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
         cuda_graph_config=cuda_graph_config)
 
 
-@skip_gpu_memory_less_than_80gb
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
+def test_qwen3_5_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
         cuda_graph_config):
-    _check_llama3_1_multi_lora_evict_load_new_adapters(
+    _check_qwen3_5_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[2, 2, 2],
         max_loras=1,
         max_cpu_loras=3,
@@ -484,11 +543,10 @@ def test_llama3_1_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
         cuda_graph_config=cuda_graph_config)
 
 
-@skip_gpu_memory_less_than_80gb
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_multi_lora_read_from_cache_after_insert(cuda_graph_config):
-    _check_llama3_1_multi_lora_evict_load_new_adapters(
+def test_qwen3_5_multi_lora_read_from_cache_after_insert(cuda_graph_config):
+    _check_qwen3_5_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[3],
         max_loras=3,
         max_cpu_loras=3,
@@ -497,12 +555,11 @@ def test_llama3_1_multi_lora_read_from_cache_after_insert(cuda_graph_config):
         cuda_graph_config=cuda_graph_config)
 
 
-@skip_gpu_memory_less_than_80gb
 @pytest.mark.part3
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_multi_lora_evict_and_reload_cpu_and_gpu_cache(
+def test_qwen3_5_multi_lora_evict_and_reload_cpu_and_gpu_cache(
         cuda_graph_config):
-    _check_llama3_1_multi_lora_evict_load_new_adapters(
+    _check_qwen3_5_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[3],
         max_loras=2,
         max_cpu_loras=2,
@@ -511,20 +568,20 @@ def test_llama3_1_multi_lora_evict_and_reload_cpu_and_gpu_cache(
         cuda_graph_config=cuda_graph_config)
 
 
-@skip_gpu_memory_less_than_80gb
 @pytest.mark.part2
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_peft_cache_config_affects_cache_size(cuda_graph_config):
-    lora_config = LoraConfig(max_lora_rank=64)
+def test_qwen3_5_peft_cache_config_affects_cache_size(cuda_graph_config):
+    lora_config = LoraConfig(lora_target_modules=["attn_dense"],
+                             max_lora_rank=8)
     with pytest.raises(RuntimeError):
-        check_llama3_1_multi_lora_from_request_test_harness(
+        check_qwen3_5_multi_lora_from_request_test_harness(
             LLM,
             lora_config=lora_config,
             peft_cache_config=PeftCacheConfig(host_cache_size=1),
             cuda_graph_config=cuda_graph_config)
 
     with pytest.raises(RuntimeError):
-        check_llama3_1_multi_lora_from_request_test_harness(
+        check_qwen3_5_multi_lora_from_request_test_harness(
             LLM,
             lora_config=lora_config,
             peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
@@ -538,12 +595,11 @@ def test_llama3_1_peft_cache_config_affects_cache_size(cuda_graph_config):
 @pytest.mark.private_mpi_session
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
-def test_llama3_1_lora_config_overrides_peft_cache_config(cuda_graph_config):
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    check_llama3_1_multi_lora_from_request_test_harness(
+def test_qwen3_5_lora_config_overrides_peft_cache_config(cuda_graph_config):
+    check_qwen3_5_multi_lora_from_request_test_harness(
         LLM,
-        lora_config=LoraConfig(lora_dir=[lora_dir],
-                               max_lora_rank=64,
+        lora_config=LoraConfig(lora_target_modules=["attn_dense"],
+                               max_lora_rank=8,
                                max_loras=2,
                                max_cpu_loras=2),
         peft_cache_config=PeftCacheConfig(host_cache_size=1,
@@ -551,33 +607,10 @@ def test_llama3_1_lora_config_overrides_peft_cache_config(cuda_graph_config):
         cuda_graph_config=cuda_graph_config)
 
 
-@skip_gpu_memory_less_than_80gb
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
-def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
-    skip_fp8_pre_ada(use_fp8=True)
-    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    prompt = "美国的首都是哪里？"
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-
-    lora_config = LoraConfig(lora_dir=[lora_dir],
-                             max_lora_rank=64,
-                             max_loras=2,
-                             max_cpu_loras=2)
-    lora_req = LoRARequest("lora-chinese", 0, lora_dir)
-
-    llm = LLM(model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=cuda_graph_config)
-
-    try:
-        output = llm.generate(prompt,
-                              SamplingParams(max_tokens=20),
-                              lora_request=[lora_req])
-    finally:
-        llm.shutdown()
-    assert similar(output.outputs[0].text, reference)
+def test_qwen3_5_bf16_with_bf16_lora(cuda_graph_config) -> None:
+    qwen3_5_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
 
 
 @pytest.mark.part2

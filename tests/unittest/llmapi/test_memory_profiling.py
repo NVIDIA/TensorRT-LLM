@@ -97,7 +97,7 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
 
     Both components must use the same stream for proper synchronization.
     """
-    MODEL = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    MODEL = "Qwen3.5-4B"
     MODEL_PATH = get_model_path(MODEL)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,

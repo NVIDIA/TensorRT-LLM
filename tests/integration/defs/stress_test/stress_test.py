@@ -173,14 +173,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for aiperf"""
-    input_len_mean: int = 64  # Customized for TinyLlama.
+    input_len_mean: int = 64  # Customized for TinyLlama and Qwen3.5-4B.
     input_len_std: int = 16
-    output_len_mean: int = 128  # Customized for TinyLlama.
+    output_len_mean: int = 128  # Customized for TinyLlama and Qwen3.5-4B.
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # One hour for TinyLlama.
+    test_timeout: int = 3600  # One hour for TinyLlama and Qwen3.5-4B.
     concurrency_list: List[int] = field(
         default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
@@ -433,6 +433,10 @@ def is_port_available(port: int,
         # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
                     tp_size=1,
+                    memory_requirement=12288),
+        # Configuration for Qwen3.5-4B
+        # memory_requirement is in MiB (12 GB = 12288 MiB)
+        ModelConfig(model_dir="Qwen3.5-4B", tp_size=1,
                     memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
         # memory_requirement is in MiB (96 GB = 98304 MiB)

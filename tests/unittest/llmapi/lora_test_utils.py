@@ -14,16 +14,18 @@
 # limitations under the License.
 
 import json
+import os
 import tarfile
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Type, Union
+from typing import Iterator, List, Optional, Tuple, Type, Union
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from utils.llm_data import llm_models_root
-from utils.util import similar, skip_fp8_pre_ada
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
@@ -37,78 +39,171 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 
 from .test_utils import DelayedAssert
 
-
-def _llama3_1_lora_paths() -> tuple[str, str]:
-    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    return model_dir, lora_dir
+QWEN3_5_MODEL_DIR = str(llm_models_root() / "Qwen3.5-4B")
+_QWEN3_5_LORA_RANK = 8
 
 
-def check_llama3_1_multi_unique_lora_adapters_from_request(
+def create_qwen3_5_lora_adapter(output_dir: str,
+                                model_dir: str = QWEN3_5_MODEL_DIR) -> str:
+    """Create a deterministic adapter for Qwen3.5 full-attention layers."""
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(model_dir, "config.json")) as config_file:
+        config = json.load(config_file)
+
+    text_config = config.get("text_config", config)
+    hidden_size = text_config["hidden_size"]
+    head_dim = text_config["head_dim"]
+    num_attention_heads = text_config["num_attention_heads"]
+    num_hidden_layers = text_config["num_hidden_layers"]
+    layer_types = text_config.get("layer_types")
+    if layer_types is None:
+        full_attention_interval = text_config["full_attention_interval"]
+        layer_types = [
+            "full_attention" if layer_idx %
+            full_attention_interval == full_attention_interval -
+            1 else "linear_attention" for layer_idx in range(num_hidden_layers)
+        ]
+    if len(layer_types) != num_hidden_layers:
+        raise ValueError("Qwen3.5 layer_types must match num_hidden_layers")
+    full_attention_layers = [
+        layer_idx for layer_idx, layer_type in enumerate(layer_types)
+        if layer_type == "full_attention"
+    ]
+    if not full_attention_layers:
+        raise ValueError(
+            "Qwen3.5 LoRA test adapter requires full-attention layers")
+
+    adapter_config = {
+        "base_model_name_or_path": model_dir,
+        "bias": "none",
+        "lora_alpha": 16,
+        "peft_type": "LORA",
+        "r": _QWEN3_5_LORA_RANK,
+        "target_modules": ["o_proj"],
+        "task_type": "CAUSAL_LM",
+    }
+    with open(os.path.join(output_dir, "adapter_config.json"),
+              "w") as config_file:
+        json.dump(adapter_config, config_file)
+
+    projection_size = num_attention_heads * head_dim
+    weights = {}
+    generator = torch.Generator().manual_seed(42)
+    for layer_idx in full_attention_layers:
+        key = f"base_model.model.model.layers.{layer_idx}.self_attn.o_proj"
+        weights[f"{key}.lora_A.weight"] = (torch.randn(_QWEN3_5_LORA_RANK,
+                                                       projection_size,
+                                                       dtype=torch.bfloat16,
+                                                       generator=generator) *
+                                           0.01)
+        weights[f"{key}.lora_B.weight"] = (torch.randn(hidden_size,
+                                                       _QWEN3_5_LORA_RANK,
+                                                       dtype=torch.bfloat16,
+                                                       generator=generator) *
+                                           0.01)
+
+    save_file(weights, os.path.join(output_dir, "adapter_model.safetensors"))
+    return output_dir
+
+
+@contextmanager
+def qwen3_5_lora_adapter() -> Iterator[str]:
+    """Yield a temporary Qwen3.5 adapter directory."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        yield create_qwen3_5_lora_adapter(os.path.join(temp_dir, "lora"))
+
+
+def assert_lora_changes_output(lora_outputs, base_outputs) -> None:
+    """Assert that applying LoRA changes generated tokens or their logprobs."""
+    for output_idx, (lora_output, base_output) in enumerate(
+            zip(lora_outputs, base_outputs, strict=True)):
+        lora_completion = lora_output.outputs[0]
+        base_completion = base_output.outputs[0]
+        if lora_completion.token_ids != base_completion.token_ids:
+            continue
+        logprobs_differ = False
+        for lora_step, base_step in zip(lora_completion.logprobs,
+                                        base_completion.logprobs,
+                                        strict=True):
+            common_token_ids = lora_step.keys() & base_step.keys()
+            if any(
+                    abs(lora_step[token_id].logprob -
+                        base_step[token_id].logprob) > 1e-6
+                    for token_id in common_token_ids):
+                logprobs_differ = True
+                break
+        if not logprobs_differ:
+            raise AssertionError(
+                f"LoRA output {output_idx} matches base model tokens and log probabilities"
+            )
+
+
+def check_qwen3_5_multi_unique_lora_adapters_from_request(
         lora_adapter_count_per_call: List[int], repeat_calls: int,
         repeats_per_call: int, llm_class: Type[BaseLLM], **llm_kwargs):
     """Exercise unique adapter IDs, cache eviction, reload, and request reuse."""
-    skip_fp8_pre_ada(use_fp8=True)
     total_lora_adapters = sum(lora_adapter_count_per_call)
-    model_dir, lora_dir = _llama3_1_lora_paths()
-    prompt = "美国的首都是哪里？"
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-    lora_requests = [
-        LoRARequest(f"llama31-chinese-{index}", index, lora_dir)
-        for index in range(total_lora_adapters)
-    ]
+    with qwen3_5_lora_adapter() as lora_dir:
+        lora_requests = [
+            LoRARequest(f"qwen35-{index}", index, lora_dir)
+            for index in range(total_lora_adapters)
+        ]
 
-    llm = llm_class(model_dir, **llm_kwargs)
-    try:
-        for _ in range(repeat_calls):
-            first = 0
-            for adapter_count in lora_adapter_count_per_call:
-                outputs = llm.generate(
-                    [prompt] * adapter_count * repeats_per_call,
-                    SamplingParams(max_tokens=20, temperature=0.0),
-                    lora_request=lora_requests[first:first + adapter_count] *
-                    repeats_per_call,
-                )
-                assert len(outputs) == adapter_count * repeats_per_call
-                for output in outputs:
-                    assert similar(output.outputs[0].text, reference)
-                first += adapter_count
-    finally:
-        llm.shutdown()
+        llm = llm_class(QWEN3_5_MODEL_DIR, **llm_kwargs)
+        try:
+            for _ in range(repeat_calls):
+                first = 0
+                for adapter_count in lora_adapter_count_per_call:
+                    prompts = (["The capital of France is"] * adapter_count *
+                               repeats_per_call)
+                    sampling_params = SamplingParams(max_tokens=20,
+                                                     temperature=0.0,
+                                                     logprobs=0)
+                    outputs = llm.generate(
+                        prompts,
+                        sampling_params,
+                        lora_request=lora_requests[first:first + adapter_count]
+                        * repeats_per_call,
+                    )
+                    assert len(outputs) == adapter_count * repeats_per_call
+                    assert all(output.outputs[0].token_ids
+                               for output in outputs)
+                    base_outputs = llm.generate(prompts, sampling_params)
+                    assert_lora_changes_output(outputs, base_outputs)
+                    first += adapter_count
+        finally:
+            llm.shutdown()
 
 
-def check_llama3_1_multi_lora_from_request_test_harness(
-        llm_class: Type[BaseLLM], **llm_kwargs) -> None:
+def check_qwen3_5_multi_lora_from_request_test_harness(llm_class: Type[BaseLLM],
+                                                       **llm_kwargs) -> None:
     """Generate base and multi-ID LoRA requests in one batch."""
-    skip_fp8_pre_ada(use_fp8=True)
-    model_dir, lora_dir = _llama3_1_lora_paths()
-    prompt = "美国的首都是哪里？"
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-    lora_requests = [
-        LoRARequest(f"llama31-chinese-{index}", index, lora_dir)
-        for index in range(2)
-    ]
-    request_pattern = [
-        None,
-        lora_requests[0],
-        lora_requests[1],
-        None,
-        lora_requests[0],
-        lora_requests[1],
-    ]
+    with qwen3_5_lora_adapter() as lora_dir:
+        lora_requests = [
+            LoRARequest(f"qwen35-{index}", index, lora_dir)
+            for index in range(2)
+        ]
+        request_pattern = [
+            None,
+            lora_requests[0],
+            lora_requests[1],
+            None,
+            lora_requests[0],
+            lora_requests[1],
+        ]
 
-    with llm_class(model_dir, **llm_kwargs) as llm:
-        outputs = llm.generate(
-            [prompt] * len(request_pattern),
-            SamplingParams(max_tokens=20, temperature=0.0),
-            lora_request=request_pattern,
-        )
+        with llm_class(QWEN3_5_MODEL_DIR, **llm_kwargs) as llm:
+            outputs = llm.generate(
+                ["The capital of France is"] * len(request_pattern),
+                SamplingParams(max_tokens=20, temperature=0.0, logprobs=0),
+                lora_request=request_pattern,
+            )
 
-    assert len(outputs) == len(request_pattern)
-    for output, lora_request in zip(outputs, request_pattern):
-        assert output.outputs[0].token_ids
-        if lora_request is not None:
-            assert similar(output.outputs[0].text, reference)
+        assert len(outputs) == len(request_pattern)
+        assert all(output.outputs[0].token_ids for output in outputs)
+        assert_lora_changes_output(
+            [outputs[1], outputs[2], outputs[4], outputs[5]],
+            [outputs[0], outputs[0], outputs[3], outputs[3]])
 
 
 def create_mock_nemo_lora_checkpoint(

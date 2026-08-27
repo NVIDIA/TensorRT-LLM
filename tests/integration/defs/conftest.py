@@ -674,15 +674,9 @@ def llama_v2_tokenizer_model_root():
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "llama-30b":
-        llama_model_root = os.path.join(models_root, "llama-models",
-                                        "llama-30b-hf")
-    elif request.param == "TinyLlama-1.1B-Chat-v1.0":
+    if request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-70B-Instruct-Gradient-1048k")
     elif request.param == "llama-3.1-8b":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Meta-Llama-3.1-8B")
@@ -932,37 +926,6 @@ def llm_long_alpaca_model_root(llm_venv):
     long_alpaca_model_root = os.path.join(workspace, "LongAlpaca-7B")
 
     return long_alpaca_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt-neox-20b", True)
-def llm_gptneox_model_root(llm_venv):
-    "return gptneox model root"
-
-    workspace = llm_venv.get_working_directory()
-    gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
-
-    return gptneox_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-180b", True)
-def llm_falcon_180b_model_root():
-    "prepare falcon 180b model & return falcon model root"
-    raise RuntimeError("falcon 180b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-11B", True)
-def llm_falcon_11b_model_root(llm_venv):
-    "prepare falcon-11B model & return falcon model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "falcon-11B")
-
-    call(f"git clone https://huggingface.co/tiiuae/falcon-11B {model_root}",
-         shell=True)
-
-    return model_root
 
 
 @pytest.fixture(scope="module")

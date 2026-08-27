@@ -15,25 +15,6 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_v2_vs_v1_basic
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_token_budget_limited
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_chunked_prefill
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_chunked_prefill_multi_request
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_eviction[cuda_graph]
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_eviction[no_cuda_graph]
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_batch_size_limited
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_overlap_scheduler[non_overlap]
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_overlap_scheduler[overlap]
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_block_reuse
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_partial_block_reuse
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_chunked_prefill_with_eviction
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_eviction_with_block_reuse
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_chunked_prefill_eviction_block_reuse
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3::test_eviction_overlap
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3LoRA::test_lora_v2
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3LoRA::test_lora_multi_adapter_v2
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3LoRA::test_lora_chunked_prefill
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Qwen3LoRA::test_lora_eviction
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
@@ -220,6 +201,26 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
+  # ------------- KV Cache V2 Scheduler IT ---------------
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_multi_request
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction[cuda_graph]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction[no_cuda_graph]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_batch_size_limited
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_overlap_scheduler[non_overlap]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_overlap_scheduler[overlap]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_partial_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_with_eviction
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_eviction_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_overlap
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_v2
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- KV Cache Iteration Stats ---------------
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
