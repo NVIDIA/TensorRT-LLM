@@ -120,6 +120,8 @@ FIXED_NUM_EXPERTS = 32
 # to avoid _WORKSPACE singleton assertion failures.
 NVLINK_WORKSPACE_MB = "512"
 
+NCCL_EP_MAX_TOP_K = 9
+
 # ============================================================================
 # Test Configuration
 # ============================================================================
@@ -812,6 +814,8 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
     if comm_type == COMM_NCCL_EP:
         if config.quant_mode != "none":
             return f"NcclEP does not support quant_mode={config.quant_mode}"
+        if config.top_k > NCCL_EP_MAX_TOP_K:
+            return f"NcclEP MAX_TOP_K={NCCL_EP_MAX_TOP_K}, got top_k={config.top_k}"
 
     if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
         # FlashInfer alltoallv requires every 2D payload row to be 16-byte aligned.
