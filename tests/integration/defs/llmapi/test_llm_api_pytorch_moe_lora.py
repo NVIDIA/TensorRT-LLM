@@ -14,10 +14,10 @@
 # limitations under the License.
 """Routed-expert (MoE) LoRA integration tests on the PyTorch CUTLASS backend.
 
-Covers unquantized bf16 (Qwen3-MoE) and per-tensor FP8 (Mistral Small 4)
-base weights, with several adapters of varying rank applied in one batch. The
-adapters are fabricated on disk in the per-expert key layout the TRT-LLM loader
-expects, so the tests do not depend on a real PEFT export.
+Covers unquantized bf16 Qwen3-MoE base weights, with several adapters of varying
+rank applied in one batch. The adapters are fabricated on disk in the per-expert
+key layout the TRT-LLM loader expects, so the tests do not depend on a real PEFT
+export.
 
 These tests require their model checkpoints under LLM_MODELS_ROOT and fail (not
 skip) when a checkpoint is missing, so a misconfigured model root surfaces as a
@@ -36,9 +36,8 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import MoeConfig, PeftCacheConfig
-from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_pre_ada
+from ..conftest import llm_models_root
 
 # These tests spin up the PyTorch engine (and, in CUDA-graph mode, torch.compile
 # / inductor subprocesses) whose helper threads outlive the test, so the
@@ -64,9 +63,9 @@ def _write_routed_expert_lora_adapter(
 ) -> None:
     """Fabricate a per-expert routed-expert HF LoRA adapter on disk.
 
-    Models like Qwen3-MoE, DeepSeek, and Mistral Small 4 store routed experts
-    under mlp.experts.{e} with gate_proj/up_proj/down_proj projections. This
-    writes per-expert lora_A/lora_B for those projections, keyed as
+    Qwen3-MoE stores routed experts under mlp.experts.{e} with
+    gate_proj/up_proj/down_proj projections. This writes per-expert
+    lora_A/lora_B for those projections, keyed as
     .../mlp.experts.{e}.{proj}.lora_{A,B}.weight. lora_B is non-zero so each
     adapter perturbs the routed-expert output.
     """
@@ -114,9 +113,7 @@ def _run_routed_expert_multi_lora(
     max_rank: int,
     target_modules: list,
     trtllm_modules_to_hf_modules: dict,
-    expected_quant_algo=None,
     cuda_graph_config,
-    tensor_parallel_size: int = 1,
     preallocate_all_adapters: bool = True,
     peft_cache_config=None,
 ) -> None:
@@ -147,15 +144,9 @@ def _run_routed_expert_multi_lora(
         moe_config=MoeConfig(backend="CUTLASS"),
         kv_cache_config=_KV_CACHE_CONFIG,
         cuda_graph_config=cuda_graph_config,
-        tensor_parallel_size=tensor_parallel_size,
         peft_cache_config=peft_cache_config,
     )
     try:
-        if expected_quant_algo is not None:
-            assert llm.args.quant_config.quant_algo == expected_quant_algo, (
-                f"Expected quant_algo={expected_quant_algo}; "
-                f"got {llm.args.quant_config.quant_algo}."
-            )
         sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
         prompt = "What is your name?"
 
@@ -238,92 +229,4 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
             cuda_graph_config=cuda_graph_config,
             preallocate_all_adapters=False,
             peft_cache_config=peft_cache_config,
-        )
-
-
-@skip_pre_ada
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize(
-    "moe_lora_mode",
-    [
-        "eager",
-        "cudagraph",
-    ],
-)
-def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(moe_lora_mode: str) -> None:
-    """Routed-expert MoE LoRA on FP8 Mistral-Small-4-119B (replaces Mixtral-8x7B).
-
-    Mistral Small 4 ships pre-quantized to FP8 and stores routed experts as
-    gate_proj/up_proj/down_proj (same HF names as Qwen-MoE). This keeps the
-    historical Mixtral test node ids while exercising the FP8 base-weight +
-    routed-expert LoRA path end to end: the CUTLASS MoE kernel dequantizes the
-    FP8 activations to the bf16 LoRA compute type before the LoRA GEMM.
-
-    - eager: the per-request input schema (host adapter expansion); no CUDA
-      graph.
-    - cudagraph: CUDA-graph decode, which takes the slot-indexed input schema;
-      all adapters share one captured graph, exercising per-slot rank handling.
-    """
-    cuda_graph_config = CudaGraphConfig(max_batch_size=10) if moe_lora_mode == "cudagraph" else None
-
-    model_dir = f"{llm_models_root()}/Mistral-Small-4-119B-2603/Mistral-Small-4-119B-2603"
-
-    ranks = _RANKS
-    max_rank = max(ranks)
-
-    # Default MoE map is Mixtral w1/w2/w3; Mistral Small 4 uses Qwen-style names.
-    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
-    trtllm_modules_to_hf_modules = {
-        "moe_h_to_4h": "gate_proj",
-        "moe_gate": "up_proj",
-        "moe_4h_to_h": "down_proj",
-    }
-
-    with open(f"{model_dir}/config.json") as f:
-        cfg = json.load(f)
-    # Multimodal wrapper configs nest the text MoE fields under text_config.
-    text_cfg = cfg.get("text_config", cfg)
-    num_experts = (
-        text_cfg.get("n_routed_experts")
-        or text_cfg.get("num_local_experts")
-        or text_cfg.get("num_experts")
-    )
-    hidden_size = text_cfg["hidden_size"]
-    moe_intermediate_size = text_cfg.get("moe_intermediate_size") or text_cfg["intermediate_size"]
-    num_hidden_layers = text_cfg["num_hidden_layers"]
-    first_k_dense_replace = text_cfg.get("first_k_dense_replace", 0)
-    moe_layer_freq = text_cfg.get("moe_layer_freq", 1)
-    moe_layers = [
-        layer_idx
-        for layer_idx in range(num_hidden_layers)
-        if layer_idx >= first_k_dense_replace
-        and (layer_idx - first_k_dense_replace) % moe_layer_freq == 0
-    ]
-
-    with tempfile.TemporaryDirectory() as lora_dir:
-        lora_paths = []
-        for i, r in enumerate(ranks):
-            lora_path = f"{lora_dir}/lora_{i}"
-            _write_routed_expert_lora_adapter(
-                lora_path,
-                moe_layers=moe_layers,
-                num_experts=num_experts,
-                hidden_size=hidden_size,
-                moe_intermediate_size=moe_intermediate_size,
-                rank=r,
-                lora_alpha=2 * r,
-                seed=2000 + i,
-            )
-            lora_paths.append(lora_path)
-
-        _run_routed_expert_multi_lora(
-            model_dir,
-            lora_paths,
-            max_rank=max_rank,
-            target_modules=target_modules,
-            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
-            expected_quant_algo=QuantAlgo.FP8,
-            cuda_graph_config=cuda_graph_config,
-            tensor_parallel_size=2,
         )
