@@ -31,6 +31,8 @@ Two layers here, deliberately:
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, Optional, TypeVar
 
 import pytest
 
@@ -46,33 +48,46 @@ from tensorrt_llm.serve.router import RoundRobinRouter
 pytestmark = pytest.mark.cpu_only
 
 
+# Truthy stand-in for a metadata server. Module-level rather than a default
+# argument: evaluating `object()` in the signature would bind one instance for
+# the life of the module anyway, so naming it says that out loud.
+_DEFAULT_METADATA_SERVER = object()
+
+# How long a test will wait for the monitor to reach the state it asserts on.
+# Generous on purpose -- it is a deadlock guard, not a timing assertion, and a
+# loaded CI worker must not be able to turn a passing test red.
+_PROGRESS_TIMEOUT_SECS = 10.0
+
+_T = TypeVar("_T")
+
+
 class _StubRouter:
     """Just the surface ``is_ready`` touches."""
 
-    def __init__(self, servers, stale=False):
+    def __init__(self, servers: Iterable[str], stale: bool = False) -> None:
         self._servers = list(servers)
         self._stale = stale
 
     @property
-    def servers(self):
+    def servers(self) -> list[str]:
         return self._servers
 
     @property
-    def num_prepared_servers(self):
+    def num_prepared_servers(self) -> int:
         return len(self._servers)
 
-    def monitoring_is_stale(self, max_age_secs):
+    def monitoring_is_stale(self, max_age_secs: float) -> bool:
         return self._stale
 
 
 def _coordinator(
-    ctx_servers,
-    gen_servers,
-    cluster_manager=None,
-    metadata_server=object(),
-    ctx_stale=False,
-    gen_stale=False,
-):
+    ctx_servers: Iterable[str],
+    gen_servers: Iterable[str],
+    cluster_manager: Optional[Any] = None,
+    metadata_server: Optional[Any] = _DEFAULT_METADATA_SERVER,
+    ctx_stale: bool = False,
+    gen_stale: bool = False,
+) -> DisaggCoordinatorService:
     """A DisaggCoordinatorService with only the readiness surface populated.
 
     __init__ builds sessions and config we do not need, so the object is
@@ -90,8 +105,30 @@ def _coordinator(
     return c
 
 
-def _ready(c):
+def _ready(c: DisaggCoordinatorService) -> bool:
     return asyncio.run(c.is_ready())
+
+
+async def _await_progress(event: asyncio.Event, what: str) -> None:
+    """Wait for the monitor to actually reach a state, instead of sleeping.
+
+    A fixed sleep asserts a timing guess: on a loaded CI worker the monitor
+    may not have completed the poll the assertions depend on, which either
+    fails the test for the wrong reason or -- worse -- lets it pass without
+    the code under test having run at all.
+    """
+    try:
+        await asyncio.wait_for(event.wait(), timeout=_PROGRESS_TIMEOUT_SECS)
+    except asyncio.TimeoutError:
+        pytest.fail(f"monitor did not {what} within {_PROGRESS_TIMEOUT_SECS}s")
+
+
+async def _run_monitored(router: RoundRobinRouter, body: Callable[[], Awaitable[_T]]) -> _T:
+    """Run ``body`` with ``router``'s monitor live, then stop it cleanly."""
+    try:
+        return await body()
+    finally:
+        await router.stop_server_monitoring()
 
 
 class TestReadinessPredicate:
@@ -176,17 +213,17 @@ class TestReadinessPredicate:
 class _StubMetadataServer:
     """Minimal JsonDictionary surface used by ``fetch_live_servers``."""
 
-    def __init__(self, entries):
+    def __init__(self, entries: dict[str, dict[str, str]]) -> None:
         # {key: {"url": ...}} for keys under 'trtllm/'
         self._entries = dict(entries)
 
-    def keys(self):
+    def keys(self) -> list[str]:
         return list(self._entries)
 
-    def get(self, key):
+    def get(self, key: str) -> Optional[dict[str, str]]:
         return self._entries.get(key)
 
-    def remove(self, key):
+    def remove(self, key: str) -> None:
         self._entries.pop(key, None)
 
 
@@ -198,16 +235,19 @@ class TestMonitorDrivesReadiness:
     """
 
     @staticmethod
-    def _router(servers, healthy, role=ServerRole.CONTEXT):
+    def _router(
+        servers: Iterable[str], healthy: set[str], role: ServerRole = ServerRole.CONTEXT
+    ) -> RoundRobinRouter:
         """A real RoundRobinRouter whose health check answers from `healthy`."""
+        servers = list(servers)
         router = RoundRobinRouter(
             server_role=role,
-            servers=list(servers),
+            servers=servers,
             metadata_server_cfg=None,
             metadata_server=_StubMetadataServer({f"trtllm/{s}": {"url": s} for s in servers}),
         )
 
-        async def _check(server_url):
+        async def _check(server_url: str) -> bool:
             return server_url in healthy
 
         router._check_server_health = _check
@@ -223,18 +263,25 @@ class TestMonitorDrivesReadiness:
 
         async def scenario():
             router = self._router(["ctx0"], healthy=set())  # worker is dead
-            # One poll, then stop: _monitor_servers loops forever by design.
-            task = asyncio.create_task(router._monitor_servers(poll_interval=0.01))
-            router._monitor_task = task
-            await asyncio.sleep(0.1)
-            still_running = not task.done()
-            servers = list(router.servers)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            return servers, still_running
+            published = asyncio.Event()
+            inner_updated = router._on_servers_updated
+
+            def updated_then_signal(old_servers: list[str], new_servers: list[str]) -> None:
+                inner_updated(old_servers, new_servers)
+                # `_on_servers_updated` runs under the monitor's lock, after
+                # `self._servers` has been reassigned. Signalling here -- and
+                # not around the fetch -- is what makes the assertion below
+                # read a published list rather than race the publish.
+                published.set()
+
+            router._on_servers_updated = updated_then_signal
+            await router.start_server_monitoring(poll_interval=0.01)
+
+            async def body():
+                await _await_progress(published, "publish a server-list change")
+                return list(router.servers), not router._monitor_task.done()
+
+            return await _run_monitored(router, body)
 
         servers, still_running = asyncio.run(scenario())
         assert servers == [], (
@@ -254,24 +301,25 @@ class TestMonitorDrivesReadiness:
         async def scenario():
             router = self._router(["ctx0"], healthy={"ctx0"})
             calls = {"n": 0}
+            polled_again = asyncio.Event()
 
-            async def flaky_fetch():
+            async def flaky_fetch() -> dict[str, str]:
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise RuntimeError("metadata server unreachable")
+                # The retry is the whole point of the test, so wait for it
+                # rather than for a duration that merely usually contains it.
+                polled_again.set()
                 return {"trtllm/ctx0": "ctx0"}
 
             router.fetch_live_servers = flaky_fetch
-            task = asyncio.create_task(router._monitor_servers(poll_interval=0.01))
-            router._monitor_task = task
-            await asyncio.sleep(0.15)
-            alive = not task.done()
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            return alive, calls["n"]
+            await router.start_server_monitoring(poll_interval=0.01)
+
+            async def body():
+                await _await_progress(polled_again, "poll again after the error")
+                return not router._monitor_task.done(), calls["n"]
+
+            return await _run_monitored(router, body)
 
         alive, n_calls = asyncio.run(scenario())
         assert alive, "monitor task died on a transient poll error"
@@ -317,36 +365,57 @@ class TestMonitorDrivesReadiness:
 
         async def scenario():
             router = self._router(["gen0"], healthy={"gen0"}, role=ServerRole.GENERATION)
+            calls = {"n": 0}
+            failed_twice = asyncio.Event()
 
             async def always_fails():
+                calls["n"] += 1
+                # Two failures, not one: it proves the loop retried rather
+                # than merely entered once. Waiting on this is also what stops
+                # the assertions below from passing vacuously -- with a fixed
+                # sleep, a monitor that never got scheduled at all would leave
+                # `_last_successful_poll` unset and look identical to one that
+                # tried and failed.
+                if calls["n"] >= 2:
+                    failed_twice.set()
                 raise RuntimeError("metadata server unreachable")
 
             router.fetch_live_servers = always_fails
             # The real entry point: it is what records the monitor's start.
             await router.start_server_monitoring(poll_interval=0.01)
-            await asyncio.sleep(0.1)
 
-            # The precondition for the fail-open: alive, never succeeded, and
-            # still holding the list it was constructed with.
-            alive = not router._monitor_task.done()
-            never_succeeded = router._last_successful_poll is None
-            servers = list(router.servers)
+            async def body():
+                await _await_progress(failed_twice, "retry after a failed poll")
 
-            c = _coordinator(["ctx0"], [])
-            c._gen_router = router
-            c._monitor_staleness_secs = 0.05
-            ready = await c.is_ready()
+                # The precondition for the fail-open: alive, never succeeded,
+                # and still holding the list it was constructed with.
+                alive = not router._monitor_task.done()
+                never_succeeded = router._last_successful_poll is None
+                servers = list(router.servers)
 
-            # A generous window must NOT report stale, or a merely slow first
-            # poll would flap /health during startup.
-            c._monitor_staleness_secs = 30.0
-            ready_in_generous_window = await c.is_ready()
+                # Age the monitor deterministically instead of waiting out a
+                # real bound: the assertion is about the staleness arithmetic,
+                # and tying it to wall-clock would put CI load back in the
+                # loop. 60s of failing polls against a 30s bound.
+                router._monitor_started_at -= 60.0
 
-            await router.stop_server_monitoring()
-            return alive, never_succeeded, servers, ready, ready_in_generous_window
+                c = _coordinator(["ctx0"], [])
+                c._gen_router = router
+                c._monitor_staleness_secs = 30.0
+                ready = await c.is_ready()
 
-        alive, never_succeeded, servers, ready, generous = asyncio.run(scenario())
+                # A window the monitor has not yet outlived must NOT report
+                # stale, or a merely slow first poll would flap /health during
+                # startup.
+                c._monitor_staleness_secs = 300.0
+                generous = await c.is_ready()
+                return alive, never_succeeded, servers, ready, generous, calls["n"]
+
+            return await _run_monitored(router, body)
+
+        alive, never_succeeded, servers, ready, generous, n_calls = asyncio.run(scenario())
         assert alive, "monitor died; this test is meant to cover the still-running case"
+        assert n_calls >= 2, "the monitor never actually retried a failing poll"
         assert never_succeeded, "no poll should have succeeded"
         assert servers == ["gen0"], "the un-refreshed initial list is what readiness must not trust"
         assert ready is False, (
