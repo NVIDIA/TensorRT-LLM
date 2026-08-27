@@ -23,6 +23,8 @@ simplified metadata that doesn't require KV caching.
 from .cute_dsl import (
     VSA_TILE_SIZE,
     CuTeDSLAttention,
+    SolAttnAttention,
+    SolAttnStepContext,
     VSAAttention,
     VSAMetadata,
     VSAMetadataBuilder,
@@ -44,6 +46,8 @@ __all__ = [
     "create_attention",
     "CuTeDSLAttention",
     "VSAAttention",
+    "SolAttnAttention",
+    "SolAttnStepContext",
     "FlashAttn4Attention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",

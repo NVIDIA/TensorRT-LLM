@@ -41,6 +41,11 @@ force-exclude = true
 exclude = [
     "**3rdparty/**",
     "triton_kernels/**",
+    # Sol-Attn: vendored wholesale from github.com/NVlabs/Sana (branch
+    # sol-engine, pinned commit -- see cute_dsl_kernels/blackwell/sol_attn/
+    # THIRD_PARTY_NOTICES.md). Not hand-edited so it stays diffable/verifiable
+    # against upstream; lint debt is upstream's to fix, not ours to carry.
+    "tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/**",
 ]
 
 

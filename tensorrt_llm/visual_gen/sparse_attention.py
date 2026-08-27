@@ -199,6 +199,58 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return None
 
 
+class SolAttnAttentionConfig(BaseSparseAttentionConfig):
+    """Sol-Attn sparse attention configuration for visual generation.
+
+    Dynamic block routing + sparse computation + approximation correction in
+    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL (sm90/
+    sm100 only, head_dim=128, bf16); the vendored kernel itself falls back to
+    dense SDPA on any unsupported shape/dtype/arch, so this config is safe to
+    set unconditionally.
+    """
+
+    algorithm: Literal["sol_attn"] = "sol_attn"
+    tau: float = PydanticField(
+        1.0,
+        description="Per-block routing threshold; higher tau routes more blocks sparse.",
+    )
+    thresh_type: Literal["diag", "exact"] = PydanticField(
+        "diag",
+        description="Threshold policy forwarded to the kernel (kernel default: 'diag').",
+    )
+    kv_splits: str = PydanticField(
+        "auto",
+        description="KV split policy: an integer count as a string, or 'auto'.",
+    )
+    dense_steps: int = PydanticField(
+        0,
+        ge=0,
+        description=(
+            "Dense-prefix warmup step count (absolute, not normalized -- unlike "
+            "skip_softmax's disabled_until_timestep). Requires a per-denoising-"
+            "step counter wired into the model's forward loop (see "
+            "SolAttnStepContext); currently wired for the WAN pipeline only. "
+            "On other pipelines this has no effect (no counter advances it), "
+            "so leave it at 0 (no dense prefix) there."
+        ),
+    )
+    dense_layers: Optional[str] = PydanticField(
+        None,
+        description=(
+            "Comma-separated layer indices/ranges (e.g. '0,2-4') forced dense "
+            "regardless of dense_steps. Evaluated per-layer at construction "
+            "time; no pipeline wiring required."
+        ),
+    )
+
+    def to_sparse_params(self, **kwargs):
+        # Sol-Attn's knobs are consumed directly by SolAttnAttention.__init__
+        # (constructed via CUTEDSL backend dispatch in create_attention), not
+        # lowered into a shared SparseParams -- the vendored kernel has no
+        # checkpoint-calibration step to resolve here, unlike skip_softmax.
+        return None
+
+
 class VideoSparseAttentionConfig(StrictBaseModel):
     """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
 

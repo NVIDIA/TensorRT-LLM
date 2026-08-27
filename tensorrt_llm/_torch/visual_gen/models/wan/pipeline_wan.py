@@ -26,6 +26,7 @@ from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from tensorrt_llm._torch.visual_gen.attention_backend import (
+    SolAttnStepContext,
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
@@ -549,6 +550,18 @@ class WanPipeline(BasePipeline):
         _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
         _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
 
+        # Sol-Attn: advance the process-wide step counter once per denoising
+        # step, mirroring the VSA counter above exactly. Reset per generate()
+        # call so a warmup generation never leaks a stale step count into the
+        # timed run that follows it (see SolAttnStepContext docstring).
+        _solattn_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "sol_attn"
+        )
+        if _solattn_active:
+            SolAttnStepContext.reset()
+
         # Denoising with two-stage support
         # Track which model was used in last step (for logging model transitions)
         last_model_used = [None]
@@ -600,6 +613,9 @@ class WanPipeline(BasePipeline):
                 else:
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+
+            if _solattn_active:
+                SolAttnStepContext.advance_step()
 
             if _vsa_active and _vsa_builder is not None:
                 # latents: [B, C, T_latent, H_latent, W_latent]

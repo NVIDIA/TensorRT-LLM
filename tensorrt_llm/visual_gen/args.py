@@ -30,7 +30,11 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
+from .sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    SolAttnAttentionConfig,
+    VideoSparseAttentionConfig,
+)
 
 # =============================================================================
 # Type aliases
@@ -89,7 +93,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttnAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -101,6 +105,18 @@ class AttentionConfig(StrictBaseModel):
         "VANILLA",
         status="prototype",
         description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
+    )
+    cross_attention_backend: Optional[Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Backend override for cross-attention modules (SEPARATE_QKV, non-self-attention) "
+            "only. Leave as None to inherit `backend`, which for TRTLLM (and CUTEDSL+VSA) "
+            "already falls back to VANILLA for cross-attention because those kernels require "
+            "equal Q/KV sequence length. Set explicitly to force a specific cross-attention "
+            "backend independent of the self-attention backend, e.g. to isolate the "
+            "self-attention backend choice from cross-attention's kernel in a benchmark."
+        ),
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
@@ -116,7 +132,8 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM backend) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM backend), vsa (CUTEDSL backend), or "
+            "sol_attn (CUTEDSL backend)."
         ),
     )
 
@@ -177,7 +194,11 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         algo = self.sparse_attention_config.algorithm
-        required_backend = {"skip_softmax": "TRTLLM", "vsa": "CUTEDSL"}.get(algo)
+        required_backend = {
+            "skip_softmax": "TRTLLM",
+            "vsa": "CUTEDSL",
+            "sol_attn": "CUTEDSL",
+        }.get(algo)
         if required_backend is None:
             return self
 
@@ -666,6 +687,7 @@ __all__ = [
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
+    "SolAttnAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",
