@@ -29,15 +29,15 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
 )
 
 
-def _require_sm100() -> None:
+def _require_supported_gpu() -> None:
     if not _supports_nvfp4_device(torch.device("cuda")):
-        pytest.skip("NVFP4 Wan VAE requires an SM100-family GPU")
+        pytest.skip("NVFP4 Wan VAE requires an SM100, SM103, or SM120 GPU")
 
 
 @pytest.mark.parametrize("channels", [128, 192, 512])
 def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(channels: int) -> None:
     """Compare fused bytes, including activation blocks beyond calibration."""
-    _require_sm100()
+    _require_supported_gpu()
     torch.manual_seed(0)
     activation = torch.randn((17, channels), device="cuda", dtype=torch.bfloat16)
     activation[0, :16] = 20.0
@@ -58,7 +58,7 @@ def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(channels: int) -> None:
 
 
 def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
-    _require_sm100()
+    _require_supported_gpu()
     torch.manual_seed(0)
     rows, channels = 17, 192
     activation = torch.randn((rows, channels), device="cuda", dtype=torch.bfloat16)
@@ -88,7 +88,7 @@ def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
 
 def test_nvfp4_wan_conv_bias_residual_and_spatial_padding() -> None:
     """Run the VAE wrapper through its CuTe ABI on a partial output tile."""
-    _require_sm100()
+    _require_supported_gpu()
     torch.manual_seed(0)
     base = WanCausalConv3d(192, 96, 3, padding=1).cuda().to(torch.bfloat16).eval()
     with torch.no_grad():
@@ -142,7 +142,7 @@ def test_nvfp4_wan_conv_bias_residual_and_spatial_padding() -> None:
 
 def test_nvfp4_wan_conv_reuses_cubin_across_runtime_shapes() -> None:
     """One compiled kernel serves compatible channel and spatial shapes."""
-    _require_sm100()
+    _require_supported_gpu()
     saved_cache = dict(_fp4_compile_cache)
     try:
         _fp4_compile_cache.clear()
