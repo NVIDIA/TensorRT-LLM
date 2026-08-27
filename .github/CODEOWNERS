@@ -330,7 +330,7 @@
 # Deliberately still under thop/: the top-k kernel this exercises gained a second
 # production consumer outside Attention (KV-cache compression), so the test's final
 # home is settled together with the kernel's, not by this move. Keeping the explicit
-# rule preserves Attention ownership meanwhile. See TRTLLM-14844.
+# rule preserves Attention ownership meanwhile. See PR #17968 for the discussion.
 /tests/unittest/_torch/thop/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
