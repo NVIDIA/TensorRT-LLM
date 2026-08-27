@@ -12,6 +12,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa import (
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     QSAIndexer,
+    _position_coordinates,
     average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_sparse_gqa,
@@ -181,6 +182,23 @@ def test_qsa_selection_is_causal_and_score_ordered() -> None:
     )
     assert selected[0].tolist() == [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]
     assert selected[1].tolist() == [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1]
+
+
+def test_qsa_position_coordinates_preserve_scheduler_views() -> None:
+    positions_1d = torch.arange(5, dtype=torch.int64)
+    coordinates_1d = _position_coordinates(positions_1d, 5)
+    assert coordinates_1d.shape == (5, 3)
+    assert coordinates_1d.stride() == (1, 0)
+    assert coordinates_1d.untyped_storage().data_ptr() == positions_1d.untyped_storage().data_ptr()
+
+    positions_mrope = torch.arange(3 * 2 * 5, dtype=torch.int64).reshape(3, 2, 5)
+    coordinates_mrope = _position_coordinates(positions_mrope, 10)
+    assert coordinates_mrope.shape == (10, 3)
+    assert coordinates_mrope.stride() == (1, 10)
+    assert (
+        coordinates_mrope.untyped_storage().data_ptr()
+        == positions_mrope.untyped_storage().data_ptr()
+    )
 
 
 @pytest.mark.parametrize("rows", [1, 64, 257])
@@ -453,8 +471,10 @@ def test_qsa_fused_decode_pre_indexer_matches_reference() -> None:
             logical_positions + 2,
             logical_positions + 4,
         ),
-        dim=1,
-    ).to(torch.int32)
+        dim=0,
+    ).transpose(0, 1)
+    assert position_coordinates.dtype == torch.int64
+    assert not position_coordinates.is_contiguous()
     q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda") * 0.05
     k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda") * 0.05
     angles = (

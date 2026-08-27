@@ -117,7 +117,11 @@ def _position_coordinates(position_ids: torch.Tensor, num_tokens: int) -> torch.
         raise ValueError(
             f"QSA position count {positions.shape[0]} does not match {num_tokens} tokens"
         )
-    return positions.to(torch.int32).contiguous()
+    # The fused pre-indexer accepts arbitrary row/axis strides and converts
+    # positions while storing its int32 side cache. Preserve the scheduler's
+    # tensor view here instead of materializing the same coordinates once per
+    # sparse layer.
+    return positions
 
 
 def _logical_to_pages(
