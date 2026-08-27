@@ -131,8 +131,6 @@ full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:A100/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6581064)
 full:A100/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
 full:B200/accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_fp8] SKIP (https://nvbugs/6327718)
-full:B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[latency] SKIP (https://nvbugs/6650388)
-full:B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_piecewise_cuda_graph[mtp3_fp8kv_chunked] SKIP (https://nvbugs/6650388)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] SKIP (https://nvbugs/6424188)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False] SKIP (https://nvbugs/6424188)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] SKIP (https://nvbugs/6572838)
