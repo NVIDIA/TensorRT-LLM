@@ -247,20 +247,23 @@ FP8 KV cache is a separate setting. The following are distinct supported cases:
 - pre-quantized block-FP8 routed-expert weights with an automatic/BF16 KV cache;
 - pre-quantized block-FP8 routed-expert weights with FP8 KV cache.
 
-## Configuration recipes
+## Example deployment recipes
 
-The examples below are functionality-oriented starting points. Capacity fields
-must be sized for the selected checkpoint, GPU count, input/output lengths, and
-concurrency. Performance-sensitive deployments should tune from a matched
-validated baseline.
+The examples below are functionality-oriented, end-to-end starting points. They
+cover the primary requested deployment shapes: BF16 TEP2 with MTP3, block-FP8
+TP1 with MTP3, text prefill/decode disaggregation, and aggregate multimodal
+serving. Capacity fields must be sized for the selected checkpoint, GPU count,
+input/output lengths, and concurrency. Performance-sensitive deployments should
+tune from a matched validated baseline.
 
 ### Choosing a recipe
 
 | Deployment goal | Starting point | Validation status |
 |---|---|---|
+| BF16 on two GB300 GPUs with MTP3 | BF16 TEP2 with MTP3 | Supported starting point; constituent TP2 MTP3 and TEP4 MTP3 paths are validated |
+| Block-FP8 on one GB300 with MTP3 | Block-FP8 TP1 with MTP3 | Validated |
 | BF16 tensor-parallel text serving | BF16 TP4 with CUTLASS MoE | Validated |
 | BF16 expert-parallel text serving | BF16 TEP4 with TRTLLM MoE | Validated |
-| Block-FP8 on one GB300 | Block-FP8 TP1 with TRTLLM or DeepGEMM MoE | Validated |
 | Block-FP8 multi-GPU text serving | Block-FP8 TEP4 with TRTLLM MoE | Validated |
 | MTP3 | Add the greedy or non-greedy MTP3 overlay | Validated |
 | Prefix caching | Use the complete cache configuration in the Validation evidence section | Validated |
@@ -271,6 +274,71 @@ validated baseline.
 | Block-FP8 image-language serving | Multimodal aggregate example with the block-FP8 TP1 overlay | Validated on one GB300 backend GPU |
 
 ### Aggregate text generation
+
+#### BF16 TEP2 with MTP3
+
+This two-GPU topology uses attention TP2 and routed-expert EP2. Keeping
+`moe_tensor_parallel_size` at one preserves each expert's complete intermediate
+dimension, while `moe_expert_parallel_size: 2` partitions the routed experts
+between the two GPUs. Save the following configuration as
+`bf16-tep2-mtp3.yaml`:
+
+```yaml
+tensor_parallel_size: 2
+moe_tensor_parallel_size: 1
+moe_expert_parallel_size: 2
+pipeline_parallel_size: 1
+enable_attention_dp: false
+disable_mm_encoder: true
+
+max_batch_size: 8
+max_input_len: 8192
+max_seq_len: 16384
+max_num_tokens: 8192
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+
+moe_config:
+  backend: TRTLLM
+  max_num_tokens: 8192
+  disable_finalize_fusion: true
+
+sparse_attention_config:
+  algorithm: qsa
+
+kv_cache_config:
+  max_tokens: 65536
+  avg_seq_len: 8192
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: false
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  use_rejection_sampling: true
+  advanced_sampling_mode: full
+```
+
+Start the two-rank aggregate server with:
+
+```bash
+trtllm-llmapi-launch trtllm-serve /path/to/Qwen3.8-Flash-Next \
+  --config bf16-tep2-mtp3.yaml \
+  --served_model_name Qwen3.8-Flash-Next \
+  --host 0.0.0.0 --port 8000 \
+  --generation-config trtllm --no-telemetry
+```
+
+This is the two-GPU form of the supported TEP and MTP3 paths. Retained
+production-size evidence separately covers BF16 TP2 with MTP3 and BF16 TEP4
+with MTP3. Validate the selected batch, sequence, and cache capacities before
+using this TEP2 recipe as a production SLA baseline. `allreduce_strategy` is
+intentionally omitted so that the GB300 `AUTO` policy selects among supported
+collective implementations.
 
 #### BF16 TP4 with CUTLASS MoE
 
@@ -333,11 +401,11 @@ kv_cache_config:
   use_kv_cache_manager_v2: true
 ```
 
-#### Block-FP8 TP1 on one GB300
+#### Block-FP8 TP1 with MTP3 on one GB300
 
-TP1 avoids both expert sharding and FP8 scale-block ambiguity. `TRTLLM` is the
-validated general backend. `DEEPGEMM` is also validated for the pre-quantized
-block-FP8 checkpoint on SM103.
+TP1 avoids both expert sharding and FP8 scale-block ambiguity. The conservative
+configuration below uses the validated TRTLLM MoE backend and the single-GPU
+MTP3 envelope. Save it as `fp8-tp1-mtp3.yaml`:
 
 ```yaml
 tensor_parallel_size: 1
@@ -346,15 +414,18 @@ moe_expert_parallel_size: 1
 enable_attention_dp: false
 disable_mm_encoder: true
 
-max_batch_size: 8
+max_batch_size: 1
 max_num_tokens: 2048
-max_seq_len: 8192
+max_seq_len: 13312
 enable_chunked_prefill: true
 disable_overlap_scheduler: true
-cuda_graph_config: null
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1
 
 moe_config:
-  backend: DEEPGEMM  # TRTLLM is also validated for this topology
+  backend: TRTLLM
   max_num_tokens: 2048
 
 sparse_attention_config:
@@ -365,11 +436,30 @@ kv_cache_config:
   avg_seq_len: 4096
   use_kv_cache_manager_v2: true
   enable_block_reuse: false
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  use_rejection_sampling: true
+  advanced_sampling_mode: full
 ```
 
-This is the validated DeepGEMM functionality-smoke envelope. Increase sequence
-and cache capacities only after checking the target workload's memory budget;
-the separate long-context TP1 validation used the TRTLLM MoE backend.
+Start the single-rank aggregate server with:
+
+```bash
+trtllm-llmapi-launch trtllm-serve /path/to/Qwen3.8-Flash-Next-FP8 \
+  --config fp8-tp1-mtp3.yaml \
+  --served_model_name Qwen3.8-Flash-Next \
+  --host 0.0.0.0 --port 8000 \
+  --generation-config trtllm --no-telemetry
+```
+
+The complete block-FP8 checkpoint fits on one GB300 under the validated
+functionality envelope, but remaining memory for KV cache and concurrent
+requests is limited. Reduce `max_batch_size` or cache capacity if initialization
+reports insufficient free memory. DeepGEMM is also validated on this topology,
+but this copy-ready MTP3 example uses TRTLLM MoE to match the general block-FP8
+serving path.
 
 #### Block-FP8 TEP4
 
@@ -471,7 +561,7 @@ For long prompts, choose `max_num_tokens` below the prompt length when the goal
 is to exercise chunked prefill. Graph batch sizes should cover the expected
 decode batch distribution rather than only the maximum batch size.
 
-### Text disaggregated serving
+### Disaggregated text deployment recipes
 
 #### BF16 TP4
 
@@ -687,10 +777,13 @@ are unsupported. For long generations, set the proxy request timeout above the
 maximum expected request duration. The validation profile used 21,600 seconds;
 the NIXL KV-transfer timeout was 600,000 milliseconds.
 
-### Multimodal aggregate examples
+### Aggregate multimodal deployment recipes
+
+#### BF16 TP4
 
 The following conservative BF16 TP4 configuration is validated for aggregate
 image-language serving with a local multimodal encoder on NVIDIA GB300 GPUs.
+Save it as `multimodal-bf16-tp4.yaml`:
 
 ```yaml
 tensor_parallel_size: 4
@@ -721,37 +814,60 @@ kv_cache_config:
   use_kv_cache_manager_v2: true
 ```
 
-For the pre-quantized block-FP8 checkpoint, use a TP1 topology on one GB300
-backend GPU. TP1 keeps each routed expert and its 128-by-128 scale grid local;
-the checkpoint's vision modules remain unquantized. Replace the BF16 parallelism
-and MoE settings above with this validated overlay:
+#### Block-FP8 TP1
+
+For the pre-quantized block-FP8 checkpoint, use the following self-contained
+configuration on one GB300 backend GPU. TP1 keeps each routed expert and its
+128-by-128 scale grid local; the checkpoint's vision modules remain
+unquantized. Save it as `multimodal-fp8-tp1.yaml`:
 
 ```yaml
 tensor_parallel_size: 1
 moe_tensor_parallel_size: 1
 moe_expert_parallel_size: 1
+pipeline_parallel_size: 1
 enable_attention_dp: false
+disable_mm_encoder: false
+
+max_batch_size: 8
+max_input_len: 4096
+max_seq_len: 16384
+max_num_tokens: 8192
+encoder_max_batch_size: 8
+encoder_max_num_tokens: 65536
+enable_chunked_prefill: false
+disable_overlap_scheduler: true
+cuda_graph_config: null
 
 moe_config:
   backend: TRTLLM
   max_num_tokens: 8192
 ```
 
-Keep the multimodal, QSA, cache-manager, batching, and scheduler fields from the
-base example. The validated block-FP8 TP1 profile used `max_num_tokens: 8192`.
+sparse_attention_config:
+  algorithm: qsa
+
+kv_cache_config:
+  max_tokens: 65536
+  enable_block_reuse: false
+  use_kv_cache_manager_v2: true
+```
 
 Start an aggregate server with the multimodal-disaggregation switch explicitly
 disabled. Setting the value explicitly prevents an inherited environment value
-from selecting the unsupported encoder-handoff path:
+from selecting the unsupported encoder-handoff path. Select the configuration
+and matching checkpoint precision from the preceding examples:
 
 ```bash
 TLLM_MULTIMODAL_DISAGGREGATED=0 \
 trtllm-llmapi-launch trtllm-serve /path/to/checkpoint \
-  --config multimodal.yaml \
+  --config multimodal-bf16-tp4.yaml \
   --served_model_name Qwen3.8-Flash-Next \
   --host 0.0.0.0 --port 8000 \
   --generation-config trtllm --no-telemetry
 ```
+
+Use `multimodal-fp8-tp1.yaml` instead when serving the block-FP8 checkpoint.
 
 An OpenAI-compatible single-image request uses an `image_url` content part
 followed by the text instruction:
