@@ -495,11 +495,13 @@ class QSAIndexer(nn.Module):
             return
         if num_contexts >= num_seqs:
             return
+        # Mixed-IFB forwards are eager. Derive this branch once from the host
+        # query lengths rather than synchronizing a device reduction per layer.
+        if not metadata.is_cuda_graph and not metadata.qsa_needs_speculative_snapshot:
+            return
         seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.long)
         generation_lens = seq_lens[num_contexts:]
         if generation_lens.numel() == 0:
-            return
-        if not metadata.is_cuda_graph and not torch.any(generation_lens > 1):
             return
 
         token_ids = torch.arange(
