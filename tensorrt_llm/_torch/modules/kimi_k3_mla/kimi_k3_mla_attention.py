@@ -77,19 +77,21 @@ def _kimi_k3_mla_decode_backend_policy(
     CuTe-DSL reuses one staged page table across MLA layers for a
     generation-only, one-token-per-request batch. Other mixed batches repeat
     the staging copies in every MLA layer and regress time to first token, so
-    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception:
-    TRTLLM-Gen may select a 64-head Q tile, which does not divide 96 and
-    produces an invalid configuration after K3's head padding was removed.
+    they fall back to TRTLLM-Gen. The CuTe-DSL kernel itself accepts
+    multi-token queries, but K3's decode tuning covers only the
+    one-token-per-request regime, so generation-only speculative verification
+    also falls back.
 
-    The CuTe-DSL kernel itself accepts multi-token queries, but K3's decode
-    tuning covers only the one-token-per-request regime, so generation-only
-    speculative verification also falls back.
+    Both fallbacks are perf tuning and neither may override correctness:
+    TRTLLM-Gen's MLA decode rejects ``64 < num_heads < 128`` outright, because
+    its Q tile is 64 or 128 heads and neither divides such a head count once
+    K3's padding to 128 heads was removed.
     """
     is_single_token_generation = num_gen_tokens == metadata.num_generations
-    requires_cute_dsl_for_mixed_batch = metadata.num_contexts > 0 and num_heads == 96
+    trtllm_gen_supports_num_heads = not (64 < num_heads < 128)
     if (
         requested_backend == "cute-dsl"
-        and not requires_cute_dsl_for_mixed_batch
+        and trtllm_gen_supports_num_heads
         and (metadata.num_contexts > 0 or not is_single_token_generation)
     ):
         return "trtllm-gen"

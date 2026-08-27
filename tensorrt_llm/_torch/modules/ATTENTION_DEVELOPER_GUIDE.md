@@ -337,9 +337,11 @@ cache (override with `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen`; other values are
 rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
 per-batch policy that falls back to `trtllm-gen` for mixed
 context/generation batches and multi-token generation (speculative
-verification), keeping `cute-dsl` for plain one-token-per-request decode. A
-mixed H=96 batch remains on `cute-dsl`: TRTLLM-Gen may select a 64-head Q tile,
-which does not divide 96 after K3's head padding removal.
+verification), keeping `cute-dsl` for plain one-token-per-request decode. Both
+fallbacks are perf tuning, so neither applies when `64 < num_heads < 128`
+(e.g. K3's H=96 after its padding to 128 heads was removed): TRTLLM-Gen's MLA
+decode rejects those head counts outright, since its Q tile is 64 or 128 heads
+and neither divides them.
 
 The FMHA package is split by role:
 

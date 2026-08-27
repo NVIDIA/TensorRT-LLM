@@ -66,7 +66,13 @@ def test_select_kimi_k3_mla_generation_backend_uses_trtllm_gen_for_fp8_kv_cache(
         ("cute-dsl", 0, 4, 4, 96, "cute-dsl"),
         ("cute-dsl", 1, 3, 3, 12, "trtllm-gen"),
         ("cute-dsl", 1, 3, 3, 96, "cute-dsl"),
-        ("cute-dsl", 0, 4, 8, 96, "trtllm-gen"),
+        # Generation-only speculative verification at H=96, the shape the
+        # layer-wise benchmark hits in https://nvbugs/6669206: trtllm-gen
+        # rejects 64 < num_heads < 128, so the multi-token perf fallback
+        # must not fire.
+        ("cute-dsl", 0, 4, 8, 96, "cute-dsl"),
+        # H=128 divides trtllm-gen's Q tile, so the fallback still applies.
+        ("cute-dsl", 0, 4, 8, 128, "trtllm-gen"),
         ("trtllm-gen", 1, 3, 3, 96, "trtllm-gen"),
     ],
 )
@@ -78,7 +84,7 @@ def test_kimi_k3_mla_decode_backend_policy_by_batch_shape(
     num_heads: int,
     expected_backend: str,
 ) -> None:
-    """K3 falls back outside plain decode except for unsafe H=96 mixed batches."""
+    """K3 falls back outside plain decode, except where trtllm-gen cannot run."""
     assert (
         _kimi_k3_mla_decode_backend_policy(
             requested_backend,
