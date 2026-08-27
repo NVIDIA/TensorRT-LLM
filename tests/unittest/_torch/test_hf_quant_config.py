@@ -62,3 +62,20 @@ def test_load_hf_quant_config_parses_nvfp4_with_kv_cache_scheme():
     assert quant_config.group_size == 16
     assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
     assert set(quant_config.exclude_modules) == {gate_exclude, "lm_head"}
+
+
+def test_load_hf_quant_config_defaults_null_fp8_weight_block_size():
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        {
+            "activation_scheme": "static",
+            "modules_to_not_convert": ["model.vision_tower", "lm_head"],
+            "quant_method": "fp8",
+            "weight_block_size": None,
+        },
+        moe_backend="CUTLASS",
+    )
+
+    assert layer_quant_config is None
+    assert quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert quant_config.group_size == 128
+    assert {"model.vision_tower", "lm_head"} <= set(quant_config.exclude_modules)
