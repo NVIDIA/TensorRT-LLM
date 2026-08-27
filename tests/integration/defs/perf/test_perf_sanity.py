@@ -547,8 +547,10 @@ def add_perf_metric_value(
     """Populate `new_data` with per-test perf metrics from `metrics`.
 
     - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
-    - Adds `d_al` only when spec_decoding=True; non-spec rows omit it so
-      OpenSearch baselines don't blend the two populations.
+    - Adds `d_al` only when spec_decoding=True *and* the value was parsed;
+      non-spec rows omit it so OpenSearch baselines don't blend the two
+      populations, and spec rows exempted from reporting it (AgentX) omit it
+      rather than failing the upload.
     - Adds the `d_*_gen_worker_per_iter_device_step_time` family only for the
       disagg gen_only mode (the only mode that emits them). Of these the mean
       and the median are regression-gated (GEN_ONLY_REGRESSION_METRICS); the
@@ -563,7 +565,17 @@ def add_perf_metric_value(
     for metric_name in PERF_METRIC_LOG_QUERIES:
         new_data[f"d_{metric_name}"] = metrics[metric_name]
     if spec_decoding:
-        new_data["d_al"] = metrics["al"]
+        # 'al' is legitimately absent for AgentX lanes: aiperf does not propagate
+        # TRT-LLM's non-standard avg_decoded_tokens_per_iter field. Omit the
+        # column instead of raising -- check_test_failure runs immediately before
+        # upload and has already hard-failed any non-exempt spec-decoding run
+        # whose 'al' is missing, so reaching here without it means the run is
+        # exempt by design. Omitted rather than defaulted: typeCheckForOpenSearchDB
+        # rejects None for a d_ key (losing the whole row), and a substituted 0.0
+        # would corrupt the spec-decoding baseline population.
+        al = metrics.get("al")
+        if al is not None:
+            new_data["d_al"] = al
     if benchmark_mode == "gen_only":
         for metric_name in GEN_ONLY_DEVICE_STEP_TIME_METRICS:
             value = metrics.get(metric_name)
