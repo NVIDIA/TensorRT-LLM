@@ -250,9 +250,7 @@ class NcclEP(Communication):
         # were shaped by that stored value, and a re-read could disagree with
         # them if the env changed after context creation.
         _ht = ctx.is_high_throughput
-        layout_info = None if _ht else LayoutInfo(
-            src_rank_counters=ctx.recv_rank_counter_nd
-        )
+        layout_info = None if _ht else LayoutInfo(src_rank_counters=ctx.recv_rank_counter_nd)
         # The v0.2-gated capability path asks the kernel to emit global
         # expert ids directly; v0.1 retains the default local-id contract
         # and uses the translation below. Track whether THIS dispatch
@@ -297,9 +295,7 @@ class NcclEP(Communication):
         # numbering downstream consumers expect.
         # The dispatch buffer is 3D [ep_size, max_tokens_per_rank, max_top_k]
         # per the LL rank-major contract; flatten to 2D for downstream.
-        recv_topk_idx_flat = ctx.recv_topk_idx_buf.reshape(
-            self.max_recv_tokens, self.max_top_k
-        )
+        recv_topk_idx_flat = ctx.recv_topk_idx_buf.reshape(self.max_recv_tokens, self.max_top_k)
         if dispatch_writes_global_ids:
             recv_slots_global = recv_topk_idx_flat
         else:
