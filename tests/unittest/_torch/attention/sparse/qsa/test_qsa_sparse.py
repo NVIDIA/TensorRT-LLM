@@ -761,6 +761,69 @@ def test_fused_qsa_sparse_gqa_matches_reference(head_dim: int, cache_dtype: torc
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_qsa_prefill_bounds_sparse_attention_to_visible_tokens() -> None:
+    torch.manual_seed(43)
+    rows = 257
+    num_requests = 2
+    num_kv_heads = 2
+    num_q_heads = 6
+    head_dim = 64
+    tokens_per_block = 8
+    compress_ratio = 4
+    token_topk = 32
+    final_topk = token_topk + compress_ratio - 1
+    pages_per_request = 4
+    q = torch.randn(rows, num_q_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(
+        num_requests * pages_per_request,
+        num_kv_heads,
+        tokens_per_block,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_table = torch.arange(
+        num_requests * pages_per_request,
+        dtype=torch.int32,
+        device="cuda",
+    ).reshape(num_requests, pages_per_request)
+    request_indices = (torch.arange(rows, device="cuda") % num_requests).to(torch.int32)
+    query_positions = torch.arange(rows, device="cuda") % (pages_per_request * tokens_per_block)
+    visible_tokens = query_positions + 1
+    selected = torch.full((rows, final_topk), -1, dtype=torch.int32, device="cuda")
+    columns = torch.arange(final_topk, device="cuda").unsqueeze(0)
+    selected.copy_(torch.where(columns < visible_tokens.unsqueeze(1), columns, -1))
+    metadata = SimpleNamespace(
+        qsa_block_table=block_table,
+        kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
+    )
+
+    actual = qsa_sparse_gqa(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=head_dim**-0.5,
+        query_positions=query_positions,
+        compress_ratio=compress_ratio,
+    )
+    expected = qsa_sparse_gqa_reference(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=head_dim**-0.5,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
 def test_qsa_index_storage_avoids_kv_role_coalescing() -> None:
     manager = object.__new__(QSAMambaHybridCacheManagerV2)
     manager.qsa_index_dim = 128
