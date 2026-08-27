@@ -7,11 +7,15 @@ There are multiple ways to install and run TensorRT LLM. The options below are o
 
 **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
+Nightly releases are development builds identified by a `.dev` segment in the version. They provide early access to
+the latest changes, but their quality is not guaranteed and they may contain bugs or regressions.
+
 ## Option 1: Pre-built Release Container
 
 Pre-built TensorRT LLM releases are available as [container images on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release). This is the simplest way to obtain TensorRT LLM.
 
-Replace `x.y.z` with the desired version tag. Browse the [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) to find the latest release.
+Replace `x.y.z` with the desired version tag. The [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)
+include both regular and `.dev` nightly releases; select the latest tag or a specific version.
 
 ```bash
 docker pull nvcr.io/nvidia/tensorrt-llm/release:x.y.z
@@ -74,6 +78,26 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
 
 ```bash
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
+```
+
+#### Install a nightly release
+
+Nightly wheels are published to a dedicated package index. Use `--extra-index-url` to add this index while keeping
+PyPI available for dependency resolution.
+
+To install or upgrade to the latest nightly release:
+
+```bash
+pip3 install --pre --upgrade tensorrt_llm \
+    --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
+```
+
+To install a specific nightly release, choose a version from the [available nightly wheels](https://pypi.nvidia.com/trtllm_nightly/tensorrt-llm/)
+and replace `<version>` in the following command:
+
+```bash
+pip3 install --pre "tensorrt_llm==<version>" \
+    --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 ```
 
 > **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
