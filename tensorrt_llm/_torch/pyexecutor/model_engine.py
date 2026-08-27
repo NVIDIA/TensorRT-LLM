@@ -3874,6 +3874,26 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(num_ctx_requests))
         return None
 
+    def _get_all_rank_num_tokens_and_spec_counts(
+        self, attn_metadata: AttentionMetadata, spec_counts: Tuple[int, ...]
+    ) -> Tuple[Optional[List[int]], Optional[List[List[int]]]]:
+        """Exchange the attention and speculative per-rank counts in a single
+        collective instead of one collective each."""
+        if not self.enable_attention_dp:
+            return None, None
+        if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
+            # attn counts span TP only while spec counts span TP*CP; keep the
+            # two exchanges separate.
+            gathered = self.dist.tp_cp_allgather(list(spec_counts))
+            return (self._get_all_rank_num_tokens(attn_metadata),
+                    [list(col) for col in zip(*gathered)])
+        num_tokens = attn_metadata.num_tokens
+        if self.mapping.has_cp_helix():
+            num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
+        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts])
+        cols = [list(col) for col in zip(*gathered)]
+        return cols[0], cols[1:]
+
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.
 
@@ -3940,8 +3960,6 @@ class PyTorchModelEngine(ModelEngine):
             can_run_prefill_cuda_graph: whether a prefill CUDA graph can run
             attn_all_rank_num_tokens: the number of tokens for each rank
         """
-        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
-            num_ctx_requests)
 
         def get_padded_prefill_tokens(tokens: int) -> int:
             return self._prefill_cuda_graph_num_tokens[bisect.bisect_left(
@@ -3949,6 +3967,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if (self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED
                 and self._prefill_cuda_graph_num_tokens):
+            all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+                num_ctx_requests)
             max_captured_num_tokens = self._prefill_cuda_graph_num_tokens[-1]
             if attn_all_rank_num_tokens is not None:
                 has_ctx_requests = num_ctx_requests != 0 or (
@@ -4565,9 +4585,17 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = None
 
         # Handle attention DP
+        spec_all_rank_counts = None
         if enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
+            if spec_metadata is not None:
+                (attn_metadata.all_rank_num_tokens, spec_all_rank_counts
+                 ) = self._get_all_rank_num_tokens_and_spec_counts(
+                     attn_metadata,
+                     (total_num_tokens, len(spec_metadata.seq_lens),
+                      attn_metadata.num_generations))
+            else:
+                attn_metadata.all_rank_num_tokens = \
+                    self._get_all_rank_num_tokens(attn_metadata)
 
         # Prepare speculative metadata
         if spec_metadata is not None:
@@ -4580,15 +4608,8 @@ class PyTorchModelEngine(ModelEngine):
 
             # Handle distributed spec metadata
             if enable_attention_dp:
-                sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    spec_metadata.num_tokens,
-                    len(sequence_lengths), attn_metadata.num_generations
-                ])
                 self._set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    spec_metadata, *spec_all_rank_counts)
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
@@ -6247,7 +6268,15 @@ class PyTorchModelEngine(ModelEngine):
             maybe_graph,
             use_lora_graph=use_lora_graph)
 
-        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
+        spec_all_rank_counts = None
+        if spec_metadata is not None and self.enable_attention_dp:
+            (attn_all_rank_num_tokens, spec_all_rank_counts
+             ) = self._get_all_rank_num_tokens_and_spec_counts(
+                 attn_metadata, (total_num_tokens, len(sequence_lengths),
+                                 len(scheduled_requests.generation_requests)))
+        else:
+            attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
+                attn_metadata)
         (padded_num_tokens, can_run_prefill_cuda_graph,
          attn_all_rank_num_tokens) = self._get_padding_params(
              total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
@@ -6344,14 +6373,8 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    spec_metadata.num_tokens,
-                    len(sequence_lengths), spec_metadata.num_generations
-                ])
                 self._set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    spec_metadata, *spec_all_rank_counts)
 
         if mm_token_indices is not None:
             self._ship_multimodal_indices(
