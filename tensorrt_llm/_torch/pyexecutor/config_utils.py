@@ -192,9 +192,10 @@ def reject_unsupported_inkling_kv_cache_features(
     Block reuse without a snapshot policy is warned-and-auto-disabled upstream in
     ``_validate_and_adjust_mamba_snapshot_config`` (shared with the Mamba family),
     so reuse reaches here only with a snapshot -- whose one caveat is multimodal.
-    Disaggregated serving is refused: the transfer path finds state pools by
-    manager class, and Inkling's is not the Mamba one, so the short-conv windows
-    would move as ordinary paged KV. Chunked prefill is served.
+    Disaggregated serving is refused: the short-conv windows are per-request
+    recurrent state with a mixed layout (k/v TP-sharded, residual-stream
+    replicated) that the KV-cache transfer path does not move. Chunked prefill
+    is served.
     """
     if not is_inkling(config):
         return
@@ -202,25 +203,21 @@ def reject_unsupported_inkling_kv_cache_features(
         # Proactive startup notice: the manager's equivalent warning only fires
         # once a multimodal request actually arrives.
         logger.warning(
-            "Inkling: KV cache block reuse is enabled, and applies to text "
-            "prompts only. A request carrying image, video or audio input gets "
-            "a private chain in the reuse tree and never reuses, because "
-            "Inkling produces no multimodal content hashes and a prefix matched "
-            "on placeholder token ids alone would serve one item's KV for "
-            "another's. Such requests still run, uncached.")
+            "Inkling: KV cache block reuse applies to text prompts only. "
+            "Multimodal requests get a private reuse chain and never reuse -- "
+            "Inkling emits no content hashes, so a prefix matched on placeholder "
+            "token ids alone would serve one item's KV for another's. They still "
+            "run, uncached.")
     if enable_cache_transceiver:
         # _util.py refuses the C++ route for every V2 manager; KvCacheTransceiverV2
         # is not, but would move the paged KV and leave the conv windows behind.
         raise NotImplementedError(
-            "Inkling does not support disaggregated serving. Its four "
-            "short-conv windows per layer are per-request recurrent state, "
-            "held as KV cache manager V2 SSM layers -- but the cache-transfer "
-            "path enumerates state pools by cache-manager class, and "
-            "InklingHybridCacheManager is not MambaHybridCacheManagerV2, so "
-            "they are described to it as ordinary paged attention memory. The "
-            "generation instance would resume from a window that was never "
-            "transferred and silently emit wrong output. Unset "
-            "cache_transceiver_config to run Inkling.")
+            "Inkling does not support disaggregated serving. Its per-request "
+            "short-conv windows are recurrent state, not paged KV, with a mixed "
+            "layout -- k/v convs TP-sharded, residual-stream convs replicated. "
+            "The KV-cache transfer path does not move them, so decode would "
+            "resume from windows that were never transferred and emit wrong "
+            "output. Unset cache_transceiver_config to run Inkling.")
 
 
 def _coerce_torch_dtype(dtype):
