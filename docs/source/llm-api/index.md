@@ -59,8 +59,7 @@ llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 print(llm.startup_metrics)
 ```
 
-A TP1 PyTorch-backend run of `TinyLlama/TinyLlama-1.1B-Chat-v1.0` produced the
-following result:
+A typical result has the following structure:
 
 ```json
 {
@@ -113,33 +112,34 @@ following result:
 }
 ```
 
-The `py_executor` object contains the timed scopes in `create_py_executor()`. When KV cache capacity
-estimation creates a temporary PyExecutor before constructing the final PyExecutor,
-`initial_model_engine` contains the warmup metrics from the temporary pass and
-`final_model_engine` contains the warmup metrics from the final pass. Without estimation, only
-`final_model_engine` appears. The model-engine dictionaries are promoted alongside `py_executor` in
-the startup metrics payload so callers do not need to traverse another nesting level. Legacy
-two-model speculative decoding can likewise produce `initial_draft_model_engine` and
-`final_draft_model_engine`.
+The `py_executor` property contains the timed scopes in `create_py_executor()`, which creates the [PyExecutor](../developer-guide/overview.md).
 
 | PyExecutor metric | Scope |
 |-----------------|-------|
-| `config_and_checkpoint_loader_initialization_seconds` | Load the model configuration and initialize the checkpoint loader. |
-| `model_engine_creation_seconds` | Construct and load the main model engine. |
-| `draft_model_engine_creation_seconds` | Construct and load the separate draft model engine, when used. |
+| `config_and_checkpoint_loader_initialization_seconds` | Initialize the model config and checkpoint loader. |
+| `model_engine_creation_seconds` | Construct the main model engine, which includes loading model weights. |
+| `draft_model_engine_creation_seconds` | Construct the separate draft model engine in the deprecated two-model MTP setting. |
 | `guided_decoder_creation_seconds` | Construct guided-decoding resources. |
 | `sampler_creation_seconds` | Construct the sampler. |
 | `initial_kv_cache_creation_seconds` | Construct the temporary KV cache used to estimate final capacity. |
-| `final_kv_cache_creation_seconds` | Construct the final KV cache retained for serving. |
-| `speculative_decoding_resource_manager_creation_seconds` | Construct speculative-decoding resource managers. |
+| `speculative_decoding_resource_manager_creation_seconds` | Construct the speculative-decoding resource manager. |
 | `speculative_drafter_creation_seconds` | Construct the speculative drafter. |
-| `initial_py_executor_creation_seconds_for_kv_cache_estimation` | Construct and warm up the temporary PyExecutor used during KV cache capacity estimation. |
+| `initial_py_executor_creation_seconds_for_kv_cache_estimation` | Construct the temporary PyExecutor for KV cache capacity estimation, which includes the initial model engine warmup. |
 | `kv_cache_capacity_configuration_seconds` | Determine final KV cache capacity from the temporary executor and available memory. |
-| `final_py_executor_creation_seconds` | Construct and warm up the final PyExecutor retained for serving. |
+| `final_kv_cache_creation_seconds` | Construct the final KV cache retained for serving. |
+| `final_py_executor_creation_seconds` | Using the final KV cache, construct the final PyExecutor retained for serving, which includes the final model engine warmup. |
 | `worker_start_seconds` | Start the final PyExecutor worker. |
-| `total_executor_creation_seconds` | Complete `create_py_executor()` call, including all applicable scopes above. |
+| `total_executor_creation_seconds` | Total time for the `create_py_executor()` call, including all applicable scopes above. |
 
-The model-engine objects contain the warmup scopes below. Which scopes appear depends on the model
+The two model-engine properties contain times for various `PyTorchModelEngine` warmup stages.
+`initial_model_engine` measures the timings for the initial model engine creation as part of the
+`py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
+Likewise, `final_model_engine` measures the timings for the final model engine creation as part of
+the `py_executor.final_py_executor_creation_seconds` timing.
+The deprecated two-model speculative decoding setting may produce the additional properties
+`initial_draft_model_engine` and `final_draft_model_engine`.
+
+Each model-engine property contains the warmup scopes below. Which scopes appear depends on the model
 and configuration; for example, encoder-decoder and context-parallel configurations can skip some
 stages.
 
@@ -157,18 +157,19 @@ stages.
 | `kv_cache_cleanup_seconds` | Check and clear invalid KV cache values produced during warmup. |
 | `total_warmup_seconds` | Complete model-engine warmup, including KV cache cleanup. |
 
-The `model_loader` object contains timings for the main LLM weights. If a draft model is used,
-additional field `draft_checkpoint_preparation_seconds` and `draft_weight_population_seconds` will appear.
-A `draft_model_loader` object can also appear in deprecated 2-model style MTP setting.
+The `model_loader` property contains timings for loading the main LLM weights. If a draft model is used,
+additional fields `draft_checkpoint_preparation_seconds` and `draft_weight_population_seconds` will appear.
+A `draft_model_loader` property can also appear in the deprecated two-model MTP setting.
+The `py_executor.model_engine_creation_seconds` timing includes the total `model_loader` timing.
 
 | Metric | Description |
 |--------|-------------|
-| `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
 | `checkpoint_preparation_seconds` | Time spent warming up, parsing and preparing checkpoint tensors for the model. Some checkpoint formats can populate model storage directly during this phase. |
 | `weight_population_seconds` | Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase. |
 | `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
 | `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
 | `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup. |
+| `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
 
 `trtllm-serve` exposes the same rank-0 payload in the `startup_metrics` field of the
 `GET /server_info` response:
