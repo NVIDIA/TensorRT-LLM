@@ -11,9 +11,21 @@ select the best cuBLAS or low-M CuTe DSL implementation for each token count.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_sm_version
+
+
+def _pdl_enabled(rows: int) -> bool:
+    # PDL hides the serial launch dependency at decode sizes, but its
+    # synchronization overhead becomes measurable once M supplies enough CTA
+    # parallelism on its own. Keep the shape-aware boundary used by the HC
+    # low-latency path rather than regressing prefill or large IFB batches.
+    return rows <= 16 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
 
 
 @triton.jit
@@ -25,16 +37,21 @@ def _hc_silu_kernel(
     width: tl.constexpr,
     hc_count: tl.constexpr,
     block_size: tl.constexpr,
+    launch_with_pdl: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
     mask = offsets < width
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_wait()
     value = tl.load(
         input_ptr + row * stride_input + offsets,
         mask=mask,
         other=0.0,
     ).to(tl.float32)
     value /= hc_count
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
     tl.store(
         output_ptr + row * stride_output + offsets,
         value * tl.sigmoid(value),
@@ -49,6 +66,7 @@ def hc_silu(input: torch.Tensor, hc_count: int) -> torch.Tensor:
     assert input.is_cuda and input.stride(1) == 1
     output = torch.empty_like(input)
     block_size = triton.next_power_of_2(width)
+    launch_with_pdl = _pdl_enabled(rows)
     with torch.cuda.device(input.device.index):
         _hc_silu_kernel[(rows,)](
             input,
@@ -58,6 +76,8 @@ def hc_silu(input: torch.Tensor, hc_count: int) -> torch.Tensor:
             width=width,
             hc_count=hc_count,
             block_size=block_size,
+            launch_with_pdl=launch_with_pdl,
+            launch_pdl=launch_with_pdl,
         )
     return output
 
@@ -79,12 +99,15 @@ def _hc_gate_mix_kernel(
     hidden_size: tl.constexpr,
     hc_count: tl.constexpr,
     block_size: tl.constexpr,
+    launch_with_pdl: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     tile = tl.program_id(1)
     offsets_inner = tile * block_size + tl.arange(0, block_size)
     mask = offsets_inner < hidden_size
 
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_wait()
     accumulator = tl.zeros([block_size], dtype=tl.float32)
     for stream in tl.static_range(hc_count):
         offsets = stream * hidden_size + offsets_inner
@@ -100,6 +123,8 @@ def _hc_gate_mix_kernel(
         ).to(tl.float32)
         accumulator += tl.sigmoid(gate) * value
     accumulator /= hc_count
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
     tl.store(
         output_ptr + row * stride_output + offsets_inner,
         accumulator,
@@ -122,6 +147,7 @@ def hc_gate_mix(
     output = input.new_empty((rows, hidden_size))
     block_size = 512
     grid = (rows, triton.cdiv(hidden_size, block_size))
+    launch_with_pdl = _pdl_enabled(rows)
     with torch.cuda.device(input.device.index):
         _hc_gate_mix_kernel[grid](
             input,
@@ -133,6 +159,8 @@ def hc_gate_mix(
             hidden_size=hidden_size,
             hc_count=hc_count,
             block_size=block_size,
+            launch_with_pdl=launch_with_pdl,
+            launch_pdl=launch_with_pdl,
         )
     return output
 
@@ -156,12 +184,15 @@ def _hc_combine_kernel(
     hidden_size: tl.constexpr,
     hc_count: tl.constexpr,
     block_size: tl.constexpr,
+    launch_with_pdl: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     tile = tl.program_id(1)
     offsets_inner = tile * block_size + tl.arange(0, block_size)
     mask = offsets_inner < hidden_size
 
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_wait()
     block = tl.load(
         block_ptr + row * stride_block + offsets_inner,
         mask=mask,
@@ -181,6 +212,8 @@ def _hc_combine_kernel(
             residual + injection * block,
             mask=mask,
         )
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @torch.library.custom_op("trtllm::qwen4_exp_hc_combine", mutates_args=())
@@ -201,6 +234,7 @@ def hc_combine(
     output = torch.empty_like(residual)
     block_size = 512
     grid = (rows, triton.cdiv(hidden_size, block_size))
+    launch_with_pdl = _pdl_enabled(rows)
     with torch.cuda.device(residual.device.index):
         _hc_combine_kernel[grid](
             residual,
@@ -214,6 +248,8 @@ def hc_combine(
             hidden_size=hidden_size,
             hc_count=hc_count,
             block_size=block_size,
+            launch_with_pdl=launch_with_pdl,
+            launch_pdl=launch_with_pdl,
         )
     return output
 
@@ -248,6 +284,7 @@ def _hc_combine_norm_kernel(
     eps: tl.constexpr,
     block_size: tl.constexpr,
     padded_tiles: tl.constexpr,
+    launch_with_pdl: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     stream = tl.program_id(1)
@@ -257,6 +294,8 @@ def _hc_combine_norm_kernel(
     offsets = stream * hidden_size + offsets_inner
     weight_offsets = offsets_inner if shared_weight else offsets
 
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_wait()
     residual = tl.load(
         residual_ptr + row * stride_residual + offsets,
         mask=mask,
@@ -280,6 +319,8 @@ def _hc_combine_norm_kernel(
     weight = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0).to(tl.float32)
     normed = output_fp32 * reciprocal_rms
     normed += normed * weight
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
     tl.store(normed_ptr + row * stride_normed + offsets, normed, mask=mask)
 
 
@@ -306,6 +347,7 @@ def hc_combine_norm(
     normed = torch.empty_like(residual)
     block_size = 512
     padded_tiles = triton.next_power_of_2(triton.cdiv(hidden_size, block_size))
+    launch_with_pdl = _pdl_enabled(rows)
     with torch.cuda.device(residual.device.index):
         _hc_combine_norm_kernel[(rows, hc_count)](
             residual,
@@ -325,7 +367,9 @@ def hc_combine_norm(
             eps=eps,
             block_size=block_size,
             padded_tiles=padded_tiles,
+            launch_with_pdl=launch_with_pdl,
             num_warps=8,
+            launch_pdl=launch_with_pdl,
         )
     return output, normed
 
