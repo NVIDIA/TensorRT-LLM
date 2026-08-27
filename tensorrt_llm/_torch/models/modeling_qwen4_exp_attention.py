@@ -33,7 +33,14 @@ class Qwen4ExpAttention(Qwen3Attention):
     the compressed index cache and exact paged sparse-GQA path.
     """
 
-    def __init__(self, model_config: ModelConfig, layer_idx: int, *, reduce_output: bool = False):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        layer_idx: int,
+        *,
+        reduce_output: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+    ):
         super().__init__(
             model_config,
             layer_idx=layer_idx,
@@ -45,6 +52,9 @@ class Qwen4ExpAttention(Qwen3Attention):
         # Enable the fused split-gate + Gemma qk-norm + RoPE kernel (matches
         # Qwen3Next's full-attention path).
         self._fuse_qk_norm_rope_gate = True
+        self.qsa_aux_stream = aux_stream
+        self.qsa_projection_fork_event = torch.cuda.Event() if aux_stream is not None else None
+        self.qsa_projection_join_event = torch.cuda.Event() if aux_stream is not None else None
 
     def forward(
         self,

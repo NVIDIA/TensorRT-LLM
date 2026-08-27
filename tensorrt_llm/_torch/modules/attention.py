@@ -1052,17 +1052,6 @@ class Attention(nn.Module):
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
 
-        if bool(lora_params):
-            qkv = LoraLayer.forward_with_base(
-                lambda: self.qkv_proj(hidden_states),
-                (self.splitted_qkv_lora, self.fused_qkv_lora),
-                hidden_states,
-                lora_params,
-                self.layer_idx,
-            )
-        else:
-            qkv = self.qkv_proj(hidden_states)
-
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
         if (not self.rope_fusion
@@ -1076,8 +1065,35 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
-        q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
-        q, k, v = self.convert_qkv(q, k, v)
+        def prepare_qkv():
+            if bool(lora_params):
+                qkv = LoraLayer.forward_with_base(
+                    lambda: self.qkv_proj(hidden_states),
+                    (self.splitted_qkv_lora, self.fused_qkv_lora),
+                    hidden_states,
+                    lora_params,
+                    self.layer_idx,
+                )
+            else:
+                qkv = self.qkv_proj(hidden_states)
+            q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
+            q, k, v = self.convert_qkv(q, k, v)
+            return q, k, v, gate
+
+        sparse_precomputed = None
+        if self.sparse_attn_hooks is not None:
+            (q, k, v,
+             gate), sparse_precomputed = self.sparse_attn_hooks.prepare_qkv(
+                 self,
+                 prepare_qkv,
+                 hidden_states,
+                 position_ids,
+                 attn_metadata,
+             )
+        else:
+            q, k, v, gate = prepare_qkv()
+        if sparse_precomputed is not None:
+            kwargs["sparse_precomputed"] = sparse_precomputed
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", (

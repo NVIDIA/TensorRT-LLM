@@ -135,7 +135,10 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
             # reduce_output=False: the layer's attn_tp_all_reduce (below) owns the
             # tensor-parallel reduction before the Hyper-Connection combine.
             self.self_attn = Qwen4ExpAttention(
-                model_config, layer_idx=layer_idx, reduce_output=False
+                model_config,
+                layer_idx=layer_idx,
+                reduce_output=False,
+                aux_stream=aux_stream,
             )
         else:
             raise ValueError(f"Unsupported Qwen4-Exp layer type: {layer_type!r}")
