@@ -516,8 +516,8 @@ def test_pack_gdn_decode_qkv(
 
 
 @skip_no_cuda
-def test_reset_gdn_states_preserves_initialized_and_invalid_slots():
-    from tensorrt_llm._torch.modules.mamba.gdn_mixer import _reset_gdn_states
+def test_recurrent_state_reset_supports_gdn_pool_views():
+    from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurrent_state_rows
 
     num_slots = 4
     ssm_state_size = 6
@@ -537,11 +537,11 @@ def test_reset_gdn_states_preserves_initialized_and_invalid_slots():
     state_indices = torch.tensor([1, 3, -1], device="cuda", dtype=torch.int32)
     has_initial_states = torch.tensor([False, True, False], device="cuda", dtype=torch.bool)
 
-    _reset_gdn_states(
+    reset_recurrent_state_rows(
         ssm_states,
-        conv_states,
         state_indices,
         has_initial_states,
+        conv_states,
     )
 
     torch.testing.assert_close(state_pool[1], torch.zeros_like(state_pool[1]))

@@ -32,8 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -396,31 +395,23 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         Args:
-            spec_resource_manager: the resource manager for the spec-dec mode.
             is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
-            use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
         use_case_1 = self.use_one_engine()
-        # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
-        # the target model (verification) or on the first draft for CDL based speculation.
-        use_case_2 = not self.use_one_engine() and (
-            not is_draft_model or
-            (spec_resource_manager is not None
-             and spec_resource_manager.is_first_draft
-             and use_chain_drafter)) and is_trtllm_attention
+        # For 2-model, only the target model (verification) processes multiple tokens at once.
+        use_case_2 = (not self.use_one_engine() and not is_draft_model
+                      and is_trtllm_attention)
 
         return use_case_1 or use_case_2
 
@@ -1191,6 +1182,10 @@ class SpecMetadata:
         """
         if not self.spec_dec_mode.use_one_engine():
             return
+        # The synchronized group decision belongs to the previous iteration.
+        # Clear it before deriving this iteration's local flag; the caller
+        # immediately recomputes the group decision before graph-key lookup.
+        self.group_all_greedy_sample = None
         self._scan_one_model_sampling(requests)
 
     def populate_sampling_params_for_one_model(

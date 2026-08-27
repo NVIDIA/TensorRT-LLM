@@ -78,10 +78,7 @@ def add_llm_args(parser):
     parser.add_argument('--attention_backend',
                         type=str,
                         default='TRTLLM',
-                        choices=[
-                            'VANILLA', 'TRTLLM', 'FLASHINFER',
-                            'FLASHINFER_STAR_ATTENTION'
-                        ])
+                        choices=['VANILLA', 'TRTLLM', 'FLASHINFER'])
     parser.add_argument(
         '--moe_backend',
         type=str,

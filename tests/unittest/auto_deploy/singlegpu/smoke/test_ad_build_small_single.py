@@ -157,24 +157,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-compile"},
-                },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
             {
                 "transforms": {
