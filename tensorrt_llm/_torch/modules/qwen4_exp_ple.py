@@ -69,6 +69,14 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
+from .qwen4_exp_ple_kernels import (
+    can_use_ple_gate_value,
+    can_use_ple_ngram_hash,
+    can_use_ple_short_conv_state,
+    ple_gate_value,
+    ple_ngram_hash,
+    ple_short_conv_state,
+)
 
 # --- splitmix64 constants (verbatim from the sglang reference) ---
 _MASK64 = (1 << 64) - 1
@@ -838,9 +846,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid_mask = (pos_in_segment >= n) & (src_idx.unsqueeze(0) >= 0)
         return torch.where(valid_mask, shifted, tensor.new_full((), self.eos_token_id))
 
-    def hash_contexts(self, contexts: torch.Tensor) -> torch.Tensor:
+    def hash_contexts(
+        self,
+        contexts: torch.Tensor,
+        *,
+        use_decode_fusion: bool = False,
+    ) -> torch.Tensor:
         """Hash n-gram windows ``[T, ngram_size]`` to head ids ``[T, ngram_heads]``."""
         contexts = contexts.to(torch.long)
+        if use_decode_fusion and can_use_ple_ngram_hash(
+            contexts,
+            self.layer_multipliers,
+            self.ngram_heads_vocab_sizes,
+            self.ngram_heads_offsets,
+        ):
+            return ple_ngram_hash(
+                contexts,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+                self.eos_token_id,
+            )
         shifted_tokens = [contexts]
         for shift in range(1, self.ngram_size):
             shifted_tokens.append(self._shift_right_ignore_eos(contexts, shift))
@@ -1021,7 +1047,10 @@ class Qwen4ExpPLE(nn.Module):
         combined = torch.cat([history, metadata.padded_tokens.to(torch.long)], dim=1)
         windows = combined.unfold(1, self.ngram_size, 1)
         contexts = windows[metadata.req_indices, metadata.token_offsets]
-        return combined, self.ple_embedding.hash_contexts(contexts)
+        return combined, self.ple_embedding.hash_contexts(
+            contexts,
+            use_decode_fusion=metadata.is_decode,
+        )
 
     def _allocate_prefetch_buffer(
         self,
@@ -1186,6 +1215,17 @@ class Qwen4ExpPLE(nn.Module):
             generation_output = self._short_conv(x[context_tokens:], generation_meta, conv_state)
             return torch.cat((context_output, generation_output))
 
+        if m.is_decode and can_use_ple_short_conv_state(conv_state, m.state_indices, x):
+            conv_input = ple_short_conv_state(conv_state, m.state_indices, x)
+            conv_output = F.conv1d(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=self.conv_channels,
+            ).squeeze(-1)
+            return F.silu(conv_output)
+
         state = conv_state.index_select(0, m.state_indices).to(dtype=x.dtype)
 
         padded_seq = x.new_zeros((num_seq, m.row_width, self.conv_channels))
@@ -1322,9 +1362,12 @@ class Qwen4ExpPLE(nn.Module):
         query_normed = self._apply_ple_norm(self.norm_query, query)
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
         gate = gate / math.sqrt(self.hidden_size)
-        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        gate = torch.sigmoid(gate)
-        gated_value = gate * value.unsqueeze(-2)
+        if m.is_decode and can_use_ple_gate_value(gate, value):
+            gated_value = ple_gate_value(gate, value)
+        else:
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+            gate = torch.sigmoid(gate)
+            gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
