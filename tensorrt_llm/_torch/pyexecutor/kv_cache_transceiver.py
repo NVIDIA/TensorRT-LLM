@@ -344,9 +344,13 @@ class KvCacheTransceiver(ABC):
 
                 Runtime-independent callers (e.g. drain loops) must use
                 a finite int in an explicit loop instead: 0 is a
-                non-blocking sweep; N > 0 waits up to the configured
-                poll interval for at least N sends to settle, but may
-                report fewer when the interval expires first.
+                non-blocking sweep; N > 0 additionally waits for sends
+                to settle, bounded by
+                ``kv_transfer_sender_future_timeout_ms`` — the C++
+                runtime waits it once per still-pending selected
+                transfer (so a single call may wait it several times),
+                the Python (V2) runtime once per call — and may still
+                report fewer than N when the bound expires.
             mark_complete: When True, transition requests whose send
                 completed to ``DISAGG_CONTEXT_COMPLETE`` before returning;
                 when False, that transition is the caller's responsibility.
@@ -367,7 +371,12 @@ class KvCacheTransceiver(ABC):
 
         ``at_least_request_num`` follows the same runtime-specific
         blocking / bounded-polling semantics as
-        ``check_context_transfer_status``. Postconditions: requests whose
+        ``check_context_transfer_status``, except that on this receive
+        side both runtimes bound N > 0 local readiness polling by
+        ``kv_transfer_poll_interval_ms``, applied as a single deadline
+        per call (unlike the C++ context path); the rank-consensus
+        collectives that follow are outside that local wait bound.
+        Postconditions: requests whose
         receive completed are transitioned to
         ``DISAGG_GENERATION_TRANS_COMPLETE`` and failed ones to
         ``DISAGG_TRANS_ERROR``; cancelled sessions are closed and their

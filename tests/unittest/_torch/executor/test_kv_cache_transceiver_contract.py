@@ -201,6 +201,22 @@ def test_recv_sync_failure_sets_error_state() -> None:
     assert bad.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
+def test_recv_sync_rejects_double_receive() -> None:
+    fake = FakeKvCacheTransceiver()
+    req = _req(13)
+    fake.request_and_receive_sync(req)
+    with pytest.raises(AssertionError, match="double receive"):
+        fake.request_and_receive_sync(req)
+
+
+def test_unconsumed_sync_script_does_not_leak_into_status_poll() -> None:
+    fake = FakeKvCacheTransceiver()
+    stale = _req(14)
+    fake.script_sync_recv(stale, outcome="error")
+    # The sync receive never happens; the async poll must not see the script.
+    assert fake.check_gen_transfer_status(0) == GenTransferStatus([], [], [])
+
+
 def test_cancel_request_clears_pending_transfers() -> None:
     fake = FakeKvCacheTransceiver()
     req = _req(8)
@@ -209,6 +225,21 @@ def test_cancel_request_clears_pending_transfers() -> None:
     assert fake.cancel_request(req) is True
     assert fake.check_gen_transfer_complete()
     assert fake.check_gen_transfer_status(0) == GenTransferStatus([], [], [])
+
+
+def test_cancelled_request_may_receive_again() -> None:
+    fake = FakeKvCacheTransceiver()
+    req = _req(15)
+    fake.request_and_receive_async(req)
+    fake.cancel_request(req)
+    fake.request_and_receive_async(req)
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+
+def test_inflight_cancellation_support_is_configurable() -> None:
+    assert FakeKvCacheTransceiver().supports_inflight_request_cancellation() is False
+    fake = FakeKvCacheTransceiver(supports_inflight_cancellation=True)
+    assert fake.supports_inflight_request_cancellation() is True
 
 
 def test_results_stay_positionally_compatible() -> None:

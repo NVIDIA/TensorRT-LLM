@@ -45,13 +45,25 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
     ``py_request_id`` and a writable ``state`` attribute.
     """
 
-    def __init__(self, kv_transfer_timeout_ms: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        kv_transfer_timeout_ms: Optional[int] = None,
+        supports_inflight_cancellation: bool = False,
+    ) -> None:
         self.kv_transfer_timeout_ms = kv_transfer_timeout_ms
+        self._supports_inflight_cancellation = supports_inflight_cancellation
         self._pending_sends: Dict[int, LlmRequest] = {}
         self._pending_recvs: Dict[int, LlmRequest] = {}
         # rid -> outcome, consumed by the next check_*_transfer_status call.
         self._send_outcomes: Dict[int, str] = {}
         self._recv_outcomes: Dict[int, str] = {}
+        # Scripted synchronous-receive outcomes, kept separate from the async
+        # channel so an unconsumed script can never leak into a status poll.
+        self._sync_recv_outcomes: Dict[int, str] = {}
+        # Every request id that ever started a receive (sync or async), for
+        # the symmetric double-receive assertion. Cancellation removes the id
+        # so a fresh attempt after cancel stays legal.
+        self._recv_started: set = set()
         # Chronological record of contract calls, for call-order assertions.
         self.call_log: List[str] = []
         self._is_shut_down = False
@@ -85,7 +97,7 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         one fail so the blocking-receive error postcondition can be tested.
         """
         assert outcome in _SEND_OUTCOMES, f"invalid sync receive outcome {outcome!r}"
-        self._recv_outcomes[req.py_request_id] = outcome
+        self._sync_recv_outcomes[req.py_request_id] = outcome
 
     # -- KvCacheTransceiver contract -----------------------------------------
 
@@ -101,9 +113,11 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self._assert_alive("request_and_receive_sync")
         rid = req.py_request_id
         self.call_log.append(f"request_and_receive_sync:{rid}")
+        assert rid not in self._recv_started, f"double receive for request {rid}"
+        self._recv_started.add(rid)
         # The blocking receive settles before returning: consume a scripted
         # outcome if one was queued ahead of time, defaulting to success.
-        outcome = self._recv_outcomes.pop(rid, "complete")
+        outcome = self._sync_recv_outcomes.pop(rid, "complete")
         if outcome == "complete":
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
         else:
@@ -113,7 +127,8 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self._assert_alive("request_and_receive_async")
         rid = req.py_request_id
         self.call_log.append(f"request_and_receive_async:{rid}")
-        assert rid not in self._pending_recvs, f"double receive for request {rid}"
+        assert rid not in self._recv_started, f"double receive for request {rid}"
+        self._recv_started.add(rid)
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         self._pending_recvs[rid] = req
 
@@ -160,6 +175,11 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         return not self._pending_recvs
 
     def cancel_request(self, req: LlmRequest) -> bool:
+        """Cancel any pending transfer for ``req``.
+
+        Always succeeds immediately: the mid-write refusal (returning False)
+        and the caller's retry path are not modeled.
+        """
         self._assert_alive("cancel_request")
         rid = req.py_request_id
         self.call_log.append(f"cancel_request:{rid}")
@@ -167,7 +187,12 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self._pending_recvs.pop(rid, None)
         self._send_outcomes.pop(rid, None)
         self._recv_outcomes.pop(rid, None)
+        self._sync_recv_outcomes.pop(rid, None)
+        self._recv_started.discard(rid)
         return True
+
+    def supports_inflight_request_cancellation(self) -> bool:
+        return self._supports_inflight_cancellation
 
     def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         # Mirror BindKvCacheTransceiver: a no-op placeholder so the executor
