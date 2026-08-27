@@ -63,6 +63,12 @@ def test_pinned_lookup_matches_local_row_shard_and_masks_invalid_ids(table_dtype
     assert embedding._mapped_device_ptrs[ids.device.index] != 0
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
+    if table_dtype == torch.float8_e4m3fn:
+        scale = 0.0002
+        scaled = embedding.gather(ids, weight_scale=scale)
+        scaled_expected = (expected.float() * scale).to(torch.bfloat16)
+        torch.testing.assert_close(scaled, scaled_expected, rtol=0, atol=0)
+
 
 def _tiny_fp8_offload_config() -> SimpleNamespace:
     return SimpleNamespace(

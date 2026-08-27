@@ -349,10 +349,12 @@ def _gather_ple_embedding_from_pinned_kernel(
     weight_ptr,
     ids_ptr,
     output_ptr,
+    weight_scale,
     embedding_dim,
     vocab_start,
     vocab_end,
     is_fp8: tl.constexpr,
+    apply_weight_scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Gather row-sharded BF16/FP8 weights directly through pinned-host UVA."""
@@ -375,6 +377,10 @@ def _gather_ple_embedding_from_pinned_kernel(
         mask=in_range & output_mask,
         other=0.0,
     ).to(tl.bfloat16)
+    if apply_weight_scale:
+        # Match the checkpoint contract exactly: FP8 is first represented as
+        # BF16, then multiplied in FP32, and finally rounded back to BF16.
+        values = (values.to(tl.float32) * weight_scale).to(tl.bfloat16)
     tl.store(output_ptr + row_id * embedding_dim + offsets, values, mask=output_mask)
 
 
@@ -503,11 +509,20 @@ class Qwen4ExpPinnedHostEmbedding(nn.Module):
         self,
         input_ids: torch.Tensor,
         out: Optional[torch.Tensor] = None,
+        *,
+        weight_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Gather global row IDs, returning zeros for rows outside this shard."""
+        """Gather global row IDs, returning zeros for rows outside this shard.
+
+        ``weight_scale`` fuses scaled-FP8 dequantization into the host-memory
+        gather. Omitting it preserves the raw-table lookup used by checkpoint
+        loading tests and BF16 tables.
+        """
         if input_ids.device.type != "cuda":
             raise ValueError("PLE pinned-host gather requires CUDA input IDs")
         weight = self.materialize_pinned()
+        if weight_scale is not None and weight.dtype != torch.float8_e4m3fn:
+            raise ValueError("PLE pinned-host weight scaling is only valid for FP8 tables")
         expected_shape = (*input_ids.shape, self.embedding_dim)
         output = self.allocate_output(expected_shape, input_ids.device) if out is None else out
         if tuple(output.shape) != expected_shape:
@@ -525,10 +540,12 @@ class Qwen4ExpPinnedHostEmbedding(nn.Module):
                 self._mapped_device_ptr(input_ids.device),
                 flat_ids,
                 output,
+                1.0 if weight_scale is None else weight_scale,
                 embedding_dim=self.embedding_dim,
                 vocab_start=self.vocab_start_index,
                 vocab_end=self.vocab_end_index,
                 is_fp8=weight.dtype == torch.float8_e4m3fn,
+                apply_weight_scale=weight_scale is not None,
                 BLOCK_D=self._block_d,
             )
         return output
@@ -581,6 +598,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             None,
             persistent=False,
         )
+        self._host_offload_weight_scale: Optional[float] = None
 
         if self.ngram_size < 2:
             raise ValueError(f"ngram_size must be >= 2, got {self.ngram_size}")
@@ -725,6 +743,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if self.ngram_embedding_weight_scale.device != configured_scale.device:
                 raise RuntimeError("PLE n-gram scale device cannot change after configuration")
             self.ngram_embedding_weight_scale.copy_(configured_scale)
+        if self.host_offload:
+            self._host_offload_weight_scale = scale
         logger.info(
             "Qwen4-Exp PLE n-gram table configured for scaled FP8 storage: "
             f"dtype={self.ngram_embedding.weight.dtype}, "
@@ -806,8 +826,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         elif self.tp_size > 1 and self.host_offload:
             partial = self.embedding_allreduce(partial)
 
-        if self.host_offload:
-            partial = self._dequantize_embeddings(partial)
         return partial[:semantic_tokens]
 
     def _build_layer_multipliers(self, size: int) -> torch.Tensor:
@@ -920,7 +938,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 physical_tokens,
                 all_rank_num_tokens,
             )
-            partial = self.ngram_embedding.gather(lookup_ids)
+            partial = self.ngram_embedding.gather(
+                lookup_ids,
+                weight_scale=self._host_offload_weight_scale,
+            )
             return self._finish_embedding_lookup(
                 partial,
                 semantic_tokens,
@@ -1137,7 +1158,11 @@ class Qwen4ExpPLE(nn.Module):
         self._prefetch_stream.wait_stream(current_stream)
         lookup_ids.record_stream(self._prefetch_stream)
         with torch.cuda.stream(self._prefetch_stream):
-            self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+            self.ple_embedding.ngram_embedding.gather(
+                lookup_ids,
+                out=output_view,
+                weight_scale=self.ple_embedding._host_offload_weight_scale,
+            )
         self._prefetch_state = (
             prefetched,
             semantic_tokens,
