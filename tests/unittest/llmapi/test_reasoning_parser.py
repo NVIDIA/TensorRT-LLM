@@ -1175,22 +1175,28 @@ def test_inkling_reasoning_parser_stream_equals_batch_any_split(text: str):
 
 
 def test_inkling_reasoning_parser_tool_and_repetition_segmentation():
-    """Tool-invocation blocks route to visible content, not to reasoning.
+    """Tool-invocation blocks route to visible content, framing INTACT.
 
-    A separator-interleaved repetition splits into one reasoning block plus the
-    repeated visible answers, with no control tokens leaking into either
-    channel.
+    This test used to assert the payload alone. That is what broke tool calls
+    end to end: trtllm-serve runs this parser first and hands its content to
+    the tool parser, which matches on the framing -- so a stripped block became
+    bare JSON in `message.content` with `tool_calls: []`. The framing is the
+    tool protocol and passes through with the block.
+
+    A separator-interleaved repetition still splits into one reasoning block
+    plus the repeated visible answers, with no control tokens leaking into
+    either channel.
     """
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     r = parser.parse(
-        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}'
+        f'{INK_CH}need tool{INK_EM}{INK_MM}get_n<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}'
     )
-    assert r.content == '{"n":1}'
+    assert r.content == f'{INK_MM}get_n<|content_invoke_tool_json|>{{"n":1}}{INK_EM}'
     assert r.reasoning_content == "need tool"
     r = parser.parse(
         f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_text|>lookup{INK_EM}{INK_END}'
     )
-    assert r.content == "lookup"
+    assert r.content == f"{INK_MM}<|content_invoke_tool_text|>lookup{INK_EM}"
     assert r.reasoning_content == "need tool"
     rep = f"{INK_CH}reason{INK_EM}" + f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6
     r = parser.parse(rep)

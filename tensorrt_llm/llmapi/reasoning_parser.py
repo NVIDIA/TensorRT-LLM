@@ -23,6 +23,15 @@ from typing import Any, ClassVar, Optional, Type
 
 from tensorrt_llm import logger
 
+from .inkling_tokens import INKLING_CONTENT_TEXT as _INKLING_CONTENT_TEXT
+from .inkling_tokens import \
+    INKLING_CONTENT_THINKING as _INKLING_CONTENT_THINKING
+from .inkling_tokens import INKLING_CONTROL_TOKENS as _INKLING_CONTROL_TOKENS
+from .inkling_tokens import INKLING_MAX_CONTROL_LEN as _INKLING_MAX_CONTROL_LEN
+from .inkling_tokens import INKLING_MESSAGE_MODEL as _INKLING_MESSAGE_MODEL
+from .inkling_tokens import \
+    INKLING_TOOL_CONTENT_TOKENS as _INKLING_TOOL_CONTENT_TOKENS
+
 
 @dataclass
 class ReasoningParserResult:
@@ -436,6 +445,7 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
 
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
+    "inkling_mm_model": "inkling",
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
     "qwen3_5": "qwen3",
@@ -788,45 +798,16 @@ class Gemma4ReasoningParser(BaseReasoningParser):
 # SGLang's ``InklingDetector`` (``--reasoning-parser inkling``) so trtllm-serve
 # returns the same thinking-stripped ``message.content``. The control-token
 # alphabet is copied verbatim from SGLang's ``INKLING_CONTROL_TOKENS``.
-_INKLING_MESSAGE_MODEL = "<|message_model|>"
-_INKLING_CONTENT_TEXT = "<|content_text|>"
-_INKLING_CONTENT_THINKING = "<|content_thinking|>"
-_INKLING_INVOKE_TOOL_JSON = "<|content_invoke_tool_json|>"
-_INKLING_INVOKE_TOOL_TEXT = "<|content_invoke_tool_text|>"
-_INKLING_INVOKE_TOOL = "<|content_invoke_tool|>"
+# The token alphabet lives in one module (inkling_tokens) so the tool parser
+# cannot drift from this one; a token missing from either list silently leaks
+# framing into user-visible output.
 _INKLING_CONTENT_KINDS = {
     _INKLING_CONTENT_THINKING: "reasoning",
     _INKLING_CONTENT_TEXT: "content",
 }
-_INKLING_TOOL_CONTENT_TOKENS = frozenset({
-    _INKLING_INVOKE_TOOL_JSON,
-    _INKLING_INVOKE_TOOL_TEXT,
-    _INKLING_INVOKE_TOOL,
-})
-_INKLING_CONTROL_TOKENS = frozenset({
-    "<|endoftext|>",
-    "<|message_user|>",
-    _INKLING_MESSAGE_MODEL,
-    "<|message_system|>",
-    "<|message_tool|>",
-    _INKLING_CONTENT_TEXT,
-    "<|content_image|>",
-    "<|content_model_end_sampling|>",
-    _INKLING_CONTENT_THINKING,
-    "<|content_audio_input|>",
-    "<|content_tool_error|>",
-    "<|content_xml|>",
-    "<|end_message|>",
-    "<|audio_end|>",
-    _INKLING_INVOKE_TOOL_JSON,
-    _INKLING_INVOKE_TOOL_TEXT,
-    _INKLING_INVOKE_TOOL,
-    "<|model_trigger_generation|>",
-})
 _INKLING_CONTROL_RE = re.compile("|".join(
     re.escape(t)
     for t in sorted(_INKLING_CONTROL_TOKENS, key=len, reverse=True)))
-_INKLING_MAX_CONTROL_LEN = max(len(t) for t in _INKLING_CONTROL_TOKENS)
 
 
 @register_reasoning_parser("inkling")
@@ -839,6 +820,19 @@ class InklingReasoningParser(BaseReasoningParser):
     Tool-invocation blocks route to content, matching SGLang. Text before any
     control token (or when no markers are present at all) is treated as visible
     content, so non-Inkling / already-stripped output passes through unchanged.
+
+    A tool-invocation block keeps its framing -- header token, function name and
+    content marker -- because in trtllm-serve the tool parser runs on THIS
+    parser's content (``postprocess_handlers`` applies reasoning first). Framing
+    is the tool protocol: dropping it left the detector matching bare JSON and
+    returning no calls at all, while the payload appeared as the assistant's
+    visible answer. Measured end to end on the BF16 release: a `get_weather`
+    request came back with ``content`` = ``{"name":"get_weather",...}`` and
+    ``tool_calls`` = ``[]``.
+
+    A client that declares tools and configures no tool parser therefore sees
+    the framed block rather than a bare payload. Neither is presentable, and the
+    framed one at least says what it is.
 
     ``needs_raw_special_tokens = True`` makes the OpenAI server disable
     ``skip_special_tokens`` for requests using this parser; otherwise the
@@ -854,17 +848,23 @@ class InklingReasoningParser(BaseReasoningParser):
         super().__init__(chat_template_kwargs=chat_template_kwargs)
         self._kind: Optional[str] = None
         self._buffer = ""
+        # A header run is dropped unless the block it opens turns out to be a
+        # tool invocation, and that is only known at the NEXT control token --
+        # the function name sits between the two. So it is held, not emitted.
+        self._header = ""
 
     def _emit(self, segment: str, content: list[str],
               reasoning: list[str]) -> None:
         if not segment:
             return
         # content / tool / None(between blocks or no marker) -> visible content;
-        # reasoning -> reasoning; header -> framing (dropped).
+        # reasoning -> reasoning; header -> held (see _header).
         if self._kind in ("content", "tool", None):
             content.append(segment)
         elif self._kind == "reasoning":
             reasoning.append(segment)
+        elif self._kind == "header":
+            self._header += segment
 
     def _consume(self, text: str, content: list[str],
                  reasoning: list[str]) -> None:
@@ -875,20 +875,32 @@ class InklingReasoningParser(BaseReasoningParser):
             pos = m.end()
             if token == _INKLING_MESSAGE_MODEL:
                 self._kind = "header"
+                self._header = token
             elif token in _INKLING_TOOL_CONTENT_TOKENS:
+                # The block is a tool invocation: replay its framing verbatim so
+                # the tool parser downstream sees the protocol it matches on.
+                content.append(self._header + token)
+                self._header = ""
                 self._kind = "tool"
             elif token in _INKLING_CONTENT_KINDS:
+                self._header = ""
                 self._kind = _INKLING_CONTENT_KINDS[token]
             else:
                 # End tokens, message headers, and non-text content markers are
-                # framing. They close the previous block and drop any text until a
-                # visible content or tool-content marker opens a new block.
+                # framing. They close the previous block and hold any text until
+                # a visible content or tool-content marker opens a new block --
+                # except an end token closing a tool block, which belongs to the
+                # tool protocol and goes through with it.
+                if self._kind == "tool":
+                    content.append(token)
+                self._header = ""
                 self._kind = "header"
         self._emit(text[pos:], content, reasoning)
 
     def parse(self, text: str) -> ReasoningParserResult:
         self._kind = None
         self._buffer = ""
+        self._header = ""
         content: list[str] = []
         reasoning: list[str] = []
         self._consume(text, content, reasoning)
@@ -930,13 +942,16 @@ class InklingReasoningParser(BaseReasoningParser):
         self._buffer = ""
         if not remaining:
             self._kind = None
+            self._header = ""
             return ReasoningParserResult()
         content: list[str] = []
         reasoning: list[str] = []
         self._consume(remaining, content, reasoning)
-        # Reset the block kind too, so reusing this instance for a second stream
-        # does not route its first segment by the previous stream's channel.
+        # Reset the block kind and any held header too, so reusing this
+        # instance for a second stream does not route its first segment by the
+        # previous stream's channel.
         self._kind = None
+        self._header = ""
         return ReasoningParserResult(content="".join(content),
                                      reasoning_content="".join(reasoning))
 
