@@ -236,7 +236,7 @@ class TestLocalityDomainComputeTopology:
 
     def test_runtime_rejects_unsupported_num_partitions(self):
         """Runtime resources exist for exactly 2 partitions, so reject anything else."""
-        for bad in (0, 1, 3):
+        for bad in (0, 1, 3, 2.0):
             with pytest.raises(ValueError, match="num_partitions"):
                 LocalityDomainRuntime(num_partitions=bad)
 

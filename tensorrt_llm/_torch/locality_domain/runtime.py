@@ -21,6 +21,7 @@ Module layer code should use LocalityDomainRuntime instead of calling locality_d
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 import torch
@@ -46,18 +47,16 @@ class LocalityDomainRuntime:
     within partition_context(), never by module code directly.
     """
 
-    #: Runtime resources (streams, mempools, TPC masks) exist for exactly this many partitions.
-    NUM_PARTITIONS = 2
-
-    def __init__(self, num_partitions: int = 2):
+    def __init__(self, num_partitions: int = 2) -> None:
         # Mirrors the LocalityDomainPolicy check: the constraint belongs to this class,
         # so validate here too rather than relying on the caller having gone through a
-        # policy. Kept strict (== 2) to match the policy rather than silently accepting 1.
-        if num_partitions != self.NUM_PARTITIONS:
+        # policy. The isinstance guard rejects 2.0, which compares equal to 2 and would
+        # then break range() in topology_identity().
+        if not isinstance(num_partitions, int) or num_partitions != 2:
             raise ValueError(
-                f"locality domain only supports num_partitions={self.NUM_PARTITIONS}, "
-                f"got {num_partitions}. Runtime resources (streams, mempools, TPC masks) "
-                f"are hardcoded for exactly {self.NUM_PARTITIONS} partitions."
+                f"locality domain only supports num_partitions=2, got {num_partitions!r}. "
+                f"Runtime resources (streams, mempools, TPC masks) are "
+                f"hardcoded for exactly 2 partitions."
             )
         self.num_partitions = num_partitions
 
@@ -78,7 +77,7 @@ class LocalityDomainRuntime:
         )
 
     @contextmanager
-    def partition_context(self, partition_id: int):
+    def partition_context(self, partition_id: int) -> Iterator[None]:
         """Set thread-local locality domain context and stream for kernel dispatch.
 
         This is the ONLY place where thread-local locality_domain_id is set during
@@ -89,7 +88,7 @@ class LocalityDomainRuntime:
                 yield
 
     @contextmanager
-    def partition_weight_context(self, partition_id: int):
+    def partition_weight_context(self, partition_id: int) -> Iterator[None]:
         """Set thread-local locality domain context and memory pool for weight operations.
 
         Used during create_weights and load_weights to allocate on the
@@ -99,21 +98,21 @@ class LocalityDomainRuntime:
             with optional_locality_domain_mem_pool():
                 yield
 
-    def fork(self):
+    def fork(self) -> None:
         """Record event on current stream, then wait on all partition streams.
 
         Call before launching partition work.
         """
         start_for_all_locality_domain()
 
-    def join(self):
+    def join(self) -> None:
         """Record events on partition streams, then wait on current stream.
 
         Call after all partition work is launched.
         """
         end_for_all_locality_domain()
 
-    def prepare_for_capture(self, plan: PartitionPlan):
+    def prepare_for_capture(self, plan: PartitionPlan) -> None:
         """Pre-initialize all resources before CUDA Graph capture.
 
         Must be called before any graph capture to ensure streams,
