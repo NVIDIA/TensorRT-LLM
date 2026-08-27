@@ -40,6 +40,9 @@ python3 -c "import tensorrt_llm"
 (linux)=
 ## Option 2: Install on Linux via `pip`
 
+> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
+> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel is located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
+
 Tested on Ubuntu 24.04.
 
 ### Install prerequisites
@@ -105,9 +108,6 @@ and replace `<version>` in the following command:
 pip3 install --pre "tensorrt_llm==<version>" \
     --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 ```
-
-> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
-> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel is located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
 
 ### Sanity check
 
