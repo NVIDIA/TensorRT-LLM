@@ -413,6 +413,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
+            self.allocate_context_prompt_lookahead()
         if self.layers_to_capture is None:
             if self.spec_dec_mode.is_mtp_eagle_one_model():
                 # MTP Eagle one-model feeds the target model's hidden_states
@@ -1356,8 +1358,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # context
         input_ids_ctx = self._prepare_context_input_ids(
-            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
-            accepted_tokens, num_contexts)
+            input_ids,
+            attn_metadata.num_ctx_tokens,
+            spec_metadata.gather_ids,
+            accepted_tokens,
+            num_contexts,
+            context_prompt_lookahead_tokens=(
+                spec_metadata.context_prompt_lookahead_tokens
+                if self.is_mtp_eagle else None),
+            context_prompt_lookahead_lens=(
+                spec_metadata.context_prompt_lookahead_lens
+                if self.is_mtp_eagle else None))
 
         # generation
         input_ids_gen = accepted_tokens[
