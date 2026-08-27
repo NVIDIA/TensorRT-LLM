@@ -121,29 +121,6 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
 
-# TEMPORARY DIAGNOSTIC INSTRUMENTATION for the EAGLE3/MTP draft-side
-# block-reuse fix (see scripts/repro.py). Not a product change; safe to
-# delete once validated. Uses plain print() (not `logger`) so it is visible
-# regardless of TLLM_LOG_LEVEL, including under TLLM_WORKER_USE_SINGLE_PROCESS=1.
-_EAGLE3_REPRO_DEBUG = os.environ.get("TLLM_EAGLE3_REPRO_DEBUG", "0") == "1"
-
-
-def _repro_debug(tag: str, **fields) -> None:
-    if not _EAGLE3_REPRO_DEBUG:
-        return
-    kv = " ".join(f"{k}={v}" for k, v in fields.items())
-    print(f"[EAGLE3-DEBUG][{tag}] {kv}", flush=True)
-
-
-def _repro_debug_token_hash(tokens) -> str:
-    """Short stable hash of a reuse lookup key, for diagnostic log lines only
-    (not used for any actual radix-tree/hashing decision)."""
-    try:
-        data = b",".join(str(int(t)).encode() for t in tokens)
-    except (TypeError, ValueError):
-        data = repr(list(tokens)).encode()
-    return hashlib.sha256(data).hexdigest()[:16]
-
 
 class Role:
     KEY = DataRole("key")
@@ -2560,16 +2537,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_draft_target_chunk_end = (
                     req.context_current_position + req.context_chunk_size
                 )
-                if _EAGLE3_REPRO_DEBUG and not self.is_draft:
-                    _repro_debug(
-                        "TARGET-reuse",
-                        req_id=req.py_request_id,
-                        safe_reused_prefix_applied=req.context_current_position,
-                        target_forward_position_range=(
-                            f"[{req.context_current_position}, "
-                            f"{req.context_current_position + req.context_chunk_size})"
-                        ),
-                    )
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -2625,17 +2592,6 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_hit = draft_mgr.probe_prefix_match_length(
             draft_tokens, req.lora_task_id, req.cache_salt
         )
-        if _EAGLE3_REPRO_DEBUG:
-            target_hit_probe = self.probe_prefix_match_length(
-                tokens, req.lora_task_id, req.cache_salt
-            )
-            _repro_debug(
-                "TARGET-draft-paired-reuse-cap",
-                req_id=req.py_request_id,
-                target_trie_hit_tokens=target_hit_probe,
-                draft_trie_hit_tokens=draft_hit,
-                safe_reused_prefix=min(target_hit_probe, draft_hit),
-            )
         if draft_hit >= len(tokens):
             return tokens
         if draft_hit <= 0:
@@ -2843,33 +2799,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         if chunk_end is not None:
                             req.context_current_position = matched
                             req.context_chunk_size = chunk_end - matched
-                        if _EAGLE3_REPRO_DEBUG:
-                            try:
-                                attached_block_ids = self.get_batch_cache_indices(
-                                    [req.py_request_id])[0]
-                                attached_block_ids = (
-                                    attached_block_ids.tolist() if hasattr(
-                                        attached_block_ids, "tolist") else
-                                    list(attached_block_ids))
-                            except Exception:  # noqa: BLE001 - diagnostic only
-                                attached_block_ids = None
-                            _repro_debug(
-                                "DRAFT-reuse-lookup",
-                                req_id=req.py_request_id,
-                                safe_prefix_requested=safe_prefix,
-                                lookup_key_len=(
-                                    len(draft_lookup_tokens)
-                                    if draft_lookup_tokens is not None else 0
-                                ),
-                                lookup_key_hash=(
-                                    _repro_debug_token_hash(draft_lookup_tokens)
-                                    if draft_lookup_tokens is not None else "n/a"
-                                ),
-                                draft_trie_hit_tokens=matched,
-                                draft_context_start=req.context_current_position,
-                                draft_context_chunk=req.context_chunk_size,
-                                attached_block_ids=attached_block_ids,
-                            )
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
@@ -2881,20 +2810,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     + draft_len
                     + self.num_extra_kv_tokens
                 )
-                if _EAGLE3_REPRO_DEBUG:
-                    # This manager's OWN (draft-mode) bookkeeping view, not
-                    # necessarily proof of what gets embedded/computed by the
-                    # actual forward -- see DRAFT-forward-ground-truth
-                    # (eagle3.py), logged from attn_metadata/position_ids
-                    # immediately before the real forward, for that.
-                    _repro_debug(
-                        "DRAFT-capacity-range",
-                        req_id=req.py_request_id,
-                        draft_kv_cache_manager_position_range=(
-                            f"[{req.context_current_position}, "
-                            f"{req.context_current_position + req.context_chunk_size})"
-                        ),
-                    )
                 if not kv_cache.resize(capacity):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
@@ -3778,20 +3693,6 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
-            if _EAGLE3_REPRO_DEBUG and self.is_draft:
-                try:
-                    block_ids = self.get_batch_cache_indices(
-                        [request.py_request_id])[0]
-                    block_ids = (block_ids.tolist() if hasattr(
-                        block_ids, "tolist") else list(block_ids))
-                except Exception:  # noqa: BLE001 - diagnostic only
-                    block_ids = None
-                _repro_debug(
-                    "DRAFT-commit",
-                    req_id=request.py_request_id,
-                    committed_tokens=kv_cache.num_committed_tokens,
-                    committed_block_ids=block_ids,
-                )
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 

@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -27,85 +26,6 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
-
-# TEMPORARY DIAGNOSTIC INSTRUMENTATION for the EAGLE3/MTP draft-side
-# block-reuse fix (see scripts/repro.py). Not a product change; safe to
-# delete once validated. Uses plain print() (not `logger`) so it is visible
-# regardless of TLLM_LOG_LEVEL, including under TLLM_WORKER_USE_SINGLE_PROCESS=1.
-_EAGLE3_REPRO_DEBUG = os.environ.get("TLLM_EAGLE3_REPRO_DEBUG", "0") == "1"
-
-
-def _repro_debug(tag: str, **fields) -> None:
-    if not _EAGLE3_REPRO_DEBUG:
-        return
-    kv = " ".join(f"{k}={v}" for k, v in fields.items())
-    print(f"[EAGLE3-DEBUG][{tag}] {kv}", flush=True)
-
-
-def _repro_debug_draft_forward_ground_truth(attn_metadata, inputs,
-                                            draft_kv_cache_manager,
-                                            step_idx: int) -> None:
-    """Log ground-truth state immediately before the real draft-model
-    forward, for the context (prefill) step of one-model (fused)
-    EAGLE3/MTP-Eagle speculative decoding.
-
-    Called with ``attn_metadata`` already swapped to point at the draft KV
-    cache manager (inside ``draft_kv_cache_context``), and with
-    ``inputs["position_ids"]``/``inputs["input_ids"]`` being the *exact*
-    tensors about to be fed into ``_run_draft_forward`` -- i.e. this reads
-    what is actually about to be computed, not a prediction from request
-    bookkeeping. request.context_current_position/context_chunk_size are
-    deliberately NOT used here: they are a C++-level dual-mode field
-    (target vs draft, gated on request.use_draft_model) that is only valid
-    to read while inside the specific request_context(...) scope that wrote
-    it (see kv_cache_manager_v2.py's _prepare_draft_resources /
-    _prepare_context_impl comments) -- by the time this forward runs, that
-    scope has long exited. Everything logged here instead comes from the
-    draft KV cache manager's own committed-token counter and the tensors
-    actually bound to this forward.
-    """
-    if not _EAGLE3_REPRO_DEBUG or step_idx != 0 or draft_kv_cache_manager is None:
-        return
-    num_contexts = getattr(attn_metadata, "num_contexts", 0)
-    if num_contexts <= 0:
-        return
-    request_ids = list(attn_metadata.request_ids[:num_contexts])
-    context_lens = attn_metadata.context_lens[:num_contexts].tolist()
-    position_ids = inputs.get("position_ids")
-    tokens_per_block = getattr(draft_kv_cache_manager, "tokens_per_block", None)
-    offset = 0
-    for req_id, num_tokens in zip(request_ids, context_lens):
-        pos_slice = (position_ids[offset:offset + num_tokens]
-                    if position_ids is not None else None)
-        kv_cache = draft_kv_cache_manager.kv_cache_map.get(req_id)
-        matched = kv_cache.num_committed_tokens if kv_cache is not None else None
-        try:
-            block_ids = draft_kv_cache_manager.get_batch_cache_indices(
-                [req_id])[0]
-            block_ids = (block_ids.tolist()
-                        if hasattr(block_ids, "tolist") else list(block_ids))
-        except Exception:  # noqa: BLE001 - diagnostic only
-            block_ids = None
-        reused_blocks, new_blocks = None, None
-        if block_ids is not None and matched is not None and tokens_per_block:
-            n_reused = min(
-                (matched + tokens_per_block - 1) // tokens_per_block,
-                len(block_ids))
-            reused_blocks = block_ids[:n_reused]
-            new_blocks = block_ids[n_reused:]
-        _repro_debug(
-            "DRAFT-forward-ground-truth",
-            req_id=req_id,
-            draft_trie_hit_tokens=matched,
-            num_input_tokens_this_forward=num_tokens,
-            actual_forward_position_range=(
-                f"[{int(pos_slice[0])}, {int(pos_slice[-1]) + 1})"
-                if pos_slice is not None and len(pos_slice) else "n/a"),
-            full_block_table=block_ids,
-            reused_blocks=reused_blocks,
-            newly_allocated_blocks=new_blocks,
-        )
-        offset += num_tokens
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -1034,9 +954,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             for i in range(runtime_draft_len):
                 if uses_dsa_mtp_metadata:
                     attn_metadata.set_skip_topk(i > 0)
-                if _EAGLE3_REPRO_DEBUG:
-                    _repro_debug_draft_forward_ground_truth(
-                        attn_metadata, inputs, draft_kv_cache_manager, i)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
