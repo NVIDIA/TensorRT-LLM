@@ -44,6 +44,7 @@ def enforce_single_worker(monkeypatch):
     "drafter_type,schedule",
     [
         ("ngram", {1: 3, 4: 2, 8: 1}),
+        ("model_drafter", {1: 3, 4: 2, 8: 1}),
     ],
 )
 @pytest.mark.high_cuda_memory
@@ -55,7 +56,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
 
     models_path = llm_models_root()
     target_model = f"{models_path}/Qwen3.5-4B"
-    draft_model = f"{models_path}/Qwen3.5-4B"
+    draft_model = f"{models_path}/Qwen3.5-0.8B"
 
     max_batch_size = 8
     max_draft_len = max(schedule.values())  # Use max from schedule
@@ -130,7 +131,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
             is_public_pool=False,
         )
     else:
-        # skipped for move to 1 model
         spec_config_fixed = DraftTargetDecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=str(draft_model),
@@ -157,6 +157,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     "drafter_type,draft_schedule",
     [
         ("ngram", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
+        ("model_drafter", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
     ],
 )
 @pytest.mark.high_cuda_memory
@@ -194,10 +195,9 @@ def test_draft_len_schedule_functionality(
             draft_len_schedule=draft_schedule,
         )
     else:
-        # skipped for move to 1 model
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=5,
-            speculative_model=str(llm_models_root() / "Qwen3.5-4B"),
+            speculative_model=str(llm_models_root() / "Qwen3.5-0.8B"),
             draft_len_schedule=draft_schedule,
         )
     prompts = ["The capital of France is" for i in range(7)]

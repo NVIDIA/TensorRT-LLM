@@ -186,12 +186,14 @@ cd tests/integration/defs
 
 ### 6.3 Add Test Case to Test List
 ```bash
-echo "perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]" >> perf_test.txt
+echo "perf/test_perf.py::test_perf[<test-case-id>]" >> perf_test.txt
 ```
 
 ### 6.4 Run Performance Test
 ```bash
-pytest -v -s --test-prefix=H100_80GB_HBM3 --test-list=perf_test.txt -R=llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128 --output-dir=./output --perf --perf-log-formats=csv -o junit_logging=out-err
+pytest -v -s --test-prefix=H100_80GB_HBM3 --test-list=perf_test.txt \
+  -R=<test-case-id> --output-dir=./output --perf \
+  --perf-log-formats=csv -o junit_logging=out-err
 ```
 
 ### 6.5 Command Parameters Explanation

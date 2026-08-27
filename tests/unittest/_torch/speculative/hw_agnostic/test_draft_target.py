@@ -36,7 +36,7 @@ def test_qwen3_5_draft_target(use_cuda_graph: bool, attn_backend: str):
         pytest.skip("Not enough memory to load target and draft models")
 
     models_path = llm_models_root()
-    draft_model_dir = f"{models_path}/Qwen3.5-4B"
+    draft_model_dir = f"{models_path}/Qwen3.5-0.8B"
     target_model_dir = f"{models_path}/Qwen3.5-4B"
 
     max_batch_size = 2
@@ -92,7 +92,7 @@ def test_qwen3_5_draft_target_rejection():
 
     models_path = llm_models_root()
     target_model_dir = f"{models_path}/Qwen3.5-4B"
-    draft_model_dir = f"{models_path}/Qwen3.5-4B"
+    draft_model_dir = f"{models_path}/Qwen3.5-0.8B"
 
     spec_config = DraftTargetDecodingConfig(
         max_draft_len=4,

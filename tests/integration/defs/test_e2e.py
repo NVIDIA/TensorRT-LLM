@@ -1374,12 +1374,7 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
     if gpu_count > get_device_count():
         pytest.skip(f"Not enough GPUs for {model_name}")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    mapping = {
-        "Llama3.1-70B-BF16": 24.6,
-        "Llama3.1-70B-FP8": 58.5,
-        "Llama3.1-405B-FP8": 63.2,
-        "DeepSeek-V3-671B-FP8": 83.8
-    }
+    mapping = {"DeepSeek-V3-671B-FP8": 83.8}
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
         "--enable_chunked_prefill",
