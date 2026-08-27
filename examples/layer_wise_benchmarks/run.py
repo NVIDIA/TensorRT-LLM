@@ -275,8 +275,9 @@ if args.replay_file_path:
             parser.error(
                 f"--replay-start-iter/--replay-stop-iter ask for iterations "
                 f"[{replay_start_iter}, {replay_stop_iter}], but "
-                f"{args.replay_file_path} does not hold {shown}. Drop both flags "
-                f"to replay whatever the calibration contains."
+                f"{args.replay_file_path} does not hold {shown}. Pick a window it "
+                f"does hold, or drop both flags to take the recorded range, which "
+                f"has to be contiguous."
             )
     logger.info(
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
@@ -304,10 +305,7 @@ if args.replay_file_path:
             f"{args.replay_file_path} recorded {recorded_tokens} tokens per "
             f"iteration, but --batch-size/--seq-len-q ask for "
             f"{', '.join(f'{b}x{s}={b * s}' for b, s in mismatched)}. "
-            f"seq_len_q > 1 is MTP and also needs --spec-max-draft-len "
-            f"seq_len_q-1; examples/layer_wise_benchmarks does not currently "
-            f"ship a way to discover the recorded count, so read it off the "
-            f"calibration's token_selected_slots_shape."
+            f"seq_len_q > 1 is MTP and also needs --spec-max-draft-len seq_len_q-1."
         )
 else:
     calibrator.init("NONE", None, None)
