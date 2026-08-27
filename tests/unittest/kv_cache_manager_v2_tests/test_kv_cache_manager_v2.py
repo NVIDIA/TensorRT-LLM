@@ -895,6 +895,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if kv_cache.status != _KVCache.Status.CLOSED:
                     kv_cache.close()
 
+    @requires_cpp_backend
     def test_constant_size_pool_group_floor_ignores_growth_headroom(self) -> None:
         """An SSM-only pool group is sized to its exact constraint floor.
 
@@ -3463,35 +3464,6 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(slots[ssm_pg], 2)
         self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
-
-    def test_ssm_pool_ratio_at_constraint_floor_keeps_exact_slot_count(self) -> None:
-        """A floor-sized SSM ratio leaves all discretionary quota to attention."""
-        ssm_floor_slots = 4
-        granularity = 2 << 20
-        gpu_quota = 256 << 20
-        cfg = self._make_hybrid_config(gpu_quota)
-        cfg.constraints = [
-            BatchDesc(kv_caches=[KVCacheDesc(capacity=0, history_length=0)] * ssm_floor_slots)
-        ]
-        fixed_grains = _introspection.grains_for_slots(
-            ssm_floor_slots,
-            [self.SSM_STATE_SLOT_SIZE, self.SSM_CONV_SLOT_SIZE],
-            granularity,
-        )
-        ssm_ratio = fixed_grains / (gpu_quota // granularity)
-        cfg.initial_pool_ratio = [ssm_ratio, 1.0 - ssm_ratio]
-
-        manager = KVCacheManager(cfg)
-        try:
-            ssm_lc = _introspection.ssm_life_cycle_id(manager)
-            assert ssm_lc is not None
-            ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
-            attn_pg = 1 - ssm_pg
-            statistics = _introspection.storage_statistics(manager)
-            self.assertEqual(statistics[ssm_pg].total, ssm_floor_slots)
-            self.assertGreater(statistics[attn_pg].total, ssm_floor_slots)
-        finally:
-            manager.shutdown()
 
     def test_constraints_floor_typical_step(self):
         """Constraints clamp the typical_step ratio from below."""

@@ -293,11 +293,7 @@ class StorageManager:
                     config.cache_tiers[i],
                     slot_size_lists,
                     self._compute_slot_count_for_level(
-                        i,
-                        config.cache_tiers[i],
-                        slot_size_lists,
-                        init_ratio,
-                        initial_pool_ratio is not None,
+                        i, config.cache_tiers[i], slot_size_lists, init_ratio
                     ),
                 )
                 for i in typed_range(num_levels)
@@ -906,13 +902,6 @@ class StorageManager:
         assert total > 0
         return typed_map(pool_group_ratio, lambda x: x / total)
 
-    def _pool_group_needs_headroom_for_growth(self, pool_group: PoolGroupIndex) -> bool:
-        """Return whether any lifecycle in a hot-tier pool group can grow."""
-        return any(
-            self.get_pool_group_index(life_cycle) == pool_group and isinstance(lc, AttnLifeCycle)
-            for life_cycle, lc in self.life_cycles.items()
-        )
-
     def ratio_from_batch(
         self,
         batch: BatchDesc,
@@ -956,13 +945,7 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for life_cycle in typed_range(self.num_life_cycles):
-                pool_group = self.get_pool_group_index(life_cycle)
-                utilization_limit = (
-                    max_util_for_resume
-                    if self._pool_group_needs_headroom_for_growth(pool_group)
-                    else 1.0
-                )
-                scaled_slots = math.ceil(slots[life_cycle] / utilization_limit)
+                scaled_slots = math.ceil(slots[life_cycle] / max_util_for_resume)
                 max_slots[life_cycle] = max(max_slots[life_cycle], scaled_slots)
         return max_slots
 
@@ -992,12 +975,7 @@ class StorageManager:
                 batch, tokens_per_block, swa_scratch_reuse
             )
             for pg_idx in typed_range(self.num_pool_groups):
-                utilization_limit = (
-                    max_util_for_resume
-                    if self._pool_group_needs_headroom_for_growth(pg_idx)
-                    else 1.0
-                )
-                scaled_slots = math.ceil(slots[pg_idx] / utilization_limit)
+                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
                 max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 
@@ -1110,7 +1088,6 @@ class StorageManager:
         tier_config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         ratio: TypedIndexList[PoolGroupIndex, float],
-        cap_ssm_at_floor: bool,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute slot counts for a cache level from its tier config and ratio.
 
@@ -1122,20 +1099,9 @@ class StorageManager:
             self._min_quota_for_level(slot_size_lists, granularity, min_slots),
             round_up(tier_config.quota, granularity),
         )
-        slot_counts = CacheLevelStorage.ratio_to_slot_count_list(
+        return CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio, granularity, min_slots
         )
-        ssm_life_cycle = self.life_cycles.ssm_life_cycle_id
-        if level == GPU_LEVEL and cap_ssm_at_floor and ssm_life_cycle is not None:
-            pool_group = self.get_pool_group_index(ssm_life_cycle)
-            if not self._pool_group_needs_headroom_for_growth(pool_group):
-                requested_grains = round(quota / granularity * ratio[pool_group])
-                floor_grains = CacheLevelStorage._grains_for_slots(
-                    min_slots[pool_group], slot_size_lists[pool_group], granularity
-                )
-                if requested_grains <= floor_grains:
-                    slot_counts[pool_group] = min_slots[pool_group]
-        return slot_counts
 
     def constrain_pool_group_ratio(
         self,

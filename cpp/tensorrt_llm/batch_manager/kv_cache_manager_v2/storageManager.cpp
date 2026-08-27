@@ -336,27 +336,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mLevels.reserve(config.cacheTiers.size());
 
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
-    if (initialPoolRatio.has_value())
-    {
-        auto const ssmLifeCycle = mLifeCycles.ssmLifeCycleId();
-        if (ssmLifeCycle.has_value())
-        {
-            auto const poolGroup = getPoolGroupIndex(*ssmLifeCycle);
-            if (!poolGroupNeedsHeadroomForGrowth(poolGroup))
-            {
-                size_t const allocatedQuota = std::max(
-                    minQuotaForLevel(slotSizeLists, gpuGranularity, mMinSlots), roundUp(gpuQuota, gpuGranularity));
-                size_t const requestedGrains = static_cast<size_t>(
-                    std::nearbyint(static_cast<double>(allocatedQuota / gpuGranularity) * hotRatio[poolGroup]));
-                size_t const floorGrains
-                    = CacheLevelStorage::grainsForSlots(mMinSlots[poolGroup], slotSizeLists[poolGroup], gpuGranularity);
-                if (requestedGrains <= floorGrains)
-                {
-                    gpuSlotCounts[poolGroup] = mMinSlots[poolGroup];
-                }
-            }
-        }
-    }
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get());
 

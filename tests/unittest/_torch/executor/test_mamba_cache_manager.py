@@ -2016,10 +2016,6 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
 
         kv_cache_config = KvCacheConfig(
             pool_ratio=pool_ratio,
-            # Extra recurrent-state capacity is useful only when snapshots can
-            # be reused. Without block reuse, the SSM pool is intentionally
-            # capped at the live-request plus dummy-slot count.
-            enable_block_reuse=True,
             enable_partial_reuse=False,
             mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
         )
@@ -2271,18 +2267,6 @@ def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
         assert mgr.local_num_mamba_layers == 1
         assert len(mgr.all_ssm_states) == 1
         assert len(mgr.all_conv_states) == 1
-        expected_state_slots = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
-        assert mgr.all_ssm_states[0].shape[0] == expected_state_slots
-        assert mgr.all_conv_states[0].shape[0] == expected_state_slots
-        ssm_life_cycle = int(mgr.ssm_layer_group_id)
-        hot_pool_group = _introspection.pool_group_index(mgr.impl, ssm_life_cycle)
-        cold_pool_group = _introspection.pool_group_index(mgr.impl, ssm_life_cycle, 1)
-        assert _introspection.storage_statistics(mgr.impl)[hot_pool_group].total == (
-            expected_state_slots
-        )
-        assert _introspection.storage_statistics(mgr.impl, 1)[cold_pool_group].total > (
-            expected_state_slots
-        )
         assert mgr.all_ssm_states[0].shape[1:] == torch.Size([4, 8, 8])
         assert mgr.all_conv_states[0].shape[1:] == torch.Size([48, 3])
         assert mgr.get_max_resource_count() == 4
