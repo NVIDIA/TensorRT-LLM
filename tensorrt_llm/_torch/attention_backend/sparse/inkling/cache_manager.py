@@ -525,6 +525,41 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         """Pool rows of the current batch, in packed batch order."""
         return self._conv_cache.state_indices
 
+    def prepare_conv_runtime(self, attn_metadata):
+        """Build this step's context/generation split against THIS manager's pool.
+
+        ``model.forward`` publishes one split via ``InklingConvRuntime.from_metadata``
+        from whichever manager was in play then -- the target's. A draft forward
+        runs inside the draft KV cache context with the manager swapped
+        underneath, and the chain has its own pool, so it has to ask again rather
+        than reuse that.
+
+        The result is retained because the post-verify conv commit runs from the
+        spec worker, after the forward context has exited, and must commit
+        against the same rows this step's forward advanced.
+        """
+        from .conv_state import InklingConvRuntime
+
+        rt = InklingConvRuntime.build(attn_metadata, self._conv_cache)
+        self._last_conv_rt = rt
+        return self._conv_cache, rt
+
+    def commit_conv_state_after_verify(self, num_accepted) -> None:
+        """Roll the conv windows back to each request's last accepted token.
+
+        The pool rows come from the runtime built for the verify step, so this
+        commits against the same rows the forward advanced -- not whatever the
+        next batch happens to occupy.
+        """
+        rt = self._last_conv_rt
+        if rt is None or rt.gen_indices is None or rt.gen_tokens_per_seq < 2:
+            return
+        # ``num_accepted`` covers the whole batch; the conv rows cover only the
+        # generation slice, so it is indexed from the END. A verify step's
+        # requests are the batch's tail by construction.
+        rows = rt.gen_indices.to(torch.int64)
+        self._conv_cache.commit_after_verify(num_accepted[-rows.shape[0] :], rows)
+
     def free_conv_state(self, request_ids) -> None:
         self._conv_cache.free(list(request_ids))
 

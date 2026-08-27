@@ -426,15 +426,28 @@ class InklingConvRuntime:
 
     @classmethod
     def from_metadata(cls, attn_metadata) -> Optional["InklingConvRuntime"]:
-        """Build this forward's split, or ``None`` for the stateless conv path.
+        """Build this forward's split against the conv pool of the manager in play.
+
+        The ordinary-decode entry: resolve the pool off the current manager and
+        delegate to :meth:`build`. A draft forward runs with the KV cache manager
+        swapped and its own pool, so the chain asks its manager directly through
+        ``prepare_conv_runtime`` (which calls :meth:`build` with that pool).
+        """
+        mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        cache = getattr(mgr, "conv_state_cache", None)
+        if cache is None:
+            return None
+        return cls.build(attn_metadata, cache)
+
+    @classmethod
+    def build(cls, attn_metadata, cache) -> Optional["InklingConvRuntime"]:
+        """Build the context/generation split against an explicit conv pool.
 
         Called from ``model.forward``, so the pool rows come back as a view of the
         buffer ``prepare()`` already refreshed. The varlen offsets below do
         allocate, but only for a batch carrying context requests, and a captured
         batch never does -- decode graphs are generation-only.
         """
-        mgr = getattr(attn_metadata, "kv_cache_manager", None)
-        cache = getattr(mgr, "conv_state_cache", None)
         if cache is None or attn_metadata.request_ids is None:
             return None
         num_contexts = attn_metadata.num_contexts

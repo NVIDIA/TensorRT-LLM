@@ -390,6 +390,18 @@ class MTPWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
+        # Roll back any recurrent state the verify forward advanced over tokens
+        # that were then rejected. The KV cache needs no such step -- it is
+        # indexed by position, so rejected entries are simply overwritten -- but
+        # a model carrying an in-place window (Inkling's short-conv) would
+        # otherwise continue from a history it never produced, with nothing
+        # wrong in any shape to show it.
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        commit_state = getattr(kv_cache_manager,
+                               "commit_conv_state_after_verify", None)
+        if commit_state is not None:
+            commit_state(num_accepted_tokens)
+
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,
                                       hidden_states=hidden_states,
