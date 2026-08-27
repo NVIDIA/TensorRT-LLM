@@ -2892,6 +2892,7 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
     max_num_sequences: Optional[int] = None,
+    enable_self_benchmark: bool = True,
 ) -> PyExecutor:
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
@@ -3271,6 +3272,7 @@ def create_py_executor_instance(
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         enable_early_first_token_response=llm_args.
         enable_early_first_token_response,
+        enable_self_benchmark=enable_self_benchmark,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
