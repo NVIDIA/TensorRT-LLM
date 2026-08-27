@@ -19,6 +19,7 @@ replaced by an in-process fake, and the KV cache layout is synthesized from
 plain integers, which is all the addressing arithmetic needs.
 """
 
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -80,7 +81,8 @@ class FakeStore:
         self.exist_calls = []
         self.closed = False
         self.fail_gets_for = set()
-        #: Workers built against this store, torn down by the fixture.
+        #: Workers built against this store. ``make_worker`` shuts each one
+        #: down; the fixture repeats it as a backstop for early failures.
         self.workers = []
 
     def register_buffer(self, address, size):
@@ -183,12 +185,22 @@ def fake_store(monkeypatch):
     worker_module._LOCAL_WORKER_READY.clear()
 
 
+@contextlib.contextmanager
 def make_worker(fake_store, *, layout=None):
+    """Build a worker and shut it down before the test call phase ends.
+
+    Registering a layout starts the background save thread, and
+    pytest-threadleak snapshots threads around the call phase only, so
+    fixture teardown would run too late to keep it quiet.
+    """
     worker = MooncakeStoreConnectorWorker(make_llm_args())
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
-    return worker
+    try:
+        yield worker
+    finally:
+        worker.shutdown()
 
 
 def make_request(request_id, tokens, cache_salt=None):
@@ -419,111 +431,111 @@ def test_validate_layout_rejects_sliding_window():
 
 def test_worker_registers_every_pool_range(store_config, fake_store):
     layout = make_layout(num_groups=2, regions_per_group=2)
-    worker = make_worker(fake_store, layout=layout)
-    assert fake_store.registered == [
-        (start, end - start) for start, end in PageAddressing(layout).registration_ranges()
-    ]
-    assert worker.is_registered
+    with make_worker(fake_store, layout=layout) as worker:
+        assert fake_store.registered == [
+            (start, end - start) for start, end in PageAddressing(layout).registration_ranges()
+        ]
+        assert worker.is_registered
 
 
 def test_worker_rejects_v1_pool_registration(store_config, fake_store):
-    worker = make_worker(fake_store)
-    with pytest.raises(NotImplementedError, match="KVCacheManagerV2"):
-        worker.register_kv_caches(None)
+    with make_worker(fake_store) as worker:
+        with pytest.raises(NotImplementedError, match="KVCacheManagerV2"):
+            worker.register_kv_caches(None)
 
 
 def test_worker_prefix_hit_needs_every_layer_group(store_config, fake_store):
     layout = make_layout(num_groups=2)
-    worker = make_worker(fake_store, layout=layout)
-    hashes = [bytes([index]) * 16 for index in range(3)]
+    with make_worker(fake_store, layout=layout) as worker:
+        hashes = [bytes([index]) * 16 for index in range(3)]
 
-    assert worker.count_prefix_hit(hashes) == 0
+        assert worker.count_prefix_hit(hashes) == 0
 
-    # Populate blocks 0 and 1 completely, and block 2 only partially.
-    for block in range(2):
-        for group_id in range(2):
-            fake_store.objects.add(worker._namespaces[group_id].key(hashes[block]))
-    fake_store.objects.add(worker._namespaces[0].key(hashes[2]))
+        # Populate blocks 0 and 1 completely, and block 2 only partially.
+        for block in range(2):
+            for group_id in range(2):
+                fake_store.objects.add(worker._namespaces[group_id].key(hashes[block]))
+        fake_store.objects.add(worker._namespaces[0].key(hashes[2]))
 
-    assert worker.count_prefix_hit(hashes) == 2
+        assert worker.count_prefix_hit(hashes) == 2
 
 
 def test_worker_prefix_hit_stops_at_the_first_gap(store_config, fake_store):
-    worker = make_worker(fake_store, layout=make_layout())
-    hashes = [bytes([index]) * 16 for index in range(3)]
-    # Block 1 missing: block 2 is unusable even though it is present, because a
-    # prefix is replayed contiguously.
-    fake_store.objects.add(worker._namespaces[0].key(hashes[0]))
-    fake_store.objects.add(worker._namespaces[0].key(hashes[2]))
-    assert worker.count_prefix_hit(hashes) == 1
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(3)]
+        # Block 1 missing: block 2 is unusable even though it is present, because a
+        # prefix is replayed contiguously.
+        fake_store.objects.add(worker._namespaces[0].key(hashes[0]))
+        fake_store.objects.add(worker._namespaces[0].key(hashes[2]))
+        assert worker.count_prefix_hit(hashes) == 1
 
 
 def test_worker_load_raises_when_a_page_is_missing(store_config, fake_store):
-    worker = make_worker(fake_store, layout=make_layout())
-    transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
-    worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
-    with pytest.raises(RuntimeError, match="already"):
-        worker.start_load_kv(None)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        with pytest.raises(RuntimeError, match="already"):
+            worker.start_load_kv(None)
 
 
 def test_worker_load_addresses_the_requested_page(store_config, fake_store):
     layout = make_layout(regions_per_group=2)
-    worker = make_worker(fake_store, layout=layout)
-    block_hash = b"\x00" * 16
-    key = worker._namespaces[0].key(block_hash)
-    fake_store.objects.add(key)
+    with make_worker(fake_store, layout=layout) as worker:
+        block_hash = b"\x00" * 16
+        key = worker._namespaces[0].key(block_hash)
+        fake_store.objects.add(key)
 
-    transfers = RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])
-    worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
-    worker.start_load_kv(None)
+        transfers = RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        worker.start_load_kv(None)
 
-    (keys, addresses, sizes) = fake_store.get_calls[0]
-    expected_addresses, expected_sizes = PageAddressing(layout).buffers(0, 3)
-    assert keys == [key]
-    assert addresses == [expected_addresses]
-    assert sizes == [expected_sizes]
+        (keys, addresses, sizes) = fake_store.get_calls[0]
+        expected_addresses, expected_sizes = PageAddressing(layout).buffers(0, 3)
+        assert keys == [key]
+        assert addresses == [expected_addresses]
+        assert sizes == [expected_sizes]
 
 
 def test_worker_save_skips_pages_already_in_the_store(store_config, fake_store):
-    worker = make_worker(fake_store, layout=make_layout())
-    hashes = [bytes([index]) * 16 for index in range(2)]
-    fake_store.objects.add(worker._namespaces[0].key(hashes[0]))
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(2)]
+        fake_store.objects.add(worker._namespaces[0].key(hashes[0]))
 
-    worker._put(
-        [
-            RequestTransfers(
-                1,
-                [PageTransfer(hashes[0], 0, 0), PageTransfer(hashes[1], 0, 1)],
-            )
-        ]
-    )
-    assert len(fake_store.put_calls) == 1
-    assert fake_store.put_calls[0][0] == [worker._namespaces[0].key(hashes[1])]
+        worker._put(
+            [
+                RequestTransfers(
+                    1,
+                    [PageTransfer(hashes[0], 0, 0), PageTransfer(hashes[1], 0, 1)],
+                )
+            ]
+        )
+        assert len(fake_store.put_calls) == 1
+        assert fake_store.put_calls[0][0] == [worker._namespaces[0].key(hashes[1])]
 
 
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
-    worker = make_worker(fake_store, layout=make_layout())
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        # One submission outstanding: the request is closed but must not be released.
+        worker._outstanding_saves[42] = 1
+        assert worker.get_finished([42], []) == ([], [])
 
-    # One submission outstanding: the request is closed but must not be released.
-    worker._outstanding_saves[42] = 1
-    assert worker.get_finished([42], []) == ([], [])
-
-    worker._outstanding_saves.pop(42)
-    assert worker.get_finished([], []) == ([42], [])
-    # Reported once only.
-    assert worker.get_finished([], []) == ([], [])
+        worker._outstanding_saves.pop(42)
+        assert worker.get_finished([], []) == ([42], [])
+        # Reported once only.
+        assert worker.get_finished([], []) == ([], [])
 
 
 def test_worker_reports_a_request_with_no_saves_immediately(store_config, fake_store):
-    worker = make_worker(fake_store, layout=make_layout())
-    assert worker.get_finished([9], [5]) == ([9], [5])
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker.get_finished([9], [5]) == ([9], [5])
 
 
 def test_worker_shutdown_closes_the_store(store_config, fake_store):
-    worker = make_worker(fake_store, layout=make_layout())
-    worker.shutdown()
-    assert fake_store.closed
-    worker.shutdown()
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.shutdown()
+        assert fake_store.closed
+        # Idempotent: a second call must not raise or reopen anything.
+        worker.shutdown()
 
 
 # ---- scheduler ----

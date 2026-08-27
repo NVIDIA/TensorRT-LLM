@@ -138,6 +138,31 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
+# Install the Mooncake Python store bindings, but only when a worker config asks
+# for the mooncake-store KV connector. The bindings shipped in the container
+# images are unusable (see mooncake_disagg/README.md section 2), and the fix has
+# to be reapplied per job: --container-name gives each node a container that
+# lives for the job, so anything installed here survives to the worker sruns but
+# not into the next job.
+if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
+    mooncake_install_script=""
+    if [ -n "${trtllm_repo:-}" ]; then
+        mooncake_install_script="${trtllm_repo}/mooncake_disagg/install_mooncake_runtime.sh"
+    fi
+    if [ -z "${mooncake_install_script}" ] || [ ! -f "${mooncake_install_script}" ]; then
+        cleanup_on_failure "A worker config requests the mooncake-store connector, but mooncake_disagg/install_mooncake_runtime.sh was not found under trtllm_repo='${trtllm_repo:-}'. Set environment.trtllm_repo to a checkout that contains it, or bake the bindings into the container image."
+    fi
+    echo "Installing Mooncake store bindings on all nodes..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "MOONCAKE_WHEEL='${MOONCAKE_WHEEL:-}' bash ${mooncake_install_script}" \
+        &> ${full_logdir}/2_install_mooncake.log; then
+        cleanup_on_failure "Mooncake store bindings installation failed. Check ${full_logdir}/2_install_mooncake.log for details"
+    fi
+    echo "Mooncake store bindings installation completed successfully"
+fi
+
 # Get node lists and replace the placeholder with the actual node names
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))

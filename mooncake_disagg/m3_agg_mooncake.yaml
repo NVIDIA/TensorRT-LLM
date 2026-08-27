@@ -1,0 +1,89 @@
+# MiniMax-M3-NVFP4, aggregated, with the mooncake-store KV connector.
+#
+# Derived from the production M3 serving config. Every deviation from it is
+# marked CONNECTOR: with the gate that forces it. Startup gates live in
+# py_executor_creator.py (~line 830), py_executor._maybe_init_kv_connector_manager,
+# and connectors/mooncake_store/validation.py.
+
+max_seq_len: 1048576
+max_num_tokens: 16384
+max_batch_size: 20
+
+cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+torch_compile_config:
+    enable_fullgraph: true
+    enable_inductor: false
+    enable_piecewise_cuda_graph: true
+    capture_num_tokens: [1, 16, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+    enable_userbuffers: true
+    max_num_streams: 3
+
+moe_config:
+    backend: TRTLLM
+    use_low_precision_moe_combine: true
+
+sparse_attention_config:
+    algorithm: minimax_m3
+    implementation: msa
+    indexer_kv_dtype: fp8
+    # Required by the connector: index-V is a plain tensor outside the paged
+    # pools, so it is never described or transferred. A replayed prefix would
+    # pair stored index-K with stale index-V.
+    sparse_disable_index_value: true
+    fuse_qkv_index_projection: true
+
+kv_cache_config:
+    free_gpu_memory_fraction: 0.94
+    enable_block_reuse: true
+    tokens_per_block: 128
+    use_kv_cache_manager_v2: true
+    dtype: fp8
+    event_buffer_max_size: 0
+
+    # CONNECTOR: was host_cache_size: 388554555392.
+    # _reject_non_gpu_cache_tiers rejects every tier below GPU, because a
+    # registered region is only a valid device address while its page stays
+    # pinned to GPU -- eviction reassigns the slot. Both must be an explicit
+    # 0: V2 provisions a host tier when the field is left at its default of
+    # None, which is falsy but still yields a tier.
+    host_cache_size: 0
+    disk_cache_size: 0
+
+    # CONNECTOR: was block_reuse_policy: per_conversation.
+    # Not gated, but the connector derives its own blake2b hash chain seeded
+    # by cache_salt, so reuse-policy interactions are untested. Restore this
+    # after the store is proven.
+    # block_reuse_policy: per_conversation
+
+# CONNECTOR: was MAX_UTILIZATION. py_executor_creator raises
+# "KV connector is only supported with guaranteed no evict scheduler policy."
+scheduler_config:
+    capacity_scheduler_policy: GUARANTEED_NO_EVICT
+
+# CONNECTOR: Eagle3 disabled for the first validation run.
+# Not gated, but MiniMaxM3KVCacheManagerV2 sets supports_shared_draft_layers,
+# so draft layers join the unified V2 cache and therefore the registered
+# layout. That adds page geometry the store must key correctly, on a path
+# with no coverage. Re-enable once cold/warm passes without it.
+# speculative_config:
+#     decoding_type: Eagle3
+#     max_draft_len: 3
+#     speculative_model: /path/to/eagle3/draft
+
+enable_chunked_prefill: true
+enable_autotuner: true
+trust_remote_code: true
+reasoning_parser: minimax_m3
+stream_interval: 20
+print_iter_log: true
+num_postprocess_workers: 8
+
+# Required: dummy requests inserted for cross-DP balancing flow through the
+# connector hooks and are indistinguishable from real requests.
+enable_attention_dp: false
+
+kv_connector_config:
+    connector: mooncake-store

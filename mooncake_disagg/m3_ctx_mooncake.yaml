@@ -1,0 +1,68 @@
+# MiniMax-M3-NVFP4 CONTEXT (prefill) worker: reads AND writes the store.
+#
+# Same as m3_agg_mooncake.yaml plus the transceiver. Every CONNECTOR: note
+# there applies here too.
+
+max_seq_len: 1048576
+max_num_tokens: 16384
+max_batch_size: 20
+
+cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+torch_compile_config:
+    enable_fullgraph: true
+    enable_inductor: false
+    enable_piecewise_cuda_graph: true
+    capture_num_tokens: [1, 16, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+    enable_userbuffers: true
+    max_num_streams: 3
+
+moe_config:
+    backend: TRTLLM
+    use_low_precision_moe_combine: true
+
+sparse_attention_config:
+    algorithm: minimax_m3
+    implementation: msa
+    indexer_kv_dtype: fp8
+    sparse_disable_index_value: true
+    fuse_qkv_index_projection: true
+
+kv_cache_config:
+    free_gpu_memory_fraction: 0.94
+    enable_block_reuse: true
+    tokens_per_block: 128
+    use_kv_cache_manager_v2: true
+    dtype: fp8
+    event_buffer_max_size: 0
+    # CONNECTOR: GPU-only tiers. Mooncake takes over the CPU-offload role.
+    host_cache_size: 0
+    disk_cache_size: 0
+
+# MANDATORY, and not only because of the connector. M3 sets
+# sparse_attention_config, so get_kv_cache_manager_cls routes to
+# MiniMaxM3KVCacheManagerV2 unconditionally -- use_kv_cache_manager_v2 is not
+# even consulted on that branch. KVCacheManagerV2 cannot drive the C++
+# transceiver, and M3 does not override get_preferred_transceiver_runtime, so
+# 'auto' would resolve to C++ and be rejected.
+cache_transceiver_config:
+    backend: "NIXL"
+    transceiver_runtime: "PYTHON"
+
+# CONNECTOR: was MAX_UTILIZATION; connectors require guaranteed-no-evict.
+scheduler_config:
+    capacity_scheduler_policy: GUARANTEED_NO_EVICT
+
+enable_chunked_prefill: true
+enable_autotuner: true
+trust_remote_code: true
+reasoning_parser: minimax_m3
+stream_interval: 20
+print_iter_log: true
+num_postprocess_workers: 8
+enable_attention_dp: false
+
+kv_connector_config:
+    connector: mooncake-store

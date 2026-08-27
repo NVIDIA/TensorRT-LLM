@@ -1,0 +1,22 @@
+# Generation (decode) worker: does not touch the Mooncake store at all.
+#
+# There is deliberately no kv_connector_config here. "Decode none" is the
+# absence of a connector, not a StoreRole -- StoreRole only has
+# producer / consumer / both. Generated tokens are rarely a reused prefix,
+# so writing them would cost bandwidth for no hit rate.
+#
+#   CUDA_VISIBLE_DEVICES=1 trtllm-serve <model> \
+#     --host localhost --port 8002 --server_role GENERATION \
+#     --config ./gen_config.yaml
+
+kv_cache_config:
+  # Only to match the context side's transceiver, which must be the Python
+  # one there. Nothing here is required by the store: this worker never
+  # opens a store handle.
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+
+cache_transceiver_config:
+  backend: "NIXL"
+  transceiver_runtime: "PYTHON"
