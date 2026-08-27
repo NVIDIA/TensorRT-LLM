@@ -3337,42 +3337,31 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
         auto* blockscale_gemm_runner = getDeepSeekBlockScaleGemmRunner();
         TLLM_CHECK(blockscale_gemm_runner != nullptr);
-        // The FC2 GEMM output lives in exactly one of the two overlapped buffers, decided by the same
-        // predicate the forward pass uses to route it (see `use_fused_block_scale_quant`). Adding it to
-        // both would reserve the region twice; on DeepSeek-V3.2 at 65536 MoE rows that is 7 GiB wasted.
         // getWorkspaceSize also sets the runner's 1x128 scale leading dim (getActScaleLeadingDim()); the dim
         // depends only on (num_rows, top_k, num_experts) so it is shape_k-independent and shared by FC1/FC2.
         if (blockscale_gemm_runner->isActivationPrequantized())
         {
-            // Fused: FC2 writes glu_inter_result_ in the outputs buffer, because its input (fc1_result_)
-            // is aliased onto fc2_result_ in the inputs buffer. Only the outputs buffer carries it.
+            // FC2's input (fc1_result_) is aliased onto fc2_result_ in the inputs buffer, so FC2 writes
+            // its output into the outputs buffer (glu_inter_result_).
             overlapped_gemm1_gemm2_outputs_size = std::max(blockscale_fc1_output_size, blockscale_fc2_output_size);
-            // The runner needs no internal workspace (both operands pre-quantized). The fused quant
+            // Fused: the runner needs no internal workspace (both operands pre-quantized). The fused quant
             // instead packs fp8 activations + the padded 1x128 scales into the overlapped inputs buffer
             // (fc1_result_ for FC2, permuted_data_ for FC1); size it for both (hidden_size > inter_size makes
-            // FC1 dominant). The scale leading dim (~num_experts*32) can dwarf the token count, so it is not
-            // covered by the bf16-activation size.
+            // FC1 dominant). The scale leading dim (~num_experts*32) can dwarf the token count. The buffer
+            // holds these fp8 regions only, never the bf16 activations.
             blockscale_gemm_runner->getWorkspaceSize(
                 num_rows, hidden_size, inter_size, experts_per_token, num_experts_per_node);
             int64_t const scale_leading_dim = blockscale_gemm_runner->getActScaleLeadingDim();
-            // Size the inputs buffer for what the fused path actually stores. It holds
-            // PRE-QUANTIZED fp8 activations plus their padded 1x128 scales -- never the bf16
-            // activations that permuted_data_size and fc1_result_size are sized for. Taking a max
-            // with those bf16 sizes keeps the buffer at twice what is needed: sizeof(T) ==
-            // sizeof(UnfusedGemmOutputType) == 2, so permuted_data_size alone pins it at
-            // permuted_elems*2 (7.0 GiB on DeepSeek-V3.2 at 65536 MoE rows) where the fp8
-            // regions need ~3.9 GiB. Replace rather than max.
             overlapped_gemm1_gemm2_inputs_size
                 = std::max(fp8BlockScaleRegionBytes(num_moe_inputs, inter_size, scale_leading_dim),
                     fp8BlockScaleRegionBytes(num_moe_inputs, hidden_size, scale_leading_dim));
         }
         else
         {
-            // Unfused: FC2 writes fc2_result_, which is aliased into the inputs buffer, so only the
-            // inputs buffer carries it.
+            // FC2 writes fc2_result_, which is aliased into the inputs buffer.
             overlapped_gemm1_gemm2_inputs_size
                 = std::max(overlapped_gemm1_gemm2_inputs_size, blockscale_fc2_output_size);
-            // The <bf16,fp8,bf16> runner quantizes A internally into deepseek_fc_workspace.
+            // Unfused: the <bf16,fp8,bf16> runner quantizes A internally into deepseek_fc_workspace.
             auto deepseek_fc1_workspace_size = blockscale_gemm_runner->getWorkspaceSize(
                 num_rows, factor * inter_size, hidden_size, experts_per_token, num_experts_per_node);
             auto deepseek_fc2_workspace_size = blockscale_gemm_runner->getWorkspaceSize(
