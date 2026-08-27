@@ -12,6 +12,59 @@ import triton.language as tl
 
 
 @triton.jit
+def _qsa_decode_token_mapping_kernel(
+    kv_lens,
+    seq_lens,
+    request_indices,
+    logical_positions,
+    num_rows,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_rows
+    cached_lens = tl.load(kv_lens + offsets, mask=valid) - tl.load(
+        seq_lens + offsets,
+        mask=valid,
+    )
+    tl.store(request_indices + offsets, offsets, mask=valid)
+    tl.store(logical_positions + offsets, cached_lens.to(tl.int64), mask=valid)
+
+
+def triton_qsa_decode_token_mapping(
+    *,
+    kv_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    request_indices: torch.Tensor,
+    logical_positions: torch.Tensor,
+) -> None:
+    """Build request and position metadata for one-token-per-request decode."""
+    rows = kv_lens.numel()
+    if rows == 0:
+        return
+    if seq_lens.numel() != rows:
+        raise ValueError("QSA decode KV and sequence lengths must have matching shapes")
+    if request_indices.numel() < rows or logical_positions.numel() < rows:
+        raise ValueError("QSA decode token-mapping outputs are too small")
+    if not all(
+        tensor.is_cuda for tensor in (kv_lens, seq_lens, request_indices, logical_positions)
+    ):
+        raise ValueError("QSA decode token mapping requires CUDA tensors")
+
+    # One fixed specialization covers all decode graph batch sizes. It avoids
+    # cold-start compilation per graph shape and is faster even for small rows.
+    block_size = 256
+    _qsa_decode_token_mapping_kernel[(triton.cdiv(rows, block_size),)](
+        kv_lens,
+        seq_lens,
+        request_indices,
+        logical_positions,
+        rows,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _qsa_gemma_norm_rope(
     x,
     pos_t,

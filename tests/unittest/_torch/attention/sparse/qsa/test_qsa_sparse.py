@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_decode_pre_indexer,
+    triton_qsa_decode_token_mapping,
     triton_qsa_paged_index_scores,
     triton_qsa_prefill_compress,
 )
@@ -180,6 +181,28 @@ def test_qsa_selection_is_causal_and_score_ordered() -> None:
     )
     assert selected[0].tolist() == [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]
     assert selected[1].tolist() == [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1]
+
+
+@pytest.mark.parametrize("rows", [1, 64, 257])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
+    seq_lens = torch.ones(rows, dtype=torch.int32, device="cuda")
+    kv_lens = torch.arange(17, 17 + rows, dtype=torch.int32, device="cuda")
+    request_indices = torch.empty(rows, dtype=torch.int32, device="cuda")
+    logical_positions = torch.empty(rows, dtype=torch.int64, device="cuda")
+
+    triton_qsa_decode_token_mapping(
+        kv_lens=kv_lens,
+        seq_lens=seq_lens,
+        request_indices=request_indices,
+        logical_positions=logical_positions,
+    )
+
+    torch.testing.assert_close(
+        request_indices,
+        torch.arange(rows, dtype=torch.int32, device="cuda"),
+    )
+    torch.testing.assert_close(logical_positions, (kv_lens - seq_lens).to(torch.int64))
 
 
 @pytest.mark.parametrize("rows", [1, 64, 257])
