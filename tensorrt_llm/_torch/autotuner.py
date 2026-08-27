@@ -390,7 +390,7 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += "    - Failed profiling combinations:\n"
+                    stats_str += f"    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
 
@@ -811,7 +811,7 @@ class AutoTunerProfilingCache:
                 # value we store, not the enum member — else non-IntEnum fails).
                 assert tactic_check == ast.literal_eval(
                     tactic_str
-                ), "Tactic is not compatible with json.dumps/json.loads"
+                ), f"Tactic is not compatible with json.dumps/json.loads"
             except Exception as e:
                 logger.warning_once(
                     f"[AutoTuner] Could not serialize tactic: {tactic_str} for cache key {key_str} due to {e}. Deserialization may fail.",
@@ -1813,9 +1813,9 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def print_profiling_cache(self):
-        self._debug_logger("[Autotuner] The profiling_cache entries:")
+        self._debug_logger(f"[Autotuner] The profiling_cache entries:")
         self._debug_logger(
-            "[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
+            f"[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
         )
         for key, value in self.profiling_cache.cache.items():
             runner_id, tactic, min_time = value
@@ -1826,7 +1826,7 @@ class AutoTuner:
         self.print_statistics()
 
     def print_statistics(self):
-        self._debug_logger("[Autotuner] The statistics:")
+        self._debug_logger(f"[Autotuner] The statistics:")
         for line in self.stats.__str__().split("\n"):
             self._debug_logger(line)
 
