@@ -91,9 +91,13 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
-# Generate OSS attribution file for devel image
+ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ARG TARGETARCH
+ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
+    TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Generate OSS attribution file for devel image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/tmp/gen_attribution.sh \
     bash /tmp/gen_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
 
@@ -130,6 +134,7 @@ COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt re
 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
+ARG GIT_COMMIT
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
@@ -137,7 +142,9 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     if [ -n "$GITHUB_MIRROR" ]; then \
       export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
+    GITHUB_MIRROR=${GITHUB_MIRROR} \
+    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 

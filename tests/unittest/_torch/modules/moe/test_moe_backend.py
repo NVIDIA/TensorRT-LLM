@@ -1133,7 +1133,7 @@ DTYPES_TO_TEST = [
 CI_MOE_MODEL_CONFIGS = [
     # Real models (small/medium — tactic replay is model-size-independent,
     # e256 is covered by test_moe_module integration tests)
-    MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
+    MoeModelConfig(60, 4, 2048, 1408),  # retained 60-expert backend shape
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
     # Boundary tests for tactic correctness
@@ -1329,7 +1329,7 @@ TEST_PARAMS += generate_element_wise_test_params()
 #    - Supported by: CUTLASS (W4A8_MXFP4_MXFP8), TRTLLM (W4A8_MXFP4_MXFP8)
 #
 # 6. MODEL CONFIGURATIONS:
-#    - Real models: Mixtral, DeepSeek, Qwen, Grok, GPT-OSS
+#    - Real models: Mixtral, DeepSeek, Grok, GPT-OSS
 #    - Boundary cases: prime num_experts, small sizes, top_k=1, top_k=num_experts
 #
 # =============================================================================
