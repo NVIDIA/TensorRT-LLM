@@ -327,3 +327,26 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     for t in tactics:
         assert isinstance(t, tuple) and len(t) == 4
         assert all(isinstance(v, int) for v in t)
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_splitk_kernel_generic_epilogue_matches_torch() -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+        SplitKTactic,
+        run_splitk_dense,
+    )
+
+    torch.manual_seed(42)
+    a = torch.randn((4, 512), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((4, 256), dtype=torch.bfloat16, device="cuda")
+    run_splitk_dense(
+        a,
+        weight.t(),
+        None,
+        output,
+        False,
+        SplitKTactic(mma_m=64, mma_n=8, split_k=4, ab_stages=2),
+    )
+    torch.testing.assert_close(output, torch.nn.functional.linear(a, weight), rtol=1e-2, atol=5e-3)

@@ -43,6 +43,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
 from .linear import Linear
@@ -52,6 +53,32 @@ from .qwen4_exp_hyper_connection_kernels import hc_combine, hc_combine_norm, hc_
 __all__ = ["GroupedRMSNorm", "Qwen4ExpHyperConnection"]
 
 _HC_DIRECT_SKINNY_GEMM_ENV = "TRTLLM_QWEN4_EXP_HC_DIRECT_SKINNY_GEMM"
+_HC_FUSED_MIX_ENV = "TRTLLM_QWEN4_EXP_HC_FUSED_MIX"
+_HC_FUSED_MIX_MAX_ROWS = 16
+_HC_FUSED_LOWRANK_ALIGNMENT = 128
+
+
+def _fused_mix_requested() -> bool:
+    return os.environ.get(_HC_FUSED_MIX_ENV, "0") == "1"
+
+
+def _permute_pad_up_weight(
+    weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    padded_lowrank: int,
+) -> torch.Tensor:
+    hc_dim, lowrank = weight.shape
+    padded = torch.zeros(
+        (hc_dim, padded_lowrank),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+    padded[:, :lowrank] = weight.detach()
+    source = torch.arange(hc_dim, device=weight.device)
+    permutation = torch.empty(hc_dim, dtype=torch.long, device=weight.device)
+    permutation[(source % hidden_size) * hc_count + (source // hidden_size)] = source
+    return padded[permutation].contiguous()
 
 
 class GroupedRMSNorm(TritonRMSNorm):
@@ -173,9 +200,16 @@ class Qwen4ExpHyperConnection(nn.Module):
 
         hc_dim = hc_count * hidden_size
         if use_mix:
-            self.input_mix_padding = (-(hc_lowrank + hc_count)) % 16 if use_combine else 0
+            self.fused_mix_requested = use_combine and _fused_mix_requested()
+            self.input_mix_lowrank_padding = (
+                (-hc_lowrank) % _HC_FUSED_LOWRANK_ALIGNMENT if self.fused_mix_requested else 0
+            )
+            self.input_mix_injection_offset = hc_lowrank + self.input_mix_lowrank_padding
+            self.input_mix_padding = (
+                (-(self.input_mix_injection_offset + hc_count)) % 16 if use_combine else 0
+            )
             if use_combine:
-                packed_rows = hc_lowrank + hc_count + self.input_mix_padding
+                packed_rows = self.input_mix_injection_offset + hc_count + self.input_mix_padding
                 self.input_mix_weight_down_block_inject = Linear(
                     hc_dim,
                     packed_rows,
@@ -203,6 +237,11 @@ class Qwen4ExpHyperConnection(nn.Module):
                 mapping=mapping,
                 reduce_output=False,
                 use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            )
+            self.register_buffer(
+                "_input_mix_weight_up_permuted_padded",
+                None,
+                persistent=False,
             )
             if device is not None:
                 self.input_mix_weight_up.to(device=device)
@@ -309,11 +348,17 @@ class Qwen4ExpHyperConnection(nn.Module):
     ) -> Tuple[torch.Tensor, HCResidual]:
         """Project a normalized HC bundle and retain its combine logits."""
         hc, hs = self.hc_count, self.hidden_size
+        fused = self._fused_mix_normed(normed) if self.fused_mix_requested else None
+        if fused is not None:
+            mixed, injection_logits = fused
+            return mixed.to(self.params_dtype), (hyper_input, normed, injection_logits)
         if self.use_combine:
             packed = self._packed_down_and_injection(normed)
-            down, injection_logits, _ = packed.split(
-                (self.hc_lowrank, hc, self.input_mix_padding), dim=-1
-            )
+            down = packed[..., : self.hc_lowrank]
+            injection_logits = packed[
+                ...,
+                self.input_mix_injection_offset : self.input_mix_injection_offset + hc,
+            ]
         else:
             down = self.input_mix_weight_down(normed)
             injection_logits = None
@@ -329,6 +374,105 @@ class Qwen4ExpHyperConnection(nn.Module):
             mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
 
         return mixed.to(self.params_dtype), (hyper_input, normed, injection_logits)
+
+    def _fused_mix_normed(
+        self,
+        normed: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the decode-size HC mix through two fused CuTe GEMMs."""
+        if normed.ndim != 2:
+            return None
+        rows = normed.shape[0]
+        packed_projection = self.input_mix_weight_down_block_inject
+        packed_weight = packed_projection.weight
+        up_weight = self.input_mix_weight_up.weight
+        if not (
+            self.fused_mix_requested
+            and not torch.is_grad_enabled()
+            and 0 < rows <= _HC_FUSED_MIX_MAX_ROWS
+            and normed.is_cuda
+            and packed_weight.is_cuda
+            and up_weight.is_cuda
+            and normed.dtype == torch.bfloat16
+            and packed_weight.dtype == torch.bfloat16
+            and up_weight.dtype == torch.bfloat16
+            and normed.is_contiguous()
+            and packed_weight.is_contiguous()
+            and up_weight.is_contiguous()
+            and self.hc_count == 4
+            and self.input_mix_injection_offset % _HC_FUSED_LOWRANK_ALIGNMENT == 0
+            and is_sm_100f()
+        ):
+            return None
+
+        permuted_up = self._input_mix_weight_up_permuted_padded
+        if permuted_up is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            permuted_up = _permute_pad_up_weight(
+                up_weight,
+                self.hc_count,
+                self.hidden_size,
+                self.input_mix_injection_offset,
+            )
+            self._input_mix_weight_up_permuted_padded = permuted_up
+
+        from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+            SplitKTactic,
+            default_tactic,
+            run_splitk_dense_gate,
+            run_splitk_dense_silu_prefix,
+        )
+        from ..flashinfer_utils import get_env_enable_pdl
+
+        pdl = get_env_enable_pdl()
+        packed = torch.empty(
+            (rows, packed_weight.shape[0]),
+            dtype=normed.dtype,
+            device=normed.device,
+        )
+        down_tactic = SplitKTactic(
+            mma_m=64,
+            mma_n=8,
+            split_k=16,
+            ab_stages=6,
+        )
+        run_splitk_dense_silu_prefix(
+            normed,
+            packed_weight.t(),
+            packed,
+            pdl,
+            down_tactic,
+            1.0 / self.hc_count,
+            self.input_mix_injection_offset,
+        )
+
+        mixed = torch.empty(
+            (rows, self.hidden_size),
+            dtype=normed.dtype,
+            device=normed.device,
+        )
+        gate_input = packed[:, : self.input_mix_injection_offset]
+        gate_tactic = default_tactic(
+            rows,
+            self.hc_count * self.hidden_size,
+            self.input_mix_injection_offset,
+        )
+        run_splitk_dense_gate(
+            gate_input,
+            permuted_up.t(),
+            normed,
+            mixed,
+            pdl,
+            gate_tactic,
+            1.0 / self.hc_count,
+            self.hc_count,
+        )
+        injection_logits = packed[
+            ...,
+            self.input_mix_injection_offset : self.input_mix_injection_offset + self.hc_count,
+        ]
+        return mixed, injection_logits
 
     def mix(self, hyper_input: torch.Tensor) -> Tuple[torch.Tensor, HCResidual]:
         """10240 -> 2560. Returns ``(mixed_input, residual_state)`` where
