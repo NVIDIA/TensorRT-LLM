@@ -26,6 +26,10 @@ l0_rtx_pro_6000:
   - unittest/_torch/thop/parallel/test_weight_only_quant_linear.py
   - unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py
   - unittest/_torch/thop/parallel/test_w4a8_linear.py
+  # FP8 UE8M0 quant kernels, incl. the torch.compile guards against Inductor
+  # binding the host-side float scalars as fp64 (breaks the int32 bitcast).
+  - unittest/_torch/thop/parallel/test_fp8_quantize.py
+  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
