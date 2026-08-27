@@ -15,7 +15,7 @@ the latest changes, but their quality is not guaranteed and they may contain bug
 Pre-built TensorRT LLM releases are available as [container images on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release). This is the simplest way to obtain TensorRT LLM.
 
 Replace `x.y.z` with the desired version tag. The [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)
-include both regular and `.dev` nightly releases; select the latest tag or a specific version.
+include both regular and `.dev` nightly releases.
 
 ```bash
 docker pull nvcr.io/nvidia/tensorrt-llm/release:x.y.z
@@ -85,10 +85,10 @@ pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_ll
 Nightly wheels are published to a dedicated package index. Use `--extra-index-url` to add this index while keeping
 PyPI available for dependency resolution.
 
-To install or upgrade to the latest nightly release:
+To install the latest nightly release:
 
 ```bash
-pip3 install --pre --upgrade tensorrt_llm \
+pip3 install --pre tensorrt_llm \
     --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 ```
 
@@ -100,14 +100,8 @@ pip3 install --pre "tensorrt_llm==<version>" \
     --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 ```
 
-> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
->
-> ```bash
-> # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container
-> pip3 install tensorrt_llm==1.3.0rc16+ngcpytorch2602
-> ```
->
-> If the NGC PyTorch container-specific wheel is not available, you can instead install the pre-built wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
+> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
+> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
 
 ### Sanity check
 
