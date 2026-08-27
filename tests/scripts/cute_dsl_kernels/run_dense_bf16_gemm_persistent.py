@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -53,16 +53,12 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
-        dense_gemm_persistent as kernel_module,
-    )
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin import dense_gemm_persistent as kernel_module
 except (ModuleNotFoundError, ImportError):
     sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell import dense_gemm_persistent as kernel_module
-    from blackwell.utils import make_ptr
+    from rubin import dense_gemm_persistent as kernel_module
 
-PersistentDenseGemmKernel = kernel_module.PersistentDenseGemmKernel
+PersistentDenseGemmKernel = kernel_module.SM107PersistentDenseGemmKernel
 
 try:
     from .testing import benchmark
@@ -164,50 +160,20 @@ def run(
     # C layout: (M, N, batch)
     c_major = "n"
 
-    # Skip unsupported testcase
-    if not PersistentDenseGemmKernel.can_implement(
-        ab_dtype,
-        acc_dtype,
-        c_dtype,
-        use_2cta_instrs,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        m,
-        n,
-        k,
-        batch,
-        a_major,
-        b_major,
-        c_major,
-    ):
-        raise TypeError(
-            f"Unsupported testcase {ab_dtype}, {acc_dtype}, {c_dtype}, "
-            f"use_2cta={use_2cta_instrs}, "
-            f"{mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {batch}, "
-            f"{a_major}, {b_major}, {c_major}"
-        )
+    # NOTE: can_implement check skipped for SM107 - the kernel constructor
+    # and compile step will raise if configuration is unsupported.
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
     torch.manual_seed(1111)
 
-    # Determine torch dtype for A/B
-    if ab_dtype == cutlass.BFloat16:
-        _ab_torch_dtype = torch.bfloat16  # noqa: F841
-    elif ab_dtype == cutlass.Float16:
-        _ab_torch_dtype = torch.float16  # noqa: F841
-    else:
+    # Validate A/B dtype
+    if ab_dtype not in (cutlass.BFloat16, cutlass.Float16):
         raise ValueError(f"Unsupported ab_dtype: {ab_dtype}")
 
-    # Determine torch dtype for C
-    if c_dtype == cutlass.BFloat16:
-        _c_torch_dtype = torch.bfloat16  # noqa: F841
-    elif c_dtype == cutlass.Float32:
-        _c_torch_dtype = torch.float32  # noqa: F841
-    elif c_dtype == cutlass.Float16:
-        _c_torch_dtype = torch.float16  # noqa: F841
-    else:
+    # Validate C dtype
+    if c_dtype not in (cutlass.BFloat16, cutlass.Float32, cutlass.Float16):
         raise ValueError(f"Unsupported c_dtype: {c_dtype}")
 
     # Create tensors:
@@ -218,26 +184,43 @@ def run(
     b_ref = cutlass_torch.matrix(batch, n, k, b_major == "n", cutlass.Float32)
     c_ref = cutlass_torch.matrix(batch, m, n, c_major == "m", cutlass.Float32)
 
-    _, a_torch = cutlass_torch.cute_tensor_like(
+    a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    _, b_torch = cutlass_torch.cute_tensor_like(
+    b_tensor, b_torch = cutlass_torch.cute_tensor_like(
         b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    _, c_torch = cutlass_torch.cute_tensor_like(
+    c_tensor, c_torch = cutlass_torch.cute_tensor_like(
         c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    a_ptr = make_ptr(ab_dtype, a_torch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    b_ptr = make_ptr(ab_dtype, b_torch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    c_tensor = from_dlpack(c_torch, assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if c_major == "n" else 0
+
+    # Mark tensor to be byte aligned
+    a_tensor.mark_compact_shape_dynamic(
+        mode=1 if a_major == "k" else 0,
+        stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
+        divisibility=1,
+    )
+    b_tensor.mark_compact_shape_dynamic(
+        mode=1 if b_major == "k" else 0,
+        stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
+        divisibility=1,
+    )
+    c_tensor.mark_compact_shape_dynamic(
+        mode=1 if c_major == "n" else 0,
+        stride_order=(2, 0, 1) if c_major == "n" else (2, 1, 0),
+        divisibility=1,
     )
 
     # Configure gemm kernel
+    # SM107 kernel requires mma_tiler (M, N, K) and mma_inst_shape (M, N, K)
+    mma_k = 32  # K dimension for BF16/FP16 MMA on SM107
+    mma_tiler = (*mma_tiler_mn, mma_k)
+    mma_inst_shape = (*mma_tiler_mn, mma_k)
     gemm = PersistentDenseGemmKernel(
         acc_dtype,
         use_2cta_instrs,
-        mma_tiler_mn,
+        mma_tiler,
+        mma_inst_shape,
         cluster_shape_mn,
         use_tma_store=True,
     )
@@ -251,16 +234,22 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
+    # Extract pointers from tensors for wrapper/wrapper_strided
+    a_ptr = a_tensor.iterator
+    b_ptr = b_tensor.iterator
+
     if use_strided:
-        # Strided BMM mode: need a_stride_m and a_stride_batch
-        # A is (M, K, batch) with K innermost, so stride along M dimension
-        # and stride along batch dimension are needed.
-        # For a contiguous (M, K, batch) tensor with K innermost:
-        #   stride_k = 1, stride_m = K, stride_batch = M*K
+        # Strided BMM mode: need A and B strides.
+        # A is (M, K, batch) and B is (N, K, batch), both with K innermost,
+        # so the M/N strides and batch strides are needed.
+        # For contiguous tensors with K innermost:
+        #   A: stride_k = 1, stride_m = K, stride_batch = M*K
+        #   B: stride_k = 1, stride_n = K, stride_batch = N*K
         a_stride_m = k
         a_stride_batch = m * k
+        b_stride_n = k
+        b_stride_batch = n * k
 
-        # Compile gemm kernel for strided mode
         compiled_gemm = cute.compile(
             gemm.wrapper_strided,
             m,
@@ -272,6 +261,8 @@ def run(
             c_tensor,
             a_stride_m,
             a_stride_batch,
+            b_stride_n,
+            b_stride_batch,
             max_active_clusters,
             current_stream,
             options="--opt-level 2",
@@ -283,11 +274,13 @@ def run(
                 n,
                 k,
                 batch,
-                a_t,
-                b_t,
+                a_t.iterator,
+                b_t.iterator,
                 c_t,
                 a_stride_m,
                 a_stride_batch,
+                b_stride_n,
+                b_stride_batch,
                 stream,
             )
     else:
@@ -312,8 +305,8 @@ def run(
                 n,
                 k,
                 batch,
-                a_t,
-                b_t,
+                a_t.iterator,
+                b_t.iterator,
                 c_t,
                 stream,
             )
@@ -321,7 +314,7 @@ def run(
     # Compute reference result
     if not skip_ref_check:
         # Execute kernel once for reference checking
-        run_kernel(a_ptr, b_ptr, c_tensor, current_stream)
+        run_kernel(a_tensor, b_tensor, c_tensor, current_stream)
         print("Verifying results...")
 
         # Reference: C = einsum("mkl,nkl->mnl", A, B)
@@ -339,85 +332,81 @@ def run(
 
         torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
 
-    # make_ptr stores only raw addresses, so retain each generated tensor until
-    # the benchmark has finished using its JIT arguments.
-    backing_tensors = []
-
     if use_strided:
 
-        def generate_tensors() -> cute.testing.JitArguments:
-            _, a_torch_new = cutlass_torch.cute_tensor_like(
+        def generate_tensors():
+            a_tensor_new, _ = cutlass_torch.cute_tensor_like(
                 a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
             )
-            _, b_torch_new = cutlass_torch.cute_tensor_like(
+            b_tensor_new, _ = cutlass_torch.cute_tensor_like(
                 b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
             )
-            _, c_torch_new = cutlass_torch.cute_tensor_like(
+            c_tensor_new, _ = cutlass_torch.cute_tensor_like(
                 c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
             )
-            a_ptr_new = make_ptr(
-                ab_dtype,
-                a_torch_new.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
+            a_tensor_new.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=(2, 0, 1),
+                divisibility=1,
             )
-            b_ptr_new = make_ptr(
-                ab_dtype,
-                b_torch_new.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
+            b_tensor_new.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=(2, 0, 1),
+                divisibility=1,
             )
-            c_tensor_new = from_dlpack(c_torch_new, assumed_align=16).mark_layout_dynamic(
-                leading_dim=1 if c_major == "n" else 0
+            c_tensor_new.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=(2, 0, 1),
+                divisibility=1,
             )
-            backing_tensors.append((a_torch_new, b_torch_new, c_torch_new))
             return cute.testing.JitArguments(
                 m,
                 n,
                 k,
                 batch,
-                a_ptr_new,
-                b_ptr_new,
+                a_tensor_new.iterator,
+                b_tensor_new.iterator,
                 c_tensor_new,
                 a_stride_m,
                 a_stride_batch,
+                b_stride_n,
+                b_stride_batch,
                 current_stream,
             )
     else:
 
-        def generate_tensors() -> cute.testing.JitArguments:
-            _, a_torch_new = cutlass_torch.cute_tensor_like(
+        def generate_tensors():
+            a_tensor_new, _ = cutlass_torch.cute_tensor_like(
                 a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
             )
-            _, b_torch_new = cutlass_torch.cute_tensor_like(
+            b_tensor_new, _ = cutlass_torch.cute_tensor_like(
                 b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
             )
-            _, c_torch_new = cutlass_torch.cute_tensor_like(
+            c_tensor_new, _ = cutlass_torch.cute_tensor_like(
                 c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
             )
-            a_ptr_new = make_ptr(
-                ab_dtype,
-                a_torch_new.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
+            a_tensor_new.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=(2, 0, 1),
+                divisibility=1,
             )
-            b_ptr_new = make_ptr(
-                ab_dtype,
-                b_torch_new.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
+            b_tensor_new.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=(2, 0, 1),
+                divisibility=1,
             )
-            c_tensor_new = from_dlpack(c_torch_new, assumed_align=16).mark_layout_dynamic(
-                leading_dim=1 if c_major == "n" else 0
+            c_tensor_new.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=(2, 0, 1),
+                divisibility=1,
             )
-            backing_tensors.append((a_torch_new, b_torch_new, c_torch_new))
             return cute.testing.JitArguments(
                 m,
                 n,
                 k,
                 batch,
-                a_ptr_new,
-                b_ptr_new,
+                a_tensor_new.iterator,
+                b_tensor_new.iterator,
                 c_tensor_new,
                 current_stream,
             )

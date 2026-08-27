@@ -60,6 +60,12 @@ from cutlass.pipeline import agent_sync
 
 _make_sync_object = _Sm100PipelineFactory._make_sync_object
 
+try:
+    from cutlass.pipeline.sm100 import PipelineTmaUmma as _Sm100PipelineTmaUmma
+    _sm100_make_sync = _Sm100PipelineTmaUmma._make_sync_object
+except (ImportError, AttributeError):
+    _sm100_make_sync = PipelineAsync._make_sync_object
+
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
     """Initializes the mbarrier and synchronizes the threadblock or cluster.
@@ -188,9 +194,9 @@ class PipelineTmaUmma(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = _make_sync_object(barrier_storage.align(min_align=8),
-                                             num_stages, producer, tx_count)
-        sync_object_empty = _make_sync_object(
+        sync_object_full = _sm100_make_sync(barrier_storage.align(min_align=8),
+                                            num_stages, producer, tx_count)
+        sync_object_empty = _sm100_make_sync(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -343,9 +349,9 @@ class PipelineUmmaAsync(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = _make_sync_object(barrier_storage.align(min_align=8),
-                                             num_stages, producer)
-        sync_object_empty = _make_sync_object(
+        sync_object_full = _sm100_make_sync(barrier_storage.align(min_align=8),
+                                            num_stages, producer)
+        sync_object_empty = _sm100_make_sync(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -496,12 +502,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = _make_sync_object(
+        sync_object_full = _sm100_make_sync(
             barrier_storage.align(min_align=8),
             num_stages,
             producer,
         )
-        sync_object_empty = _make_sync_object(
+        sync_object_empty = _sm100_make_sync(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
