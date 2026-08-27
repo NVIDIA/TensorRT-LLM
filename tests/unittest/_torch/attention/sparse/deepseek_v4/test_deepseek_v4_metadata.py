@@ -86,15 +86,15 @@ def _minimal_metadata_for_base_prepare() -> DeepseekV4TrtllmAttentionMetadata:
     metadata.kv_cache_manager = _RecordingKvCacheManager()
     metadata.draft_kv_cache_manager = _RecordingDeepseekV4CacheManager()
     metadata.request_ids = [11, 12]
-    metadata.num_contexts = 1
-    metadata.num_generations = 1
-    metadata.num_seqs = 2
-    metadata.num_tokens = 5
-    metadata.num_ctx_tokens = 3
+    metadata._seq_lens = torch.tensor([3, 2], dtype=torch.int)
+    metadata._seq_lens_kv = torch.tensor([3, 2], dtype=torch.int)
+    metadata._seq_lens_cuda = metadata._seq_lens
+    metadata._seq_lens_kv_cuda = metadata._seq_lens_kv
+    metadata._num_contexts = 1
+    metadata._num_generations = 1
+    metadata._num_tokens = 5
+    metadata._num_ctx_tokens = 3
     metadata.prompt_lens = [3, 1]
-    metadata.context_lens = [3, 1]
-    metadata.seq_lens = torch.tensor([3, 2], dtype=torch.int)
-    metadata.seq_lens_kv = torch.tensor([3, 2], dtype=torch.int)
     metadata.kv_cache_params = KVCacheParams(
         use_cache=True,
         num_cached_tokens_per_seq=[0, 1],
