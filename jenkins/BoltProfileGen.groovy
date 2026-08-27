@@ -27,12 +27,12 @@
 // (scripts/bolt/internal/slurm_merge.sh) gathers every workload's .fdata, merges
 // + packages the promotable bundle.
 //
-// Run on-demand today (manual / bot-triggered); there is no auto-trigger.
+// Launched from the postmerge pipeline's SBSA branch with promote=true, so it
+// runs on that pipeline's cadence; also runnable on demand with explicit params.
 // APPLY_PROFILES (default on) re-BOLTs that tarball in the same run
-// ("consume immediately after generating"); PROMOTE (opt-in) publishes the
-// packaged bundle to the branch-keyed Artifactory path so premerge can pull
-// `latest` (apply_latest.sh). Wiring the postmerge trigger is the remaining
-// deployment step; see promoteBundle().
+// ("consume immediately after generating"); PROMOTE (set by the postmerge launch,
+// opt-in elsewhere) publishes the packaged bundle to the branch-keyed Artifactory
+// path so premerge can pull `latest` (apply_latest.sh).
 // =============================================================================
 
 import groovy.transform.Field
@@ -55,7 +55,9 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 LLM_DOCKER_IMAGE = env.dockerImage
 AGENT_IMAGE = env.dockerImage ? env.dockerImage.replace("aarch64", "x86_64") : env.dockerImage
 
-// ---- bolt-specific params (passed by launchJob additionalParameters) --------
+// ---- bolt-specific params ---------------------------------------------------
+// Declared in the parameters{} block below and/or passed by launchJob; each
+// resolves as `params.X ?: env.X ?: default`, so empty keeps the default here.
 // targetArch        : aarch64-linux-gnu | x86_64-linux-gnu
 // boltRef           : source ref/commit the tarball was built from
 // branch            : branch name for the branch-keyed promote path
@@ -596,6 +598,97 @@ pipeline {
     agent {
         // Lightweight x86 CPU dispatcher pod; the heavy work runs on SLURM nodes.
         kubernetes createKubernetesPodConfig(AGENT_IMAGE, "amd64")
+    }
+    // "" default wherever the real default is derived at run time (from targetArch,
+    // the resolved partition, or parent env) and so can't be a static value: the
+    // resolution chains above handle those, and "" is falsy, so empty == default.
+    // gitlabSourceRepoHttpUrl/gitlabCommit are declared because this block REPLACES
+    // the job's parameter list on every run, and an undeclared parameter is dropped
+    // even when the parent sends it -- so the job config's ${gitlabSourceRepoHttpUrl}
+    // SCM URL, which fetches this file, would never resolve. The remaining
+    // pass-throughs (artifactCommit, gitlabTargetBranch, boltModelsRoot) are optional
+    // and stay undeclared.
+    parameters {
+        string(
+            name: "gitlabSourceRepoHttpUrl",
+            defaultValue: "",
+            description: "Repo the job config's SCM step clones to read this Jenkinsfile. Passed by the parent, already resolved via its default-llm-repo credential; set explicitly for a standalone run. Left empty here so no repo is hardcoded and the per-instance credential stays authoritative."
+        )
+        string(
+            name: "gitlabCommit",
+            defaultValue: "",
+            description: "Commit the SCM step checks out, and the boltRef fallback recorded in the bundle manifest. Passed by the parent; empty lets boltRef fall through to \"unknown\"."
+        )
+        string(
+            name: "targetArch",
+            defaultValue: "",
+            description: "Build triple to profile. Empty -> aarch64-linux-gnu; also selects the boltTarName and slurmPlatform defaults."
+        )
+        string(
+            name: "artifactPath",
+            defaultValue: "",
+            description: "Artifactory directory holding the input tarball, e.g. sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/<build>. Passed by the parent pipeline; set explicitly for a standalone run."
+        )
+        string(
+            name: "dockerImage",
+            defaultValue: "",
+            description: "Container image the SLURM collect and merge jobs run in; must match targetArch (LLM_SBSA_DOCKER_IMAGE for aarch64). Passed by the parent pipeline."
+        )
+        string(
+            name: "boltRef",
+            defaultValue: "",
+            description: "Provenance ref recorded in the bundle manifest and versioned bundle name. Empty -> artifactCommit, then gitlabCommit, then \"unknown\"."
+        )
+        string(
+            name: "branch",
+            defaultValue: "",
+            description: "Branch key of the promote path (.../bolt-profiles/<branch>/<triple>/). Empty -> gitlabTargetBranch, then main."
+        )
+        string(
+            name: "boltTarName",
+            defaultValue: "",
+            description: "Name of the tarball to profile under artifactPath. Empty -> TensorRT-LLM-GH200.tar.gz for aarch64, TensorRT-LLM.tar.gz for x86_64."
+        )
+        choice(
+            name: "promote",
+            choices: ["false", "true"],
+            description: "Publish the bundle to the branch-keyed Artifactory path, as a versioned copy and latest.tar.gz. false still builds a bundle, but repoints nothing."
+        )
+        choice(
+            name: "applyProfiles",
+            choices: ["true", "false"],
+            description: "Re-BOLT the input tarball with the just-generated bundle in the merge job, as a same-commit check that the profiles apply. No extra GPU allocation."
+        )
+        string(
+            name: "slurmPlatform",
+            defaultValue: "",
+            description: "SlurmConfig platform for the collect and merge jobs. Empty -> gb300-flex-aws-cmh for aarch64, unset for x86_64."
+        )
+        string(
+            name: "numNodes",
+            defaultValue: "2",
+            description: "Legacy single-workload node count. UNUSED by the fan-out, which sizes each allocation from the workload's own config."
+        )
+        string(
+            name: "boltIterMult",
+            defaultValue: "",
+            description: "Multiplier on each workload's client iterations (num_requests = concurrency * iterations * mult), for a steady-state profile. Empty -> 64."
+        )
+        string(
+            name: "boltHarnessPartition",
+            defaultValue: "",
+            description: "SLURM partition for the perf-harness collect jobs. Empty -> the partition of the resolved slurmPlatform."
+        )
+        string(
+            name: "boltHarnessMounts",
+            defaultValue: "",
+            description: "Container bind mounts for the harness. Empty -> the run workspace plus the models root."
+        )
+        string(
+            name: "boltHarnessTimeLimit",
+            defaultValue: "",
+            description: "SLURM walltime per collect job. Empty -> 04:00:00 (instrumented runs are much slower than uninstrumented ones)."
+        )
     }
     options {
         skipDefaultCheckout()

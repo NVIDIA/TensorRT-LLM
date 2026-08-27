@@ -56,9 +56,16 @@ def _reference_select_blocks(
     return idx.to(torch.int32)
 
 
+# Rows wider than this go to the histogram select instead of the register-
+# resident bitonic sorts; see kSmallMaxBlocks in
+# cpp/tensorrt_llm/kernels/minimaxM3SelectBlocks.cu.
+HISTOGRAM_MIN_BLOCKS = 129
+
+
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize(
-    "num_blocks", [1, 8, 16, 17, 32, 33, 64, 65, 96, 127, 128, 129, 1024, 1537]
+    "num_blocks",
+    [1, 8, 16, 17, 32, 33, 64, 65, 96, 127, 128, 129, 1024, 1537, 4096, 8192],
 )
 def test_fused_selector_matches_reference_random(num_kv_heads, num_blocks):
     total_q = 19
@@ -420,6 +427,236 @@ def test_fused_selector_rejects_invalid_operator_contracts(case, match):
             local_blocks,
             False,
         )
+
+
+@pytest.mark.parametrize("num_blocks", [HISTOGRAM_MIN_BLOCKS, 512, 3000])
+def test_histogram_selector_matches_reference_ties_and_forcing(num_blocks):
+    """All-equal scores on the histogram path.
+
+    Every block lands in one histogram bin, so the whole top-k comes out of the
+    boundary sort. That sort must break ties towards the smaller block index to
+    match torch.topk, which is the part of the histogram select that does not
+    come for free from the vendored algorithm.
+    """
+    scores = torch.zeros((2, num_blocks, 5), device="cuda", dtype=torch.float32)
+    n_valid_blocks = torch.tensor(
+        [0, 16, 17, num_blocks - 1, num_blocks], device="cuda", dtype=torch.int32
+    )
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_histogram_selector_matches_reference_mixed_length_batch():
+    """Per-row valid-block bounds, from a single block up to the full row.
+
+    The histogram select reads each row through its own n_valid_blocks bound
+    rather than a batch-wide one, so a batch whose rows span the trivial
+    path, the boundary-sort path, and everything between must still agree.
+    """
+    num_kv_heads, num_blocks = 3, 2048
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    n_valid_blocks = torch.tensor(
+        [0, 1, 15, 16, 17, 63, 200, 1023, 2047, 2048, 4096, -5],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    scores = torch.randn(
+        num_kv_heads,
+        num_blocks,
+        n_valid_blocks.numel(),
+        generator=generator,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=2,
+        local_blocks=3,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=2,
+        local_blocks=3,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_histogram_selector_matches_reference_fp16_indistinguishable_scores():
+    """Scores that share one fp16 bin but are all distinct in fp32.
+
+    Step 0 of the histogram select bins an fp16 cast of the score, so this row
+    lands entirely in one bin, overflows the boundary staging buffer, and
+    forces the kernel through the exact fp32 refinement steps. Consecutive fp32
+    values keep every score distinct, which keeps the expected answer
+    well-defined: more than 2048 bit-identical scores in one row is the one
+    case the histogram select resolves arbitrarily.
+    """
+    num_kv_heads, num_blocks, total_q = 2, 3000, 4
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    # 3000 consecutive fp32 values above 1.0 span ~3.6e-4, inside the ~9.8e-4
+    # rounding interval of fp16's 1.0.
+    ladder = 1.0 + torch.arange(num_blocks, device="cuda", dtype=torch.float32) * 2.0**-23
+    noise = torch.rand(num_kv_heads, total_q, num_blocks, generator=generator, device="cuda")
+    scores = ladder[noise.argsort(dim=-1)].permute(0, 2, 1).contiguous()
+    assert scores.shape == (num_kv_heads, num_blocks, total_q)
+    assert torch.unique(scores[0, :, 0]).numel() == num_blocks
+    n_valid_blocks = torch.tensor([17, 1000, 2999, 3000], device="cuda", dtype=torch.int32)
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=0,
+        local_blocks=1,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=0,
+        local_blocks=1,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_histogram_selector_matches_reference_nonfinite():
+    """NaN, +-inf and forced sentinels together on the histogram path.
+
+    NaN must outrank +inf (torch.topk on CUDA orders it that way), the init and
+    local sentinels must outrank ordinary scores, and query 1 has fewer than
+    sixteen non--inf valid blocks so some selected slots must come back as -1
+    rather than as a block index.
+    """
+    num_blocks, total_q = 300, 4
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    scores = torch.randn(2, num_blocks, total_q, generator=generator, device="cuda")
+    scores[:, 5, :] = float("nan")
+    scores[:, 6, :] = float("inf")
+    scores[:, 7, :] = float("-inf")
+    # Query 1 keeps only ten finite blocks inside its 200 valid ones.
+    scores[:, 10:, 1] = float("-inf")
+    n_valid_blocks = torch.tensor([17, 200, 290, num_blocks], device="cuda", dtype=torch.int32)
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=3,
+        local_blocks=4,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=3,
+        local_blocks=4,
+    )
+
+    assert (expected[1] == -1).any(), "query 1 should exercise the -inf -> -1 rule"
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("num_nan", [16, 48])
+def test_histogram_selector_matches_reference_repeated_nan(num_nan):
+    """A row whose threshold bin holds more than one NaN.
+
+    NaN outranks every finite score and +inf, so a row with at least topk NaNs
+    makes the NaN bin the threshold bin and sends every NaN through the
+    boundary sort. That sort therefore has to rank NaN against NaN, which
+    comparing the scores as floats cannot do.
+    """
+    num_kv_heads, num_blocks, total_q = 2, 300, 3
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    scores = torch.randn(num_kv_heads, num_blocks, total_q, generator=generator, device="cuda")
+    nan_blocks = torch.arange(20, 20 + 2 * num_nan, 2, device="cuda")
+    scores[:, nan_blocks, :] = float("nan")
+    n_valid_blocks = torch.full((total_q,), num_blocks, device="cuda", dtype=torch.int32)
+
+    kwargs = dict(topk=16, n_valid_blocks=n_valid_blocks, init_blocks=0, local_blocks=0)
+    actual = select_blocks_from_maxscore(scores, **kwargs)
+
+    # The NaNs are bit-identical, so the smaller-block-index tie-break decides.
+    expected = nan_blocks[:16].to(torch.int32).view(1, 1, 16).expand(total_q, num_kv_heads, 16)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, _reference_select_blocks(scores, **kwargs))
+
+
+@pytest.mark.parametrize("num_blocks", [HISTOGRAM_MIN_BLOCKS, 1023])
+def test_histogram_selector_matches_reference_contiguous_single_query(num_blocks):
+    """The float4 read path, which needs a unit block stride.
+
+    A [num_kv_heads, n_blocks, total_q] score tensor has block stride total_q,
+    so only a single-query batch reads through float4. An odd n_blocks with
+    several KV heads misaligns the row base for some heads and leaves a
+    remainder, so the scalar lead-in and the scalar tail run alongside the
+    vector body.
+    """
+    num_kv_heads = 3
+    generator = torch.Generator(device="cuda").manual_seed(23)
+    scores = torch.randn(num_kv_heads, num_blocks, 1, generator=generator, device="cuda")
+    assert scores.stride(1) == 1
+    assert num_blocks % 4 != 0
+    n_valid_blocks = torch.tensor([num_blocks], device="cuda", dtype=torch.int32)
+
+    kwargs = dict(topk=16, n_valid_blocks=n_valid_blocks, init_blocks=2, local_blocks=3)
+    assert torch.equal(
+        select_blocks_from_maxscore(scores, **kwargs),
+        _reference_select_blocks(scores, **kwargs),
+    )
+
+
+def test_histogram_selector_supports_strided_scores():
+    """The histogram select reads through blockStride, with no transpose."""
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    backing = torch.randn(2, 601, 22, generator=generator, device="cuda")
+    scores = backing[:, 1:600:2, ::2]
+    assert not scores.is_contiguous()
+    assert scores.shape[1] >= HISTOGRAM_MIN_BLOCKS
+
+    n_valid_blocks = torch.tensor(
+        [0, 1, 16, 17, 100, 200, 299, 300, 400, 17, 33],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=2,
+        local_blocks=3,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=2,
+        local_blocks=3,
+    )
+
+    assert torch.equal(actual, expected)
 
 
 def test_fused_selector_cuda_graph_replay_updates_inputs():

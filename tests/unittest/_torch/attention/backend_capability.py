@@ -156,8 +156,8 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         return f"TRTLLM Blackwell paged attention does not support head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
-    # Qwen2-VL vision tower's head_dim 80 workload; other no-cache head dims in
-    # this sweep still pass on Blackwell.
+    # retained head_dim 80 vision workload; other no-cache head dims in this
+    # sweep still pass on Blackwell.
     if (
         backend == "TRTLLM"
         and sm >= 100

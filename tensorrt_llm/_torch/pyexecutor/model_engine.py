@@ -35,7 +35,6 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor,
                                           create_input_processor,
-                                          create_input_processor_with_hash,
                                           get_multimodal_encoder_item_metadata)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
@@ -45,6 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -334,6 +334,12 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
 
 _DEEP_GEMM_PDL_CONFIGURED = False
 
+# Arbitrary non-greedy params used to force the advanced-sampling CUDA graph
+# warmup capture path.
+NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7,
+                                                    top_k=50,
+                                                    top_p=0.9)
+
 
 def _configure_deep_gemm_pdl() -> None:
     global _DEEP_GEMM_PDL_CONFIGURED
@@ -395,7 +401,7 @@ class PyTorchModelEngine(ModelEngine):
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
-        self.ub_buffers = None
+        self._cleanup_done = False
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -499,12 +505,9 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
-        self.input_processor_with_hash = create_input_processor_with_hash(
-            self.input_processor,
-            encoder_cache_enabled=(
-                llm_args.multimodal_config is not None
-                and llm_args.multimodal_config.encoder_cache_max_bytes > 0),
-        )
+
+        self.moe_load_balancer: Optional[MoeLoadBalancer] = None
+        self.model_loader: Optional[ModelLoader] = None
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
@@ -524,7 +527,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
-                setattr(self, "moe_load_balancer", moe_load_balancer)
+                self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
         self._validate_breakable_cuda_graph_compatibility()
@@ -558,7 +561,6 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args, self.mm_encoder_item_scheduling_enabled)
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
-        self.max_mm_encoder_output_embeddings: Optional[int] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
         # Item scheduling bounds four distinct MM encoder resources. They are
         # owned in different places and measured in different units, so they
@@ -731,9 +733,6 @@ class PyTorchModelEngine(ModelEngine):
             self._encoder_cuda_graph_padding_enabled)
                                      if encoder_cuda_graph_seq_lens else [])
 
-        self._max_cuda_graph_seq_len = (self._cuda_graph_seq_lens[-1]
-                                        if self._cuda_graph_seq_lens else 0)
-
         use_encoder_cuda_graph = ((self._is_encoder_decoder_model()
                                    or self._is_encode_only)
                                   and self.encoder_cuda_graph_config is not None
@@ -828,9 +827,11 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
         self.previous_request_ids = []
         self.has_previous_device_draft = False
-        self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),
-                                                         dtype=torch.int,
-                                                         device='cuda')
+
+        self._encoder_decoder_host_buffer_pool: List[Dict[str, Any]] = []
+        self._encoder_decoder_input_fast_path_static_eligible: Optional[
+            bool] = None
+        self._encoder_decoder_position_id_offset: Optional[int] = None
 
         sparse_params = (self.sparse_attention_config.to_sparse_params(
             pretrained_config=self.model.model_config.pretrained_config)
@@ -1188,16 +1189,14 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def moe_load_balancer_iter_info(self):
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
         if moe_load_balancer is not None:
             return moe_load_balancer.enable_statistic, moe_load_balancer.enable_update_weights
         return False, False
 
     @moe_load_balancer_iter_info.setter
     def moe_load_balancer_iter_info(self, value: Tuple[bool, bool]):
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
         if moe_load_balancer is not None:
             moe_load_balancer.set_iter_info(enable_statistic=value[0],
                                             enable_update_weights=value[1])
@@ -1691,6 +1690,9 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
             next_n = 1 + self.original_max_draft_len
             attn_meta.warmup_cute_dsl_radix_topk(next_n)
+            if hasattr(attn_meta, "warmup_selfsampling_topk"):
+                attn_meta.warmup_selfsampling_topk(
+                    next_n, batch_sizes=self._cuda_graph_batch_sizes)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -2380,17 +2382,8 @@ class PyTorchModelEngine(ModelEngine):
 
         def _run_capture_pass(force_non_greedy: bool, label: str,
                               force_lora_graph: bool) -> None:
-            spec_metadata = self.spec_metadata
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
-            if force_non_greedy and spec_metadata is not None:
-                spec_metadata._force_non_greedy_for_capture = True
-                # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
-                # to build the graph cache key BEFORE populate runs inside
-                # _prepare_inputs. Pre-flip it here so the very first capture
-                # in this pass uses the non-greedy key; populate's override
-                # below will keep it False on every subsequent iteration.
-                spec_metadata.is_all_greedy_sample = False
             try:
                 for bs, draft_len in graphs_to_capture:
                     if bs > self.batch_size:
@@ -2398,7 +2391,11 @@ class PyTorchModelEngine(ModelEngine):
 
                     for max_seq_len in max_seq_len_list:
                         warmup_request = self._create_cuda_graph_warmup_request(
-                            resource_manager, bs, draft_len, max_seq_len)
+                            resource_manager,
+                            bs,
+                            draft_len,
+                            max_seq_len,
+                            force_non_greedy=force_non_greedy)
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
                             if batch is None:
@@ -2429,25 +2426,6 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
-                if force_non_greedy and spec_metadata is not None:
-                    spec_metadata._force_non_greedy_for_capture = False
-                    # The base object is not the only holder of the flag: every
-                    # graph captured during this pass cached its own SHALLOW COPY
-                    # of spec_metadata (create_cuda_graph_metadata -> copy.copy),
-                    # which inherited the flag. Those copies are reseated as the
-                    # live spec_metadata on every later replay, so leaving the
-                    # flag set there makes _scan_one_model_sampling overwrite
-                    # every serving request's sampling params with the synthetic
-                    # capture values (0.7 / 50 / 0.9). Defer cleanup during
-                    # warmup-only because the real capture pass reuses that
-                    # pass's cached metadata.
-                    if not self.cuda_graph_runner.is_warmup_only:
-                        cleared = (self.cuda_graph_runner.
-                                   clear_capture_only_spec_state())
-                        logger.info(
-                            "Cleared capture-only sampling override from "
-                            f"{cleared} cached CUDA graph spec metadata "
-                            "object(s).")
 
         if self.cuda_graph_lora_manager is None:
             lora_graph_cases = [False]
@@ -2486,11 +2464,11 @@ class PyTorchModelEngine(ModelEngine):
                                   force_lora_graph=use_lora_graph)
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
-        # The advanced-sampling capture pass above leaves is_all_greedy_sample
-        # set to False on spec_metadata. Reset it to the default so the first
-        # real iteration's graph-key selection is not seeded with this
-        # capture-only value. (update_is_all_greedy_sample refreshes it every
-        # iteration; this is a defensive guard.)
+        # update_is_all_greedy_sample inside each forward call during the
+        # non-greedy capture pass leaves is_all_greedy_sample=False on
+        # spec_metadata. Reset it so the first real iteration starts clean;
+        # update_is_all_greedy_sample will refresh it on every iteration anyway.
+        # This is a defensive guard.
         if self.spec_metadata is not None:
             self.spec_metadata.is_all_greedy_sample = True
 
@@ -2871,8 +2849,11 @@ class PyTorchModelEngine(ModelEngine):
         max_seq_len: int = None,
         mixed_context_encoder_output_lens: Optional[Sequence[int]] = None,
         mixed_context_query_len: int = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
+        force_non_greedy: bool = False,
     ) -> Optional[ScheduledRequests]:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
+        capture_sampling_params = (NON_GREEDY_CAPTURE_SAMPLING_PARAMS
+                                   if force_non_greedy else None)
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -2913,7 +2894,8 @@ class PyTorchModelEngine(ModelEngine):
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
                 encoder_output_lens=list(mixed_context_encoder_output_lens),
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                capture_sampling_params=capture_sampling_params)
             if context_requests is None:
                 return None
 
@@ -2932,7 +2914,8 @@ class PyTorchModelEngine(ModelEngine):
                     max_beam_width=self.max_beam_width,
                     encoder_output_lens=[max_encoder_output_len] *
                     len(generation_request_ids),
-                    draft_kv_cache_manager=draft_kv_cache_manager)
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                    capture_sampling_params=capture_sampling_params)
                 if generation_requests is None:
                     for request in context_requests:
                         kv_cache_manager.free_resources(request)
@@ -2954,7 +2937,8 @@ class PyTorchModelEngine(ModelEngine):
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
                 encoder_output_lens=encoder_output_lens,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                capture_sampling_params=capture_sampling_params)
             if requests is None:
                 return None
 
@@ -3019,7 +3003,8 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             encoder_output_lens=[max_encoder_output_len]
             if is_enc_dec else None,
-            draft_kv_cache_manager=draft_kv_cache_manager)
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params)
 
         if max_seq_len_request is None:
             free_warmup_requests()
@@ -3401,7 +3386,6 @@ class PyTorchModelEngine(ModelEngine):
                 "A model with MM encoder item scheduling must implement "
                 "get_max_mm_encoder_output_embeddings() and return a positive "
                 "aggregate embedding capacity")
-        self.max_mm_encoder_output_embeddings = max_output_embeddings
         bytes_per_embedding = self._resolve_bytes_per_mm_encoder_embedding()
         self.bytes_per_mm_encoder_embedding = bytes_per_embedding
         return max_output_embeddings * bytes_per_embedding
@@ -3566,35 +3550,28 @@ class PyTorchModelEngine(ModelEngine):
         2. The model module reference.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
-        5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
-           failure the unfreed buffers are kept attached so a deterministic
-           retry doesn't double-free already-released ones, and the
-           collected errors are re-raised after the loop.
 
         Idempotency:
             Subsequent calls are no-ops (guarded by ``_cleanup_done``).
             The flag is set only at the end, so a partial cleanup that
             raises mid-way will be retried on the next call.
 
-        Raises:
-            RuntimeError: If one or more userbuffer deallocations fail
-                (chained from the first error). All other steps are
-                best-effort and either succeed or leak silently with
-                their errors logged at warning level by callees.
-
         Called from:
-            - :meth:`PyExecutor.shutdown` (deterministic teardown).
-            - :meth:`__del__` (best-effort fallback during garbage
-              collection / interpreter shutdown).
+            :meth:`__del__`, and only from there. ``PyExecutor.shutdown``
+            deliberately does *not* call this: it is also invoked mid-init by
+            ``configure_kv_cache_capacity``, which reads ``model`` right
+            afterwards, so clearing ``model`` here would break it. That path
+            calls :meth:`_release_cuda_graphs` and then drops its reference
+            instead.
         """
-        if getattr(self, "_cleanup_done", False):
+        if self._cleanup_done:
             return
 
         # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
         # rolled back.  Keep each handle live until its own release succeeds,
         # so a failed cleanup can be retried without double-freeing resources
         # that were already released.
-        model_loader = getattr(self, "model_loader", None)
+        model_loader = self.model_loader
         if model_loader is not None:
             model_loader.cleanup()
             self.model_loader = None
@@ -3603,26 +3580,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self._release_cuda_graphs()
         self.input_processor = None
-        self.input_processor_with_hash = None
-
-        ub_buffers = getattr(self, 'ub_buffers', None)
-        if ub_buffers:
-            remaining_ub_buffers = []
-            ub_errors = []
-            for u in ub_buffers:
-                try:
-                    ub.ub_deallocate(u.addr)
-                except RuntimeError as e:
-                    # Keep failed buffers attached so a deterministic
-                    # cleanup() call can retry without double-freeing buffers
-                    # that were already deallocated successfully.
-                    remaining_ub_buffers.append(u)
-                    ub_errors.append(e)
-            self.ub_buffers = remaining_ub_buffers or None
-            if ub_errors:
-                raise RuntimeError(
-                    "Failed to deallocate one or more userbuffers during "
-                    "PyTorchModelEngine cleanup") from ub_errors[0]
 
         # Release model weights.
         release_gc()
@@ -3631,15 +3588,16 @@ class PyTorchModelEngine(ModelEngine):
     def __del__(self) -> None:
         """Best-effort cleanup during garbage collection.
 
-        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (raised
-        when one or more userbuffer deallocations fail) and
-        ``AttributeError`` (typical on partially-initialized engines
-        torn down during interpreter shutdown when module references
-        have already been cleared); both are logged and swallowed
-        because destructors cannot reliably surface exceptions.
+        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (which a
+        release step such as :meth:`_release_cuda_graphs` or
+        ``ModelLoader.cleanup`` may raise) and ``AttributeError`` (typical
+        on partially-initialized engines torn down during interpreter
+        shutdown when module references have already been cleared); both
+        are logged and swallowed because destructors cannot reliably
+        surface exceptions.
 
-        Deterministic callers (``PyExecutor.shutdown``) should call
-        :meth:`cleanup` directly so they see any failure.
+        This is the only production caller of :meth:`cleanup` -- see the
+        note there on why ``PyExecutor.shutdown`` must not call it.
         """
         try:
             self.cleanup()
@@ -4241,8 +4199,7 @@ class PyTorchModelEngine(ModelEngine):
             new_tokens_device: Optional[torch.Tensor],
             next_draft_tokens_device: Optional[torch.Tensor]) -> bool:
         """Return whether the TRT-like persistent input path is sufficient."""
-        static_eligible = getattr(
-            self, '_encoder_decoder_input_fast_path_static_eligible', None)
+        static_eligible = self._encoder_decoder_input_fast_path_static_eligible
         if static_eligible is None:
             static_eligible = (
                 hasattr(batch_manager_bindings,
@@ -4273,10 +4230,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _acquire_encoder_decoder_host_buffers(self) -> Dict[str, Any]:
         """Acquire pinned staging whose preceding asynchronous copies finished."""
-        pool = getattr(self, '_encoder_decoder_host_buffer_pool', None)
-        if pool is None:
-            pool = []
-            self._encoder_decoder_host_buffer_pool = pool
+        pool = self._encoder_decoder_host_buffer_pool
         for buffers in pool:
             event = buffers['event']
             if event is None or event.query():
@@ -4329,9 +4283,7 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager: Optional[ResourceManager]):
         """Prepare a simple BART batch with native collation and reused buffers."""
         buffers = self._acquire_encoder_decoder_host_buffers()
-        position_id_offset = getattr(self,
-                                     '_encoder_decoder_position_id_offset',
-                                     None)
+        position_id_offset = self._encoder_decoder_position_id_offset
         if position_id_offset is None:
             position_id_offset = self._get_position_id_offset()
             self._encoder_decoder_position_id_offset = position_id_offset
@@ -6360,16 +6312,6 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
-            # The capture-only sampling override must never be live outside CUDA
-            # graph warmup: it replaces every request's sampling params with
-            # synthetic capture values. It leaked here once already (inherited by
-            # the cached graph metadata shallow copies), so assert rather than
-            # trust the teardown.
-            assert self.is_warmup or not getattr(
-                spec_metadata, '_force_non_greedy_for_capture', False
-            ), ("capture-only sampling override (_force_non_greedy_for_capture) "
-                "is set outside CUDA graph warmup; serving requests would be "
-                "silently decoded with the synthetic capture sampling params")
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
@@ -7182,8 +7124,7 @@ class PyTorchModelEngine(ModelEngine):
         Returns:
             Dict with 'logits' tensor and any other model outputs.
         """
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
 
         batch_size = len(inputs['seq_lens'])
         with self.encoder_cuda_graph_runner.pad_batch(
@@ -7326,8 +7267,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = None
             spec_metadata = None
 
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata,
@@ -7539,10 +7479,6 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
-
-    def _get_spec_worker(self):
-        """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
-        return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
@@ -8023,8 +7959,7 @@ class PyTorchModelEngine(ModelEngine):
                 model_inputs['seq_lens'], key[1])
             model_inputs['attn_metadata'] = graph_attn_metadata
 
-            moe_load_balancer: MoeLoadBalancer = getattr(
-                self, 'moe_load_balancer', None)
+            moe_load_balancer = self.moe_load_balancer
             with with_shared_pool(runner.get_graph_pool()):
                 capture_outputs = None
                 if runner.needs_capture(key):

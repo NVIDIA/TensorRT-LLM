@@ -224,6 +224,7 @@ def _make_forward_only_engine(
     engine.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = {}
     engine.forward_pass_callable = None
+    engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
     engine.cuda_graph_lora_manager = None
@@ -1422,9 +1423,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           max_num_tokens=32,
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
-        # A bare Mock auto-vivifies every attribute, so the capture-only
-        # override has to be pinned off or _prepare_tp_inputs reads it as live.
-        spec_metadata = Mock(_force_non_greedy_for_capture=False)
+        spec_metadata = Mock()
 
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_current_position = 3
