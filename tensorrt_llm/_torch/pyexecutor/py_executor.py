@@ -1717,9 +1717,8 @@ class PyExecutor:
             # — the events being read have already passed by the time we
             # read them. Stashing on self lets the /metrics serializer pick
             # up the values without going through the log line.
-            should_capture_timing = start_time is not None and (
-                self.print_log or self.enable_iter_perf_stats)
-            if should_capture_timing:
+            should_capture_timing = self.print_log or self.enable_iter_perf_stats
+            if should_capture_timing and start_time is not None:
                 end_time = time.time()
                 if it % 2 == 0:
                     end_event_1.record()
@@ -1784,14 +1783,15 @@ class PyExecutor:
 
             calibrator.pre_step(it)
             start_time = time.time()
-            if it % 2 == 0:
-                if start_event_1 is None:
-                    start_event_1 = torch.cuda.Event(enable_timing=True)
-                start_event_1.record()
-            else:
-                if start_event_2 is None:
-                    start_event_2 = torch.cuda.Event(enable_timing=True)
-                start_event_2.record()
+            if should_capture_timing:
+                if it % 2 == 0:
+                    if start_event_1 is None:
+                        start_event_1 = torch.cuda.Event(enable_timing=True)
+                    start_event_1.record()
+                else:
+                    if start_event_2 is None:
+                        start_event_2 = torch.cuda.Event(enable_timing=True)
+                    start_event_2.record()
 
         try:
             yield profile_step
@@ -3610,7 +3610,7 @@ class PyExecutor:
             # A single-rank CTX worker cannot diverge on a collective. Reap
             # completed sends while it is idle so their pinned KV blocks can
             # be reused by the next context requests.
-            if (is_idle and self._dist_size(self.dist, "world_size") == 1 and
+            if (self._dist_size(self.dist, "world_size") == 1 and
                     self.async_transfer_manager.has_any_inflight_requests()):
                 self._check_disagg_ctx_cache_transfer_status(0)
             return
