@@ -161,7 +161,6 @@ class AttentionLayerConfig:
 class SsmLayerConfig:
     layer_id: LayerId
     buffers: list[BufferConfig]
-    max_gpu_slots: int | None = None
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
@@ -195,6 +194,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    cap_constant_size_pools: bool = False
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

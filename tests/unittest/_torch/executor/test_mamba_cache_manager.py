@@ -1713,7 +1713,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     config = mgr._build_cache_config(base_config)
 
     assert isinstance(config.layers[0], SsmLayerConfig)
-    assert config.layers[0].max_gpu_slots is None
+    assert not config.cap_constant_size_pools
     assert isinstance(config.layers[1], AttentionLayerConfig)
     assert int(config.layers[1].layer_id) == int(base_layers[1].layer_id)
     assert config.typical_step == BatchDesc(
@@ -2273,7 +2273,7 @@ def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
         assert len(mgr.all_ssm_states) == 1
         assert len(mgr.all_conv_states) == 1
         expected_state_slots = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
-        assert mgr.kv_cache_manager_py_config.layers[0].max_gpu_slots == expected_state_slots
+        assert mgr.kv_cache_manager_py_config.cap_constant_size_pools
         assert mgr.all_ssm_states[0].shape[0] == expected_state_slots
         assert mgr.all_conv_states[0].shape[0] == expected_state_slots
         ssm_life_cycle = int(mgr.ssm_layer_group_id)
@@ -2497,7 +2497,7 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         assert mgr.block_reuse_policy is BlockReusePolicy.PER_REQUEST
         assert mgr.kv_cache_config.enable_partial_reuse
         assert mgr.kv_cache_manager_py_config.commit_min_snapshot
-        assert mgr.kv_cache_manager_py_config.layers[0].max_gpu_slots is None
+        assert not mgr.kv_cache_manager_py_config.cap_constant_size_pools
     finally:
         mgr.shutdown()
 

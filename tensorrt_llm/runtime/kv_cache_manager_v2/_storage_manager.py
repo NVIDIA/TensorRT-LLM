@@ -251,19 +251,16 @@ class StorageManager:
         self._min_slots = self._compute_pool_group_min_slots_from_constraints(
             constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
-        self._max_gpu_slots = (
-            cast(
-                TypedIndexList[PoolGroupIndex, int | None],
-                filled_list(None, self.num_pool_groups),
-            )
-            if config.max_gpu_slots is None
-            else config.max_gpu_slots
+        self._max_gpu_slots = cast(
+            TypedIndexList[PoolGroupIndex, int | None],
+            [
+                self._min_slots[pool_group]
+                if config.cap_constant_size_pools
+                and not self._pool_group_needs_headroom_for_growth(pool_group)
+                else None
+                for pool_group in typed_range(self.num_pool_groups)
+            ],
         )
-        if any(
-            max_slot is not None and max_slot < min_slot
-            for max_slot, min_slot in zip(self._max_gpu_slots, self._min_slots)
-        ):
-            raise ValueError("max_gpu_slots must be at least the hot-tier min_slots")
 
         # Derive one lifecycle ratio, then project it onto each level's pool grouping.
         life_cycle_ratio: TypedIndexList[LifeCycleId, float]

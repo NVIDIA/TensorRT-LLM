@@ -19,7 +19,7 @@ from fractions import Fraction
 from typing import NamedTuple, cast
 
 from .._common import LayerId
-from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig, SsmLayerConfig
+from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycleId, LifeCycleRegistry, make_life_cycle
 from .._storage._core import PoolGroupIndex, PoolIndex
 from .._utils import (
@@ -118,7 +118,7 @@ class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     expansion: dict[BufferId, int]  # expansion factor of page due to heterogeneous tokens_per_block
-    max_gpu_slots: TypedIndexList[PoolGroupIndex, int | None] | None = None
+    cap_constant_size_pools: bool = False
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
@@ -193,9 +193,6 @@ class StorageConfig:
         groups = [tuple(s.life_cycle_id for s in pg.variants) for pg in self.slot_desc_list]
         all_life_cycle_ids = sum((g for g in groups), ())
         assert len(all_life_cycle_ids) == len(set(all_life_cycle_ids))
-        if self.max_gpu_slots is not None:
-            assert len(self.max_gpu_slots) == len(self.slot_desc_list)
-            assert all(limit is None or limit > 0 for limit in self.max_gpu_slots)
 
 
 def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
@@ -206,15 +203,9 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     life_cycle_registry = LifeCycleRegistry(config)
     tokens_per_block = config.tokens_per_block
     expansion_map = dict[BufferId, int]()
-    life_cycle_max_gpu_slots = dict[LifeCycleId, int | None]()
     for layer in config.layers:
         life_cycle = make_life_cycle(layer, tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
-        max_gpu_slots = layer.max_gpu_slots if isinstance(layer, SsmLayerConfig) else None
-        if life_cycle_id in life_cycle_max_gpu_slots:
-            assert life_cycle_max_gpu_slots[life_cycle_id] == max_gpu_slots
-        else:
-            life_cycle_max_gpu_slots[life_cycle_id] = max_gpu_slots
         size_to_buffers = buffer_groups[life_cycle_id]
         for buffer in layer.buffers:
             tokens_per_block_override = value_or(buffer.tokens_per_block_override, tokens_per_block)
@@ -245,19 +236,9 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         TypedIndexList[PoolGroupIndex, SlotDesc],
         [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],
     )
-    max_gpu_slots = cast(TypedIndexList[PoolGroupIndex, int | None], [])
-    for pool_group in slot_desc_list:
-        limits = [
-            life_cycle_max_gpu_slots[variant.life_cycle_id] for variant in pool_group.variants
-        ]
-        max_gpu_slots.append(
-            None
-            if any(limit is None for limit in limits)
-            else sum(cast(int, limit) for limit in limits)
-        )
     return StorageConfig(
         cache_tiers=tuple(config.cache_tiers),
         slot_desc_list=slot_desc_list,
         expansion=expansion_map,
-        max_gpu_slots=max_gpu_slots,
+        cap_constant_size_pools=config.cap_constant_size_pools,
     )

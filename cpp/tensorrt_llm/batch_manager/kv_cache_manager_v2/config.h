@@ -171,10 +171,6 @@ struct SsmLayerConfig
     LayerId layerId = 0;
     std::vector<BufferConfig> buffers;
 
-    // Optional requested ceiling for GPU-resident slots in the SSM lifecycle. A physical pool shared with an
-    // uncapped lifecycle remains uncapped. Colder tiers remain unconstrained so they can preserve suspended requests.
-    std::optional<int> maxGpuSlots;
-
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
@@ -183,8 +179,6 @@ struct SsmLayerConfig
             if (buf.tokensPerBlockOverride.has_value())
                 throw std::invalid_argument("tokensPerBlockOverride not supported for SSM layers");
         }
-        if (maxGpuSlots.has_value() && *maxGpuSlots <= 0)
-            throw std::invalid_argument("maxGpuSlots must be positive");
     }
 };
 
@@ -306,6 +300,9 @@ struct KVCacheManagerConfig
     // path without scanning. A per-KvCache text_only override may only tighten this
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
+
+    // Cap constant-size hot-tier pool groups at their constraint-derived minimum slot count.
+    bool capConstantSizePools = false;
 
     bool enableSwaScratchReuse() const noexcept
     {

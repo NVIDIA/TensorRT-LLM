@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <map>
 #include <stdexcept>
-#include <type_traits>
 #include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -161,24 +160,11 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // StorageConfig mappings, so this is not expected to affect correctness.
     std::map<LifeCycleId, std::map<size_t, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
-    std::map<LifeCycleId, std::optional<SlotCount>> lifeCycleMaxGpuSlots;
 
     for (auto const& layer : config.layers)
     {
         LifeCycle lc = makeLifeCycle(layer, tokensPerBlock);
         LifeCycleId lcId = registry.getId(lc);
-        auto const maxGpuSlots = std::visit(
-            [](auto const& cfg) -> std::optional<SlotCount>
-            {
-                using T = std::decay_t<decltype(cfg)>;
-                if constexpr (std::is_same_v<T, SsmLayerConfig>)
-                    return cfg.maxGpuSlots;
-                return std::nullopt;
-            },
-            layer);
-        auto const [maxSlotsIt, inserted] = lifeCycleMaxGpuSlots.emplace(lcId, maxGpuSlots);
-        TLLM_CHECK_WITH_INFO(
-            inserted || maxSlotsIt->second == maxGpuSlots, "All layers in a lifecycle must use the same max_gpu_slots");
 
         std::visit(
             [&](auto const& cfg)
@@ -230,24 +216,13 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
+    out.capConstantSizePools = config.capConstantSizePools;
 
     for (auto& [sizes, variants] : poolGroupsBySizes)
     {
         SlotDesc sd;
         sd.variants = std::move(variants);
-        std::optional<SlotCount> poolGroupMaxGpuSlots = SlotCount{0};
-        for (auto const& variant : sd.variants)
-        {
-            auto const maxGpuSlots = lifeCycleMaxGpuSlots.at(variant.lifeCycleId);
-            if (!maxGpuSlots.has_value())
-            {
-                poolGroupMaxGpuSlots = std::nullopt;
-                break;
-            }
-            *poolGroupMaxGpuSlots += *maxGpuSlots;
-        }
         out.slotDescList.push_back(std::move(sd));
-        out.maxGpuSlots.push_back(poolGroupMaxGpuSlots);
     }
 
     // A21: Assert all life_cycle_ids across all SlotDescVariants are unique.

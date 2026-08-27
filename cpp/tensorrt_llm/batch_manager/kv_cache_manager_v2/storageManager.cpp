@@ -289,20 +289,15 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // with no growth to reserve for uses its full capacity. Other levels need only the structural one-slot floor.
     mMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
-    mMaxGpuSlots = config.maxGpuSlots;
-    if (mMaxGpuSlots.empty())
+    mMaxGpuSlots.resize(numPoolGroups(), std::nullopt);
+    if (config.capConstantSizePools)
     {
-        mMaxGpuSlots.resize(numPoolGroups(), std::nullopt);
-    }
-    if (mMaxGpuSlots.size() != numPoolGroups())
-    {
-        throw std::invalid_argument("max_gpu_slots length must match hot-tier pool groups");
-    }
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
-    {
-        if (mMaxGpuSlots[pgIdx].has_value() && *mMaxGpuSlots[pgIdx] < mMinSlots[pgIdx])
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
         {
-            throw std::invalid_argument("max_gpu_slots must be at least the hot-tier min_slots");
+            if (!poolGroupNeedsHeadroomForGrowth(pgIdx))
+            {
+                mMaxGpuSlots[pgIdx] = mMinSlots[pgIdx];
+            }
         }
     }
 

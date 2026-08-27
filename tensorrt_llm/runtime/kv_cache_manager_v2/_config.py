@@ -131,20 +131,11 @@ class SsmLayerConfig:
 
     buffers: list[BufferConfig]
 
-    max_gpu_slots: int | None = None
-    """
-    Optional requested ceiling for GPU-resident slots belonging to this SSM
-    lifecycle. A physical pool shared with an uncapped lifecycle remains
-    uncapped. Colder tiers remain unconstrained so they can preserve suspended
-    requests.
-    """
-
     def __post_init__(self) -> None:
         assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
             "duplicate buffer role"
         )
         assert all(buf.tokens_per_block_override is None for buf in self.buffers)
-        assert self.max_gpu_slots is None or self.max_gpu_slots > 0
 
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
@@ -265,6 +256,13 @@ class KVCacheManagerConfig:
 
     (In this pure-Python backend the block hasher has no digest-free fast path, so this
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
+    """
+
+    cap_constant_size_pools: bool = False
+    """
+    If True, cap constant-size hot-tier pool groups at their constraint-derived
+    minimum slot count. Growth-capable or mixed pool groups and colder tiers
+    remain unconstrained.
     """
 
     @property
