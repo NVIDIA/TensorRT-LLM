@@ -120,13 +120,21 @@ class MXCheckpointLoader(HfCheckpointLoader):
         transform_protocol_version = kwargs.pop("post_transform_protocol_version", None)
         preserve_mx_session = kwargs.pop("_preserve_mx_session", False)
 
-        missing_mx_state = (
-            self._mx_server_url is None
-            or model is None
-            or local_source_identity is None
-            or model_config is None
-        )
+        missing_mx_state = [
+            name
+            for name, value in (
+                ("mx_server_url", self._mx_server_url),
+                ("model", model),
+                ("source_identity", local_source_identity),
+                ("model_config", model_config),
+            )
+            if value is None
+        ]
         if missing_mx_state and preserve_mx_session:
+            logger.info(
+                "MX loading skipped for auxiliary native checkpoint load: "
+                f"missing {', '.join(missing_mx_state)}; preserving the active MX session."
+            )
             return super().load_weights(
                 checkpoint_dir,
                 mapping=mapping,
@@ -141,6 +149,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._cleanup_mx_loader()
 
         if missing_mx_state:
+            logger.info(
+                f"MX loading unavailable: missing {', '.join(missing_mx_state)}; "
+                "falling back to native Hugging Face checkpoint loading."
+            )
             return super().load_weights(
                 checkpoint_dir,
                 mapping=mapping,
@@ -152,21 +164,32 @@ class MXCheckpointLoader(HfCheckpointLoader):
         try:
             trtllm_adapter = import_module("modelexpress.engines.trtllm")
         except ModuleNotFoundError as exc:
-            if exc.name not in {
-                "modelexpress",
-                "modelexpress.engines",
-                "modelexpress.engines.trtllm",
-            }:
+            if exc.name == "modelexpress":
+                logger.warning(
+                    "ModelExpress is not installed; install it with "
+                    '`pip install "tensorrt-llm[mx]"`. Falling back to native '
+                    "Hugging Face checkpoint loading."
+                )
+            elif exc.name in {"modelexpress.engines", "modelexpress.engines.trtllm"}:
+                logger.warning(
+                    "The installed ModelExpress package does not provide the TensorRT-LLM "
+                    "adapter; install modelexpress>=0.5.1 or another compatible version. "
+                    "Falling back to native Hugging Face checkpoint loading."
+                )
+            else:
                 raise
-            trtllm_adapter = None
-        MxModelLoader = (
-            getattr(trtllm_adapter, "MxModelLoader", None) if trtllm_adapter is not None else None
-        )
+            return super().load_weights(
+                checkpoint_dir,
+                mapping=mapping,
+                **kwargs,
+            )
+
+        MxModelLoader = getattr(trtllm_adapter, "MxModelLoader", None)
         if MxModelLoader is None:
             logger.warning(
-                "The installed ModelExpress package does not provide the "
-                "TensorRT-LLM adapter; falling back to native Hugging Face "
-                "checkpoint loading."
+                "The installed ModelExpress TensorRT-LLM adapter is incompatible: "
+                "MxModelLoader is missing. Install a compatible ModelExpress version. "
+                "Falling back to native Hugging Face checkpoint loading."
             )
             return super().load_weights(
                 checkpoint_dir,
@@ -205,35 +228,41 @@ class MXCheckpointLoader(HfCheckpointLoader):
             mx_server_url=self._mx_server_url,
         )
         self._mx_loader = mx_loader
-        weights = mx_loader.load_model(model)
-        self._p2p_succeeded = mx_loader.p2p_succeeded
-        self._transform_protocol_version_for_last_load = mx_loader.transform_protocol_version
-        if self._p2p_succeeded and weights:
-            self._p2p_succeeded = False
-            raise RuntimeError("MX P2P loading must not return native checkpoint weights")
-        post_transform_compatible = (
-            self._p2p_succeeded
-            and transform_protocol_version is not None
-            and self._transform_protocol_version_for_last_load == transform_protocol_version
-            # The real ModelExpress TRT-LLM adapter serializes the complete
-            # authoritative SourceIdentity into its discovery identity. RDMA
-            # success therefore means the selected source matched format v3,
-            # the transform-layout ABI, and the remaining TRT identity fields.
-            and self._local_source_identity.format_version == SOURCE_IDENTITY_FORMAT_VERSION
-            and bool(self._local_source_identity.transform_abi_id)
-        )
-        if self._p2p_succeeded and not post_transform_compatible:
-            # Discovery includes the transform protocol in SourceIdentity, so
-            # this is only a backstop. RDMA already wrote the receiver buffers;
-            # falling back to disk here could mix transformed and raw weights.
-            self._p2p_succeeded = False
-            raise RuntimeError(
-                "MX transferred weights without a compatible TRT-LLM "
-                "transform protocol and SourceIdentity ABI"
+        try:
+            weights = mx_loader.load_model(model)
+            self._p2p_succeeded = mx_loader.p2p_succeeded
+            self._transform_protocol_version_for_last_load = mx_loader.transform_protocol_version
+            if self._p2p_succeeded and weights:
+                raise RuntimeError("MX P2P loading must not return native checkpoint weights")
+            post_transform_compatible = (
+                self._p2p_succeeded
+                and transform_protocol_version is not None
+                and self._transform_protocol_version_for_last_load == transform_protocol_version
+                # The real ModelExpress TRT-LLM adapter serializes the complete
+                # authoritative SourceIdentity into its discovery identity. RDMA
+                # success therefore means the selected source matched format v3,
+                # the transform-layout ABI, and the remaining TRT identity fields.
+                and self._local_source_identity.format_version == SOURCE_IDENTITY_FORMAT_VERSION
+                and bool(self._local_source_identity.transform_abi_id)
             )
-        self._post_transform_weights_preloaded = post_transform_compatible
-        self._source_identity_compatible_for_last_load = post_transform_compatible
-        return weights
+            if self._p2p_succeeded and not post_transform_compatible:
+                # Discovery includes the transform protocol in SourceIdentity, so
+                # this is only a backstop. RDMA already wrote the receiver buffers;
+                # falling back to disk here could mix transformed and raw weights.
+                raise RuntimeError(
+                    "MX transferred weights without a compatible TRT-LLM "
+                    "transform protocol and SourceIdentity ABI"
+                )
+            self._post_transform_weights_preloaded = post_transform_compatible
+            self._source_identity_compatible_for_last_load = post_transform_compatible
+            return weights
+        except Exception:
+            self._p2p_succeeded = False
+            self._post_transform_weights_preloaded = False
+            self._source_identity_compatible_for_last_load = False
+            self._transform_protocol_version_for_last_load = None
+            self._cleanup_mx_loader()
+            raise
 
     def publish_as_source(
         self,

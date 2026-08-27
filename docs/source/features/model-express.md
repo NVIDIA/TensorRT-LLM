@@ -120,7 +120,7 @@ uses a metadata-only view of the donor's canonical snapshot and contains no
 weight shards. A positive result therefore requires direct transfer; disk
 fallback cannot accidentally satisfy the test.
 
-Run the TP=1 smoke test against an isolated ModelExpress 0.4.1 service with
+Run the TP=1 smoke test against an isolated ModelExpress 0.5.1 service with
 NIXL enabled:
 
 ```bash
@@ -144,7 +144,7 @@ row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout used for the
 baseline worker, receiver worker, and donor-readiness wait; increase it for
 slow model storage or startup.
 
-The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
+The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
 sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
 automatically in post-merge pipelines or when a multi-GPU file changes, while
 direct pre-merge dispatch requires the `ci: full pre-merge approved` label.
@@ -238,7 +238,7 @@ docker run -d --name modelexpress-server \
   -e MODEL_EXPRESS_LOG_LEVEL=info \
   -e MX_METADATA_BACKEND=redis \
   -e REDIS_URL=redis://modelexpress-redis:6379 \
-  nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.1
+  nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.1
 ```
 
 ## Configure TensorRT LLM

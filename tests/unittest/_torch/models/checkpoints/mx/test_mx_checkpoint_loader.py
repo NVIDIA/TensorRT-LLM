@@ -94,6 +94,7 @@ def _install_fake_mx(
     p2p_succeeded,
     value,
     transform_protocol_version=1,
+    load_error=None,
 ):
     instances = []
 
@@ -108,6 +109,8 @@ def _install_fake_mx(
 
         def load_model(self, model):
             self.model = model
+            if load_error is not None:
+                raise load_error
             return value
 
     module = ModuleType("modelexpress.engines.trtllm")
@@ -165,13 +168,39 @@ def test_registered_under_mx_and_mapper_fallback_is_preserved():
     )
 
 
-def test_missing_mx_state_uses_native_hf_loader():
-    loader, weight_loader, _ = _loader()
-    kwargs = _load_kwargs()
+@pytest.mark.parametrize(
+    ("loader_kwargs", "load_overrides", "missing_state"),
+    [
+        ({}, {}, "mx_server_url"),
+        ({"mx_server_url": "mx:8001"}, {"model": None}, "model"),
+        (
+            {"mx_server_url": "mx:8001"},
+            {"source_identity": None},
+            "source_identity",
+        ),
+        (
+            {"mx_server_url": "mx:8001"},
+            {"model_config": None},
+            "model_config",
+        ),
+    ],
+)
+def test_missing_mx_state_logs_reason_and_uses_native_hf_loader(
+    loader_kwargs,
+    load_overrides,
+    missing_state,
+):
+    loader, weight_loader, _ = _loader(**loader_kwargs)
+    kwargs = _load_kwargs(**load_overrides)
 
-    value = loader.load_weights("checkpoint", **kwargs)
+    with patch.object(checkpoint_loader_mod.logger, "info") as log_info:
+        value = loader.load_weights("checkpoint", **kwargs)
 
     assert value == weight_loader.load_weights.return_value
+    log_info.assert_any_call(
+        f"MX loading unavailable: missing {missing_state}; "
+        "falling back to native Hugging Face checkpoint loading."
+    )
     weight_loader.load_weights.assert_called_once_with(
         "checkpoint",
         mapping=kwargs["mapping"],
@@ -179,14 +208,71 @@ def test_missing_mx_state_uses_native_hf_loader():
 
 
 def test_missing_trtllm_adapter_uses_native_hf_loader(monkeypatch):
+    def fail_import(_name):
+        raise ModuleNotFoundError(
+            "No module named 'modelexpress.engines.trtllm'",
+            name="modelexpress.engines.trtllm",
+        )
+
+    monkeypatch.setattr(checkpoint_loader_mod, "import_module", fail_import)
+    loader, weight_loader, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _load_kwargs()
+
+    with patch.object(checkpoint_loader_mod.logger, "warning") as log_warning:
+        value = loader.load_weights("checkpoint", **kwargs)
+
+    assert value == weight_loader.load_weights.return_value
+    log_warning.assert_any_call(
+        "The installed ModelExpress package does not provide the TensorRT-LLM "
+        "adapter; install modelexpress>=0.5.1 or another compatible version. "
+        "Falling back to native Hugging Face checkpoint loading."
+    )
+    weight_loader.load_weights.assert_called_once_with(
+        "checkpoint",
+        mapping=kwargs["mapping"],
+    )
+
+
+def test_missing_modelexpress_package_logs_install_hint_and_uses_native_hf_loader(
+    monkeypatch,
+):
+    def fail_import(_name):
+        raise ModuleNotFoundError("No module named 'modelexpress'", name="modelexpress")
+
+    monkeypatch.setattr(checkpoint_loader_mod, "import_module", fail_import)
+    loader, weight_loader, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _load_kwargs()
+
+    with patch.object(checkpoint_loader_mod.logger, "warning") as log_warning:
+        value = loader.load_weights("checkpoint", **kwargs)
+
+    assert value == weight_loader.load_weights.return_value
+    log_warning.assert_any_call(
+        "ModelExpress is not installed; install it with "
+        '`pip install "tensorrt-llm[mx]"`. Falling back to native '
+        "Hugging Face checkpoint loading."
+    )
+    weight_loader.load_weights.assert_called_once_with(
+        "checkpoint",
+        mapping=kwargs["mapping"],
+    )
+
+
+def test_incompatible_trtllm_adapter_logs_missing_entrypoint(monkeypatch):
     module = ModuleType("modelexpress.engines.trtllm")
     monkeypatch.setitem(sys.modules, module.__name__, module)
     loader, weight_loader, _ = _loader(mx_server_url="mx:8001")
     kwargs = _load_kwargs()
 
-    value = loader.load_weights("checkpoint", **kwargs)
+    with patch.object(checkpoint_loader_mod.logger, "warning") as log_warning:
+        value = loader.load_weights("checkpoint", **kwargs)
 
     assert value == weight_loader.load_weights.return_value
+    log_warning.assert_any_call(
+        "The installed ModelExpress TensorRT-LLM adapter is incompatible: "
+        "MxModelLoader is missing. Install a compatible ModelExpress version. "
+        "Falling back to native Hugging Face checkpoint loading."
+    )
     weight_loader.load_weights.assert_called_once_with(
         "checkpoint",
         mapping=kwargs["mapping"],
@@ -366,7 +452,7 @@ def test_qualified_model_requires_current_source_identity(monkeypatch, source_id
 
 
 def test_incompatible_transfer_protocol_fails_closed(monkeypatch):
-    _install_fake_mx(
+    instances = _install_fake_mx(
         monkeypatch,
         p2p_succeeded=True,
         value={},
@@ -382,10 +468,12 @@ def test_incompatible_transfer_protocol_fails_closed(monkeypatch):
 
     assert not loader.is_weights_preloaded()
     assert not loader.is_post_transform_weights_preloaded()
+    instances[0].cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
 
 
 def test_p2p_transfer_cannot_return_native_weights(monkeypatch):
-    _install_fake_mx(
+    instances = _install_fake_mx(
         monkeypatch,
         p2p_succeeded=True,
         value={"disk": object()},
@@ -400,6 +488,32 @@ def test_p2p_transfer_cannot_return_native_weights(monkeypatch):
 
     assert not loader.is_weights_preloaded()
     assert not loader.is_post_transform_weights_preloaded()
+    instances[0].cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
+
+
+def test_failed_mx_load_cleans_session_and_prevents_publish(monkeypatch):
+    instances = _install_fake_mx(
+        monkeypatch,
+        p2p_succeeded=False,
+        value=None,
+        load_error=RuntimeError("transfer failed"),
+    )
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        loader.load_weights("checkpoint", **_load_kwargs())
+
+    session = instances[0]
+    session.cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
+
+    loader.post_load_publish(
+        MagicMock(),
+        checkpoint_dir="checkpoint",
+        weights_preloaded=False,
+    )
+    session.publish_model.assert_not_called()
 
 
 def test_repeated_load_clears_cleaned_session_before_replacement(monkeypatch):
