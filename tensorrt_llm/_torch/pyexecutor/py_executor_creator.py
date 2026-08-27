@@ -32,7 +32,6 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -438,19 +437,6 @@ def create_py_executor(
         tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
 
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION":
-        # Star attention still derives its page table from every allocated block,
-        # which is incompatible with blocks allocated ahead for reuse.
-        if kv_cache_config.enable_block_reuse:
-            logger.warning(
-                f"Disabling block reuse for {llm_args.attn_backend} backend")
-            kv_cache_config.enable_block_reuse = False
-
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
-        logger.warning(
-            f"Disabling chunked context for {llm_args.attn_backend} backend")
-        enable_chunked_context = False
-
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
         from tensorrt_llm._torch.speculative import suggest_spec_config
@@ -619,38 +605,6 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            use_chain_drafter = (
-                guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
-                and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
-                and draft_spec_config.draft_len_schedule is None)
-
-            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
-
-                def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper,
-                        StaticTreeDraftingLoopWrapper)
-                    from tensorrt_llm.llmapi import EagleDecodingConfig
-
-                    static_tree_drafter = isinstance(
-                        draft_spec_config, EagleDecodingConfig
-                    ) and draft_spec_config.eagle_choices is not None
-
-                    if static_tree_drafter:
-                        return StaticTreeDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, max_batch_size,
-                            model)
-                    else:
-                        return LinearDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, model)
-            else:
-                drafting_loop_wrapper = None
-
             draft_llm_args = copy.copy(llm_args)
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
@@ -670,7 +624,6 @@ def create_py_executor(
                 dist=dist,
                 spec_config=draft_spec_config,
                 is_draft_model=True,
-                drafting_loop_wrapper=drafting_loop_wrapper,
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
@@ -682,13 +635,10 @@ def create_py_executor(
     else:
         draft_model_engine = None
 
-    # TODO: Overlap scheduler is not supported for below cases:
-    # 1. non-CDL is used
-    # 2. non-TrtllmAttention attention backend is used
-    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
-            draft_model_engine.attn_backend, TrtllmAttention)):
+    # TODO: Overlap scheduler is not supported for two-model speculative decoding.
+    if has_draft_model_engine:
         logger.warning(
-            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
+            "Overlap scheduler is not supported for two-model speculative decoding."
         )
         llm_args.disable_overlap_scheduler = True
 

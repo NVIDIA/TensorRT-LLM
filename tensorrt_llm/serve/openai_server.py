@@ -102,8 +102,8 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
-from tensorrt_llm.serve.visual_gen_metrics import \
-    build_visual_gen_timing_headers
+from tensorrt_llm.serve.visual_gen_metrics import (
+    build_visual_gen_server_timings, build_visual_gen_timing_headers)
 from tensorrt_llm.serve.visual_gen_utils import (
     cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
@@ -1258,9 +1258,15 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.openai_video_generation_async,
                                methods=["POST"])
         # Synchronous video generation (waits for completion, extended API)
-        self.app.add_api_route("/v1/videos/generations",
+        self.app.add_api_route("/v1/videos/sync",
                                self.openai_video_generation_sync,
                                methods=["POST"])
+        # Deprecated alias of /v1/videos/sync, retained for upstream
+        # back-compat after the rename; both hit the same sync handler.
+        self.app.add_api_route("/v1/videos/generations",
+                               self.openai_video_generation_sync,
+                               methods=["POST"],
+                               deprecated=True)
         # Video management endpoints
         self.app.add_api_route("/v1/videos", self.list_videos, methods=["GET"])
         self.app.add_api_route("/v1/videos/{video_id}",
@@ -2078,10 +2084,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         functools.partial(self.generator.input_processor,
                                           prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
-                        prompt_token_ids=prompt_token_ids,
-                        query_token_ids=extra_processed_inputs.get(
-                            "query_token_ids")
-                        if extra_processed_inputs is not None else None)
+                        prompt_token_ids=prompt_token_ids)
                 else:
                     tokens_prompt = prompt
 
@@ -2521,6 +2524,10 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
+            path_error = self._reject_disabled_path(request.response_format)
+            if path_error is not None:
+                return path_error
+
             # Client-side ValueErrors from request translation and
             # parameter validation are 400. Serialization failures below
             # (server-side: missing media, inconsistent batch) fall
@@ -2572,13 +2579,13 @@ class OpenAIServer(_VideoRoutesMixin):
                         self.media_storage_path / f"{image_id}_{i}{ext}"
                         for i in range(batch_size)
                     ]
-                    output.save(paths_in, format=request.format)
+                    # Report the paths save() actually wrote, not paths_in --
+                    # save() may normalize (e.g. fill a missing extension), so
+                    # its return is the on-disk location the client will open().
+                    saved = output.save(paths_in, format=request.format)
                     data = [
-                        ImageObject(
-                            url=self._build_image_content_url(
-                                raw_request, image_id, i),
-                            revised_prompt=request.prompt,
-                        ) for i in range(batch_size)
+                        self._image_object(request, raw_request, image_id, i,
+                                           saved[i]) for i in range(batch_size)
                     ]
                 response = ImageGenerationResponse(
                     created=int(time.time()),
@@ -2610,11 +2617,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         path.write_bytes(
                             image_to_bytes(image, format=pil_format))
                         data.append(
-                            ImageObject(
-                                url=self._build_image_content_url(
-                                    raw_request, image_id, i),
-                                revised_prompt=request.prompt,
-                            ))
+                            self._image_object(request, raw_request, image_id,
+                                               i, path))
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
@@ -2629,7 +2633,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} generated and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
-            headers = build_visual_gen_timing_headers(metrics)
+            headers = build_visual_gen_timing_headers(
+                build_visual_gen_server_timings(metrics))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
@@ -2678,6 +2683,48 @@ class OpenAIServer(_VideoRoutesMixin):
         """Return a fetchable HTTP URL for a generated image item."""
         base = str(raw_request.base_url).rstrip("/")
         return f"{base}/v1/images/{image_id}/content?i={i}"
+
+    def _reject_disabled_path(
+            self, response_format: Optional[str]) -> Optional[Response]:
+        """Return a 400 when ``response_format='path'`` but it is disabled.
+
+        ``path`` discloses absolute server-side filesystem paths, so it can be
+        turned off via ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` on shared /
+        untrusted deployments (enabled by default). Returns ``None`` when
+        allowed.
+        """
+        if response_format != "path":
+            return None
+        raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
+        if raw not in ("0", "1"):
+            logger.warning(
+                "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
+                f"{raw!r}. Expected '0' or '1'. Treating as '0' "
+                "(response_format='path' enabled).")
+        if raw == "1":
+            return self.create_error_response(
+                "response_format='path' is disabled on this server "
+                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
+                "server-side filesystem paths and is only meaningful for "
+                "co-located clients.",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        return None
+
+    def _image_object(self, request: ImageGenerationRequest,
+                      raw_request: Request, image_id: str, i: int,
+                      path: Path) -> ImageObject:
+        """Build the per-item ``ImageObject`` for the ``path``/``url`` transports.
+
+        ``b64_json`` is handled separately. Shared by the tensor and encoder
+        branches so they cannot drift when a transport changes.
+        """
+        if request.response_format == "path":
+            return ImageObject(path=str(path), revised_prompt=request.prompt)
+        return ImageObject(url=self._build_image_content_url(
+            raw_request, image_id, i),
+                           revised_prompt=request.prompt)
 
     async def _parse_image_edit_request(
         self,
@@ -2820,7 +2867,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} edited and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
-            headers = build_visual_gen_timing_headers(metrics)
+            headers = build_visual_gen_timing_headers(
+                build_visual_gen_server_timings(metrics))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 

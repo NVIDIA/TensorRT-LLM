@@ -484,15 +484,6 @@ _SMALL_MODEL_CONFIGS = {
             "q_lora_rank": 128,
         },
     },
-    "Qwen/Qwen2.5-3B-Instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-        },
-    },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
         "model_factory": "AutoModelForImageTextToText",
         "model_kwargs": {

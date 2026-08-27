@@ -102,6 +102,22 @@ def is_torch_compiling() -> bool:
     return is_torch_compiling_flag
 
 
+@contextlib.contextmanager
+def torch_compiling(enable: bool):
+    """Scope `is_torch_compiling()` to a region, restoring the prior value.
+
+    The flag is a plain module global, not thread- or context-local, so it
+    outlives the engine that set it. Code running a model region outside an
+    engine forward must establish the value rather than inherit it.
+    """
+    prev_enable = is_torch_compiling()
+    set_torch_compiling(enable)
+    try:
+        yield
+    finally:
+        set_torch_compiling(prev_enable)
+
+
 def set_piecewise_running(enable: bool):
     global is_piecewise_running_flag
     is_piecewise_running_flag = enable

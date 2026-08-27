@@ -14,18 +14,34 @@
 
 """Shared infrastructure for the sampler package.
 
-Holds what the feature modules (token bans, top-p decay, finish reasons,
-beam search, penalties) build on: the per-request queries that read an
-``LlmRequest``'s sampling config into :class:`UtilsSamplingParams`, the shared
-step/beam index constants, and tensor helpers.
+The package's base layer: it imports nothing from its siblings, so anything
+here is safe for every other module to depend on. Holds what the feature
+modules (token bans, top-p decay, finish reasons, beam search, penalties,
+log-probs) build on:
+
+* the per-request queries that read an ``LlmRequest``'s sampling config into
+  :class:`UtilsSamplingParams`, plus the predicates over it
+  (``top_p_decay_active``, ``_request_sampling_params_cachable``);
+* the shared step/beam index constants and beam-width accessors;
+* tensor helpers (``int_tensor``, ``add_token``);
+* plain data types passed *between* modules that no single feature owns --
+  :class:`RequestSeeds` (seed manager -> strategy impls) and
+  :class:`_BatchedSamplingResult` (sampler -> log-probs).
+
+That last group follows the package's dependency rule: a type shared across
+features belongs here, so that a lower-layer module never has to import a
+higher-layer one to name it. A type owned by a single feature belongs with that
+feature instead -- the ``*Store`` classes all live in their own modules.
 
 Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, TypeAlias, TypeVar, cast
 
 import torch
+
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..llm_request import LlmRequest
 
@@ -124,13 +140,23 @@ def _get_beam_width_out(request: LlmRequest) -> int:
 def _get_max_beam_width(request: LlmRequest) -> int:
     sampling_config = request.sampling_config
     max_beam_width = cast(int, sampling_config.beam_width)
-    if sampling_config.beam_width_array is not None:
-        max_beam_width = max(
-            max_beam_width,
-            cast(
-                int, torch.tensor(sampling_config.beam_width_array, dtype=torch.int32).max().item()
-            ),
-        )
+    # The array holds at most kMaxBeamWidthArrayLength (8) entries, so reduce it
+    # on the host. The C++ field is OptVec<vector<SizeType32>>, so it may arrive
+    # as [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength];
+    # unwrap the per-request row before reducing.
+    #
+    # Both `[]` and `[[]]` mean "no schedule" -- checkBeamWidthArray bounds only
+    # the array's length, so an empty one passes admission -- and must fall
+    # through to beam_width rather than reduce over nothing. Hence truthiness
+    # rather than `is not None`, and hence a second guard after the unwrap:
+    # the same two checks LlmRequest.get_beam_width_by_iter and
+    # PyExecutor._validate_request make.
+    beam_width_array = sampling_config.beam_width_array
+    if beam_width_array:
+        if isinstance(beam_width_array[0], (list, tuple)):
+            beam_width_array = beam_width_array[0]
+    if beam_width_array:
+        max_beam_width = max(max_beam_width, *map(int, beam_width_array))
     return max_beam_width
 
 
@@ -202,3 +228,74 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
     return not params.use_beam_search
+
+
+@dataclass(kw_only=True)
+class RequestSeeds:
+    """Per-request RNG state for user-specified ``SamplingParams.seed``.
+
+    Threaded alongside ``generator`` through the strategy impls and handed to
+    the flashinfer sampling ops as their stateless ``seed``/``offset`` pair.
+    Both tensors are int64 and 1-D with one entry per group row, matching the
+    per-row shape flashinfer documents; a row whose request did not specify a
+    seed carries the sampler's global seed, so unseeded requests keep their
+    previous behavior only in distribution, not token-for-token (see
+    ``_SeedManager``).
+
+    NB: the pinned flashinfer (0.6.15) accepts these per-row tensors but reads
+    only element 0 of each, separating rows by ``blockIdx.x``. The per-row
+    values below are therefore carried end-to-end but not yet honored for
+    batched requests; see the warning on ``_SeedManager`` and the upstream fix
+    at https://github.com/flashinfer-ai/flashinfer/pull/2345.
+
+    ``offset`` advances per request per sampling step, which is what makes a
+    seeded request's stream depend on how many tokens it has drawn rather than
+    on which batch it happened to land in.
+    """
+
+    seed: torch.Tensor
+    """Per-row Philox seed (int64, device)."""
+    offset: torch.Tensor
+    """Per-row Philox offset (int64, device)."""
+
+    def index_select(self, indices: torch.Tensor) -> "RequestSeeds":
+        """Narrow to a subset of rows, mirroring ``group_logit_indices``."""
+        return RequestSeeds(
+            seed=self.seed.index_select(0, indices),
+            offset=self.offset.index_select(0, indices),
+        )
+
+
+def top_p_decay_active(params: UtilsSamplingParams) -> bool:
+    """Whether dynamic top-p decay is active for a request.
+
+    Delegates to the single-source predicate on SamplingParams; note that
+    ``top_p_min`` / ``top_p_reset_ids`` alone do not activate dynamic behavior.
+    """
+    return SamplingParams.params_imply_top_p_decay_active(params.top_p_decay)
+
+
+@dataclass(kw_only=True, frozen=True)
+class _BatchedSamplingResult:
+    # Original request indices for all requests (permuted due to batching by strategy):
+    req_indices: torch.Tensor
+    # Next tokens for all requests:
+    next_tokens_cuda_int: torch.Tensor
+
+    # Processed and raw logprobs buffer. The tensor is sized to accommodate logprobs for all requests currently being
+    # processed by the sampler and slice(0, processed_logprobs_end) contains processed logprobs, ordered consistently
+    # with processed_logprobs_reqs_indices. Excludes beam search requests, which have a separate path for logprobs
+    # handling.
+    logprobs_cuda: torch.Tensor | None = None
+
+    # Requests requesting processed logprobs (incl. beam-search requests), same ordering as req_indices.
+    processed_logprobs_reqs_indices: list[int] = field(default_factory=list)
+    # Index of first unused row of logprobs_cuda
+    processed_logprobs_end: int = 0
+
+    # Requests requesting raw logprobs (incl. beam-search requests), ordered consistently with original
+    # (unpermuted) requests
+    raw_logprobs_reqs_indices: list[int] = field(default_factory=list)
+    # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices.
+    # Excludes beam search requests, which have a separate path for logprobs handling.
+    raw_logprobs_logit_indices_cuda: torch.Tensor | None = None

@@ -270,6 +270,17 @@ Qwen/Qwen3.5-397B-A17B:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.0
+Qwen/Qwen3.8-2.4T-A95B:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 93.80
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 93.80
+  - quant_algo: NVFP4
+    accuracy: 93.80
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 93.80
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 94.84
@@ -474,6 +485,11 @@ nvidia/Nemotron-3-Nano:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 65.428
+nvidia/Nemotron-3.5-Lightning:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 84.42
 MiniMaxAI/MiniMax-M2:
   - accuracy: 89.045
   - quant_algo: FP8_BLOCK_SCALES
@@ -515,22 +531,3 @@ zai-org/GLM-5.2:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 90
-# Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
-# TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale
-# checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). MTP
-# (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
-# baseline accuracy.
-stepfun-ai/Step-3.7-Flash:
-  - accuracy: 88
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 88
-  - quant_algo: FP8_BLOCK_SCALES
-    spec_dec_algo: MTP
-    accuracy: 88
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 88
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: MTP
-    accuracy: 88
