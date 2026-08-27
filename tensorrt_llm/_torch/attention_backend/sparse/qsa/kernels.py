@@ -129,6 +129,168 @@ def triton_qsa_decode_token_mapping(
 
 
 @triton.jit
+def _qsa_paged_kv_store_kernel(
+    k,
+    v,
+    k_cache,
+    v_cache,
+    request_indices,
+    logical_positions,
+    block_table,
+    num_rows,
+    k_stride_row: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    v_stride_row: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    k_cache_stride_page: tl.constexpr,
+    k_cache_stride_head: tl.constexpr,
+    k_cache_stride_token: tl.constexpr,
+    k_cache_stride_dim: tl.constexpr,
+    v_cache_stride_page: tl.constexpr,
+    v_cache_stride_head: tl.constexpr,
+    v_cache_stride_token: tl.constexpr,
+    v_cache_stride_dim: tl.constexpr,
+    block_table_stride_request: tl.constexpr,
+    block_table_stride_page: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+    NUM_REQUESTS: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dims = tl.arange(0, BLOCK_DIM)
+    valid = (row < num_rows) & (head < NUM_KV_HEADS) & (dims < HEAD_DIM)
+
+    request = tl.load(request_indices + row).to(tl.int32)
+    logical = tl.load(logical_positions + row).to(tl.int32)
+    page_column = logical // TOKENS_PER_BLOCK
+    token_in_page = logical % TOKENS_PER_BLOCK
+    valid_page_lookup = (
+        (request >= 0)
+        & (request < NUM_REQUESTS)
+        & (logical >= 0)
+        & (page_column < PAGE_TABLE_WIDTH)
+    )
+    page = tl.load(
+        block_table + request * block_table_stride_request + page_column * block_table_stride_page,
+        mask=valid_page_lookup,
+        other=-1,
+    ).to(tl.int64)
+    valid &= (page >= 0) & (page < NUM_PAGES)
+
+    k_values = tl.load(
+        k + row * k_stride_row + head * k_stride_head + dims * k_stride_dim,
+        mask=valid,
+        other=0.0,
+    )
+    v_values = tl.load(
+        v + row * v_stride_row + head * v_stride_head + dims * v_stride_dim,
+        mask=valid,
+        other=0.0,
+    )
+    tl.store(
+        k_cache
+        + page * k_cache_stride_page
+        + head * k_cache_stride_head
+        + token_in_page * k_cache_stride_token
+        + dims * k_cache_stride_dim,
+        k_values,
+        mask=valid,
+    )
+    tl.store(
+        v_cache
+        + page * v_cache_stride_page
+        + head * v_cache_stride_head
+        + token_in_page * v_cache_stride_token
+        + dims * v_cache_stride_dim,
+        v_values,
+        mask=valid,
+    )
+
+
+def triton_qsa_paged_kv_store(
+    *,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    request_indices: torch.Tensor,
+    logical_positions: torch.Tensor,
+    block_table: torch.Tensor,
+    tokens_per_block: int,
+) -> None:
+    """Store one or more QSA K/V rows into an HND paged cache."""
+    if k.shape != v.shape or k.ndim != 3:
+        raise ValueError("QSA K and V inputs must have matching [tokens, heads, dim] shapes")
+    if k_cache.shape != v_cache.shape or k_cache.ndim != 4:
+        raise ValueError("QSA K and V caches must have matching [pages, heads, tokens, dim] shapes")
+    rows, num_kv_heads, head_dim = k.shape
+    if k_cache.shape[1] != num_kv_heads or k_cache.shape[3] != head_dim:
+        raise ValueError("QSA K/V inputs and caches have incompatible head geometry")
+    if k_cache.shape[2] != tokens_per_block:
+        raise ValueError("QSA K/V cache token dimension does not match tokens_per_block")
+    if request_indices.numel() < rows or logical_positions.numel() < rows:
+        raise ValueError("QSA K/V store request metadata is shorter than its token inputs")
+    if block_table.ndim != 2 or block_table.dtype != torch.int32:
+        raise ValueError("QSA K/V store requires a two-dimensional int32 block table")
+    tensors = (
+        k,
+        v,
+        k_cache,
+        v_cache,
+        request_indices,
+        logical_positions,
+        block_table,
+    )
+    if not all(tensor.is_cuda for tensor in tensors):
+        raise ValueError("QSA paged K/V store requires CUDA tensors")
+    if rows == 0:
+        return
+
+    block_dim = triton.next_power_of_2(head_dim)
+    _qsa_paged_kv_store_kernel[(rows, num_kv_heads)](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        request_indices,
+        logical_positions,
+        block_table,
+        rows,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
+        block_table.stride(0),
+        block_table.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        HEAD_DIM=head_dim,
+        TOKENS_PER_BLOCK=tokens_per_block,
+        NUM_PAGES=k_cache.shape[0],
+        NUM_REQUESTS=block_table.shape[0],
+        PAGE_TABLE_WIDTH=block_table.shape[1],
+        BLOCK_DIM=block_dim,
+        num_warps=8 if block_dim >= 256 else 4,
+    )
+
+
+@triton.jit
 def _qsa_gemma_norm_rope(
     x,
     pos_t,
@@ -1368,6 +1530,7 @@ def triton_qsa_paged_sparse_gqa(
 __all__ = [
     "triton_qsa_decode_pre_indexer",
     "triton_qsa_paged_index_scores",
+    "triton_qsa_paged_kv_store",
     "triton_qsa_paged_sparse_gqa",
     "triton_qsa_prefill_compress",
     "triton_expand_qsa_block_indices",

@@ -24,6 +24,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
     triton_qsa_paged_index_scores,
+    triton_qsa_paged_kv_store,
     triton_qsa_prefill_compress,
     triton_qsa_unscale_block_table,
 )
@@ -222,6 +223,85 @@ def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
         torch.arange(rows, dtype=torch.int32, device="cuda"),
     )
     torch.testing.assert_close(logical_positions, (kv_lens - seq_lens).to(torch.int64))
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_paged_kv_store_matches_advanced_indexing(cache_dtype: torch.dtype) -> None:
+    torch.manual_seed(42)
+    rows = 4
+    num_pages = 8
+    num_kv_heads = 2
+    tokens_per_block = 8
+    head_dim = 256
+    qkv = torch.randn(
+        rows,
+        5,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = qkv[:, 1:3]
+    v = qkv[:, 3:5]
+    block_table = torch.tensor(
+        [[3, 0, 6, 2], [5, 7, 1, 4]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    request_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
+    logical_positions = torch.tensor([0, 5, 9, 15], dtype=torch.int64, device="cuda")
+    kv_cache = torch.full(
+        (num_pages, 2, num_kv_heads, tokens_per_block, head_dim),
+        -2.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(cache_dtype)
+    k_cache = kv_cache[:, 0]
+    v_cache = kv_cache[:, 1]
+    expected_cache = kv_cache.clone()
+    expected_k = expected_cache[:, 0]
+    expected_v = expected_cache[:, 1]
+    page_columns = logical_positions // tokens_per_block
+    pages = block_table[request_indices.to(torch.long), page_columns]
+    within = logical_positions % tokens_per_block
+    expected_k[pages, :, within, :] = k.to(cache_dtype)
+    expected_v[pages, :, within, :] = v.to(cache_dtype)
+
+    triton_qsa_paged_kv_store(
+        k=k,
+        v=v,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        request_indices=request_indices,
+        logical_positions=logical_positions,
+        block_table=block_table,
+        tokens_per_block=tokens_per_block,
+    )
+
+    torch.testing.assert_close(k_cache.float(), expected_k.float(), rtol=0, atol=0)
+    torch.testing.assert_close(v_cache.float(), expected_v.float(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_paged_kv_store_skips_unallocated_pages() -> None:
+    k = torch.ones(1, 2, 64, dtype=torch.bfloat16, device="cuda")
+    v = torch.full_like(k, 2.0)
+    k_cache = torch.zeros(2, 2, 8, 64, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+
+    triton_qsa_paged_kv_store(
+        k=k,
+        v=v,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        request_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        logical_positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        block_table=torch.full((1, 1), -1, dtype=torch.int32, device="cuda"),
+        tokens_per_block=8,
+    )
+
+    torch.testing.assert_close(k_cache, torch.zeros_like(k_cache))
+    torch.testing.assert_close(v_cache, torch.zeros_like(v_cache))
 
 
 @pytest.mark.parametrize("rows", [1, 64, 128])
