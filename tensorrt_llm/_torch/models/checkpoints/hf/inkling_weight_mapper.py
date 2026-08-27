@@ -114,6 +114,34 @@ def _experts_are_nvfp4(layer_idx: int, exclude_modules: Set[str], quantized: boo
     return f"model.llm.layers.{layer_idx}.mlp.experts" not in exclude_modules
 
 
+# Per-depth MTP keys, relative to ``model.mtp.layers.N.``. The draft block is
+# structurally a DENSE trunk layer -- same attention/norm keys, same dense-MLP
+# keys, verified against both shipped checkpoints -- plus three tensors that
+# fold the previous depth's hidden state into this one's embedding.
+_MTP_PREFIX_KEYS: Tuple[str, ...] = (
+    "embed_norm.weight",
+    "hidden_norm.weight",
+    "input_proj.weight",
+)
+
+
+def inkling_expected_mtp_keys(config: InklingTextConfig, num_depths: int) -> Set[str]:
+    """Exact set of ``model.mtp.*`` keys the draft chain consumes."""
+    keys: Set[str] = set()
+    for d in range(num_depths):
+        pfx = f"model.mtp.layers.{d}."
+        for k in _MTP_PREFIX_KEYS:
+            keys.add(pfx + k)
+        block = pfx + "transformer_block."
+        for k in _ATTN_AND_NORM_KEYS:
+            keys.add(block + k)
+        # Always dense: SGLang forces the dense MLP for every MTP depth, and
+        # the checkpoints agree (one global_scale per depth, no expert tensors).
+        for k in _DENSE_MLP_KEYS:
+            keys.add(block + k)
+    return keys
+
+
 def inkling_expected_text_keys(
     config: InklingTextConfig, exclude_modules: Set[str], quantized: bool = True
 ) -> Set[str]:
@@ -218,6 +246,9 @@ _LAYER_RENAMES = {
 
 _EXPERT_RE = re.compile(r"layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)(\.\w+)?$")
 _DENSE_W13_RE = re.compile(r"layers\.(\d+)\.mlp\.w13_dn\.weight$")
+# ``model.mtp.layers.<depth>.<tail>``: the draft chain. The tail below
+# ``transformer_block.`` is an ordinary decoder layer and takes the same renames.
+_MTP_RE = re.compile(r"^model\.mtp\.layers\.(\d+)\.(.*)$")
 
 
 def _split_interleaved_gate_up(t: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -303,6 +334,11 @@ class InklingHfWeightMapper(HfWeightMapper):
             # interleave is undone by the strided split in
             # ``InklingSharedExperts.forward``.
 
+            mtp_match = _MTP_RE.match(name)
+            if mtp_match is not None:
+                self._map_mtp(mtp_match, tensor, new_weights)
+                continue
+
             m = re.match(r"layers\.(\d+)\.(.*)$", name)
             if m is not None:
                 layer_idx, tail = m.group(1), m.group(2)
@@ -313,6 +349,36 @@ class InklingHfWeightMapper(HfWeightMapper):
             # Unknown key: keep as-is so any mismatch surfaces loudly at load.
             new_weights[name] = tensor
         return new_weights
+
+    def _map_mtp(self, match, tensor, new_weights: dict) -> None:
+        """Rename one draft-chain tensor into the module tree the block builds.
+
+        Emitted relative to the draft model (``mtp_layers.<depth>....``) because
+        that is what the generic loader walks. The block's own submodules --
+        ``embed_norm``, ``hidden_norm``, ``input_proj``, ``transformer_block`` --
+        already carry the checkpoint's names, so only the decoder tail needs the
+        same treatment the trunk gets: ``wq_du``/``wk_dv``/``wv_dv`` land as
+        separate q/k/v that the loader fuses into ``qkv_proj``, and the
+        gate/up-interleaved ``w13_dn`` is split first.
+
+        Doing this here rather than in the model is the point: fusion, NVFP4
+        scales and TP sharding are the loader's job, and a ``load_state_dict``
+        that bypasses it can only fail (or, with strict off, quietly load
+        nothing).
+        """
+        depth, tail = match.group(1), match.group(2)
+        prefix = f"mtp_layers.{depth}"
+        if tail.startswith("transformer_block."):
+            inner = tail[len("transformer_block.") :]
+            if inner == "mlp.w13_dn.weight":
+                gate, up = _split_interleaved_gate_up(tensor, dim=0)
+                new_weights[f"{prefix}.transformer_block.mlp.gate_proj.weight"] = gate
+                new_weights[f"{prefix}.transformer_block.mlp.up_proj.weight"] = up
+                return
+            inner = _LAYER_RENAMES.get(inner, inner)
+            new_weights[f"{prefix}.transformer_block.{inner}"] = tensor
+            return
+        new_weights[f"{prefix}.{tail}"] = tensor
 
     def _map_expert(
         self,

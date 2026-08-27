@@ -56,6 +56,14 @@ class InklingTextConfig(PretrainedConfig):
         swa_num_attention_heads: int = 64,
         swa_num_key_value_heads: int = 16,
         swa_head_dim: int = 128,
+        # MTP (next-N draft) chain. Depths listed in ``mtp_local_layer_ids``
+        # are banded; the rest are global. The SWA geometry defaults to the
+        # trunk's, which is what the checkpoint uses unless it says otherwise.
+        mtp_local_layer_ids: list[int] | None = None,
+        mtp_local_extent: int | None = None,
+        mtp_swa_num_attention_heads: int | None = None,
+        mtp_swa_num_key_value_heads: int | None = None,
+        mtp_swa_head_dim: int | None = None,
         # relative-bias / log-scaling
         d_rel: int = 16,
         rel_extent: int = 1024,
@@ -101,8 +109,21 @@ class InklingTextConfig(PretrainedConfig):
         self.local_layer_ids = list(local_layer_ids) if local_layer_ids else []
         self.sliding_window_size = sliding_window_size
         self.swa_num_attention_heads = swa_num_attention_heads
+        self.mtp_local_layer_ids = list(mtp_local_layer_ids or [])
+        self.mtp_local_extent = mtp_local_extent
+        self.mtp_swa_num_attention_heads = (
+            mtp_swa_num_attention_heads
+            if mtp_swa_num_attention_heads is not None
+            else swa_num_attention_heads
+        )
         self.swa_num_key_value_heads = swa_num_key_value_heads
         self.swa_head_dim = swa_head_dim
+        self.mtp_swa_num_key_value_heads = (
+            mtp_swa_num_key_value_heads
+            if mtp_swa_num_key_value_heads is not None
+            else swa_num_key_value_heads
+        )
+        self.mtp_swa_head_dim = mtp_swa_head_dim if mtp_swa_head_dim is not None else swa_head_dim
 
         self.d_rel = d_rel
         self.rel_extent = rel_extent
@@ -164,6 +185,90 @@ class InklingTextConfig(PretrainedConfig):
         """Sliding-window size for local layers; ``None`` for global layers."""
         return self.sliding_window_size if self.is_local_layer(layer_idx) else None
 
+    # ------------------------------------------------------------------ MTP --
+    # The draft chain's depths are NOT trunk layers: a banded depth runs at the
+    # HEAD's window, because the checkpoint's rel_logits_proj for that depth was
+    # trained at that window. Reusing the trunk geometry would silently apply
+    # the wrong relative-position extent.
+    def is_mtp_local_depth(self, depth: int) -> bool:
+        """Whether MTP depth ``depth`` is a banded (sliding-window) block."""
+        return depth in set(self.mtp_local_layer_ids or ())
+
+    def mtp_depth_window(self, depth: int) -> int | None:
+        """Sliding-window extent for an MTP depth; ``None`` if global."""
+        if not self.is_mtp_local_depth(depth):
+            return None
+        return (
+            self.mtp_local_extent if self.mtp_local_extent is not None else self.sliding_window_size
+        )
+
+    def mtp_depth_num_heads(self, depth: int) -> int:
+        return (
+            self.mtp_swa_num_attention_heads
+            if self.is_mtp_local_depth(depth)
+            else self.num_attention_heads
+        )
+
+    def mtp_depth_num_kv_heads(self, depth: int) -> int:
+        return (
+            self.mtp_swa_num_key_value_heads
+            if self.is_mtp_local_depth(depth)
+            else self.num_key_value_heads
+        )
+
+    def mtp_depth_head_dim(self, depth: int) -> int:
+        return self.mtp_swa_head_dim if self.is_mtp_local_depth(depth) else self.head_dim
+
+    def mtp_num_kv_heads_per_layer(self, num_depths: int) -> list[int]:
+        """Per-depth KV-head counts for the DRAFT chain's own KV cache.
+
+        The draft chain gets a separate cache manager, sized from the chain's
+        geometry -- not a slice of the trunk's. Slicing would be wrong twice
+        over: the list would be the trunk's length (42 or 66) where the manager
+        expects one entry per built depth, which is the assertion this exists to
+        satisfy; and the trunk's banded layers are not the chain's, so on the
+        full checkpoint (banded 16 KV heads, global 8) depths 1 and 3 would be
+        allocated 16 heads' worth of pages for an 8-head layer.
+        """
+        return [self.mtp_depth_num_kv_heads(d) for d in range(num_depths)]
+
+    def mtp_block_config(self, depth: int, layer_idx: int | None = None) -> "InklingTextConfig":
+        """A derived config that makes ``InklingDecoderLayer`` build an MTP block.
+
+        The draft block is structurally a DENSE trunk layer whose attention
+        geometry comes from the MTP chain, not the trunk. Rather than teach the
+        decoder layer about MTP -- which would put a second notion of "which
+        layer am I" inside it -- hand it a config where the ordinary questions
+        it already asks give the draft answers:
+
+        * ``is_dense_layer(depth)`` is forced True, because every MTP block uses
+          the dense MLP (SGLang forces this, and both checkpoints agree: one
+          global_scale per depth, no expert tensors);
+        * ``is_local_layer(depth)`` follows the CHAIN's banded depths;
+        * the window and SWA head geometry come from the chain's overrides.
+        """
+        import copy
+
+        cfg = copy.copy(self)
+        # The decoder layer is built with, and queries this config by, its own
+        # layer index. That is the CHAIN depth for geometry but the GLOBAL index
+        # (trunk layers + depth) for KV-cache addressing, because the draft
+        # manager keys its layer offsets globally. So the config is written to
+        # answer for whichever index the layer will actually use.
+        idx = depth if layer_idx is None else layer_idx
+        # Everything below dense_mlp_idx is dense, so idx+1 makes this layer
+        # dense whatever its index.
+        cfg.dense_mlp_idx = idx + 1
+        # Only this one index is ever queried on this config, so the chain's
+        # banded list collapses to "is this layer banded".
+        cfg.local_layer_ids = [idx] if self.is_mtp_local_depth(depth) else []
+        if self.is_mtp_local_depth(depth):
+            cfg.sliding_window_size = self.mtp_depth_window(depth)
+            cfg.swa_num_attention_heads = self.mtp_depth_num_heads(depth)
+            cfg.swa_num_key_value_heads = self.mtp_depth_num_kv_heads(depth)
+            cfg.swa_head_dim = self.mtp_depth_head_dim(depth)
+        return cfg
+
     def num_kv_heads_per_layer(self) -> list[int]:
         """Per-layer KV-head counts for the hybrid attention geometry.
 
@@ -214,9 +319,51 @@ class InklingConfig(PretrainedConfig):
         # Retained verbatim; interpreted only in the Phase-3 multimodal stage.
         self.audio_config = self._as_config(audio_config)
         self.vision_config = self._as_config(vision_config)
-        # Retained verbatim so the checkpoint round-trips. MTP / next-N draft
-        # decoding is not supported -- the draft weights stay deferred.
+        # Retained verbatim so the checkpoint round-trips, and canonicalized
+        # onto text_config: the draft-chain geometry is read by the MTP blocks,
+        # the KV-pool routing and the weight mapper, and three readers of two
+        # sources is how they drift.
         self.mtp_config = self._as_config(mtp_config)
+        if self.mtp_config is not None:
+            local_ids = getattr(self.mtp_config, "local_layer_ids", None)
+            if local_ids:
+                self.text_config.mtp_local_layer_ids = list(local_ids)
+            extent = getattr(self.mtp_config, "local_extent", None)
+            if extent is not None:
+                self.text_config.mtp_local_extent = extent
+            # The framework's MTPForCausalLM reads the chain depth as
+            # ``pretrained_config.num_nextn_predict_layers``; Inkling declares it
+            # on mtp_config, so mirror it under the name the framework looks for
+            # rather than special-casing Inkling inside the framework.
+            #
+            # Falls back to the listed depths because that read is a BARE
+            # attribute access -- ``checkpoint_mtp_num_layers =
+            # model_config.pretrained_config.num_nextn_predict_layers``, no
+            # getattr and no default. A checkpoint that describes its chain only
+            # by naming the banded depths would otherwise reach it with the
+            # attribute absent and die on a bare AttributeError from inside
+            # framework code, naming neither Inkling nor the field.
+            depths = getattr(self.mtp_config, "num_nextn_predict_layers", None)
+            if depths is None:
+                # ``local_layer_ids`` names WHICH depths are banded, not how
+                # many there are -- ``is_mtp_local_depth`` uses it as a
+                # membership set. The shipped small checkpoint declares 8 depths
+                # with ids [0, 2, 4, 5, 6, 7]: the length is 6, the last id is
+                # 7, and only ``max + 1`` recovers the 8. So the count is
+                # derived from the largest index, not from how many are listed.
+                ids = getattr(self.mtp_config, "local_layer_ids", None) or ()
+                depths = (max(ids) + 1) if ids else None
+            if depths is not None:
+                self.text_config.num_nextn_predict_layers = int(depths)
+                # And on THIS config as well, because two different framework
+                # readers look in two different places. MTPForCausalLM gets the
+                # TEXT sub-config, but update_spec_config_from_model_config is
+                # handed config.pretrained_config -- the top-level object for a
+                # multimodal checkpoint -- and reads num_nextn_predict_layers off
+                # it directly. Not finding it, it falls back to 1 and resolves to
+                # MTP_EAGLE_ONE_MODEL rather than vanilla MTP: one draft block
+                # replayed, not Inkling's per-depth chain.
+                self.num_nextn_predict_layers = int(depths)
 
     @staticmethod
     def _as_config(value):
