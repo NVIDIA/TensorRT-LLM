@@ -16,17 +16,17 @@
 import os
 import weakref
 from abc import abstractmethod
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
 
 from ...distributed.ops import reducescatter
-from .impl_blocks import MoEEplbWeightLayoutMixin, MoEWeightOwnerMixin
-from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
-                            MoEProblem, MoERejectReason, MoERunContext,
-                            MoEStaticCapability)
+from .impl_blocks import (MoEEplbWeightLayoutMixin, MoEExecutionContractMixin,
+                          MoEWeightOwnerMixin)
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
+                            MoERejectReason, MoERunContext)
 
 # Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
 # the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
@@ -91,27 +91,12 @@ class MoEWeightLoadingMode(Enum):
     W4A8_CUSTOM = 2
 
 
-# The type of alltoall method
-class AlltoallMethodType(IntEnum):
-    # Not available
-    NotEnabled = 0
-    # NVLink One-Sided
-    NVLinkOneSided = 1
-    # NVLink Two-Sided
-    NVLinkTwoSided = 2
-    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 3
-    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 4
-    # NCCL EP: Low-latency expert parallelism via NCCL EP library
-    NcclEP = 5
-
-
 class MoESchedulerKind(Enum):
     """Selects which forward-execution scheduler ConfigurableMoE picks for a backend.
 
     Backends declare this via the ``scheduler_kind`` class attribute on
-    ``MoE``. ``ConfigurableMoE`` reads it once at init time to construct the
+    ``MoEImplBase`` (execution units) or ``MoE`` (self-contained layers).
+    ``ConfigurableMoE`` reads it once at init time to construct the
     matching scheduler and to gate communication-strategy creation.
 
     The axis is whether the cross-rank EP exchange is fused into the MoE
@@ -207,16 +192,18 @@ def _(
         return res
 
 
-class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
+class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
+          MoEEplbWeightLayoutMixin, nn.Module):
     """
     Fused Mixture of Experts (MoE) Layer interface.
 
     A complete layer that also happens to own expert weights, so it takes the
-    weight-owner and weight-side EPLB layout blocks from ``impl_blocks``. What
-    is stated *here* is the complete-layer half -- ``forward`` / ``forward_impl``,
-    routing, reduce/allreduce, layer registration, and the EPLB forward-time
-    orchestration the wrapper drives -- plus this layer's own abstract contract,
-    which ``MoEImplBase`` deliberately states differently.
+    scheduler-facing contract, weight-owner, and weight-side EPLB layout blocks
+    from ``impl_blocks``. What is stated *here* is the complete-layer half --
+    ``forward`` / ``forward_impl``, routing, reduce/allreduce, layer
+    registration, and the EPLB forward-time orchestration the wrapper drives --
+    plus this layer's own abstract contract, which ``MoEImplBase`` deliberately
+    states differently.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -229,22 +216,12 @@ class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
 
-    # Default scheduler kind for ConfigurableMoE forward dispatch. Backends
-    # whose fused kernel owns cross-rank exchange (e.g. MegaMoE-style)
-    # override this to ``MoESchedulerKind.FUSED_COMM``.
+    # The other scheduler-facing defaults come from
+    # ``MoEExecutionContractMixin``, so this class and ``MoEImplBase`` cannot
+    # drift apart. This one cannot move there: its default needs
+    # ``MoESchedulerKind``, defined in this module, and ``impl_blocks`` is
+    # imported *by* this module.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
-
-    # Subclasses must restate capabilities to preserve exact-class behavior.
-    capabilities: MoEStaticCapability = MoEStaticCapability()
-
-    # Scheduler-provided inputs; inherited values remain valid for subclasses.
-    input_requirement: MoEInputRequirement = MoEInputRequirement()
-
-    # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
-    # so backends whose dispatch/combine paths still assume uniform partitioning fail
-    # fast with a clear error. Backends that fully exercise the ceil/floor partition
-    # (see ``_compute_ep_partition``) should override this to ``True``.
-    _supports_non_divisible_ep: bool = False
 
     @classmethod
     @abstractmethod
@@ -335,8 +312,10 @@ class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
         #
         # When init_load_balancer=False (the wrapper path, e.g. ConfigurableMoE
         # creating an inner backend), the wrapper is responsible for the
-        # divisibility contract and we skip the check entirely — the wrapper's
-        # own _init_load_balancer will gate it.
+        # divisibility contract and we skip the check entirely — see
+        # ConfigurableMoE._reject_non_divisible_ep_backend(), which runs it
+        # against this backend's class once the backend exists. The wrapper's
+        # own _init_load_balancer cannot: it runs before that.
 
         self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -634,18 +613,6 @@ class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
         else:
             self.allreduce = None
 
-    def validate_configurable_moe(self, moe: "nn.Module") -> None:
-        """Backend-specific validation hook called by ``ConfigurableMoE``.
-
-        ``ConfigurableMoE.validate_backend`` invokes this AFTER the generic
-        EPLB/load-balancer compatibility check, so backends may inspect
-        ``moe.num_slots``, ``moe.ep_size``, ``moe._using_load_balancer()``,
-        ``moe._using_dynamic_load_balancer()``. Default is a no-op; backends
-        with extra constraints (e.g. fused-comm backends rejecting
-        dynamic EPLB) override this.
-        """
-        del moe
-
     def _get_load_balancer_aux_stream(self) -> Optional[torch.cuda.Stream]:
         """Get auxiliary stream for load balancer from aux_stream_dict.
 
@@ -735,22 +702,8 @@ class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
                 self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True
 
-    @abstractmethod
-    def create_weights(self):
-        raise NotImplementedError
-
-    @abstractmethod
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
-        """
-        Args:
-            weights: List of weight dictionaries to load.
-            allow_partial_loading: Whether to enable partial loading for module parameters.
-                When True, weights are loaded without applying quantization transformations.
-                When False (default), weights are loaded and quantized together.
-        """
-        raise NotImplementedError
+    # ``create_weights`` / ``load_weights`` are implemented in
+    # ``MoEWeightOwnerMixin``, shared with ``MoEImplBase``.
 
     @abstractmethod
     def quantize_input(
@@ -832,24 +785,7 @@ class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         raise NotImplementedError
 
-    def forward_fake(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        do_finalize: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
-        assert do_finalize, "Default forward_fake does not support do_finalize=False"
-        data_type = output_dtype if is_nvfp4_input else x.dtype
-        num_tokens = all_rank_num_tokens[
-            self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
-        hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
-        return x.new_empty((num_tokens, hidden_size), dtype=data_type)
+    # ``forward_fake`` is implemented in ``MoEExecutionContractMixin``.
 
     # Sub class is not allowed to override forward.
     # This is universal interface for all MoE backends
@@ -915,11 +851,10 @@ class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
     @property
     def enable_alltoall(self):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
-        """
-        return False
 
-    def supports_moe_output_in_alltoall_workspace(self):
-        """ Supports moe_output in alltoall workspace
+        Layer-level, not part of the execution-unit contract: the answer follows
+        from the communication strategy the layer owns, and ``ConfigurableMoE``
+        overrides it from ``self.comm``.
         """
         return False
 

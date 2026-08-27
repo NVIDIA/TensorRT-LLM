@@ -35,6 +35,7 @@ from .build import (
     _build_moe_module,
     _calculate_num_chunks_safe,
     _comm_method_name,
+    _epilogue_activation_name,
     _scheduler_kind_name,
 )
 from .mapping import _build_mapping_from_config, _resolve_mapping_layout
@@ -156,6 +157,16 @@ def _build_routing_control_block(
     hist_max = max(flat_hist) if flat_hist else 0
     active_experts = sum(1 for v in flat_hist if v > 0)
 
+    # ``max_abs`` compares the re-materialised plan with itself outside forced
+    # mode, so it is 0 by construction -- including for a plan the routing
+    # method could not realise. Publishing that 0 next to
+    # ``realization_status="projected"`` reads as "the projection was perfect",
+    # which is exactly backwards. Only report the number where it means
+    # something: forced mode, where the kernel consumes the materialised plan.
+    error_is_meaningful = routing_mode == "forced"
+    reported_abs: Optional[int] = int(max_abs) if error_is_meaningful else None
+    reported_rel: Optional[float] = float(max_rel) if error_is_meaningful else None
+
     warnings_out = list(warnings)
     if routing_mode != "forced":
         warnings_out.append(
@@ -179,8 +190,8 @@ def _build_routing_control_block(
             "routing_realization": {
                 "status": realization_status,
                 "reason": realization_reason,
-                "max_abs_slot_error": int(max_abs),
-                "max_relative_slot_error": float(max_rel),
+                "max_abs_slot_error": reported_abs,
+                "max_relative_slot_error": reported_rel,
             },
             "enable_perfect_router": bool(enable_perfect_router),
             "effective_src_axis": "dp_rank",
@@ -198,7 +209,7 @@ def _build_routing_control_block(
                 "row_sums": row_sums,
                 "col_sums": col_sums,
                 "off_diagonal_ratio": float(off_diag_ratio),
-                "max_abs_slot_error": int(max_abs),
+                "max_abs_slot_error": reported_abs,
                 "matrix_dump_path": None,
             },
             "observed_expert_histogram_summary": {
@@ -716,6 +727,7 @@ def _run_one_candidate(
         result.actual_backend = _backend_name_from_module(moe)
         result.scheduler_kind = _scheduler_kind_name(moe)
         result.actual_comm_method = _comm_method_name(moe)
+        result.actual_epilogue_activation = _epilogue_activation_name(moe)
         result.num_chunks = _calculate_num_chunks_safe(moe, all_rank_num_tokens)
 
         if result.actual_backend != config.backend.upper():

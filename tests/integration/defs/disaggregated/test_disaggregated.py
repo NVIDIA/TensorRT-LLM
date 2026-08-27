@@ -347,6 +347,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conditional.yaml",
         "ngram":
         f"{test_configs_root}/disagg_config_ngram.yaml",
+        "sa":
+        f"{test_configs_root}/disagg_config_sa.yaml",
+        "sa_python":
+        f"{test_configs_root}/disagg_config_sa_python.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -1027,8 +1031,8 @@ def run_disaggregated_test(example_dir,
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
-    client tests, at least one of them must contain that substring (used to prove the KV-cache
-    bounce path actually engaged instead of silently falling back to the per-fragment path).
+    client tests, at least one of them must contain that substring (used to prove an intended
+    code path actually engaged instead of silently falling back to another one).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1057,6 +1061,7 @@ def run_disaggregated_test(example_dir,
 
     server_host = config.get("hostname", "localhost")
 
+    success = False
     try:
         server_url = f"http://{server_host}:{server_port}"
 
@@ -1090,8 +1095,8 @@ def run_disaggregated_test(example_dir,
         if post_client_test is not None:
             post_client_test(server_url)
         if assert_gen_log_contains is not None:
-            # Fail loudly if the marker is absent: the transfer silently fell back to the
-            # per-fragment path, so the bounce path we meant to exercise never ran.
+            # Fail loudly if the marker is absent: the code path the test means to
+            # exercise never ran and something else silently took its place.
             logs = []
             for w in gen_workers:
                 if w.log_path and os.path.exists(w.log_path):
@@ -1099,11 +1104,16 @@ def run_disaggregated_test(example_dir,
                         logs.append(f.read())
             assert any(assert_gen_log_contains in log for log in logs), (
                 f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
-                f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
-            )
+                f"but none of {len(logs)} log(s) contained it "
+                f"(the intended code path did not engage)")
+        success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # When the marker assertion is active the worker logs are file-based
+        # (save_log=True). Preserve work_dir on the failure path so the first
+        # failures on the newly enabled stages arrive with logs to read.
+        if success or assert_gen_log_contains is None:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1826,6 +1836,37 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa(disaggregated_test_root, llm_venv,
+                          disaggregated_example_root, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
+                                 disaggregated_example_root, llama_model_root):
+    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
+
+    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
+    covers this split only on the C++ DEFAULT backend.
+    """
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa_python",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -2029,10 +2070,9 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
         cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @skip_arm
-@skip_no_hopper
-@skip_arm
+@skip_pre_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
@@ -2046,11 +2086,35 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
+
+    # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
+    # controlled by the test lists (l0_dgx_h100, l0_dgx_b200 pre_merge,
+    # l0_dgx_b300), which cover Hopper and Blackwell. The old Hopper-only
+    # @skip_no_hopper silently skipped this test on its B200/B300 registrations;
+    # skip_pre_hopper keeps those live while still gating out pre-Hopper.
+    #
+    # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
+    # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
+    # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
+    # essentially every gen forward. Require its kernel-compile marker (logged
+    # at INFO) in a generation-worker log: correct client output alone would
+    # not distinguish the CuTe DSL path from a silent fallback to another FMHA
+    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
+    # documented off switch.
+    gen_env = None
+    assert_gen_log_contains = None
+    if get_sm_version() in (100, 103):
+        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
+
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
                            env=env,
+                           gen_env=gen_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           assert_gen_log_contains=assert_gen_log_contains)
 
 
 @skip_no_hopper

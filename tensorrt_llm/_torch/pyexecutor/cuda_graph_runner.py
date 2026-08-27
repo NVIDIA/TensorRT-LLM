@@ -49,6 +49,7 @@ class KeyType(NamedTuple):
     context_query_len: int = 0
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
+    use_lora_graph: bool = False
 
 
 def _save_spec_decode_capture_state(
@@ -132,7 +133,7 @@ class CUDAGraphRunner:
 
     This unified class handles high-level orchestration (padding, eligibility)
     and low-level execution (capturing, resource management, replaying) for
-    multiple graphs, keyed by (batch size, draft_len, is_first_draft).
+    multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
 
@@ -316,6 +317,7 @@ class CUDAGraphRunner:
         spec_metadata: Optional[SpecMetadata] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
+        use_lora_graph: bool = False,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -342,7 +344,8 @@ class CUDAGraphRunner:
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
                           is_all_greedy_sample=is_all_greedy_sample,
-                          peft_cache_data_type=peft_cache_data_type)
+                          peft_cache_data_type=peft_cache_data_type,
+                          use_lora_graph=use_lora_graph)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -372,7 +375,8 @@ class CUDAGraphRunner:
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
                           num_encoder_tokens=num_encoder_tokens,
-                          peft_cache_data_type=peft_cache_data_type)
+                          peft_cache_data_type=peft_cache_data_type,
+                          use_lora_graph=use_lora_graph)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -434,6 +438,7 @@ class CUDAGraphRunner:
         spec_resource_manager: Optional[BaseResourceManager] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
+        use_lora_graph: bool = False,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
@@ -480,7 +485,7 @@ class CUDAGraphRunner:
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
                                  promoted_context_request_ids,
-                                 peft_cache_data_type)
+                                 peft_cache_data_type, use_lora_graph)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
@@ -681,6 +686,9 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -1821,6 +1829,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph,
                                   pool=self.memory_pool,
                                   capture_error_mode="thread_local"):

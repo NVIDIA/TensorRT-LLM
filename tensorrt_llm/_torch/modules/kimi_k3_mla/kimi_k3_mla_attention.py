@@ -10,17 +10,90 @@ gated output projection.
 
 from __future__ import annotations
 
+import os
+from functools import partial
 from typing import Optional
 
 import torch
-from torch import nn
 
 from ....functional import PositionEmbeddingType
+from ....logger import logger
+from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
-from ...attention_backend import AttentionMetadata, TrtllmAttention
+from ...attention_backend import AttentionMetadata, TrtllmAttention, TrtllmAttentionMetadata
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
+from ..linear import Linear, TensorParallelMode
 from ..mla import MLA
+
+_KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
+_KIMI_K3_MLA_GEN_BACKENDS = ("cute-dsl", "trtllm-gen")
+
+
+def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
+    """Select K3's absorbed-generation MLA backend.
+
+    K3 was tuned with the FlashInfer CuTe-DSL backend for BF16 KV cache.
+    FP8 KV cache carries device scales that CuTe-DSL does not support, so
+    retain the TRTLLM-Gen fallback used by the pre-refactor implementation.
+    """
+    backend = os.environ.get(_KIMI_K3_MLA_GEN_BACKEND_ENV, "cute-dsl")
+    # Validate here, where the env var is read: an invalid value would
+    # otherwise surface only deep inside attention-backend construction,
+    # with an error that never names the knob that caused it.
+    if backend not in _KIMI_K3_MLA_GEN_BACKENDS:
+        raise ValueError(
+            f"{_KIMI_K3_MLA_GEN_BACKEND_ENV}={backend!r} is invalid; "
+            f"expected one of {list(_KIMI_K3_MLA_GEN_BACKENDS)}."
+        )
+    has_fp8_kv_cache = bool(
+        quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
+    )
+    if has_fp8_kv_cache and backend != "trtllm-gen":
+        # info_once: this runs once per MLA layer (~60x at startup for
+        # FP8-KV) and the decision is identical for every layer.
+        logger.info_once(
+            "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
+            f"generation backend; overriding '{backend}' -> 'trtllm-gen'.",
+            key="kimi_k3_mla_gen_backend_fp8_override",
+        )
+        return "trtllm-gen"
+    return backend
+
+
+def _kimi_k3_mla_decode_backend_policy(
+    requested_backend: str,
+    metadata: TrtllmAttentionMetadata,
+    num_gen_tokens: int,
+    *,
+    num_heads: int,
+) -> str:
+    """Per-batch MLA decode backend selection for Kimi K3.
+
+    Installed as ``mla_backend_policy`` on K3's generation attention backend
+    (see :class:`KimiK3MLAAttention`); the general attention code applies no
+    such policy on its own.
+
+    CuTe-DSL reuses one staged page table across MLA layers for a
+    generation-only, one-token-per-request batch. Other mixed batches repeat
+    the staging copies in every MLA layer and regress time to first token, so
+    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception:
+    TRTLLM-Gen may select a 64-head Q tile, which does not divide 96 and
+    produces an invalid configuration after K3's head padding was removed.
+
+    The CuTe-DSL kernel itself accepts multi-token queries, but K3's decode
+    tuning covers only the one-token-per-request regime, so generation-only
+    speculative verification also falls back.
+    """
+    is_single_token_generation = num_gen_tokens == metadata.num_generations
+    requires_cute_dsl_for_mixed_batch = metadata.num_contexts > 0 and num_heads == 96
+    if (
+        requested_backend == "cute-dsl"
+        and not requires_cute_dsl_for_mixed_batch
+        and (metadata.num_contexts > 0 or not is_single_token_generation)
+    ):
+        return "trtllm-gen"
+    return requested_backend
 
 
 def _meta_safe_cast_dtype(module, dtype):
@@ -158,14 +231,12 @@ class KimiK3MLAAttention(MLA):
         layer_idx: int = 0,
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantConfig] = None,
+        model_config: ModelConfig,
+        mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
             max_position_embeddings=max_position_embeddings,
-        )
-        model_config = ModelConfig(
-            quant_config=quant_config if quant_config is not None else QuantConfig()
         )
         super().__init__(
             hidden_size=hidden_size,
@@ -184,9 +255,11 @@ class KimiK3MLAAttention(MLA):
             dtype=dtype,
             dense_bias=False,
             config=model_config,
+            mapping_with_cp=mapping_with_cp,
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
+            flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
         )
         # K3 calls forward_impl() directly to insert its output gate before
         # the base row-parallel o_proj. The original executor metadata remains
@@ -196,10 +269,22 @@ class KimiK3MLAAttention(MLA):
         self.use_output_gate = use_output_gate
 
         if use_output_gate:
-            self.g_proj = nn.Linear(
+            # The gate must match o_proj's input sharding (under helix the
+            # post-all-to-all 1/cp head chunk); outside helix this equals
+            # q_b_proj's head sharding, replicated under attention-DP.
+            self.g_proj = Linear(
                 hidden_size,
                 num_heads * v_head_dim,
                 bias=False,
+                dtype=dtype,
+                mapping=self.o_proj.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                allreduce_strategy=model_config.allreduce_strategy,
+                force_dynamic_quantization=model_config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
 
         # K3 is NoPE. The base MLA backends still require real RoPE tables, so
@@ -208,6 +293,13 @@ class KimiK3MLAAttention(MLA):
         assert isinstance(self.mqa, TrtllmAttention)
         _install_identity_rope_table(self.mha)
         _install_identity_rope_table(self.mqa)
+        # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
+        # only it needs K3's per-batch fallback policy; mha keeps the
+        # default trtllm-gen selection.
+        self.mqa.mla_backend_policy = partial(
+            _kimi_k3_mla_decode_backend_policy,
+            num_heads=self.mqa.num_heads,
+        )
         self.rotary_emb = None
         self.apply_rotary_emb = False
 

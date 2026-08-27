@@ -103,6 +103,9 @@ def LLVM_CONFIG = "LLVM"
 def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
+def INFRA_DRY_RUN_TEST_CONTEXT = "infra_dry_run"
+
+@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
@@ -125,6 +128,9 @@ SLURM_MEMORY_LIMIT = "12Gi"
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
+
+TESTER_CPU_ONLY_CORES = "2"
+TESTER_CPU_ONLY_MEMORY = "12Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
@@ -164,15 +170,16 @@ SLURM_INFRA_RETRY_MAX = 1
 K8S_INFRA_RETRY_MAX = 1
 
 // Infra-scoped fail-fast master switch. When true, a branch whose post-retry
-// failure classifies as a positive K8s infra abort (via
+// failure classifies as a positive infra abort (via
 // FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its sibling
 // branches keep running instead of being SIGTERMed by failFast -- and a sub-job
 // that saw only infra aborts (no genuine failure) resolves to UNSTABLE. When
 // false, every failure rethrows and the original bare-boolean fail-fast is fully
 // restored. Kept separate from params.enableFailFast so the scoped behavior can
-// be disabled pipeline-wide without turning fail-fast itself off. Only K8s-scoped
-// aborts are deferred today; SLURM-scoped aborts fall back to today's fail-fast
-// (see runBranchesWithInfraDefer).
+// be disabled pipeline-wide without turning fail-fast itself off. Both K8s-scoped
+// and SLURM-scoped aborts are deferred: runBranchesWithInfraDefer classifies each
+// branch under its real execution scope (SLURM dispatcher stages under both K8S
+// and SLURM, every other stage under K8S).
 //
 // Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
 // env var on the job. Env values are strings ("false" is truthy in Groovy), so
@@ -226,6 +233,10 @@ COMMON_SSH_OPTIONS = Utils.DEFAULT_CUSTOM_SSH_OPTIONS
 
 // Per-stage CBTS coverage exclusions applied on top of the upstream eligibility decision.
 CBTS_EXCLUDE_STAGES = [] as Set
+
+def isInfraDryRun() {
+    return testFilter[(INFRA_DRY_RUN)] ?: false
+}
 
 def isCbtsStage(String stageName) {
     // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
@@ -561,6 +572,24 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     return rerunFailed  // Return the updated value
 }
 
+def getInfraDryRunPytestTargets(testListPath) {
+    if (!isInfraDryRun()) {
+        return []
+    }
+
+    // --test-list filters after collection, so also pass the exact rendered
+    // nodeid positionally to avoid importing unrelated product tests.
+    def targets = readFile(file: testListPath).readLines()
+        .collect { it.trim().split(/\s+/, 2)[0] }
+        .findAll { it.contains("::") }
+    def expectedTarget =
+        "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
+    if (targets != [expectedTarget]) {
+        error "Unexpected pytest targets in infrastructure dry-run list ${testListPath}: ${targets}"
+    }
+    return targets
+}
+
 def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -633,6 +662,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
         if (durationsPath) {
             testListCmd += ["--durations-path ${durationsPath}"]
         }
+        testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
         try {
             // First execute the pytest command and check if it succeeds
@@ -1391,6 +1421,23 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         boolean slurmFailureClassified = false
         def classifySlurmFailure = { Throwable err ->
             slurmFailureClassified = true
+            // A completed-pytest deterministic failure (tests ran, were re-run via
+            // --reruns, and still failed) is a real test failure, not lost-contact
+            // infra. On the agent path the SLURM allocation outlives pytest, so the
+            // job is still RUNNING here even though pytest already finished -- do NOT
+            // let the job state below relabel it as slurm-job-still-running and retry
+            // it (which masks the failure whenever the retry happens to pass). Key
+            // off the propagated rerun-failure error: it is raised only when reruns
+            // genuinely failed and takes precedence over the timeout path. Do not key
+            // off failed_results.xml -- generateRerunReport writes it from the first
+            // run whenever any rerun occurred, even when the rerun passed or the job
+            // timed out, so it would wrongly suppress a legitimate infra retry. Defer
+            // so the base classifier treats it as a UserFailure (no retry); a monitor-
+            // lost-contact cut raises "terminated unexpectedly" instead and retries.
+            if ((err?.toString() ?: "").contains("still failed after rerun attempts")) {
+                echo "[INFRA-RETRY] ${stageName}: pytest reported deterministic test failure(s); not an infra retry."
+                return err
+            }
             // Measure elapsed from when the job was first observed RUNNING; fall back
             // to executeStartMs if the RUNNING stamp was never set.
             long timeoutBaselineMs = (jobRunningStartMs ?: executeStartMs) as long
@@ -1679,6 +1726,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
+    def infraDryRun = isInfraDryRun()
+    if (infraDryRun) {
+        testList = INFRA_DRY_RUN_TEST_CONTEXT
+        splitId = 1
+        splits = 1
+        perfMode = false
+    }
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -1709,6 +1763,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
+            def waivesListPathLocal = infraDryRun
+                ? "${llmPath}/infra_dry_run_waives.txt"
+                : "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
             def slurmJobLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
@@ -1783,18 +1840,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     script: Utils.sshUserCmd(remote, "\"mv -f ${testListPathNode}.tmp ${testListPathNode}\"")
                 )
 
-                // Download and Merge waives.txt
-                mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
+                if (infraDryRun) {
+                    sh "mkdir -p ${llmPath} && : > ${waivesListPathLocal}"
+                } else {
+                    // Download and Merge waives.txt
+                    mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
 
-                // Add passed test list from previous pipeline run to the waives.txt
-                if (testFilter[(REUSE_TEST)] != false) {
-                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt", postTag)
+                    // Add passed test list from previous pipeline run to the waives.txt
+                    if (testFilter[(REUSE_TEST)] != false) {
+                        reusePassedTestResults(llmSrcLocal, stageName, waivesListPathLocal, postTag)
+                    }
                 }
 
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
-                    "${llmSrcLocal}/tests/integration/test_lists/waives.txt",
+                    waivesListPathLocal,
                     waivesListPathNode
                 )
 
@@ -1890,7 +1951,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         "--s3-upload-mode=deferred",
                     ]
                 }
-                def pytestCommand = getPytestBaseCommandLine(
+                def pytestCommandParts = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
                     waivesListPathNode,
@@ -1899,7 +1960,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
-                ).join(" ")
+                )
+                pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
+                def pytestCommand = pytestCommandParts.join(" ")
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE
@@ -2073,6 +2136,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     export perfMode=$perfMode
+                    ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
@@ -2092,7 +2156,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ${srunPrologue}
                 """.replaceAll("(?m)^\\s*", "")
 
-                if (disaggMultiNodeMode || aggMultiNodeMode) {
+                if (!isInfraDryRun() && (disaggMultiNodeMode || aggMultiNodeMode)) {
                     def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
                     def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
                     // The unified submit.py handles both agg and disagg; only the
@@ -2355,8 +2419,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         fi
                     done
 
-                    # Kill tail -f process
-                    kill \$tailPid
+                    # Stop and reap the log follower. It may have already exited
+                    # when the remote log stream closes; that is not a test failure.
+                    kill \$tailPid 2>/dev/null || true
+                    wait \$tailPid 2>/dev/null || true
 
                     # Wait briefly to ensure accounting is consistent
                     sleep 10
@@ -2547,6 +2613,56 @@ def cbtsResizeSplits(configs) {
         resized[key + CBTS_STAGE_SUFFIX] = v
     }
     return resized
+}
+
+// CBTS Layer 2: replace the normal stage set with the selector's affected
+// stages while retaining the baseline sanity and multi-GPU gates.
+def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts == null) {
+        return parallelJobsFiltered
+    }
+
+    // cbtsResizeSplits renames only narrowed stages (those in
+    // affected_stage_split_counts) to `-cbts`; affected-but-not-narrowed
+    // stages keep their original name, so match each per its actual key.
+    def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
+    def narrowed = (cbts.affected_stage_split_counts ?: [:]).keySet()
+    def affectedSet = (cbts.affected_stages ?: []).collect {
+        (stageSuffix && narrowed.contains(it)) ? (it + stageSuffix) : it
+    } as Set
+    def needsSanity = cbts.sanity_required
+    def needsPerfSanity = cbts.perfsanity_required
+    def filtered = parallelJobs.findAll { key, _ ->
+        if (key.contains("-OnDemand-")) {
+            return false
+        }
+        if (key =~ /Post-Merge/) return affectedSet.contains(key)
+        return affectedSet.contains(key) ||
+               (needsSanity && key =~ /PackageSanityCheck/) ||
+               (needsPerfSanity && key =~ /PerfSanity/)
+    }
+    if (affectedSet.isEmpty()) {
+        if (filtered.isEmpty()) {
+            echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
+        } else {
+            echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
+                 "${filtered.size()} force-kept stage(s) only"
+        }
+    } else if (filtered) {
+        echo "CBTS [${cbts.scope}]: limiting to ${filtered.size()} stages " +
+             "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
+    } else {
+        echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+    }
+
+    // The coverage tier omits multi-GPU; re-add it under the baseline gate.
+    if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
+        filtered += multiGpuJobs
+        echo "CBTS [${cbts.scope}]: multi-GPU file changed → running " +
+             "${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+    }
+    return filtered
 }
 
 // True when an exception indicates the K8s dispatcher pod this SLURM stage runs
@@ -2761,6 +2877,8 @@ def CBTS_RESULT = "cbts_result"
 // Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
 @Field
 def CBTS_COVERAGE = "cbts_coverage"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
 // Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
@@ -2788,6 +2906,7 @@ def testFilter = [
     (DETAILED_LOG): false,
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
+    (INFRA_DRY_RUN): false,
 ]
 
 @Field
@@ -3258,7 +3377,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def nodeLabelPrefix = ""
     def tolerations = ""
     def extraDeviceEnv = ""
-    def serviceInitContainerConfig = ""
     def serviceContainerConfig = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
@@ -3332,12 +3450,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     tty: true
                     resources:
                       requests:
-                        cpu: ${TESTER_CORES}
-                        memory: ${TESTER_MEMORY}
+                        cpu: ${TESTER_CPU_ONLY_CORES}
+                        memory: ${TESTER_CPU_ONLY_MEMORY}
                         ephemeral-storage: 300Gi
                       limits:
-                        cpu: ${TESTER_CORES}
-                        memory: ${TESTER_MEMORY}
+                        cpu: ${TESTER_CPU_ONLY_CORES}
+                        memory: ${TESTER_CPU_ONLY_MEMORY}
                         ephemeral-storage: 300Gi
                     imagePullPolicy: Always
                     volumeMounts:
@@ -3587,7 +3705,6 @@ ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
-${serviceInitContainerConfig}
                 containers:
                   ${containerConfig}
                     env:
@@ -3714,6 +3831,18 @@ def runLLMAgentFlowTest(pipeline, stageName)
     // These resolve from the container's default PyPI mirror.
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${agentFlowRoot} && pip3 install -e \".[test]\"")
 
+    if (isInfraDryRun()) {
+        // Keep the normal environment and reporting path, but replace product tests.
+        sh """
+            rm -rf "${agentFlowRoot}/tests" && \
+            mkdir -p "${agentFlowRoot}/tests" && \
+            printf '%s\\n' \
+                'def test_infra_dry_run_placeholder():' \
+                '    pass' \
+                > "${agentFlowRoot}/tests/test_infra_dry_run_placeholder.py"
+        """
+    }
+
     sh "mkdir -p ${WORKSPACE}/${stageName}"
 
     // test_workflow_entrypoint_modules_run_without_import_warnings is deselected
@@ -3750,7 +3879,9 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            // --validate --parity: after --l0/--qa generate the collectable lists, assert every
+            // statically-verified parametrize ID is actually collectable (validate<->collection parity).
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -3902,10 +4033,6 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-FMHA-", add "backend=fmha" to makoArgs
         // At this point, only tests with backend=fmha or unspecified backend will be run
         makoArgs += ["backend=fmha"]
-    } else if (stageName.contains("-AutoDeploy-")) {
-        // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
-        // At this point, only tests with backend=autodeploy or unspecified backend will be run
-        makoArgs += ["backend=autodeploy"]
     } else if (stageName.contains("-Generic-")) {
         // Generic stages select tests by marker expression rather than backend ownership.
         makoArgs += ["backend=generic"]
@@ -3914,7 +4041,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // At this point, only tests with backend=verl or unspecified backend will be run
         makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", "-AutoDeploy-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", or "-Verl-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -3967,6 +4094,24 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         }
     }
 
+    // Log the resolved mako match on every render, tagged with stage+context.
+    // transformMakoArgsToJson already echoes the bare JSON ("Test DB Mako opts:"),
+    // but unlabeled and far upstream of the render; the preDefinedMakoOpts path
+    // skips it entirely. This co-locates the match with the stage/context and the
+    // "-> N tests" summary below under one greppable renderTestDB: prefix, so a
+    // wrong-but-non-empty render (a stale/unexpected sysinfo value selecting the
+    // wrong block) is diagnosable per stage, not just the "na"/empty cases.
+    echo "renderTestDB: stage=${stageName} context=${testContext} mako match: ${makoOpts}"
+
+    if (makoOpts.contains('"na"')) {
+        // "na" is a sysinfo probe failure sentinel (see get_sysinfo.py). Blocks
+        // conditioned on the failed property silently drop out of the render, so
+        // even a non-empty list may be missing tests. Warn here, where every
+        // sysinfo-based stage passes through, not just when the list ends up empty.
+        echo "WARNING: renderTestDB: some sysinfo probes returned \"na\": ${makoOpts}. " +
+             "Test-db blocks conditioned on those properties (e.g. linux_distribution_name: ubuntu*) " +
+             "will NOT be selected."
+    }
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
     // orchestrator uploaded to Artifactory (see getCbtsResult in
@@ -4013,10 +4158,30 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    def testCount = sh(returnStdout: true, script: "wc -l < ${testList} | tr -d ' '").trim()
+    // Count non-empty lines, not newlines: trt-test-db writes the test names
+    // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
+    // for a single-test render, which would trip the empty-list guard below
+    // (and mis-report every stage's count by one). `grep -c .` is agnostic to
+    // the missing terminator. It exits 1 for no matches (a legitimately empty
+    // render -> count "0"); accept only that, so a read failure (exit 2:
+    // missing file, unreadable, etc.) still aborts the step instead of being
+    // silently masked.
+    def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
+    if (testCount == "0") {
+        // An empty render is never legitimate here: every launched stage must
+        // have tests (CBTS drops stages with an empty selection before launch).
+        // Fail now with the match query rather than letting pytest --collect-only
+        // exit 5 later with an unattributable "Test collection failed" message.
+        def hint = makoOpts.contains('"na"') ?
+            " Some sysinfo probes returned \"na\" (see the match JSON above); a broken probe" +
+            " (e.g. the python 'distro' module missing) makes conditions like" +
+            " linux_distribution_name: ubuntu* match nothing." : ""
+        error("renderTestDB: rendered EMPTY test list for stage=${stageName} " +
+              "context=${testContext} test-db=${testDBLabel}. Match query: ${makoOpts}.${hint}")
+    }
     recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount, clusterName)
 
     return testList
@@ -4395,9 +4560,13 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
                 sh "cd ${priorDir} && tar -xzf ${tarName}"
                 // results.xml may live at ${stageName}/results.xml inside the
                 // tar, or at the tar's root depending on how it was packaged.
-                // Scan both.
+                // Scan both. Also match superseded-results*.xml: a suppressed
+                // intermediate attempt renames its result XMLs with that prefix
+                // (so the build-level junit does not re-ingest the superseded
+                // attempt), but its PASSED tests are still valid to reuse here --
+                // extract_passed_tests only pulls the passing subset.
                 def xmlFiles = sh(returnStdout: true,
-                                  script: "find ${priorDir} -maxdepth 4 -name 'results*.xml' 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
+                                  script: "find ${priorDir} -maxdepth 4 \\( -name 'results*.xml' -o -name 'superseded-results*.xml' \\) 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
                 if (xmlFiles) {
                     priorXmls += xmlFiles.split(',') as List
                 }
@@ -4707,6 +4876,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
+        def infraDryRun = isInfraDryRun()
+        if (infraDryRun) {
+            testList = INFRA_DRY_RUN_TEST_CONTEXT
+            splitId = 1
+            splits = 1
+            perfMode = false
+        }
 
         // When useClusterDurations is set, use a per-cluster durations file keyed on
         // partition.clusterName (e.g. "oci-hsg", "dlcluster").  This lets each cluster
@@ -4724,13 +4900,20 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
+        def waivesFilePath = infraDryRun
+            ? "${llmSrc}/infra_dry_run_waives.txt"
+            : "${llmSrc}/tests/integration/test_lists/waives.txt"
 
-        // Download and Merge waives.txt
-        mergeWaivesTxt(pipeline, llmSrc, stageName)
+        if (infraDryRun) {
+            sh ": > ${waivesFilePath}"
+        } else {
+            // Download and Merge waives.txt
+            mergeWaivesTxt(pipeline, llmSrc, stageName)
 
-        // Add passed test list from previous pipeline run to the waives.txt
-        if (testFilter[(REUSE_TEST)] != false) {
-            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
+            // Add passed test list from previous pipeline run to the waives.txt
+            if (testFilter[(REUSE_TEST)] != false) {
+                reusePassedTestResults(llmSrc, stageName, waivesFilePath, postTag)
+            }
         }
 
         // Process shard test list and create separate files for regular and isolate tests
@@ -4778,7 +4961,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
-            "${llmSrc}/tests/integration/test_lists/waives.txt",
+            waivesFilePath,
             perfMode,
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
@@ -4791,6 +4974,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Only add --test-list if there are regular tests to run
         if (preprocessedLists.regularCount > 0) {
             pytestCommand += ["--test-list=${preprocessedLists.regular}"]
+            pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)
         }
 
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
@@ -4800,7 +4984,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
         }
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
-        withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
+        def testEnvironment = ["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]
+        if (infraDryRun) {
+            testEnvironment += ["stageName=${stageName}"]
+        }
+        withEnv(testEnvironment) {
             withCredentials([
                 string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
@@ -5561,7 +5749,7 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
 }
 
 // Infra-scoped fail-fast (inner/branch layer). Runs `jobs` under `parallel` so a
-// branch whose post-retry failure is a positive K8s infra abort
+// branch whose post-retry failure is a positive infra abort
 // (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its siblings
 // keep running instead of being SIGTERMed by failFast. A genuine test/build
 // failure (or an unclassified one) is rethrown unchanged, so failFast stays fully
@@ -5572,13 +5760,20 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
 // sibling architecture; a mixed sub-job already threw on its real failure and is
 // FAILURE (currentBuild.result worst-of semantics won't downgrade it).
 //
-// Scope: classify() is scope-filtered, so this passes K8S -- the motivating
-// pod-scheduling abort (KubernetesClientTimeoutException) is K8S-scoped. SLURM-only
-// aborts do NOT match here and keep today's fail-fast; deferring those too means
-// threading each stage's scope (opts.slurmDispatcher) in -- a follow-up, not this
-// change. Gated on ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior
-// exactly (plain failFast + parallel, no wrapping, no UNSTABLE).
-def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
+// Scope: classify() is scope-filtered, so each branch is classified under its real
+// execution scope, passed per-stage in `stageScopes` (built in launchTestJobs from
+// opts.slurmDispatcher). Every branch is checked under K8S -- this is where the
+// motivating pod-scheduling abort (KubernetesClientTimeoutException) matches, and
+// keeps K8s-pod aborts of a SLURM dispatcher pod deferrable exactly as before.
+// SLURM dispatcher stages are ADDITIONALLY checked under SLURM so a SLURM-scoped
+// abort (SSH outage to the head node, slurm_track ssh exit 255, monitor loss while
+// the job is still active) defers too instead of cascading via failFast. The inner
+// SLURM retry (runLLMTestlistOnSlurm) has already been exhausted by the time the
+// branch body returns here, so this stays post-retry, mirroring the K8s path.
+// Stages absent from stageScopes default to K8S-only (phase-1 behavior). Gated on
+// ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior exactly (plain
+// failFast + parallel, no wrapping, no UNSTABLE).
+def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:]) {
     if (!ENABLE_INFRA_SCOPED_FAILFAST) {
         jobs.failFast = failFast
         parallel jobs
@@ -5589,15 +5784,22 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
     // JVM-level concurrency to guard against here.
     def deferred = []
     def wrapped = jobs.collectEntries { stageName, body ->
+        // A SLURM dispatcher stage can abort under either scope: its dispatcher pod
+        // is a K8s pod (K8S-scoped aborts) that in turn drives the SLURM job
+        // (SLURM-scoped aborts). Check K8S for every stage and SLURM in addition
+        // for SLURM stages, so neither class of infra abort cascades.
+        boolean slurmScoped = (stageScopes[stageName] == InfraFailure.SLURM)
         [(stageName), {
             try {
                 body()
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)) {
+                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S) ||
+                        (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
+                    def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
                     deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: K8s infra abort recorded; " +
+                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
                          "siblings continue instead of fail-fast. ${e.toString()}"
                     return
                 }
@@ -5611,6 +5813,19 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
         echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
              "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
              "(coverage incomplete, no genuine test failure)."
+        // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
+        // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
+        // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
+        // burned against still-down infra. (A prospective short-circuit that cancels
+        // healthy siblings the moment a quorum aborts is deliberately NOT done here:
+        // it would reintroduce the cross-branch SIGTERM cascade this seam removes.
+        // Tracked as a follow-up.) NB: compare against jobs.size(), not
+        // wrapped.size() -- `wrapped.failFast = failFast` above adds a `failFast`
+        // key that `parallel` consumes, inflating wrapped's entry count by one.
+        if (deferred.size() == jobs.size()) {
+            echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
+                 "suspected cluster-wide / shared-frontend outage rather than isolated blips."
+        }
         currentBuild.result = 'UNSTABLE'
     }
 }
@@ -5644,12 +5859,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A30-CPP-1": ["a30", "l0_a30", 1, 1],
-        "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         // platform, test DB, split, splits, GPU count, ModelExpress sidecars
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
@@ -5671,7 +5884,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "H100_PCIe-AutoDeploy-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
@@ -5684,8 +5896,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
         "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
-        "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        // Disable RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1 and RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2 due to some nodes are offline temporarily.
+        // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
@@ -5720,8 +5933,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-AutoDeploy-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
@@ -5732,8 +5943,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-PyTorch-7": ["auto:dgx-b200-flex", "l0_b200", 7, 9, 1, 1, true],
         "DGX_B200-PyTorch-8": ["auto:dgx-b200-flex", "l0_b200", 8, 9, 1, 1, true],
         "DGX_B200-PyTorch-9": ["auto:dgx-b200-flex", "l0_b200", 9, 9, 1, 1, true],
-        "DGX_B200-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
-        "DGX_B200-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
         "DGX_B200-2_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 2, 1, true],
@@ -5741,8 +5950,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-4_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-4_GPUs-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-4_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
@@ -5752,7 +5959,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
@@ -6327,7 +6533,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
                             // Remove stale nvidia-cutlass-dsl from the base image to prevent namespace
                             // directory corruption when pip upgrades to the version required by tensorrt_llm.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
+                            trtllm_utils.llmExecStepWithRetry(
+                                pipeline,
+                                script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base " +
+                                    "nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 " +
+                                    "nvidia-cutlass-dsl-libs-cu13 || true")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
@@ -6541,41 +6751,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
     }
 
-    // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
-    // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
-    // perfsanity_required). Pure -Perf- stages run only when CBTS selects them
-    // (present in affected_stages). Post-Merge stages are never force-kept;
-    // they only run when explicitly listed in affected_stages.
-    def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts != null) {
-        // Match the -cbts rename cbtsResizeSplits applies to narrowed stages.
-        def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
-        def affectedSet = (cbts.affected_stages ?: []).collect { it + stageSuffix } as Set
-        def needsSanity = cbts.sanity_required
-        def needsPerfSanity = cbts.perfsanity_required
-        parallelJobsFiltered = parallelJobs.findAll { key, _ ->
-            if (key.contains("-OnDemand-")) {
-                return false
-            }
-            if (key =~ /Post-Merge/) return affectedSet.contains(key)
-            return affectedSet.contains(key) ||
-                   (needsSanity && key =~ /PackageSanityCheck/) ||
-                   (needsPerfSanity && key =~ /PerfSanity/)
-        }
-        if (affectedSet.isEmpty()) {
-            if (parallelJobsFiltered.isEmpty()) {
-                echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
-            } else {
-                echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
-                     "${parallelJobsFiltered.size()} force-kept stage(s) only"
-            }
-        } else if (parallelJobsFiltered) {
-            echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} stages " +
-                 "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
-        } else {
-            echo "CBTS [${cbts.scope}]: empty stage set after filtering"
-        }
-    }
+    parallelJobsFiltered = filterCbtsStageJobs(
+        parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = sanityCheckJobs
@@ -6585,7 +6762,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     def keysStr = parallelJobsFiltered.keySet().join(",\n")
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
 
-    parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
+    // Per-stage execution scope for infra-scoped fail-fast (runBranchesWithInfraDefer).
+    // A stage carrying opts.slurmDispatcher runs its work through a SLURM dispatcher
+    // pod, so its post-retry failures can be SLURM-scoped; everything else is K8s.
+    // Built here, where the config tuple's opts (3rd element) is still visible, and
+    // keyed by stage name so the K8s/SLURM group subsets can look each branch up.
+    stageInfraScope = [:]
+    parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values ->
+        def stageOpts = (values instanceof List && values.size() >= 3 && values[2] instanceof Map) ? values[2] : [:]
+        stageInfraScope[key] = stageOpts.slurmDispatcher ? InfraFailure.SLURM : InfraFailure.K8S
+        [key, {
         stage(key) {
             if (key in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - Reused") {
@@ -6764,6 +6950,10 @@ pipeline {
         stage("Test") {
             steps {
                 script {
+                    // Default scope map so the image-sanity path (which does not
+                    // build one) still has a value for runBranchesWithInfraDefer;
+                    // launchTestJobs overwrites this with per-stage scopes.
+                    stageInfraScope = [:]
                     try {
                         if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
                             parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
@@ -6811,27 +7001,29 @@ pipeline {
                                 echo "Skip multi-GPU testing. No test to run."
                             }
                             if (singleGpuJobs.size() > 0) {
-                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast)
+                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
+                            } else if (isInfraDryRun()) {
+                                error "Skip single-GPU testing. No test to run for infrastructure dry run."
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
                         } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                             echo "Only run multi-GPU tests."
                             if (dgxJobs.size() > 0) {
-                                runBranchesWithInfraDefer(dgxJobs, params.enableFailFast)
+                                runBranchesWithInfraDefer(dgxJobs, params.enableFailFast, stageInfraScope)
                             } else {
                                 error "Skip multi-GPU testing. No test to run."
                             }
                         } else {
                             if (singleGpuJobs.size() > 0) {
-                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast)
+                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
 
                             if (dgxJobs.size() > 0) {
                                 stage(testPhase2StageName) {
-                                    runBranchesWithInfraDefer(dgxJobs, params.enableFailFast)
+                                    runBranchesWithInfraDefer(dgxJobs, params.enableFailFast, stageInfraScope)
                                 }
                             }
                         }

@@ -61,14 +61,13 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
 # TRTLLM-Gen-local activation encoding, kept separate from the shared
-# ActivationType above ON PURPOSE: ActivationType mirrors the cutlass enum in
-# common.h and drives cutlass MoE kernels, whereas SiTu exists only in the
-# trtllm-gen batched-GEMM kernels. Adding SiTu to the shared ActivationType
-# would force a matching cutlass enum member that no cutlass kernel implements.
-# So SiTu stays here (TRTLLM-15177 item 1.2(a): decided keep-backend-local).
+# ActivationType above: ActivationType mirrors the CUTLASS enum in common.h,
+# while ActType_TrtllmGen mirrors the independent batched-GEMM encoding below.
+# SiTu is supported by both backends, but its numeric value is backend-local.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -88,7 +87,8 @@ class ActType_TrtllmGen(IntEnum):
 # And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
-        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
+        ActivationType.SiTu
     ]
 
 
@@ -100,6 +100,22 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+@contextlib.contextmanager
+def torch_compiling(enable: bool):
+    """Scope `is_torch_compiling()` to a region, restoring the prior value.
+
+    The flag is a plain module global, not thread- or context-local, so it
+    outlives the engine that set it. Code running a model region outside an
+    engine forward must establish the value rather than inherit it.
+    """
+    prev_enable = is_torch_compiling()
+    set_torch_compiling(enable)
+    try:
+        yield
+    finally:
+        set_torch_compiling(prev_enable)
 
 
 def set_piecewise_running(enable: bool):
@@ -199,6 +215,53 @@ class Fp4QuantizedTensor:
     @property
     def shape(self):
         return self.fp4_tensor.shape
+
+
+@dataclass
+class MxFp8QuantizedTensor:
+    """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
+
+    Attributes:
+        fp8_tensor: Row-major E4M3 activation with shape
+            ``[num_tokens, hidden_size]``.
+        scaling_factor: Row-major UE8M0 scales stored as ``torch.uint8`` with
+            shape ``[num_tokens, ceil(hidden_size / 32)]``. Each value scales
+            one contiguous group of 32 activation elements.
+        is_sf_swizzled: Whether ``scaling_factor`` uses a backend-specific
+            swizzled layout. The carrier's ``split`` method requires the
+            default row-major layout and only supports the token dimension.
+    """
+
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = False
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.fp8_tensor.dtype
+
+    def numel(self) -> int:
+        return self.fp8_tensor.numel()
+
+    def split(
+        self,
+        split_size_or_sections: int | list[int],
+        dim: int = 0,
+    ) -> tuple["MxFp8QuantizedTensor", ...]:
+        """Split activation rows and their scales along the token dimension."""
+        if dim != 0:
+            raise ValueError(
+                "MxFp8QuantizedTensor can only be split along the token dimension"
+            )
+        fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        return tuple(
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
+            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
 
 
 def compute_swizzled_sf_shape(row: int, col: int):

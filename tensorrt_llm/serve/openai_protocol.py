@@ -1628,7 +1628,7 @@ class ImageGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport (OpenAI-standard, always honored)
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
         default="png",
         description=(
@@ -1762,6 +1762,7 @@ class ImageObject(OpenAIBaseModel):
     """Generated image object in the response."""
     b64_json: Optional[str] = None
     url: Optional[str] = None
+    path: Optional[str] = None
     revised_prompt: Optional[str] = None
 
 
@@ -1792,7 +1793,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["file", "path"] = "file"
     format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = Field(
         default="auto",
         description=(
@@ -1865,6 +1866,26 @@ class VideoGenerationRequest(OpenAIBaseModel):
                 f"{self.width!r}, height={self.height!r}")
         return self
 
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def _reject_removed_response_format(cls, value):
+        """Give migrating callers an actionable error for removed values.
+
+        ``url``/``b64_json`` were valid before the transport rewrite; run
+        before the ``Literal`` check so the error names the replacement
+        instead of the generic "Input should be 'file' or 'path'".
+        """
+        removed = {
+            "url":
+            ("'url' was removed for video; use 'file' (raw bytes -- the "
+             "old 'url' behavior, renamed) or 'path' (server-side path)."),
+            "b64_json": ("'b64_json' was removed for video; use 'file' (raw "
+                         "bytes) or 'path' (server-side path)."),
+        }
+        if isinstance(value, str) and value in removed:
+            raise ValueError(removed[value])
+        return value
+
 
 class VideoJob(OpenAIBaseModel):
     """Metadata for an asynchronous video generation job.
@@ -1886,8 +1907,13 @@ class VideoJob(OpenAIBaseModel):
         default=None,
         description="Progress of the video generation job (0-100)")
     prompt: str = Field(description="The prompt used to generate the video")
-    status: Literal["queued", "in_progress", "completed", "failed"] = Field(
-        description="Current status of the video generation job")
+    status: Literal["queued", "generating", "postprocessing", "completed",
+                    "failed"] = Field(description=(
+                        "Current status of the video generation job. "
+                        "``generating`` (model inference) becomes "
+                        "``postprocessing`` (encode and/or write the output "
+                        "file) when inference finishes, then ``completed`` "
+                        "once downloadable via ``/content``."))
 
     # Video properties
     duration: Optional[float] = Field(default=None,
@@ -1900,17 +1926,35 @@ class VideoJob(OpenAIBaseModel):
     )
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    # exclude=True: internal file-location for /content resolution + delete;
+    # never on the wire (the path payload is the hand-built {id, output_path}
+    # envelope in /content), so status/list model_dump() stays status-only.
     output_path: Optional[str] = Field(
-        default=None, description="Actual path where the video file was saved")
+        default=None,
+        exclude=True,
+        description="Server-side saved path (internal; excluded from the wire)."
+    )
     output_paths: Optional[List[str]] = Field(
-        default=None, description="Paths for all generated videos when n > 1")
-    response_format: Optional[Literal["url", "b64_json"]] = Field(
+        default=None,
+        exclude=True,
+        description=
+        "Server-side paths for n>1 (internal; excluded from the wire).")
+    # exclude=True internal timings, never on the wire (status/list
+    # model_dump() stays status-only). ``request_started`` is a
+    # ``perf_counter()`` stamped at the POST handler; the background task
+    # computes ``total`` from it and stores the header timings
+    # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
+    # ``/content`` emits the same Server-Timing header as the sync route.
+    request_started: Optional[float] = Field(default=None, exclude=True)
+    timing_metrics: Optional[Dict[str, float]] = Field(default=None,
+                                                       exclude=True)
+    response_format: Optional[Literal["file", "path"]] = Field(
         default=None,
         description=(
             "Transport the client requested. ``GET /v1/videos/{id}/content`` "
-            "honors this: ``b64_json`` returns the encoded payload as a "
-            "base64 string inside a JSON envelope; ``url`` (or unset) "
-            "returns the file as a ``FileResponse`` download."),
+            "honors this: ``path`` returns the server-side output path(s) in a "
+            "JSON envelope; ``file`` (or unset) returns the file as a "
+            "``FileResponse`` download."),
     )
 
 

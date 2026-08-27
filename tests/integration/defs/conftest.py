@@ -283,34 +283,6 @@ def minitron_model_root(request):
     return minitron_model_root
 
 
-@pytest.fixture(scope="function")
-def mistral_nemo_model_root(request):
-    "Get Mistral Nemo model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if hasattr(request, "param"):
-        assert request.param == "Mistral-Nemo-12b-Base"
-        mistral_nemo_model_root = os.path.join(models_root,
-                                               "Mistral-Nemo-Base-2407")
-    assert exists(
-        mistral_nemo_model_root), f"{mistral_nemo_model_root} does not exist!"
-    return mistral_nemo_model_root
-
-
-@pytest.fixture(scope="function")
-def mistral_nemo_minitron_model_root(request):
-    "Get Mistral Nemo Minitron model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if hasattr(request, "param"):
-        assert request.param == "Mistral-NeMo-Minitron-8B-Instruct"
-        mistral_nemo_minitron_model_root = os.path.join(
-            models_root, "Mistral-NeMo-Minitron-8B-Instruct")
-    assert exists(mistral_nemo_minitron_model_root
-                  ), f"{mistral_nemo_minitron_model_root} does not exist!"
-    return mistral_nemo_minitron_model_root
-
-
 @pytest.fixture(scope="module")
 def gpt_example_root(llm_root, llm_venv):
     "Get gpt example root"
@@ -931,9 +903,6 @@ def mamba_model_root(request):
         elif request.param == "mamba2-130m":
             mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba2-130m")
-        elif request.param == "mamba-codestral-7B-v0.1":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba-codestral-7B-v0.1")
 
     assert exists(mamba_model_root), f"{mamba_model_root} does not exist!"
 
@@ -985,10 +954,6 @@ def llm_lora_model_root(request):
         elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
             model_root_list.append(
                 os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
-        elif item == "Phi-3-mini-4k-instruct-ru-lora":
-            model_root_list.append(
-                os.path.join(models_root, "lora", "phi",
-                             "Phi-3-mini-4k-instruct-ru-lora"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
@@ -997,12 +962,6 @@ def llm_lora_model_root(request):
                     "starcoder",
                     "peft-lora-starcoder2-15b-unity-copilot",
                 ))
-        elif item == "chinese-mixtral-lora":
-            model_root_list.append(
-                os.path.join(models_root, "chinese-mixtral-lora"))
-        elif item == "komt-mistral-7b-v1-lora":
-            model_root_list.append(
-                os.path.join(models_root, "komt-mistral-7b-v1-lora"))
         elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
             model_root_list.append(
                 os.path.join(
@@ -1044,51 +1003,6 @@ def llm_dora_model_root(request):
     return ",".join(model_root_list)
 
 
-@pytest.fixture(scope="function")
-def llm_mistral_model_root(request):
-    "get mistral model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    model_root = os.path.join(models_root, "mistral-7b-v0.1")
-    if request.param == "mistral-7b-v0.1":
-        model_root = os.path.join(models_root, "mistral-7b-v0.1")
-    if request.param == "mistral-nemo-instruct-2407":
-        model_root = os.path.join(models_root, "Mistral-Nemo-Instruct-2407")
-    if request.param == "komt-mistral-7b-v1":
-        model_root = os.path.join(models_root, "komt-mistral-7b-v1")
-    if request.param == "mistral-7b-v0.3":
-        model_root = os.path.join(models_root, "Mistral-7B-Instruct-v0.3")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_mixtral_model_root(request):
-    "get mixtral model path"
-    models_root = llm_models_root()
-    model_root = os.path.join(models_root, "Mixtral-8x7B-v0.1")
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "Mixtral-8x7B-v0.1":
-        model_root = os.path.join(models_root, "Mixtral-8x7B-v0.1")
-    if request.param == "Mixtral-8x22B-v0.1":
-        model_root = os.path.join(models_root, "Mixtral-8x22B-v0.1")
-    if request.param == "Mixtral-8x7B-Instruct-v0.1":
-        model_root = os.path.join(models_root, "Mixtral-8x7B-Instruct-v0.1")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("mathstral-7B-v0.1", True)
-def llm_mathstral_model_root(llm_venv):
-    "return mathstral-7B-v0.1 model root"
-
-    workspace = llm_venv.get_working_directory()
-    long_mathstral_model_root = os.path.join(workspace, "mathstral-7B-v0.1")
-
-    return long_mathstral_model_root
-
-
 @pytest.fixture(scope="module")
 @cached_in_llm_models_root("LongAlpaca-7B", True)
 def llm_long_alpaca_model_root(llm_venv):
@@ -1109,26 +1023,6 @@ def llm_gptneox_model_root(llm_venv):
     gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
 
     return gptneox_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_phi_model_root(request):
-    "return phi model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if "Phi-3.5" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3.5/" + request.param)
-    elif "Phi-3" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3/" + request.param)
-    else:
-        phi_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        phi_model_root
-    ), f"{phi_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return phi_model_root
 
 
 @pytest.fixture(scope="module")
@@ -1476,14 +1370,6 @@ def qcache_dir_without_install_package(llm_venv, llm_root):
     )
 
 
-@pytest.fixture(scope="module")
-def star_attention_input_root(llm_root):
-    "Get star attention input file dir"
-    star_attention_input_root = unittest_path() / "_torch" / "multi_gpu"
-
-    return star_attention_input_root
-
-
 def parametrize_with_ids(
     argnames: str | Sequence[str],
     argvalues: Iterable[ParameterSet | Sequence[object] | object],
@@ -1664,6 +1550,11 @@ skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
     reason="This test is not supported on ARM architecture",
+)
+
+skip_x86 = pytest.mark.skipif(
+    "x86_64" in platform.machine(),
+    reason="This test is not supported on x86 architecture",
 )
 
 

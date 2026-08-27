@@ -15,15 +15,22 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    _KVCacheManagerInitStatus,
+    _sync_kv_cache_manager_init_status,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
@@ -31,7 +38,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     BatchDesc,
+    DiskCacheTierConfig,
     GpuCacheTierConfig,
+    HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
 )
@@ -39,6 +48,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+class _CacheTierInitError(Exception):
+    pass
+
+
+@dataclass
+class _FakeManagerConfig:
+    cache_tiers: list[object]
+    layers: list[object] = field(default_factory=lambda: [None])
 
 
 class _FakeKVCache:
@@ -82,11 +101,125 @@ def _make_cache_config_for_test(
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
+    # Mirrors __init__: without helix the ledger block equals the physical
+    # page (the helper re-enacts construction for partial instances).
+    cache_manager._ledger_tokens_per_block = 128
 
     return cache_manager._build_base_config(
         kv_cache_config,
         tokens_per_block=128,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
+    )
+
+
+def _make_manager_for_cache_tier_test(
+    kv_cache_config: KvCacheConfig,
+    impl_side_effect: list[object],
+    *,
+    add_secondary_gpu_tier: bool = False,
+    mapping: Mapping | None = None,
+) -> tuple[KVCacheManagerV2, Mock]:
+    impl_constructor = Mock(side_effect=impl_side_effect)
+    if mapping is None:
+        mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> _FakeManagerConfig:
+        del self, config, tokens_per_block
+        return _FakeManagerConfig(cache_tiers=cache_tiers)
+
+    def build_cache_config(
+        self: KVCacheManagerV2, config: _FakeManagerConfig
+    ) -> _FakeManagerConfig:
+        del self
+        if add_secondary_gpu_tier:
+            return _FakeManagerConfig(
+                cache_tiers=[
+                    config.cache_tiers[0],
+                    GpuCacheTierConfig(quota=1 << 20),
+                    *config.cache_tiers[1:],
+                ],
+                layers=config.layers,
+            )
+        return config
+
+    fake_impl = next(
+        (item for item in reversed(impl_side_effect) if not isinstance(item, BaseException)),
+        None,
+    )
+    if fake_impl is not None:
+        fake_impl.layer_grouping = [[0]]
+        fake_impl.pool_group_descs = []
+        fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    with (
+        patch(f"{module}.CuError", _CacheTierInitError),
+        patch(f"{module}.IndexMapper"),
+        patch(f"{module}.KVCacheManagerPy", impl_constructor),
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+    ):
+        manager = KVCacheManagerV2(
+            kv_cache_config,
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=mapping,
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+        )
+    return manager, impl_constructor
+
+
+def _multi_rank_host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
+    """Exercise the real world collective from an MPI worker."""
+    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+    rank = mpi_rank()
+    world_size = mpi_world_size()
+    initial_impl = Mock()
+    fallback_impl = Mock()
+    impl_side_effect: list[object] = (
+        [initial_impl, fallback_impl]
+        if rank == 0
+        else [_CacheTierInitError("rank-local host tier failure"), fallback_impl]
+    )
+
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+        ),
+        impl_side_effect,
+        mapping=Mapping(
+            world_size=world_size,
+            rank=rank,
+            tp_size=world_size,
+        ),
+    )
+
+    return (
+        rank,
+        impl_constructor.call_count,
+        initial_impl.shutdown.call_count,
+        any(
+            isinstance(tier, HostCacheTierConfig)
+            for tier in manager.kv_cache_manager_py_config.cache_tiers
+        ),
     )
 
 
@@ -199,6 +332,179 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
         )
 
 
+def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [impl],
+    )
+
+    assert manager.can_evict
+    assert impl_constructor.call_count == 1
+    cache_tiers = impl_constructor.call_args.args[0].cache_tiers
+    assert [type(tier) for tier in cache_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
+def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
+    with pytest.raises(_CacheTierInitError, match="disk tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                disk_cache_size=16 << 20,
+                disk_cache_path=str(tmp_path),
+            ),
+            [_CacheTierInitError("disk tier init failed"), Mock()],
+        )
+
+
+def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
+    mapping = SimpleNamespace(world_size=2)
+    dist = Mock()
+    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.USE_NO_HOST)
+
+    with patch.object(Distributed, "get", return_value=dist):
+        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.KEEP_HOST, mapping)
+
+    assert status == _KVCacheManagerInitStatus.USE_NO_HOST
+    dist.allreduce.assert_called_once_with(
+        int(_KVCacheManagerInitStatus.KEEP_HOST), op=ReduceOp.MAX
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
+def test_world_ranks_converge_on_hostless_fallback() -> None:
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = MpiPoolSession(n_workers=2)
+    try:
+        results = session.submit_sync(_multi_rank_host_fallback_consensus_worker)
+    finally:
+        session.shutdown()
+
+    assert sorted(results) == [(0, 2, 1, False), (1, 2, 0, False)]
+
+
+def test_local_fallback_failure_is_shared_before_raising() -> None:
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=[
+                _KVCacheManagerInitStatus.USE_NO_HOST,
+                _KVCacheManagerInitStatus.ABORT,
+            ],
+        ) as sync_status,
+        pytest.raises(RuntimeError, match="fallback init failed"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [
+                _CacheTierInitError("host tier init failed"),
+                RuntimeError("fallback init failed"),
+            ],
+        )
+
+    assert [call.args[0] for call in sync_status.call_args_list] == [
+        _KVCacheManagerInitStatus.USE_NO_HOST,
+        _KVCacheManagerInitStatus.ABORT,
+    ]
+
+
+def test_peer_fallback_failure_discards_local_candidate() -> None:
+    initial_impl = Mock()
+    fallback_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=[
+                _KVCacheManagerInitStatus.USE_NO_HOST,
+                _KVCacheManagerInitStatus.ABORT,
+            ],
+        ),
+        pytest.raises(RuntimeError, match="failed on another rank"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl, fallback_impl],
+        )
+
+    initial_impl.shutdown.assert_called_once_with()
+    fallback_impl.shutdown.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("add_secondary_gpu_tier", "expected_can_evict"),
+    [(False, False), (True, True)],
+)
+def test_host_init_fallback_recomputes_eviction_capability(
+    add_secondary_gpu_tier: bool,
+    expected_can_evict: bool,
+) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+        add_secondary_gpu_tier=add_secondary_gpu_tier,
+    )
+
+    assert manager.can_evict is expected_can_evict
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert any(isinstance(tier, HostCacheTierConfig) for tier in initial_tiers)
+    assert all(isinstance(tier, GpuCacheTierConfig) for tier in fallback_tiers)
+    assert len(fallback_tiers) == 1 + int(add_secondary_gpu_tier)
+
+
+def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+    )
+
+    assert manager.can_evict
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert [type(tier) for tier in initial_tiers] == [
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+    assert [type(tier) for tier in fallback_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
 def test_extra_tokens_are_in_context_capacity() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(avg_seq_len=264),
@@ -255,6 +561,7 @@ class _ContextRequest:
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
     is_dummy_request: bool = False
+    return_perf_metrics: bool = False
     context_current_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
@@ -610,6 +917,42 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
+
+
+def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._cold_pool_group_membership = lambda: ((0, frozenset({0, 1})),)
+    life_cycle_metadata = {
+        0: (0, 32, "attention"),
+        1: (1, 64, "attention"),
+    }
+    secondary_stats_by_level = [
+        [SimpleNamespace(total=7, available=2, evictable=1, slot_sizes=(4096,))],
+        [SimpleNamespace(total=11, available=5, evictable=3, slot_sizes=(4096,))],
+    ]
+    secondary_peak_stats_by_level = [
+        [SimpleNamespace(available=1, unavailable=6, evictable=2)],
+        [SimpleNamespace(available=4, unavailable=7, evictable=3)],
+    ]
+
+    report = manager._build_cold_pool_group_iteration_stats(
+        life_cycle_metadata,
+        primary_stats=(),
+        secondary_stats_by_level=secondary_stats_by_level,
+        primary_peak_stats=(),
+        secondary_peak_stats_by_level=secondary_peak_stats_by_level,
+    )
+
+    cold_group = report[0]
+    assert cold_group.slot_size == (4096,)
+    assert cold_group.window_sizes == (32, 64)
+    assert cold_group.stats.secondary_max_num_blocks == 18
+    assert cold_group.stats.secondary_free_num_blocks == 7
+    assert cold_group.stats.secondary_used_num_blocks == 11
+    assert cold_group.stats.secondary_evictable_num_blocks == 4
+    assert cold_group.stats.secondary_peak_free_num_blocks == 5
+    assert cold_group.stats.secondary_peak_used_num_blocks == 13
+    assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
 def test_disagg_role_mapper_kinds_default_to_indexed():
