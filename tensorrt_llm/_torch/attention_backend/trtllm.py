@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bisect
 import functools
 import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -50,6 +51,87 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
+
+# Keep these general-purpose cache buckets aligned with the shape coverage used
+# by TRTLLM-Gen JIT warmup in fmhaKernels.h. Cache lookup uses ceiling buckets;
+# values larger than the last candidate share the last bucket.
+_FMHA_SELECTION_BATCH_SIZE_GRID: Tuple[int, ...] = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    26,
+    28,
+    30,
+    32,
+    36,
+    40,
+    48,
+    56,
+    64,
+    80,
+    96,
+    128,
+    256,
+    384,
+    512,
+    768,
+    1024,
+    1280,
+    1536,
+    2048,
+)
+_FMHA_SELECTION_SEQ_LEN_Q_GRID: Tuple[int, ...] = (1, 2, 4, 8, 32, 64, 128)
+
+
+class _FmhaSelectionCacheKey(NamedTuple):
+    attention_input_type: AttentionInputType
+    has_context: bool
+    has_generation: bool
+    context_batch_size: int
+    generation_batch_size: int
+    generation_seq_len_q: int
+    # LoRA can change the effective output from packed NVFP4 to unpacked BF16
+    # without changing the request shape. Keep those selection regimes apart.
+    output_dtype: Optional[torch.dtype]
+    output_sf_dtype: Optional[torch.dtype]
+
+
+def _normalize_fmha_selection_grid_value(value: int, grid: Tuple[int,
+                                                                 ...]) -> int:
+    if value <= 0:
+        return 0
+    index = bisect.bisect_left(grid, value)
+    return grid[min(index, len(grid) - 1)]
+
+
+def _is_fmha_selection_cache_enabled() -> bool:
+    # CuTe DSL MLA intentionally relaxes its performance gate while tuning.
+    # Do not let those temporary selections read or populate the serving cache.
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    autotuner = AutoTuner._instance
+    return autotuner is None or not autotuner.is_tuning_mode
 
 
 @functools.cache
@@ -1491,7 +1573,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.fmha_libs: List[Fmha] = []
         self.phased_fmha_libs: List[PhasedFmha] = []
         self.non_phased_fmha_libs: List[Fmha] = []
-        self.combined_fmha: Optional[CombinedFmha] = None
+        self._fmha_selection_cache: Dict[_FmhaSelectionCacheKey, Fmha] = {}
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1747,6 +1829,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.original_max_positions
 
     def create_fmha_libs(self) -> None:
+        self._fmha_selection_cache = {}
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
                 and get_sm_version() in (120, 121)
@@ -1765,8 +1848,90 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.non_phased_fmha_libs = [
             fmha for fmha in self.fmha_libs if not isinstance(fmha, PhasedFmha)
         ]
-        self.combined_fmha = (CombinedFmha(self) if self.phased_fmha_libs
-                              and not self.is_mla_enable else None)
+
+    def _make_fmha_selection_cache_key(
+        self,
+        q: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> _FmhaSelectionCacheKey:
+        """Build the dynamic selection key for one attention instance.
+
+        FMHA selection inputs not represented here must remain invariants for
+        the cache lifetime. Rebuilding the FMHA library list starts a new one.
+        """
+        attention_input_type = forward_args.attention_input_type
+        has_context = metadata.num_contexts > 0
+        has_generation = metadata.num_generations > 0
+        output_dtype = (forward_args.output.dtype
+                        if forward_args.output is not None else None)
+        output_sf_dtype = (forward_args.output_sf.dtype
+                           if forward_args.output_sf is not None else None)
+
+        context_batch_size = 0
+        if (attention_input_type != AttentionInputType.generation_only
+                and has_context):
+            context_batch_size = _normalize_fmha_selection_grid_value(
+                metadata.num_contexts, _FMHA_SELECTION_BATCH_SIZE_GRID)
+
+        generation_batch_size = 0
+        generation_seq_len_q = 0
+        if (attention_input_type != AttentionInputType.context_only
+                and has_generation):
+            generation_batch_size = _normalize_fmha_selection_grid_value(
+                metadata.num_generations, _FMHA_SELECTION_BATCH_SIZE_GRID)
+            num_generation_tokens = q.shape[0]
+            if attention_input_type == AttentionInputType.mixed:
+                num_generation_tokens -= metadata.num_ctx_tokens
+            generation_seq_len_q = _normalize_fmha_selection_grid_value(
+                num_generation_tokens // metadata.num_generations,
+                _FMHA_SELECTION_SEQ_LEN_Q_GRID,
+            )
+
+        return _FmhaSelectionCacheKey(
+            attention_input_type=attention_input_type,
+            has_context=has_context,
+            has_generation=has_generation,
+            context_batch_size=context_batch_size,
+            generation_batch_size=generation_batch_size,
+            generation_seq_len_q=generation_seq_len_q,
+            output_dtype=output_dtype,
+            output_sf_dtype=output_sf_dtype,
+        )
+
+    def _select_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if (self.is_mla_enable and not _is_fmha_selection_cache_enabled()):
+            return self._select_fmha_uncached(q, k, v, metadata, forward_args)
+
+        cache_key = self._make_fmha_selection_cache_key(q, metadata,
+                                                        forward_args)
+        fmha = self._fmha_selection_cache.get(cache_key)
+        if fmha is not None:
+            return fmha
+
+        fmha = self._select_fmha_uncached(q, k, v, metadata, forward_args)
+        if fmha is None:
+            return None
+        return self._fmha_selection_cache.setdefault(cache_key, fmha)
+
+    def _select_fmha_uncached(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if self.is_mla_enable:
+            return self._select_mla_fmha(q, k, v, metadata, forward_args)
+        return self._select_non_mla_fmha(q, k, v, metadata, forward_args)
 
     def _select_non_mla_fmha(
         self,
@@ -1813,11 +1978,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 if generation_fmha is None or context_fmha is generation_fmha:
                     return context_fmha
 
-                self.combined_fmha.set_fmha_impls(
+                combined_fmha = CombinedFmha(self)
+                combined_fmha.set_fmha_impls(
                     context_fmha,
                     generation_fmha,
                 )
-                return self.combined_fmha
+                return combined_fmha
             if fmha.is_supported(q, k, v, metadata, forward_args):
                 return fmha
         return None
@@ -2152,17 +2318,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.fmha_libs:
             self.create_fmha_libs()
 
-        fmha: Optional[Fmha] = None
-        if self.is_mla_enable:
-            fmha = self._select_mla_fmha(q, k, v, metadata, forward_args)
-        else:
-            fmha = self._select_non_mla_fmha(
-                q,
-                k,
-                v,
-                metadata,
-                forward_args,
-            )
+        fmha = self._select_fmha(q, k, v, metadata, forward_args)
 
         if fmha is None:
             raise RuntimeError(
