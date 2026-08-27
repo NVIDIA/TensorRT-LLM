@@ -6047,8 +6047,10 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
                         (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
                     def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
                     deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        error "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
+                              "siblings continue instead of fail-fast. ${e.toString()}"
+                    }
                     return
                 }
                 throw e
@@ -6074,7 +6076,6 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:])
             echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
                  "suspected cluster-wide / shared-frontend outage rather than isolated blips."
         }
-        currentBuild.result = 'UNSTABLE'
     }
 }
 
