@@ -505,6 +505,22 @@ def preparation(pipeline, testFilter, globalVars)
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
+        stage("Upload Build Info") {
+            try {
+                def branch = globalVars[BUILD_BRANCH]
+                def buildInfo = "commit=${env.gitlabCommit}\n" +
+                    "branch=${branch}\n" +
+                    "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                    "jenkins_url=${env.BUILD_URL}"
+                writeFile file: 'build_info.txt', text: buildInfo
+                trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+                pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo "Upload Build Info failed: ${e.toString()}"
+            }
+        }
         stage("Merge Test Waive List") {
             if (testFilter[INFRA_DRY_RUN]) {
                 echo "Skipping Merge Test Waive List for the infrastructure dry run."
@@ -996,7 +1012,7 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        // artifact.py resolves, downloads and unpacks; paths come back
+        // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
@@ -2233,6 +2249,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'wait_success_seconds': "",
                             ]
                         }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
+                        }
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2300,6 +2319,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
+                        }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
                         }
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2428,20 +2450,6 @@ pipeline {
         }
         always {
             script {
-                stage("Upload Build Info") {
-                    try {
-                        def branch = globalVars[BUILD_BRANCH]
-                        def buildInfo = "commit=${env.gitlabCommit}\n" +
-                            "branch=${branch}\n" +
-                            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
-                            "jenkins_url=${env.BUILD_URL}"
-                        writeFile file: 'build_info.txt', text: buildInfo
-                        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-                        echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
-                    } catch (Exception e) {
-                        echo "Upload Build Info failed: ${e.toString()}"
-                    }
-                }
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter, globalVars)
                 }
