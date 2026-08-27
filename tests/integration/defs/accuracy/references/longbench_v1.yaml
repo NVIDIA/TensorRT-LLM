@@ -1,4 +1,21 @@
 Qwen3/Qwen3-30B-A3B-Instruct-2507:
+  # PROVENANCE: the six rows below were cut in 5e1a98e6ba (#12789, 2026-04-11)
+  # and have never been re-measured since. Re-cutting them requires >=3 runs per
+  # row (single-run LongBench subgroup means drift by several points), so treat
+  # a one-off miss as unverified rather than as a regression in the row's config.
+  #
+  # nvbugs/6668774 -- target_sparsity=0.5 + FP8 KV is waived. Measured on
+  # unmodified main b460237a9c (DGX H200, TP4/EP4, attention DP):
+  #   target_sparsity=0.0 FP8 KV -> 38.796 (vs 47.650)  <-- skip-softmax OFF
+  #   target_sparsity=0.5 FP8 KV -> 38.201 (vs 46.559)
+  # The 0.0 row passes threshold_scale_factor 0.0, which leaves skip-softmax
+  # disabled entirely (see fmhaRunner.cpp), yet it misses by the same margin --
+  # so the deficit is not in the skip-softmax kernels or their thresholds. In the
+  # same run longbench_passage_retrieval_en scores 98.5, so long-context
+  # attention and the KV cache are healthy; the gap is concentrated in Code
+  # Completion (18.96), whose code_sim_score fuzz-matches only the first
+  # non-comment output line. Do not "fix" this by editing the values below.
+  #
   # Skip Softmax Attention ref accuracy (BF16 KV cache)
   - extra_acc_spec: "target_sparsity=0.0"
     accuracy: 48.383
