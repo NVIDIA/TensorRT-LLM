@@ -3596,12 +3596,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
-            # Chunk the MoE workspace (NVBug 6633931). Left unset, moe_max_num_tokens
-            # defaults to max_num_tokens * dp_size, which the DP-gathered row count can
-            # never exceed, so MoE runs unchunked and sizes its workspace for all
-            # 8192 * 8 = 65536 rows. That workspace is allocated during warmup, after the
-            # KV cache has been sized from a profile taken before it, so it has to fit in
-            # whatever the KV cache left behind. Matches the Blackwell branch above.
+            # Chunk MoE so its workspace fits alongside the KV cache, which is sized
+            # from a profile taken before that workspace is allocated (NVBug 6633931).
             moe_config = MoeConfig(max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
