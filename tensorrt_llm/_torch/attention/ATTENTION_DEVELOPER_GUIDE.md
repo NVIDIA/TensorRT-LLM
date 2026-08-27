@@ -6,6 +6,10 @@ This guide covers the TRT-LLM PyTorch attention stack:
 
 - `tensorrt_llm/_torch/attention/attention.py`
 - `tensorrt_llm/_torch/attention/mla.py`
+- `tensorrt_llm/_torch/attention/qk_norm_attention.py`
+- `tensorrt_llm/_torch/attention/cross_attention.py`
+- `tensorrt_llm/_torch/attention/rotary_embedding.py`
+- `tensorrt_llm/_torch/attention/kernels/`
 - `tensorrt_llm/_torch/attention/backends/`
 - `tensorrt_llm/_torch/attention/backends/sparse/`
 
@@ -477,6 +481,10 @@ Working rules:
 |------|------|
 | `tensorrt_llm/_torch/attention/attention.py` | Standard attention module logic and shared Helix CP helpers |
 | `tensorrt_llm/_torch/attention/mla.py` | MLA module logic, MLA custom ops, and MLA-specific dispatch |
+| `tensorrt_llm/_torch/attention/qk_norm_attention.py` | QK-norm attention module logic and fused QK-norm/RoPE/gate dispatch |
+| `tensorrt_llm/_torch/attention/cross_attention.py` | Encoder-decoder cross-attention module logic and cross-KV cache reuse |
+| `tensorrt_llm/_torch/attention/rotary_embedding.py` | Unfused RoPE and mRoPE modules shared across the attention stack |
+| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and unfused fallbacks |
 | `tensorrt_llm/_torch/attention/backends/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention/backends/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention/backends/trtllm.py` | TRTLLM backend execution and metadata |
@@ -504,6 +512,8 @@ Key test files:
 - `tests/unittest/_torch/attention/test_combined_fmha.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
+- `tests/unittest/_torch/attention/kernels/`
+- `tests/unittest/_torch/attention/multi_gpu/`
 - `tests/unittest/_torch/attention/sparse/`
 
 ## 7. Anti-Patterns
