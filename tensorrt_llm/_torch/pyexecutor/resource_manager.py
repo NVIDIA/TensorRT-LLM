@@ -2821,6 +2821,7 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     def encode_cold_pages(
         self,
+        codec_state: object,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,
@@ -2832,6 +2833,7 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     def decode_cold_pages(
         self,
+        codec_state: object,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,

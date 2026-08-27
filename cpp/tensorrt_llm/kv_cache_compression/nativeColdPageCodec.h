@@ -66,16 +66,16 @@ public:
         std::size_t numBasePages, cudaStream_t stream) noexcept final;
 
 private:
-    virtual std::vector<ColdPageLifecycleProperties> configurePolicy(
+    virtual std::vector<ColdPageLifecycleProperties> configureProvider(
         std::vector<ResolvedHotLifecycle> const& lifecycles)
         = 0;
 
     //! Enqueue only on stream; this codec drains partial submissions after a throw.
-    virtual void encodePolicy(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+    virtual void encodeProvider(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream)
         = 0;
 
-    virtual void decodePolicy(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    virtual void decodeProvider(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream)
         = 0;
 

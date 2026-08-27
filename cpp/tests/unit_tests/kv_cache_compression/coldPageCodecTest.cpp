@@ -76,7 +76,7 @@ public:
     {
     }
 
-    std::vector<ColdPageLifecycleProperties> configurePolicy(
+    std::vector<ColdPageLifecycleProperties> configureProvider(
         std::vector<ResolvedHotLifecycle> const& lifecycles) override
     {
         resolved = lifecycles;
@@ -88,7 +88,7 @@ public:
             lifecycles.size(), ColdPageLifecycleProperties{777U, kv::PageIndexLocation::kHost});
     }
 
-    void encodePolicy(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
+    void encodeProvider(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
         if (failBatches)
@@ -103,7 +103,7 @@ public:
         lastStream = stream;
     }
 
-    void decodePolicy(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
+    void decodeProvider(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
         if (failBatches)
@@ -207,7 +207,7 @@ TEST(NativeColdPageCodecTest, RejectsMixedMissingAndDuplicateLifecycleMappings)
     }
 }
 
-TEST(NativeColdPageCodecTest, CatchesPolicyConfigureFailuresAndInvalidBatches)
+TEST(NativeColdPageCodecTest, CatchesProviderConfigureFailuresAndInvalidBatches)
 {
     RecordingCodec codec{{0}};
     codec.failConfigure = true;
@@ -224,7 +224,7 @@ TEST(NativeColdPageCodecTest, CatchesPolicyConfigureFailuresAndInvalidBatches)
     EXPECT_EQ(validCodec.decodeCalls, 0);
 }
 
-TEST(NativeColdPageCodecTest, PolicyFailureUsesTheSuppliedCudaStreamForRollback)
+TEST(NativeColdPageCodecTest, ProviderFailureUsesTheSuppliedCudaStreamForRollback)
 {
     int deviceCount = 0;
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0)

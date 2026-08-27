@@ -6,7 +6,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
@@ -76,6 +76,16 @@ class _Nvfp4ColdPageMetadata:
     num_buffers: int
     max_half_groups_per_tile: int
     cold_page_bytes: int
+
+
+@dataclass
+class _Nvfp4ColdPageCodecState:
+    """NVFP4 state owned by one target, draft, or retry codec."""
+
+    layer_layouts: dict[int, _Nvfp4LayerLayout]
+    layer_ids: tuple[int, ...]
+    runtime_type: int
+    lifecycle_metadata: tuple[_Nvfp4ColdPageMetadata, ...] = field(init=False)
 
 
 def _load_modelopt_nvfp4_scales(
@@ -155,7 +165,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         super().__init__(config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
-    def initialize_codec(
+    def build_codec_state(
         self,
         cache_config: object,
         *,
@@ -164,7 +174,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-    ) -> None:
+    ) -> _Nvfp4ColdPageCodecState:
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
         runtime_type = {
@@ -227,11 +237,16 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 )
             )
 
-        self._layer_layouts = {layout.layer_id: layout for layout in layer_layouts}
-        self._layer_ids = tuple(sorted(self._layer_layouts))
-        self._runtime_type = runtime_type if runtime_type is not None else 0
+        layouts_by_layer = {layout.layer_id: layout for layout in layer_layouts}
+        return _Nvfp4ColdPageCodecState(
+            layer_layouts=layouts_by_layer,
+            layer_ids=tuple(sorted(layouts_by_layer)),
+            runtime_type=runtime_type if runtime_type is not None else 0,
+        )
 
-    def build_lifecycle_metadata(self, lifecycle: object) -> _Nvfp4ColdPageMetadata:
+    def build_lifecycle_metadata(
+        self, codec_state: _Nvfp4ColdPageCodecState, lifecycle: object
+    ) -> _Nvfp4ColdPageMetadata:
         wide_rows: list[list[int]] = []
         integer_rows: list[list[int]] = []
         scale_rows: list[list[float]] = []
@@ -239,12 +254,12 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         max_half_groups_per_tile = 0
 
         for layer_id, hot_buffers in lifecycle.layers.items():
-            layout = self._layer_layouts[int(layer_id)]
+            layout = codec_state.layer_layouts[int(layer_id)]
             expected_roles = {buffer.role for buffer in layout.buffers}
             if set(hot_buffers) != expected_roles:
                 raise ValueError(f"Cold-page layer {layer_id} roles do not match its KVCM layout")
             elements = layout.num_kv_heads * layout.tokens_per_page * layout.head_dim
-            element_bytes = 1 if self._runtime_type == 2 else 2
+            element_bytes = 1 if codec_state.runtime_type == 2 else 2
             expected_raw_bytes = elements * element_bytes
             half_groups = elements // _ELEMENTS_PER_HALF_GROUP
             compressed_count = sum(buffer.scales is not None for buffer in layout.buffers)
@@ -348,13 +363,14 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
     def encode_cold_pages(
         self,
+        codec_state: _Nvfp4ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,
         num_pages: int,
         stream: int,
     ) -> None:
-        metadata = self._lifecycle_metadata[lifecycle_index]
+        metadata = codec_state.lifecycle_metadata[lifecycle_index]
         torch.ops.trtllm.nvfp4_cold_page_encode(
             page_indices,
             num_pages,
@@ -364,20 +380,21 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             metadata.num_buffers,
             metadata.max_half_groups_per_tile,
             metadata.cold_page_bytes,
-            self._runtime_type,
+            codec_state.runtime_type,
             cold_base,
             stream,
         )
 
     def decode_cold_pages(
         self,
+        codec_state: _Nvfp4ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,
         num_pages: int,
         stream: int,
     ) -> None:
-        metadata = self._lifecycle_metadata[lifecycle_index]
+        metadata = codec_state.lifecycle_metadata[lifecycle_index]
         torch.ops.trtllm.nvfp4_cold_page_decode(
             page_indices,
             num_pages,
@@ -387,7 +404,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             metadata.num_buffers,
             metadata.max_half_groups_per_tile,
             metadata.cold_page_bytes,
-            self._runtime_type,
+            codec_state.runtime_type,
             cold_base,
             stream,
         )

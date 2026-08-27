@@ -82,12 +82,16 @@ def _native() -> tuple[SimpleNamespace, MagicMock]:
     return module, codec
 
 
-def _callback(native: SimpleNamespace) -> object:
+def _provider(native: SimpleNamespace) -> object:
     return native.create_python_cold_page_codec.call_args.args[0]
 
 
+def _codec_state(native: SimpleNamespace) -> object:
+    return native.create_python_cold_page_codec.call_args.args[1]
+
+
 def _layouts(native: SimpleNamespace) -> list[object]:
-    return list(_callback(native)._layer_layouts.values())
+    return list(_codec_state(native).layer_layouts.values())
 
 
 def _configure_lifecycle(native: SimpleNamespace, layer_bytes: dict[int, dict[str, int]]) -> object:
@@ -103,11 +107,13 @@ def _configure_lifecycle(native: SimpleNamespace, layer_bytes: dict[int, dict[st
             )
             address += 0x10000
         layers[layer_id] = hot
-    _callback(native).configure([SimpleNamespace(layers=layers)])
-    return _callback(native)._lifecycle_metadata[0]
+    provider = _provider(native)
+    codec_state = _codec_state(native)
+    provider.configure(codec_state, [SimpleNamespace(layers=layers)])
+    return codec_state.lifecycle_metadata[0]
 
 
-def _configure_callback(native: SimpleNamespace, raw_bytes: int) -> object:
+def _configure_default_lifecycle(native: SimpleNamespace, raw_bytes: int) -> object:
     return _configure_lifecycle(native, {0: {"key": raw_bytes, "value": raw_bytes}})
 
 
@@ -165,7 +171,7 @@ def test_optional_modelopt_scales_map_pp_layers_and_default_missing_layers(tmp_p
     assert result is codec
     layouts = _layouts(native)
     assert [layout.layer_id for layout in layouts] == [0, 1, 2]
-    assert _callback(native)._runtime_type == 1
+    assert _codec_state(native).runtime_type == 1
     assert [
         (
             tuple(buffer.scales.nvfp4_orig_quant for buffer in layout.buffers),
@@ -256,7 +262,7 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
         1.0,
         1.0,
     ]
-    metadata = _configure_callback(native, raw_bytes=5120)
+    metadata = _configure_default_lifecycle(native, raw_bytes=5120)
     assert metadata.cold_page_bytes == 2880
     assert metadata.wide[:2, 3].tolist() == [0, 1280]
     assert metadata.wide[:2, 4].tolist() == [2560, 2720]
@@ -287,7 +293,7 @@ def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
             head_dim_per_layer=(32,),
         )
 
-    metadata = _configure_callback(native, raw_bytes=320)
+    metadata = _configure_default_lifecycle(native, raw_bytes=320)
     assert metadata.cold_page_bytes == 192
     assert metadata.wide[:2, 3].tolist() == [0, 80]
     assert metadata.wide[:2, 4].tolist() == [160, 170]
@@ -295,7 +301,7 @@ def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
     assert metadata.integers[:2, 0].tolist() == [0, 12]
 
 
-def test_provider_creates_one_native_codec_per_kv_cache_manager():
+def test_provider_creates_independent_state_per_kv_cache_manager() -> None:
     native, _ = _native()
     codecs = (object(), object())
     native.create_python_cold_page_codec.side_effect = codecs
@@ -315,15 +321,14 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
 
     assert results == codecs
     assert native.create_python_cold_page_codec.call_count == 2
-    target_callback, draft_callback = (
-        call.args[0] for call in native.create_python_cold_page_codec.call_args_list
-    )
-    assert target_callback is not draft_callback
-    assert target_callback is not provider
-    assert draft_callback is not provider
+    calls = native.create_python_cold_page_codec.call_args_list
+    assert all(call.args[0] is provider for call in calls)
+    target_state, draft_state = (call.args[1] for call in calls)
+    assert target_state is not draft_state
+    assert target_state.layer_ids == draft_state.layer_ids == (0,)
 
 
-def test_callback_forwards_a_4096_page_batch_through_one_custom_op_call() -> None:
+def test_provider_forwards_a_4096_page_batch_through_one_custom_op_call() -> None:
     native, _ = _native()
 
     with (
@@ -338,7 +343,8 @@ def test_callback_forwards_a_4096_page_batch_through_one_custom_op_call() -> Non
             num_kv_heads_per_layer=(1,),
             head_dim_per_layer=(16,),
         )
-        callback = _callback(native)
+        provider = _provider(native)
+        codec_state = _codec_state(native)
         hot = {
             role: SimpleNamespace(
                 raw_base=0x1000 + index * 0x1000,
@@ -347,13 +353,13 @@ def test_callback_forwards_a_4096_page_batch_through_one_custom_op_call() -> Non
             )
             for index, role in enumerate(("key", "value"))
         }
-        properties = callback.configure([SimpleNamespace(layers={0: hot})])
-        callback.encode_cold_pages(0, 0x3000, 0x4000, 4096, 0x5000)
-        callback.decode_cold_pages(0, 0x3000, 0x4000, 4096, 0x5000)
+        properties = provider.configure(codec_state, [SimpleNamespace(layers={0: hot})])
+        provider.encode_cold_pages(codec_state, 0, 0x3000, 0x4000, 4096, 0x5000)
+        provider.decode_cold_pages(codec_state, 0, 0x3000, 0x4000, 4096, 0x5000)
 
     assert properties[0].cold_page_bytes == 1152
     assert properties[0].page_index_location == "host"
-    metadata = callback._lifecycle_metadata[0]
+    metadata = codec_state.lifecycle_metadata[0]
     for operation in (encode, decode):
         operation.assert_called_once()
         arguments = operation.call_args.args
@@ -372,7 +378,7 @@ def test_callback_forwards_a_4096_page_batch_through_one_custom_op_call() -> Non
         )
 
 
-def test_callback_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
+def test_codec_state_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
     native, _ = _native()
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
@@ -384,7 +390,7 @@ def test_callback_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
         )
 
     with torch.device("meta"):
-        metadata = _configure_callback(native, raw_bytes=2048)
+        metadata = _configure_default_lifecycle(native, raw_bytes=2048)
     for tensor, dtype, shape in (
         (metadata.wide, torch.int64, (256, 6)),
         (metadata.integers, torch.int32, (256, 5)),
@@ -396,7 +402,7 @@ def test_callback_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
         assert tensor.is_contiguous()
 
 
-def test_callback_rejects_invalid_resolved_hot_buffers() -> None:
+def test_provider_rejects_invalid_resolved_hot_buffers() -> None:
     native, _ = _native()
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
@@ -407,7 +413,8 @@ def test_callback_rejects_invalid_resolved_hot_buffers() -> None:
             head_dim_per_layer=(16,),
         )
 
-    callback = _callback(native)
+    provider = _provider(native)
+    codec_state = _codec_state(native)
 
     def hot(raw_base: int = 0x1000, raw_bytes: int = 2048) -> SimpleNamespace:
         return SimpleNamespace(
@@ -417,20 +424,22 @@ def test_callback_rejects_invalid_resolved_hot_buffers() -> None:
         )
 
     with pytest.raises(ValueError, match="roles do not match"):
-        callback.configure(
-            [SimpleNamespace(layers={0: {"key": hot(), "value": hot(), "extra": hot()}})]
+        provider.configure(
+            codec_state,
+            [SimpleNamespace(layers={0: {"key": hot(), "value": hot(), "extra": hot()}})],
         )
     with pytest.raises(ValueError, match="size does not match"):
-        callback.configure(
-            [SimpleNamespace(layers={0: {"key": hot(raw_bytes=32), "value": hot()}})]
+        provider.configure(
+            codec_state, [SimpleNamespace(layers={0: {"key": hot(raw_bytes=32), "value": hot()}})]
         )
     with pytest.raises(ValueError, match="16-byte aligned"):
-        callback.configure(
-            [SimpleNamespace(layers={0: {"key": hot(raw_base=0x1001), "value": hot()}})]
+        provider.configure(
+            codec_state,
+            [SimpleNamespace(layers={0: {"key": hot(raw_base=0x1001), "value": hot()}})],
         )
 
 
-def test_callback_rejects_more_than_256_lifecycle_buffers() -> None:
+def test_provider_rejects_more_than_256_lifecycle_buffers() -> None:
     native, _ = _native()
     layers = tuple(
         AttentionLayerConfig(
@@ -596,7 +605,7 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
         )
 
     assert result is codec
-    assert _callback(native).layer_ids == ()
+    assert _codec_state(native).layer_ids == ()
 
 
 def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
@@ -628,7 +637,7 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
     assert layout.layer_id == 0
     assert [buffer.role for buffer in layout.buffers] == ["key", "index_key"]
     assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
-    assert _callback(native)._runtime_type == 1
+    assert _codec_state(native).runtime_type == 1
     assert layout.num_kv_heads == 1
     assert layout.tokens_per_page == 64
     assert layout.head_dim == 576
@@ -774,7 +783,7 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
         )
 
     layout = _layouts(native)[0]
-    assert _callback(native)._runtime_type == 2
+    assert _codec_state(native).runtime_type == 2
     assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         2.0,
         4.0,
