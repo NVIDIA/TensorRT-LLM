@@ -207,6 +207,7 @@ class PLEMetadata:
         num_contexts: int = 0,
         use_spec_decoding: bool = False,
         uniform_row_width: Optional[int] = None,
+        host_seq_lens: Optional[list[int]] = None,
         all_rank_num_tokens: Optional[list[int]] = None,
         is_cuda_graph: bool = False,
     ) -> "PLEMetadata":
@@ -248,7 +249,18 @@ class PLEMetadata:
             context_tokens = num_contexts * row_width
         else:
             lengths = seq_lens.to(device=device, dtype=torch.long)
-            seq_lens_cpu = lengths.tolist()
+            if host_seq_lens is None:
+                seq_lens_cpu = lengths.tolist()
+            else:
+                if len(host_seq_lens) != lengths.shape[0]:
+                    raise ValueError(
+                        "PLE host sequence lengths do not match the device batch: "
+                        f"{len(host_seq_lens)} != {lengths.shape[0]}"
+                    )
+                # The model runner already owns this host view of the same
+                # attention lengths. Reusing it avoids a device-to-host sync
+                # solely to derive Python layout scalars.
+                seq_lens_cpu = host_seq_lens
             row_width = max(seq_lens_cpu) if seq_lens_cpu else processed_tokens
             num_seq = lengths.shape[0]
             context_tokens = sum(seq_lens_cpu[:num_contexts])

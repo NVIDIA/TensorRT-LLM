@@ -776,6 +776,76 @@ def test_mtp_uses_one_recurrent_checkpoint_layer(monkeypatch, draft_len) -> None
     assert created == [config.num_hidden_layers]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
+    from tensorrt_llm._torch.models import modeling_qwen4_exp
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
+
+    torch.cuda.set_device(0)
+    device = torch.device("cuda:0")
+    model = object.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.has_ple = True
+    model.ple_layer_mask = [True]
+    model.layers = [SimpleNamespace(ple=SimpleNamespace())]
+    model.eos_token_id = 2
+
+    captured = {}
+
+    def fake_build(input_ids, seq_lens, state_indices, **kwargs):
+        captured["input_ids"] = input_ids
+        captured["seq_lens"] = seq_lens
+        captured["state_indices"] = state_indices
+        captured["kwargs"] = kwargs
+        return SimpleNamespace()
+
+    monkeypatch.setattr(modeling_qwen4_exp.PLEMetadata, "build", staticmethod(fake_build))
+    conv_state = torch.tensor([1.0, 2.0], device=device).view(2, 1, 1)
+    ngram_context = torch.tensor([[11], [12]], dtype=torch.long, device=device)
+    monkeypatch.setattr(
+        Qwen4ExpModel,
+        "_resolve_ple_pools",
+        lambda self, *args: (conv_state, ngram_context),
+    )
+
+    seq_lens = torch.tensor([2, 3], dtype=torch.int32)
+    seq_lens_cuda = seq_lens.to(device)
+    attn_metadata = SimpleNamespace(
+        num_contexts=2,
+        num_seqs=2,
+        num_tokens=5,
+        seq_lens=seq_lens,
+        seq_lens_cuda=seq_lens_cuda,
+        all_rank_num_tokens=None,
+        is_cuda_graph=False,
+    )
+    state_indices = torch.arange(2, dtype=torch.int32, device=device)
+    state_indices_long = state_indices.to(dtype=torch.long)
+    mamba_metadata = SimpleNamespace(
+        state_indices=state_indices,
+        state_indices_long=state_indices_long,
+        has_initial_states=torch.tensor([True, False], dtype=torch.bool, device=device),
+    )
+
+    model._prepare_ple_state(
+        attn_metadata,
+        torch.arange(5, dtype=torch.long, device=device),
+        mamba_metadata,
+        spec_metadata=None,
+    )
+
+    assert captured["seq_lens"].data_ptr() == seq_lens_cuda.data_ptr()
+    assert captured["seq_lens"].dtype == torch.int32
+    assert captured["state_indices"].data_ptr() == state_indices_long.data_ptr()
+    assert captured["state_indices"].dtype == torch.long
+    assert captured["kwargs"]["host_seq_lens"] == [2, 3]
+    assert captured["input_ids"].shape == (5,)
+    torch.testing.assert_close(conv_state.flatten(), torch.tensor([1.0, 0.0], device=device))
+    torch.testing.assert_close(
+        ngram_context.flatten(), torch.tensor([11, 2], dtype=torch.long, device=device)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="PP construct smoke requires CUDA")
 @pytest.mark.parametrize(
     "rank,owned_layers,owns_embedding,owns_epilogue",
