@@ -187,25 +187,18 @@ def reject_unsupported_inkling_kv_cache_features(
         enable_block_reuse: bool,
         enable_cache_transceiver: bool = False,
         periodic_snapshot_interval: int = 0):
-    """Refuse the features Inkling's context path cannot serve correctly.
+    """Refuse the KV-cache features Inkling's short-conv state cannot serve.
 
-    Block reuse leaves a context request with a reused prefix whose conv window
-    it never computed, and disaggregated serving moves a request without its
-    conv windows at all. Neither raises on its own; both emit wrong logits
-    silently, which is why they are refused here.
+    Both refusals guard silently-wrong logits (neither raises on its own):
+    - Block reuse: a reused prefix has no conv window, since the convs consumed
+      activations it never computed. Allowed only with a snapshot policy
+      (``periodic_snapshot_interval``), which commits the window into the block
+      lifecycle so a hit has one to restore.
+    - Disaggregated serving: the transfer path finds state pools by manager
+      class; Inkling's is not the Mamba one, so the conv windows would move as
+      ordinary paged KV -- i.e. be left behind.
 
-    Block reuse is refused only when no snapshot policy is configured:
-    ``periodic_snapshot_interval`` commits the conv window with the block at
-    each snapshot ordinal, which is what gives a prefix hit a window to restore.
-    Disaggregated serving stays refused: the conv windows are V2 SSM-layer
-    memory, but the transfer path finds state pools by manager class, and
-    Inkling's is not the Mamba one, so they would never be described to it.
-    Neither raises on its own; both emit wrong logits silently.
-
-    Chunked prefill is no longer refused: ``_run_context`` routes a request with
-    cached history to the one prefill kernel, which reads the
-    pages back at absolute positions, and ``has_initial_state`` is derived from
-    ``num_cached_tokens_per_seq``.
+    Chunked prefill is served, not refused.
     """
     if not is_inkling(config):
         return
@@ -222,9 +215,8 @@ def reject_unsupported_inkling_kv_cache_features(
             "a positive number of tokens, which puts the window in the block "
             "lifecycle and makes the hit servable.")
     if enable_block_reuse and periodic_snapshot_interval:
-        # Said at startup because the manager's equivalent warning needs a
-        # multimodal request to arrive, and rides on the same probe as the rule
-        # it describes -- if that breaks, the warning goes quiet with it.
+        # Proactive startup notice: the manager's equivalent warning only fires
+        # once a multimodal request actually arrives.
         logger.warning(
             "Inkling: KV cache block reuse is enabled, and applies to text "
             "prompts only. A request carrying image, video or audio input gets "
@@ -233,9 +225,8 @@ def reject_unsupported_inkling_kv_cache_features(
             "on placeholder token ids alone would serve one item's KV for "
             "another's. Such requests still run, uncached.")
     if enable_cache_transceiver:
-        # The C++ route is already refused in _util.py for every V2 manager, but
-        # KvCacheTransceiverV2 is not: it would move the paged KV and leave the
-        # conv windows behind, so the decode instance convolves against zeros.
+        # _util.py refuses the C++ route for every V2 manager; KvCacheTransceiverV2
+        # is not, but would move the paged KV and leave the conv windows behind.
         raise NotImplementedError(
             "Inkling does not support disaggregated serving. Its four "
             "short-conv windows per layer are per-request recurrent state, "
