@@ -410,6 +410,165 @@ def test_mapper_normalizes_bf16_and_per_expert_fp8_weights() -> None:
     }
 
 
+def _tiny_ngram_config(*, exclude_table: bool = False) -> SimpleNamespace:
+    excluded = ["model.language_model.layers.1.ple.key_proj"]
+    if exclude_table:
+        excluded.append("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0")
+    return SimpleNamespace(
+        ngram_size=2,
+        heads_per_ngram=1,
+        vocab_size=16,
+        eos_token_id=2,
+        seed=1234,
+        ngram_vocab_size_base=3,
+        make_ngram_vocab_size_divisible_by=4,
+        quantization_config={
+            "quant_method": "fp8",
+            "modules_to_not_convert": excluded,
+        },
+    )
+
+
+def test_mapper_keeps_fp8_ple_table_quantized(monkeypatch) -> None:
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
+        Qwen4ExpHfWeightMapper,
+    )
+    from tensorrt_llm._torch.modules.qwen4_exp_ple import Qwen4ExpNGramEmbedding
+
+    module = Qwen4ExpNGramEmbedding(
+        _tiny_ngram_config(),
+        embedding_dim=2,
+        dtype=torch.bfloat16,
+    )
+    assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+
+    excluded_module = Qwen4ExpNGramEmbedding(
+        _tiny_ngram_config(exclude_table=True),
+        embedding_dim=2,
+        dtype=torch.bfloat16,
+    )
+    assert excluded_module.ngram_embedding.weight.dtype == torch.bfloat16
+
+    mapper = Qwen4ExpHfWeightMapper()
+    monkeypatch.setattr(mapper, "_ngram_module_for_prefix", lambda _prefix: module)
+    fp8_table = torch.tensor(
+        [[-48.0, 72.0], [-80.0, 64.0], [-36.0, 36.0], [-26.0, 30.0]],
+        dtype=torch.float8_e4m3fn,
+    )
+    scale = torch.tensor([0.0002], dtype=torch.bfloat16)
+    mapper._load_ngram_tables(
+        {
+            "model.layers.1.ple": {
+                "ngram_embedding.shard_0.weight": fp8_table[:2],
+                "ngram_embedding.shard_1.weight": fp8_table[2:],
+                "ngram_embedding.weight_scale": scale,
+            }
+        }
+    )
+
+    assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+    assert module.ngram_embedding.weight.element_size() == 1
+    torch.testing.assert_close(module.ngram_embedding.weight, fp8_table)
+    expected = (fp8_table.float() * scale.item()).to(torch.bfloat16)
+    torch.testing.assert_close(module.embed(torch.arange(4)), expected)
+
+
+def test_fp8_ple_parameter_replacement_preserves_registration() -> None:
+    from tensorrt_llm._torch.modules.qwen4_exp_ple import Qwen4ExpNGramEmbedding
+
+    module = Qwen4ExpNGramEmbedding(
+        _tiny_ngram_config(exclude_table=True),
+        embedding_dim=2,
+        dtype=torch.bfloat16,
+    )
+    module.configure_fp8_weight_storage(
+        torch.tensor(0.0002, dtype=torch.bfloat16),
+        torch.float8_e4m3fn,
+    )
+
+    parameters = dict(module.named_parameters())
+    state = module.state_dict()
+    assert parameters["ngram_embedding.weight"].dtype == torch.float8_e4m3fn
+    assert state["ngram_embedding.weight"].dtype == torch.float8_e4m3fn
+    assert "ngram_embedding_weight_scale" not in state
+
+
+@pytest.mark.parametrize("scale", [float("nan"), float("inf"), -1.0])
+def test_fp8_ple_rejects_nonfinite_or_negative_scale(scale) -> None:
+    from tensorrt_llm._torch.modules.qwen4_exp_ple import Qwen4ExpNGramEmbedding
+
+    module = Qwen4ExpNGramEmbedding(
+        _tiny_ngram_config(),
+        embedding_dim=2,
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        module.configure_fp8_weight_storage(
+            torch.tensor(scale, dtype=torch.float32),
+            torch.float8_e4m3fn,
+        )
+
+
+@pytest.mark.parametrize(
+    ("leaves", "match"),
+    [
+        (
+            {"ngram_embedding.shard_0.weight": torch.empty((4, 2), dtype=torch.float8_e4m3fn)},
+            "have no weight scale",
+        ),
+        (
+            {
+                "ngram_embedding.shard_0.weight": torch.empty((2, 2), dtype=torch.float8_e4m3fn),
+                "ngram_embedding.shard_1.weight": torch.empty((2, 2), dtype=torch.bfloat16),
+                "ngram_embedding.weight_scale": torch.ones((), dtype=torch.bfloat16),
+            },
+            "mixed dtypes",
+        ),
+        (
+            {"ngram_embedding.weight_scale": torch.ones((), dtype=torch.bfloat16)},
+            "has no table shards",
+        ),
+        (
+            {
+                "ngram_embedding.shard_0.weight": torch.empty((4, 2), dtype=torch.float8_e4m3fn),
+                "ngram_embedding.weight_scale": torch.ones(2, dtype=torch.bfloat16),
+            },
+            "must be scalar",
+        ),
+        (
+            {
+                "ngram_embedding.shard_0.weight": torch.empty((4, 2), dtype=torch.float8_e4m3fn),
+                "ngram_embedding.weight_scale": torch.zeros((), dtype=torch.bfloat16),
+            },
+            "finite and positive",
+        ),
+        (
+            {
+                "ngram_embedding.shard_0.weight": torch.empty((4, 2), dtype=torch.bfloat16),
+                "ngram_embedding.weight_scale": torch.ones((), dtype=torch.bfloat16),
+            },
+            "scaled weight dtype must be FP8",
+        ),
+    ],
+)
+def test_mapper_rejects_invalid_fp8_ple_tables(monkeypatch, leaves, match) -> None:
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
+        Qwen4ExpHfWeightMapper,
+    )
+    from tensorrt_llm._torch.modules.qwen4_exp_ple import Qwen4ExpNGramEmbedding
+
+    module = Qwen4ExpNGramEmbedding(
+        _tiny_ngram_config(),
+        embedding_dim=2,
+        dtype=torch.bfloat16,
+    )
+    mapper = Qwen4ExpHfWeightMapper()
+    monkeypatch.setattr(mapper, "_ngram_module_for_prefix", lambda _prefix: module)
+
+    with pytest.raises(ValueError, match=match):
+        mapper._load_ngram_tables({"model.layers.1.ple": leaves})
+
+
 def test_pipeline_mapper_drops_nonlocal_layer_weights() -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
@@ -547,7 +706,11 @@ def test_mtp_local_full_vocab_head_collapses_hc_streams(monkeypatch) -> None:
             return hidden_states
 
     lm_head = CaptureLMHead()
-    hidden_states = torch.zeros(2, config.hc_count * config.hidden_size)
+    hidden_states = torch.zeros(
+        2,
+        config.hc_count * config.hidden_size,
+        dtype=torch.bfloat16,
+    )
 
     logits = head.forward_local_full_vocab(
         hidden_states, lm_head, attn_metadata=None, return_context_logits=True

@@ -49,11 +49,14 @@ What differs from the stock HF loader (why a bespoke mapper is required):
   loaded through ``MoEWeightLoadingMode.FUSED_GATE_UP_PROJ``. The shared expert
   (``gate_proj``/``up_proj`` -> fused ``gate_up_proj``) and router ``gate`` use
   the stock fusion / direct-copy paths.
-* **PLE n-gram embedding (C4)** — the ~100 GB n-gram table is stored as
+* **PLE n-gram embedding (C4)** — the n-gram table is stored as
   ``split_ngram_parts`` (128) equal prime-tiled shards
   ``ple_embedding.ngram_embedding.shard_{i}.weight``; they are streamed
-  shard-by-shard into the single ``ngram_embedding`` table (no 100 GB concat),
-  and the three recurrent-hash metadata buffers (``layer_multipliers`` /
+  shard-by-shard into the single ``ngram_embedding`` table (no full-table
+  concat). FP8 checkpoints additionally store the scalar
+  ``ngram_embedding.weight_scale``; the table stays FP8 in device memory and
+  only selected rows are dequantized after lookup. The three recurrent-hash
+  metadata buffers (``layer_multipliers`` /
   ``ngram_heads_offsets`` / ``ngram_heads_vocab_sizes``) are copied into the
   module's registered buffers.
 * **QSA full attention (C3)** — ``q_proj`` (output-gated, 2x q heads) / ``k_proj``
@@ -366,11 +369,32 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     buf.data.copy_(leaves[leaf][:].to(buf.dtype))
 
             # N-gram table shards: tile them into the single embedding weight.
-            table = module.ngram_embedding.weight
             shard_leaves = sorted(
                 (leaf for leaf in leaves if leaf.startswith("ngram_embedding.shard_")),
                 key=lambda s: int(s.split(".shard_")[1].split(".")[0]),
             )
+            shard_dtypes = {leaves[leaf].dtype for leaf in shard_leaves}
+            if len(shard_dtypes) > 1:
+                raise ValueError(
+                    f"PLE n-gram shards for {ple_prefix} have mixed dtypes: "
+                    f"{sorted(map(str, shard_dtypes))}"
+                )
+            weight_scale = leaves.get("ngram_embedding.weight_scale")
+            if weight_scale is not None:
+                if not shard_leaves:
+                    raise ValueError(
+                        f"PLE n-gram weight scale for {ple_prefix} has no table shards"
+                    )
+                module.configure_fp8_weight_storage(
+                    weight_scale,
+                    next(iter(shard_dtypes)),
+                )
+            elif shard_dtypes:
+                shard_dtype = next(iter(shard_dtypes))
+                if shard_dtype.is_floating_point and shard_dtype.itemsize == 1:
+                    raise ValueError(f"PLE FP8 n-gram shards for {ple_prefix} have no weight scale")
+
+            table = module.ngram_embedding.weight
             row = 0
             for leaf in shard_leaves:
                 shard = leaves[leaf][:]

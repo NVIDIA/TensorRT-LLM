@@ -59,6 +59,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.logger import logger
 
 # --- splitmix64 constants (verbatim from the sglang reference) ---
 _MASK64 = (1 << 64) - 1
@@ -66,6 +67,18 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
+
+
+def _uses_scaled_fp8_ngram_table(config) -> bool:
+    """Return whether the HF config declares the custom scaled-FP8 PLE table."""
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return False
+    if quantization_config.get("quant_method") != "fp8":
+        return False
+    excluded = quantization_config.get("modules_to_not_convert") or ()
+    marker = "ple.ple_embedding.ngram_embedding"
+    return not any(marker in module_name for module_name in excluded)
 
 
 def _splitmix64(x: int) -> int:
@@ -292,6 +305,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.unigram_vocab_size = int(config.vocab_size)
         self.eos_token_id = int(config.eos_token_id)
         self.seed = int(getattr(config, "seed", 1234))
+        self.embedding_output_dtype = dtype
+        self.register_buffer(
+            "ngram_embedding_weight_scale",
+            None,
+            persistent=False,
+        )
 
         if self.ngram_size < 2:
             raise ValueError(f"ngram_size must be >= 2, got {self.ngram_size}")
@@ -330,11 +349,60 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             // self.make_ngram_vocab_size_divisible_by
         ) * self.make_ngram_vocab_size_divisible_by
         self.padded_vocab_size = padded_vocab_size
+        weight_dtype = torch.float8_e4m3fn if _uses_scaled_fp8_ngram_table(config) else dtype
         self.ngram_embedding = Embedding(
             padded_vocab_size,
             self.head_dim_per_ngram,
-            dtype=dtype,
+            dtype=weight_dtype,
         )
+
+    def configure_fp8_weight_storage(
+        self,
+        weight_scale: torch.Tensor,
+        weight_dtype: torch.dtype,
+    ) -> None:
+        """Keep a scaled-FP8 n-gram table quantized until after lookup."""
+        if weight_scale.numel() != 1:
+            raise ValueError(
+                f"PLE n-gram weight scale must be scalar, got shape {tuple(weight_scale.shape)}"
+            )
+        scale = float(weight_scale.item())
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(f"PLE n-gram weight scale must be finite and positive, got {scale}")
+        if not weight_dtype.is_floating_point or weight_dtype.itemsize != 1:
+            raise ValueError(f"PLE scaled weight dtype must be FP8, got {weight_dtype}")
+
+        weight = self.ngram_embedding.weight
+        if weight.dtype != weight_dtype:
+            weight_shape = weight.shape
+            weight_device = weight.device
+            # Drop the checkpoint-sized BF16 allocation before creating the
+            # FP8 table. Holding both would add about 48 GiB at production size.
+            self.ngram_embedding.register_parameter("weight", None)
+            del weight
+            self.ngram_embedding.weight = nn.Parameter(
+                torch.empty(weight_shape, device=weight_device, dtype=weight_dtype),
+                requires_grad=False,
+            )
+        self.ngram_embedding_weight_scale = (
+            weight_scale.detach()
+            .reshape(())
+            .to(
+                device=self.ngram_embedding.weight.device,
+                dtype=torch.float32,
+            )
+        )
+        logger.info(
+            "Qwen4-Exp PLE n-gram table configured for scaled FP8 storage: "
+            f"dtype={self.ngram_embedding.weight.dtype}, "
+            f"shape={tuple(self.ngram_embedding.weight.shape)}, scale={scale}"
+        )
+
+    def _dequantize_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if self.ngram_embedding_weight_scale is None:
+            return embeddings
+        output_dtype = self.embedding_output_dtype or torch.get_default_dtype()
+        return embeddings.float().mul_(self.ngram_embedding_weight_scale).to(output_dtype)
 
     def _build_layer_multipliers(self, size: int) -> torch.Tensor:
         max_long = (1 << 63) - 1
@@ -410,6 +478,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def embed(self, ngram_ids: torch.Tensor) -> torch.Tensor:
         """Embed head ids ``[T, ngram_heads]`` -> ``[T, ngram_heads, head_dim]``."""
+        if self.ngram_embedding_weight_scale is not None:
+            embeddings = F.embedding(ngram_ids, self.ngram_embedding.weight)
+            return self._dequantize_embeddings(embeddings)
         return self.ngram_embedding(ngram_ids)
 
 
