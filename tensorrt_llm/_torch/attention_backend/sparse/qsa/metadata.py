@@ -10,9 +10,9 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._utils import prefer_pinned
 
 from .cache_manager import QSAMambaHybridCacheManagerV2
+from .kernels import triton_qsa_unscale_block_table
 from .params import QSASparseMetadataParams
 
 
@@ -46,10 +46,8 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        self.host_qsa_block_table = torch.zeros_like(
-            self.qsa_block_table,
-            device="cpu",
-            pin_memory=prefer_pinned(),
+        self._qsa_attention_pool_id, self._qsa_page_index_scale = (
+            self.kv_cache_manager.get_qsa_attention_pool_layout()
         )
         self.qsa_req_idx_per_token = self.get_empty(
             buffers,
@@ -140,18 +138,20 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         self.qsa_logical_positions[:num_tokens].copy_(logical)
 
     def _refresh_qsa_block_table(self) -> None:
-        request_ids = list(self.request_ids[: self.num_seqs])
-        rows = self.kv_cache_manager.get_qsa_slot_block_indices(request_ids)
-        host = self.host_qsa_block_table[: self.num_seqs]
-        host.zero_()
-        for row_idx, pages in enumerate(rows):
-            if len(pages) > host.shape[1]:
-                raise RuntimeError(
-                    f"QSA request has {len(pages)} pages, capacity is {host.shape[1]}"
-                )
-            if pages:
-                host[row_idx, : len(pages)].copy_(torch.tensor(pages, dtype=torch.int32))
-        self.qsa_block_table[: self.num_seqs].copy_(host, non_blocking=True)
+        num_seqs = self.num_seqs
+        if num_seqs <= 0:
+            return
+        scaled = self.kv_cache_block_offsets[
+            self._qsa_attention_pool_id,
+            :num_seqs,
+            0,
+            :,
+        ]
+        triton_qsa_unscale_block_table(
+            scaled_block_table=scaled,
+            block_table=self.qsa_block_table[:num_seqs],
+            page_index_scale=self._qsa_page_index_scale,
+        )
 
     def prepare(self) -> None:
         super().prepare()
