@@ -1419,7 +1419,7 @@ def test_cute_dsl_gvr_topk_decode_ext_list(mode, tie_aware_check):
               claim into the admission band -> the line-cut copy must
               re-measure and demote (exactness regression).
     """
-    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import (
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import (
         LIST_CAP_C,
         LIST_PARK_LINE,
         LIST_SEG_A,
@@ -1546,7 +1546,10 @@ def _emulate_emission(logits, n_eff, st, tier, top_k):
     """Host-side stand-in for the indexer epilogue: fill the packed-row
     counts (and the candidate list on the list tier) against the CURRENT
     seed lines, exactly as the production emitter would."""
-    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import LIST_CAP_C, LIST_SEG_A
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+        LIST_CAP_C,
+        LIST_SEG_A,
+    )
 
     batch, N = logits.shape
     dev = logits.device
@@ -1589,7 +1592,7 @@ def test_cute_dsl_gvr_topk_decode_ext_closed_loop(tier_shape, tie_aware_check):
     width, so line placement must come from the fitted slope; every step
     must stay exact regardless of which internal path admission picks.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import GvrEmissionState
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import GvrEmissionState
 
     want_tier, batch, N = tier_shape
     top_k = 512

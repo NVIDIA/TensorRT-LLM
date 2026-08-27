@@ -32,13 +32,7 @@ from typing import Optional
 
 import torch
 
-from ...cute_dsl_kernels.blackwell.top_k.gvr_routing import (
-    LIST_EMIT_MAX_B,
-    LIST_EMIT_MIN_N,
-    TopkRoute,
-    pick_config,
-    plan_emission,
-)
+from .gvr_routing import LIST_EMIT_MAX_B, LIST_EMIT_MIN_N, TopkRoute, pick_config, plan_emission
 
 # Bucketed candidate-list geometry: two tight segments of LIST_SEG_A
 # entries plus a LIST_CAP_C-entry loose segment.

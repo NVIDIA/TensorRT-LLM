@@ -334,7 +334,10 @@ class TopK(nn.Module):
             gvr_prior_indices: Caller-owned previous-selection state;
                 defines the emission state's row capacity and device.
         """
-        from ..attention_backend.sparse.gvr_emission import LIST_EMIT_MIN_N, GvrEmissionState
+        from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+            LIST_EMIT_MIN_N,
+            GvrEmissionState,
+        )
 
         if self._gvr_emission_state is None:
             self._gvr_emission_state = GvrEmissionState(
