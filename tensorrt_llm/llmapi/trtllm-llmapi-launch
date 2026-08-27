@@ -8,7 +8,7 @@ task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 
-flashinfer_workspace_lock_fd=200
+flashinfer_workspace_lock_held=0
 
 log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
 log_stderr "mpi_rank: $mpi_rank"
@@ -52,8 +52,9 @@ function use_unique_flashinfer_workspace {
 
 function try_lock_flashinfer_workspace {
     # flock(2) is attached to the inherited open file description, so the lock
-    # remains held by this launcher after the Python helper exits.
-    python3 - "$flashinfer_workspace_lock_fd" <<'PY'
+    # remains held by this launcher after the Python helper exits. Disable site
+    # initialization so startup hooks cannot import FlashInfer before setup.
+    python3 -S - 200 <<'PY'
 import sys
 
 try:
@@ -71,6 +72,14 @@ PY
 function configure_flashinfer_workspace {
     if [ -n "$FLASHINFER_WORKSPACE_BASE" ] || [ "$tllm_mpi_size" -le 1 ] || \
         [ "${TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS:-1}" = "0" ]; then
+        return
+    fi
+
+    # Do not overwrite a descriptor inherited from the launcher caller. A
+    # process-unique workspace still provides safe isolation in this rare case.
+    if { true >&200; } 2>/dev/null; then
+        log_stderr "File descriptor 200 is already open; persistent FlashInfer JIT workspace isolation is unavailable"
+        use_unique_flashinfer_workspace
         return
     fi
 
@@ -92,7 +101,7 @@ function configure_flashinfer_workspace {
     local lock_status
     while true; do
         workspace="$workspace_root/rank-$workspace_slot"
-        if ! mkdir -p "$workspace" || ! exec 200>"$workspace/.lock"; then
+        if ! mkdir -p "$workspace" || ! exec 200>>"$workspace/.lock"; then
             log_stderr "Failed to prepare the persistent FlashInfer JIT workspace: $workspace"
             exec 200>&-
             use_unique_flashinfer_workspace
@@ -100,6 +109,7 @@ function configure_flashinfer_workspace {
         fi
 
         if try_lock_flashinfer_workspace; then
+            flashinfer_workspace_lock_held=1
             export FLASHINFER_WORKSPACE_BASE="$workspace"
             set_shared_flashinfer_cubin_dir
             log_stderr "FlashInfer JIT workspace: $FLASHINFER_WORKSPACE_BASE"
@@ -115,6 +125,14 @@ function configure_flashinfer_workspace {
         fi
         workspace_slot=$((workspace_slot + tllm_mpi_size))
     done
+}
+
+function run_child_command {
+    if [ "$flashinfer_workspace_lock_held" -eq 1 ]; then
+        "$@" 200>&-
+    else
+        "$@"
+    fi
 }
 
 function maybe_export_free_tcp_addr_for_spawn_proxy_process {
@@ -181,12 +199,12 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         set +e
 
         # Execute the task with cleaned environment
-        "${task_with_command[@]}" 200>&-
+        run_child_command "${task_with_command[@]}"
         task_exit_code=$?
         log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
         # Stop the MPI Comm server
-        python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop 200>&-
+        run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
         mpi_exit_code=$?
         log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
 
@@ -207,7 +225,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
     log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
     log_stderr "Rank0 host: $HOSTNAME"
-    python3 -m tensorrt_llm.llmapi.mgmn_leader_node 200>&-
+    run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node
     mgmn_leader_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN leader node exit code: $mgmn_leader_node_exit_code"
 
@@ -228,7 +246,7 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
-    python3 -m tensorrt_llm.llmapi.mgmn_worker_node 200>&-
+    run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
 

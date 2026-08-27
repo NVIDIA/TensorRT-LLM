@@ -78,7 +78,7 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 def test_remote_mpi_session(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace"],
     tmp_path: Path,
-):
+) -> None:
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")

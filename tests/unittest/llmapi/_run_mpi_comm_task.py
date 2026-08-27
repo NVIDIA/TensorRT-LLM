@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.utils import print_colored
 
 
 def get_flashinfer_workspace() -> tuple[str | None, str | None]:
+    """Return the FlashInfer workspace and cubin cache configured for this rank."""
     return (os.environ.get("FLASHINFER_WORKSPACE_BASE"),
             os.environ.get("FLASHINFER_CUBIN_DIR"))
 
@@ -34,7 +35,10 @@ def get_flashinfer_workspace() -> tuple[str | None, str | None]:
               type=click.Choice(
                   ["submit", "submit_sync", "flashinfer_workspace"]),
               default="submit")
-def main(task_type: Literal["submit", "submit_sync", "flashinfer_workspace"]):
+def main(
+    task_type: Literal["submit", "submit_sync",
+                       "flashinfer_workspace"]) -> None:
+    """Run the requested remote MPI session test task."""
     tasks = [0]
     assert os.environ[
         'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"

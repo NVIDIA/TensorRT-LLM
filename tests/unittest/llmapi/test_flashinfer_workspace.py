@@ -16,6 +16,7 @@
 import fcntl
 import os
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,8 +109,10 @@ def test_worker_bootstrap_falls_back_when_isolation_fails(
     monkeypatch.setattr(Path, "mkdir", raise_read_only_error)
     _run_worker_bootstrap(monkeypatch, tmp_path)
 
-    assert _FLASHINFER_WORKSPACE_ENV not in os.environ
-    assert "falling back to FlashInfer's shared defaults" in capfd.readouterr().err
+    temporary_workspace = Path(os.environ[_FLASHINFER_WORKSPACE_ENV])
+    assert temporary_workspace.name.startswith("trtllm-flashinfer-rank-")
+    assert not temporary_workspace.exists()
+    assert "using temporary workspace" in capfd.readouterr().err
 
 
 def test_worker_bootstrap_falls_back_on_non_os_setup_error(
@@ -123,11 +126,32 @@ def test_worker_bootstrap_falls_back_on_non_os_setup_error(
     monkeypatch.setattr(Path, "expanduser", raise_home_error)
     _run_worker_bootstrap(monkeypatch, tmp_path)
 
-    assert _FLASHINFER_WORKSPACE_ENV not in os.environ
+    temporary_workspace = Path(os.environ[_FLASHINFER_WORKSPACE_ENV])
+    rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
+    assert temporary_workspace.name.startswith(f"trtllm-flashinfer-rank-{rank}-")
+    assert not temporary_workspace.exists()
     error = capfd.readouterr().err
-    assert "rank unknown" in error
+    assert f"rank {rank}" in error
     assert "home directory unavailable" in error
-    assert "falling back to FlashInfer's shared defaults" in error
+    assert "using temporary workspace" in error
+
+
+def test_worker_bootstrap_fails_when_no_isolated_workspace_is_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+
+    def raise_home_error(_path: Path) -> Path:
+        raise RuntimeError("home directory unavailable")
+
+    def raise_temporary_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("temporary directory unavailable")
+
+    monkeypatch.setattr(Path, "expanduser", raise_home_error)
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", raise_temporary_error)
+
+    with pytest.raises(RuntimeError, match="could not create an isolated FlashInfer workspace"):
+        _run_worker_bootstrap(monkeypatch, tmp_path)
 
 
 def test_worker_bootstrap_warns_when_unlock_fails(
@@ -151,11 +175,11 @@ def test_worker_bootstrap_warns_when_unlock_fails(
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
+        (1, {}, None),
         (1, {_FLASHINFER_ISOLATION_ENV: "1"}, None),
-        (4, {}, None),
         (
             4,
-            {_FLASHINFER_ISOLATION_ENV: "1"},
+            {},
             [
                 "-c",
                 mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
@@ -166,7 +190,6 @@ def test_worker_bootstrap_warns_when_unlock_fails(
         (
             4,
             {
-                _FLASHINFER_ISOLATION_ENV: "1",
                 _FLASHINFER_WORKSPACE_ENV: "/explicit",
             },
             None,
@@ -210,7 +233,7 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
-    monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "1")
+    monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
     monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
     workspace_root = tmp_path / "workspaces"
     monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(workspace_root))
@@ -231,7 +254,7 @@ def test_mpi_pool_propagates_explicit_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     explicit = str(tmp_path / "explicit")
-    monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "1")
+    monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
     monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, explicit)
     session = mpi_session.MpiPoolSession(n_workers=2)
     try:
