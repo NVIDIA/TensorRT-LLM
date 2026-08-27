@@ -22,11 +22,12 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
-from fla.modules import FusedRMSNormGated, ShortConvolution
+from fla.modules import ShortConvolution
 from torch import nn
 
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
+from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ..multi_stream_utils import maybe_execute_in_parallel
 from ._kda_kernels import KDAKernelDispatch
@@ -57,20 +58,6 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
         return tensor.to(dtype=dtype)
 
     module._apply(_cast)
-
-
-class _MetaSafeFusedRMSNormGated(FusedRMSNormGated):
-    """FLA gated RMSNorm whose initialization supports ``MetaInitMode``.
-
-    ``FusedRMSNormGated.reset_parameters`` uses ``nn.init.ones_`` (a plain
-    ``fill_``), which ``MetaInitMode`` rejects. ``uniform_(1, 1)`` produces
-    the same values and is on the allowed random-initialization path.
-    """
-
-    def reset_parameters(self) -> None:
-        if self.elementwise_affine:
-            with torch.no_grad():
-                self.weight.uniform_(1.0, 1.0)
 
 
 def _kda_split_conv_sections(
@@ -170,9 +157,9 @@ class KimiKDALinearAttention(nn.Module):
         else:
             self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
             self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-        self.o_norm = _MetaSafeFusedRMSNormGated(
-            self.head_dim, eps=self.rms_norm_eps, activation="sigmoid"
-        )
+        self.o_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+        if not self.o_norm.weight.is_meta:
+            nn.init.ones_(self.o_norm.weight)
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
         # Installed together by the FP8 weight loader as the fused
         # [q | k | v | g] projection and its output-section metadata.
@@ -1125,15 +1112,18 @@ class KimiKDALinearAttention(nn.Module):
     def _output_gate_and_proj(
         self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        from einops import rearrange
-
         if onorm_g is not None:
             g_out = onorm_g
         elif self.use_full_rank_gate:
             g_out = self.g_proj(x)
         else:
             g_out = self.g_b_proj(self.g_a_proj(x))
-        g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
-        o = self.o_norm(o, g_out)
-        o = rearrange(o, "b t h d -> (b t) (h d)")
-        return self.o_proj(o)
+        g_out = g_out.reshape(-1, self.num_heads, self.head_dim)
+        o = rms_norm_gated_token_major(
+            o.reshape(-1, self.head_dim),
+            g_out,
+            self.o_norm.weight,
+            self.o_norm.eps,
+            gate_activation="sigmoid",
+        )
+        return self.o_proj(o.reshape(-1, self.proj_size))
