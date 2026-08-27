@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2091,
-    "total_files": 222
+    "total_violations": 2096,
+    "total_files": 224
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -154,6 +154,12 @@
     "D202": 1,
     "D212": 1,
     "E402": 20
+  },
+  "tensorrt_llm/_torch/attention_backend/sparse/kernel.py": {
+    "E731": 3
+  },
+  "tensorrt_llm/_torch/attention_backend/sparse/rocket.py": {
+    "E712": 2
   },
   "tensorrt_llm/_torch/attention_backend/trtllm.py": {
     "E712": 1
