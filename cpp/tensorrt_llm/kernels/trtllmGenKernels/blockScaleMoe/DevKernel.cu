@@ -274,6 +274,17 @@ constexpr int kDsActWarpsPerCta = 4;
 constexpr int kDsActPermutedNumThreadsPerCta = kDsActWarpSize * kDsActWarpsPerCta;
 constexpr float kDsActAmaxEpsilon = 1.0e-10F;
 
+// The 640-wide expert projection used by the target high-throughput workload
+// has five 128-element scale blocks. Assign one 16-thread subgroup to each
+// block so a CTA consumes a complete permuted row without the generic kernel's
+// per-task 64-bit divide/mod. Each lane moves eight adjacent FP8 elements;
+// five subgroups require 80 threads (three physical warps).
+constexpr int kDsAct640OutputDim = 640;
+constexpr int kDsAct640ThreadsPerGroup = 16;
+constexpr int kDsAct640EltsPerThread = kDsActEltsPerSf / kDsAct640ThreadsPerGroup;
+constexpr int kDsAct640GroupsPerCta = kDsAct640OutputDim / kDsActEltsPerSf;
+constexpr int kDsAct640NumThreadsPerCta = kDsAct640ThreadsPerGroup * kDsAct640GroupsPerCta;
+
 constexpr bool shouldUsePermutedActivation(int innerDim, int numTokens, int topK, int numExperts, int tileTokensDim)
 {
     int const outputDim = innerDim / 2;
@@ -377,6 +388,89 @@ __global__ void activationDeepSeekPermutedKernel(KernelParams params)
             outElts[i] = static_cast<Type>(out[i] / scaleOut);
         }
         *reinterpret_cast<PackedIo*>(params.outPtr + static_cast<int64_t>(permutedIdx) * outputDim + hiddenBase)
+            = packedOut;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void activationDeepSeekPermuted640Kernel(KernelParams params)
+{
+    using Type = typename KernelParams::Type;
+    using PackedIo = uint64_t; // kDsAct640EltsPerThread x 8-bit elements
+
+    static_assert(kDsAct640EltsPerThread == 8, "PackedIo assumes 8 elements per thread");
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
+#endif
+
+    float constexpr kE4m3MaxVal{448.F};
+
+    int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+    int const laneInGroup = threadIdx.x % kDsAct640ThreadsPerGroup;
+    int const sfBlock = threadIdx.x / kDsAct640ThreadsPerGroup;
+    int const hiddenBase = sfBlock * kDsActEltsPerSf + laneInGroup * kDsAct640EltsPerThread;
+    int const lane = threadIdx.x % kDsActWarpSize;
+    uint32_t const subgroupMask = 0xFFFFU << ((lane / kDsAct640ThreadsPerGroup) * kDsAct640ThreadsPerGroup);
+
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
+
+    for (int permutedIdx = blockIdx.x; permutedIdx < totalNumPaddedTokens; permutedIdx += gridDim.x)
+    {
+        float const scale1 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock];
+        float const scale2 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * (sfBlock + kDsAct640GroupsPerCta)];
+
+        int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenBase;
+        PackedIo const packed1 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx);
+        PackedIo const packed2 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx + kDsAct640OutputDim);
+
+        Type const* elts1 = reinterpret_cast<Type const*>(&packed1);
+        Type const* elts2 = reinterpret_cast<Type const*>(&packed2);
+
+        float out[kDsAct640EltsPerThread];
+        float aMax = 0.F;
+#pragma unroll
+        for (int i = 0; i < kDsAct640EltsPerThread; ++i)
+        {
+            float x1 = scale1 * static_cast<float>(elts1[i]);
+            float x2 = scale2 * static_cast<float>(elts2[i]);
+            if (hasSwigluLimit)
+            {
+                x2 = fminf(x2, swigluLimit);
+                x1 = fmaxf(fminf(x1, swigluLimit), -swigluLimit);
+            }
+            out[i] = silu(x2) * x1;
+            aMax = fmaxf(aMax, fabsf(out[i]));
+        }
+
+#pragma unroll
+        for (int offset = kDsAct640ThreadsPerGroup / 2; offset > 0; offset >>= 1)
+        {
+            aMax = fmaxf(aMax, __shfl_xor_sync(subgroupMask, aMax, offset, kDsAct640ThreadsPerGroup));
+        }
+
+        float const scaleOut = fmaxf(aMax, kDsActAmaxEpsilon) / kE4m3MaxVal;
+        if (laneInGroup == 0)
+        {
+            params.outDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock] = scaleOut;
+        }
+
+        PackedIo packedOut;
+        Type* outElts = reinterpret_cast<Type*>(&packedOut);
+#pragma unroll
+        for (int i = 0; i < kDsAct640EltsPerThread; ++i)
+        {
+            outElts[i] = static_cast<Type>(out[i] / scaleOut);
+        }
+        *reinterpret_cast<PackedIo*>(
+            params.outPtr + static_cast<int64_t>(permutedIdx) * kDsAct640OutputDim + hiddenBase)
             = packedOut;
     }
 }
@@ -723,17 +817,29 @@ void run(Data const& data, void* stream)
         // expert's real rows do not even fill the tile that must be swept for it.
         if (shouldUsePermutedActivation(data.innerDim, data.numTokens, data.topK, data.numExperts, data.tileTokensDim))
         {
-            int64_t const maxTasks = static_cast<int64_t>(data.numTokens) * data.topK * (outputDim / kDsActEltsPerSf);
-            int64_t const ctasForAllTasks = (maxTasks + kDsActWarpsPerCta - 1) / kDsActWarpsPerCta;
+            int64_t const maxRows = static_cast<int64_t>(data.numTokens) * data.topK;
             // Persistent grid: totalNumPaddedTokens is a device-side value, so the
             // host can only bound it. Cap at a few waves and let the grid stride
             // absorb the difference rather than launching the (numTokens x topK)
             // worst case that the expanded-space kernel pays unconditionally.
-            int const numCtas = static_cast<int>(std::min<int64_t>(ctasForAllTasks, int64_t{numSms} * 32));
+            int64_t const ctasForAllTasks
+                = (maxRows * (outputDim / kDsActEltsPerSf) + kDsActWarpsPerCta - 1) / kDsActWarpsPerCta;
+            int64_t const ctasForAllRows = maxRows;
+            int64_t const maxCtas = int64_t{numSms} * 32;
+            int const numCtas = static_cast<int>(
+                std::min(outputDim == kDsAct640OutputDim ? ctasForAllRows : ctasForAllTasks, maxCtas));
             dim3 const permutedGrid(std::max(numCtas, 1), 1, 1);
 
-            LAUNCH_ACTIVATION(
-                data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
+            if (outputDim == kDsAct640OutputDim)
+            {
+                LAUNCH_ACTIVATION(
+                    data, activationDeepSeekPermuted640Kernel, 1, permutedGrid, kDsAct640NumThreadsPerCta, 0, stream);
+            }
+            else
+            {
+                LAUNCH_ACTIVATION(
+                    data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
+            }
         }
         else
         {
