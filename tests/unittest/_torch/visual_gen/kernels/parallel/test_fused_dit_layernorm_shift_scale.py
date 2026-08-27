@@ -168,7 +168,7 @@ def test_adaln_batch_modulation_correctness():
 
 
 def test_affine_fp32_weight_matches_eager():
-    """fp32 weight/bias passed directly to kernel match the fp32 reference."""
+    """Guards against regressing ln_weight/ln_bias back to a bf16 downcast."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     device = torch.device("cuda")
@@ -180,8 +180,22 @@ def test_affine_fp32_weight_matches_eager():
     ln_bias = torch.randn(D, device=device) * 0.1
 
     out = torch.ops.trtllm.fused_adaptive_layernorm(x, ln_weight, ln_bias, None, None, M, EPS)
-    ref = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
-    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
+    ref_fp32 = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
+    torch.testing.assert_close(out.float(), ref_fp32.float(), rtol=1e-2, atol=1e-2)
+
+    # out must land closer to ref_fp32 than to ref_bf16, or a downcast regression
+    # would go undetected by the assert_close above.
+    ref_bf16 = _ref_layernorm_affine(
+        x, ln_weight.to(torch.bfloat16), ln_bias.to(torch.bfloat16), EPS
+    )
+    dist_to_fp32 = (out.float() - ref_fp32.float()).norm()
+    dist_to_bf16_downcast = (out.float() - ref_bf16.float()).norm()
+    assert dist_to_fp32 < dist_to_bf16_downcast, (
+        f"kernel output should be closer to the fp32-weight reference "
+        f"({dist_to_fp32:.4e}) than to the bf16-downcast-weight reference "
+        f"({dist_to_bf16_downcast:.4e}); this likely means ln_weight/ln_bias "
+        f"are being downcast to bf16 before reaching the kernel"
+    )
 
 
 # ---------------------------------------------------------------------------
