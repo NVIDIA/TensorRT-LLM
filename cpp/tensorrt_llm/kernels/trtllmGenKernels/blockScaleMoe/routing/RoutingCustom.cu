@@ -1740,7 +1740,8 @@ void run(Data const& data, void* stream)
 
         if (useCoop)
         {
-            launchInitExpertCounts(data, numThreadsHist, stream);
+            // routingIndicesHistogramScoresKernel already cleared both expert-count
+            // regions before publishing TopK scores to this cooperative kernel.
             launchCoopKernel(lastKernelData, numBlocksCoop, numThreadsHist, stream);
         }
         else
