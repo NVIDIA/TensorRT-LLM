@@ -3865,13 +3865,15 @@ class PyTorchModelEngine(ModelEngine):
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-                return list(self.dist.tp_cp_allgather(num_tokens))
-            return list(self.dist.tp_allgather(num_tokens))
+                return list(
+                    self.dist.tp_cp_allgather(num_tokens, small_payload=True))
+            return list(self.dist.tp_allgather(num_tokens, small_payload=True))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(num_ctx_requests))
+            return list(
+                self.dist.tp_allgather(num_ctx_requests, small_payload=True))
         return None
 
     def _get_all_rank_num_tokens_and_spec_counts(
@@ -3884,13 +3886,15 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
             # two exchanges separate.
-            gathered = self.dist.tp_cp_allgather(list(spec_counts))
+            gathered = self.dist.tp_cp_allgather(list(spec_counts),
+                                                 small_payload=True)
             return (self._get_all_rank_num_tokens(attn_metadata),
                     [list(col) for col in zip(*gathered)])
         num_tokens = attn_metadata.num_tokens
         if self.mapping.has_cp_helix():
             num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts])
+        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts],
+                                             small_payload=True)
         cols = [list(col) for col in zip(*gathered)]
         return cols[0], cols[1:]
 
@@ -3914,7 +3918,7 @@ class PyTorchModelEngine(ModelEngine):
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather(local_flag)
+        all_flags = self.dist.tp_allgather(local_flag, small_payload=True)
         spec_metadata.group_all_greedy_sample = all(all_flags)
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
@@ -3979,7 +3983,8 @@ class PyTorchModelEngine(ModelEngine):
                                               and max(attn_all_rank_num_tokens)
                                               <= max_captured_num_tokens)
                 all_ranks_can_run_prefill_cuda_graph = list(
-                    self.dist.tp_allgather(can_run_prefill_cuda_graph))
+                    self.dist.tp_allgather(can_run_prefill_cuda_graph,
+                                           small_payload=True))
                 if all(all_ranks_can_run_prefill_cuda_graph):
                     padded_num_tokens = get_padded_prefill_tokens(
                         max(attn_all_rank_num_tokens))
