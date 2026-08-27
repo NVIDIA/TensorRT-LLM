@@ -1040,14 +1040,7 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=0,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=True,
-            all_gen_first=False,
-            is_idle=True,
-        )
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor.dist.allreduce.assert_not_called()
         executor.dist.tp_allreduce.assert_not_called()
