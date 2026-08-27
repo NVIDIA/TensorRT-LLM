@@ -29,8 +29,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-class HostMem;
-
 //! Describes one physical pool in the hot storage representation.
 struct PoolDesc
 {
@@ -127,20 +125,5 @@ public:
 
 //! Creates the lossless default codec that concatenates hot pools into one cold-page blob.
 [[nodiscard]] std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec();
-
-namespace detail
-{
-
-//! Returns whether the default codec needs HostMem spans for the batched-copy registration-boundary workaround.
-[[nodiscard]] bool needsHostMemRegistration(IKvCacheColdPageCodec const& codec) noexcept;
-
-//! Registers KVCM-owned pinned memory after needsHostMemRegistration() returns true.
-//!
-//! The codec keeps a non-owning pointer, so the HostMem object and its allocation must remain valid while codec work
-//! can access the span. Callers must register every HostMem span that can back a cold base pointer; otherwise copies
-//! within an unregistered span cannot be split at registration boundaries.
-void registerHostMem(IKvCacheColdPageCodec& codec, HostMem const* memory);
-
-} // namespace detail
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
