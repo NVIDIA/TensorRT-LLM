@@ -25,7 +25,12 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...custom_ops.cute_dsl_custom_ops import (
+    GroupedGemmInputsHelper,
+    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+    Sm100BlockScaledContiguousGroupedGemmRunner,
+    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
@@ -320,19 +325,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 tile_size = tactic
         if tile_size is None:
             return True
-
-        # Imported here rather than at module scope because these classes are
-        # defined inside cute_dsl_custom_ops' ``if IS_CUTLASS_DSL_AVAILABLE:``
-        # block: a module-scope import makes this file -- and therefore
-        # create_moe, modeling_utils and every model -- unimportable without the
-        # optional cutlass DSL. Reaching this line means a CuteDSL runner is
-        # already being autotuned, so the DSL is installed. Same pattern as
-        # attention_backend/fmha/cute_dsl_mla.py and sparse/dsa/metadata.py.
-        from ...custom_ops.cute_dsl_custom_ops import (
-            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-            Sm100BlockScaledContiguousGroupedGemmRunner,
-            Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 
         for runner, tactic in comb:
             if isinstance(
