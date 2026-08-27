@@ -33,6 +33,7 @@ from .mapping import PARALLEL_MODE_SYNTAX_HINT, _resolve_mapping_layout, is_name
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
+    _default_parallel_axis_values,
     _maybe_auto_enable_search_axes,
     _parse_analysis,
     _parse_search_axes,
@@ -85,6 +86,17 @@ def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
 
 
 def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int) -> Dict[str, Any]:
+    # A parallel-mode sweep can mix attention-DP and attention-TP layouts, so
+    # there is no single header-level token distribution. Candidate rows carry
+    # the resolved distribution; leave the shared workload metadata unset.
+    per_rank_num_tokens: Optional[List[List[int]]] = None
+    if not ctx.search.parallel_modes:
+        enable_dp = bool(_resolve_mapping_layout(ctx.base_config, world_size)[2])
+        per_rank_num_tokens = [
+            _per_rank_tokens(workload, world_size, enable_dp=enable_dp)
+            for workload in ctx.workloads
+        ]
+
     return {
         "benchmark": "bench_moe",
         "launcher": launcher,
@@ -94,13 +106,11 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
         "analysis": list(ctx.analysis) or ["summary"],
         "workloads": [
             w.to_dict(
-                per_rank_num_tokens=_per_rank_tokens(
-                    w,
-                    world_size,
-                    enable_dp=bool(_resolve_mapping_layout(ctx.base_config, world_size)[2]),
+                per_rank_num_tokens=(
+                    per_rank_num_tokens[index] if per_rank_num_tokens is not None else None
                 )
             )
-            for w in ctx.workloads
+            for index, w in enumerate(ctx.workloads)
         ],
         "base_config": ctx.base_config.to_dict(),
     }
@@ -664,13 +674,46 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
 
     explicit_sizes = args.moe_ep_size is not None or args.moe_tp_size is not None
 
-    # A hybrid (D|T)TP<k>EP<m> name already spells the grid out; combining it with
-    # explicit size flags would silently discard one of the two intents.
-    if explicit_sizes and parallel_mode not in ("DEP", "TEP", "DTP", "TTP", "CUSTOM"):
-        raise ValueError(
-            f"--parallel_mode={parallel_mode} already specifies moe_tp_size/moe_ep_size; "
-            "drop --moe_ep_size/--moe_tp_size, or use --parallel_mode CUSTOM with them."
+    search_axes = _parse_search_axes(args.search)
+    parallel_search_enabled = "parallel" in search_axes or "full" in search_axes
+    if parallel_search_enabled:
+        provided = set(getattr(args, "_cli_provided", set()))
+        config_parallel_modes = tuple(
+            (getattr(args, "_config_search_axes", {}) or {}).get("parallel_mode", ())
         )
+        if "parallel_mode" in provided:
+            effective_parallel_modes = parallel_list
+        elif config_parallel_modes:
+            effective_parallel_modes = config_parallel_modes
+        else:
+            effective_parallel_modes = _default_parallel_axis_values(
+                int(getattr(args, "world_size", 1) or 1)
+            )
+    else:
+        effective_parallel_modes = parallel_list
+
+    # A hybrid (D|T)TP<k>EP<m> name already spells the grid out; combining it with
+    # explicit size flags would silently discard one of the two intents. Explicit
+    # sizes also cannot describe more than one candidate in a parallel-mode sweep.
+    if explicit_sizes:
+        if len(effective_parallel_modes) != 1:
+            raise ValueError(
+                "--moe_ep_size/--moe_tp_size describe one CUSTOM layout and cannot be "
+                "combined with a parallel-mode sweep; drop the size flags or pass "
+                "--parallel_mode CUSTOM alone."
+            )
+        selected_mode = effective_parallel_modes[0]
+        if selected_mode not in ("DEP", "TEP", "DTP", "TTP", "CUSTOM"):
+            raise ValueError(
+                f"--parallel_mode={selected_mode} already specifies "
+                "moe_tp_size/moe_ep_size; drop --moe_ep_size/--moe_tp_size, or use "
+                "--parallel_mode CUSTOM with them."
+            )
+        if parallel_search_enabled and selected_mode != "CUSTOM":
+            raise ValueError(
+                "--moe_ep_size/--moe_tp_size require --parallel_mode CUSTOM when "
+                "parallel search is enabled; named layouts ignore explicit size flags."
+            )
 
     # parallel_mode CUSTOM if explicit EP/TP overrides are present.
     if explicit_sizes and parallel_mode in (

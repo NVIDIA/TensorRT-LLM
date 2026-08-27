@@ -368,7 +368,7 @@ parallel mapping checks, and forced-communication validity checks.
 | `backend` | Backends. If `--backend` is omitted, all backends are searched. | Find the fastest backend. |
 | `comm` | Forced communication methods: `NVLINK_ONE_SIDED`, `NVLINK_TWO_SIDED`, `DEEPEP`, `DEEPEPLOWLATENCY`, and `ALLGATHER`. `AUTO` is filtered out. | Compare concrete communication strategies. |
 | `backend comm` | Backend x forced-communication product; other axes use the base config. | Most common combined search. |
-| `parallel` | Parallel layouts: `DEP`, `TEP`, `DTP`, `TTP`, or a subset. Hybrid `(D\|T)TP<k>EP<m>` layouts must be listed explicitly on `--parallel_mode`. | Compare EP/TP layout effects. |
+| `parallel` | Parallel layouts: `DEP`, `TEP`, `DTP`, `TTP` plus the even-split hybrids for the current `world_size`, or a subset. Other `(D\|T)TP<k>EP<m>` grids must be listed explicitly on `--parallel_mode`. | Compare EP/TP layout effects. |
 | `full` | Backend, parallel layout, communication, and CUDA Graph on/off. | Full runtime sweep; can be large. |
 
 Passing more than one value to `--backend`, `--comm_method`, or
@@ -740,9 +740,9 @@ Notes:
   ranks is rejected with an explicit error.
 - Do not pass `--moe_ep_size` / `--moe_tp_size` alongside a hybrid mode; the two
   would describe the layout twice. Use `CUSTOM` if you want the flag form.
-- Hybrid names are **not** part of the default `--search parallel` expansion (a
-  bare `--search parallel` still expands only `DEP`, `TEP`, `DTP`, `TTP`) — list
-  them explicitly on `--parallel_mode` or in the JSON `search.parallel_mode`.
+- The even-split hybrids **are** part of the default `--search parallel`
+  expansion (see below). Any *other* grid must be listed explicitly on
+  `--parallel_mode` or in the JSON `search.parallel_mode`.
 - Any layout with `moe_tp_size != 1` cannot use alltoall communication;
   TensorRT-LLM routes it through `AllGatherReduceScatter`. Consequently the only
   legal *forced* `--comm_method` for a hybrid mode is `ALLGATHER`, and only with
@@ -755,10 +755,29 @@ Notes:
   `intermediate_size=2048` allows `k <= 16` and `3072` allows `k <= 24`;
   larger `k` is pruned as `skipped`.
 
-`CUSTOM` is not part of the default `--search parallel` expansion either. A bare
-`--search parallel` expands only `DEP`, `TEP`, `DTP`, and `TTP`. Use a hybrid
-name — or `CUSTOM` — when you need an EP/TP split that is not covered by the four
-presets.
+### Default `--search parallel` expansion
+
+A bare `--search parallel` expands to the four presets plus the hybrid grids
+that split the world as evenly as possible, so a sweep compares pure EP, pure
+MoE-TP and the balanced middle instead of only the extremes. When `world_size`
+is a perfect square the even split is unique; otherwise both neighbouring grids
+are offered (rounded down and rounded up on the MoE-TP axis). Both attention
+flavours are emitted for every grid, keeping the axis symmetric.
+
+| `world_size` | Added to the four presets | Total |
+|---|---|---|
+| 1, 2 | *(none — every split degenerates to a preset)* | 4 |
+| 4 | `DTP2EP2`, `TTP2EP2` | 6 |
+| 8 | `DTP2EP4`, `TTP2EP4`, `DTP4EP2`, `TTP4EP2` | 8 |
+| 16 | `DTP4EP4`, `TTP4EP4` | 6 |
+| 32 | `DTP4EP8`, `TTP4EP8`, `DTP8EP4`, `TTP8EP4` | 8 |
+| 64 | `DTP8EP8`, `TTP8EP8` | 6 |
+
+Passing `--parallel_mode` explicitly (or `search.parallel_mode` in the JSON
+config) replaces this set entirely.
+
+`CUSTOM` is never part of the default expansion. Use a hybrid name — or
+`CUSTOM` — when you need an EP/TP split outside the defaults.
 
 Users provide a custom layout through these flags:
 

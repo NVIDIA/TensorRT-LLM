@@ -27,11 +27,12 @@ import pytest
 
 from .mapping import (
     _resolve_mapping_layout,
+    default_hybrid_parallel_modes,
     is_named_parallel_mode,
     parallel_mode_enable_attention_dp,
     resolve_named_layout,
 )
-from .search import _comm_axis_for_parallel_mode
+from .search import _comm_axis_for_parallel_mode, _default_parallel_axis_values
 from .specs import ConfigSpec
 
 
@@ -154,3 +155,50 @@ def test_comm_axis_preserved_with_attention_dp(mode):
 
 def test_comm_axis_passthrough_for_custom():
     assert _comm_axis_for_parallel_mode("CUSTOM", _COMM) == _COMM
+
+
+# --------------------------------------------------------------------------
+# Default --search parallel expansion.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "world_size,expected",
+    [
+        # No non-degenerate split: the historical four presets, unchanged.
+        (1, ()),
+        (2, ()),
+        # Perfect squares: one even split, so one grid x two attention flavours.
+        (4, ("DTP2EP2", "TTP2EP2")),
+        (16, ("DTP4EP4", "TTP4EP4")),
+        (64, ("DTP8EP8", "TTP8EP8")),
+        # Not a perfect square: both neighbouring grids are offered.
+        (8, ("DTP2EP4", "TTP2EP4", "DTP4EP2", "TTP4EP2")),
+        (32, ("DTP4EP8", "TTP4EP8", "DTP8EP4", "TTP8EP4")),
+        # Non-power-of-two world sizes still resolve.
+        (6, ("DTP2EP3", "TTP2EP3", "DTP3EP2", "TTP3EP2")),
+    ],
+)
+def test_default_hybrid_parallel_modes(world_size, expected):
+    assert default_hybrid_parallel_modes(world_size) == expected
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 6, 8, 16, 32, 64])
+def test_default_axis_starts_with_the_four_presets(world_size):
+    """Adding hybrids must not disturb the historical prefix or its order."""
+    assert _default_parallel_axis_values(world_size)[:4] == ("DEP", "TEP", "DTP", "TTP")
+
+
+@pytest.mark.parametrize("world_size", [4, 6, 8, 16, 32, 64])
+def test_default_axis_hybrids_are_resolvable(world_size):
+    """Every generated name must resolve to a legal grid for its world size."""
+    for mode in default_hybrid_parallel_modes(world_size):
+        moe_ep, moe_tp, _enable_dp = _resolve_mapping_layout(_config(mode), world_size)
+        assert moe_ep * moe_tp == world_size
+        assert moe_ep > 1 and moe_tp > 1  # never degenerates to a preset
+
+
+def test_default_axis_has_no_duplicates():
+    for world_size in (1, 2, 4, 6, 8, 16, 32, 64):
+        values = _default_parallel_axis_values(world_size)
+        assert len(values) == len(set(values))

@@ -35,7 +35,7 @@ the worker and CLI layers.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers.configuration_utils import PretrainedConfig
@@ -127,6 +127,38 @@ def parallel_mode_enable_attention_dp(mode: str) -> Optional[bool]:
 def is_named_parallel_mode(mode: str) -> bool:
     """Whether ``mode`` is a self-describing layout name (i.e. not ``CUSTOM``)."""
     return parallel_mode_enable_attention_dp(mode) is not None
+
+
+def default_hybrid_parallel_modes(world_size: int) -> Tuple[str, ...]:
+    """Hybrid mode names that split ``world_size`` as evenly as possible.
+
+    When ``world_size`` is a perfect square there is a single even split
+    (``k == m == sqrt(world_size)``). Otherwise the split is ambiguous, so both
+    neighbours are offered: the grid rounded down on the MoE-TP axis
+    (``k <= sqrt(world_size)``, favouring EP) and the one rounded up
+    (``k >= sqrt(world_size)``, favouring TP). Both attention flavours are
+    emitted for every grid, keeping the axis symmetric with the four presets.
+
+    Grids that degenerate to an existing preset (``k == 1`` is DEP/TEP,
+    ``m == 1`` is DTP/TTP) are dropped, so ``world_size < 4`` adds nothing.
+    """
+    size = int(world_size)
+    if size < 4:
+        return ()
+    divisors = [d for d in range(1, size + 1) if size % d == 0]
+    grids: List[Tuple[int, int]] = []
+    for moe_tp in (
+        max((d for d in divisors if d * d <= size), default=None),
+        min((d for d in divisors if d * d >= size), default=None),
+    ):
+        if moe_tp is None:
+            continue
+        moe_ep = size // moe_tp
+        if moe_tp == 1 or moe_ep == 1 or (moe_tp, moe_ep) in grids:
+            continue
+        grids.append((moe_tp, moe_ep))
+    grids.sort()
+    return tuple(f"{attn}TP{tp}EP{ep}" for tp, ep in grids for attn in ("D", "T"))
 
 
 def _resolve_mapping_layout(config: ConfigSpec, world_size: int) -> Tuple[int, int, bool]:

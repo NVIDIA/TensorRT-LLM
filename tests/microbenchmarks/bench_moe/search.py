@@ -36,7 +36,11 @@ from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, get_backend_class
-from .mapping import _resolve_mapping_layout, parallel_mode_enable_attention_dp
+from .mapping import (
+    _resolve_mapping_layout,
+    default_hybrid_parallel_modes,
+    parallel_mode_enable_attention_dp,
+)
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"})
@@ -454,7 +458,18 @@ def _parse_search_axes(value: Any) -> Tuple[str, ...]:
     return tuple(out)
 
 
-_DEFAULT_PARALLEL_AXIS_VALUES: Tuple[str, ...] = ("DEP", "TEP", "DTP", "TTP")
+_BASE_PARALLEL_AXIS_VALUES: Tuple[str, ...] = ("DEP", "TEP", "DTP", "TTP")
+
+
+def _default_parallel_axis_values(world_size: int) -> Tuple[str, ...]:
+    """Default ``--search parallel`` expansion for a world size.
+
+    The four presets plus the even-split hybrid grids, so a bare
+    ``--search parallel`` compares pure EP, pure MoE-TP and the balanced middle
+    instead of only the extremes. World sizes with no non-degenerate split
+    (``< 4``) keep the historical four-value expansion.
+    """
+    return _BASE_PARALLEL_AXIS_VALUES + default_hybrid_parallel_modes(world_size)
 
 
 def _axis_values_from_args(
@@ -525,7 +540,7 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
             cli_dest="parallel_mode",
             cli_flag_name="--parallel_mode",
             config_key="parallel_mode",
-            full_set=_DEFAULT_PARALLEL_AXIS_VALUES,
+            full_set=_default_parallel_axis_values(int(getattr(args, "world_size", 1) or 1)),
         )
     if "comm" in enabled_axes:
         comm_methods = _axis_values_from_args(
