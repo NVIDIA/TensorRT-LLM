@@ -73,10 +73,6 @@ if [ $base -eq 1 ]; then
     # Clean up the pip constraint file from the base NGC PyTorch image.
     [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
 
-    # DLFW defaults to Open MPI 5; switch to the co-packaged OMPI 4 before
-    # anything (mpi4py, torch consumers) binds against /usr/local/mpi.
-    bash $SCRIPT_DIR/switch_to_ompi4.sh
-
     echo "Using Python version: $PYTHON_VERSION"
     GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_base.sh $PYTHON_VERSION
 fi
