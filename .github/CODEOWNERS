@@ -16,6 +16,7 @@
 #   Disaggregated Serving    			  @NVIDIA/trt-llm-disagg-devs
 #   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
 #   MoE                      			  @NVIDIA/trt-llm-moe-devs
+#   Top-K                     			  @NVIDIA/trt-llm-topk-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
 #   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
@@ -246,10 +247,11 @@
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
-# Disagg tests: co-own with the owning team so disagg-devs review disagg-test changes.
-/tests/integration/defs/accuracy/*disagg* @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
-/tests/integration/defs/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
-/tests/integration/defs/stress_test/disagg_cancel @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
+# Disagg tests: sole-owned. Owners on one line are OR, so co-owning made the disagg
+# review advisory -- any co-owner approval satisfied the gate on its own.
+/tests/integration/defs/accuracy/*disagg* @NVIDIA/trt-llm-disagg-devs
+/tests/integration/defs/disaggregated @NVIDIA/trt-llm-disagg-devs
+/tests/integration/defs/stress_test/disagg_cancel @NVIDIA/trt-llm-disagg-devs
 /tests/scripts/perf-sanity/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
 /tests/scripts/perf/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/_torch/executor/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
@@ -378,6 +380,13 @@
 /tests/unittest/_torch/thop/parallel/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
+
+# ===== TOP-K =====
+/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k @NVIDIA/trt-llm-topk-devs
+/tensorrt_llm/_torch/modules/top_k.py @NVIDIA/trt-llm-topk-devs
+/tests/scripts/cute_dsl_kernels/top_k @NVIDIA/trt-llm-topk-devs
+/tests/unittest/_torch/attention/sparse/*topk* @NVIDIA/trt-llm-topk-devs
+/tests/unittest/_torch/modules/test_top_k.py @NVIDIA/trt-llm-topk-devs
 
 # ===== VisualGen / AIGV =====
 /cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-torch-visual-gen-devs
