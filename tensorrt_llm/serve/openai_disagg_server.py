@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import json
 import signal
 import socket
 import traceback
@@ -26,6 +27,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
@@ -33,6 +35,13 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
+                                                  AnthropicResponseError,
+                                                  anthropic_error_response,
+                                                  convert_anthropic_request,
+                                                  convert_chat_response,
+                                                  reframe_openai_stream)
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
@@ -43,8 +52,9 @@ from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -229,6 +239,9 @@ class OpenAIDisaggServer:
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request: Request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
+            if request.url.path == "/v1/messages":
+                return anthropic_error_response(str(exc),
+                                                "invalid_request_error", 400)
             self._val_err_n += 1
             if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
                 try:
@@ -263,6 +276,7 @@ class OpenAIDisaggServer:
         # so /health and /cluster_info hook straight to self._coordinator.
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -347,10 +361,68 @@ class OpenAIDisaggServer:
                 self._handle_exception(e)
         return wrapper
 
+    async def anthropic_messages(self, request: AnthropicMessagesRequest,
+                                 raw_request: Request) -> Response:
+        """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        try:
+            chat_request = convert_anthropic_request(request)
+        except (AnthropicRequestError, ValidationError) as e:
+            return anthropic_error_response(str(e), "invalid_request_error",
+                                            400)
+
+        try:
+            openai_response = await self._wrap_entry_point(
+                self._service.openai_chat_completion)(chat_request, raw_request)
+        except HTTPException as e:
+            error_type = ("invalid_request_error"
+                          if 400 <= e.status_code < 500 else "api_error")
+            return anthropic_error_response(str(e.detail), error_type,
+                                            e.status_code)
+
+        if isinstance(openai_response, StreamingResponse):
+            return StreamingResponse(
+                content=reframe_openai_stream(openai_response.body_iterator,
+                                              model=request.model),
+                media_type="text/event-stream",
+            )
+
+        status = getattr(openai_response, "status_code", 500)
+        if status != 200:
+            try:
+                payload = json.loads(openai_response.body)
+                message = (payload.get("message") or payload.get("detail")
+                           or payload.get("error") or json.dumps(payload))
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                message = "Internal server error"
+            error_type = ("invalid_request_error"
+                          if 400 <= status < 500 else "api_error")
+            return anthropic_error_response(str(message), error_type, status)
+
+        try:
+            chat_response = ChatCompletionResponse(
+                **json.loads(openai_response.body))
+            anthropic_response = convert_chat_response(chat_response)
+        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
+            logger.error(
+                "Invalid response from OpenAI chat pipeline:\n"
+                f"{traceback.format_exc()}")
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+        return JSONResponse(content=anthropic_response.model_dump(
+            exclude_none=True))
+
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
+        elif isinstance(exception, aiohttp.ClientResponseError):
+            self._perf_metrics_collector.http_exceptions.inc()
+            status = exception.status or 502
+            logger.error(
+                f"Upstream HTTP error {status} {exception.message}: ",
+                traceback.format_exc())
+            raise HTTPException(status_code=status,
+                                detail=exception.message) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
