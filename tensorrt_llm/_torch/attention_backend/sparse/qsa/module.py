@@ -348,6 +348,8 @@ class QSASparseHooks(AttentionSparseHooks):
                 request_indices=req_idx[packed_slice],
                 metadata=attn_metadata,
                 softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
+                query_positions=logical[packed_slice],
+                compress_ratio=params.compress_ratio,
             )
         return output.reshape(num_tokens, -1)
 

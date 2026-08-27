@@ -599,6 +599,8 @@ def qsa_sparse_gqa(
     request_indices: torch.Tensor | None = None,
     metadata: "QSAAttentionMetadata",
     softmax_scale: float,
+    query_positions: torch.Tensor | None = None,
+    compress_ratio: int | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA over V2 paged K/V, using Triton on CUDA by default."""
     if request_indices is None:
@@ -628,6 +630,8 @@ def qsa_sparse_gqa(
             request_indices=request_indices.contiguous(),
             tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
             softmax_scale=softmax_scale,
+            query_positions=query_positions,
+            compress_ratio=compress_ratio,
         )
     logger.info_once(
         "QSA sparse GQA reference path is active",

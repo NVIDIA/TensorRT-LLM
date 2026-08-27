@@ -1085,6 +1085,7 @@ def _qsa_paged_sparse_gqa_kernel(
     block_table,
     selected_tokens,
     request_indices,
+    query_positions,
     output,
     softmax_scale,
     q_stride_row: tl.constexpr,
@@ -1105,16 +1106,24 @@ def _qsa_paged_sparse_gqa_kernel(
     output_stride_row: tl.constexpr,
     output_stride_head: tl.constexpr,
     output_stride_dim: tl.constexpr,
+    NUM_CACHE_PAGES: tl.constexpr,
+    NUM_REQUESTS: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     TOKENS_PER_BLOCK: tl.constexpr,
     TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    ONLY_VISIBLE_TOKENS: tl.constexpr,
 ):
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     request = tl.load(request_indices + row).to(tl.int64)
+    valid_request = (request >= 0) & (request < NUM_REQUESTS)
+    safe_request = tl.minimum(tl.maximum(request, 0), NUM_REQUESTS - 1)
 
     head_offsets = tl.arange(0, BLOCK_M)
     dim_offsets = tl.arange(0, HEAD_DIM)
@@ -1127,35 +1136,47 @@ def _qsa_paged_sparse_gqa_kernel(
         mask=(head_offsets < GROUP_SIZE)[:, None],
         other=0.0,
     )
-    query_values = (query_values * softmax_scale * 1.4426950408889634).to(query_values.dtype)
 
     running_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
     running_sum = tl.zeros([BLOCK_M], tl.float32)
     accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
     token_offsets = tl.arange(0, BLOCK_N)
+    valid_tiles = tl.cdiv(TOPK, BLOCK_N)
+    if ONLY_VISIBLE_TOKENS:
+        visible_tokens = tl.load(query_positions + row) + 1
+        selected_blocks = tl.minimum(visible_tokens // COMPRESS_RATIO, BLOCK_TOPK)
+        valid_tokens = selected_blocks * COMPRESS_RATIO + visible_tokens % COMPRESS_RATIO
+        valid_tiles = tl.cdiv(tl.minimum(valid_tokens, TOPK), BLOCK_N)
 
-    for start in range(0, TOPK, BLOCK_N):
-        selected_columns = start + token_offsets
+    for tile in tl.range(0, valid_tiles, num_stages=2):
+        selected_columns = tile * BLOCK_N + token_offsets
         logical_tokens = tl.load(
             selected_tokens + row * selected_stride_row + selected_columns * selected_stride_token,
             mask=selected_columns < TOPK,
             other=-1,
         )
-        valid = (selected_columns < TOPK) & (logical_tokens >= 0)
-        safe_tokens = tl.where(valid, logical_tokens, 0)
+        safe_tokens = tl.maximum(logical_tokens, 0)
         logical_pages = safe_tokens // TOKENS_PER_BLOCK
         token_in_page = safe_tokens % TOKENS_PER_BLOCK
+        valid = (
+            valid_request
+            & (selected_columns < TOPK)
+            & (logical_tokens >= 0)
+            & (logical_pages < PAGE_TABLE_WIDTH)
+        )
         physical_pages = tl.load(
             block_table
-            + request * block_table_stride_request
-            + logical_pages * block_table_stride_page,
+            + safe_request * block_table_stride_request
+            + tl.minimum(logical_pages, PAGE_TABLE_WIDTH - 1) * block_table_stride_page,
             mask=valid,
-            other=0,
+            other=-1,
         ).to(tl.int64)
+        valid &= (physical_pages >= 0) & (physical_pages < NUM_CACHE_PAGES)
+        safe_pages = tl.maximum(physical_pages, 0)
 
         keys = tl.load(
             k_cache
-            + physical_pages[None, :] * k_stride_page
+            + safe_pages[None, :] * k_stride_page
             + kv_head * k_stride_head
             + token_in_page[None, :] * k_stride_token
             + dim_offsets[:, None] * k_stride_dim,
@@ -1164,26 +1185,24 @@ def _qsa_paged_sparse_gqa_kernel(
         )
         values = tl.load(
             v_cache
-            + physical_pages[:, None] * v_stride_page
+            + safe_pages[:, None] * v_stride_page
             + kv_head * v_stride_head
             + token_in_page[:, None] * v_stride_token
             + dim_offsets[None, :] * v_stride_dim,
             mask=valid[:, None],
             other=0.0,
         )
-        # TRT-LLM uses unit-scale FP8 KV cache in the PyTorch backend.  Cast
-        # loaded cache values to the query compute type because Triton does
-        # not permit mixed BF16-by-FP8 dot operands.
         keys = keys.to(query_values.dtype)
         values = values.to(query_values.dtype)
-        scores = tl.where(
-            valid[None, :],
-            tl.dot(query_values, keys),
-            -float("inf"),
-        )
+        scores = tl.dot(query_values, keys) * softmax_scale * 1.4426950408889634
+        scores = tl.where(valid[None, :], scores, -float("inf"))
         next_max = tl.maximum(running_max, tl.max(scores, axis=1))
         correction = tl.math.exp2(running_max - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        probabilities = tl.where(
+            valid[None, :],
+            tl.math.exp2(scores - next_max[:, None]),
+            0.0,
+        )
         accumulator = tl.dot(
             probabilities.to(values.dtype),
             values,
@@ -1194,7 +1213,7 @@ def _qsa_paged_sparse_gqa_kernel(
 
     normalized = tl.where(
         running_sum[:, None] > 0,
-        accumulator / running_sum[:, None],
+        accumulator / tl.maximum(running_sum[:, None], 1.0e-20),
         0.0,
     )
     tl.store(
@@ -1440,6 +1459,8 @@ def triton_qsa_paged_sparse_gqa(
     request_indices: torch.Tensor,
     tokens_per_block: int,
     softmax_scale: float,
+    query_positions: torch.Tensor | None = None,
+    compress_ratio: int | None = None,
 ) -> torch.Tensor:
     """Run fused sparse GQA directly over the HND paged K/V cache."""
     rows, num_q_heads, head_dim = q.shape
@@ -1450,8 +1471,68 @@ def triton_qsa_paged_sparse_gqa(
     if rows == 0:
         return output
 
+    if (query_positions is None) != (compress_ratio is None):
+        raise ValueError("QSA causal-prefix bounds require positions and compression ratio")
+    if query_positions is not None:
+        if query_positions.shape != (rows,):
+            raise ValueError("QSA query positions must match sparse-attention rows")
+        if compress_ratio is None or compress_ratio <= 0:
+            raise ValueError("QSA compression ratio must be positive")
+
+    base_programs = rows * num_kv_heads
+    if query_positions is not None and base_programs > 512:
+        final_topk = selected_tokens.shape[1]
+        token_topk = final_topk - compress_ratio + 1
+        if token_topk <= 0 or token_topk % compress_ratio:
+            raise ValueError("QSA selected-token width is incompatible with its compression ratio")
+        block_topk = token_topk // compress_ratio
+        block_n = 64
+        _qsa_paged_sparse_gqa_kernel[(rows, num_kv_heads)](
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            selected_tokens,
+            request_indices,
+            query_positions.contiguous(),
+            output,
+            softmax_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            k_cache.stride(3),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            v_cache.stride(3),
+            block_table.stride(0),
+            block_table.stride(1),
+            selected_tokens.stride(0),
+            selected_tokens.stride(1),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            NUM_CACHE_PAGES=k_cache.shape[0],
+            NUM_REQUESTS=block_table.shape[0],
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            GROUP_SIZE=group_size,
+            TOKENS_PER_BLOCK=tokens_per_block,
+            TOPK=final_topk,
+            BLOCK_TOPK=block_topk,
+            COMPRESS_RATIO=compress_ratio,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            ONLY_VISIBLE_TOKENS=True,
+            num_warps=2,
+            num_stages=2,
+        )
+        return output
+
     if os.environ.get("TRTLLM_QSA_SPARSE_SPLITK", "1") != "0":
-        base_programs = rows * num_kv_heads
         if base_programs <= 4:
             block_n, target_splits, num_warps = 16, 64, 4
         elif base_programs < 32:
@@ -1557,6 +1638,7 @@ def triton_qsa_paged_sparse_gqa(
         block_table,
         selected_tokens,
         request_indices,
+        request_indices,
         output,
         softmax_scale,
         q.stride(0),
@@ -1577,12 +1659,18 @@ def triton_qsa_paged_sparse_gqa(
         output.stride(0),
         output.stride(1),
         output.stride(2),
+        NUM_CACHE_PAGES=k_cache.shape[0],
+        NUM_REQUESTS=block_table.shape[0],
+        PAGE_TABLE_WIDTH=block_table.shape[1],
         GROUP_SIZE=group_size,
         TOKENS_PER_BLOCK=tokens_per_block,
         TOPK=selected_tokens.shape[1],
+        BLOCK_TOPK=selected_tokens.shape[1],
+        COMPRESS_RATIO=1,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        ONLY_VISIBLE_TOKENS=False,
         num_warps=8,
         num_stages=2,
     )
