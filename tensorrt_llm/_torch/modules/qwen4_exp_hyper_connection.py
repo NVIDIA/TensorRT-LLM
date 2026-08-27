@@ -144,9 +144,11 @@ class GroupedRMSNorm(TritonRMSNorm):
 
 
 # The residual state threaded from ``mix`` to ``combine``. Injection logits are
-# computed from the same normalized bundle during mix and consumed only after
-# the wrapped attention/MLP block returns.
-HCResidual = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+# computed from the normalized bundle during mix and consumed only after the
+# wrapped attention/MLP block returns. The normalized bundle is intentionally
+# not retained across the wrapped block; the optional middle slot preserves the
+# tuple contract used by existing callers while allowing its storage to die.
+HCResidual = Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
 
 
 class Qwen4ExpHyperConnection(nn.Module):
@@ -351,7 +353,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         fused = self._fused_mix_normed(normed) if self.fused_mix_requested else None
         if fused is not None:
             mixed, injection_logits = fused
-            return mixed.to(self.params_dtype), (hyper_input, normed, injection_logits)
+            return mixed.to(self.params_dtype), (hyper_input, None, injection_logits)
         if self.use_combine:
             packed = self._packed_down_and_injection(normed)
             down = packed[..., : self.hc_lowrank]
@@ -373,7 +375,7 @@ class Qwen4ExpHyperConnection(nn.Module):
             gate = torch.sigmoid(gate).unflatten(-1, (hc, hs))
             mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
 
-        return mixed.to(self.params_dtype), (hyper_input, normed, injection_logits)
+        return mixed.to(self.params_dtype), (hyper_input, None, injection_logits)
 
     def _fused_mix_normed(
         self,
@@ -476,8 +478,8 @@ class Qwen4ExpHyperConnection(nn.Module):
 
     def mix(self, hyper_input: torch.Tensor) -> Tuple[torch.Tensor, HCResidual]:
         """10240 -> 2560. Returns ``(mixed_input, residual_state)`` where
-        ``residual_state = (hyper_input, hyper_input_normed)`` is threaded to
-        ``combine``."""
+        the original bundle and precomputed injection logits are threaded to
+        ``combine`` without retaining the normalized temporary."""
         assert self.use_mix, "mix() called on a combine-only Hyper-Connection"
         hc, hs = self.hc_count, self.hidden_size
         assert hyper_input.shape[-1] == hc * hs, (
@@ -490,7 +492,7 @@ class Qwen4ExpHyperConnection(nn.Module):
             injection_logits = (
                 hyper_input.new_empty((*hyper_input.shape[:-1], hc)) if self.use_combine else None
             )
-            return mixed, (hyper_input, hyper_input, injection_logits)
+            return mixed, (hyper_input, None, injection_logits)
 
         normed = self._normed_bundle(hyper_input)
         return self._mix_normed(hyper_input, normed)

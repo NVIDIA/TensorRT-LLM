@@ -77,7 +77,7 @@ def test_combine_and_mix_matches_unfused_reference_cpu(rows):
     torch.testing.assert_close(actual_hidden, expected_hidden)
     torch.testing.assert_close(actual_mixed, expected_mixed)
     torch.testing.assert_close(actual_residual[0], expected_residual[0])
-    torch.testing.assert_close(actual_residual[1], expected_residual[1])
+    assert actual_residual[1] is None
     torch.testing.assert_close(actual_residual[2], expected_residual[2])
 
 
@@ -141,7 +141,8 @@ def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows, monkey
     )
     torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-2, atol=5e-3)
     torch.testing.assert_close(actual_mixed, expected_mixed, rtol=1e-2, atol=5e-3)
-    torch.testing.assert_close(actual_residual[1], expected_residual[1], rtol=1e-2, atol=5e-3)
+    assert actual_previous_residual[1] is None
+    assert actual_residual[1] is None
     torch.testing.assert_close(actual_residual[2], expected_residual[2], rtol=1e-2, atol=5e-3)
 
     graph = torch.cuda.CUDAGraph()
@@ -161,6 +162,8 @@ def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows, monkey
     )
     torch.testing.assert_close(graph_hidden, actual_hidden, rtol=1e-2, atol=5e-3)
     torch.testing.assert_close(graph_mixed, actual_mixed, rtol=1e-2, atol=5e-3)
+    assert graph_previous_residual[1] is None
+    assert graph_residual[1] is None
     torch.testing.assert_close(graph_residual[2], actual_residual[2], rtol=1e-2, atol=5e-3)
 
 
