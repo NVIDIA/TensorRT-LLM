@@ -440,11 +440,6 @@ class AutoTunerProfilingCache:
         - Ops with INDEPENDENT strategy are stored per-rank (rank_0, rank_1, ...)
         - Ops with non-INDEPENDENT strategy (BROADCAST, MERGE, PARALLEL) are stored
           in a shared dict since all ranks share the same tuning results
-
-    Attributes:
-        generation: Monotonically increasing version of the in-memory cache.
-            Consumers may use it to invalidate derived selections after cache
-            mutation, replacement, or merging.
     """
 
     # Key for shared cache entries (non-INDEPENDENT ops)
@@ -452,7 +447,6 @@ class AutoTunerProfilingCache:
 
     def __init__(self):
         self.cache: Dict[Tuple, Tuple] = dict()
-        self.generation = 0
 
         # Track which ops use which distributed strategy
         # Maps custom_op name -> DistributedTuningStrategy
@@ -472,7 +466,6 @@ class AutoTunerProfilingCache:
 
     def __setitem__(self, cache_key: Tuple, value: Tuple) -> None:
         self.cache[cache_key] = value
-        self.generation += 1
 
     def __getitem__(self, cache_key: Tuple) -> Tuple:
         return self.cache[cache_key]
@@ -484,7 +477,6 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
-        self.generation += 1
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -545,8 +537,6 @@ class AutoTunerProfilingCache:
 
     def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
-        if cache_data:
-            self.generation += 1
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
@@ -731,35 +721,21 @@ class AutoTunerProfilingCache:
             with _exclusive_cache_lock(lock_path):
                 with open(file_path, "r") as f:
                     current_cache_contents = json.load(f)
-            if not isinstance(current_cache_contents, dict):
-                raise ValueError("AutoTuner cache root must be a JSON object")
+            self._deserialize_metadata(
+                current_cache_contents.get("metadata", {}))
 
-            # Deserialize the complete document before changing live state. A
-            # failed load must not leave a partial cache behind with an old
-            # generation, which could make derived selections appear current.
-            metadata = current_cache_contents.get("metadata", {})
-            if not isinstance(metadata, dict):
-                raise ValueError(
-                    "AutoTuner cache metadata must be a JSON object")
-            staged_lib_version = metadata["lib_version"]
-            staged_creation_timestamp = metadata["creation_timestamp"]
-            staged_device_name = metadata["device_name"]
-            staged_device_capability = metadata["device_capability"]
-            staged_cache = {}
-            staged_independent_op = set()
+            # Start with empty cache and independent ops set
+            self.cache = {}
+            self.independent_op = set()
 
             # Load shared cache entries (non-INDEPENDENT ops)
             if self.SHARED_CACHE_KEY in current_cache_contents:
-                if not isinstance(current_cache_contents[self.SHARED_CACHE_KEY],
-                                  dict):
-                    raise ValueError(
-                        "AutoTuner shared cache must be a JSON object")
                 shared_cache = self._deserialize_cache_data(
                     current_cache_contents[self.SHARED_CACHE_KEY])
-                staged_cache.update(shared_cache)
+                self.cache.update(shared_cache)
                 # add custom op in shared cache to independent ops set
                 for key in shared_cache.keys():
-                    staged_independent_op.add(key[0])
+                    self.independent_op.add(key[0])
                 logger.debug(
                     f"[AutoTuner] Loaded {len(shared_cache)} shared cache entries"
                 )
@@ -767,23 +743,12 @@ class AutoTunerProfilingCache:
             # Load rank-specific cache entries (INDEPENDENT ops)
             rank_key = f"rank_{rank}"
             if rank_key in current_cache_contents:
-                if not isinstance(current_cache_contents[rank_key], dict):
-                    raise ValueError(
-                        f"AutoTuner {rank_key} cache must be a JSON object")
                 rank_cache = self._deserialize_cache_data(
                     current_cache_contents[rank_key])
-                staged_cache.update(rank_cache)
+                self.cache.update(rank_cache)
                 logger.debug(
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
-
-            self.lib_version = staged_lib_version
-            self.creation_timestamp = staged_creation_timestamp
-            self.device_name = staged_device_name
-            self.device_capability = staged_device_capability
-            self.cache = staged_cache
-            self.independent_op = staged_independent_op
-            self.generation += 1
 
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
@@ -803,6 +768,12 @@ class AutoTunerProfilingCache:
             "device_name": self.device_name,
             "device_capability": self.device_capability,
         }
+
+    def _deserialize_metadata(self, metadata: Dict[str, Any]) -> None:
+        self.lib_version = metadata["lib_version"]
+        self.creation_timestamp = metadata["creation_timestamp"]
+        self.device_name = metadata["device_name"]
+        self.device_capability = metadata["device_capability"]
 
     def _serialize_cache_data(self,
                               cache: Optional[Dict[Tuple, Tuple]] = None
@@ -989,11 +960,6 @@ class AutoTuner:
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
-
-    @property
-    def is_capturing_tactics(self) -> bool:
-        """Whether a tactic capture or replay context is active."""
-        return self._active_capture is not None
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.

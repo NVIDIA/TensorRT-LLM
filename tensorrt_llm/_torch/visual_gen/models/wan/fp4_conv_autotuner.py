@@ -54,7 +54,6 @@ FP4_CONV_TACTICS: tuple[FP4ConvTactic, ...] = (
     FP4ConvTactic((256, 192), (2, 1), (2, 1), True),
     FP4_CONV_FIXED_TACTIC,
 )
-_selected_tactics: dict[tuple[object, ...], tuple[int, FP4ConvTactic]] = {}
 _failed_tactics: dict[tuple[object, ...], set[int]] = {}
 
 
@@ -63,9 +62,8 @@ def _tactic_set_key() -> tuple[tuple[object, ...], ...]:
     return tuple(astuple(tactic) for tactic in FP4_CONV_TACTICS)
 
 
-def _clear_fp4_conv_tactic_cache() -> None:
-    """Clear in-process selections and failed-candidate records."""
-    _selected_tactics.clear()
+def _clear_fp4_conv_failed_tactics() -> None:
+    """Clear failed-candidate records shared across runner instances."""
     _failed_tactics.clear()
 
 
@@ -211,32 +209,6 @@ def run_tuned_fp4_conv(
 ) -> tuple[torch.Tensor, FP4ConvTactic]:
     """Choose and launch a Conv3d tactic; return output and chosen config."""
     tuner = AutoTuner.get()
-    selection_key = (_tactic_set_key(), *signature, problem_shape)
-    bypass_fast_cache = tuner.is_tuning_mode or tuner.is_capturing_tactics
-    if bypass_fast_cache:
-        # Tuning may replace a local winner during distributed post-merge, and
-        # capture/replay must reach choose_one() to force each requested tactic.
-        _selected_tactics.pop(selection_key, None)
-    elif (cached_selection := _selected_tactics.get(selection_key)) is not None:
-        generation, tactic = cached_selection
-        if generation == tuner.profiling_cache.generation:
-            try:
-                launch(compile_tactic(tactic))
-            except Exception as error:
-                if tactic == FP4_CONV_FALLBACK_TACTIC:
-                    raise
-                tactic = _launch_fallback_tactic(
-                    signature=signature,
-                    problem_shape=problem_shape,
-                    failed_tactic=tactic,
-                    error=error,
-                    compile_tactic=compile_tactic,
-                    launch=launch,
-                )
-                _selected_tactics[selection_key] = (generation, tactic)
-            return output, tactic
-        _selected_tactics.pop(selection_key, None)
-
     runner = FP4ConvTunableRunner(
         signature=signature,
         problem_shape=problem_shape,
@@ -265,10 +237,6 @@ def run_tuned_fp4_conv(
             compile_tactic=compile_tactic,
             launch=launch,
         )
-    # Cache only selections tied to the current profiling-cache generation.
-    # Tuning and capture/replay must continue through choose_one().
-    if not bypass_fast_cache:
-        _selected_tactics[selection_key] = (tuner.profiling_cache.generation, tactic)
     logger.debug_once(
         f"Wan NVFP4 Conv3d selected tactic {tactic} for {signature}",
         key=("wan_nvfp4_conv3d", signature, tactic),

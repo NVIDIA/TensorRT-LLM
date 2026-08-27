@@ -571,9 +571,7 @@ def test_load_cache_skips_non_literal_tactic():
         json.dump(doc, f)
 
     # Must not raise (previously raised SyntaxError out of load_cache).
-    generation_before_load = cache.generation
     cache.load_cache(cache_path, rank=0)
-    assert cache.generation == generation_before_load + 1
 
     # The literal-safe entry survived with its exact tactic ...
     good = ("op_good", "R", "0", ((1, 128), ))
@@ -582,44 +580,6 @@ def test_load_cache_skips_non_literal_tactic():
     # ... and the non-literal entry was skipped, not silently mis-decoded.
     bad = ("op_bad", "R", "0", ((2, 128), ))
     assert bad not in cache.cache
-
-
-def test_load_cache_failure_preserves_live_state(tmp_path):
-    """A failed replacement must not partially mutate the live cache."""
-    cache = autotuner.AutoTunerProfilingCache()
-    old_key = ("old_op", "Runner", "0", ((1, 128), ))
-    cache[old_key] = (0, 7, 0.001)
-    cache.independent_op.add("old_op")
-    cache.lib_version = "preserved-version"
-    cache.creation_timestamp = 123.0
-    cache.device_name = "preserved-device"
-    cache.device_capability = (10, 0)
-
-    old_cache = dict(cache.cache)
-    old_independent_op = set(cache.independent_op)
-    old_metadata = cache._serialize_metadata()
-    old_generation = cache.generation
-    malformed_path = tmp_path / "malformed-cache.json"
-    malformed_path.write_text(
-        json.dumps({
-            "metadata": {
-                "lib_version": "replacement-version",
-                "creation_timestamp": 456.0,
-                "device_name": "replacement-device",
-                "device_capability": [10, 0],
-            },
-            # Cache sections must be mappings.
-            "shared": [],
-            "rank_0": {},
-        }))
-
-    with pytest.raises(ValueError, match="shared cache must be a JSON object"):
-        cache.load_cache(malformed_path, rank=0)
-
-    assert cache.cache == old_cache
-    assert cache.independent_op == old_independent_op
-    assert cache._serialize_metadata() == old_metadata
-    assert cache.generation == old_generation
 
 
 def test_kernel_testing_single_context():
@@ -1445,47 +1405,12 @@ def test_post_tune_merge_tactics_min_time_and_subset_kept():
 
     tuner._dist = _FakeDist()
     tuner.profiling_cache.cache = dict(r0)
-    generation_before_merge = tuner.profiling_cache.generation
     tuner.post_tune_merge_tactics()
 
     cache = tuner.profiling_cache.cache
-    assert tuner.profiling_cache.generation == generation_before_merge + 1
     assert cache[("gemm", "X")] == (0, ("cublaslt", 0), 0.5)
     assert cache[("q", "A")] == r0[("q", "A")]
     assert cache[("vae", "B")] == r1[("vae", "B")]
-
-
-def test_profiling_cache_generation_tracks_mutations():
-    cache = autotuner.AutoTuner().profiling_cache
-    initial_generation = cache.generation
-
-    cache[("gemm", "X")] = (0, ("cutlass", 10), 1.0)
-    assert cache.generation == initial_generation + 1
-
-    cache.merge_cache_data({("vae", "B"): (0, ("cutlass", 2), 1.0)})
-    assert cache.generation == initial_generation + 2
-
-    cache.clear()
-    assert cache.generation == initial_generation + 3
-
-
-def test_is_capturing_tactics_tracks_capture_and_replay():
-    tuner = autotuner.AutoTuner()
-    assert not tuner.is_capturing_tactics
-    runner = GemmRunner()
-    tuning_config = TuningConfig()
-    inputs = [torch.empty(1), torch.empty(1)]
-
-    with tuner.capture() as all_tactics:
-        assert tuner.is_capturing_tactics
-        tuner.choose_one("capture-state", [runner], tuning_config, inputs)
-
-    assert not tuner.is_capturing_tactics
-    (runner, tactic), = next(iter(all_tactics))
-    with tuner.replay(((runner, tactic), )):
-        assert tuner.is_capturing_tactics
-        tuner.choose_one("capture-state", [runner], tuning_config, inputs)
-    assert not tuner.is_capturing_tactics
 
 
 def test_post_tune_merge_tactics_single_rank_noop():
