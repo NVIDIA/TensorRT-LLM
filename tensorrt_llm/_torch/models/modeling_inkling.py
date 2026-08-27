@@ -57,9 +57,9 @@ from tensorrt_llm._torch.attention_backend.sparse.inkling import (
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import InklingHfWeightMapper
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModel,
-    DecoderModelForCausalLM,
     MetaInitException,
     filter_weights,
     register_auto_model,
@@ -79,6 +79,7 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.logger import logger
 
 from ...inputs import (
     ContentFormat,
@@ -99,6 +100,79 @@ from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
 )
+
+
+def _assert_draft_chain_loaded(mtp_layers) -> None:
+    """Refuse a draft chain whose weights never arrived.
+
+    A trained projection is not all zeros. A block that was built but never
+    loaded is: it keeps whatever ``to_empty``/init left, which is zeros for the
+    matrices and ones for the norms. That state costs nothing at load and
+    everything at runtime -- the block returns zeros, its logits are flat, the
+    drafter proposes token 0 forever, the target rejects every draft, and
+    speculative decoding burns a whole extra forward per step for no speedup,
+    with no error and correct output. It took a probe on the drafter's own
+    proposals to see it.
+
+    So the invariant is checked where it is cheap: once, at load.
+
+    The chain's shape is logged alongside it. How many blocks get built and
+    which depth each one carries is decided by two config readers that
+    disagreed once already -- the top-level multimodal config carries no
+    ``num_nextn_predict_layers``, the depth fell back to 1, and MTP resolved to
+    EAGLE mode. By this point the chain exists, and this is the only place its
+    real shape is visible.
+    """
+    # An f-string, not %-args: this logger concatenates its arguments rather
+    # than interpolating them, so the lazy form prints the format string.
+    depths = [getattr(b, "depth", None) for b in mtp_layers]
+    logger.info(f"MTP: draft chain loaded with {len(mtp_layers)} block(s), depths {depths}")
+    for depth, block in enumerate(mtp_layers):
+        for name, param in block.named_parameters():
+            # Norms legitimately load as all-ones; a weight MATRIX does not
+            # legitimately load as all-zeros.
+            if param.dim() < 2:
+                continue
+            if not torch.any(param != 0):
+                raise RuntimeError(
+                    f"Inkling MTP depth {depth}: '{name}' is all zeros after "
+                    f"loading, i.e. the draft chain's weights never reached the "
+                    f"module. The chain would run, propose nothing the target "
+                    f"accepts, and cost a forward per step."
+                )
+
+
+def _unquantized_like(quant_config):
+    """The target's quant config with weight quantization switched off.
+
+    The MTP chain is NOT quantized in either shipped checkpoint. The evidence is
+    direct: under ``model.mtp`` the only scale tensor is the dense MLP's
+    ``global_scale`` (which BF16 dense layers carry too) -- there is no
+    ``weight_scale``, ``weight_scale_2`` or ``input_scale`` anywhere in the
+    chain. And ``hf_quant_config.json``'s ``exclude_modules`` names only
+    ``model.llm.*`` entries, so nothing in it can mark the chain as excluded:
+    the chain is outside the quantized subtree entirely rather than carved out
+    of it.
+
+    Building the draft blocks NVFP4 anyway produces two failures a long way from
+    the cause: a strict load reporting missing ``input_proj.weight_scale`` and
+    friends, and -- once loading is fixed -- ``fp4_quantize only supports
+    fp16/bf16/e4m3`` from the quantize op, which reads as a dtype problem at the
+    activation rather than as "this module should never have been quantized".
+
+    ``kv_cache_quant_algo`` is preserved: the draft KV cache follows the
+    target's KV quantization regardless of how the chain's weights are stored.
+    """
+    if quant_config is None:
+        return None
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    # A fresh instance, not a copy with quant_algo cleared: ``quant_mode`` and
+    # ``layer_quant_mode`` are cached_property, so a copy keeps the NVFP4 mode
+    # that was already computed and every Linear still builds quantized while
+    # the algo field reads None. Nothing about that is visible until the
+    # quantize op rejects the activation.
+    return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
 
 
 def _module_excluded_from_quant(model_config: ModelConfig, name: str) -> bool:
@@ -419,13 +493,14 @@ class InklingAttention(QKNormRoPEAttention):
         )
         self.local_num_heads = num_heads // tp_size
 
-    def _project(self, hidden_states, conv_pool_kv=None, conv_rt=None):
+    def _project(self, hidden_states, conv_pool_kv=None, conv_rt=None, conv_capture_kv=None):
         """Fused qkv projection -> split -> k/v short-conv -> per-head qk RMSNorm.
 
         Returns ``(q, k, v)`` shaped ``[T, local_heads, head_dim]`` /
         ``[T, local_kv_heads, head_dim]``. With ``conv_pool_kv`` + ``conv_rt`` the
         k/v short-convs run through the runtime state pool; without them they run
-        the stateless full-sequence causal conv.
+        the stateless full-sequence causal conv. ``conv_capture_kv=(cap_k, cap_v)``
+        is the verify-step capture the post-verify commit replays from.
         """
         D = self.head_dim
         num_tokens = hidden_states.shape[0]
@@ -434,8 +509,9 @@ class InklingAttention(QKNormRoPEAttention):
         # k/v short convolution before the q/k norm (source order).
         if conv_pool_kv is not None:
             pool_k, pool_v = conv_pool_kv
-            k = apply_short_conv(self.k_sconv, k, pool_k, conv_rt)
-            v = apply_short_conv(self.v_sconv, v, pool_v, conv_rt)
+            cap_k, cap_v = conv_capture_kv if conv_capture_kv is not None else (None, None)
+            k = apply_short_conv(self.k_sconv, k, pool_k, conv_rt, cap_k)
+            v = apply_short_conv(self.v_sconv, v, pool_v, conv_rt, cap_v)
         else:
             k = self.k_sconv(k)
             v = self.v_sconv(v)
@@ -477,6 +553,7 @@ class InklingAttention(QKNormRoPEAttention):
         attn_metadata: AttentionMetadata,
         *,
         conv_pool_kv=None,
+        conv_capture_kv=None,
         conv_rt=None,
         **kwargs,
     ):
@@ -484,12 +561,14 @@ class InklingAttention(QKNormRoPEAttention):
 
         ``conv_pool_kv`` + ``conv_rt`` drive the k/v short-convs through the
         runtime state pool; without them they run stateless over the sequence.
+        ``conv_capture_kv`` carries the verify-step captures for the post-verify
+        conv-window commit.
         """
         num_tokens = hidden_states.shape[0]
         # The pre-attention RMSNorm can emit fp32 while the attention/r
         # projections are bf16, so cast once here.
         hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
-        q, k, v = self._project(hidden_states, conv_pool_kv, conv_rt)
+        q, k, v = self._project(hidden_states, conv_pool_kv, conv_rt, conv_capture_kv)
         rel_logits = self._build_rel_logits(hidden_states, position_ids)
         # Standard backend contract; rel_logits and the mixed-batch certificate
         # ride AttentionForwardArgs.sparse_backend_args (see inkling/params.py).
@@ -735,6 +814,7 @@ class InklingDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         *,
         conv_state: Optional[InklingConvState] = None,
+        conv_capture: Optional[InklingConvState] = None,
         conv_rt: Optional[InklingConvRuntime] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         **kwargs,
@@ -744,7 +824,8 @@ class InklingDecoderLayer(nn.Module):
 
         With ``conv_rt`` given, ``conv_state`` holds this layer's four pool
         buffers and each short-conv runs through them; without it they run
-        stateless over the whole sequence.
+        stateless over the whole sequence. ``conv_capture`` holds the matching
+        verify-step captures (all-None outside a verify step).
         """
         if conv_rt is None:
             residual = hidden_states
@@ -762,19 +843,258 @@ class InklingDecoderLayer(nn.Module):
         # --- Runtime state-pool path (prefill-seed / decode / mixed). ---
         residual = hidden_states
         h = self.attn_norm(hidden_states)
+        caps = (
+            conv_capture if conv_capture is not None else InklingConvState(None, None, None, None)
+        )
         h = self.attn(
             position_ids,
             h,
             attn_metadata,
             conv_pool_kv=(conv_state.k, conv_state.v),
+            conv_capture_kv=(caps.k, caps.v),
             conv_rt=conv_rt,
             **kwargs,
         )
-        h = residual + apply_short_conv(self.attn_sconv, h, conv_state.attn, conv_rt)
+        h = residual + apply_short_conv(self.attn_sconv, h, conv_state.attn, conv_rt, caps.attn)
 
         residual = h
         hm = self._run_mlp(self.mlp_norm(h), all_rank_num_tokens)
-        return residual + apply_short_conv(self.mlp_sconv, hm, conv_state.mlp, conv_rt)
+        return residual + apply_short_conv(self.mlp_sconv, hm, conv_state.mlp, conv_rt, caps.mlp)
+
+
+def _mtp_num_depths(config: InklingTextConfig) -> int:
+    """How many depths the draft chain has.
+
+    Inkling declares this on ``mtp_config`` rather than at the top level of the
+    text config, which is where the framework's MTPForCausalLM looks
+    (``pretrained_config.num_nextn_predict_layers``), so it is mirrored there --
+    see InklingForCausalLM -- and read back through one accessor here.
+    """
+    n = getattr(config, "num_nextn_predict_layers", None)
+    if n:
+        return int(n)
+    # The ids name WHICH depths are banded, not how many exist
+    # (``is_mtp_local_depth`` treats them as a membership set), so the count
+    # comes from the largest index. The shipped small checkpoint declares 8
+    # depths as [0, 2, 4, 5, 6, 7]: six ids, last one 7, and only ``max + 1``
+    # gets back to 8.
+    ids = getattr(config, "mtp_local_layer_ids", None) or ()
+    return (max(ids) + 1) if ids else 1
+
+
+def _mtp_depth_from_global_index(config: InklingTextConfig, global_layer_idx: int) -> int:
+    """Recover a chain depth from the layer index the framework builds with.
+
+    ``MTPForCausalLM`` passes ``depth + start_layer_idx`` where start_layer_idx
+    is the trunk's layer count, so the trunk is SUBTRACTED back off. A modulo
+    over the depth count gives the same answer only when
+    ``num_hidden_layers % num_depths == 0``; on the shipped small checkpoint
+    that is 42 % 8 = 2, which shifted every block onto another depth's geometry
+    while it carried its own depth's weights.
+
+    Raises rather than clamping: an index outside the chain means the caller and
+    this config disagree about how tall the trunk is, and every downstream
+    symptom of that (wrong window, wrong KV-head count, a conv pool sized from a
+    different depth) is silent.
+    """
+    depth = global_layer_idx - config.num_hidden_layers
+    num_depths = _mtp_num_depths(config)
+    if not 0 <= depth < num_depths:
+        raise ValueError(
+            f"Inkling MTP block built at global layer index {global_layer_idx}, "
+            f"i.e. depth {depth} of a {num_depths}-deep chain sitting above "
+            f"{config.num_hidden_layers} trunk layers. MTPForCausalLM passes the "
+            "trunk's layer count as start_layer_idx, so this means the two "
+            "disagree about the trunk."
+        )
+    return depth
+
+
+class InklingMTPHead(nn.Module):
+    """Per-depth head: optional chain post-norm, then the shared LM head.
+
+    Mirrors ``DeepseekV3MTPHead``. The norm exists only when the checkpoint
+    declares ``chain_hidden_post_norm`` -- both shipped Inkling releases set it
+    False and ship no ``chain_norm`` tensor, so building it unconditionally
+    would create a parameter the loader then has to explain away.
+    """
+
+    def __init__(self, model_config: ModelConfig[InklingTextConfig], use_norm: bool):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.norm = (
+            RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            if use_norm
+            else None
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: nn.Module,
+        attn_metadata: AttentionMetadata,
+        return_context_logits: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """One logit row per SEQUENCE, not per token.
+
+        ``MTPWorker`` samples one draft token per sequence from what this
+        returns and then writes it back at ``last_tokens_idx``, so a row per
+        token makes that assignment a shape mismatch -- [draft_len] into [1].
+        Gathering here rather than in the worker also avoids running the
+        vocab-sized projection over every token of the batch, which is the
+        reason DeepSeek's MTP head does the same thing.
+        """
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
+        if not return_context_logits and attn_metadata is not None:
+            last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            hidden_states = hidden_states[last_tokens]
+        return lm_head(hidden_states)
+
+
+class InklingMTPBlock(nn.Module):
+    """One depth of the next-N draft chain.
+
+    Structure follows SGLang's ``InklingMTPLayer``: the previous depth's hidden
+    state and this depth's token embedding are each normalized, concatenated and
+    projected back to hidden width, then run through what is otherwise an
+    ordinary decoder layer.
+
+    The decoder layer is reused unchanged. It asks its config which layers are
+    dense and which are banded, so ``mtp_block_config`` hands it a config where
+    those ordinary questions return the draft answers -- rather than teaching
+    the layer a second notion of what layer it is.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig[InklingTextConfig],
+        depth: int,
+        aux_stream_dict: Optional[dict] = None,
+    ):
+        super().__init__()
+        config = model_config.pretrained_config
+        # MTPForCausalLM passes the target's layer count as start_layer_idx, so
+        # the index arrives offset by the trunk depth; the chain's own geometry
+        # is indexed from 0.
+        # The offset index is the GLOBAL layer index, which is what the draft KV
+        # cache manager keys its layer offsets by; the chain's own geometry is
+        # indexed from 0. Both are needed, so keep both rather than folding one
+        # away: passing the chain depth as the layer index asks the draft
+        # manager for layer 2 when the buffers live at trunk+2, a KeyError deep
+        # in the first draft forward.
+        global_layer_idx = depth
+        depth = _mtp_depth_from_global_index(config, global_layer_idx)
+        # Accepted for the framework's uniform constructor signature. Inkling's
+        # draft blocks are dense, so there is no MoE/shared-expert overlap to
+        # schedule on a second stream.
+        del aux_stream_dict
+        self.depth = depth
+        self.dtype = config.torch_dtype
+        self.embed_norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.hidden_norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        # Concatenation of two hidden-width tensors, projected back to hidden.
+        self.input_proj = Linear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            # The chain is BF16; see _unquantized_like.
+            quant_config=None,
+        )
+        block_model_config = copy.copy(model_config)
+        block_model_config.pretrained_config = config.mtp_block_config(depth, global_layer_idx)
+        block_model_config.quant_config = _unquantized_like(model_config.quant_config)
+        self.transformer_block = InklingDecoderLayer(block_model_config, global_layer_idx)
+        # MTPWorker calls shared_head(hidden, lm_head, attn_metadata) per depth.
+        # ``chain_hidden_post_norm`` is False in both shipped checkpoints, which
+        # ships no chain_norm weight -- so the norm is built only when the
+        # checkpoint declares it, and the head is otherwise a straight LM-head
+        # application.
+        self.shared_head = InklingMTPHead(
+            model_config, use_norm=bool(getattr(config, "chain_hidden_post_norm", False))
+        )
+
+    def forward(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: Embedding,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Fold the previous depth's hidden state into this depth's embedding.
+
+        The signature is the one MTPWorker calls with -- it passes the target
+        model's ``embed_tokens`` in and the rest as ``**draft_inputs`` -- so the
+        embedding lookup happens here rather than in the caller.
+        """
+        inputs_embeds = embed_tokens(input_ids)
+        combined = torch.cat(
+            (self.hidden_norm(hidden_states), self.embed_norm(inputs_embeds)), dim=-1
+        )
+        # RMSNorm can emit fp32 while the NVFP4 quantize op accepts only
+        # fp16/bf16/e4m3 and refuses fp32 outright, so this boundary needs a
+        # cast to the compute dtype. Three candidates were tried on the cluster
+        # and only the last is that dtype: ``input_proj.weight.dtype`` is a
+        # quantized Linear's PACKED storage type; ``config.torch_dtype`` is what
+        # the config declares rather than what the model runs in; and the
+        # incoming ``hidden_states`` are whatever the spec worker hands over,
+        # which is not guaranteed either. The norm's own weight is a real
+        # parameter of the model, built at the compute dtype.
+        combined = combined.to(self.embed_norm.weight.dtype)
+        # The chain's own short-conv state. Without it the block takes the
+        # decoder layer's stateless branch, which is wrong twice over: a
+        # stateless conv runs across the context/generation boundary of a packed
+        # batch (the trunk raises NotImplementedError for exactly that), and the
+        # chain would carry no conv history between steps at all. Neither fails.
+        #
+        # It comes from the manager in play (``mgr.prepare_conv_runtime``) rather
+        # than from the metadata's published runtime: that split was published
+        # once, during prepare(), from the TARGET manager, while the draft
+        # forward runs inside the draft KV cache context with the manager
+        # swapped underneath.
+        #
+        # KNOWN GAP, and deliberately left: the chain's windows are never rolled
+        # back. ``MTPWorker`` calls ``commit_conv_state_after_verify`` once, on
+        # ``attn_metadata.kv_cache_manager``, before entering the draft context
+        # -- so the commit only ever reaches the TARGET's pool. The chain
+        # advances its own windows over every drafted token and keeps the ones
+        # the next step rejects.
+        #
+        # This is an acceptance-rate defect, not a correctness one, and the
+        # asymmetry is the whole reason the target-side commit exists: a wrong
+        # window in the TARGET corrupts the logits that decide acceptance, so
+        # the committed tokens leave the greedy trajectory; a wrong window in
+        # the CHAIN only produces a worse draft, which the target then rejects.
+        # Output stays exactly right and the cost is a forward per step.
+        conv_state = conv_capture = conv_rt = None
+        mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        prepare = getattr(mgr, "prepare_conv_runtime", None)
+        if prepare is not None:
+            cache, conv_rt = prepare(attn_metadata)
+            layer_idx = self.transformer_block.layer_idx
+            conv_state = cache.layer_state(layer_idx)
+            conv_capture = cache.layer_capture(layer_idx)
+        return self.transformer_block(
+            position_ids=position_ids,
+            hidden_states=self.input_proj(combined),
+            attn_metadata=attn_metadata,
+            conv_state=conv_state,
+            conv_capture=conv_capture,
+            conv_rt=conv_rt,
+            **kwargs,
+        )
 
 
 class InklingModel(DecoderModel):
@@ -801,6 +1121,10 @@ class InklingModel(DecoderModel):
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
+        # MTPForCausalLM reads this when it builds the draft chain. Inkling's
+        # blocks are dense and schedule nothing on a second stream, so an empty
+        # mapping is the honest value rather than a fabricated stream.
+        self.aux_stream_dict: dict = {}
 
     def forward(
         self,
@@ -834,38 +1158,183 @@ class InklingModel(DecoderModel):
         hidden_states = inputs_embeds if inputs_embeds_prenormed else self.embed_norm(inputs_embeds)
         for i, layer in enumerate(self.layers):
             layer_state = conv_cache.layer_state(i) if conv_cache is not None else None
+            layer_capture = conv_cache.layer_capture(i) if conv_cache is not None else None
             hidden_states = layer(
                 position_ids,
                 hidden_states,
                 attn_metadata,
                 conv_state=layer_state,
+                conv_capture=layer_capture,
                 conv_rt=conv_rt,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
         return self.norm(hidden_states)
 
 
-class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig]):
+class InklingForCausalLM(SpecDecOneEngineForCausalLM[InklingModel, InklingTextConfig]):
     """Text CausalLM: muP logit scaling + unpadded-vocab slice.
 
     ``embed`` and ``unembed`` are separate checkpoint tensors (never tied). The
     ``LMHead`` is built at the unpadded vocab size so its forward slices off the
     padding automatically; hidden states are divided by
     ``logits_mup_width_multiplier`` before the head (accuracy-critical).
+
+    The base is ``SpecDecOneEngineForCausalLM`` rather than the plain
+    ``DecoderModelForCausalLM`` because one-engine speculative decoding is not
+    something a model opts into piecemeal: that base is what builds the draft
+    model, creates the spec worker, and -- the part that actually bit -- routes
+    the forward through the worker so logits are taken at
+    ``spec_metadata.gather_ids`` instead of over every token. Without it the
+    trunk returns a flat [tokens, vocab] where the sampler expects one entry per
+    verified position, which surfaces as an IndexError in HandleLogits naming
+    neither speculation nor Inkling. With no ``spec_config`` the base is
+    behaviourally the plain decoder it replaces.
     """
 
     def __init__(self, model_config: ModelConfig[InklingTextConfig]):
         config = model_config.pretrained_config
         self.mup_multiplier = float(config.logits_mup_width_multiplier)
+        # ``model_config`` positionally: the one-engine base takes it as
+        # ``model_config`` (it needs the spec_config off it) and forwards it to
+        # the decoder base as ``config``.
         super().__init__(
             InklingModel(model_config),
-            config=model_config,
+            model_config,
             hidden_size=config.hidden_size,
             vocab_size=config.unpadded_vocab_size,
         )
         self._assert_inkling_attn_backend(model_config)
         self._assert_inkling_moe_parallel(model_config)
+        self._assert_inkling_spec_conv_state(model_config)
         self._apply_allreduce_strategy()
+
+    @staticmethod
+    def _assert_inkling_spec_conv_state(model_config) -> None:
+        """Check the conv pool can roll back before allowing speculative decoding.
+
+        The short-conv state is a sliding window of past INPUTS, mutated in
+        place. A verify step advances it over every drafted token while only a
+        prefix is accepted, so without a commit the window is left holding
+        tokens the model never emitted -- and nothing about that is detectable:
+        right shape, right dtype, a perfectly valid window. The KV cache is safe
+        here by construction, being position-indexed, which leaves the conv as
+        the one piece of state needing an explicit commit and the one no smoke
+        test would catch.
+
+        That commit now exists (``InklingConvStateCache.commit_after_verify``,
+        driven from ``MTPWorker`` once acceptance is known). What is checked here
+        is the precondition it depends on: the capture buffers are sized from
+        ``max_draft_len``, so a chain deeper than they allow would commit the
+        wrong window rather than fail.
+        """
+        spec_config = getattr(model_config, "spec_config", None)
+        if spec_config is None:
+            return
+        # The chain's blocks are addressed by global layer index, which only the
+        # separate draft KV cache manager provides. Without it every draft
+        # forward dies on a bare KeyError several minutes in, so the condition is
+        # checked where it can still be explained.
+        from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+
+        if not should_use_separate_draft_kv_cache(spec_config):
+            raise ValueError(
+                "Inkling speculative decoding requires a separate draft KV cache: "
+                "the draft chain's layers are not the target's, so they cannot "
+                "share its cache, and they are addressed by the global layer "
+                "index the separate manager is keyed by."
+            )
+        text_config = getattr(
+            model_config.pretrained_config, "text_config", model_config.pretrained_config
+        )
+        if getattr(text_config, "num_nextn_predict_layers", None) is None:
+            # ``MTPForCausalLM`` reads this as a bare attribute, so its absence
+            # is an AttributeError from inside framework code rather than a
+            # statement about the checkpoint. It is absent exactly when the
+            # checkpoint carries no ``mtp_config`` -- i.e. ships no draft chain
+            # -- which is worth saying in those words.
+            raise ValueError(
+                "This Inkling checkpoint declares no MTP chain (no mtp_config, "
+                "so no draft depths to build). Speculative decoding needs a "
+                "checkpoint that ships one; run without speculative_config."
+            )
+        if not spec_config.spec_dec_mode.is_mtp_vanilla():
+            # Inkling's chain is vanilla MTP: every depth has its own weights
+            # and its own banded/global attention geometry. The EAGLE-style
+            # modes build ONE block and replay it, which is a different model.
+            #
+            # This is reachable by configuration rather than by asking for it:
+            # ``spec_dec_mode`` resolves to EAGLE whenever the spec config's
+            # ``num_nextn_predict_layers`` comes out as 1, and that field is
+            # filled from the TOP-LEVEL pretrained config. Nothing downstream
+            # complains -- the model side reads the text config and believes it
+            # has N depths while the framework has decided there is one.
+            raise ValueError(
+                f"Inkling MTP needs vanilla MTP, got {spec_config.spec_dec_mode}. "
+                "Its draft depths have distinct weights and attention geometry, "
+                "so a single replayed block is a different model. This usually "
+                "means the chain depth did not reach the speculative config; "
+                "set use_mtp_vanilla=True on MTPDecodingConfig if the checkpoint "
+                "genuinely declares one depth."
+            )
+        if getattr(getattr(model_config, "mapping", None), "enable_attention_dp", False):
+            # Inkling MTP requires a separate draft KV cache; attention DP
+            # refuses to provide one. Both sides say so in as many words:
+            # _util._should_create_separate_draft_kv_cache returns False under
+            # attention DP ("separate draft KV cache is not supported"), and the
+            # guard above this one requires it. Incompatible by construction.
+            #
+            # So this is not a patchable mismatch. The conv pool's sizing, its
+            # layer offset and the draft-context manager swap all assume the
+            # chain has its own manager. Supporting the combination needs either
+            # the framework to allow a separate draft cache under attention DP,
+            # or Inkling's global-layer addressing to work inside the target
+            # manager. Refused until one of those is chosen.
+            raise ValueError(
+                "Inkling MTP does not support attention DP. MTP needs a "
+                "separate draft KV cache and attention DP does not provide "
+                "one, so the draft chain's layers fold into the target "
+                "manager, which is sized and addressed for the trunk alone. "
+                "Set enable_attention_dp=False when enabling MTP on Inkling."
+            )
+        if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+            # Relaxed acceptance is LOSSY by design -- it takes a draft that
+            # matches any of the target's top-K instead of its top-1 -- and it
+            # buys that back by applying only inside the thinking phase, which
+            # it locates with ``begin_thinking_phase_token`` /
+            # ``end_thinking_phase_token``. Those default to 128798/128799,
+            # DeepSeek-R1's ``<think>``/``</think>``. In Inkling's vocabulary
+            # they are not special tokens at all; its thinking run is opened by
+            # ``<|content_thinking|>`` (200008) and closed by the NEXT channel
+            # marker rather than by a matching end token, so the paired-token
+            # shape cannot express it however the ids are set.
+            #
+            # Left alone this does not raise. The phase is simply never entered
+            # where it should be, and is entered wherever those two ordinary
+            # token ids happen to fall -- relaxing acceptance outside the
+            # thinking text, which is the one place the mode is not meant to be
+            # lossy. Nothing in the output says so.
+            raise ValueError(
+                "Inkling MTP does not support relaxed acceptance for thinking. "
+                "It is gated on begin/end_thinking_phase_token, a paired "
+                "<think>/</think> shape; Inkling opens thinking with "
+                "<|content_thinking|> and ends it by switching channel, so "
+                "there is no end token to name. Enabling it would relax "
+                "acceptance -- which is lossy -- outside the thinking phase. "
+                "Set use_relaxed_acceptance_for_thinking=False."
+            )
+        if getattr(model_config, "use_cuda_graph", False):
+            # The verify step walks the drafted positions one at a time, writing
+            # KV and re-attending per position, which is not capturable; the
+            # backend raises when it sees a captured batch. That raise lands
+            # inside warmup, minutes in, from a stack that names neither
+            # speculation nor the graph setting -- so refuse the combination
+            # here, where both are still in hand.
+            raise ValueError(
+                "Inkling speculative decoding cannot run with CUDA graphs: the "
+                "verify step walks the drafted positions one at a time and "
+                "cannot be captured. Set cuda_graph_config=None (or remove it "
+                "from --extra_llm_api_options) when enabling MTP on Inkling."
+            )
 
     @staticmethod
     def _assert_inkling_attn_backend(model_config) -> None:
@@ -954,21 +1423,159 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
         inputs_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
         inputs_embeds_prenormed: bool = False,
+        spec_metadata=None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        # The short-conv state pool reaches the decoder through attn_metadata, so
-        # there are no conv kwargs and no ResourceManager lookup here.
+        # The short-conv state pool is owned by InklingHybridCacheManager and
+        # reaches the decoder through attn_metadata, published outside the
+        # captured region -- no conv kwargs and no ResourceManager lookup here.
         hidden_states = self.model(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             inputs_embeds_prenormed=inputs_embeds_prenormed,
+            **kwargs,
         )
-        hidden_states = hidden_states / self.mup_multiplier
+        # Padded rows are scratch the batch was rounded up to; the spec worker
+        # indexes by request and would read them as real tokens. The one-engine
+        # base trims here for the same reason -- this override has to repeat it
+        # rather than inherit it.
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[: attn_metadata.num_tokens]
+        # muP: accuracy-critical, and it applies to the lm_head input only. The
+        # draft chain is handed the UNDIVIDED hidden states below, matching the
+        # SGLang reference, because the division belongs to the head rather than
+        # to the residual stream the chain continues.
+        head_input = hidden_states / self.mup_multiplier
+        if self.spec_worker is not None:
+            logits = self.logits_processor.forward(
+                head_input[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            # On a multimodal request ``fuse_input_embeds`` returns input_ids as
+            # None -- the token stream became an embedding stream -- and the
+            # worker subscripts what it is given (``input_ids[:num_ctx_tokens]``
+            # in prepare_drafter_inputs). The wrapper forwards the pre-fusion ids
+            # under ``orig_input_ids`` for exactly this, the same key
+            # Qwen3-VL and Gemma4-MM use.
+            spec_input_ids = input_ids if input_ids is not None else kwargs.get("orig_input_ids")
+            spec_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if spec_input_ids is not None:
+                    spec_input_ids = spec_input_ids[: attn_metadata.num_tokens]
+                if spec_position_ids is not None:
+                    spec_position_ids = spec_position_ids[..., : attn_metadata.num_tokens]
+            return self.spec_worker(
+                input_ids=spec_input_ids,
+                position_ids=spec_position_ids,
+                hidden_states=hidden_states,
+                logits=logits,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=self.draft_model,
+                resource_manager=resource_manager,
+            )
         return self.logits_processor.forward(
-            hidden_states, self.lm_head, attn_metadata, return_context_logits
+            head_input, self.lm_head, attn_metadata, return_context_logits
         )
+
+    def load_weights(self, weights: dict, weight_mapper=None):
+        """Load the trunk, then the draft chain if one was built.
+
+        The text-only path goes through here; the multimodal subclass overrides
+        load_weights for the towers and calls _load_mtp_weights itself. Without
+        this override the base implementation runs and the draft blocks stay at
+        their initial values -- speculative decoding would then produce garbage
+        drafts that the target rejects, i.e. a silent speed regression rather
+        than an error.
+        """
+        super().load_weights(weights, weight_mapper=weight_mapper)
+        self._load_mtp_weights(weights, weight_mapper)
+
+    def _load_mtp_weights(self, weights: dict, weight_mapper) -> None:
+        """Load the draft chain, if one was built, through the generic loader.
+
+        Only the depths that exist are loaded: the runtime caps the chain at
+        ``min(max_draft_len, checkpoint depths)``, so a server asking for 3
+        draft tokens builds 3 blocks out of the checkpoint's 8. Loading all 8
+        into 3 modules would fail; skipping the extras is correct, and they are
+        reported so a silent shortfall is visible.
+
+        ``load_state_dict`` cannot do this job. The checkpoint carries the raw
+        per-projection names and full-width tensors while the block has fused
+        ``qkv_proj``/``gate_up_proj``, NVFP4 scale tensors and TP-sharded
+        widths; fusion, scales and sharding are all the loader's work. The
+        weight mapper has already renamed the chain to ``mtp_layers.<d>....``,
+        so the same ``_load_weights_impl`` that loads the trunk applies here.
+        """
+        from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
+
+        draft_model = getattr(self, "draft_model", None)
+        mtp_layers = getattr(draft_model, "mtp_layers", None)
+        if not mtp_layers:
+            return
+        built = len(mtp_layers)
+        # The chain arrives under its CHECKPOINT names (``model.mtp.layers.N.``)
+        # and the loader walks the MODULE tree (``mtp_layers.N.``); the mapper
+        # is what turns one into the other. Looking for the mapped names in the
+        # raw dict finds nothing, and "nothing" is a silent success here: every
+        # draft block keeps its initial values, the drafter proposes token 0 on
+        # every step, the target rejects all of it, and speculative decoding
+        # runs at a loss with no error anywhere. Measured before this was fixed:
+        # every weight matrix of the built blocks read absmean 0.0, with the
+        # norms at their init 1.0.
+        mtp_weights = weight_mapper.preprocess_weights(
+            {k: v for k, v in weights.items() if k.startswith("model.mtp.")}
+        )
+        available = {
+            int(k.split("mtp_layers.")[1].split(".")[0])
+            for k in mtp_weights
+            if k.startswith("mtp_layers.")
+        }
+        if not available:
+            logger.warning(
+                "MTP chain built but the checkpoint carries no draft weights; "
+                "the draft blocks stay at their initial values."
+            )
+            return
+        # Hand the loader only the depths that were built: it walks the module
+        # tree, so extra depths would simply go unclaimed, but reporting the
+        # shortfall is what keeps "capped by max_draft_len" from looking like a
+        # loading bug later.
+        depth_weights = {
+            k: v
+            for k, v in mtp_weights.items()
+            if k.startswith("mtp_layers.") and int(k.split("mtp_layers.")[1].split(".")[0]) < built
+        }
+        # ``_load_weights_impl`` reads ``model.model_config`` for the quant and
+        # mapping config it needs to fuse and shard. ``MTPForCausalLM`` keeps
+        # only ``mtp_layers``/``lm_head``/``embed_tokens``, so it is handed the
+        # config the chain was built from -- the same object, not a copy, since
+        # the blocks were constructed with it.
+        if not hasattr(draft_model, "model_config"):
+            draft_model.model_config = self.model_config
+        if not hasattr(draft_model, "config"):
+            # The loader reads ``config.num_key_value_heads`` for ONE purpose:
+            # duplicating KV weights when the head count is below tp_size. The
+            # chain's depths disagree on that count (banded 16, global 8), so a
+            # single value cannot be right for all of them -- it is safe here
+            # only because both counts exceed the tensor-parallel sizes Inkling
+            # runs at. If Inkling is ever run at TP > 8 without attention DP,
+            # this needs the per-depth accessor instead.
+            # ``self.model_config`` is already the TEXT sub-config here (the
+            # causal LM is constructed from it), so no further descent.
+            draft_model.config = self.model_config.pretrained_config
+        _load_weights_impl(draft_model, depth_weights)
+        _assert_draft_chain_loaded(mtp_layers)
+        if len(available) > built:
+            logger.info(
+                f"MTP: built {built} of the checkpoint's {len(available)} draft depths "
+                f"(capped by max_draft_len); the remainder are not loaded."
+            )
 
 
 def _encode_inkling_image_embeds(
@@ -1146,6 +1753,11 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         text decoder. Only context (prefill) requests carry media features;
         decode steps have ``num_contexts == 0`` and pass straight through. A
         text-only request never touches the towers."""
+        # Kept before fusion: ``fuse_input_embeds`` returns input_ids as None,
+        # and the MTP worker needs the token stream. Passed down under
+        # ``orig_input_ids`` (Qwen3-VL / Gemma4-MM use the same key) rather than
+        # threaded as a named argument, so the non-speculative path is untouched.
+        orig_input_ids = input_ids
         inputs_embeds_prenormed = False
         if inputs_embeds is None and (self.visual is not None or self.audio_tower is not None):
             multimodal_params = kwargs.get("multimodal_params", []) or []
@@ -1217,6 +1829,7 @@ class InklingForConditionalGeneration(InklingForCausalLM):
                         ],
                     )
                     inputs_embeds_prenormed = True
+        kwargs.setdefault("orig_input_ids", orig_input_ids)
         return super().forward(
             attn_metadata,
             input_ids=input_ids,
@@ -1306,7 +1919,17 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # the base _load_weights_impl_v2 assumes already-mapped names.
         text_weights = filter_weights("model.llm", weights)
         text_weights = weight_mapper.preprocess_weights(text_weights)
-        super().load_weights(text_weights, weight_mapper=weight_mapper)
+        # Named base rather than ``super()``: InklingForCausalLM.load_weights
+        # would run _load_mtp_weights over ``text_weights``, which has had the
+        # ``model.mtp.*`` keys filtered out -- reporting a missing draft chain
+        # that is in fact right there in ``weights``. The chain is loaded from
+        # the full dict just below instead.
+        #
+        # Not DecoderModelForCausalLM either: the one-engine base's own
+        # load_weights is what passes ``skip_modules=["draft_model"]``, without
+        # which the generic loader tries to bind the chain from trunk weights.
+        SpecDecOneEngineForCausalLM.load_weights(self, text_weights, weight_mapper=weight_mapper)
+        self._load_mtp_weights(weights, weight_mapper)
 
 
 def _text_sub_model_config(

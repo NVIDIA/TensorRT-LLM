@@ -285,7 +285,12 @@ def build_page_table(block_ids_per_seq, max_pages: int, device) -> torch.Tensor:
     batch = len(block_ids_per_seq)
     pt = torch.zeros((batch, max_pages), dtype=torch.int32, device=device)
     for i, blocks in enumerate(block_ids_per_seq):
-        valid = [int(b) for b in blocks if int(b) >= 0]
+        # Cap at max_pages: a caller may pass a token-derived width while the
+        # manager reserved extra blocks (e.g. the speculative KV headroom raised
+        # in InklingHybridCacheManager). Only the first max_pages blocks hold
+        # this batch's tokens -- the rest are reserved-empty -- so cap rather
+        # than overflow the row.
+        valid = [int(b) for b in blocks if int(b) >= 0][:max_pages]
         if valid:
             pt[i, : len(valid)] = torch.tensor(valid, dtype=torch.int32, device=device)
     return pt

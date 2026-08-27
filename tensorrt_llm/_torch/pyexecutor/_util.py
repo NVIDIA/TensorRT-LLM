@@ -2309,6 +2309,22 @@ def _create_kv_cache_manager(
         # Local (sliding-window) layers carry more KV heads than global ones;
         # head_dim is uniform, so only this list varies per layer.
         num_key_value_heads = config.num_kv_heads_per_layer()
+        if is_draft and num_layers is not None:
+            # The draft chain gets its own manager, sized from the CHAIN's
+            # banded/global pattern rather than the trunk's -- they differ, and
+            # on the full checkpoint banded layers carry twice the KV heads.
+            #
+            # The list is indexed by GLOBAL layer index, not by built depth:
+            # V2 sets num_layers = len(layer_mask) (the draft mask is
+            # [False]*trunk + [True]*depths) and reads num_kv_heads[i] for i in
+            # pp_layers. So the chain's entries have to sit at indices
+            # trunk..trunk+depths, which means appending to the trunk's list
+            # rather than replacing it. Passing the chain's list alone is a
+            # length assertion; passing the trunk's alone is the same assertion
+            # from the other side.
+            chain = config.mtp_num_kv_heads_per_layer(num_layers)
+            num_key_value_heads = (num_key_value_heads +
+                                   chain if layer_mask is not None else chain)
     if not isinstance(head_dim, int):
         head_dim = getattr(config, "head_dim", None)
     if not isinstance(head_dim, int):
