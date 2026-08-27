@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_decode_pre_indexer,
+    triton_qsa_paged_index_scores,
     triton_qsa_prefill_compress,
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _query_chunk_size
@@ -179,6 +180,75 @@ def test_qsa_selection_is_causal_and_score_ordered() -> None:
     )
     assert selected[0].tolist() == [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]
     assert selected[1].tolist() == [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1]
+
+
+@pytest.mark.parametrize("rows", [1, 64, 257])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_paged_index_scores_match_reference(rows: int) -> None:
+    torch.manual_seed(42)
+    tokens_per_block = 8
+    compress_ratio = 4
+    pages_per_request = 300
+    num_heads = 4
+    head_dim = 16
+    block_table = (
+        torch.arange(
+            pages_per_request,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        .unsqueeze(0)
+        .expand(rows, -1)
+        .contiguous()
+    )
+    index_cache = torch.randn(
+        pages_per_request,
+        tokens_per_block,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q = torch.randn(
+        rows,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    query_positions = (
+        pages_per_request * tokens_per_block - 1 - torch.arange(rows, device="cuda") % 13
+    )
+    request_indices = torch.arange(
+        rows,
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    actual = triton_qsa_paged_index_scores(
+        q=q,
+        index_cache=index_cache,
+        block_table=block_table,
+        query_positions=query_positions,
+        request_indices=request_indices,
+        tokens_per_block=tokens_per_block,
+        compress_ratio=compress_ratio,
+    )
+
+    max_compressed_blocks = pages_per_request * tokens_per_block // compress_ratio
+    block_indices = torch.arange(max_compressed_blocks, device="cuda")
+    anchor_positions = block_indices * compress_ratio + compress_ratio - 1
+    logical_pages = anchor_positions // tokens_per_block
+    tokens_in_page = anchor_positions % tokens_per_block
+    physical_pages = block_table[:, logical_pages]
+    keys = index_cache[physical_pages, tokens_in_page, 0]
+    expected = torch.einsum("rhd,rbd->rhb", q.float(), keys.float())
+    expected = expected.clamp_min(0).sum(dim=1) * head_dim**-0.5
+    visible = block_indices.unsqueeze(0) < ((query_positions + 1) // compress_ratio).unsqueeze(1)
+    expected = expected.masked_fill(~visible, -float("inf"))
+
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
+    torch.testing.assert_close(actual[visible], expected[visible], rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

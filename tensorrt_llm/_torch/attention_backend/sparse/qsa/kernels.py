@@ -629,51 +629,65 @@ def _qsa_paged_index_scores_kernel(
     MAX_COMPRESSED_BLOCKS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TILES_PER_PROGRAM: tl.constexpr,
 ):
     row = tl.program_id(0)
-    block_columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    head_offsets = tl.arange(0, BLOCK_H)
     dim_offsets = tl.arange(0, INDEX_HEAD_DIM)
+    head_offsets = tl.arange(0, BLOCK_H)
     request = tl.load(request_indices + row).to(tl.int64)
     query_position = tl.load(query_positions + row)
     visible_blocks = (query_position + 1) // COMPRESS_RATIO
-    valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < visible_blocks)
-
-    anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
-    logical_pages = anchor_positions // TOKENS_PER_BLOCK
-    token_in_page = anchor_positions % TOKENS_PER_BLOCK
-    physical_pages = tl.load(
-        block_table
-        + request * block_table_stride_request
-        + logical_pages * block_table_stride_page,
-        mask=valid_blocks,
-        other=0,
-    ).to(tl.int64)
-
     query_values = tl.load(
         q
         + row * q_stride_row
-        + head_offsets[:, None] * q_stride_head
-        + dim_offsets[None, :] * q_stride_dim,
-        mask=(head_offsets < NUM_INDEX_HEADS)[:, None],
+        + dim_offsets[:, None] * q_stride_dim
+        + head_offsets[None, :] * q_stride_head,
+        mask=head_offsets[None, :] < NUM_INDEX_HEADS,
         other=0.0,
     )
-    keys = tl.load(
-        index_cache
-        + physical_pages[None, :] * cache_stride_page
-        + token_in_page[None, :] * cache_stride_token
-        + dim_offsets[:, None] * cache_stride_dim,
-        mask=valid_blocks[None, :],
-        other=0.0,
+
+    first_tile = tl.program_id(1) * TILES_PER_PROGRAM
+    last_tile = tl.minimum(
+        first_tile + TILES_PER_PROGRAM,
+        tl.cdiv(MAX_COMPRESSED_BLOCKS, BLOCK_N),
     )
-    per_head_scores = tl.dot(query_values, keys) * score_scale
-    scores = tl.sum(tl.maximum(per_head_scores, 0.0), axis=0)
-    scores = tl.where(valid_blocks, scores, -float("inf"))
-    tl.store(
-        output + row * output_stride_row + block_columns * output_stride_block,
-        scores,
-        mask=block_columns < MAX_COMPRESSED_BLOCKS,
-    )
+    column_offsets = tl.arange(0, BLOCK_N)
+    for tile in tl.range(first_tile, last_tile, num_stages=2):
+        block_columns = tile * BLOCK_N + column_offsets
+        valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < visible_blocks)
+        anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
+        logical_pages = anchor_positions // TOKENS_PER_BLOCK
+        token_in_page = anchor_positions % TOKENS_PER_BLOCK
+        physical_pages = tl.load(
+            block_table
+            + request * block_table_stride_request
+            + logical_pages * block_table_stride_page,
+            mask=valid_blocks,
+            other=0,
+        ).to(tl.int64)
+        keys = tl.load(
+            index_cache
+            + physical_pages[:, None] * cache_stride_page
+            + token_in_page[:, None] * cache_stride_token
+            + dim_offsets[None, :] * cache_stride_dim,
+            mask=valid_blocks[:, None],
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        per_head_scores = tl.dot(keys, query_values, out_dtype=tl.float32)
+        scores = tl.sum(
+            tl.where(
+                head_offsets[None, :] < NUM_INDEX_HEADS,
+                tl.maximum(per_head_scores, 0.0),
+                0.0,
+            ),
+            axis=1,
+        )
+        tl.store(
+            output + row * output_stride_row + block_columns * output_stride_block,
+            tl.where(valid_blocks, scores * score_scale, -float("inf")),
+            mask=block_columns < MAX_COMPRESSED_BLOCKS,
+        )
 
 
 def triton_qsa_paged_index_scores(
@@ -694,12 +708,16 @@ def triton_qsa_paged_index_scores(
         dtype=torch.float32,
         device=q.device,
     )
-    # Keep single-request decode narrow. Multi-row scoring uses fewer warps so
-    # the wider tile amortizes cache setup without the occupancy regression of
-    # the original 128-wide, 8-warp launch.
-    block_n = 32 if rows == 1 else 128
-    num_warps = 8 if rows == 1 else 4
-    grid = (rows, triton.cdiv(max_compressed_blocks, block_n))
+    # GB300 tuning uses fine-grained parallelism for decode-sized batches and
+    # reuses each query across multiple score tiles for prefill-sized batches.
+    # The 256-row boundary also covers the largest decode CUDA graph.
+    is_prefill_sized = rows > 256
+    block_n = 64 if is_prefill_sized else 32
+    tiles_per_program = 8 if is_prefill_sized else 1
+    grid = (
+        rows,
+        triton.cdiv(max_compressed_blocks, block_n * tiles_per_program),
+    )
     _qsa_paged_index_scores_kernel[grid](
         q,
         index_cache,
@@ -726,8 +744,8 @@ def triton_qsa_paged_index_scores(
         MAX_COMPRESSED_BLOCKS=max_compressed_blocks,
         BLOCK_H=max(16, triton.next_power_of_2(num_index_heads)),
         BLOCK_N=block_n,
-        num_warps=num_warps,
-        num_stages=2,
+        TILES_PER_PROGRAM=tiles_per_program,
+        num_warps=2,
     )
     return output
 
