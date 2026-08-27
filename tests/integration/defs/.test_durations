@@ -1054,7 +1054,6 @@
    "unittest/_torch/modeling -k \"modeling_llama\"": 116.07080075662043,
    "unittest/_torch/modeling -k \"modeling_mixtral\"": 72.60693384223919,
    "unittest/_torch/modeling -k \"modeling_nemotron_nano_v2_vl\"": 421.9780921658986,
-   "unittest/_torch/modeling -k \"modeling_nemotron_nas\"": 42.0892577092511,
    "unittest/_torch/modeling -k \"modeling_out_of_tree\"": 144.867929456112,
    "unittest/_torch/modeling -k \"modeling_phi3\"": 35.700971046770604,
    "unittest/_torch/modeling -k \"modeling_siglip\"": 204.05294545454547,
