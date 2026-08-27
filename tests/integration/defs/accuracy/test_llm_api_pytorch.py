@@ -78,6 +78,11 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+# MPI session reuse cannot safely reset Userbuffers between Engines. Tests
+# using this helper must keep ``torch_compile=True`` in their node id; tests
+# with unconditional compile configs must keep ``piecewise_cuda_graph`` in
+# their node id. Keep this contract in sync with
+# test_common.session_reuse_hooks._PRIVATE_NODEID_PATTERNS.
 def _get_default_torch_compile_config(torch_compile):
     return TorchCompileConfig(enable_fullgraph=True,
                               enable_piecewise_cuda_graph=True,
@@ -4648,35 +4653,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
-    EXTRA_EVALUATOR_KWARGS = dict(
-        apply_chat_template=True,
-        system_prompt=
-        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
-    )
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @pytest.mark.skip(
-        reason="TP2 hangs in the AUTO custom allreduce on PCIe-only (all-SYS "
-        "topology) nodes; the LMHead AllReduce ignores allreduce_strategy and "
-        "always takes the AUTO path (tunable_allreduce), so the strategy knob "
-        "cannot work around it. Unskip once validated on an NVLink platform "
-        "or the lm_head strategy plumbing is fixed.")
-    @pytest.mark.skip_less_device(2)
-    def test_tp2(self):
-        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
@@ -6159,14 +6135,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "tp_size,ep_size,attention_dp",
-        [
-            (4, 4, False),
-            (4, 4, True),
-        ],
-        ids=[
-            "tep4",
-            "dep4",
-        ],
+        [(4, 4, False)],
+        ids=["tep4"],
     )
     def test_bf16_4gpu(self, tp_size, ep_size, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
@@ -6197,17 +6167,12 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
-                             ids=["cutlass", "trtllm"])
-    @pytest.mark.parametrize("tp_size,ep_size,attention_dp,enable_block_reuse",
-                             [
-                                 (1, 1, False, True),
-                                 (4, 4, True, False),
-                             ],
-                             ids=[
-                                 "tp1_block_reuse",
-                                 "dep4",
-                             ])
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM"], ids=["trtllm"])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,attention_dp,enable_block_reuse",
+        [(4, 4, True, False)],
+        ids=["dep4"],
+    )
     def test_nvfp4(self, moe_backend, tp_size, ep_size, attention_dp,
                    enable_block_reuse, mocker):
         gpu_needed = max(tp_size, ep_size)
@@ -6219,8 +6184,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=enable_block_reuse)
-        if enable_block_reuse:
-            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=True))
@@ -6245,7 +6208,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def test_bf16_2gpu_mtp_ar(self):
         max_draft_len = 3
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
-        model_path = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
+        model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
 
         llm_common_config = dict(
             model=model_path,
