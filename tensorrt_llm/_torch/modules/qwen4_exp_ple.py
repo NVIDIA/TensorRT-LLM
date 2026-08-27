@@ -70,9 +70,11 @@ from tensorrt_llm.mapping import Mapping
 
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
 from .qwen4_exp_ple_kernels import (
+    can_use_ple_decode_short_conv,
     can_use_ple_gate_value,
     can_use_ple_ngram_hash,
     can_use_ple_short_conv_state,
+    ple_decode_short_conv,
     ple_gate_value,
     ple_ngram_hash,
     ple_short_conv_state,
@@ -1215,11 +1217,17 @@ class Qwen4ExpPLE(nn.Module):
             generation_output = self._short_conv(x[context_tokens:], generation_meta, conv_state)
             return torch.cat((context_output, generation_output))
 
+        conv_weight = self.conv1d.weight.to(dtype=x.dtype)
+        if m.is_decode and can_use_ple_decode_short_conv(
+            conv_state, m.state_indices, x, conv_weight
+        ):
+            return ple_decode_short_conv(conv_state, m.state_indices, x, conv_weight)
+
         if m.is_decode and can_use_ple_short_conv_state(conv_state, m.state_indices, x):
             conv_input = ple_short_conv_state(conv_state, m.state_indices, x)
             conv_output = F.conv1d(
                 conv_input,
-                self.conv1d.weight.to(dtype=x.dtype),
+                conv_weight,
                 bias=None,
                 dilation=self.short_conv_dilation,
                 groups=self.conv_channels,
@@ -1233,7 +1241,7 @@ class Qwen4ExpPLE(nn.Module):
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         conv_output = F.conv1d(
             conv_input,
-            self.conv1d.weight.to(dtype=x.dtype),
+            conv_weight,
             bias=None,
             dilation=self.short_conv_dilation,
             groups=self.conv_channels,
