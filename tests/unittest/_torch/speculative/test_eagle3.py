@@ -311,23 +311,19 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
                                             device="cuda")
     spec_metadata.runtime_draft_len = 3
     graph_metadata = spec_metadata.create_cuda_graph_metadata(1)
-    assert graph_metadata.context_prompt_lookahead_tokens.shape == (1, 3)
+    assert graph_metadata.context_prompt_lookahead_tokens.shape == (1, )
     assert (graph_metadata.context_prompt_lookahead_tokens.data_ptr()
             != spec_metadata.context_prompt_lookahead_tokens.data_ptr())
     assert torch.all(graph_metadata.context_prompt_lookahead_tokens == invalid)
 
-    # The first row is an intermediate chunk and has prompt lookahead. The
-    # second row is the final chunk and must retain the sampled-token fallback.
-    spec_metadata.populate_context_prompt_lookahead([[0, 14, 15], [22]])
+    # Seed both rows with stale values, including token ID zero, then clear the
+    # final-chunk row with the sentinel below.
+    spec_metadata.populate_context_prompt_lookahead([0, 22])
     torch.testing.assert_close(
         spec_metadata.context_prompt_lookahead_tokens[:2],
-        torch.tensor(
-            [[0, 14, 15], [22, invalid, invalid]],
-            dtype=torch.int32,
-            device="cuda",
-        ),
+        torch.tensor([0, 22], dtype=torch.int32, device="cuda"),
     )
-    spec_metadata.populate_context_prompt_lookahead([[0, 14, 15], []])
+    spec_metadata.populate_context_prompt_lookahead([0, invalid])
 
     worker = MTPEagleWorker(spec_config)
     draft_inputs = worker.prepare_1st_drafter_inputs(
@@ -353,11 +349,7 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
     )
     torch.testing.assert_close(
         spec_metadata.context_prompt_lookahead_tokens[:2],
-        torch.tensor(
-            [[0, 14, 15], [invalid] * 3],
-            dtype=torch.int32,
-            device="cuda",
-        ),
+        torch.tensor([0, invalid], dtype=torch.int32, device="cuda"),
     )
 
 
@@ -366,7 +358,7 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
     worker = object.__new__(MTPEagleDynamicTreeWorker)
     lookahead_tokens = torch.tensor(
-        [[13, 14, 15], [invalid] * 3],
+        [13, invalid],
         dtype=torch.int32,
         device="cuda",
     )

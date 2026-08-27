@@ -79,6 +79,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
@@ -109,13 +110,12 @@ from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
 
-def _get_context_prompt_lookahead_tokens(request: LlmRequest, chunk_end: int,
-                                         max_lookahead: int) -> List[int]:
-    """Read prompt tokens immediately following the current context chunk."""
-    lookahead_end = min(chunk_end + max_lookahead, request.py_prompt_len)
-    if lookahead_end <= chunk_end:
-        return []
-    return request.get_tokens_range(0, chunk_end, lookahead_end)
+def _get_context_prompt_lookahead_token(request: LlmRequest,
+                                        chunk_end: int) -> int:
+    """Read the prompt token immediately following a context chunk."""
+    if chunk_end >= request.py_prompt_len:
+        return INVALID_PROMPT_LOOKAHEAD_TOKEN
+    return request.get_token(0, chunk_end)
 
 
 def _make_single_token_context_graph_batch(
@@ -5536,10 +5536,8 @@ class PyTorchModelEngine(ModelEngine):
         first_draft_input_ids_positions = []
 
         context_prompt_lookahead = None
-        context_prompt_lookahead_buffer = (
-            spec_metadata.context_prompt_lookahead_tokens
-            if spec_metadata is not None else None)
-        if context_prompt_lookahead_buffer is not None:
+        if (spec_metadata is not None
+                and spec_metadata.context_prompt_lookahead_tokens is not None):
             context_prompt_lookahead = []
 
         def append_cross_attention_state(request: LlmRequest,
@@ -5580,11 +5578,7 @@ class PyTorchModelEngine(ModelEngine):
             end_compute = begin_compute + request.context_chunk_size
             if context_prompt_lookahead is not None:
                 context_prompt_lookahead.append(
-                    _get_context_prompt_lookahead_tokens(
-                        request,
-                        end_compute,
-                        context_prompt_lookahead_buffer.shape[1],
-                    ))
+                    _get_context_prompt_lookahead_token(request, end_compute))
             # Fetch only the current chunk. get_tokens(0) marshals the whole
             # O(seq_len) VecTokens into a Python list of boxed ints; chunked
             # prefill re-enters this loop for every chunk of the same prompt, so
@@ -6917,7 +6911,8 @@ class PyTorchModelEngine(ModelEngine):
                 # No-cache context inputs contain the complete prompt, so
                 # there is never a valid token beyond the current chunk.
                 spec_metadata.populate_context_prompt_lookahead(
-                    [[] for _ in scheduled_requests.context_requests])
+                    [INVALID_PROMPT_LOOKAHEAD_TOKEN] *
+                    len(scheduled_requests.context_requests))
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

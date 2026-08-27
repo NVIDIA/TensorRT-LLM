@@ -19,7 +19,8 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
+                        SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -857,6 +858,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             sequence_lengths=attn_metadata.seq_lens_cuda[:batch_size],
             num_contexts=num_contexts,
             batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
+            prompt_lookahead_tokens=(
+                spec_metadata.context_prompt_lookahead_tokens),
         )
 
         draft_metadata = attn_metadata.get_draft_metadata()
@@ -1392,6 +1395,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         sequence_lengths: torch.Tensor,
         num_contexts: int,
         batch_indices: torch.Tensor,
+        prompt_lookahead_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select the accepted token, hidden row, and fixed draft position."""
         sequence_starts = torch.cumsum(
@@ -1402,6 +1406,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_accepted_tokens[num_contexts:] - 1)
         draft_input_ids = accepted_tokens[batch_indices,
                                           num_accepted_tokens - 1]
+        context_lookahead = prompt_lookahead_tokens[:num_contexts]
+        draft_input_ids[:num_contexts].copy_(
+            torch.where(
+                context_lookahead != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+                context_lookahead,
+                draft_input_ids[:num_contexts],
+            ))
         recurrent_hidden_states = hidden_states[recurrent_indices]
         draft_position_ids = (
             _select_mtp_position_ids(position_ids, recurrent_indices) + 1)

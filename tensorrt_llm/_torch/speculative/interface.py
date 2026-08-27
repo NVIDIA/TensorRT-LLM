@@ -460,14 +460,9 @@ class SpecMetadata:
     draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
     draft_lens: Optional[torch.Tensor] = None
-    # Prompt tokens immediately following each context request's current
-    # chunk. The fixed-width, batch-ordered buffers are populated by the model
-    # engine and do not depend on either KV cache manager implementation.
-    #
-    # Shape: [max_num_requests, max_draft_len]. A consumer may use as many
-    # columns as its physical draft layers require. MTP Eagle currently uses
-    # only column 0 because it repeatedly executes one physical MTP layer.
-    # Unused positions contain INVALID_PROMPT_LOOKAHEAD_TOKEN.
+    # Immediate prompt token following each context request's current chunk.
+    # Shape: [max_num_requests]. Final-chunk rows contain
+    # INVALID_PROMPT_LOOKAHEAD_TOKEN.
     context_prompt_lookahead_tokens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
@@ -681,17 +676,17 @@ class SpecMetadata:
         pass
 
     def allocate_context_prompt_lookahead(self) -> None:
-        """Allocate CUDA-graph-stable prompt lookahead buffers."""
+        """Allocate a CUDA-graph-stable prompt lookahead buffer."""
         self.context_prompt_lookahead_tokens = torch.full(
-            (self.max_num_requests, self.max_draft_len),
+            (self.max_num_requests, ),
             INVALID_PROMPT_LOOKAHEAD_TOKEN,
             dtype=torch.int32,
             device="cuda",
         )
 
-    def populate_context_prompt_lookahead(
-            self, lookahead_tokens: List[List[int]]) -> None:
-        """Populate prompt lookahead for the context rows of this batch."""
+    def populate_context_prompt_lookahead(self,
+                                          lookahead_tokens: List[int]) -> None:
+        """Populate immediate prompt lookahead for this batch's context rows."""
         if self.context_prompt_lookahead_tokens is None:
             return
 
@@ -703,15 +698,8 @@ class SpecMetadata:
                 f"Context batch size {num_contexts} exceeds prompt lookahead "
                 f"capacity {self.context_prompt_lookahead_tokens.shape[0]}")
 
-        width = self.context_prompt_lookahead_tokens.shape[1]
-        valid_lens = [min(len(tokens), width) for tokens in lookahead_tokens]
-        padded_tokens = [
-            tokens[:valid_len] + [INVALID_PROMPT_LOOKAHEAD_TOKEN] *
-            (width - valid_len)
-            for tokens, valid_len in zip(lookahead_tokens, valid_lens)
-        ]
         tokens_cpu = torch.tensor(
-            padded_tokens,
+            lookahead_tokens,
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
@@ -2665,8 +2653,8 @@ class SpecWorkerBase(nn.Module, ABC):
             gather_ids: Indices for placing accepted tokens (last token positions)
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
             num_contexts: Number of context requests
-            prompt_lookahead_tokens: Optional prompt tokens following
-                each current context chunk.
+            prompt_lookahead_tokens: Optional immediate prompt token following
+                each current context chunk. Shape: [max_num_requests].
 
         Returns:
             input_ids_ctx: Prepared context input IDs
@@ -2679,7 +2667,7 @@ class SpecWorkerBase(nn.Module, ABC):
             input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
             context_tail_tokens = accepted_tokens[:num_contexts, 0]
             if prompt_lookahead_tokens is not None:
-                lookahead_tokens = prompt_lookahead_tokens[:num_contexts, 0]
+                lookahead_tokens = prompt_lookahead_tokens[:num_contexts]
                 context_tail_tokens = torch.where(
                     lookahead_tokens != INVALID_PROMPT_LOOKAHEAD_TOKEN,
                     lookahead_tokens,
