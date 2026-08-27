@@ -89,6 +89,21 @@ def is_hybrid_linear(config):
         is_kimi_linear(config)
 
 
+# Added for Inkling KV cache block reuse: a reuse hit can only land where a
+# snapshot exists, so the chunking policy has to be able to end an iteration
+# there. Consumed by py_executor_creator to select FORCE_CHUNK.
+def needs_block_aligned_context_chunks(config) -> bool:
+    """True for models that snapshot per-request recurrent state for reuse.
+
+    Named for the property, not the model family: a reuse hit can only land
+    where a snapshot exists, and only the chunking policy decides where
+    iterations -- and therefore snapshots -- may end. Inkling qualifies without
+    being a Mamba model, so it is not folded into ``is_hybrid_linear``, which
+    would also route it through Mamba conv-state layouts it cannot satisfy.
+    """
+    return is_hybrid_linear(config) or is_inkling(config)
+
+
 def is_kimi_linear(config):
     """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
 
@@ -147,6 +162,62 @@ def get_kimi_linear_layer_masks(config):
 def get_kimi_linear_num_attention_layers(config):
     full_mask, _ = get_kimi_linear_layer_masks(config)
     return sum(full_mask)
+
+
+def is_inkling(config):
+    """True for the Inkling checkpoint (top-level multimodal or text sub-config).
+
+    Inkling is a RoPE-free hybrid-attention decoder whose local (sliding-window)
+    layers carry 16 KV heads and global layers 8, so the paged KV cache needs the
+    per-layer ``num_kv_heads`` geometry that only ``KVCacheManagerV2`` allocates.
+    Accepts either the top-level ``inkling_mm_model`` config (runtime model
+    registration) or the ``inkling_text`` sub-config (the text tower the KV cache
+    is actually sized from).
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type in ("inkling_mm_model", "inkling_text"):
+        return True
+    text_config = getattr(config, "text_config", None)
+    return getattr(text_config, "model_type", None) == "inkling_text"
+
+
+def reject_unsupported_inkling_kv_cache_features(
+        config,
+        *,
+        enable_block_reuse: bool,
+        enable_cache_transceiver: bool = False,
+        periodic_snapshot_interval: int = 0):
+    """Warn on / refuse the Inkling-specific KV-cache feature interactions.
+
+    Block reuse without a snapshot policy is warned-and-auto-disabled upstream in
+    ``_validate_and_adjust_mamba_snapshot_config`` (shared with the Mamba family),
+    so reuse reaches here only with a snapshot -- whose one caveat is multimodal.
+    Disaggregated serving is refused: the short-conv windows are per-request
+    recurrent state with a mixed layout (k/v TP-sharded, residual-stream
+    replicated) that the KV-cache transfer path does not move. Chunked prefill
+    is served.
+    """
+    if not is_inkling(config):
+        return
+    if enable_block_reuse and periodic_snapshot_interval:
+        # Proactive startup notice: the manager's equivalent warning only fires
+        # once a multimodal request actually arrives.
+        logger.warning(
+            "Inkling: KV cache block reuse applies to text prompts only. "
+            "Multimodal requests get a private reuse chain and never reuse -- "
+            "Inkling emits no content hashes, so a prefix matched on placeholder "
+            "token ids alone would serve one item's KV for another's. They still "
+            "run, uncached.")
+    if enable_cache_transceiver:
+        # _util.py refuses the C++ route for every V2 manager; KvCacheTransceiverV2
+        # is not, but would move the paged KV and leave the conv windows behind.
+        raise NotImplementedError(
+            "Inkling does not support disaggregated serving. Its per-request "
+            "short-conv windows are recurrent state, not paged KV, with a mixed "
+            "layout -- k/v convs TP-sharded, residual-stream convs replicated. "
+            "The KV-cache transfer path does not move them, so decode would "
+            "resume from windows that were never transferred and emit wrong "
+            "output. Unset cache_transceiver_config to run Inkling.")
 
 
 def _coerce_torch_dtype(dtype):
@@ -614,6 +685,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
     laguna="LagunaConfig",
+    inkling_mm_model="InklingConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 

@@ -46,8 +46,8 @@ from ..modules.fused_moe.moe_load_balancer import (
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
-                           resolve_ssm_cache_dtype)
+from .config_utils import (is_hybrid_linear, is_inkling,
+                           resolve_hf_torch_dtype, resolve_ssm_cache_dtype)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -83,8 +83,14 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
                                                llm_args: TorchLlmArgs) -> None:
-    """Validate snapshot reuse after the model and V2 setting are resolved."""
-    if not is_hybrid_linear(config.pretrained_config):
+    """Validate snapshot reuse after the model and V2 setting are resolved.
+
+    Covers every model whose reuse depends on snapshotting per-request recurrent
+    state a reused prefix never computed: the Mamba/linear family, and Inkling's
+    short-conv windows.
+    """
+    if not (is_hybrid_linear(config.pretrained_config)
+            or is_inkling(config.pretrained_config)):
         return
 
     kv_cache_config = llm_args.kv_cache_config
@@ -103,8 +109,9 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
     if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
             and not has_additional_snapshots):
         logger.warning(
-            "Disabling KV cache block reuse for the hybrid Mamba model "
-            "because no Mamba state snapshot policy is configured. Set "
+            "Disabling KV cache block reuse: this model carries per-request "
+            "recurrent state (Mamba SSM or short-conv windows) that a reused "
+            "prefix never computed, and no snapshot policy is configured. Set "
             "kv_cache_config.mamba_state_config.periodic_snapshot_interval "
             "to a positive value or provide additional snapshot offsets to "
             "enable block reuse.")
