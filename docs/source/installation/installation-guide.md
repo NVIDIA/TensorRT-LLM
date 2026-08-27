@@ -104,7 +104,7 @@ pip3 index versions tensorrt_llm --pre \
 Choose a version from the list and install it explicitly:
 
 ```bash
-pip3 install --pre "tensorrt_llm==<version-from-the-list>" \
+pip3 install "tensorrt_llm==<version-from-the-list>" \
     --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 ```
 

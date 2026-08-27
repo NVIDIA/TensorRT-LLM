@@ -134,6 +134,7 @@ COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt co
 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
+ARG GIT_COMMIT
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
@@ -141,7 +142,9 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     if [ -n "$GITHUB_MIRROR" ]; then \
       export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
+    GITHUB_MIRROR=${GITHUB_MIRROR} \
+    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
