@@ -37,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 
 class _BounceProbe:
@@ -549,6 +550,84 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
 
 @pytest.mark.cpu_only
+def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
+    rid = 94
+    receiver = object.__new__(Receiver)
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = set()
+    receiver._bounce = _BounceProbe()
+    receiver._enforce_physical_ownership = True
+    receiver._shutdown = True
+    receiver_req = SimpleNamespace(
+        unique_rid=rid,
+        slice_id=0,
+        bounce_dst_base=None,
+        to_bytes=Mock(return_value=b"receiver-request"),
+    )
+    receiver._build_recv_req_info = Mock(return_value=receiver_req)
+    overlaps = {
+        0: SimpleNamespace(ranks=[0, 1]),
+        1: SimpleNamespace(ranks=[2, 3]),
+    }
+    receiver._registrar = SimpleNamespace(
+        get_peer_overlap=Mock(side_effect=lambda _peer, dp_rank: overlaps[dp_rank]),
+        self_extractor=SimpleNamespace(page_table=None),
+        self_rank_info=SimpleNamespace(
+            cp_size=1,
+            instance_name="gen",
+            instance_rank=0,
+        ),
+    )
+    receiver._get_sender_info = Mock(
+        return_value=SimpleNamespace(
+            sender_endpoints={rank: f"tcp://sender-{rank}" for rank in range(4)},
+            page_table=None,
+            dp_size=2,
+            cp_size=1,
+        )
+    )
+    receiver._request_sender_data = Mock()
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(
+            disagg_request_id=rid,
+            ctx_dp_rank=None,
+            schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+        ),
+        receiver=receiver,
+    )
+    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    assert task is not None
+
+    session.dispatch_prepared_receive(task)
+
+    assert task.expected_transfers == 2
+    assert {call.args[0] for call in receiver._request_sender_data.call_args_list} == {
+        f"tcp://sender-{rank}" for rank in range(4)
+    }
+    assert receiver._request_sender_data.call_count == 4
+    session.process_kv_agent_result(
+        peer_rank=2,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.FAILED,
+    )
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert not task.resources_drained
+
+    session.process_kv_agent_result(
+        peer_rank=3,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.SUCCESS,
+    )
+    assert task.resources_drained
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert session.close() is True
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("writer_settles_before_failure", [False, True])
 def test_partial_bounced_publication_waits_for_queued_writer_success(
     monkeypatch: pytest.MonkeyPatch,
@@ -1020,7 +1099,7 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
         close=Mock(return_value=True),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._shutdown = False
+    transceiver._shutdown_complete = False
     transceiver._wait_reqs = {}
     transceiver._send_sessions = {}
     transceiver._send_reqs = {}
@@ -1031,7 +1110,7 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     with pytest.raises(RuntimeError, match="physical resources remain active"):
         transceiver.shutdown()
 
-    assert not transceiver._shutdown
+    assert not transceiver._shutdown_complete
     assert transceiver._recv_sessions[rid] is session
     session.close.assert_not_called()
     transceiver._transfer_worker.shutdown.assert_not_called()
@@ -1039,7 +1118,7 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     session.resources_drained.return_value = True
     transceiver.shutdown()
 
-    assert transceiver._shutdown
+    assert transceiver._shutdown_complete
     assert transceiver._recv_sessions == {}
     session.close.assert_called_once_with()
     transceiver._transfer_worker.shutdown.assert_called_once_with()
@@ -1055,7 +1134,7 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
         close=Mock(return_value=False),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._shutdown = False
+    transceiver._shutdown_complete = False
     transceiver._send_sessions = {rid + 1: send_session}
     transceiver._send_reqs = {rid + 1: object()}
     transceiver._recv_sessions = {rid: recv_session}
@@ -1065,7 +1144,7 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     with pytest.raises(RuntimeError, match="session close refused"):
         transceiver.shutdown()
 
-    assert not transceiver._shutdown
+    assert not transceiver._shutdown_complete
     assert transceiver._recv_sessions == {rid: recv_session}
     assert transceiver._send_sessions == {rid + 1: send_session}
     send_session.close.assert_not_called()
@@ -1074,7 +1153,7 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     recv_session.close.return_value = True
     transceiver.shutdown()
 
-    assert transceiver._shutdown
+    assert transceiver._shutdown_complete
     assert transceiver._recv_sessions == {}
     assert transceiver._send_sessions == {}
     send_session.close.assert_called_once_with()

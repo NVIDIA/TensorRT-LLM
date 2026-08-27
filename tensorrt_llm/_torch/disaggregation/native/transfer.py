@@ -2129,10 +2129,17 @@ class Receiver(ReceiverBase):
                     published_writers.discard(rank)
                     raise
 
+        # Gen-first ADP publishes the destination to every eligible DP group,
+        # but the qualified immutable-request, no-retry/no-reroute profile
+        # admits exactly one group. Track that group's distinct terminal
+        # writers by count instead of sealing the full broadcast union.
+        writer_cohort = (
+            set(peer_ranks) if sender_dp_rank is not None or peer_infos.dp_size == 1 else None
+        )
         if not session.try_begin_transfer(
             task.slice_id,
             sender_endpoints,
-            set(peer_ranks),
+            writer_cohort,
             publish=publish_requests,
             published_writers=published_writers,
         ):

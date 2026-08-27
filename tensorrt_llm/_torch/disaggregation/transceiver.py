@@ -86,6 +86,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
+        self._shutdown_complete = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
@@ -257,8 +258,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     def shutdown(self) -> None:
-        if getattr(self, "_shutdown", False):
+        if getattr(self, "_shutdown_complete", False):
             return
+        # This flag records completed teardown, not an attempted shutdown. If
+        # an active owner refuses closure, leave it false so shutdown can be
+        # retried after the physical operation drains.
         # Close receive owners before touching send-side or worker state. The
         # separate drain snapshot would not be sufficient: late evidence can make an
         # owner unretirable before close() acquires its lock.
@@ -271,7 +275,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions.clear()
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
-        self._shutdown = True
+        self._shutdown_complete = True
 
     def __enter__(self):
         return self
