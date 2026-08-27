@@ -327,7 +327,7 @@ def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(moe_lora_mode: s
     """
     cuda_graph_config = CudaGraphConfig(max_batch_size=10) if moe_lora_mode == "cudagraph" else None
 
-    model_dir = f"{llm_models_root()}/Mistral-Small-4-119B-2603"
+    model_dir = f"{llm_models_root()}/Mistral-Small-4-119B-2603/Mistral-Small-4-119B-2603"
 
     ranks = _RANKS
     max_rank = max(ranks)
