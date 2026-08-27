@@ -81,17 +81,28 @@ def _qsa_decode_token_mapping_kernel(
     seq_lens,
     request_indices,
     logical_positions,
+    sequence_lengths,
+    visible_blocks,
     num_rows,
+    COMPRESS_RATIO: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     valid = offsets < num_rows
-    cached_lens = tl.load(kv_lens + offsets, mask=valid) - tl.load(
+    kv_len = tl.load(kv_lens + offsets, mask=valid, other=0)
+    cached_lens = kv_len - tl.load(
         seq_lens + offsets,
         mask=valid,
+        other=0,
     )
     tl.store(request_indices + offsets, offsets, mask=valid)
     tl.store(logical_positions + offsets, cached_lens.to(tl.int64), mask=valid)
+    tl.store(sequence_lengths + offsets, kv_len, mask=valid)
+    tl.store(
+        visible_blocks + offsets,
+        ((cached_lens + 1) // COMPRESS_RATIO).to(tl.int32),
+        mask=valid,
+    )
 
 
 def triton_qsa_decode_token_mapping(
@@ -100,6 +111,9 @@ def triton_qsa_decode_token_mapping(
     seq_lens: torch.Tensor,
     request_indices: torch.Tensor,
     logical_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    compress_ratio: int,
 ) -> None:
     """Build request and position metadata for one-token-per-request decode."""
     rows = kv_lens.numel()
@@ -107,12 +121,18 @@ def triton_qsa_decode_token_mapping(
         return
     if seq_lens.numel() != rows:
         raise ValueError("QSA decode KV and sequence lengths must have matching shapes")
-    if request_indices.numel() < rows or logical_positions.numel() < rows:
+    outputs = (
+        request_indices,
+        logical_positions,
+        sequence_lengths,
+        visible_blocks,
+    )
+    if any(output.numel() < rows for output in outputs):
         raise ValueError("QSA decode token-mapping outputs are too small")
-    if not all(
-        tensor.is_cuda for tensor in (kv_lens, seq_lens, request_indices, logical_positions)
-    ):
+    if not all(tensor.is_cuda for tensor in (kv_lens, seq_lens, *outputs)):
         raise ValueError("QSA decode token mapping requires CUDA tensors")
+    if compress_ratio <= 0:
+        raise ValueError(f"QSA compression ratio must be positive, got {compress_ratio}")
 
     # One fixed specialization covers all decode graph batch sizes. It avoids
     # cold-start compilation per graph shape and is faster even for small rows.
@@ -122,7 +142,10 @@ def triton_qsa_decode_token_mapping(
         seq_lens,
         request_indices,
         logical_positions,
+        sequence_lengths,
+        visible_blocks,
         rows,
+        COMPRESS_RATIO=compress_ratio,
         BLOCK_SIZE=block_size,
         num_warps=4,
     )

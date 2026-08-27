@@ -210,12 +210,17 @@ def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
     kv_lens = torch.arange(17, 17 + rows, dtype=torch.int32, device="cuda")
     request_indices = torch.empty(rows, dtype=torch.int32, device="cuda")
     logical_positions = torch.empty(rows, dtype=torch.int64, device="cuda")
+    sequence_lengths = torch.empty(rows, dtype=torch.int32, device="cuda")
+    visible_blocks = torch.empty(rows, dtype=torch.int32, device="cuda")
 
     triton_qsa_decode_token_mapping(
         kv_lens=kv_lens,
         seq_lens=seq_lens,
         request_indices=request_indices,
         logical_positions=logical_positions,
+        sequence_lengths=sequence_lengths,
+        visible_blocks=visible_blocks,
+        compress_ratio=4,
     )
 
     torch.testing.assert_close(
@@ -223,6 +228,8 @@ def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
         torch.arange(rows, dtype=torch.int32, device="cuda"),
     )
     torch.testing.assert_close(logical_positions, (kv_lens - seq_lens).to(torch.int64))
+    torch.testing.assert_close(sequence_lengths, kv_lens)
+    torch.testing.assert_close(visible_blocks, ((kv_lens - seq_lens + 1) // 4))
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])

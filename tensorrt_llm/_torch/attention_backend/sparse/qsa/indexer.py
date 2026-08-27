@@ -758,6 +758,7 @@ def select_qsa_paged_tokens(
     top_k: TopK | None = None,
     top_k_output: torch.Tensor | None = None,
     top_k_row_starts: torch.Tensor | None = None,
+    visible_blocks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select tokens with packed, fixed-width paged scoring."""
     from .kernels import triton_qsa_paged_index_scores
@@ -775,7 +776,8 @@ def select_qsa_paged_tokens(
         if top_k_output is None or top_k_row_starts is None:
             raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
         indices = top_k_output[: q.shape[0]]
-        visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
+        if visible_blocks is None:
+            visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
         top_k(
             logits,
             indices,

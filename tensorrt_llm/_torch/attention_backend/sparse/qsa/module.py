@@ -82,7 +82,7 @@ class QSASparseHooks(AttentionSparseHooks):
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")
         req_idx = attn_metadata.qsa_req_idx_per_token[:num_tokens]
         logical = attn_metadata.qsa_logical_positions[:num_tokens]
-        sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
+        sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]
         selected = select_qsa_paged_tokens(
             q_index,
             index_cache,
@@ -94,6 +94,7 @@ class QSASparseHooks(AttentionSparseHooks):
             top_k=attention.indexer.top_k,
             top_k_output=attn_metadata.qsa_topk_indices,
             top_k_row_starts=attn_metadata.qsa_topk_row_starts,
+            visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
         )
         return _QSAIndexResult(q_index=q_index, selected_tokens=selected)
 
@@ -289,7 +290,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 precomputed.selected_tokens if isinstance(precomputed, _QSAIndexResult) else None
             )
             if selected is None:
-                sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
+                sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]
                 selected = select_qsa_paged_tokens(
                     q_index,
                     index_cache,
@@ -301,6 +302,7 @@ class QSASparseHooks(AttentionSparseHooks):
                     top_k=attention.indexer.top_k,
                     top_k_output=attn_metadata.qsa_topk_indices,
                     top_k_row_starts=attn_metadata.qsa_topk_row_starts,
+                    visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
                 )
             output = qsa_sparse_gqa(
                 q=q,
@@ -316,7 +318,7 @@ class QSASparseHooks(AttentionSparseHooks):
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")
-        sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
+        sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]
         score_columns = (
             attn_metadata.qsa_block_table.shape[1] * tokens_per_block // params.compress_ratio
         )
@@ -336,6 +338,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k=attention.indexer.top_k,
                 top_k_output=attn_metadata.qsa_topk_indices[packed_slice],
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts[packed_slice],
+                visible_blocks=attn_metadata.qsa_visible_blocks[packed_slice],
             )
             output[packed_slice] = qsa_sparse_gqa(
                 q=q[packed_slice],

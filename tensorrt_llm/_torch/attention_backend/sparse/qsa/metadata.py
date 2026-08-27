@@ -63,6 +63,20 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int64,
             capture_graph=capture_graph,
         )
+        self.qsa_sequence_lengths = self.get_empty(
+            buffers,
+            (self.max_num_tokens,),
+            cache_name="qsa_sequence_lengths",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.qsa_visible_blocks = self.get_empty(
+            buffers,
+            (self.max_num_tokens,),
+            cache_name="qsa_visible_blocks",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         self._qsa_token_arange = self.get_empty(
             buffers,
             (self.max_num_tokens,),
@@ -115,6 +129,9 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
                 seq_lens=seq_lens,
                 request_indices=self.qsa_req_idx_per_token[:num_tokens],
                 logical_positions=self.qsa_logical_positions[:num_tokens],
+                sequence_lengths=self.qsa_sequence_lengths[:num_tokens],
+                visible_blocks=self.qsa_visible_blocks[:num_tokens],
+                compress_ratio=self.sparse_metadata_params.compress_ratio,
             )
             return
         torch.cumsum(
@@ -136,6 +153,10 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         )
         logical = cached_lens[req_idx] + token_ids - seq_starts[req_idx]
         self.qsa_logical_positions[:num_tokens].copy_(logical)
+        self.qsa_sequence_lengths[:num_tokens].copy_(self.kv_lens_cuda_runtime[:num_seqs][req_idx])
+        self.qsa_visible_blocks[:num_tokens].copy_(
+            ((logical + 1) // self.sparse_metadata_params.compress_ratio).to(torch.int32)
+        )
 
     def _refresh_qsa_block_table(self) -> None:
         num_seqs = self.num_seqs
