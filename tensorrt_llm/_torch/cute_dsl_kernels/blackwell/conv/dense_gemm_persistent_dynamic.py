@@ -13,35 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-# Adapted from dlarch-fastkernels/dynamic-kernel-generator!20906 for TensorRT-LLM.
 # ruff: noqa: E501, E741
-
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
 from functools import lru_cache
@@ -1642,9 +1614,7 @@ class PersistentDenseGemmKernel:
                 raise testing.CantImplementError(
                     f"Problem shape {m}, {n} must be divisible by cta tile shape {cta_tile_shape_mn} for non TMA store"
                 )
-            # {$nv-internal-release begin}
             # Make sure the swizzle size divides the cta/cga count since non TMA epilouge don't support OOB tiles.
-            # {$nv-internal-release end}
             # CTA swizzling improves the L2 cache utilization and reduces the number of cache misses.
             m_per_swizzle = (m // cta_tile_shape_mn[0]) // self.cluster_shape_mn[0]
             n_per_swizzle = (n // cta_tile_shape_mn[1]) // self.cluster_shape_mn[1]
@@ -2061,9 +2031,6 @@ def run(
     return exec_time
 
 
-# {$nv-internal-release begin}
-
-
 def benchmark_nsight(
     ab_dtype: Type[cutlass.Numeric],
     c_dtype: Type[cutlass.Numeric],
@@ -2144,9 +2111,6 @@ def benchmark_nsight(
     _details()
 
 
-# {$nv-internal-release end}
-
-
 def _parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
     try:
         return tuple(int(x.strip()) for x in s.split(","))
@@ -2178,9 +2142,7 @@ def prepare_parser():
         type=str,
         default="default",
         choices=[
-            # {$nv-internal-release begin}
             "nsight",
-            # {$nv-internal-release end}
             "default",
             "none",
         ],
@@ -2274,7 +2236,6 @@ if __name__ == "__main__":
     print(f"[DSL INFO] Use TMA Store: {'True' if args.use_tma_store else 'False'}")
     print(f"[DSL INFO] Cluster Split-K: {args.cluster_split_k}")
 
-    # {$nv-internal-release begin}
     if args.benchmark == "nsight":
         benchmark_nsight(
             args.ab_dtype,
@@ -2289,7 +2250,6 @@ if __name__ == "__main__":
             args.use_tma_store,
         )
         exit(0)
-    # {$nv-internal-release end}
 
     run(
         args.mnkl,
