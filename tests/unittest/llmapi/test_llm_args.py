@@ -954,7 +954,7 @@ def test_KvCacheConfig_requires_v2_for_branch_snapshots():
 def test_KvCacheConfig_keeps_branch_snapshots_under_per_conversation():
     """per_conversation zeroes the periodic interval but not this flag."""
     config = KvCacheConfig(
-        block_reuse_policy="per_conversation",
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=64,
             enable_branch_snapshot=True,

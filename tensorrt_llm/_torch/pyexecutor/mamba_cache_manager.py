@@ -3355,7 +3355,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._recurrent_dropped_blocks_total += dropped_blocks
         if (self.mapping.rank == 0
                 and (has_movement or not self._recurrent_status_logged)):
-            logger.info(
+            logger.debug(
                 f"[MambaHybridCacheManagerV2] recurrent cache status "
                 f"rank={self.mapping.rank} pool_group_ids={pool_group_ids} "
                 f"evicted_recurrent_blocks={evicted_blocks} "
