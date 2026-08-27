@@ -24,6 +24,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -668,6 +669,77 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
+# Ports reserved for multi-frontend servers. Module-level so a reservation is
+# never garbage-collected: closing the socket would release the port and reopen
+# the very race the reservation exists to close.
+_RESERVED_PORT_SOCKETS: List[socket.socket] = []
+
+
+def reserve_multi_frontend_port(host: str) -> int:
+    """Reserve a port for a server that runs several HTTP frontends.
+
+    trtllm-serve rejects port 0 / --report_addr when num_serve_frontends > 1:
+    the extra frontends re-exec the command line verbatim, so with port 0 each
+    would bind its *own* kernel-assigned port instead of sharing one, and each
+    would republish its address, leaving the reader with whichever wrote last.
+    The port therefore has to be chosen on this side.
+
+    Choosing it by binding and closing would reopen exactly the window the port-0
+    scheme was introduced to remove -- anything on the node could take the port
+    between the probe and the server's bind. So the socket stays bound instead.
+    In multi-frontend mode every frontend binds with SO_REUSEPORT (see
+    launch_server), and Linux lets same-uid SO_REUSEPORT sockets share a port
+    provided the *first* binder set the flag, which this one does. So the
+    reservation is transparent to the server while still refusing a plain bind()
+    from any unrelated process on the node.
+
+    The socket is deliberately never listen()ed: only *listening* SO_REUSEPORT
+    sockets join the kernel's accept load-balancing group, so a bound-only socket
+    holds the port without ever swallowing a request.
+    """
+    # Mirror launch_server's family choice; a reservation in a different address
+    # family than the server's bind would not share the port.
+    addr_info = socket.getaddrinfo(host, 0, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    family = (
+        socket.AF_INET6
+        if addr_info and all(info[0] == socket.AF_INET6 for info in addr_info)
+        else socket.AF_INET
+    )
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind((host, 0))
+    port = sock.getsockname()[1]
+    _RESERVED_PORT_SOCKETS.append(sock)
+    print_info(f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT socket)")
+    return port
+
+
+def publish_addr_file(path: str, host: str, port: int) -> None:
+    """Write "host:port" to *path* the way trtllm-serve's --report_addr does.
+
+    Used when this side picked the port (multi-frontend), so the disagg server's
+    hostname-file reader needs no special case. The write is atomic
+    (temp file in the same directory, then rename) with a ".tmp" suffix: the
+    reader counts only ".txt" entries, and a partial read on the shared
+    filesystem these tests coordinate through would be parsed as a URL.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    # Bracket IPv6 literals so the value is a usable URL authority: readers build
+    # "http://<reported>/..." from it verbatim.
+    reported_host = f"[{host}]" if ":" in host else host
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as addr_file:
+            addr_file.write(f"{reported_host}:{port}\n")
+            addr_file.flush()
+            os.fsync(addr_file.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
     """Run a benchmark while streaming its combined output to an artifact log."""
     benchmark_env = env.copy()
@@ -825,6 +897,12 @@ class ServerConfig:
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
         }
+
+        # Not a recognized field, so it rides through in extra_llm_api_config_data
+        # to the engine. Read it out here too: K > 1 HTTP frontends against one
+        # executor is incompatible with the port-0 launch scheme, so the launcher
+        # has to know the count before it builds the command line.
+        self.num_serve_frontends = self.extra_llm_api_config_data.get("num_serve_frontends", 1)
 
     def to_cmd(
         self, output_dir: str, numa_bind: bool = False, disagg_serving_type: str = ""
@@ -1741,10 +1819,6 @@ class DisaggTestCmds(NamedTuple):
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
-            # port 0 + --report_addr: the worker binds a kernel-assigned port
-            # and publishes host:port itself, so no port is reserved here and
-            # left unbound while anything on the node could take it. The disagg
-            # server reads these files to build its config, exactly as before.
             hostname_file = self._hostname_file(server_idx)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
@@ -1754,10 +1828,36 @@ class DisaggTestCmds(NamedTuple):
                 config_idx = server_cmd.index("--config") + 1
                 self._wait_for_config_file(server_cmd[config_idx])
 
-            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, 0) + [
-                "--report_addr",
-                hostname_file,
-            ]
+            worker_cfg = None
+            if configs_for_idx is not None:
+                ctx_cfg, gen_cfg, _ = configs_for_idx
+                worker_cfg = ctx_cfg if is_ctx else gen_cfg
+            num_frontends = getattr(worker_cfg, "num_serve_frontends", 1) or 1
+
+            if num_frontends > 1:
+                # trtllm-serve refuses port 0 / --report_addr with several
+                # frontends (each would bind a different port), so reserve the
+                # port here and publish it on the worker's behalf; the disagg
+                # server's hostname-file reader is unchanged.
+                #
+                # Publishing before the server is up matches the semantics this
+                # replaces rather than loosening them: launch_server publishes at
+                # *bind* time, well before it constructs the engine, so a reader
+                # has always been able to see the address of a worker that is
+                # still loading weights. The disagg server's readiness wait is
+                # what covers that, and it is untouched here.
+                worker_port = reserve_multi_frontend_port(self.hostname)
+                server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, worker_port)
+                publish_addr_file(hostname_file, self.hostname, worker_port)
+            else:
+                # port 0 + --report_addr: the worker binds a kernel-assigned port
+                # and publishes host:port itself, so no port is reserved here and
+                # left unbound while anything on the node could take it. The disagg
+                # server reads these files to build its config, exactly as before.
+                server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, 0) + [
+                    "--report_addr",
+                    hostname_file,
+                ]
             try:
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
@@ -1767,9 +1867,8 @@ class DisaggTestCmds(NamedTuple):
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
                 worker_env = copy.deepcopy(os.environ)
-                if configs_for_idx is not None:
-                    ctx_cfg, gen_cfg, _ = configs_for_idx
-                    worker_env.update((ctx_cfg if is_ctx else gen_cfg).to_env())
+                if worker_cfg is not None:
+                    worker_env.update(worker_cfg.to_env())
                 with open(server_file_path, "w") as server_ctx:
                     server_proc = subprocess.Popen(
                         server_cmd,
