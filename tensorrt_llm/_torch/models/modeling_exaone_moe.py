@@ -57,7 +57,9 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
 
-def _per_layer_list(config: ExaoneMoeConfig, name: str, layer_idx: int):
+def _per_layer_list(
+    config: ExaoneMoeConfig, name: str, layer_idx: int
+) -> list[int | float | str] | None:
     """Return `config.<name>` when it is a list long enough to cover `layer_idx`.
 
     K-EXAONE2 encodes its per-layer contracts as plain lists in config.json.
