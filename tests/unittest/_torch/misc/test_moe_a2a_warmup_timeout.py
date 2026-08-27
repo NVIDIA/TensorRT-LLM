@@ -10,12 +10,16 @@ class _WarmupFlagStub:
 
     Building a real PyTorchModelEngine needs a model and a device; the property
     itself only touches _is_warmup, the MoE all-to-all budget selector, and
-    moe_load_balancer_iter_info (a no-op without a balancer), so a stub exercises
-    the real code path without either.
+    moe_load_balancer_iter_info (a no-op when moe_load_balancer is None), so a
+    stub exercises the real code path without either.
+
+    The stub borrows the property objects without inheriting, so it has to
+    declare moe_load_balancer itself.
     """
 
     is_warmup = PyTorchModelEngine.is_warmup
     moe_load_balancer_iter_info = PyTorchModelEngine.moe_load_balancer_iter_info
+    moe_load_balancer = None
 
 
 class TestMoeA2AWarmupBudget(unittest.TestCase):

@@ -172,7 +172,7 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
 
     ~KvCache();
 
@@ -482,6 +482,8 @@ private:
 
     bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
+    bool _shouldRecordManagerStats() const;
+    bool _shouldRecordRequestStats() const;
     bool _shouldRecordStats() const;
     void _refreshStatsDirtyState();
     void _recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIterationStatsDelta const& iterationStats);
@@ -513,6 +515,13 @@ private:
     // moves (vs copies) the live SSM page into the tree (caller must guarantee
     // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
     void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
+
+    // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
+    // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the
+    // chain from the deepest surviving ancestor. The evicted page stays absent, which is
+    // fine: pruneMatch() truncates reuse before a block that lacks it.
+    // See https://nvbugs/6625710.
+    void _reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root);
 
     struct TakenPage
     {
@@ -590,6 +599,7 @@ private:
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumTokensBeforeHybridPruning;
+    bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

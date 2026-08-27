@@ -1029,7 +1029,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
         self.d2t = None
-        self.py_draft_use_greedy_sampling = False
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters

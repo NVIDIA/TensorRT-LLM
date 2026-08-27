@@ -126,6 +126,19 @@ class MambaRole:
     CONV_STATE = DataRole("conv_state")
 
 
+def _mamba_effective_tp_size(mapping: Mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state pools.
+
+    Attention-DP replicates the state and takes precedence; helix
+    repurposes CP ranks as plain TP for recurrent-state layers.
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
+
+
 def get_tensor_size_bytes(tensor):
     """Calculate tensor size in bytes."""
     if isinstance(tensor, torch.Tensor):
@@ -449,7 +462,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        tp_size = _mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -1578,6 +1591,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         max_seq_len: int,
         max_batch_size: int,
         mapping: Mapping,
+        max_num_tokens: int = 8192,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
@@ -1642,6 +1656,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
@@ -2189,6 +2204,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
+                **kwargs,
             )
             # PP ranks replay the same scheduling decisions, so a rank without
             # local Mamba layers must still publish the configured boundaries.
@@ -2200,7 +2216,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = _mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2485,11 +2501,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
@@ -2502,7 +2513,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if requests:
@@ -2933,7 +2943,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            tp_size = _mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
@@ -3548,7 +3558,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
@@ -3561,7 +3570,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if requests and prepare_resource:
