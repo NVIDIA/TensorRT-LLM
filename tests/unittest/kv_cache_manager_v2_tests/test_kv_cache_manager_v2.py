@@ -299,25 +299,6 @@ class TestCacheLevelStorage(unittest.TestCase):
         for slot_count, min_slot in zip(slot_counts, min_slots):
             self.assertGreaterEqual(slot_count, min_slot)
 
-    def test_ratio_to_slot_count_list_caps_and_redistributes_slots(self) -> None:
-        granularity = 1024
-        slot_size_lists = [[100], [100]]
-
-        slot_counts = _introspection.ratio_to_slot_count_list(
-            10 * granularity,
-            slot_size_lists,
-            [0.9, 0.1],
-            granularity,
-            [3, 1],
-            [3, None],
-        )
-
-        # The first pool exposes exactly three slots even though its one-grain
-        # allocation could physically fit more. The remaining quota goes to
-        # the uncapped pool rather than becoming recurrent-state capacity.
-        self.assertEqual(slot_counts[0], 3)
-        self.assertGreater(slot_counts[1], 10)
-
 
 def create_config(
     tokens_per_block: int,
@@ -3482,6 +3463,51 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(slots[ssm_pg], 2)
         self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
+
+    def test_non_reusable_ssm_pool_uses_constraint_floor(self) -> None:
+        """Non-reusable SSM slots stop at the live-request floor and leave quota to attention."""
+        ssm_floor_slots = 4
+        granularity = 2 << 20
+        gpu_quota = 256 << 20
+        cfg = self._make_hybrid_config(gpu_quota)
+        cfg.enable_block_reuse = False
+        cfg.constraints = [
+            BatchDesc(kv_caches=[KVCacheDesc(capacity=0, history_length=0)] * ssm_floor_slots)
+        ]
+        cfg.initial_pool_ratio = [0.9, 0.1]
+
+        manager = KVCacheManager(cfg)
+        try:
+            ssm_lc = _introspection.ssm_life_cycle_id(manager)
+            assert ssm_lc is not None
+            ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+            attn_pg = 1 - ssm_pg
+            statistics = _introspection.storage_statistics(manager)
+            ssm_statistics = statistics[ssm_pg]
+            attn_statistics = statistics[attn_pg]
+            ssm_slot_sizes = list(
+                ssm_statistics.slot_sizes
+                if hasattr(ssm_statistics, "slot_sizes")
+                else ssm_statistics.slot_size
+            )
+            attn_slot_sizes = list(
+                attn_statistics.slot_sizes
+                if hasattr(attn_statistics, "slot_sizes")
+                else attn_statistics.slot_size
+            )
+            fixed_grains = _introspection.grains_for_slots(
+                ssm_floor_slots, ssm_slot_sizes, granularity
+            )
+            expected_attn_slots, _ = _introspection.grains_to_slots(
+                gpu_quota // granularity - fixed_grains,
+                attn_slot_sizes,
+                granularity,
+            )
+
+            self.assertEqual(statistics[ssm_pg].total, ssm_floor_slots)
+            self.assertEqual(statistics[attn_pg].total, expected_attn_slots)
+        finally:
+            manager.shutdown()
 
     def test_constraints_floor_typical_step(self):
         """Constraints clamp the typical_step ratio from below."""

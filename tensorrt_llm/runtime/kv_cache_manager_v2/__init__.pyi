@@ -194,7 +194,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
-    cap_constant_size_pools: bool = False
+    enable_block_reuse: bool = True
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

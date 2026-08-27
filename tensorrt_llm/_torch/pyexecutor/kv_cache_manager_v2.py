@@ -1970,6 +1970,7 @@ class KVCacheManagerV2(BaseResourceManager):
             constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_partial_reuse=kv_cache_config.enable_partial_reuse,
+            enable_block_reuse=kv_cache_config.enable_block_reuse,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(

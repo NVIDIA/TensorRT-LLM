@@ -3382,10 +3382,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
-            # The constraints above already encode the live/dummy SSM slot
-            # count. Without reusable snapshots, extra constant-size GPU slots
-            # cannot serve another request and should become attention quota.
-            cap_constant_size_pools=not kv_cache_config.enable_block_reuse,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
             # attempted, while the runtime config still needs the invariant.

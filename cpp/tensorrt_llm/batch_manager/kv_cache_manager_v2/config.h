@@ -301,8 +301,8 @@ struct KVCacheManagerConfig
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
 
-    // Cap constant-size hot-tier pool groups at their constraint-derived minimum slot count.
-    bool capConstantSizePools = false;
+    // Whether committed cache blocks may be reused by later requests.
+    bool enableBlockReuse = true;
 
     bool enableSwaScratchReuse() const noexcept
     {

@@ -258,11 +258,9 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
-    cap_constant_size_pools: bool = False
+    enable_block_reuse: bool = True
     """
-    If True, cap constant-size hot-tier pool groups at their constraint-derived
-    minimum slot count. Growth-capable or mixed pool groups and colder tiers
-    remain unconstrained.
+    Whether committed cache blocks may be reused by later requests.
     """
 
     @property

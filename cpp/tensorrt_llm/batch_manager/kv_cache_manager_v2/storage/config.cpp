@@ -216,7 +216,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
-    out.capConstantSizePools = config.capConstantSizePools;
+    out.enableBlockReuse = config.enableBlockReuse;
 
     for (auto& [sizes, variants] : poolGroupsBySizes)
     {

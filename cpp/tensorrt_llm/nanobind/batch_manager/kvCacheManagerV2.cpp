@@ -1617,7 +1617,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly, bool capConstantSizePools)
+                bool textOnly, bool enableBlockReuse)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1639,7 +1639,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
-                cfg->capConstantSizePools = capConstantSizePools;
+                cfg->enableBlockReuse = enableBlockReuse;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1649,7 +1649,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("swa_scratch_reuse").none() = std::nullopt,
             nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true, nb::arg("text_only") = false,
-            nb::arg("cap_constant_size_pools") = false)
+            nb::arg("enable_block_reuse") = true)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1663,7 +1663,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
-        .def_rw("cap_constant_size_pools", &kv::KVCacheManagerConfig::capConstantSizePools)
+        .def_rw("enable_block_reuse", &kv::KVCacheManagerConfig::enableBlockReuse)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -2143,17 +2143,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "ratio_to_slot_count_list",
         [](size_t quota, std::vector<std::vector<size_t>> const& slotSizeLists, std::vector<float> const& ratioList,
-            size_t granularity, std::vector<kv::SlotCount> const& minSlots,
-            std::optional<std::vector<std::optional<kv::SlotCount>>> const& maxSlots)
+            size_t granularity, std::vector<kv::SlotCount> const& minSlots)
         {
-            kv::TypedVec<kv::PoolGroupIndex, std::optional<kv::SlotCount>> typedMaxSlots;
-            if (maxSlots.has_value())
-            {
-                typedMaxSlots = kv::TypedVec<kv::PoolGroupIndex, std::optional<kv::SlotCount>>{*maxSlots};
-            }
             auto slotCountList = kv::CacheLevelStorage::ratioToSlotCountList(quota, typedSlotSizeLists(slotSizeLists),
-                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots),
-                typedMaxSlots);
+                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots));
             std::vector<kv::SlotCount> result;
             result.reserve(slotCountList.stdSize());
             for (kv::SlotCount slotCount : slotCountList)
@@ -2163,7 +2156,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return result;
         },
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
-        nb::arg("min_slots"), nb::arg("max_slots").none() = std::nullopt, nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
 
     // ---- Cold-page codec --------------------------------------------------
     nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");
