@@ -1397,7 +1397,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         batch_indices: torch.Tensor,
         prompt_lookahead_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select the accepted token, hidden row, and fixed draft position."""
+        """Select the next token, recurrent hidden row, and draft position."""
         sequence_starts = torch.cumsum(
             sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
         recurrent_indices = sequence_starts + sequence_lengths - 1
