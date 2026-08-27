@@ -91,8 +91,8 @@ pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_ll
 
 #### Install a nightly release
 
-Nightly wheels are published to a dedicated package index. Use `--extra-index-url` to add this index while keeping
-PyPI available for dependency resolution.
+Nightly wheels are published to a dedicated package index. Query that index to list compatible versions, and use
+`--extra-index-url` when installing to keep PyPI available for dependency resolution.
 
 List the nightly releases compatible with the current environment:
 
