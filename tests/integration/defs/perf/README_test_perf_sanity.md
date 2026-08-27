@@ -117,6 +117,37 @@ pass. `process_and_upload_test_results` therefore looks history up against a
 baseline branch — `PERF_BASELINE_BRANCH`, default `main` — using a lookup-only copy
 of the data. The uploaded documents keep their true `s_branch`.
 
+`ClientConfig.to_match_keys()` includes `s_benchmark_client`, so a lane driven by a
+different load generator forms its own baseline population instead of being compared
+against `benchmark_serving` history. The built-in client uploads `""` (not `"default"`)
+for this field, and `benchmark_data_matches` treats absent and empty as equal, so every
+baseline recorded before the field existed keeps matching.
+
+## Benchmark Clients
+
+A disaggregated `benchmark_config` may select which load generator drives the lane via
+the optional `benchmark_client` key. Any value other than the two below is rejected at
+config-parse time rather than silently falling through to the default client.
+
+| `benchmark_client` | Client | Notes |
+|---|---|---|
+| *(omitted / `""`)* | `tensorrt_llm/serve/scripts/benchmark_serving.py` | Default. Fixed request count from `dataset_file` + `concurrency_list`. |
+| `agentx` | `perf/agentx_client.py` | AgentX agentic multi-turn trace replay (a fork of `aiperf`). |
+
+**AgentX specifics**:
+- Duration-bounded, not count-bounded: the run replays a conversation trace for
+  `AGENTX_DURATION` seconds, so `dataset_file` names an `aiperf` dataset loader (fetched
+  from HF), *not* a path — `get_dataset_dir` must not be applied to it.
+- `concurrency_list` is the whole-cluster total and is passed through un-multiplied.
+- Tunables are passed through `client_env_var` (`AGENTX_MAX_CTX`, `AGENTX_DURATION`,
+  `AGENTX_WARMUP_PER_LANE`). Artifacts land in
+  `{test_output_dir}/agentx.{server_idx}.{client_idx}/concurrency_{N}/`.
+- `al` (Mean Avg Decoded Tokens per Iter) is exempt from the spec-decoding hard-fail for
+  agentx lanes: it derives from a TRT-LLM-specific per-response field that `aiperf` does
+  not propagate. This loses no signal as long as the lane pins the accepted length with
+  `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS` (already a match key), which makes `al` a
+  restatement of a configured constant rather than a measurement.
+
 ## Overview
 
 - Run performance sanity benchmarks across multiple model configs
@@ -190,6 +221,10 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 **Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+**Optional `benchmark_config` keys**: `benchmark_client` selects a non-default load
+generator (see [Benchmark Clients](#benchmark-clients)); `client_env_var` passes
+client-side environment variables through to it.
 
 ## Test Case Formats
 

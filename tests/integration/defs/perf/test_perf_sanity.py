@@ -54,6 +54,10 @@ SUPPORTED_GPU_MAPPING = {
     "H200": "h200",
 }
 
+# benchmark_client value selecting the AgentX trace-replay client
+# (agentx_client.py). Any other non-empty value is rejected at parse time.
+AGENTX_BENCHMARK_CLIENT = "agentx"
+
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
 BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
 BENCH_SERVING_DIR = "/tmp/bench_serving"
@@ -647,9 +651,16 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     """Extract TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS from a space-separated KEY=val env-var string.
 
     Returns 0 when not set.
+
+    The runtime accepts a fractional value (see get_force_num_accepted_tokens_float
+    in tensorrt_llm), so parse as float first and truncate. The return value only
+    feeds the l_force_num_accepted_tokens baseline match key, which is a long, so
+    two lanes differing solely in the fractional part share a match identity --
+    acceptable today because every such lane also differs in concurrency and
+    parallelism, but widen the key if that ever stops holding.
     """
     val = to_env_dict(env_vars).get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS")
-    return int(val) if val is not None else 0
+    return int(float(val)) if val is not None else 0
 
 
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
@@ -1099,6 +1110,11 @@ class ClientConfig:
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
+        # Which load generator drives the lane. "" selects the built-in
+        # benchmark_serving client; "agentx" selects the trace-replay client in
+        # agentx_client.py. The empty default is load-bearing for baseline
+        # matching -- see the s_benchmark_client note in to_db_data.
+        self.benchmark_client = client_config_data.get("benchmark_client", "")
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -1123,10 +1139,38 @@ class ClientConfig:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
 
-        if self.use_nv_sa_benchmark:
+        if self.benchmark_client == AGENTX_BENCHMARK_CLIENT:
+            return self._to_agentx_cmd()
+        elif self.use_nv_sa_benchmark:
             return self._to_sa_benchmark_cmd()
         else:
             return self._to_default_benchmark_cmd()
+
+    def _to_agentx_cmd(self) -> List[str]:
+        """Generate AgentX benchmark command (aiperf trace replay).
+
+        AgentX replays a recorded conversation corpus for a fixed wall-clock
+        duration, so it takes neither a prompt count nor ISL/OSL; every other
+        knob comes from AGENTX_* env vars set in the lane's client_env_var. The
+        dataset name is passed through verbatim rather than resolved to a path
+        because it names an aiperf loader (which fetches from HF), not a file --
+        so get_dataset_dir must not be applied to it.
+        """
+        if not self.dataset_file:
+            raise ValueError(
+                f"Client {self.name} uses benchmark_client={AGENTX_BENCHMARK_CLIENT} but sets no "
+                "dataset_file; the agentx scenario has no default corpus."
+            )
+        return [
+            "python",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentx_client.py"),
+            "--model",
+            self.model_path,
+            "--concurrency",
+            str(self.concurrency),
+            "--dataset",
+            self.dataset_file,
+        ]
 
     def _to_sa_benchmark_cmd(self) -> List[str]:
         """Generate SA benchmark command (bench_serving repo)."""
@@ -1235,6 +1279,11 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            # Match key. Deliberately uploaded as "" (not "default") for the
+            # built-in client: benchmark_data_matches treats absent and empty
+            # as equal, so every baseline recorded before this field existed
+            # keeps matching. Only named clients form their own population.
+            "s_benchmark_client": self.benchmark_client,
             "b_eos": self.spec_decoding,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
@@ -1834,6 +1883,12 @@ class DisaggTestCmds(NamedTuple):
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
+                        # Keep aiperf's artifacts (its own logs included) with
+                        # the rest of the lane's output; ignored by other
+                        # clients.
+                        bench_env["TRTLLM_AGENTX_ARTIFACT_DIR"] = os.path.join(
+                            self.test_output_dir, f"agentx.{server_idx}.{client_idx}"
+                        )
                         output = _run_benchmark_with_log(
                             client_cmd_with_port,
                             bench_env,
@@ -2248,6 +2303,15 @@ class PerfSanityTestConfig:
         osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
+        benchmark_client = benchmark.get("benchmark_client", "")
+        if benchmark_client not in ("", AGENTX_BENCHMARK_CLIENT):
+            # There is no schema validation on these yamls, so an unrecognised
+            # value would otherwise fall through to the default client and
+            # quietly measure the wrong workload.
+            raise ValueError(
+                f"Unknown benchmark_client {benchmark_client!r}; "
+                f"expected '' or {AGENTX_BENCHMARK_CLIENT!r}."
+            )
 
         if benchmark_mode == "ctx_only":
             spec_decoding = bool(ctx_server_config.spec_decoding_type)
@@ -2276,6 +2340,7 @@ class PerfSanityTestConfig:
                 "streaming": benchmark.get("streaming", True),
                 "dataset_file": dataset_file,
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
+                "benchmark_client": benchmark_client,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
             }
@@ -2564,9 +2629,19 @@ class PerfSanityTestConfig:
                 # Spec-decoding tests must report 'Mean Avg Decoded Tokens per Iter'
                 # (parsed as 'al'). If the field is missing the test fails here so the
                 # data is never uploaded to OpenSearch.
+                # AgentX is exempt: 'al' comes from TRT-LLM's non-standard
+                # avg_decoded_tokens_per_iter response field, which aiperf does
+                # not propagate. It is not a real loss of signal, because every
+                # agentx lane pins the accepted length with
+                # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS -- already captured
+                # as the l_force_num_accepted_tokens match key -- so 'al' would
+                # be a restatement of a configured constant rather than a
+                # measurement. Revisit if an agentx lane ever runs spec decoding
+                # without forcing the accepted count.
                 if (
                     client_idx < len(client_configs)
                     and client_configs[client_idx].spec_decoding
+                    and client_configs[client_idx].benchmark_client != AGENTX_BENCHMARK_CLIENT
                     and "al" not in metrics
                 ):
                     error_msg += (
