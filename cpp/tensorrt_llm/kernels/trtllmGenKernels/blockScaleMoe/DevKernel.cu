@@ -969,6 +969,7 @@ __global__ void finalizeKernel(KernelParams params)
 }
 
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
+constexpr static int FINALIZE_SINGLE_PASS_BF16_THREADS_PER_BLOCK = 320;
 
 __device__ float4 vectorizedLoadPtx(float4 const* ptr)
 {
@@ -1002,7 +1003,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     int64_t const hiddenBlockIdx = blockIdx.y;
     int64_t const tokenIdx = blockIdx.x;
     int64_t const startOffset = threadIdx.x + hiddenBlockIdx * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
-    int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+    int64_t const stride = blockDim.x;
     int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
     int64_t const numElemsInColPerBlock = (hiddenBlockIdx + 1) * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
 
@@ -1163,8 +1164,14 @@ void run(Data const& data, void* stream)
         }
         else
         {
+            // A 2560-element BF16 row contains 320 128-bit vectors. Use one
+            // thread per vector for this high-occupancy Qwen MoE shape so the
+            // finalize kernel does not need a second loop iteration.
+            int const vectorThreads = data.mDtypeElt == tg::Dtype::Bfloat16 && data.hiddenDim == 2560 && data.topK == 10
+                ? FINALIZE_SINGLE_PASS_BF16_THREADS_PER_BLOCK
+                : FINALIZE_THREADS_PER_BLOCK;
             LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
-                /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+                /*numThreads=*/vectorThreads, 0, stream);
         }
     }
 }
