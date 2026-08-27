@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -24,9 +24,10 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import (
+    CacheKind,
     KVCachePageTable,
     MambaLayerGroup,
-    PhysicalPool,
+    MapperKind,
 )
 from tensorrt_llm._utils import nvtx_range
 
@@ -333,7 +334,99 @@ def _compute_tp_offsets(
 class MambaPolicy:
     """
     Dispatch mappers and build frags for Mamba state transfer.
+
+    Instance-based: holds ``self_rank_info`` for TP resolution, exposing a
+    ``build_mapper`` method with the same signature as ``AttentionPolicy``
+    so that ``peer.py`` can dispatch polymorphically.
     """
+
+    def __init__(self, self_rank_info: RankInfo):
+        self._ri = self_rank_info
+
+    def should_send(self, peer_overlap, peer_rank_info) -> "bool | None":
+        """Mamba TP routing: always send (each rank owns unique sharded state).
+        When mamba_tp == 1 (attention_dp), returns None to signal fan-in election."""
+        mamba_tp, _ = MambaPolicy._mamba_tp(self._ri)
+        if mamba_tp == 1:
+            return None  # caller should use fan-in election
+        return True
+
+    def build_mapper(
+        self,
+        *,
+        peer_ri: RankInfo,
+        mapper_kind: MapperKind,
+        self_layer_offsets,
+        peer_layer_offsets,
+        self_bytes_per_layer: int,
+        peer_bytes_per_layer: int,
+        self_buffers_per_layer: int = 1,
+        peer_buffers_per_layer: int = 1,
+        self_lg=None,
+        peer_lg=None,
+        src_layer_off: int = 0,
+        dst_layer_off: int = 0,
+    ) -> RegionMapperBase:
+        """Pick the mapper for one mamba pool-view pair.
+
+        For mamba, ``self_layer_offsets`` / ``peer_layer_offsets`` byte offsets
+        are not used by the mapper internally (mamba mappers work on per-layer
+        ptrs from extraction). The number of overlapping layers is inferred
+        from ``len(self_layer_offsets)``.
+
+        ``src_layer_off`` / ``dst_layer_off`` are the starting positions of
+        the overlapping layers within the full ptrs array returned by
+        ``extract_slot``. Under full PP overlap these are 0; under partial PP
+        overlap they identify which slice of the extraction to transfer.
+
+        The ``mapper_kind`` discriminates conv (SECTIONED) from ssm (INDEXED).
+        TP info comes from ``self._ri`` and ``peer_ri``. Per-head / per-section
+        metadata comes from ``self_lg`` / ``peer_lg`` (MambaLayerGroup).
+        """
+        transfer_layers = len(self_layer_offsets)
+        self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self._ri)
+        peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
+        tp_match = self_mamba_tp == peer_mamba_tp
+
+        if tp_match:
+            return MambaHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=src_layer_off,
+                dst_layer_off=dst_layer_off,
+                block_bytes_per_layer=self_bytes_per_layer,
+            )
+
+        is_conv = mapper_kind == MapperKind.SECTIONED
+        if is_conv:
+            return ConvStateMismatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=src_layer_off,
+                dst_layer_off=dst_layer_off,
+                self_section_bytes=self_lg.conv_section_bytes,
+                peer_section_bytes=peer_lg.conv_section_bytes,
+                self_tp_per_dp=self_mamba_tp,
+                peer_tp_per_dp=peer_mamba_tp,
+                self_tp_rank=self_mamba_tp_rank,
+                peer_tp_rank=peer_mamba_tp_rank,
+            )
+
+        # SSM state (INDEXED): head-level granularity
+        assert self_lg.ssm_bytes_per_head is not None, "ssm_bytes_per_head required for SSM mapper"
+        assert peer_lg.ssm_bytes_per_head is not None, "ssm_bytes_per_head required for SSM mapper"
+        self_nheads = self_bytes_per_layer // self_lg.ssm_bytes_per_head
+        peer_nheads = peer_bytes_per_layer // peer_lg.ssm_bytes_per_head
+        return MambaHeadMismatchMapper(
+            transfer_layers=transfer_layers,
+            src_layer_off=src_layer_off,
+            dst_layer_off=dst_layer_off,
+            bytes_per_head=self_lg.ssm_bytes_per_head,
+            self_nheads=self_nheads,
+            peer_nheads=peer_nheads,
+            self_tp_per_dp=self_mamba_tp,
+            peer_tp_per_dp=peer_mamba_tp,
+            self_tp_rank=self_mamba_tp_rank,
+            peer_tp_rank=peer_mamba_tp_rank,
+        )
 
     @staticmethod
     def _find_mamba_layer_group(
@@ -342,7 +435,7 @@ class MambaPolicy:
         if page_table is None:
             return None
         return next(
-            (lg for lg in page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            (lg for lg in page_table.layer_groups if lg.kind == CacheKind.STATE),
             None,
         )
 
@@ -379,7 +472,7 @@ class MambaPolicy:
             # Under pipeline parallelism each rank publishes only its own
             # stage's layers, so a hybrid model can pair a rank holding
             # recurrent layers with a peer stage holding none. The transfer
-            # path (build_mamba_frags) intersects the two layer sets and
+            # path intersects the two layer sets and
             # moves nothing when either side has no recurrent layers, so
             # there is nothing to validate for this pair.
             return
@@ -419,12 +512,25 @@ class MambaPolicy:
                     "only with attention-DP enabled on both sides."
                 )
 
-        _check_global(
-            "ssm slot_bytes", self_mlg.ssm_states.slot_bytes, peer_mlg.ssm_states.slot_bytes
-        )
-        _check_global(
-            "conv slot_bytes", self_mlg.conv_states.slot_bytes, peer_mlg.conv_states.slot_bytes
-        )
+        # Resolve slot_bytes from pool_views by pool_role (conv_states/ssm_states
+        # fields were removed; pool_views carry the same geometry).
+        from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
+        def _slot_bytes_by_role(mlg, role):
+            for pv in mlg.pool_views:
+                if pv.pool_role == role:
+                    return pv.bytes_per_layer
+            return None
+
+        self_ssm_slot = _slot_bytes_by_role(self_mlg, MAMBA_SSM_ROLE)
+        peer_ssm_slot = _slot_bytes_by_role(peer_mlg, MAMBA_SSM_ROLE)
+        self_conv_slot = _slot_bytes_by_role(self_mlg, MAMBA_CONV_ROLE)
+        peer_conv_slot = _slot_bytes_by_role(peer_mlg, MAMBA_CONV_ROLE)
+
+        if self_ssm_slot is not None and peer_ssm_slot is not None:
+            _check_global("ssm slot_bytes", self_ssm_slot, peer_ssm_slot)
+        if self_conv_slot is not None and peer_conv_slot is not None:
+            _check_global("conv slot_bytes", self_conv_slot, peer_conv_slot)
 
         if self_mlg.conv_section_bytes is not None and peer_mlg.conv_section_bytes is not None:
             if len(self_mlg.conv_section_bytes) != len(peer_mlg.conv_section_bytes):
@@ -453,249 +559,57 @@ class MambaPolicy:
         return ri.tp_size, ri.tp_rank
 
     @staticmethod
-    def _build_layer_ptrs(
-        pool: PhysicalPool,
-        layer_offsets: Dict[int, int],
-        overlapping_layers: List[int],
-        slot: int,
-    ) -> np.ndarray:
-        """Build per-layer pointers from a pool's affine layer/slot layout."""
-        slot_stride_bytes = pool.slot_stride_bytes
-        layer_stride_bytes = pool.layer_stride_bytes
-        assert slot_stride_bytes is not None
-        assert layer_stride_bytes is not None
-        ptrs = [
-            pool.base_address
-            + layer_offsets[global_layer_id] * layer_stride_bytes
-            + slot * slot_stride_bytes
-            for global_layer_id in overlapping_layers
-        ]
-        return np.array(ptrs, dtype=np.int64)
+    def is_paired(self_ri: RankInfo, peer_ri: RankInfo) -> bool:
+        """Check if sender and receiver are paired for mamba state transfer.
 
-    @staticmethod
-    def _select_mapper(
-        *,
-        is_conv: bool,
-        tp_match: bool,
-        transfer_layers: int,
-        self_mlg: MambaLayerGroup,
-        peer_mlg: MambaLayerGroup,
-        self_pool: PhysicalPool,
-        peer_pool: PhysicalPool,
-        self_mamba_tp: int,
-        peer_mamba_tp: int,
-        self_mamba_tp_rank: int,
-        peer_mamba_tp_rank: int,
-    ) -> RegionMapperBase:
-        """Select the appropriate mapper for a conv/ssm pool pair."""
-        if tp_match:
-            return MambaHeadMatchMapper(
-                transfer_layers=transfer_layers,
-                src_layer_off=0,
-                dst_layer_off=0,
-                block_bytes_per_layer=self_pool.slot_bytes,
-            )
-        if is_conv:
-            return ConvStateMismatchMapper(
-                transfer_layers=transfer_layers,
-                src_layer_off=0,
-                dst_layer_off=0,
-                self_section_bytes=self_mlg.conv_section_bytes,
-                peer_section_bytes=peer_mlg.conv_section_bytes,
-                self_tp_per_dp=self_mamba_tp,
-                peer_tp_per_dp=peer_mamba_tp,
-                self_tp_rank=self_mamba_tp_rank,
-                peer_tp_rank=peer_mamba_tp_rank,
-            )
-        # SSM state: head-level granularity
-        self_nheads = self_pool.slot_bytes // self_mlg.ssm_bytes_per_head
-        peer_nheads = peer_pool.slot_bytes // peer_mlg.ssm_bytes_per_head
-        return MambaHeadMismatchMapper(
-            transfer_layers=transfer_layers,
-            src_layer_off=0,
-            dst_layer_off=0,
-            bytes_per_head=self_mlg.ssm_bytes_per_head,
-            self_nheads=self_nheads,
-            peer_nheads=peer_nheads,
-            self_tp_per_dp=self_mamba_tp,
-            peer_tp_per_dp=peer_mamba_tp,
-            self_tp_rank=self_mamba_tp_rank,
-            peer_tp_rank=peer_mamba_tp_rank,
-        )
-
-    @staticmethod
-    def build_mamba_frags(
-        self_mlg: MambaLayerGroup,
-        peer_mlg: MambaLayerGroup,
-        src_slot: int,
-        dst_slot: int,
-        self_ri: RankInfo,
-        peer_ri: RankInfo,
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build (src_frags, dst_frags, kv_sizes) for mamba state transfer.
-
-        Returns empty lists if there are no overlapping layers.
+        Overlap targets are attention-domain (helix: every ctx rank targets
+        every gen rank) but mamba mappers assume corresponding shards;
+        unpaired senders must send nothing, or they last-writer-win the
+        receiver's slot with the wrong head range.
         """
-        overlapping_layers = sorted(
-            set(self_mlg.mamba_layer_offsets.keys()) & set(peer_mlg.mamba_layer_offsets.keys())
-        )
-        transfer_layers = len(overlapping_layers)
-        if transfer_layers == 0:
-            return [], [], []
-
-        self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self_ri)
-        peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
-        tp_match = self_mamba_tp == peer_mamba_tp
-
-        # Overlap targets are attention-domain (helix: every ctx rank
-        # targets every gen rank) but the mappers below assume corresponding
-        # mamba shards; unpaired senders must send nothing, or they
-        # last-writer-win the receiver's slot with the wrong head range.
-        if self_mamba_tp <= peer_mamba_tp:
-            ratio = peer_mamba_tp // self_mamba_tp
-            paired = (peer_mamba_tp_rank // ratio) == self_mamba_tp_rank
+        self_tp, self_rank = MambaPolicy._mamba_tp(self_ri)
+        peer_tp, peer_rank = MambaPolicy._mamba_tp(peer_ri)
+        if self_tp <= peer_tp:
+            ratio = peer_tp // self_tp
+            return (peer_rank // ratio) == self_rank
         else:
-            ratio = self_mamba_tp // peer_mamba_tp
-            paired = (self_mamba_tp_rank // ratio) == peer_mamba_tp_rank
-        if not paired:
-            return [], [], []
+            ratio = self_tp // peer_tp
+            return (self_rank // ratio) == peer_rank
 
-        src_frags: List[int] = []
-        dst_frags: List[int] = []
-        kv_sizes: List[int] = []
 
-        for self_pool, peer_pool, is_conv in [
-            (self_mlg.conv_states, peer_mlg.conv_states, True),
-            (self_mlg.ssm_states, peer_mlg.ssm_states, False),
-        ]:
-            src_ptrs = MambaPolicy._build_layer_ptrs(
-                self_pool,
-                self_mlg.mamba_layer_offsets,
-                overlapping_layers,
-                src_slot,
-            )
-            dst_ptrs = MambaPolicy._build_layer_ptrs(
-                peer_pool,
-                peer_mlg.mamba_layer_offsets,
-                overlapping_layers,
-                dst_slot,
-            )
+def mamba_receiver_payload_bytes(
+    sender_page_table: KVCachePageTable,
+    receiver_page_table: KVCachePageTable,
+    dst_slot: Optional[int],
+) -> int:
+    """Recurrent-state bytes that will land in the receiver's slot.
 
-            src_region = SpecRegion(
-                memory=MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self_pool.slot_bytes)
-            )
-            dst_region = SpecRegion(
-                memory=MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=peer_pool.slot_bytes)
-            )
+    Receiver-local invariant: regardless of the sender-side shard pairing,
+    the slot receives exactly the receiver's own per-layer slot bytes over
+    the overlapping mamba layers.  This avoids the RankInfoServer rank-0
+    limitation that makes sender-side simulation return 0 for non-rank-0
+    receivers.
+    """
+    if dst_slot is None:
+        return 0
+    sender_mlg = MambaPolicy._find_mamba_layer_group(sender_page_table)
+    receiver_mlg = MambaPolicy._find_mamba_layer_group(receiver_page_table)
+    if sender_mlg is None or receiver_mlg is None:
+        return 0
 
-            mapper = MambaPolicy._select_mapper(
-                is_conv=is_conv,
-                tp_match=tp_match,
-                transfer_layers=transfer_layers,
-                self_mlg=self_mlg,
-                peer_mlg=peer_mlg,
-                self_pool=self_pool,
-                peer_pool=peer_pool,
-                self_mamba_tp=self_mamba_tp,
-                peer_mamba_tp=peer_mamba_tp,
-                self_mamba_tp_rank=self_mamba_tp_rank,
-                peer_mamba_tp_rank=peer_mamba_tp_rank,
-            )
+    sender_globals = {ll.global_layer_id for ll in sender_mlg.local_layers}
+    receiver_globals = {ll.global_layer_id for ll in receiver_mlg.local_layers}
+    overlap = sender_globals & receiver_globals
+    if not overlap:
+        return 0
 
-            region_pair = mapper.map(src_region, dst_region)
-            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-            for rp in region_pairs:
-                src_frags.extend(rp.src.memory.ptrs)
-                dst_frags.extend(rp.dst.memory.ptrs)
-                frag_size = rp.src.memory.bytes_per_region
-                kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
-        return src_frags, dst_frags, kv_sizes
-
-    @staticmethod
-    def receiver_payload_bytes(
-        sender_page_table: KVCachePageTable,
-        receiver_page_table: KVCachePageTable,
-        dst_slot: Optional[int],
-    ) -> int:
-        """Recurrent-state bytes that will land in the receiver's slot.
-
-        Receiver-local invariant: regardless of the sender-side shard
-        pairing, the slot receives exactly the receiver's own per-layer
-        slot bytes over the overlapping mamba layers. A sender-side
-        simulation is not usable here: RankInfoServer runs on ctx rank 0
-        only, so receivers paired with any other sender would compute 0
-        and under-reserve the bounce slot.
-        """
-        if dst_slot is None:
-            return 0
-        self_mlg = MambaPolicy._find_mamba_layer_group(sender_page_table)
-        peer_mlg = MambaPolicy._find_mamba_layer_group(receiver_page_table)
-        if self_mlg is None or peer_mlg is None:
-            return 0
-        overlap = set(self_mlg.mamba_layer_offsets.keys()) & set(
-            peer_mlg.mamba_layer_offsets.keys()
-        )
-        per_layer = peer_mlg.conv_states.slot_bytes + peer_mlg.ssm_states.slot_bytes
-        return len(overlap) * int(per_layer)
-
-    @staticmethod
-    def payload_bytes(
-        sender_page_table: KVCachePageTable,
-        receiver_page_table: KVCachePageTable,
-        dst_slot: Optional[int],
-        sender_ri: RankInfo,
-        receiver_ri: RankInfo,
-    ) -> int:
-        """Total recurrent-state bytes one sender appends to the KV write for a request.
-
-        Mirrors the sender's ``collect_frags`` call in ``_build_kv_write_meta`` with the same
-        argument roles (sender as self/src), so the receiver can size a bounce region for the
-        exact bytes the coalesced write will carry. Slot indices only shift pointers, never
-        fragment sizes, so a dummy ``src_slot`` stands in for the sender's state index (which
-        the receiver does not know at reserve time). Returns 0 when either side has no mamba
-        layer group or the receiver has no state slot for the request.
-        """
-        if dst_slot is None:
-            return 0
-        _, _, sizes = MambaPolicy.collect_frags(
-            self_page_table=sender_page_table,
-            peer_page_table=receiver_page_table,
-            src_slot=0,
-            dst_slot=dst_slot,
-            self_ri=sender_ri,
-            peer_ri=receiver_ri,
-        )
-        return int(sum(sizes))
-
-    @staticmethod
-    def collect_frags(
-        self_page_table: KVCachePageTable,
-        peer_page_table: KVCachePageTable,
-        src_slot: Optional[int],
-        dst_slot: Optional[int],
-        self_ri: RankInfo,
-        peer_ri: RankInfo,
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Find mamba layer groups from page tables and build transfer frags.
-
-        Returns (src_frags, dst_frags, kv_sizes) — all empty if not applicable.
-        """
-        self_mlg = next(
-            (lg for lg in self_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
-            None,
-        )
-        peer_mlg = next(
-            (lg for lg in peer_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
-            None,
-        )
-        if self_mlg is None or peer_mlg is None or src_slot is None or dst_slot is None:
-            return [], [], []
-        return MambaPolicy.build_mamba_frags(
-            self_mlg=self_mlg,
-            peer_mlg=peer_mlg,
-            src_slot=src_slot,
-            dst_slot=dst_slot,
-            self_ri=self_ri,
-            peer_ri=peer_ri,
-        )
+    receiver_lg_idx = next(
+        i for i, lg in enumerate(receiver_page_table.layer_groups) if lg.kind == CacheKind.STATE
+    )
+    per_layer = sum(
+        get_physical_pool(receiver_page_table, receiver_lg_idx, pv.pool_idx).slot_bytes
+        for pv in receiver_mlg.pool_views
+    )
+    return len(overlap) * per_layer

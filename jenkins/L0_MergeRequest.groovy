@@ -212,6 +212,8 @@ def TARGET_BRANCH = "target_branch"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def BUILD_BRANCH = "build_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -221,6 +223,7 @@ def globalVars = [
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
 ]
+globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -957,7 +960,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
         def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
-        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output)
+        def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
+        def multiGpuLabelGateOpen = multiGpuRequired &&
+            _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                            multiGpuRequired, multiGpuLabelGateOpen)
         return result
     } catch (InterruptedException e) {
         throw e
@@ -967,12 +974,29 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
+// Observe the multi-GPU approval gate at CBTS decision time. This is telemetry
+// only: a later dispatch re-checks the label so this snapshot cannot change CI
+// behavior. Match the dispatch policy and fail open on non-interruption errors.
+def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+{
+    try {
+        def blockReason = requireMultiGpuApprovalLabel(
+            pipeline, globalVars, "CBTS telemetry")
+        return !blockReason
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: multi-GPU label telemetry check failed (${e.message}); failing open")
+        return true
+    }
+}
+
 // Check pilot eligibility, then fetch and audit the touch DB; artifact.py's
 // {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        // artifact.py resolves, downloads and unpacks; paths come back
+        // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
@@ -1015,10 +1039,19 @@ def _cbtsCoverageAudit(pipeline)
 
 // Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
 // decisionJson null for deferred; reason used only then. Context/creds via env.
-def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson)
+// Multi-GPU enters the pre-merge denominator only when normal CI requires it
+// and the approval-label gate is open at CBTS decision time.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson,
+                        boolean multiGpuRequired = false, boolean multiGpuLabelGateOpen = false)
 {
     try {
         def args = "--status ${status}"
+        if (multiGpuRequired) {
+            args += " --multi-gpu-required"
+        }
+        if (multiGpuLabelGateOpen) {
+            args += " --multi-gpu-label-gate-open"
+        }
         if (decisionJson != null) {
             pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
             args += " --decision cbts_decision.json"
@@ -1215,7 +1248,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/weight_sharing/",
-        "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
         "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
         "tensorrt_llm/_torch/visual_gen/modules/vae/",
         "tensorrt_llm/_torch/visual_gen/modules/attention.py",
@@ -1280,7 +1312,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
-        "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
@@ -1290,7 +1321,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
         "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
         "tests/integration/defs/examples/test_ray.py",
-        "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
         "tests/unittest/llmapi/test_async_llm.py",
         "docker/common/install_ucx.sh",
         "docker/common/install_nixl.sh",
@@ -1658,6 +1688,14 @@ def collectTestResults(pipeline, testFilter, globalVars)
     })
 }
 
+def resolveBuildBranch(globalVars)
+{
+    if (globalVars[GITHUB_PR_API_URL]) {
+        return "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+    }
+    return env.gitlabBranch ? env.gitlabBranch : "main"
+}
+
 def getCommonParameters()
 {
     return [
@@ -2017,6 +2055,28 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
+                // BOLT profile generation (producer): refreshes the branch-keyed
+                // `latest` bundle the BOLT consumers pull, on this pipeline's
+                // cadence. Post-merge only -- it profiles the SBSA build just
+                // built under three multi-hour GPU workloads, so it must never
+                // land on a pre-merge /bot run. Best-effort: the producer depends
+                // on external SLURM health and bundles are drift-tolerant, so a
+                // failure just leaves `latest` where it was; it must not fail
+                // post-merge nor block the tests behind it.
+                if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    stage("[BOLT-Profile-Gen] Remote Run") {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            def additionalParameters = [
+                                "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                                'targetArch': "aarch64-linux-gnu",
+                                'branch': globalVars[BUILD_BRANCH],
+                                'promote': "true",
+                            ]
+                            launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
+                        }
+                    }
+                }
+
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 def singleGpuInfraIncomplete = false
@@ -2145,10 +2205,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
 
                         // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
                         // instead of the BuildDockerImages helper job's own counter.
@@ -2215,10 +2272,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 stage("[Build-Release-Docker-Images] Remote Run") {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
 
                         // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
                         // instead of the BuildDockerImages helper job's own counter.
@@ -2376,10 +2430,7 @@ pipeline {
             script {
                 stage("Upload Build Info") {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
                         def buildInfo = "commit=${env.gitlabCommit}\n" +
                             "branch=${branch}\n" +
                             "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +

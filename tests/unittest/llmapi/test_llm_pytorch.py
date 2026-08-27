@@ -611,6 +611,9 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
 
 @skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
+# https://nvbugs/6566707: hung for 2400s in late executor-init/first-generate
+# on a many-times-reused MPI pool; isolate on a private pool until root-caused.
+@pytest.mark.private_mpi_session
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):

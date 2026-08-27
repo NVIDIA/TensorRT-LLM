@@ -635,6 +635,23 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        # Opt-in self-sampling GVR top-K decode (CuTeDSL, env-gated:
+        # TRTLLM_GVR_SELF_SAMPLING=1). Same operator contract as the tiered
+        # heuristic path (per-request device kv_lens, raw prev-top-K hints,
+        # per-row MTP window, in-kernel n <= topK short path); tuning is
+        # frozen from indexer_max_seq_len at capture time, so the launch is
+        # CUDA-graph-replay safe. The TopK module's hardware-format gate
+        # falls through to the CUDA GVR path with a one-time warning;
+        # contract violations inside the engine raise.
+        self._use_self_sampling_topk = (
+            os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
+            and IS_CUTLASS_DSL_AVAILABLE
+            # datacenter Blackwell only; consumer Blackwell (sm_120/121)
+            # lacks thread-block clusters
+            and get_sm_version() in (100, 103)
+            and sparse_params.index_topk in (512, 1024, 2048)
+            and compress_ratio in (1, 4)
+        )
         self.mtp_index_share = sparse_params.mtp_index_share
 
         if self.use_cute_dsl_topk:
@@ -647,6 +664,10 @@ class Indexer(nn.Module):
             decode_top_k_implementation = TopKImplementation.CUDA_GVR
         else:
             decode_top_k_implementation = TopKImplementation.CUDA_RADIX
+        if self._use_self_sampling_topk and self._enable_heuristic_topk:
+            # env opt-in overrides the decode implementation; the GVR prior
+            # contract is identical
+            decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR_V2
         self.top_k = TopK(
             self.index_topk,
             prefill_implementation=TopKImplementation.CUDA_RADIX,

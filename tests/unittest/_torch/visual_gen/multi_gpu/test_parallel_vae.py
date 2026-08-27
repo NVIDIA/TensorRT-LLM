@@ -473,12 +473,27 @@ def _logic_trtllm_encode_height(rank, world_size):
     assert max_diff < 0.01, f"Rank {rank}: trtllm encode height max_diff={max_diff:.6f}"
 
 
+def _logic_cosmos3_config_delegation(rank: int, world_size: int) -> None:
+    """The native wrapper preserves attributes used by the Cosmos3 pipeline."""
+    device = f"cuda:{rank}"
+    vae = _create_small_trtllm_vae(device)
+    _broadcast_params(vae)
+
+    parallel = _create_parallel_trtllm_vae(vae, world_size, "width")
+
+    assert parallel.config is vae.config
+    assert parallel.dtype == vae.dtype
+
+
 class TestParallelVAETrtllmDecode:
     def test_decode_width_2gpu(self):
         _run(2, _logic_trtllm_decode_width)
 
     def test_decode_height_2gpu(self):
         _run(2, _logic_trtllm_decode_height)
+
+    def test_cosmos3_config_delegation_2gpu(self) -> None:
+        _run(2, _logic_cosmos3_config_delegation)
 
 
 class TestParallelVAETrtllmEncode:
