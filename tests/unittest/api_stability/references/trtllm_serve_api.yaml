@@ -301,6 +301,12 @@ models:
         default: null
         status: prototype
         required: false
+      kv_transfer_params:
+        kind: extension
+        type: Optional[KvTransferParams]
+        default: null
+        status: prototype
+        required: false
       priority:
         kind: extension
         type: Optional[float]
@@ -790,6 +796,12 @@ models:
         default: null
         status: prototype
         required: false
+      kv_transfer_params:
+        kind: extension
+        type: Optional[KvTransferParams]
+        default: null
+        status: prototype
+        required: false
       cache_salt:
         kind: extension
         type: Optional[str]
@@ -1062,6 +1074,12 @@ models:
         type: Optional[ResponsePrompt]
         default: null
         status: stable
+        required: false
+      kv_transfer_params:
+        kind: extension
+        type: Optional[KvTransferParams]
+        default: null
+        status: prototype
         required: false
       reasoning:
         kind: openai

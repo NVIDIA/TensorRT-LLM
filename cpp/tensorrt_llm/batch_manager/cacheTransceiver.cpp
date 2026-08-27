@@ -959,6 +959,29 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     publishStatusSnapshot();
 }
 
+void CacheTransceiver::requestContextPrefetchAsync(std::shared_ptr<LlmRequest> llmRequest)
+{
+    TLLM_CHECK(llmRequest && !llmRequest->isGenerationOnlyRequest());
+    TLLM_CHECK_WITH_INFO(llmRequest->getContextPhaseParams().has_value(),
+        "Context KV prefetch requires source context phase parameters.");
+
+    auto const requestId = llmRequest->mRequestId;
+    if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+            [requestId](auto const& pair) { return pair.first->mRequestId == requestId; })
+        != mRequesterFutures.end())
+    {
+        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", requestId);
+        return;
+    }
+
+    llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
+    auto* requestPtr = llmRequest.get();
+    mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
+    requestPtr->setState(LlmRequestState::kCONTEXT_PREFETCH_IN_PROGRESS);
+    publishStatusSnapshot();
+}
+
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     std::shared_ptr<CacheTransceiverComm> const& mComm, std::vector<LlmRequest::RequestIdType> const& requestIds)
 {
@@ -1380,29 +1403,30 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     return requestsStatus;
 }
 
-void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
+RequestStatuses CacheTransceiver::checkRequesterTransferStatusImpl(
+    std::optional<int> const& atLeastRequestNum, bool markGenerationComplete)
 {
     bool const blockAll = !atLeastRequestNum.has_value();
     bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
     TLLM_CHECK_WITH_INFO(!inflightCancelEnabled || !blockAll,
-        "In-flight cancellation requires a finite generation-transfer status poll; pass 0 for a nonblocking poll.");
+        "In-flight cancellation requires a finite requester-transfer status poll; pass 0 for a nonblocking poll.");
     bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
-    std::optional<int> genTransferPollIntervalMs = std::nullopt;
+    std::optional<int> requesterTransferPollIntervalMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
     {
-        genTransferPollIntervalMs = mCacheTransceiverConfig->getKvTransferPollIntervalMs();
+        requesterTransferPollIntervalMs = mCacheTransceiverConfig->getKvTransferPollIntervalMs();
     }
-    auto const futureWaitInterval = getTransferFutureWaitInterval(genTransferPollIntervalMs, needsProgress);
+    auto const futureWaitInterval = getTransferFutureWaitInterval(requesterTransferPollIntervalMs, needsProgress);
 
-    std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
+    std::vector<LlmRequest::RequestIdType> requesterTransferReadyRequestIds;
     auto collectReadyRequestIds = [&]()
     {
-        genTransferReadyRequestIds.clear();
+        requesterTransferReadyRequestIds.clear();
         for (auto&& [request, future] : mRequesterFutures)
         {
             if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
             {
-                genTransferReadyRequestIds.push_back(request->mRequestId);
+                requesterTransferReadyRequestIds.push_back(request->mRequestId);
             }
         }
     };
@@ -1410,7 +1434,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     if (needsProgress)
     {
         auto const deadline = std::chrono::steady_clock::now() + futureWaitInterval;
-        while (static_cast<int>(genTransferReadyRequestIds.size()) < atLeastRequestNum.value()
+        while (static_cast<int>(requesterTransferReadyRequestIds.size()) < atLeastRequestNum.value()
             && std::chrono::steady_clock::now() < deadline)
         {
             auto const remaining
@@ -1426,7 +1450,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
     if ((syncComm) && syncComm->getSize() > 1)
     {
-        auto gatherRequestIdVec = gatherRequestIds(syncComm, genTransferReadyRequestIds);
+        auto gatherRequestIdVec = gatherRequestIds(syncComm, requesterTransferReadyRequestIds);
         for (auto&& requestId : gatherRequestIdVec)
         {
             frequencyMap[requestId]++;
@@ -1434,7 +1458,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     }
     else
     {
-        for (auto&& requestId : genTransferReadyRequestIds)
+        for (auto&& requestId : requesterTransferReadyRequestIds)
         {
             frequencyMap[requestId]++;
         }
@@ -1454,25 +1478,25 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         }
         if (useMPI())
         {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkRequesterTransferStatus freqVec requestId: %zu,freq:%d  ",
                 requestId, freq);
         }
         else
         {
             TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
+                " checkRequesterTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
         }
     }
     if (useMPI())
     {
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
+            " checkRequesterTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
     else
     {
         TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-            " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
+            " checkRequesterTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
 
@@ -1495,7 +1519,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 if (mTimedOutRequesterIds.insert(requestId).second)
                 {
                     TLLM_LOG_WARNING(
-                        "Generation KV cache transfer for request %ld exceeded configured timeout: "
+                        "Requester KV cache transfer for request %ld exceeded configured timeout: "
                         "elapsed %ld ms > limit %d ms (%s).",
                         requestId, elapsedMs, kvTransferTimeoutMs.value(),
                         inflightCancelEnabled ? "requesting cancellation" : "observe-only");
@@ -1516,19 +1540,20 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                         if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(requestId).second)
                         {
                             TLLM_LOG_WARNING(
-                                "Generation KV cache transfer for request %ld completed after its deadline: "
+                                "Requester KV cache transfer for request %ld completed after its deadline: "
                                 "elapsed %ld ms > limit %d ms (%s).",
                                 requestId, elapsedMs, kvTransferTimeoutMs.value(),
                                 inflightCancelEnabled ? "failing request" : "observe-only");
                         }
                     }
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/false, mCompletedRequesterRequestIds,
+                    auto const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
                         mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
                 }
                 else if (status == std::future_status::timeout)
                 {
                     TLLM_LOG_DEBUG(
-                        "Generation KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping "
+                        "Requester KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping "
                         "it in progress.",
                         requestId, static_cast<long>(futureWaitInterval.count()));
                     ++it;
@@ -1543,13 +1568,13 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR("Error occurred during generation transfer for request %ld: %s", requestId, e.what());
+                TLLM_LOG_ERROR("Error occurred during requester transfer for request %ld: %s", requestId, e.what());
                 recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
                     mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
             catch (...)
             {
-                TLLM_LOG_ERROR("Unknown error occurred during generation transfer for request %ld", requestId);
+                TLLM_LOG_ERROR("Unknown error occurred during requester transfer for request %ld", requestId);
                 recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
                     mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
@@ -1592,16 +1617,17 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             }
             mTimedOutRequesterIds.insert(requestId);
             if (requestCancellationNoThrow(
-                    requestId, "Generation", [&]() { return mCacheReceiver->cancelRequest(*futureIt->first); }))
+                    requestId, "Requester", [&]() { return mCacheReceiver->cancelRequest(*futureIt->first); }))
             {
                 mCancelRequestedRequesterIds.insert(requestId);
             }
             else
             {
-                TLLM_LOG_DEBUG("Generation cancellation for request %ld was not accepted; will retry", requestId);
+                TLLM_LOG_DEBUG("Requester cancellation for request %ld was not accepted; will retry", requestId);
             }
         }
     }
+    RequestStatuses requestsStatus{};
     for (auto const requestId : sortedRequestIds(consensusOutcome.failedRequestIds))
     {
         auto const requestIt = mRequesterRequestsAwaitingConsensus.find(requestId);
@@ -1609,7 +1635,15 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
-        requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        requestsStatus.errorRequestIds.insert(requestId);
+        if (markGenerationComplete)
+        {
+            requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        }
+        else if (requestIt->second->isContextPrefetchInProgressState())
+        {
+            requestIt->second->setState(LlmRequestState::kCONTEXT_INIT);
+        }
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
@@ -1626,8 +1660,16 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
-        requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
-        completedRequests.push_back(requestIt->second.get());
+        requestsStatus.completedRequestIds.insert(requestId);
+        if (markGenerationComplete)
+        {
+            requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+            completedRequests.push_back(requestIt->second.get());
+        }
+        else if (requestIt->second->isContextPrefetchInProgressState())
+        {
+            requestIt->second->setState(LlmRequestState::kCONTEXT_PREFETCH_COMPLETE);
+        }
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
@@ -1642,6 +1684,17 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         batchUpdateKVCacheTransferBW(syncComm, completedRequests);
         writeGenTransferSummary(completedRequests);
     }
+    return requestsStatus;
+}
+
+RequestStatuses CacheTransceiver::checkRequesterTransferStatus(std::optional<int> const& atLeastRequestNum)
+{
+    return checkRequesterTransferStatusImpl(atLeastRequestNum, /*markGenerationComplete=*/false);
+}
+
+void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
+{
+    static_cast<void>(checkRequesterTransferStatusImpl(atLeastRequestNum, /*markGenerationComplete=*/true));
 }
 
 void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests)

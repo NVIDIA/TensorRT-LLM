@@ -1802,7 +1802,26 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                 // deferred to Phase 2 for the single reuser.
                 auto const blockId = matchingBlock->getBlockId();
                 auto tIt = tracker.map.find(blockId);
-                if (tIt != tracker.map.end())
+                if (llmRequest.isContextPrefetchInitState())
+                {
+                    // The transfer will overwrite this logical block with remote KV. Allocate a private destination
+                    // block instead of reusing the partial leaf that is still attached to the reuse tree.
+                    claimed.needsCopy = true;
+                    if (tIt == tracker.map.end())
+                    {
+                        claimed.shouldReleaseCopySource = true;
+                        tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
+                    }
+                    else if (!tIt->second.fullyMatched)
+                    {
+                        claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].shouldReleaseCopySource
+                            = false;
+                        claimed.shouldReleaseCopySource = true;
+                        tIt->second.requestIdx = requestIdx;
+                        tIt->second.claimedIdx = result.claimedBlocks.size();
+                    }
+                }
+                else if (tIt != tracker.map.end())
                 {
                     if (tIt->second.fullyMatched)
                     {
@@ -1888,14 +1907,20 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
 
         if (claimed.isPartialMatch && claimed.needsCopy)
         {
-            // Partial match needing copy: allocate new block, copy from source, use new block
+            // Partial match needing copy: allocate new block, copy from source, use new block.
+            // Context prefetch is different: the remote transfer fills this block, so copying local partial KV first is
+            // unnecessary. The important property is that the receive target is private and has the requested block key.
+            bool const isRemoteTransferTarget = llmRequest.isContextPrefetchInitState();
             auto copySource = claimed.block;
             auto newBlock = getFreeBlock(sequence, copySource->getPriority(), copySource->getDurationMs(),
                 claimResult.mode, claimResult.directory);
-            mTransferManager->onboard(
-                copySource, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
-            // Release the claimed non-leaf copy source back to the free queue now that
-            // the copy is done. The tracker ensures only the last copier releases.
+            if (!isRemoteTransferTarget)
+            {
+                mTransferManager->onboard(
+                    copySource, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
+            }
+            // Release the claimed copy source back to the free queue now that the new request will use a private block.
+            // The tracker ensures only the last copier releases.
             if (claimed.shouldReleaseCopySource && !copySource->hasRefs())
             {
                 mEvictionPolicy->releaseBlock(copySource);
@@ -1907,7 +1932,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
                     *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
             }
             claimed.block->setHash();
-            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Copied partially filled block %d",
+            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Allocated private partial block %d",
                 mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
         }
         else if (claimed.isPartialMatch)

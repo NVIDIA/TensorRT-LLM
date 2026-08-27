@@ -141,6 +141,7 @@ static_assert(hasSerializedSize<kv_cache::SocketState>(size_t()));
 static_assert(hasSerializedSize<kv_cache::CacheState>(size_t()));
 static_assert(hasSerializedSize<DataTransceiverState>(size_t()));
 static_assert(hasSerializedSize<ContextPhaseParams>(size_t()));
+static_assert(hasSerializedSize<KvHint>(size_t()));
 static_assert(hasSerializedSize<ExternalDraftTokensConfig>(size_t()));
 static_assert(hasSerializedSize<Tensor>(size_t()));
 static_assert(hasSerializedSize<SpeculativeDecodingFastLogitsInfo>(size_t()));
@@ -280,6 +281,7 @@ static_assert(hasSerialize<kv_cache::SocketState>(nullptr));
 static_assert(hasSerialize<kv_cache::CacheState>(nullptr));
 static_assert(hasSerialize<DataTransceiverState>(nullptr));
 static_assert(hasSerialize<ContextPhaseParams>(nullptr));
+static_assert(hasSerialize<KvHint>(nullptr));
 static_assert(!hasSerialize<std::string>(nullptr));
 static_assert(!hasSerialize<std::optional<float>>(nullptr));
 static_assert(hasSerialize<CacheTransceiverConfig>(nullptr));
@@ -477,6 +479,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ContextPhaseParams>)
     {
         return Serialization::deserializeContextPhaseParams(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KvHint>)
+    {
+        return Serialization::deserializeKvHint(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::MmKey>)
     {

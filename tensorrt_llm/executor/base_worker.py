@@ -402,8 +402,13 @@ class BaseWorker(GenerationExecutor):
             request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
+        kv_hint = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         disagg_request_id = 0
+
+        if request.kv_hint is not None:
+            kv_hint = tllm.KvHint(
+                source_control_endpoint=request.kv_hint.source_control_endpoint)
 
         if request.disaggregated_params is not None:
             assert (
@@ -526,6 +531,7 @@ class BaseWorker(GenerationExecutor):
                 type=request_type,
                 disagg_request_id=disagg_request_id,
                 cache_salt=request.cache_salt,
+                kv_hint=kv_hint,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs

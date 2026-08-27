@@ -81,7 +81,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    to_llm_disaggregated_params, to_llm_kv_hint)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -1742,6 +1742,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            kv_hint = to_llm_kv_hint(request.kv_transfer_params)
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
@@ -1764,6 +1765,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
                 cache_salt=request.cache_salt,
+                kv_hint=kv_hint,
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
                 priority=request.priority
@@ -2060,6 +2062,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            kv_hint = to_llm_kv_hint(request.kv_transfer_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
@@ -2096,6 +2099,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     conversation_params=conversation_params,
+                    kv_hint=kv_hint,
                     trace_headers=trace_headers,
                     priority=request.priority if request.priority is not None
                     else DEFAULT_REQUEST_PRIORITY)
@@ -2226,6 +2230,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            kv_hint = to_llm_kv_hint(request.kv_transfer_params)
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
@@ -2240,6 +2245,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 scheduling_params=scheduling_params,
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
+                kv_hint=kv_hint,
                 trace_headers=trace_headers,
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
@@ -2387,10 +2393,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.stream else responses_api_post_processor,
                 postproc_args=postproc_args,
             )
+            kv_hint = to_llm_kv_hint(request.kv_transfer_params)
             promise = self.generator.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
+                kv_hint=kv_hint,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )

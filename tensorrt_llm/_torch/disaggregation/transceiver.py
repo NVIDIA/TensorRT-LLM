@@ -720,6 +720,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_sessions.pop(rid, None)
             self._recv_reqs.pop(rid, None)
 
+    def request_context_prefetch_async(self, req: LlmRequest):
+        raise NotImplementedError(
+            "Context KV prefetch is currently implemented by the C++ cache transceiver only."
+        )
+
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
         self._ever_had_recv_session = True
@@ -811,6 +816,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.sweep_stale_req_infos()
 
         return completed, failed
+
+    def check_requester_transfer_status(self, at_least_request_num: Optional[int]):
+        return self.check_gen_transfer_status(at_least_request_num)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
         if not self._ever_had_recv_session and not self._gen_need_sync:

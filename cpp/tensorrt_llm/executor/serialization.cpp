@@ -850,6 +850,23 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
     return totalSize;
 }
 
+// KvHint
+KvHint Serialization::deserializeKvHint(std::istream& is)
+{
+    auto sourceControlEndpoint = su::deserialize<decltype(KvHint::sourceControlEndpoint)>(is);
+    return KvHint{std::move(sourceControlEndpoint)};
+}
+
+void Serialization::serialize(KvHint const& kvHint, std::ostream& os)
+{
+    su::serialize(kvHint.sourceControlEndpoint, os);
+}
+
+size_t Serialization::serializedSize(KvHint const& kvHint)
+{
+    return su::serializedSize(kvHint.sourceControlEndpoint);
+}
+
 // Request
 Request Serialization::deserializeRequest(std::istream& is)
 {
@@ -895,6 +912,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         : std::nullopt;
     auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
     auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
+    auto kvHint = su::deserialize<std::optional<KvHint>>(is);
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
@@ -904,7 +922,8 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt),
+        std::move(kvHint));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)

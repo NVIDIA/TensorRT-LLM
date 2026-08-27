@@ -1650,6 +1650,7 @@ def executor_request_to_llm_request(
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
+        kv_hint=executor_request.kv_hint,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),

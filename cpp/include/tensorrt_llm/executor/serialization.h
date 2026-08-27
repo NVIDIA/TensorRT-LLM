@@ -123,6 +123,11 @@ public:
     static void serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(ContextPhaseParams const& contextPhaseParams);
 
+    // KvHint
+    [[nodiscard]] static KvHint deserializeKvHint(std::istream& is);
+    static void serialize(KvHint const& kvHint, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(KvHint const& kvHint);
+
     // Request
     [[nodiscard]] static Request deserializeRequest(std::istream& is);
     static void serialize(Request const& request, std::ostream& os);

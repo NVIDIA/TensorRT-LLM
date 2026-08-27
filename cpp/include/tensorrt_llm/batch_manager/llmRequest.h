@@ -51,6 +51,9 @@ enum class LlmRequestState : int32_t
     kUNKNOWN = 0,                             ///< Unknown state
     kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
 
+    kCONTEXT_PREFETCH_INIT = 4,               ///< Context request should try to fetch reusable KV before scheduling
+    kCONTEXT_PREFETCH_IN_PROGRESS = 5,        ///< Context request is fetching reusable KV before scheduling
+    kCONTEXT_PREFETCH_COMPLETE = 6,           ///< Context prefetch finished and must be committed before scheduling
     kDISAGG_CONTEXT_WAIT_SCHEDULER = 7,       ///< Waiting for scheduler to schedule the context-only request
                                               /// e.g. in gen-first mode when generation request is not scheduled yet
     kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
@@ -161,7 +164,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, std::optional<executor::KvHint> kvHint = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -224,6 +227,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(std::move(cacheSalt))
+        , mKvHint(std::move(kvHint))
         , mAgentHierarchy(std::move(agent_hierarchy))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
@@ -253,7 +257,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, std::optional<executor::KvHint> kvHint = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -295,6 +299,7 @@ public:
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
         , mCacheSalt(std::move(cacheSalt))
+        , mKvHint(std::move(kvHint))
     {
         if (mEncoderTokens.has_value())
         {
@@ -336,6 +341,7 @@ public:
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
         , mCacheSalt(req.getCacheSalt())
+        , mKvHint(req.getKvHint())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
@@ -552,6 +558,11 @@ public:
         return mContextPhaseParams;
     }
 
+    [[nodiscard]] std::optional<executor::KvHint> const& getKvHint() const noexcept
+    {
+        return mKvHint;
+    }
+
     /// @brief Get the number of generation tokens carried by context phase handoff.
     /// @return Number of first generation tokens plus draft tokens.
     [[nodiscard]] SizeType32 getNumContextPhaseGenerationTokens() const noexcept
@@ -575,6 +586,11 @@ public:
     {
         mContextPhaseParams = std::move(contextPhaseParams);
         adoptContextPhaseDraftTokens();
+    }
+
+    void clearContextPhaseParams() noexcept
+    {
+        mContextPhaseParams.reset();
     }
 
     /// @brief Get the state params of the context
@@ -1631,6 +1647,28 @@ public:
         return mState == LlmRequestState::kCONTEXT_INIT || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
     }
 
+    [[nodiscard]] bool isContextPrefetchInitState() const noexcept
+    {
+        return mState == LlmRequestState::kCONTEXT_PREFETCH_INIT;
+    }
+
+    [[nodiscard]] bool isContextPrefetchInProgressState() const noexcept
+    {
+        return mState == LlmRequestState::kCONTEXT_PREFETCH_IN_PROGRESS;
+    }
+
+    [[nodiscard]] bool isContextPrefetchCompleteState() const noexcept
+    {
+        return mState == LlmRequestState::kCONTEXT_PREFETCH_COMPLETE;
+    }
+
+    [[nodiscard]] bool isContextResourceInitState() const noexcept
+    {
+        return isContextInitState() || isContextPrefetchInitState() || isContextPrefetchInProgressState()
+            || isContextPrefetchCompleteState() || isDisaggGenerationInitState()
+            || isDisaggGenerationTransmissionComplete();
+    }
+
     [[nodiscard]] bool isContextFinished() const noexcept
     {
         return isGenerationInProgressState() || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
@@ -1683,6 +1721,9 @@ public:
         switch (mState)
         {
         case batch_manager::LlmRequestState::kENCODER_INIT: return executor::RequestStage::kENCODER_IN_PROGRESS;
+        case batch_manager::LlmRequestState::kCONTEXT_PREFETCH_INIT:
+        case batch_manager::LlmRequestState::kCONTEXT_PREFETCH_IN_PROGRESS:
+        case batch_manager::LlmRequestState::kCONTEXT_PREFETCH_COMPLETE:
         case batch_manager::LlmRequestState::kCONTEXT_INIT:
         case batch_manager::LlmRequestState::kDISAGG_CONTEXT_WAIT_SCHEDULER:
             return executor::RequestStage::kCONTEXT_IN_PROGRESS;
@@ -1734,8 +1775,7 @@ public:
 
     [[nodiscard]] SizeType32 getContextChunkSize() const
     {
-        TLLM_CHECK_WITH_INFO(
-            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
+        TLLM_CHECK_WITH_INFO(isContextResourceInitState(),
             "getContextChunkSize is only possible during the context phase or generation init phase.");
         return mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
     }
@@ -1745,8 +1785,7 @@ public:
     /// remaining length.
     void setContextChunkSize(SizeType32 size)
     {
-        TLLM_CHECK_WITH_INFO(
-            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
+        TLLM_CHECK_WITH_INFO(isContextResourceInitState(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         auto& contextChunkSize = mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
@@ -2283,6 +2322,8 @@ protected:
     // Cache salt string. Used in BlockKey hashing/matching and surfaced in KV cache events.
     std::optional<std::string> mCacheSalt{std::nullopt};
 
+    std::optional<executor::KvHint> mKvHint{std::nullopt};
+
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
 private:
@@ -2501,7 +2542,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, std::optional<executor::KvHint> kvHint = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2545,7 +2586,7 @@ public:
             multimodalRunLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(cacheSalt))
+            std::move(cacheSalt), std::move(kvHint))
     {
     }
 

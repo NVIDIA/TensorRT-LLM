@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheConnector.h"
@@ -8522,6 +8523,47 @@ static void seedAndRelease(KVCacheManager& mgr, LlmRequest::RequestIdType reqId,
     mgr.addSequenceBatch({{{reqId, inputLength, beamWidth}}}, {std::ref(*req)});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
     (void) mgr.removeSequence(reqId, req);
+}
+
+TEST_F(KVCacheManagerTest, ContextPrefetchAllocatesPrivateReceiveBlockForPartiallyReusedLeaf)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr seedRequestId = 0;
+    auto constexpr requestId = 1;
+    auto seedTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 90});
+
+    auto seedReq = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{seedRequestId}, SizeType32{0}, seedTokens, tr::SamplingConfig{beamWidth}, false);
+    mgr->addSequenceBatch({{{seedRequestId, static_cast<SizeType32>(seedTokens->size()), beamWidth}}},
+        {std::ref(*seedReq)});
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    auto const seedBlockIds = mgr->getSequence(seedRequestId).getCacheBlockIds(windowSize).at(0);
+    ASSERT_EQ(seedBlockIds.size(), 3);
+    auto const seededPartialLeafBlockId = seedBlockIds[2];
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedReq);
+    (void) mgr->removeSequence(seedRequestId, seedReq);
+
+    auto tokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20});
+    auto req = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, SizeType32{0}, tokens, tr::SamplingConfig{beamWidth}, false);
+    req->setState(LlmRequestState::kCONTEXT_PREFETCH_INIT);
+    mgr->addSequenceBatch({{{requestId, static_cast<SizeType32>(tokens->size()), beamWidth}}}, {std::ref(*req)});
+
+    auto const sequenceBlockIds = mgr->getSequence(requestId).getCacheBlockIds(windowSize).at(0);
+    ASSERT_EQ(sequenceBlockIds.size(), 3);
+    ASSERT_EQ(req->getPrepopulatedPromptLen(), 11);
+    EXPECT_NE(sequenceBlockIds[2], seededPartialLeafBlockId);
+
+    auto receiveRange = getBlockRangeForReceiving(mgr.get(), *req, /*srcEnableBlockReuse=*/true,
+        /*srcEnablePartialReuse=*/true, /*recvSideHasCP=*/false, /*srcPpSize=*/1);
+    auto const receiveBlockIds = receiveRange.getBlockIdsPerWindow().at(windowSize);
+
+    EXPECT_THAT(receiveBlockIds, ::testing::ElementsAre(sequenceBlockIds[2]));
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
 }
 
 TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalContextTokenAfterReuse)

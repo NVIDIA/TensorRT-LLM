@@ -51,6 +51,7 @@ from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
                       field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
+from tensorrt_llm.executor.request import KvHint as LlmKvHint
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
@@ -268,6 +269,37 @@ class ConversationParams(OpenAIBaseModel):
         if not conversation_id:
             raise ValueError("conversation_id must be non-empty")
         return conversation_id
+
+
+class KvHintParams(OpenAIBaseModel):
+    source_control_endpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "Control endpoint for the source worker that can expose its "
+            "cache transceiver state."),
+    )
+
+
+class KvTransferParams(OpenAIBaseModel):
+    kv_hint: Optional[KvHintParams] = Field(
+        default=None,
+        description="KV cache transfer hint for this request.",
+    )
+
+
+def to_llm_kv_hint(
+        kv_transfer_params: Optional[KvTransferParams]) -> Optional[LlmKvHint]:
+    if kv_transfer_params is None or kv_transfer_params.kv_hint is None:
+        return None
+
+    source_control_endpoint = kv_transfer_params.kv_hint.source_control_endpoint
+    if source_control_endpoint is None:
+        return None
+    source_control_endpoint = source_control_endpoint.strip()
+    if not source_control_endpoint:
+        return None
+
+    return LlmKvHint(source_control_endpoint=source_control_endpoint)
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -616,6 +648,10 @@ class CompletionRequest(OpenAIBaseModel):
     conversation_params: Optional[ConversationParams] = Field(
         default=None,
         description=("Parameters for multi-turn conversation routing"),
+    )
+    kv_transfer_params: Optional[KvTransferParams] = Field(
+        default=None,
+        description=("Parameters for KV cache transfer between workers"),
     )
 
     # doc: end-completion-extra-params
@@ -1010,6 +1046,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for multi-turn conversation routing"),
     )
+    kv_transfer_params: Optional[KvTransferParams] = Field(
+        default=None,
+        description=("Parameters for KV cache transfer between workers"),
+    )
 
     cache_salt: Optional[str] = Field(
         default=None,
@@ -1224,6 +1264,10 @@ class ResponsesRequest(OpenAIBaseModel):
     parallel_tool_calls: Optional[bool] = False
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
+    kv_transfer_params: Optional[KvTransferParams] = Field(
+        default=None,
+        description="KV cache transfer parameters for this request.",
+    )
     reasoning: Optional[Reasoning] = None
     thinking_token_budget: Optional[int] = None
     service_tier: Literal["auto", "default", "flex", "scale",

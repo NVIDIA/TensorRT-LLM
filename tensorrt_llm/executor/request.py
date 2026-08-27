@@ -1,7 +1,7 @@
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -19,6 +19,7 @@ __all__ = [
     "DEFAULT_REQUEST_PRIORITY",
     "LoRARequest",
     "PromptAdapterRequest",
+    "KvHint",
     "GenerationRequest",
     "TruncateKVCacheRequest",
     "CancellingRequest",
@@ -87,6 +88,52 @@ class PromptAdapterRequest:
         return self.prompt_adapter_local_path
 
 
+@dataclass(slots=True)
+class KvHint:
+    """KV cache transfer hint carried with a generation request.
+
+    The PyTorch executor treats a URL with a path as the exact
+    transceiver-state endpoint. For host-only URLs, it appends
+    /v1/data_transceiver_state.
+    """
+    source_control_endpoint: str
+
+    def __post_init__(self):
+        if not isinstance(self.source_control_endpoint, str):
+            raise TypeError(
+                "source_control_endpoint must be a non-empty str, got "
+                f"{type(self.source_control_endpoint).__name__}")
+        source_control_endpoint = self.source_control_endpoint.strip()
+        if not source_control_endpoint:
+            raise ValueError("source_control_endpoint must be a non-empty str")
+        self.source_control_endpoint = source_control_endpoint
+
+    @staticmethod
+    def from_extra_args(extra_args: Optional[Dict[str, Any]]) -> Optional["KvHint"]:
+        if not extra_args:
+            return None
+
+        kv_transfer_params = extra_args.get("kv_transfer_params")
+        if kv_transfer_params is None:
+            return None
+        if not isinstance(kv_transfer_params, dict):
+            raise TypeError("kv_transfer_params must be a dict when provided")
+
+        kv_hint = kv_transfer_params.get("kv_hint")
+        if kv_hint is None:
+            return None
+        if not isinstance(kv_hint, dict):
+            raise TypeError("kv_transfer_params.kv_hint must be a dict when provided")
+
+        source_control_endpoint = kv_hint.get("source_control_endpoint")
+        if source_control_endpoint is None:
+            return None
+        if isinstance(source_control_endpoint, str) and not source_control_endpoint.strip():
+            return None
+
+        return KvHint(source_control_endpoint=source_control_endpoint)
+
+
 class GenerationRequest:
     # Mirrors C++ Request::Impl::kMaxCacheSaltLength
     MAX_CACHE_SALT_LEN: int = 256
@@ -107,6 +154,7 @@ class GenerationRequest:
         scheduling_params: Optional[SchedulingParams] = None,
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
+        kv_hint: Optional[KvHint] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
@@ -150,6 +198,11 @@ class GenerationRequest:
                     f"exceeds the maximum supported length "
                     f"({self.MAX_CACHE_SALT_LEN}).")
         self.cache_salt = cache_salt
+        if kv_hint is not None and not isinstance(kv_hint, KvHint):
+            raise TypeError(
+                f"kv_hint must be KvHint or None, got {type(kv_hint).__name__}"
+            )
+        self.kv_hint = kv_hint
         self.arrival_time = arrival_time
         self.encoder_input_token_ids = self._normalize_optional_token_ids(
             encoder_input_token_ids, "encoder_input_token_ids")

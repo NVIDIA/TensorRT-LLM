@@ -245,7 +245,15 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def request_context_prefetch_async(self, req: LlmRequest):
+        raise NotImplementedError
+
+    @abstractmethod
     def check_context_transfer_status(self, at_least_request_num: int):
+        raise NotImplementedError
+
+    @abstractmethod
+    def check_requester_transfer_status(self, at_least_request_num: int):
         raise NotImplementedError
 
     @abstractmethod
@@ -383,8 +391,14 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def request_and_receive_async(self, req: LlmRequest):
         return self.impl.request_and_receive_async(req)
 
+    def request_context_prefetch_async(self, req: LlmRequest):
+        return self.impl.request_context_prefetch_async(req)
+
     def check_context_transfer_status(self, at_least_request_num: int):
         return self.impl.check_context_transfer_status(at_least_request_num)
+
+    def check_requester_transfer_status(self, at_least_request_num: int):
+        return self.impl.check_requester_transfer_status(at_least_request_num)
 
     def check_gen_transfer_status(self, at_least_request_num: int):
         return self.impl.check_gen_transfer_status(at_least_request_num)

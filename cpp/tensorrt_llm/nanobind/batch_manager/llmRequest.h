@@ -90,7 +90,8 @@ public:
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
-        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt)
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
+        std::optional<executor::KvHint> kvHint = std::nullopt)
         : Base(requestId,                                                                                       //
             maxNewTokens,                                                                                       //
             std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                 //
@@ -165,7 +166,9 @@ public:
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
             multimodalRunLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))             //
-                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt)                          //
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
+            std::nullopt,                                                                                        // cacheSalt
+            std::move(kvHint)                                                                                    //
         )
     {
     }

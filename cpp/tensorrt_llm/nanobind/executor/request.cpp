@@ -604,6 +604,23 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", guidedDecodingParamsGetstate)
         .def("__setstate__", guidedDecodingParamsSetstate);
 
+    auto kvHintGetstate = [](tle::KvHint const& self) { return nb::make_tuple(self.sourceControlEndpoint); };
+    auto kvHintSetstate = [](tle::KvHint& self, nb::tuple const& state)
+    {
+        if (state.size() != 1)
+        {
+            throw std::runtime_error("Invalid KvHint state!");
+        }
+        new (&self) tle::KvHint{nb::cast<std::optional<std::string>>(state[0])};
+    };
+
+    nb::class_<tle::KvHint>(m, "KvHint")
+        .def(nb::init<std::optional<std::string>>(), nb::arg("source_control_endpoint") = nb::none())
+        .def_rw("source_control_endpoint", &tle::KvHint::sourceControlEndpoint)
+        .def("__getstate__", kvHintGetstate)
+        .def("__setstate__", kvHintSetstate)
+        .def("__eq__", &tle::KvHint::operator==);
+
     auto requestGetstate = [](tle::Request const& self)
     {
         // Serialize input_token_ids as a raw int32 byte buffer instead of a Python
@@ -623,11 +640,11 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt());
+            self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt(), self.getKvHint());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 35)
+        if (state.size() != 35 && state.size() != 36)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -665,7 +682,8 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
             nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
+            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]),
+            state.size() == 36 ? nb::cast<std::optional<tle::KvHint>>(state[35]) : std::nullopt);
     };
 
     // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
@@ -717,7 +735,7 @@ void initRequestBindings(nb::module_& m)
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
-                std::optional<std::string> cache_salt)
+                std::optional<std::string> cache_salt, std::optional<tle::KvHint> kv_hint)
             {
                 new (self) tle::Request(toVecTokens(input_token_ids), max_tokens, streaming, sampling_config,
                     output_config, end_id, pad_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
@@ -729,7 +747,7 @@ void initRequestBindings(nb::module_& m)
                     std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
                     std::move(cross_attention_mask), num_return_sequences, std::move(eagle_config),
                     std::move(skip_cross_attn_blocks), std::move(guided_decoding_params), language_adapter_uid,
-                    allotted_time_ms, disagg_request_id, std::move(cache_salt));
+                    allotted_time_ms, disagg_request_id, std::move(cache_salt), std::move(kv_hint));
             },
             // clang-format off
         nb::arg("input_token_ids"),
@@ -770,7 +788,8 @@ void initRequestBindings(nb::module_& m)
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
         nb::arg("disagg_request_id") = nb::none(),
-        nb::arg("cache_salt") = nb::none()
+        nb::arg("cache_salt") = nb::none(),
+        nb::arg("kv_hint") = nb::none()
     ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
         .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
@@ -817,6 +836,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("cache_salt", &tle::Request::getCacheSalt, &tle::Request::setCacheSalt)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
+        .def_prop_rw("kv_hint", &tle::Request::getKvHint, &tle::Request::setKvHint)
         .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
