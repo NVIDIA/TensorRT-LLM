@@ -3325,6 +3325,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # including dtype-specific scale and subclass-provided side buffers.
         # Preserve those configs and replace only the local Mamba layers.
         layers = list(config.layers)
+        # PP can keep one max-sized microbatch per stage resident, so its live
+        # request ceiling is max_batch_size * pp_size rather than max_batch_size.
+        max_gpu_slots = (None if kv_cache_config.enable_block_reuse else
+                         self._max_resident_sequences() +
+                         self._num_reserved_dummy_slots)
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
             if self._mamba_layer_mask[global_layer_idx]:
                 layer_id = LayerId(local_layer_idx)
@@ -3336,6 +3341,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         BufferConfig(role=MambaRole.CONV_STATE,
                                      size=self.conv_bytes),
                     ],
+                    max_gpu_slots=max_gpu_slots,
                 )
 
         dummy_requests = [

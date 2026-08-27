@@ -808,10 +808,28 @@ size_t CacheLevelStorage::grainsForSlots(
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& sizeLists,
     TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    TypedVec<PoolGroupIndex, std::optional<SlotCount>> const& maxSlots)
 {
     PoolGroupIndex numPg = sizeLists.size();
     TLLM_CHECK_DEBUG(ratioList.size() == numPg);
+    TLLM_CHECK_DEBUG(minSlots.size() == numPg);
+    auto effectiveMaxSlots = maxSlots;
+    if (effectiveMaxSlots.empty())
+    {
+        effectiveMaxSlots.resize(numPg, std::nullopt);
+    }
+    if (effectiveMaxSlots.size() != numPg)
+    {
+        throw std::invalid_argument("ratioToSlotCountList: max_slots length must match pool groups");
+    }
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        if (effectiveMaxSlots[pgIdx].has_value() && *effectiveMaxSlots[pgIdx] < minSlots[pgIdx])
+        {
+            throw std::invalid_argument("ratioToSlotCountList: max_slots must be at least min_slots");
+        }
+    }
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ratioList.begin(), ratioList.end(), [](auto x) { return x > 0; }),
         "ratioToSlotCountList: all ratios must be positive");
     TLLM_CHECK_DEBUG(quota % granularity == 0);
@@ -833,8 +851,8 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     // Iteratively peel off constrained PGs until all active PGs are
     // unconstrained:
     //   1. Distribute remaining quota among active PGs by ratio.
-    //   2. Any PG with slots <= min_slots is constrained — pin it to
-    //      min_slots and subtract its grains from the budget.
+    //   2. Pin PGs outside their [min_slots, max_slots] interval to the
+    //      corresponding bound and subtract their grains from the budget.
     //   3. Repeat with the remaining PGs and re-normalized ratios.
     // Each iteration removes at least one PG, so this terminates.
     while (!activePgs.empty())
@@ -869,20 +887,23 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
             budget -= used;
         }
 
-        // Identify constrained PGs (slots <= min_slots).
-        std::vector<size_t> constrained;
+        // Identify lower- and upper-constrained PGs.
+        std::vector<size_t> lowerConstrained;
+        std::vector<size_t> upperConstrained;
         std::vector<size_t> unconstrained;
         for (size_t idx = 0; idx < nActive; ++idx)
         {
             PoolGroupIndex pgIdx = activePgs[idx];
             SlotCount const minSlotCount = minSlots[pgIdx];
             if (slotsForActive[idx] <= minSlotCount)
-                constrained.push_back(idx);
+                lowerConstrained.push_back(idx);
+            else if (effectiveMaxSlots[pgIdx].has_value() && slotsForActive[idx] >= *effectiveMaxSlots[pgIdx])
+                upperConstrained.push_back(idx);
             else
                 unconstrained.push_back(idx);
         }
 
-        if (constrained.empty())
+        if (lowerConstrained.empty() && upperConstrained.empty())
         {
             // All active PGs are unconstrained — accept their allocations.
             for (size_t idx = 0; idx < nActive; ++idx)
@@ -890,14 +911,31 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
             break;
         }
 
-        // Pin constrained PGs to min_slots and subtract from budget.
-        for (size_t idx : constrained)
+        // Pin lower-constrained PGs to min_slots and subtract from budget.
+        for (size_t idx : lowerConstrained)
         {
             PoolGroupIndex pgIdx = activePgs[idx];
             SlotCount const minSlotCount = minSlots[pgIdx];
             size_t minGrains = grainsForSlots(minSlotCount, sizeLists[pgIdx], granularity);
             auto [slots, used] = grainsToSlots(minGrains, sizeLists[pgIdx], granularity);
+            if (effectiveMaxSlots[pgIdx].has_value() && slots > *effectiveMaxSlots[pgIdx])
+            {
+                slots = *effectiveMaxSlots[pgIdx];
+                used = grainsForSlots(slots, sizeLists[pgIdx], granularity);
+            }
             slotCntList[pgIdx] = slots;
+            TLLM_CHECK_DEBUG(used <= remainingGrains);
+            remainingGrains -= used;
+        }
+
+        // Pin upper-constrained PGs to max_slots. Any released grains are
+        // redistributed to the remaining PGs on the next iteration.
+        for (size_t idx : upperConstrained)
+        {
+            PoolGroupIndex pgIdx = activePgs[idx];
+            SlotCount const maxSlotCount = *effectiveMaxSlots[pgIdx];
+            size_t used = grainsForSlots(maxSlotCount, sizeLists[pgIdx], granularity);
+            slotCntList[pgIdx] = maxSlotCount;
             TLLM_CHECK_DEBUG(used <= remainingGrains);
             remainingGrains -= used;
         }
@@ -925,7 +963,8 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     for (PoolGroupIndex pgIdx{0}; pgIdx < sizeLists.size(); ++pgIdx)
     {
         size_t grainsNow = grainsForSlots(slotCntList[pgIdx], sizeLists[pgIdx], granularity);
-        while (grainsForSlots(slotCntList[pgIdx] + 1, sizeLists[pgIdx], granularity) <= grainsNow)
+        while ((!effectiveMaxSlots[pgIdx].has_value() || slotCntList[pgIdx] < *effectiveMaxSlots[pgIdx])
+            && grainsForSlots(slotCntList[pgIdx] + 1, sizeLists[pgIdx], granularity) <= grainsNow)
             slotCntList[pgIdx] += 1;
     }
 
@@ -935,11 +974,11 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
 // Instance convenience wrapper.
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
     TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    std::optional<size_t> quota) const
+    std::optional<size_t> quota, TypedVec<PoolGroupIndex, std::optional<SlotCount>> const& maxSlots) const
 {
     size_t q = quota.value_or(totalQuota());
     TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
-    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
+    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots, maxSlots);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

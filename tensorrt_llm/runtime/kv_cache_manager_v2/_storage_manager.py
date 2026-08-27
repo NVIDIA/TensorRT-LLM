@@ -193,6 +193,7 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_max_gpu_slots",
         "_event_manager",
         "__rawref__",
     )
@@ -206,6 +207,7 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _max_gpu_slots: TypedIndexList[PoolGroupIndex, int | None]
     _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
@@ -249,6 +251,19 @@ class StorageManager:
         self._min_slots = self._compute_pool_group_min_slots_from_constraints(
             constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
+        self._max_gpu_slots = (
+            cast(
+                TypedIndexList[PoolGroupIndex, int | None],
+                filled_list(None, self.num_pool_groups),
+            )
+            if config.max_gpu_slots is None
+            else config.max_gpu_slots
+        )
+        if any(
+            max_slot is not None and max_slot < min_slot
+            for max_slot, min_slot in zip(self._max_gpu_slots, self._min_slots)
+        ):
+            raise ValueError("max_gpu_slots must be at least the hot-tier min_slots")
 
         # Derive one lifecycle ratio, then project it onto each level's pool grouping.
         life_cycle_ratio: TypedIndexList[LifeCycleId, float]
@@ -852,7 +867,10 @@ class StorageManager:
                 f"Quota {new_quota} is insufficient for min_slots constraints "
                 f"(requires at least {min_quota})"
             )
-        new_num_slots = lvl_storage.compute_slot_count_list(new_ratio_list, min_slots, new_quota)
+        max_slots = self._max_slots_for_level(level)
+        new_num_slots = lvl_storage.compute_slot_count_list(
+            new_ratio_list, min_slots, new_quota, max_slots
+        )
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (
                 "Persistent pages should be None for non-last level cache"
@@ -902,6 +920,13 @@ class StorageManager:
         assert total > 0
         return typed_map(pool_group_ratio, lambda x: x / total)
 
+    def _pool_group_needs_headroom_for_growth(self, pool_group: PoolGroupIndex) -> bool:
+        """Return whether any lifecycle in a hot-tier pool group can grow."""
+        return any(
+            self.get_pool_group_index(life_cycle) == pool_group and isinstance(lc, AttnLifeCycle)
+            for life_cycle, lc in self.life_cycles.items()
+        )
+
     def ratio_from_batch(
         self,
         batch: BatchDesc,
@@ -945,7 +970,13 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for life_cycle in typed_range(self.num_life_cycles):
-                scaled_slots = math.ceil(slots[life_cycle] / max_util_for_resume)
+                pool_group = self.get_pool_group_index(life_cycle)
+                utilization_limit = (
+                    max_util_for_resume
+                    if self._pool_group_needs_headroom_for_growth(pool_group)
+                    else 1.0
+                )
+                scaled_slots = math.ceil(slots[life_cycle] / utilization_limit)
                 max_slots[life_cycle] = max(max_slots[life_cycle], scaled_slots)
         return max_slots
 
@@ -975,7 +1006,12 @@ class StorageManager:
                 batch, tokens_per_block, swa_scratch_reuse
             )
             for pg_idx in typed_range(self.num_pool_groups):
-                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
+                utilization_limit = (
+                    max_util_for_resume
+                    if self._pool_group_needs_headroom_for_growth(pg_idx)
+                    else 1.0
+                )
+                scaled_slots = math.ceil(slots[pg_idx] / utilization_limit)
                 max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 
@@ -1069,6 +1105,11 @@ class StorageManager:
             return self._min_slots
         return filled_list(1, self.num_pool_groups)
 
+    def _max_slots_for_level(
+        self, level: CacheLevel
+    ) -> TypedIndexList[PoolGroupIndex, int | None] | None:
+        return self._max_gpu_slots if level == GPU_LEVEL else None
+
     @staticmethod
     def _min_quota_for_level(
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
@@ -1100,7 +1141,12 @@ class StorageManager:
             round_up(tier_config.quota, granularity),
         )
         return CacheLevelStorage.ratio_to_slot_count_list(
-            quota, slot_size_lists, ratio, granularity, min_slots
+            quota,
+            slot_size_lists,
+            ratio,
+            granularity,
+            min_slots,
+            self._max_slots_for_level(level),
         )
 
     def constrain_pool_group_ratio(
@@ -1114,7 +1160,9 @@ class StorageManager:
         """
         gpu_storage = self._levels[GPU_LEVEL].storage
         granularity = gpu_storage.pool_size_granularity
-        slot_count_list = gpu_storage.compute_slot_count_list(ratio, self._min_slots)
+        slot_count_list = gpu_storage.compute_slot_count_list(
+            ratio, self._min_slots, max_slots=self._max_gpu_slots
+        )
         num_bytes = self._pool_group_slots_to_bytes(slot_count_list, granularity)
         total = sum(num_bytes)
         assert total > 0

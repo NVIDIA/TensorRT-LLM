@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -220,6 +221,10 @@ struct StorageConfig
 {
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
+
+    // Optional hot-tier slot ceiling per pool group. A group remains
+    // unconstrained when any lifecycle sharing it has no ceiling.
+    TypedVec<PoolGroupIndex, std::optional<SlotCount>> maxGpuSlots;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;

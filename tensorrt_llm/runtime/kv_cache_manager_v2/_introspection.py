@@ -325,13 +325,14 @@ def ratio_to_slot_count_list(
     ratio_list: list[float],
     granularity: int,
     min_slots: list[int],
+    max_slots: list[int | None] | None = None,
 ) -> list[int]:
     """Return slot counts by pool group for a quota and ratio list."""
     cpp_introspection = _cpp_introspection_module()
     if cpp_introspection is not None:
         return list(
             cpp_introspection.ratio_to_slot_count_list(
-                quota, slot_size_lists, ratio_list, granularity, min_slots
+                quota, slot_size_lists, ratio_list, granularity, min_slots, max_slots
             )
         )
 
@@ -339,7 +340,7 @@ def ratio_to_slot_count_list(
 
     return list(
         CacheLevelStorage.ratio_to_slot_count_list(
-            quota, slot_size_lists, ratio_list, granularity, min_slots
+            quota, slot_size_lists, ratio_list, granularity, min_slots, max_slots
         )
     )
 

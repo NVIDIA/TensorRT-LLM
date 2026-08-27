@@ -161,6 +161,7 @@ class AttentionLayerConfig:
 class SsmLayerConfig:
     layer_id: LayerId
     buffers: list[BufferConfig]
+    max_gpu_slots: int | None = None
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 

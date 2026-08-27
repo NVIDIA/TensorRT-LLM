@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import ClassVar, NewType, final
+from typing import ClassVar, NewType, cast, final
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -743,6 +743,7 @@ class CacheLevelStorage:
         ratio_list: TypedIndexList[PoolGroupIndex, float],
         min_slots: TypedIndexList[PoolGroupIndex, int],
         total_quota: int | None = None,
+        max_slots: TypedIndexList[PoolGroupIndex, int | None] | None = None,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         if total_quota is None:
             total_quota = self.total_quota
@@ -750,7 +751,12 @@ class CacheLevelStorage:
             f"Wrong ratio_list length. Expected {len(self._pool_groups)}, got {len(ratio_list)}"
         )
         return self.ratio_to_slot_count_list(
-            total_quota, self.slot_size_lists, ratio_list, self.pool_size_granularity, min_slots
+            total_quota,
+            self.slot_size_lists,
+            ratio_list,
+            self.pool_size_granularity,
+            min_slots,
+            max_slots,
         )
 
     @staticmethod
@@ -818,8 +824,21 @@ class CacheLevelStorage:
         ratio_list: TypedIndexList[PoolGroupIndex, float],
         pool_size_granularity: int,
         min_slots: TypedIndexList[PoolGroupIndex, int],
+        max_slots: TypedIndexList[PoolGroupIndex, int | None] | None = None,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         num_pool_groups = typed_len(ratio_list)
+        if max_slots is None:
+            max_slots = cast(
+                TypedIndexList[PoolGroupIndex, int | None],
+                filled_list(None, num_pool_groups),
+            )
+        if len(max_slots) != num_pool_groups:
+            raise ValueError("max_slots length must match pool groups")
+        if any(
+            max_slot is not None and max_slot < min_slot
+            for max_slot, min_slot in zip(max_slots, min_slots)
+        ):
+            raise ValueError("max_slots must be at least min_slots")
         assert all(x > 0 for x in ratio_list)
         assert num_pool_groups == typed_len(slot_size_lists)
         assert total_quota % pool_size_granularity == 0
@@ -836,8 +855,8 @@ class CacheLevelStorage:
         # Iteratively peel off constrained PGs until all active PGs are
         # unconstrained:
         #   1. Distribute remaining quota among active PGs by ratio.
-        #   2. Any PG with slots <= min_slots is constrained — pin it to
-        #      min_slots and subtract its grains from the budget.
+        #   2. Pin PGs outside their [min_slots, max_slots] interval to the
+        #      corresponding bound and subtract their grains from the budget.
         #   3. Repeat with the remaining PGs and re-normalized ratios.
         # Each iteration removes at least one PG, so this terminates.
         while active_pgs:
@@ -855,29 +874,44 @@ class CacheLevelStorage:
                 budget -= used
             assert budget >= 0
 
-            # Identify constrained PGs (slots <= min_slots).
-            constrained = []
+            # Identify lower- and upper-constrained PGs.
+            lower_constrained = []
+            upper_constrained = []
             unconstrained = []
             for idx in range(len(active_pgs)):
                 pg = active_pgs[idx]
                 if slots_for_active[idx] <= min_slots[pg]:
-                    constrained.append(idx)
+                    lower_constrained.append(idx)
+                elif max_slots[pg] is not None and slots_for_active[idx] >= max_slots[pg]:
+                    upper_constrained.append(idx)
                 else:
                     unconstrained.append(idx)
 
-            if not constrained:
+            if not lower_constrained and not upper_constrained:
                 # All active PGs are unconstrained — accept their allocations.
                 for idx in range(len(active_pgs)):
                     slot_cnt_list[active_pgs[idx]] = slots_for_active[idx]
                 break
 
-            # Pin constrained PGs to min_slots and subtract from budget.
-            for idx in constrained:
+            # Pin lower-constrained PGs to min_slots and subtract from budget.
+            for idx in lower_constrained:
                 pg = active_pgs[idx]
                 min_grains = _s2g(min_slots[pg], slot_size_lists[pg], g)
                 slots, used = _g2s(min_grains, slot_size_lists[pg], g)
+                if max_slots[pg] is not None and slots > max_slots[pg]:
+                    slots = max_slots[pg]
+                    used = _s2g(slots, slot_size_lists[pg], g)
                 slot_cnt_list[pg] = slots
                 remaining_grains -= used
+
+            # Pin upper-constrained PGs to max_slots and redistribute the
+            # released grains among the remaining PGs.
+            for idx in upper_constrained:
+                pg = active_pgs[idx]
+                max_slot = max_slots[pg]
+                assert max_slot is not None
+                slot_cnt_list[pg] = max_slot
+                remaining_grains -= _s2g(max_slot, slot_size_lists[pg], g)
 
             if not unconstrained:
                 # All PGs are constrained — nothing left to redistribute.
@@ -894,7 +928,9 @@ class CacheLevelStorage:
         # within the same grain budget.
         for pg in typed_range(num_pool_groups):
             grains_now = _s2g(slot_cnt_list[pg], slot_size_lists[pg], g)
-            while _s2g(slot_cnt_list[pg] + 1, slot_size_lists[pg], g) <= grains_now:
+            while (max_slots[pg] is None or slot_cnt_list[pg] < max_slots[pg]) and _s2g(
+                slot_cnt_list[pg] + 1, slot_size_lists[pg], g
+            ) <= grains_now:
                 slot_cnt_list[pg] += 1
 
         return slot_cnt_list

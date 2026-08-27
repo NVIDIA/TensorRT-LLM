@@ -289,6 +289,22 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // with no growth to reserve for uses its full capacity. Other levels need only the structural one-slot floor.
     mMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
+    mMaxGpuSlots = config.maxGpuSlots;
+    if (mMaxGpuSlots.empty())
+    {
+        mMaxGpuSlots.resize(numPoolGroups(), std::nullopt);
+    }
+    if (mMaxGpuSlots.size() != numPoolGroups())
+    {
+        throw std::invalid_argument("max_gpu_slots length must match hot-tier pool groups");
+    }
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+    {
+        if (mMaxGpuSlots[pgIdx].has_value() && *mMaxGpuSlots[pgIdx] < mMinSlots[pgIdx])
+        {
+            throw std::invalid_argument("max_gpu_slots must be at least the hot-tier min_slots");
+        }
+    }
 
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
     // those weights while accounting for the cold representation's page sizes.
@@ -335,7 +351,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mLevels.reserve(config.cacheTiers.size());
 
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+    auto gpuSlotCounts
+        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots, mMaxGpuSlots);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get());
 
@@ -1621,7 +1638,10 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota)
             + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
     }
-    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
+    auto const maxSlots = level == kHotLevel
+        ? mMaxGpuSlots
+        : TypedVec<PoolGroupIndex, std::optional<SlotCount>>(numPoolGroups(level), std::nullopt);
+    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota, maxSlots);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -1922,14 +1942,15 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    TypedVec<PoolGroupIndex, std::optional<SlotCount>> const& maxSlots) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, maxSlots);
 }
 
 // ---------------------------------------------------------------------------
@@ -1959,7 +1980,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
     size_t granularity = gpuStorage.poolSizeGranularity();
-    auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
+    auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots, std::nullopt, mMaxGpuSlots);
     auto numBytes = slotsToBytes(slotCountList, granularity);
     return normalizeToRatio(numBytes);
 }

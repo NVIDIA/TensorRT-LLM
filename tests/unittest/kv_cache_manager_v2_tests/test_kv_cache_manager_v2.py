@@ -299,6 +299,25 @@ class TestCacheLevelStorage(unittest.TestCase):
         for slot_count, min_slot in zip(slot_counts, min_slots):
             self.assertGreaterEqual(slot_count, min_slot)
 
+    def test_ratio_to_slot_count_list_caps_and_redistributes_slots(self) -> None:
+        granularity = 1024
+        slot_size_lists = [[100], [100]]
+
+        slot_counts = _introspection.ratio_to_slot_count_list(
+            10 * granularity,
+            slot_size_lists,
+            [0.9, 0.1],
+            granularity,
+            [3, 1],
+            [3, None],
+        )
+
+        # The first pool exposes exactly three slots even though its one-grain
+        # allocation could physically fit more. The remaining quota goes to
+        # the uncapped pool rather than becoming recurrent-state capacity.
+        self.assertEqual(slot_counts[0], 3)
+        self.assertGreater(slot_counts[1], 10)
+
 
 def create_config(
     tokens_per_block: int,
@@ -895,7 +914,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if kv_cache.status != _KVCache.Status.CLOSED:
                     kv_cache.close()
 
-    @requires_cpp_backend
     def test_constant_size_pool_group_floor_ignores_growth_headroom(self) -> None:
         """An SSM-only pool group is sized to its exact constraint floor.
 

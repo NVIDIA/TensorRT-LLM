@@ -131,11 +131,20 @@ class SsmLayerConfig:
 
     buffers: list[BufferConfig]
 
+    max_gpu_slots: int | None = None
+    """
+    Optional requested ceiling for GPU-resident slots belonging to this SSM
+    lifecycle. A physical pool shared with an uncapped lifecycle remains
+    uncapped. Colder tiers remain unconstrained so they can preserve suspended
+    requests.
+    """
+
     def __post_init__(self) -> None:
         assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
             "duplicate buffer role"
         )
         assert all(buf.tokens_per_block_override is None for buf in self.buffers)
+        assert self.max_gpu_slots is None or self.max_gpu_slots > 0
 
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig

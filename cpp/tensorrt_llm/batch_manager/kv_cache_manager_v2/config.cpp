@@ -80,10 +80,13 @@ void KVCacheManagerConfig::validate() const
     bool hasSSM = false;
     for (auto const& layer : layers)
     {
-        if (std::holds_alternative<SsmLayerConfig>(layer))
+        if (auto const* ssm = std::get_if<SsmLayerConfig>(&layer))
         {
+            if (ssm->maxGpuSlots.has_value() && *ssm->maxGpuSlots <= 0)
+            {
+                throw AssertionError("KVCacheManagerConfig: max_gpu_slots must be positive");
+            }
             hasSSM = true;
-            break;
         }
     }
     if (hasSSM)

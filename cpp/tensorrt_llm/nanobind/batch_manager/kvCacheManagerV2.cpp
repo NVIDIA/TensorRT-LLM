@@ -1535,9 +1535,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("SSM", kv::LayerType::SSM);
 
     nb::class_<kv::SsmLayerConfig>(m, "SsmLayerConfig")
-        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>>(), nb::arg("layer_id"), nb::arg("buffers"))
+        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>>(), nb::arg("layer_id"),
+            nb::arg("buffers"), nb::arg("max_gpu_slots") = std::nullopt)
         .def_rw("layer_id", &kv::SsmLayerConfig::layerId)
-        .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
+        .def_rw("buffers", &kv::SsmLayerConfig::buffers)
+        .def_rw("max_gpu_slots", &kv::SsmLayerConfig::maxGpuSlots) DEF_COPY(kv::SsmLayerConfig);
 
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
         .def(nb::init<int, int>(), nb::arg("capacity"), nb::arg("history_length"))
@@ -2140,10 +2142,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "ratio_to_slot_count_list",
         [](size_t quota, std::vector<std::vector<size_t>> const& slotSizeLists, std::vector<float> const& ratioList,
-            size_t granularity, std::vector<kv::SlotCount> const& minSlots)
+            size_t granularity, std::vector<kv::SlotCount> const& minSlots,
+            std::optional<std::vector<std::optional<kv::SlotCount>>> const& maxSlots)
         {
+            kv::TypedVec<kv::PoolGroupIndex, std::optional<kv::SlotCount>> typedMaxSlots;
+            if (maxSlots.has_value())
+            {
+                typedMaxSlots = kv::TypedVec<kv::PoolGroupIndex, std::optional<kv::SlotCount>>{*maxSlots};
+            }
             auto slotCountList = kv::CacheLevelStorage::ratioToSlotCountList(quota, typedSlotSizeLists(slotSizeLists),
-                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots));
+                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots),
+                typedMaxSlots);
             std::vector<kv::SlotCount> result;
             result.reserve(slotCountList.stdSize());
             for (kv::SlotCount slotCount : slotCountList)
@@ -2153,7 +2162,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return result;
         },
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
-        nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("min_slots"), nb::arg("max_slots").none() = std::nullopt, nb::call_guard<nb::gil_scoped_release>());
 
     // ---- Cold-page codec --------------------------------------------------
     nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");

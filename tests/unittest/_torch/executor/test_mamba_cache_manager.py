@@ -1713,6 +1713,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     config = mgr._build_cache_config(base_config)
 
     assert isinstance(config.layers[0], SsmLayerConfig)
+    assert config.layers[0].max_gpu_slots is None
     assert isinstance(config.layers[1], AttentionLayerConfig)
     assert int(config.layers[1].layer_id) == int(base_layers[1].layer_id)
     assert config.typical_step == BatchDesc(
@@ -2016,6 +2017,10 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
 
         kv_cache_config = KvCacheConfig(
             pool_ratio=pool_ratio,
+            # Extra recurrent-state capacity is useful only when snapshots can
+            # be reused. Without block reuse, the SSM pool is intentionally
+            # capped at the live-request plus dummy-slot count.
+            enable_block_reuse=True,
             enable_partial_reuse=False,
             mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
         )
@@ -2267,6 +2272,19 @@ def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
         assert mgr.local_num_mamba_layers == 1
         assert len(mgr.all_ssm_states) == 1
         assert len(mgr.all_conv_states) == 1
+        expected_state_slots = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+        assert mgr.kv_cache_manager_py_config.layers[0].max_gpu_slots == expected_state_slots
+        assert mgr.all_ssm_states[0].shape[0] == expected_state_slots
+        assert mgr.all_conv_states[0].shape[0] == expected_state_slots
+        ssm_life_cycle = int(mgr.ssm_layer_group_id)
+        hot_pool_group = _introspection.pool_group_index(mgr.impl, ssm_life_cycle)
+        cold_pool_group = _introspection.pool_group_index(mgr.impl, ssm_life_cycle, 1)
+        assert _introspection.storage_statistics(mgr.impl)[hot_pool_group].total == (
+            expected_state_slots
+        )
+        assert _introspection.storage_statistics(mgr.impl, 1)[cold_pool_group].total > (
+            expected_state_slots
+        )
         assert mgr.all_ssm_states[0].shape[1:] == torch.Size([4, 8, 8])
         assert mgr.all_conv_states[0].shape[1:] == torch.Size([48, 3])
         assert mgr.get_max_resource_count() == 4
@@ -2479,6 +2497,7 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         assert mgr.block_reuse_policy is BlockReusePolicy.PER_REQUEST
         assert mgr.kv_cache_config.enable_partial_reuse
         assert mgr.kv_cache_manager_py_config.commit_min_snapshot
+        assert mgr.kv_cache_manager_py_config.layers[0].max_gpu_slots is None
     finally:
         mgr.shutdown()
 
