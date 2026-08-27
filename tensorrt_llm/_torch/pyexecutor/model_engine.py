@@ -4184,6 +4184,15 @@ class PyTorchModelEngine(ModelEngine):
         top_level_model = getattr(model, "model", model)
         return getattr(top_level_model, "_orig_mod", top_level_model)
 
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers."""
+        top_level_model = self._get_top_level_model()
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))
+
     def _get_position_id_offset(self) -> int:
         offset = getattr(self._get_top_level_model(), "position_id_offset", 0)
         return 0 if offset is None else int(offset)
@@ -7469,7 +7478,11 @@ class PyTorchModelEngine(ModelEngine):
                 and not self._is_encoder_decoder_model()
                 and not self._is_encode_only
                 and not self.llm_args.mm_encoder_only
-                and self.mapping.cp_size == 1):
+                # PLE owns recurrent n-gram and convolution state. Reclassifying
+                # a fresh final-context row as generation would skip its reset
+                # and could replay a graph with stale cache-slot state.
+                and not self._model_uses_ple_recurrent_state() and
+                self.mapping.cp_size == 1):
             graph_requests, promoted_context_request_ids = \
                 _make_single_token_context_graph_batch(
                     scheduled_requests,
