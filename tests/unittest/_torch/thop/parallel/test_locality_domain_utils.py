@@ -234,6 +234,12 @@ class TestLocalityDomainComputeTopology:
         assert identity == expected
         assert hash(identity) == hash(expected)
 
+    def test_runtime_rejects_unsupported_num_partitions(self):
+        """Runtime resources exist for exactly 2 partitions, so reject anything else."""
+        for bad in (0, 1, 3):
+            with pytest.raises(ValueError, match="num_partitions"):
+                LocalityDomainRuntime(num_partitions=bad)
+
     @pytest.mark.parametrize("locality_domain_id", [-1, 2])
     def test_compute_sm_counts_reject_invalid_partition(self, locality_domain_id):
         with pytest.raises(ValueError, match="locality_domain_id must be 0 or 1"):

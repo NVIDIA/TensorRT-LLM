@@ -46,7 +46,19 @@ class LocalityDomainRuntime:
     within partition_context(), never by module code directly.
     """
 
+    #: Runtime resources (streams, mempools, TPC masks) exist for exactly this many partitions.
+    NUM_PARTITIONS = 2
+
     def __init__(self, num_partitions: int = 2):
+        # Mirrors the LocalityDomainPolicy check: the constraint belongs to this class,
+        # so validate here too rather than relying on the caller having gone through a
+        # policy. Kept strict (== 2) to match the policy rather than silently accepting 1.
+        if num_partitions != self.NUM_PARTITIONS:
+            raise ValueError(
+                f"locality domain only supports num_partitions={self.NUM_PARTITIONS}, "
+                f"got {num_partitions}. Runtime resources (streams, mempools, TPC masks) "
+                f"are hardcoded for exactly {self.NUM_PARTITIONS} partitions."
+            )
         self.num_partitions = num_partitions
 
     def partition_stream(self, partition_id: int) -> torch.cuda.Stream:
