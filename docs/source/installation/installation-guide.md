@@ -25,6 +25,12 @@ docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=671
 
 {{container_tag_admonition}}
 
+View the source commit recorded in the image by running the following inside the container:
+
+```bash
+printenv TRT_LLM_GIT_COMMIT
+```
+
 Sanity check the installation by running the following inside the container:
 
 ```bash
@@ -101,9 +107,17 @@ pip3 install --pre "tensorrt_llm==<version>" \
 ```
 
 > **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
-> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
+> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel is located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
 
 ### Sanity check
+
+View the source commit recorded in the wheel metadata:
+
+```bash
+pip3 show --verbose tensorrt_llm | grep "Source Commit"
+```
+
+Run a quick start example on supported environment:
 
 ```{literalinclude} ../../../examples/llm-api/quickstart_example.py
     :language: python
