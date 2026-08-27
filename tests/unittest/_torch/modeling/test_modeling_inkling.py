@@ -169,16 +169,23 @@ def test_the_rejection_is_scoped_to_inkling():
     reject_unsupported_inkling_kv_cache_features(not_inkling, enable_block_reuse=True)
 
 
-def test_block_reuse_is_rejected_without_a_snapshot_policy():
+def test_block_reuse_without_a_snapshot_policy_is_auto_disabled():
     """An explicit enable_block_reuse=True wins the deep-merge over the model
-    default, so the default alone cannot be the guarantee. Without a snapshot
-    policy a prefix hit still has no conv window to restore."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        reject_unsupported_inkling_kv_cache_features,
+    default, but without a snapshot policy a prefix hit has no conv window to
+    restore. Inkling is folded into the shared Mamba-family validator, which
+    warns and turns reuse off rather than raising."""
+    from tensorrt_llm._torch.pyexecutor.model_loader import (
+        _validate_and_adjust_mamba_snapshot_config,
     )
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-    with pytest.raises(NotImplementedError, match="block reuse"):
-        reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=True)
+    kv = KvCacheConfig(enable_block_reuse=True)  # no snapshot policy
+    llm_args = SimpleNamespace(kv_cache_config=kv)
+    config = SimpleNamespace(pretrained_config=InklingConfig())
+
+    _validate_and_adjust_mamba_snapshot_config(config, llm_args)
+
+    assert kv.enable_block_reuse is False
 
 
 def test_block_reuse_is_allowed_once_snapshots_are_configured():

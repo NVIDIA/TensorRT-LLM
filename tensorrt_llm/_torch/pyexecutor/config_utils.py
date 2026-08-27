@@ -187,33 +187,17 @@ def reject_unsupported_inkling_kv_cache_features(
         enable_block_reuse: bool,
         enable_cache_transceiver: bool = False,
         periodic_snapshot_interval: int = 0):
-    """Refuse the KV-cache features Inkling's short-conv state cannot serve.
+    """Warn on / refuse the Inkling-specific KV-cache feature interactions.
 
-    Both refusals guard silently-wrong logits (neither raises on its own):
-    - Block reuse: a reused prefix has no conv window, since the convs consumed
-      activations it never computed. Allowed only with a snapshot policy
-      (``periodic_snapshot_interval``), which commits the window into the block
-      lifecycle so a hit has one to restore.
-    - Disaggregated serving: the transfer path finds state pools by manager
-      class; Inkling's is not the Mamba one, so the conv windows would move as
-      ordinary paged KV -- i.e. be left behind.
-
-    Chunked prefill is served, not refused.
+    Block reuse without a snapshot policy is warned-and-auto-disabled upstream in
+    ``_validate_and_adjust_mamba_snapshot_config`` (shared with the Mamba family),
+    so reuse reaches here only with a snapshot -- whose one caveat is multimodal.
+    Disaggregated serving is refused: the transfer path finds state pools by
+    manager class, and Inkling's is not the Mamba one, so the short-conv windows
+    would move as ordinary paged KV. Chunked prefill is served.
     """
     if not is_inkling(config):
         return
-    if enable_block_reuse and not periodic_snapshot_interval:
-        raise NotImplementedError(
-            "Inkling does not support KV cache block reuse. The four "
-            "short-conv windows per layer are per-request state outside the KV "
-            "cache; on a prefix hit there is no window to restore, because the "
-            "convs consume activations that a reused prefix never computed. "
-            "The result is silently wrong output, not a cache miss. Set "
-            "kv_cache_config.enable_block_reuse=False (the Inkling model "
-            "default), or configure a snapshot policy by setting "
-            "kv_cache_config.mamba_state_config.periodic_snapshot_interval to "
-            "a positive number of tokens, which puts the window in the block "
-            "lifecycle and makes the hit servable.")
     if enable_block_reuse and periodic_snapshot_interval:
         # Proactive startup notice: the manager's equivalent warning only fires
         # once a multimodal request actually arrives.
