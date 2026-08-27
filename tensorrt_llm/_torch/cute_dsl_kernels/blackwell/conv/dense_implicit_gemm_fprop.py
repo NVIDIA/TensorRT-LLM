@@ -44,6 +44,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+from functools import lru_cache
 from typing import Literal, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -618,7 +619,6 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         self.num_fallback_mcast_ctas_b = self.num_mcast_ctas_b
         self.is_fallback_a_mcast = self.is_a_mcast
         self.is_fallback_b_mcast = self.is_b_mcast
-        return tiled_mma
 
     @cute.jit
     def __call__(
@@ -655,7 +655,7 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         """
         self._setup_conv_input_attrs(a, b, c)
-        tiled_mma = self._setup_attributes()
+        self._setup_attributes()
 
         # Pack the runtime pad/stride/dilation scalars into (D, H, W) tuples that
         # feed the im2col A descriptor corners. Keeping them as runtime Int32 lets
@@ -664,6 +664,15 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
         lower_pad_op = (rt_lower_pad_d, rt_lower_pad_h, rt_lower_pad_w)
         stride_op = (rt_stride_d, rt_stride_h, rt_stride_w)
         dil_op = (rt_dil_d, rt_dil_h, rt_dil_w)
+
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.a_dtype,
+            self.a_major_mode,
+            self.b_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.mma_tiler[:2],
+        )
 
         (
             tma_atom_a_preferred,
@@ -1385,6 +1394,7 @@ class PersistentConvKernel(PersistentDenseGemmKernelDynamicPreferredCluster):
             tmem.free(tmem_ptr)
 
 
+@lru_cache(maxsize=1)
 def compile_conv(
     ncdhw: Tuple[int, int, int, int, int],
     ktrs: Tuple[int, int, int, int],

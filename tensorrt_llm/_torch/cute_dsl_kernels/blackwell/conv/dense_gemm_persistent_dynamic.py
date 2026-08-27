@@ -1184,10 +1184,7 @@ class PersistentDenseGemmKernel:
 
                     for subtile_idx in range(subtile_cnt):
                         # Block until every peer has read our previous sender slot.
-                        if cutlass.const_expr(subtile_idx > 0):
-                            cute.arch.mbarrier_wait(dsmem_mailbox_empty_mbar, dsmem_empty_phase)
-                            dsmem_empty_phase = dsmem_empty_phase ^ 1
-                        elif num_tiles_done > 0:
+                        if num_tiles_done > 0 or subtile_idx > 0:
                             cute.arch.mbarrier_wait(dsmem_mailbox_empty_mbar, dsmem_empty_phase)
                             dsmem_empty_phase = dsmem_empty_phase ^ 1
 
@@ -1695,16 +1692,6 @@ class PersistentDenseGemmKernel:
             self.check_mma_tiler_and_cluster_shape()
 
             m, n, k, l = mnkl
-            # _setup_attributes derives one K tile as four MMA-instruction K
-            # extents. For the supported dense types this is 1024 / bit-width
-            # elements. Reject empty split ranks before compiling the kernel.
-            mma_tiler_k = 1024 // a_dtype.width
-            k_tile_count = (k + mma_tiler_k - 1) // mma_tiler_k
-            if self.split_k > k_tile_count:
-                raise testing.CantImplementError(
-                    f"split_k={self.split_k} exceeds K tile count {k_tile_count} "
-                    f"for K={k} and MMA tile K={mma_tiler_k}"
-                )
             self.check_tensor_alignment(
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
@@ -1752,6 +1739,7 @@ def bmm(
     gemm_op(a, b, c, stream, epilogue_op)
 
 
+@lru_cache(maxsize=1)
 def prepare_tensors(
     mnkl: Tuple[int, int, int, int],
     a_dtype: Type[cutlass.Numeric],
