@@ -548,7 +548,10 @@ class TestLocalityDomainStream:
         remainder = get_reserved_remainder_stream()
         if method == "balanced":
             assert remainder is None
-        else:
+        elif remainder is not None:
+            # A strict split can be an exact cover, leaving zero remainder SMs. The C++
+            # accessor then returns null and this helper returns None, so only check
+            # stream identity when a remainder stream actually exists.
             assert isinstance(remainder, torch.cuda.Stream)
             assert remainder.cuda_stream not in {
                 get_locality_domain_stream(0).cuda_stream,
