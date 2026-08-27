@@ -738,7 +738,7 @@ class Cosmos3CrossAttention(Attention):
         k_target = k[:, control_tokens:]
         v_target = v[:, control_tokens:]
         control_outputs: list[torch.Tensor] = []
-        target_output: Optional[torch.Tensor] = None
+        target_outputs: list[torch.Tensor] = []
         start = 0
         for size, weight in zip(control_token_sizes, control_weights, strict=True):
             if size <= 0:
@@ -791,16 +791,12 @@ class Cosmos3CrossAttention(Attention):
                 )
 
             control_outputs.append(pair_output[:, :size])
-            weighted_target = pair_output[:, size:] * weight
-            target_output = (
-                weighted_target if target_output is None else target_output + weighted_target
-            )
+            target_outputs.append(pair_output[:, size:] * weight)
             start = end
 
-        if start != control_tokens or target_output is None:
-            raise RuntimeError(
-                "Cosmos3 multi-control attention failed to cover all control token ranges."
-            )
+        target_output = target_outputs[0]
+        for additional_target_output in target_outputs[1:]:
+            target_output = target_output + additional_target_output
         return torch.cat([*control_outputs, target_output], dim=1).flatten(2)
 
     def forward(
