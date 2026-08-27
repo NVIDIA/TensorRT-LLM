@@ -1070,6 +1070,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "encoder_decoder",
             "encode_only",
             "mm_encoder_only",
+            "ple_recurrent_state",
+            "nested_ple_recurrent_state",
             "context_parallel",
         )
         for case in cases:
@@ -1093,6 +1095,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine._is_encode_only = True
                 elif case == "mm_encoder_only":
                     engine.llm_args.mm_encoder_only = True
+                elif case == "ple_recurrent_state":
+                    engine.model.has_ple = True
+                elif case == "nested_ple_recurrent_state":
+                    engine.model.model = SimpleNamespace(llm=SimpleNamespace(
+                        model=SimpleNamespace(has_ple=True)))
                 elif case == "context_parallel":
                     engine.mapping.cp_size = 2
 

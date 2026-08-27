@@ -4,9 +4,8 @@
 
 The PLE (Parallel Layer Extension) side path is injected into the Hyper-Connection
 hidden stream *before* attention at exactly one decoder layer: ``layer_id`` such
-that ``(layer_id + 1) in config.ple_layer_ids``. For the released
-The checkpoint uses ``ple_layer_ids == [2]``, so PLE is active at
-``layer_id == 1`` only.
+that ``(layer_id + 1) in config.ple_layer_ids``. The released checkpoint uses
+``ple_layer_ids == [2]``, so PLE is active at ``layer_id == 1`` only.
 
 Source of truth (parity oracle): the sglang reference ``qwen4_exp.py``
 (``Qwen4ExpPLELayer`` / ``Qwen4ExpNGramEmbedding`` / ``Qwen4ExpPLEGroupedNorm`` +
@@ -16,8 +15,9 @@ runtime-decoupled re-implementation of that math:
   * n-gram id hashing — splitmix64 layer multipliers, per-head prime vocab sizes
     (``nth-prime after ngram_vocab_size_base - 1``), eos-segmented right-shift, XOR
     mixing, ``mod prime + offset`` per head;
-  * n-gram embedding lookup through the in-tree :class:`Embedding`, row-sharded
-    over TP ranks; attention-DP uses all-gather / reduce-scatter to preserve
+  * n-gram embedding lookup through either the in-tree :class:`Embedding` or an
+    opt-in pinned-host table with Triton UVA gathers; both are row-sharded over
+    TP ranks, while attention-DP uses all-gather / reduce-scatter to preserve
     rank-local token ownership;
   * key/value projection, a per-Hyper-Connection-stream grouped Gemma
     (``weight + 1``) RMSNorm gate (signed-sqrt sigmoid), and a **dilated causal
@@ -52,15 +52,20 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-from tensorrt_llm._torch.distributed import allgather, reducescatter
+from tensorrt_llm._torch.distributed import AllReduce, allgather, reducescatter
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._utils import CUASSERT, prefer_pinned
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
@@ -71,6 +76,20 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
+_PLE_HOST_OFFLOAD_ENV = "TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"
+
+
+def _uses_ple_host_offload(config) -> bool:
+    """Resolve the model-local option, falling back to a worker-safe env gate."""
+    configured = getattr(config, "qwen4_exp_ple_host_offload", None)
+    if configured is not None:
+        return bool(configured)
+    value = os.environ.get(_PLE_HOST_OFFLOAD_ENV, "0").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{_PLE_HOST_OFFLOAD_ENV} must be a boolean value, got {value!r}")
 
 
 def _uses_scaled_fp8_ngram_table(config) -> bool:
@@ -162,6 +181,7 @@ class PLEMetadata:
     all_rank_num_tokens: Optional[list[int]] = None
     num_contexts: int = 0
     use_spec_decoding: bool = False
+    is_cuda_graph: bool = False
 
     @classmethod
     def build(
@@ -177,6 +197,7 @@ class PLEMetadata:
         use_spec_decoding: bool = False,
         uniform_row_width: Optional[int] = None,
         all_rank_num_tokens: Optional[list[int]] = None,
+        is_cuda_graph: bool = False,
     ) -> "PLEMetadata":
         """Construct metadata from packed ``input_ids`` and per-sequence lengths.
 
@@ -250,6 +271,7 @@ class PLEMetadata:
             all_rank_num_tokens=all_rank_num_tokens,
             num_contexts=num_contexts,
             use_spec_decoding=use_spec_decoding,
+            is_cuda_graph=is_cuda_graph,
         )
 
 
@@ -295,6 +317,196 @@ class Qwen4ExpPLEGroupedNorm(TritonRMSNorm):
         return (x_norm * weight).to(compute_dtype)
 
 
+@triton.jit
+def _gather_ple_embedding_from_pinned_kernel(
+    weight_ptr,
+    ids_ptr,
+    output_ptr,
+    embedding_dim,
+    vocab_start,
+    vocab_end,
+    is_fp8: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather row-sharded BF16/FP8 weights directly through pinned-host UVA."""
+    row_id = tl.program_id(0)
+    global_idx = tl.load(ids_ptr + row_id)
+    in_range = (global_idx >= vocab_start) & (global_idx < vocab_end)
+    local_idx = tl.where(in_range, global_idx - vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    output_mask = offsets < embedding_dim
+    # ``weight_ptr`` is a host virtual address, so Triton receives it as an
+    # integer scalar and casts it to the checkpoint storage type explicitly.
+    if is_fp8:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+    # Include row ownership in the load predicate. Loading row zero for every
+    # non-owned ID is numerically harmless but wastes host-link bandwidth.
+    values = tl.load(
+        weight_ptr + local_idx * embedding_dim + offsets,
+        mask=in_range & output_mask,
+        other=0.0,
+    ).to(tl.bfloat16)
+    tl.store(output_ptr + row_id * embedding_dim + offsets, values, mask=output_mask)
+
+
+class Qwen4ExpPinnedHostEmbedding(nn.Module):
+    """A row shard of the PLE table that remains in pinned host memory.
+
+    The parameter starts on ``meta`` so model construction does not allocate the
+    checkpoint-sized table. The generic model materialization pass reaches
+    :meth:`_apply`, which creates the final pinned allocation instead of a CUDA
+    tensor. Later ``model.to(\"cuda\")`` calls deliberately leave that parameter
+    in place while moving the small hash buffers and all other model weights.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        dtype: torch.dtype,
+        vocab_start_index: int,
+        vocab_end_index: int,
+    ) -> None:
+        super().__init__()
+        if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise TypeError(
+                f"PLE host offload requires bfloat16 or float8_e4m3fn weights, got {dtype}"
+            )
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self.vocab_start_index = int(vocab_start_index)
+        self.vocab_end_index = int(vocab_end_index)
+        self._block_d = triton.next_power_of_2(self.embedding_dim)
+        self._mapped_host_ptr: Optional[int] = None
+        self._mapped_device_ptrs: dict[int, int] = {}
+        self.weight = nn.Parameter(
+            torch.empty(
+                (self.num_embeddings, self.embedding_dim),
+                device="meta",
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+
+    def materialize_pinned(self) -> nn.Parameter:
+        """Create the final pinned allocation once and return its parameter."""
+        weight = self.weight
+        if weight.device.type == "cpu" and weight.is_pinned():
+            return weight
+        if weight.device.type != "meta":
+            raise RuntimeError(
+                f"PLE host-offload weight must be meta or pinned CPU memory, got {weight.device}"
+            )
+        if not prefer_pinned():
+            raise RuntimeError(
+                "Qwen4-Exp PLE host offload requires pinned host memory, but "
+                "the runtime pinned-memory policy is disabled"
+            )
+        pinned = nn.Parameter(
+            torch.empty(
+                weight.shape,
+                device="cpu",
+                dtype=weight.dtype,
+                pin_memory=prefer_pinned(),
+            ),
+            requires_grad=False,
+        )
+        if not pinned.is_pinned():
+            raise RuntimeError(
+                "Qwen4-Exp PLE host offload requires pinned host memory; "
+                "the pinned allocation was not honored"
+            )
+        self.register_parameter("weight", pinned)
+        return pinned
+
+    def _mapped_device_ptr(self, device: torch.device) -> int:
+        """Return the CUDA-visible address for this pinned host allocation."""
+        weight = self.materialize_pinned()
+        host_ptr = weight.data_ptr()
+        if self._mapped_host_ptr is not None and host_ptr != self._mapped_host_ptr:
+            raise RuntimeError(
+                "PLE pinned-host allocation changed after its device pointer was resolved"
+            )
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        mapped_ptr = self._mapped_device_ptrs.get(device_index)
+        if mapped_ptr is not None:
+            return mapped_ptr
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "PLE pinned-host device pointer must be resolved during CUDA-graph warmup"
+            )
+
+        # cudaHostAlloc-backed memory usually has an identical UVA on supported
+        # systems, but cudaHostRegister-backed allocators may expose a distinct
+        # device address. Always ask the runtime instead of assuming identity.
+        from cuda.bindings import runtime as cudart
+
+        with torch.cuda.device(device_index):
+            (device_ptr,) = CUASSERT(cudart.cudaHostGetDevicePointer(host_ptr, 0))
+        mapped_ptr = int(device_ptr)
+        if mapped_ptr == 0:
+            raise RuntimeError("CUDA returned a null PLE pinned-host device pointer")
+        self._mapped_host_ptr = host_ptr
+        self._mapped_device_ptrs[device_index] = mapped_ptr
+        return mapped_ptr
+
+    def _apply(self, fn, recurse: bool = True):
+        """Apply device transforms without moving or replacing the host table."""
+        had_weight = "weight" in self._parameters
+        weight = self._parameters.pop("weight", None)
+        try:
+            result = super()._apply(fn, recurse=recurse)
+        finally:
+            if had_weight:
+                self._parameters["weight"] = weight
+        if weight is not None and weight.device.type == "meta":
+            self.materialize_pinned()
+        return result
+
+    def allocate_output(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Allocate BF16 device rows produced by the UVA gather."""
+        return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+    def gather(
+        self,
+        input_ids: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Gather global row IDs, returning zeros for rows outside this shard."""
+        if input_ids.device.type != "cuda":
+            raise ValueError("PLE pinned-host gather requires CUDA input IDs")
+        weight = self.materialize_pinned()
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        output = self.allocate_output(expected_shape, input_ids.device) if out is None else out
+        if tuple(output.shape) != expected_shape:
+            raise ValueError(
+                f"invalid PLE gather output shape: {tuple(output.shape)} != {expected_shape}"
+            )
+        if output.dtype != torch.bfloat16 or output.device != input_ids.device:
+            raise ValueError("PLE gather output must be bfloat16 on the input-ID device")
+        if not output.is_contiguous():
+            raise ValueError("PLE gather output must be contiguous")
+
+        flat_ids = input_ids.reshape(-1).long()
+        if flat_ids.numel():
+            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                self._mapped_device_ptr(input_ids.device),
+                flat_ids,
+                output,
+                embedding_dim=self.embedding_dim,
+                vocab_start=self.vocab_start_index,
+                vocab_end=self.vocab_end_index,
+                is_fp8=weight.dtype == torch.float8_e4m3fn,
+                BLOCK_D=self._block_d,
+            )
+        return output
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     """Hashes per-token n-gram contexts to per-head ids and embeds them.
 
@@ -302,7 +514,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     eos-segmented right-shift, XOR mix) is a verbatim port of the sglang
     ``Qwen4ExpNGramEmbedding``. The embedding table is row-sharded across the
     model TP group. Ordinary TP uses masked lookup plus AllReduce; attention-DP
-    uses token AllGather, masked local lookup, and ReduceScatter.
+    uses token AllGather, masked local lookup, and ReduceScatter. An opt-in
+    capacity mode leaves each row shard in pinned host memory and overlaps its
+    UVA gather with the decoder layer preceding PLE.
     """
 
     def __init__(
@@ -326,13 +540,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.tp_size = mapping.tp_size if mapping is not None else 1
         self.tp_rank = mapping.tp_rank if mapping is not None else 0
         self.embedding_output_dtype = dtype
+        self.host_offload = _uses_ple_host_offload(config)
+        self.use_attention_dp_sharding = bool(
+            mapping is not None and mapping.enable_attention_dp and self.tp_size > 1
+        )
+        if self.use_attention_dp_sharding and mapping is not None and mapping.cp_size > 1:
+            raise NotImplementedError(
+                "Qwen4-Exp PLE row sharding does not support attention DP "
+                "combined with context parallelism"
+            )
         self.register_buffer(
             "ngram_embedding_weight_scale",
             None,
             persistent=False,
-        )
-        self.use_attention_dp_sharding = bool(
-            mapping is not None and mapping.enable_attention_dp and self.tp_size > 1
         )
 
         if self.ngram_size < 2:
@@ -373,8 +593,33 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ) * self.make_ngram_vocab_size_divisible_by
         self.padded_vocab_size = padded_vocab_size
         weight_dtype = torch.float8_e4m3fn if _uses_scaled_fp8_ngram_table(config) else dtype
-        if self.use_attention_dp_sharding:
-            slice_width = math.ceil(padded_vocab_size / self.tp_size)
+        slice_width = math.ceil(padded_vocab_size / self.tp_size)
+        self.vocab_start_index = self.tp_rank * slice_width
+        self.vocab_end_index = min((self.tp_rank + 1) * slice_width, padded_vocab_size)
+        if self.host_offload:
+            if dtype != torch.bfloat16:
+                raise TypeError(
+                    f"Qwen4-Exp PLE host offload requires bfloat16 activations, got {dtype}"
+                )
+            self.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+                slice_width,
+                self.head_dim_per_ngram,
+                dtype=weight_dtype,
+                vocab_start_index=self.vocab_start_index,
+                vocab_end_index=self.vocab_end_index,
+            )
+            self.embedding_allreduce = (
+                AllReduce(mapping=mapping, dtype=torch.bfloat16)
+                if self.tp_size > 1 and not self.use_attention_dp_sharding
+                else None
+            )
+            logger.info(
+                "Qwen4-Exp PLE n-gram table will use pinned host memory: "
+                f"rank={self.tp_rank}/{self.tp_size}, "
+                f"global_rows={padded_vocab_size}, local_rows={slice_width}, "
+                f"dtype={weight_dtype}"
+            )
+        elif self.use_attention_dp_sharding:
             self.vocab_start_index = self.tp_rank * slice_width
             self.vocab_end_index = min((self.tp_rank + 1) * slice_width, padded_vocab_size)
             self.ngram_embedding = Embedding(
@@ -382,6 +627,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self.head_dim_per_ngram,
                 dtype=weight_dtype,
             )
+            self.embedding_allreduce = None
         elif self.tp_size > 1:
             self.ngram_embedding = Embedding(
                 padded_vocab_size,
@@ -392,6 +638,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
             self.vocab_start_index = self.ngram_embedding.vocab_start_index
             self.vocab_end_index = self.ngram_embedding.vocab_end_index
+            self.embedding_allreduce = None
         else:
             self.vocab_start_index = 0
             self.vocab_end_index = padded_vocab_size
@@ -400,6 +647,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self.head_dim_per_ngram,
                 dtype=weight_dtype,
             )
+            self.embedding_allreduce = None
 
     def configure_fp8_weight_storage(
         self,
@@ -419,6 +667,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         weight = self.ngram_embedding.weight
         if weight.dtype != weight_dtype:
+            if self.host_offload:
+                raise TypeError(
+                    "PLE host-offload checkpoint dtype does not match the "
+                    f"preallocated table: {weight_dtype} != {weight.dtype}"
+                )
             weight_shape = weight.shape
             weight_device = weight.device
             # Drop the checkpoint-sized BF16 allocation before creating the
@@ -431,13 +684,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 torch.empty(weight_shape, device=weight_device, dtype=weight_dtype),
                 requires_grad=False,
             )
-        self.ngram_embedding_weight_scale = (
+        configured_scale = (
             weight_scale.detach()
             .reshape(())
             .to(
-                device=self.ngram_embedding.weight.device,
+                device=self.layer_multipliers.device,
                 dtype=torch.float32,
             )
+        )
+        if self.ngram_embedding_weight_scale is None:
+            self.ngram_embedding_weight_scale = configured_scale
+        else:
+            if self.ngram_embedding_weight_scale.device != configured_scale.device:
+                raise RuntimeError("PLE n-gram scale device cannot change after configuration")
+            self.ngram_embedding_weight_scale.copy_(configured_scale)
+        logger.info(
+            "Qwen4-Exp PLE n-gram table configured for scaled FP8 storage: "
+            f"dtype={self.ngram_embedding.weight.dtype}, "
+            f"scale={scale}"
         )
 
     def _dequantize_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
@@ -460,6 +724,64 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if self.tp_size > 1:
             partial = self.ngram_embedding.all_reduce(partial)
         return partial
+
+    def _prepare_embedding_lookup(
+        self,
+        ngram_ids: torch.Tensor,
+        physical_tokens: Optional[int],
+        all_rank_num_tokens: Optional[list[int]],
+    ) -> tuple[torch.Tensor, int]:
+        """Prepare global IDs for a local gather, including ADP token exchange."""
+        semantic_tokens = ngram_ids.shape[0]
+        if not self.use_attention_dp_sharding:
+            return ngram_ids, semantic_tokens
+
+        if all_rank_num_tokens is None or len(all_rank_num_tokens) != self.tp_size:
+            raise ValueError(
+                "PLE row sharding under attention DP requires one token count per TP rank"
+            )
+        if physical_tokens is None:
+            physical_tokens = semantic_tokens
+        if semantic_tokens > physical_tokens:
+            raise ValueError(
+                f"PLE semantic token count {semantic_tokens} exceeds physical "
+                f"token count {physical_tokens}"
+            )
+        if all_rank_num_tokens[self.tp_rank] != physical_tokens:
+            raise ValueError(
+                "PLE local physical token count does not match attention-DP metadata: "
+                f"{physical_tokens} != {all_rank_num_tokens[self.tp_rank]}"
+            )
+
+        physical_ids = ngram_ids.new_zeros((physical_tokens, ngram_ids.shape[1]))
+        physical_ids[:semantic_tokens] = ngram_ids
+        sizes = None if len(set(all_rank_num_tokens)) == 1 else all_rank_num_tokens
+        return allgather(physical_ids, self.mapping, dim=0, sizes=sizes), semantic_tokens
+
+    def _finish_embedding_lookup(
+        self,
+        partial: torch.Tensor,
+        semantic_tokens: int,
+        physical_tokens: Optional[int],
+        all_rank_num_tokens: Optional[list[int]],
+    ) -> torch.Tensor:
+        """Reduce row-sharded lookup results and restore local token ownership."""
+        if not self.host_offload:
+            partial = self._dequantize_embeddings(partial)
+        if self.use_attention_dp_sharding:
+            if all_rank_num_tokens is None:
+                raise ValueError("PLE attention-DP token counts are missing")
+            sizes = None if len(set(all_rank_num_tokens)) == 1 else all_rank_num_tokens
+            partial = reducescatter(partial, self.mapping, dim=0, sizes=sizes)
+            if physical_tokens is None:
+                physical_tokens = partial.shape[0]
+            partial = partial[:physical_tokens]
+        elif self.tp_size > 1 and self.host_offload:
+            partial = self.embedding_allreduce(partial)
+
+        if self.host_offload:
+            partial = self._dequantize_embeddings(partial)
+        return partial[:semantic_tokens]
 
     def _build_layer_multipliers(self, size: int) -> torch.Tensor:
         max_long = (1 << 63) - 1
@@ -547,53 +869,44 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         the physical token rows, look up only the locally-owned vocabulary rows,
         and reduce-scatter the summed embeddings back to the source rank.
         """
+        if self.host_offload:
+            lookup_ids, semantic_tokens = self._prepare_embedding_lookup(
+                ngram_ids,
+                physical_tokens,
+                all_rank_num_tokens,
+            )
+            partial = self.ngram_embedding.gather(lookup_ids)
+            return self._finish_embedding_lookup(
+                partial,
+                semantic_tokens,
+                physical_tokens,
+                all_rank_num_tokens,
+            )
+
         if not self.use_attention_dp_sharding and self.ngram_embedding_weight_scale is not None:
             return self._embed_fp8_tp(ngram_ids)
         if not self.use_attention_dp_sharding:
             return self.ngram_embedding(ngram_ids)
 
-        if all_rank_num_tokens is None or len(all_rank_num_tokens) != self.tp_size:
-            raise ValueError(
-                "PLE row sharding under attention DP requires one token count per TP rank"
-            )
-        if physical_tokens is None:
-            physical_tokens = ngram_ids.shape[0]
-        if ngram_ids.shape[0] > physical_tokens:
-            raise ValueError(
-                f"PLE semantic token count {ngram_ids.shape[0]} exceeds physical "
-                f"token count {physical_tokens}"
-            )
-        if all_rank_num_tokens[self.tp_rank] != physical_tokens:
-            raise ValueError(
-                "PLE local physical token count does not match attention-DP metadata: "
-                f"{physical_tokens} != {all_rank_num_tokens[self.tp_rank]}"
-            )
-
-        physical_ids = ngram_ids.new_zeros((physical_tokens, ngram_ids.shape[1]))
-        physical_ids[: ngram_ids.shape[0]] = ngram_ids
-        sizes = None if len(set(all_rank_num_tokens)) == 1 else all_rank_num_tokens
-        gathered_ids = allgather(
-            physical_ids,
-            self.mapping,
-            dim=0,
-            sizes=sizes,
+        lookup_ids, semantic_tokens = self._prepare_embedding_lookup(
+            ngram_ids,
+            physical_tokens,
+            all_rank_num_tokens,
         )
-        owned = (gathered_ids >= self.vocab_start_index) & (gathered_ids < self.vocab_end_index)
+        owned = (lookup_ids >= self.vocab_start_index) & (lookup_ids < self.vocab_end_index)
         local_ids = torch.where(
             owned,
-            gathered_ids - self.vocab_start_index,
-            torch.zeros_like(gathered_ids),
+            lookup_ids - self.vocab_start_index,
+            torch.zeros_like(lookup_ids),
         )
         partial = F.embedding(local_ids, self.ngram_embedding.weight)
-        partial = self._dequantize_embeddings(partial)
         partial.masked_fill_(~owned.unsqueeze(-1), 0)
-        local_embeddings = reducescatter(
+        return self._finish_embedding_lookup(
             partial,
-            self.mapping,
-            dim=0,
-            sizes=sizes,
+            semantic_tokens,
+            physical_tokens,
+            all_rank_num_tokens,
         )
-        return local_embeddings[: ngram_ids.shape[0]]
 
 
 class Qwen4ExpPLE(nn.Module):
@@ -680,11 +993,130 @@ class Qwen4ExpPLE(nn.Module):
         self._pending_ngram_contexts: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
             None
         )
+        if self.ple_embedding.host_offload:
+            self._prefetch_stream = torch.cuda.Stream()
+        else:
+            self._prefetch_stream = None
+        self._graph_prefetch_buffers: dict[int, torch.Tensor] = {}
+        self._eager_prefetch_buffer: Optional[torch.Tensor] = None
+        self._prefetch_state: Optional[tuple[torch.Tensor, int, int, torch.Tensor]] = None
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """Per-stream grouped norm over a ``[..., hc_count, hidden]`` tensor."""
         y = norm(x.flatten(-2, -1))
         return y.unflatten(-1, (self.hc_count, self.hidden_size))
+
+    def _prepare_ngram_lookup(
+        self,
+        metadata: PLEMetadata,
+        ngram_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build recurrent contexts and the hashed per-head global row IDs."""
+        history = ngram_context.index_select(0, metadata.state_indices).to(torch.long)
+        combined = torch.cat([history, metadata.padded_tokens.to(torch.long)], dim=1)
+        windows = combined.unfold(1, self.ngram_size, 1)
+        contexts = windows[metadata.req_indices, metadata.token_offsets]
+        return combined, self.ple_embedding.hash_contexts(contexts)
+
+    def _allocate_prefetch_buffer(
+        self,
+        lookup_tokens: int,
+        lookup_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.ple_embedding.ngram_embedding.allocate_output(
+            (lookup_tokens, self.ple_embed_dim),
+            lookup_ids.device,
+        )
+
+    def _get_prefetch_buffer(
+        self,
+        lookup_tokens: int,
+        lookup_ids: torch.Tensor,
+        *,
+        is_cuda_graph: bool,
+    ) -> torch.Tensor:
+        if is_cuda_graph:
+            buffer = self._graph_prefetch_buffers.get(lookup_tokens)
+            if buffer is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "PLE CUDA-graph prefetch buffer was not created during warmup"
+                    )
+                buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+                self._graph_prefetch_buffers[lookup_tokens] = buffer
+            return buffer
+
+        buffer = self._eager_prefetch_buffer
+        if buffer is None or buffer.shape[0] < lookup_tokens:
+            buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+            self._eager_prefetch_buffer = buffer
+        return buffer[:lookup_tokens]
+
+    def start_prefetch(
+        self,
+        metadata: PLEMetadata,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Launch the pinned-host UVA gather before the PLE decoder layer."""
+        if self._prefetch_stream is None:
+            return
+        if self._prefetch_state is not None:
+            raise RuntimeError("PLE prefetch state was not consumed before reuse")
+        combined, ngram_ids = self._prepare_ngram_lookup(metadata, ngram_context)
+        lookup_ids, semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
+            ngram_ids,
+            metadata.physical_tokens,
+            metadata.all_rank_num_tokens,
+        )
+        lookup_tokens = lookup_ids.shape[0]
+        if lookup_tokens == 0:
+            return
+        prefetched = self._get_prefetch_buffer(
+            lookup_tokens,
+            lookup_ids,
+            is_cuda_graph=metadata.is_cuda_graph,
+        )
+        output_view = prefetched.view(
+            lookup_tokens,
+            self.ple_embedding.ngram_heads,
+            self.ple_embedding.head_dim_per_ngram,
+        )
+
+        current_stream = torch.cuda.current_stream()
+        # Use Stream.wait_stream rather than private events. BreakableCUDAGraph
+        # hooks this API to track side-stream forks and joins across graph
+        # segments, while ordinary CUDA graphs capture the same dependency.
+        self._prefetch_stream.wait_stream(current_stream)
+        lookup_ids.record_stream(self._prefetch_stream)
+        with torch.cuda.stream(self._prefetch_stream):
+            self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+        self._prefetch_state = (
+            prefetched,
+            semantic_tokens,
+            metadata.physical_tokens,
+            combined,
+        )
+
+    def _consume_prefetched_embeddings(
+        self,
+        metadata: PLEMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._prefetch_state is None:
+            raise RuntimeError("PLE prefetch state is missing")
+        prefetched, semantic_tokens, physical_tokens, combined = self._prefetch_state
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        embeddings = self.ple_embedding._finish_embedding_lookup(
+            prefetched.view(
+                prefetched.shape[0],
+                self.ple_embedding.ngram_heads,
+                self.ple_embedding.head_dim_per_ngram,
+            ),
+            semantic_tokens,
+            physical_tokens,
+            metadata.all_rank_num_tokens,
+        )
+        self._prefetch_state = None
+        return embeddings.flatten(start_dim=-2), combined
 
     def _short_conv(
         self, x: torch.Tensor, metadata: PLEMetadata, conv_state: torch.Tensor
@@ -814,18 +1246,18 @@ class Qwen4ExpPLE(nn.Module):
             )
         hidden_states = hidden_states[: m.processed_tokens]
 
-        # Build the [history | this-chunk] context grid and gather each token's
-        # ngram_size-token window, then hash + embed it.
-        history = ngram_context.index_select(0, m.state_indices).to(torch.long)
-        combined = torch.cat([history, m.padded_tokens.to(torch.long)], dim=1)
-        windows = combined.unfold(1, self.ngram_size, 1)
-        contexts = windows[m.req_indices, m.token_offsets]
-        ngram_ids = self.ple_embedding.hash_contexts(contexts)
-        embeddings = self.ple_embedding.embed(
-            ngram_ids,
-            physical_tokens=m.physical_tokens,
-            all_rank_num_tokens=m.all_rank_num_tokens,
-        ).flatten(start_dim=-2)
+        # Consume an overlapped pinned-host gather when available. Direct module
+        # callers and a PLE layer that is first on a pipeline stage use the same
+        # synchronous path as a correctness-preserving fallback.
+        if self._prefetch_state is not None:
+            embeddings, combined = self._consume_prefetched_embeddings(m)
+        else:
+            combined, ngram_ids = self._prepare_ngram_lookup(m, ngram_context)
+            embeddings = self.ple_embedding.embed(
+                ngram_ids,
+                physical_tokens=m.physical_tokens,
+                all_rank_num_tokens=m.all_rank_num_tokens,
+            ).flatten(start_dim=-2)
 
         key = self.key_proj(embeddings)
         value = self.value_proj(embeddings)

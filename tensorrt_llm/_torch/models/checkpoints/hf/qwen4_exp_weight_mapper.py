@@ -415,23 +415,37 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                 (leaf for leaf in leaves if leaf.startswith("ngram_embedding.shard_")),
                 key=lambda s: int(s.split(".shard_")[1].split(".")[0]),
             )
+            if not shard_leaves:
+                raise ValueError(f"PLE n-gram table for {ple_prefix} has no table shards")
+            shard_dtypes = {leaves[leaf].dtype for leaf in shard_leaves}
+            if len(shard_dtypes) > 1:
+                raise ValueError(
+                    f"PLE n-gram shards for {ple_prefix} have mixed dtypes: "
+                    f"{sorted(map(str, shard_dtypes))}"
+                )
             weight_scale = leaves.get("ngram_embedding.weight_scale")
             if weight_scale is not None:
-                if not shard_leaves:
-                    raise ValueError(
-                        f"PLE n-gram weight scale for {ple_prefix} has no table shards"
-                    )
-                shard_dtypes = {leaves[leaf].dtype for leaf in shard_leaves}
-                if len(shard_dtypes) != 1:
-                    raise ValueError(
-                        f"PLE n-gram shards for {ple_prefix} have mixed dtypes: "
-                        f"{sorted(map(str, shard_dtypes))}"
-                    )
                 module.configure_fp8_weight_storage(
                     weight_scale,
                     next(iter(shard_dtypes)),
                 )
-            table = module.ngram_embedding.weight
+            else:
+                shard_dtype = next(iter(shard_dtypes))
+                if shard_dtype.is_floating_point and shard_dtype.itemsize == 1:
+                    raise ValueError(f"PLE FP8 n-gram shards for {ple_prefix} have no weight scale")
+
+            materialize_pinned = getattr(module.ngram_embedding, "materialize_pinned", None)
+            if materialize_pinned is not None:
+                table = materialize_pinned()
+            else:
+                table = module.ngram_embedding.weight
+            if getattr(module, "host_offload", False) and table.dtype != next(iter(shard_dtypes)):
+                raise TypeError(
+                    f"PLE host-offload table for {ple_prefix} was allocated as "
+                    f"{table.dtype}, but checkpoint shards use "
+                    f"{next(iter(shard_dtypes))}"
+                )
+            table_ptr = table.data_ptr()
             row = 0
             copied_rows = 0
             for leaf in shard_leaves:
@@ -462,3 +476,5 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             local_rows = vocab_end - vocab_start
             if table.shape[0] > local_rows:
                 table.data[local_rows:].zero_()
+            if table.data_ptr() != table_ptr:
+                raise RuntimeError("PLE n-gram table address changed while loading")

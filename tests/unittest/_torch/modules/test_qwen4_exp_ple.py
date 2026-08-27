@@ -510,7 +510,7 @@ def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> 
     from tensorrt_llm._torch.modules import qwen4_exp_ple
 
     config = _make_config()
-    mapping = SimpleNamespace(tp_size=2, tp_rank=0, enable_attention_dp=True)
+    mapping = SimpleNamespace(tp_size=2, tp_rank=0, cp_size=1, enable_attention_dp=True)
     module = Qwen4ExpNGramEmbedding(
         config,
         embedding_dim=32,

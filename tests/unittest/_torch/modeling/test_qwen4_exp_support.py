@@ -432,8 +432,10 @@ def test_mapper_streams_only_local_ple_row_overlap(monkeypatch) -> None:
         "ngram_embedding.shard_1.weight": full_table[4:],
     }
 
+    table_ptr = module.ngram_embedding.weight.data_ptr()
     mapper._load_ngram_tables({"model.layers.1.ple": leaves})
 
+    assert module.ngram_embedding.weight.data_ptr() == table_ptr
     torch.testing.assert_close(module.ngram_embedding.weight, full_table[3:8])
 
 

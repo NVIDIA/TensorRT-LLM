@@ -476,6 +476,7 @@ class Qwen4ExpModel(DecoderModel):
             use_spec_decoding=use_spec_decoding,
             uniform_row_width=uniform_row_width,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            is_cuda_graph=attn_metadata.is_cuda_graph,
         )
 
         conv_state, ngram_context = self._resolve_ple_pools(
@@ -608,6 +609,10 @@ class Qwen4ExpModel(DecoderModel):
             if input_ids is not None
             else None
         )
+        if ple_state is not None:
+            ple_layer_idx = next(i for i, enabled in enumerate(self.ple_layer_mask) if enabled)
+            ple_meta, _, ngram_context = ple_state
+            self.layers[ple_layer_idx].ple.start_prefetch(ple_meta, ngram_context)
 
         for layer_idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
             hidden_states = decoder_layer(
