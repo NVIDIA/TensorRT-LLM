@@ -1527,7 +1527,9 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
                 if (_shouldRecordStats())
                 {
                     bool const changed = mPendingStats.recordAllocationRange(lc, ordinal, ordinal + 1,
-                        /*beamWidth=*/1, /*countAsMissed=*/false, /*countAsGeneration=*/true);
+                        /*beamWidth=*/1, /*countAsMissed=*/false, /*countAsGeneration=*/true,
+                        /*recordManagerStats=*/_shouldRecordManagerStats(),
+                        /*recordRequestStats=*/_shouldRecordRequestStats());
                     if (changed)
                         mManager->markStatsDirty(id);
                 }
