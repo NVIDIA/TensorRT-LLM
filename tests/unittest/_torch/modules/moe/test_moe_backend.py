@@ -1017,6 +1017,159 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
         megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
 
 
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["gated_swiglu", "nongated_relu2"],
+)
+def test_cutlass_w4a16_weight_shapes_gated_and_nongated(activation_type):
+    """W4A16 MoE must size its weights from expand_intermediate_size_per_partition.
+
+    Nemotron-H uses squared-ReLU and is NON-gated, so a class that assumes
+    gating (a literal ``* 2``) allocates twice the fc1 rows it should and the
+    loader then writes past the logical extent.  ``INT8WoqPerChannelFusedMoEMethod``
+    hardcodes ``intermediate_size_per_partition * 2`` (quantization.py:1313-1315),
+    so this generality is new code in the W4A16 class rather than something
+    inherited by cloning.
+
+    Also pins the INT4 packing axis: two INT4 values share one int8 byte along
+    the trailing (output) dim, matching the dense W4A16 convention
+    ``(in_features, out_features // 2)`` (linear.py:2173-2176) and the runner's
+    ``mInnerDimMultiplier = 2`` (moeOp.cpp:201-204).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required to construct a Cutlass MoE backend")
+
+    from tensorrt_llm._utils import get_sm_version
+
+    sm_version = get_sm_version()
+    if sm_version < 80:
+        pytest.skip(f"CutlassFusedMoE W4A16 requires SM >= 80, got SM{sm_version}")
+
+    num_experts, top_k = 4, 2
+    # 64-aligned so preprocess_weights_for_mixed_gemm's row-tile constraint
+    # (functional.py:1020-1024) is satisfied and is not what this test measures.
+    hidden_size, intermediate_size = 128, 256
+    dtype = torch.bfloat16
+
+    backend = create_test_backend(
+        backend_type=MoeBackendType.CUTLASS,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16),
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        activation_type=activation_type,
+    )
+    backend.create_weights()
+
+    is_gated = is_gated_activation(activation_type)
+    expected_expand = intermediate_size * (2 if is_gated else 1)
+    assert backend.expand_intermediate_size_per_partition == expected_expand
+
+    # Storage container stays int8; the packing is expressed in the shape.
+    assert backend.w3_w1_weight.dtype == torch.int8
+    assert backend.w2_weight.dtype == torch.int8
+
+    # Trailing (output) dim halved by INT4 packing; leading dims unpacked.
+    assert tuple(backend.w3_w1_weight.shape) == (
+        num_experts,
+        hidden_size,
+        expected_expand // 2,
+    )
+    assert tuple(backend.w2_weight.shape) == (
+        num_experts,
+        intermediate_size,
+        hidden_size // 2,
+    )
+
+    # Scales are per output channel, so they stay at full logical width.
+    assert tuple(backend.fc31_weight_scale.shape) == (num_experts, expected_expand)
+    assert tuple(backend.fc2_weight_scale.shape) == (num_experts, hidden_size)
+
+    # The whole point of 4-bit: exactly half the weight bytes of W8A16, whose
+    # params are these shapes with the trailing dim unpacked.
+    w4a16_bytes = (
+        backend.w3_w1_weight.numel() * backend.w3_w1_weight.element_size()
+        + backend.w2_weight.numel() * backend.w2_weight.element_size()
+    )
+    w8a16_bytes = num_experts * (hidden_size * expected_expand + intermediate_size * hidden_size)
+    assert w4a16_bytes * 2 == w8a16_bytes
+
+
+@pytest.mark.parametrize(
+    "intermediate_size,tp_size",
+    [(1856, 2), (1856, 4), (928, 2), (2688, 4)],
+)
+def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(intermediate_size, tp_size):
+    """A non-64-aligned row count must fail with a message that names the cause.
+
+    ``preprocess_weights_for_mixed_gemm`` enforces the row-tile constraint as a
+    BARE assert -- ``assert (num_rows % rows_per_tile == 0)``
+    (tensorrt_llm/quantization/functional.py:1024) -- inside a helper several
+    frames below the loader.  Left alone it surfaces as a bare ``AssertionError``
+    with no tensor name, no dimension and no tp_size, which is exactly the
+    unhelpful failure M6 asks to replace.
+
+    The shapes chosen here are the ones the brief calls out as breaking W8A16
+    today: intermediate_size 1856 at TP 2/4 and 2688 at TP 4.  W4A16 inherits
+    the same restriction and is no worse, because ``rows_per_tile =
+    128*8//BITS_PER_ELT_A`` is activation-driven and therefore 64 for both INT4
+    and INT8 (functional.py:1020); INT4's other row constraints are weaker
+    divisors of 64 (B_ROWS_PER_MMA = 32 at :985, elts_in_int32 = 8 at :1021).
+    """
+    from tensorrt_llm._torch.modules.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
+
+    class _DummyModule:
+        pass
+
+    module = _DummyModule()
+    module.tp_size = tp_size
+
+    # The 64-row constraint applies to the PER-SHARD row count, which is what
+    # the loader passes: _validate_alignment(w2_weight_shard.shape[-1], ...).
+    num_rows = intermediate_size // tp_size
+
+    # Precondition: these really are the unaligned cases, so the test is not
+    # vacuously passing on an aligned shape.
+    assert num_rows % 64 != 0
+
+    with pytest.raises(ValueError) as excinfo:
+        W4A16WoqPerChannelFusedMoEMethod._validate_alignment(num_rows, "w2_weight", module)
+
+    message = str(excinfo.value)
+    # The diagnostic must identify the tensor, the offending count and the
+    # tp_size -- the three facts a bare assert throws away.
+    assert "w2_weight" in message
+    assert str(num_rows) in message
+    assert f"tp_size={tp_size}" in message
+    assert "64" in message
+
+
+@pytest.mark.parametrize("num_rows", [64, 128, 1024, 2048, 2816])
+def test_cutlass_w4a16_aligned_rows_accepted(num_rows):
+    """The aligned TP sizes the method claims to support must pass cleanly.
+
+    Counterpart to the rejection test: M6's check is two-sided ("tests pass at
+    the TP sizes your choice claims to support, and fail cleanly ... at the ones
+    it does not"), so pinning only the failure would leave the validator free to
+    reject everything.
+    """
+    from tensorrt_llm._torch.modules.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
+
+    class _DummyModule:
+        pass
+
+    module = _DummyModule()
+    module.tp_size = 1
+
+    assert num_rows % 64 == 0
+    # Must not raise.
+    W4A16WoqPerChannelFusedMoEMethod._validate_alignment(num_rows, "w2_weight", module)
+
+
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,
@@ -1104,6 +1257,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.W4A8_MXFP4_MXFP8,
     QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
+    QuantAlgo.W4A16,
     QuantAlgo.W4A8_AWQ,
 ]
 

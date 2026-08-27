@@ -105,6 +105,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
     W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod,
+    W4A16WoqPerChannelFusedMoEMethod,
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
@@ -1864,6 +1865,12 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
             # W4A8_AWQ uses is_int4_weight_only_per_group() -> WInt4AFP8FusedMoEMethod
             QuantAlgo.W4A8_AWQ: WInt4AFP8FusedMoEMethod,
             QuantAlgo.W8A16: INT8WoqPerChannelFusedMoEMethod,
+            # Plain W4A16 (INT4 weight-only, per-channel) resolves via
+            # has_int4_woq_per_channel, which is checked AFTER
+            # is_int4_weight_only_per_group so W4A8_AWQ keeps priority. Asserting
+            # the concrete class here is what catches a silent fall-through to
+            # INT8WoqPerChannelFusedMoEMethod.
+            QuantAlgo.W4A16: W4A16WoqPerChannelFusedMoEMethod,
             QuantAlgo.W4A16_MXFP4: WFP4A16FusedMoEMethod,
             QuantAlgo.W4A8_MXFP4_FP8: W4A8MXFP4FP8CutlassFusedMoEMethod,
             QuantAlgo.W4A8_MXFP4_MXFP8: W4A8MXFP4MXFP8CutlassFusedMoEMethod,

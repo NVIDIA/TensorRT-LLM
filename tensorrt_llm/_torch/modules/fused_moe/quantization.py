@@ -1566,6 +1566,188 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         module.fc2_weight_scale.data.copy_(w2_scales.contiguous())
 
 
+class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
+    """Plain W4A16: INT4 weights, per-channel scales, 16-bit activations.
+
+    Storage mirrors ``INT8WoqPerChannelFusedMoEMethod`` (the dim-swapped,
+    post-transpose layout the per-channel weight-only runner expects) with the
+    trailing output dimension halved, because two INT4 values are packed into
+    one int8 byte. That matches the dense W4A16 convention, where
+    ``WeightOnlyQuantLinearMethod.create_weights`` allocates
+    ``(in_features, out_features // 2)`` (linear.py:2173-2176), and the C++
+    runner's ``mInnerDimMultiplier = 2; // 2 INT4 -> 1 INT8`` (moeOp.cpp:201-204).
+    """
+
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+
+    # 2 INT4 values per int8 byte, matching mInnerDimMultiplier in moeOp.cpp:203.
+    PACKED_ELEMENTS_PER_BYTE = 2
+
+    def create_weights(self, module: torch.nn.Module):
+        module.sm_version = get_sm_version()
+        module.sm_version = 80 if module.sm_version >= 90 else module.sm_version
+        module.preprocessor = preprocess_weights_for_mixed_gemm
+
+        if not module.quant_config.layer_quant_mode.is_int4_weight_only():
+            raise NotImplementedError(
+                f"W4A16 MoE requires INT4 weight-only quantization. Got: {module.quant_config.layer_quant_mode}."
+            )
+
+        # Storage container is int8; each byte holds two INT4 values. The
+        # logical widths are unpacked, so only the trailing (output) dim is
+        # halved. Sized from expand_intermediate_size_per_partition
+        # (interface.py:1005-1007) so gated and non-gated both work without a
+        # hardcoded factor of 2.
+        expand_inter = module.expand_intermediate_size_per_partition
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.hidden_size,
+                              expand_inter // self.PACKED_ELEMENTS_PER_BYTE)
+        w2_weight_shape = (module.expert_size_per_partition,
+                           module.intermediate_size_per_partition,
+                           module.hidden_size // self.PACKED_ELEMENTS_PER_BYTE)
+
+        # Scales stay at full logical width: one scale per output channel.
+        fc31_weight_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, expand_inter, dtype=module.dtype),
+                                         requires_grad=False)
+        module.register_parameter("fc31_weight_scale", fc31_weight_scale)
+
+        fc2_weight_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition,
+            module.hidden_size,
+            dtype=module.dtype),
+                                        requires_grad=False)
+        module.register_parameter("fc2_weight_scale", fc2_weight_scale)
+
+        super().create_weights(module, torch.int8, w3_w1_weight_shape,
+                               w2_weight_shape)
+
+        self._online_eplb_not_supported(module)
+
+        self.setup_quant_scales(module)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        # Reuses the per-channel 2-scale tuple; moeOp.cpp:1137 turns this into
+        # QuantParams::Int(fc1_scale, fc2_scale).
+        module.quant_scales = FusedMoEQuantScalesINT8WoqPerChannel(
+            fc31_weight_scale=module.fc31_weight_scale,
+            fc2_weight_scale=module.fc2_weight_scale,
+        )
+
+    @staticmethod
+    def _validate_alignment(num_rows: int, name: str, module: torch.nn.Module):
+        """Fail with a diagnostic before preprocess_weights_for_mixed_gemm's bare asserts.
+
+        functional.py:1024 asserts ``num_rows % rows_per_tile == 0`` with
+        rows_per_tile = 128*8//BITS_PER_ELT_A = 64. It is activation-driven, so
+        INT4 carries the same 64-row requirement as INT8 (functional.py:1020) --
+        W4A16 inherits exactly W8A16's TP restriction, no worse. Raised here so
+        the message names the offending tensor and tp_size instead of surfacing
+        as an opaque AssertionError inside the preprocessor.
+        """
+        if num_rows % 64 != 0:
+            raise ValueError(
+                f"W4A16 MoE requires the pre-transpose row count of {name} to be a "
+                f"multiple of 64, got {num_rows} (tp_size={module.tp_size}). "
+                "preprocess_weights_for_mixed_gemm interleaves 64-row tiles "
+                "(tensorrt_llm/quantization/functional.py:1020-1024). Use a tensor-parallel "
+                "size that keeps this dimension 64-aligned.")
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        """Load the w1 (and, when gated, w3) weights for one expert."""
+        w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        if w3_weight is not None and w3_weight.numel() > 0:
+            w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN)
+            # Gated: w3 first, matching the fc31 scale concatenation order.
+            w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
+                                         dim=0)
+        else:
+            # Non-gated activations (e.g. Nemotron-H squared-ReLU) have no w3.
+            w31_weight_shard = w1_weight_shard
+
+        assert module.dtype in [torch.float16, torch.bfloat16], \
+            f"activation dtype should be float16 or bfloat16, got {module.dtype}"
+
+        # shape[-1] is the pre-transpose column count == num_rows the
+        # preprocessor sees after .T (it reads shape[1] of the 3-D view).
+        self._validate_alignment(w31_weight_shard.shape[-1], "w3_w1_weight",
+                                 module)
+
+        # Checkpoint entries are already packed two INT4 per byte along the
+        # OUTPUT dim, i.e. w1/w3 arrive as (inter/2, hidden), so the COLUMN
+        # shard and the dim-0 concat both operate in packed coordinates. The
+        # transpose then yields (hidden, expand_inter/2), which is exactly the
+        # destination parameter. preprocess_weights_for_mixed_gemm consumes and
+        # returns packed bytes -- it preserves the byte count and only permutes
+        # (functional.py:1004-1012 subbyte_transpose) -- so no dimension is
+        # halved here. Packing along the output dim is required because a packed
+        # tensor cannot be transposed to move the packing axis.
+        w31_weight_shard = module.preprocessor(w31_weight_shard.T.contiguous(),
+                                               torch.quint4x2, module.dtype,
+                                               module.sm_version).contiguous()
+        dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
+                               non_blocking=True)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor):
+        """Load the w2 weight for one expert."""
+        # ROW shard: the split is on w2's input dim, so sharding and the
+        # last-dim packing do not interact.
+        w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW)
+
+        self._validate_alignment(w2_weight_shard.shape[-1], "w2_weight", module)
+
+        w2_weight_shard = module.preprocessor(w2_weight_shard.T.contiguous(),
+                                              torch.quint4x2, module.dtype,
+                                              module.sm_version).contiguous()
+        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                            non_blocking=True)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        all_w1_scales = [
+            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                              module.tp_size, module.tp_rank,
+                              TensorParallelMode.COLUMN)
+            for expert_id in module.initial_local_expert_ids
+        ]
+        has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
+                            for expert_id in module.initial_local_expert_ids)
+        if module.is_gated_activation and has_w3_scales:
+            all_w3_scales = [
+                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                  module.tp_size, module.tp_rank,
+                                  TensorParallelMode.COLUMN)
+                for expert_id in module.initial_local_expert_ids
+            ]
+            w3_w1_scales = torch.cat(
+                [torch.stack(all_w3_scales),
+                 torch.stack(all_w1_scales)],
+                dim=-1)
+        else:
+            w3_w1_scales = torch.stack(all_w1_scales)
+        module.fc31_weight_scale.data.copy_(
+            w3_w1_scales.to(module.dtype).contiguous())
+
+        all_w2_scales = [
+            load_weight_shard(weights[f"{expert_id}.w2.weight_scale"],
+                              module.tp_size, module.tp_rank,
+                              TensorParallelMode.ROW)
+            for expert_id in module.initial_local_expert_ids
+        ]
+        w2_scales = torch.stack(all_w2_scales).to(module.dtype)
+        module.fc2_weight_scale.data.copy_(w2_scales.contiguous())
+
+
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 

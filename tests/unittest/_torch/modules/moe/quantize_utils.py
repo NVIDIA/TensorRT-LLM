@@ -209,6 +209,14 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
     elif quant_algo == QuantAlgo.W8A16:
         quantize_util_cls = W8A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
+    elif quant_algo == QuantAlgo.W4A16:
+        # Plain W4A16: INT4 weight-only, per-channel scales. QuantConfig ->
+        # quant_mode maps W4A16 to use_weight_only(use_int4_weights=True) with no
+        # PER_GROUP bit, so is_int4_weight_only() is true and
+        # has_per_group_scaling() is false -- which is exactly what
+        # has_int4_woq_per_channel keys off in fused_moe_cutlass.py.
+        quantize_util_cls = W4A16QuantizeUtil
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
     elif quant_algo == QuantAlgo.W4A8_AWQ:
         quantize_util_cls = W4A8AWQQuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
@@ -2731,6 +2739,210 @@ class W8A16QuantizeUtil(BaseQuantizeUtil):
 
     def create_ref_module(
         self, routing_method, ref_cls=W8A16RefGatedMLPFusedMoE
+    ) -> torch.nn.Module:
+        """
+        Create a reference module for correctness testing.
+        """
+        return super().create_ref_module(routing_method, ref_cls)
+
+
+# int4_woq_per_channel (plain W4A16)
+#
+# Nibble order below is dictated by the two consumers of these bytes, both read
+# rather than assumed:
+#   * preprocess_weights_for_mixed_gemm's subbyte_transpose builds
+#     cat([low, high]) with low = (t << 4) >> 4 and high = t >> 4, i.e. the LOW
+#     nibble is the lower-indexed logical element
+#     (tensorrt_llm/quantization/functional.py:1004-1012).
+#   * unpack_int4_packed_tensor_to_int8 writes elt_0 = (packed << 4) >> 4 to the
+#     even index and elt_1 = packed >> 4 to the odd index
+#     (cpp/tensorrt_llm/thop/weightOnlyQuantOp.cpp:308-312).
+# Both agree: even logical index -> low nibble, odd -> high nibble.
+#
+# Packing runs along dim 0 (the OUTPUT channel dim) because that is the axis the
+# MoE loader needs. A packed tensor cannot be transposed to move its packing
+# axis, and torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix
+# packs along the LAST axis (weightOnlyQuantOp.cpp:330), so it cannot be reused
+# here; the arithmetic is reproduced explicitly instead.
+
+
+def pack_int4_along_dim0(unpacked: torch.Tensor) -> torch.Tensor:
+    """Pack an (out, in) int8 tensor of INT4 values into (out // 2, in) bytes.
+
+    Row ``2r`` of the input becomes the low nibble of output row ``r`` and row
+    ``2r + 1`` becomes the high nibble.
+    """
+    assert unpacked.shape[0] % 2 == 0, (
+        f"output dim must be even to pack two INT4 per byte, got {unpacked.shape[0]}"
+    )
+    low = (unpacked[0::2] & 0x0F).to(torch.uint8)
+    high = (unpacked[1::2] & 0x0F).to(torch.uint8)
+    return (low | (high << 4)).view(torch.int8)
+
+
+def unpack_int4_along_dim0(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`pack_int4_along_dim0`, sign-extending each nibble."""
+    as_u8 = packed.view(torch.uint8)
+    # Double shift sign-extends the 4-bit value, as in weightOnlyQuantOp.cpp:308.
+    low = (as_u8 << 4).view(torch.int8) >> 4
+    high = as_u8.view(torch.int8) >> 4
+    stacked = torch.stack([low, high], dim=1)
+    return stacked.reshape(packed.shape[0] * 2, packed.shape[1])
+
+
+class W4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
+    """
+    A derived class of RefMLPFusedMoE serving as a reference implementation of
+    plain W4A16 (INT4 weight-only, per-channel scales) for correctness testing.
+
+    Mirrors W8A16RefGatedMLPFusedMoE: GatedMLP has no W4A16 path, so the weights
+    are unpacked and dequantized in load_weights and the non-quantized forward is
+    used.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        routing_method: BaseMoeRoutingMethod,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: Optional[ModelConfig] = None,
+        bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
+    ):
+        assert activation_type == ActivationType.Swiglu, (
+            "Only Swiglu activation is supported for W4A16RefGatedMLPFusedMoE"
+        )
+        self._original_quant_config = model_config.quant_config if model_config else None
+        super().__init__(
+            num_experts=num_experts,
+            routing_method=routing_method,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            model_config=ModelConfig(),  # No quant_config; weights are dequantized.
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+
+    def _dequantize(self, packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Unpack along the output dim, then apply the per-output-channel scale."""
+        unpacked = unpack_int4_along_dim0(packed.cpu()).to(packed.device)
+        # unpacked is (out, in); scale is (out,) -> broadcast over the input dim.
+        return (unpacked.T.contiguous().float() * scale).to(self.dtype).T.contiguous()
+
+    def load_weights(self, weights_list: List[Dict]):
+        assert len(weights_list) == 1
+        weights = weights_list[0]
+
+        assert (
+            self._original_quant_config
+            and self._original_quant_config.quant_algo == QuantAlgo.W4A16
+        ), "expect quant_algo to be W4A16"
+
+        for expert in range(self.num_experts):
+            w1_dequant = self._dequantize(
+                weights[f"{expert}.w1.weight"], weights[f"{expert}.w1.weight_scale"]
+            )
+            w3_dequant = self._dequantize(
+                weights[f"{expert}.w3.weight"], weights[f"{expert}.w3.weight_scale"]
+            )
+            w2_dequant = self._dequantize(
+                weights[f"{expert}.w2.weight"], weights[f"{expert}.w2.weight_scale"]
+            )
+
+            gate_up_proj_weights = [{}, {}]
+            down_proj_weights = [{}]
+            gate_up_proj_weights[0]["weight"] = w1_dequant
+            gate_up_proj_weights[1]["weight"] = w3_dequant
+            down_proj_weights[0]["weight"] = w2_dequant
+            self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+            self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+    def check_accuracy(self, output, ref_output, weight_dtype=torch.quint4x2):
+        # Same helper and the same percent thresholds as the W8A16 arm; only the
+        # dtype differs, which widens atol via bits_in_type = 4
+        # (tests/unittest/_torch/helpers.py:97-99). Deliberately NOT loosened
+        # beyond that: per-channel INT4 accuracy is the gate that decides whether
+        # this feature ships, so a relaxed threshold would hide the signal.
+        atol = calc_woq_tolerence(ref_output, weight_dtype)
+        moe_tp_size = getattr(self, "moe_tp_size", 1)
+        if moe_tp_size > 1:
+            check_accuracy(output, ref_output, rtol=1e-1, atol=atol, percent=0.96)
+        else:
+            check_accuracy(output, ref_output, rtol=1e-7, atol=atol, percent=0.99)
+
+
+class W4A16QuantizeUtil(BaseQuantizeUtil):
+    """
+    W4A16QuantizeUtil inherits from BaseQuantizeUtil to support correctness
+    testing for plain W4A16 quantized MoE modules (INT4 weight-only,
+    per-channel scales).
+    """
+
+    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+        """
+        Create quantized weights for MoE experts using plain W4A16.
+
+        Values are drawn directly in the INT4 range rather than quantized from a
+        BF16 tensor, mirroring W8A16QuantizeUtil which draws int8 values with
+        torch.randint. The reference dequantizes with the same scales, so this
+        exercises the loader, packing and kernel path exactly without
+        introducing a second quantizer whose rounding convention could drift.
+
+        On-disk layout is packed along the OUTPUT dim -- w1/w3 are
+        (intermediate_size // 2, hidden_size) and w2 is
+        (hidden_size // 2, intermediate_size) -- which is what
+        W4A16WoqPerChannelFusedMoEMethod's loader expects: the COLUMN shard and
+        dim-0 concat then operate in packed coordinates and the subsequent
+        transpose yields the destination parameter shape directly.
+        """
+        assert self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.W4A16, (
+            "expect quant_algo to be W4A16"
+        )
+        weights = {}
+        for expert_id in range(self.num_experts):
+            # INT4 signed range is [-8, 7]; randint's upper bound is exclusive.
+            w1_unpacked = torch.randint(
+                -8, 8, (self.intermediate_size, self.hidden_size), dtype=torch.int8
+            ).cuda()
+            w2_unpacked = torch.randint(
+                -8, 8, (self.hidden_size, self.intermediate_size), dtype=torch.int8
+            ).cuda()
+            w3_unpacked = torch.randint(
+                -8, 8, (self.intermediate_size, self.hidden_size), dtype=torch.int8
+            ).cuda()
+
+            # Per-output-channel scales, at full (unpacked) logical width.
+            w1_scale = (
+                torch.randn(self.intermediate_size, dtype=self.dtype, device="cuda")
+                / self.hidden_size
+            )
+            w2_scale = (
+                torch.randn(self.hidden_size, dtype=self.dtype, device="cuda")
+                / self.intermediate_size
+            )
+            w3_scale = (
+                torch.randn(self.intermediate_size, dtype=self.dtype, device="cuda")
+                / self.hidden_size
+            )
+
+            weights[f"{expert_id}.w1.weight"] = pack_int4_along_dim0(w1_unpacked)
+            weights[f"{expert_id}.w2.weight"] = pack_int4_along_dim0(w2_unpacked)
+            weights[f"{expert_id}.w3.weight"] = pack_int4_along_dim0(w3_unpacked)
+            weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_scale
+        return weights
+
+    def create_ref_module(
+        self, routing_method, ref_cls=W4A16RefGatedMLPFusedMoE
     ) -> torch.nn.Module:
         """
         Create a reference module for correctness testing.

@@ -39,9 +39,9 @@ from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
-    W4A16NVFP4CutlassFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
-    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
-    WInt4AFP8FusedMoEMethod)
+    W4A16NVFP4CutlassFusedMoEMethod, W4A16WoqPerChannelFusedMoEMethod,
+    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -136,6 +136,14 @@ class CutlassFusedMoE(MoEImplBase):
         },
         # W8A16: SM >= 80
         QuantAlgo.W8A16: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W4A16 (plain INT4 weight-only, per-channel scales): SM >= 80.
+        # Uses the legacy mixed-dtype weight-only path, which SM120/121 reach
+        # via the SM80 interleaved layout (functional.py:962-963), so the same
+        # code covers SM80 through SM121.
+        QuantAlgo.W4A16: {
             "sm_constraint": ("min", 80),
             "dtypes": {torch.float16, torch.bfloat16},
         },
@@ -494,7 +502,7 @@ class CutlassFusedMoE(MoEImplBase):
             cluster_rank=self.cluster_rank,
             use_deepseek_fp8_block_scale=False,
             use_w4_group_scaling=False,
-            use_int8_woq_per_channel=False,
+            use_woq_per_channel=False,
             use_mxfp8_act_scaling=False,
             min_latency_mode=False,
             use_fused_finalize=self.use_fused_finalize,
@@ -728,6 +736,21 @@ class CutlassFusedMoE(MoEImplBase):
         return self.quant_config and self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
+    @property
+    def has_int4_woq_per_channel(self):
+        # Plain W4A16: INT4 weights with per-channel (not per-group) scales.
+        # Excluding per-group keeps W4A8_AWQ on WInt4AFP8FusedMoEMethod, which
+        # is selected by is_int4_weight_only_per_group() (mode.py:138).
+        return self.quant_config and self.quant_config.layer_quant_mode.is_int4_weight_only(
+        ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
+
+    @property
+    def has_woq_per_channel(self):
+        # Both per-channel weight-only dtypes share the dim-swapped weight
+        # layout and the 2-element scale list that moeOp.cpp:1137 turns into
+        # QuantParams::Int, so the C++ flag is driven by either.
+        return self.has_int8_woq_per_channel or self.has_int4_woq_per_channel
+
     def quantize_input(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -767,6 +790,10 @@ class CutlassFusedMoE(MoEImplBase):
                 pass
             elif self.has_int8_woq_per_channel:
                 # No quantization needed here, handled in kernel
+                pass
+            elif self.has_int4_woq_per_channel:
+                # Weight-only: activations stay in 16-bit, dequantization of the
+                # INT4 weights happens inside the mixed-dtype GEMM.
                 pass
             elif self.has_nvfp4:
                 if hasattr(
@@ -850,6 +877,11 @@ class CutlassFusedMoE(MoEImplBase):
                 return WInt4AFP8FusedMoEMethod()
             elif self.has_int8_woq_per_channel:
                 return INT8WoqPerChannelFusedMoEMethod()
+            elif self.has_int4_woq_per_channel:
+                # Placed after is_int4_weight_only_per_group() so W4A8_AWQ keeps
+                # priority on WInt4AFP8FusedMoEMethod; this branch is reached
+                # only by plain per-channel INT4.
+                return W4A16WoqPerChannelFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
                 return W4A8MXFP4FP8CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
@@ -984,6 +1016,14 @@ class CutlassFusedMoE(MoEImplBase):
         if self.has_any_quant:
             if self.has_w4afp8:
                 weight_dtype = torch.quint4x2
+            elif self.has_int4_woq_per_channel:
+                # Packed INT4 is stored in an int8 parameter. Without this view
+                # the op sees Char, isInt8Quant() matches (moeOp.cpp:1201) and
+                # CutlassMoeFCRunner<T, uint8_t> is built (moeOp.cpp:107) -- a
+                # silent fallback that runs at the wrong element width and
+                # leaves mInnerDimMultiplier at 1. quint4x2 makes
+                # isInt4Quant() (moeOp.cpp:1206) select the uint4b_t runner.
+                weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
 
@@ -1020,7 +1060,7 @@ class CutlassFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
-            use_int8_woq_per_channel=self.has_int8_woq_per_channel,
+            use_woq_per_channel=self.has_woq_per_channel,
             # use_mxfp8_act_scaling drives dynamic MXFP8 activation quantization
             # before the GEMM; required for both W4A8 MXFP4xMXFP8 and W8A8
             # MXFP8xMXFP8 paths.
@@ -1116,7 +1156,7 @@ class CutlassFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             use_deepseek_fp8_block_scale=False,
             use_w4_group_scaling=False,
-            use_int8_woq_per_channel=False,
+            use_woq_per_channel=False,
             use_mxfp8_act_scaling=False,
             min_latency_mode=False,
             use_fused_finalize=self.use_fused_finalize,

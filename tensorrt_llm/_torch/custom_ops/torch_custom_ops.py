@@ -101,7 +101,7 @@ class MoERunner(TunableRunner):
         cluster_rank: int,
         use_deepseek_fp8_block_scale: bool,
         use_w4_group_scaling: bool,
-        use_int8_woq_per_channel: bool,
+        use_woq_per_channel: bool,
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
         use_fused_finalize: bool,
@@ -123,7 +123,7 @@ class MoERunner(TunableRunner):
         self.enable_alltoall = False
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4_group_scaling = use_w4_group_scaling
-        self.use_int8_woq_per_channel = use_int8_woq_per_channel
+        self.use_woq_per_channel = use_woq_per_channel
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.use_mxfp8_weight_scaling = use_mxfp8_weight_scaling
         self.min_latency_mode = min_latency_mode
@@ -133,7 +133,7 @@ class MoERunner(TunableRunner):
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                        use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                        use_woq_per_channel, use_mxfp8_act_scaling,
                         use_mxfp8_weight_scaling)
 
         if instance_key not in MoERunner.runner_dict:
@@ -141,7 +141,7 @@ class MoERunner(TunableRunner):
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                    use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                    use_woq_per_channel, use_mxfp8_act_scaling,
                     use_mxfp8_weight_scaling, use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
@@ -161,7 +161,7 @@ class MoERunner(TunableRunner):
             self.enable_alltoall,
             self.use_deepseek_fp8_block_scale,
             self.use_w4_group_scaling,
-            self.use_int8_woq_per_channel,
+            self.use_woq_per_channel,
             self.use_mxfp8_act_scaling,
             self.min_latency_mode,
             self.use_fused_finalize,
@@ -226,7 +226,7 @@ def fused_moe(
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
+    use_woq_per_channel: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
@@ -288,7 +288,7 @@ def fused_moe(
         cluster_rank=cluster_rank,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4_group_scaling=use_w4_group_scaling,
-        use_int8_woq_per_channel=use_int8_woq_per_channel,
+        use_woq_per_channel=use_woq_per_channel,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         use_fused_finalize=use_fused_finalize,
@@ -403,7 +403,7 @@ def _(input: torch.Tensor,
       enable_alltoall: bool = False,
       use_deepseek_fp8_block_scale: bool = False,
       use_w4_group_scaling: bool = False,
-      use_int8_woq_per_channel: bool = False,
+      use_woq_per_channel: bool = False,
       use_mxfp8_act_scaling: bool = False,
       min_latency_mode: bool = False,
       use_fused_finalize: bool = True,
@@ -432,10 +432,18 @@ def _(input: torch.Tensor,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       token_to_slot: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
-    if use_int8_woq_per_channel:
-        # Note: The weight shape for INT8 weight only quantization is different, i.e.,
-        # fc2_expert_weights: [num_experts, inter_size, hidden_size]
-        hidden_size = fc2_expert_weights.shape[2]
+    if use_woq_per_channel:
+        # Note: The weight shape for per-channel weight-only quantization is
+        # dim-swapped, i.e. fc2_expert_weights: [num_experts, inter_size, hidden_size].
+        #
+        # Sub-byte weights are packed along that trailing hidden dim, so the stored
+        # extent is hidden_size / elements_per_byte and must be scaled back up to
+        # recover the logical hidden size. This mirrors the real op, which applies
+        # mInnerDimMultiplier at moeOp.cpp:379; without it the fake kernel reports
+        # half the hidden size for INT4 and shape inference silently disagrees with
+        # the kernel under torch.compile.
+        inner_dim_multiplier = 2 if fc2_expert_weights.dtype == torch.quint4x2 else 1
+        hidden_size = fc2_expert_weights.shape[2] * inner_dim_multiplier
     else:
         hidden_size = fc2_expert_weights.shape[1]
 

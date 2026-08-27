@@ -731,7 +731,7 @@ def should_skip_cutlass(
             "intermediate_size)"
         )
 
-    # TP per-shard alignment: W8A16, NVFP4, W4A8_AWQ, and MXFP8 require
+    # TP per-shard alignment: W8A16, W4A16, NVFP4, W4A8_AWQ, and MXFP8 require
     # 128-aligned per-shard intermediate_size. W8A16 fails in
     # preprocess_weights_for_mixed_gemm (num_rows % rows_per_tile != 0). NVFP4
     # pads to 128-alignment (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but
@@ -743,9 +743,20 @@ def should_skip_cutlass(
     # int32 UE8M0 SF packing, so a non-128-aligned per-shard intermediate
     # raises AssertionError.
     # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
+    #
+    # W4A16 (W4A16WoqPerChannelFusedMoEMethod) shares W8A16's constraint exactly,
+    # and it is no worse: rows_per_tile = 128*8//BITS_PER_ELT_A is
+    # activation-driven, so it is 64 for both INT4 and INT8 weights
+    # (tensorrt_llm/quantization/functional.py:1020). INT4's other row
+    # constraints are weaker divisors of 64 -- B_ROWS_PER_MMA = 32 (:985) and
+    # elts_in_int32 = 8 (:1021) -- so 64 binds in both cases. The listed quants
+    # use the stricter 128 here rather than 64 because these multi-GPU configs
+    # also feed NVFP4-style paths; W4A16 is grouped with W8A16 for the same
+    # reason it shares the loader shape.
     if moe_tp_size > 1 and model_config is not None:
         tp_alignment_quants = {
             QuantAlgo.W8A16,
+            QuantAlgo.W4A16,
             QuantAlgo.NVFP4,
             QuantAlgo.W4A8_AWQ,
             QuantAlgo.MXFP8,

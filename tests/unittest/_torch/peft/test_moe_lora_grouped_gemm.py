@@ -361,7 +361,7 @@ def test_reserve_prevents_growth_across_captures():
         cluster_rank=0,
         use_deepseek_fp8_block_scale=False,
         use_w4_group_scaling=False,
-        use_int8_woq_per_channel=False,
+        use_woq_per_channel=False,
         use_mxfp8_act_scaling=False,
         min_latency_mode=False,
         use_fused_finalize=True,
