@@ -195,9 +195,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     # One-model speculative draft layers share this manager (unified KV
     # cache): reuse, eviction, and disaggregated transfer then cover the
-    # drafter's KV natively. The drafter's buffers get their own uniform V2
-    # pool (their per-block size differs from every M3 buffer), and its
-    # attention addresses that pool through ``get_draft_subpage_view``.
+    # drafter's KV natively. Its attention addresses the physical P32 buffer
+    # expansion through ``get_draft_subpage_view``.
     supports_shared_draft_layers = True
 
     # WAR: the Eagle draft kernels break at tokens_per_block=128 (the MSA
@@ -213,6 +212,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     #      and this attribute; the drafter then attends the shared manager
     #      directly (validated at acceptance parity, PR #17457).
     draft_manager_tokens_per_block = 32
+    # The separately allocated Eagle layer cannot inherit an NVFP4 target
+    # cache: the shipped TRTLLM-Gen set has no matching M3 P32 NVFP4 decode
+    # cubin.  Keep the draft on its established FP8/P32 representation while
+    # sparse target layers use NVFP4/P128.
+    draft_manager_kv_cache_dtype = "fp8"
+    nvfp4_dense_tokens_per_block = 32
     _main_kv_layout = "NHD"
 
     def __init__(
@@ -224,6 +229,25 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_one_model_draft_layers: int = 0,
         **kwargs,
     ):
+        # Linear Eagle3 verification is a causal multi-token append and is
+        # compatible with the NVFP4 data+scale pools below. Dynamic-tree
+        # acceptance is different: its relocation op currently copies only
+        # the packed K/V bytes, not the per-16-element NVFP4 scale bytes. A
+        # relocated token would therefore pair new data with stale scales and
+        # silently corrupt attention. Reject that configuration until the
+        # relocation op accepts and moves the scale pools as well.
+        spec_config = kwargs.get("spec_config")
+        if (
+            kwargs.get("dtype") == DataType.NVFP4
+            and spec_config is not None
+            and getattr(spec_config, "use_dynamic_tree", False)
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 NVFP4 KV cache supports linear Eagle3, but not "
+                "dynamic-tree Eagle: accepted-token relocation does not yet "
+                "move NVFP4 K/V block scales."
+            )
+
         # Resolve M3 sparse-layer metadata from explicit kwargs first,
         # then from ``sparse_attn_config``, then from the M3 checkpoint
         # convention (layers 0..2 dense, 3..N-1 sparse,
@@ -275,6 +299,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         super().__init__(*args, **kwargs)
 
+        if self.dtype == DataType.NVFP4:
+            dense_target_layers = [
+                layer
+                for layer in self.layer_offsets
+                if layer not in self.sparse_layer_ids and layer not in self._shared_draft_layer_ids
+            ]
+            logger.info(
+                "[m3-kv] hybrid cache active: "
+                f"{len(self.sparse_layer_ids)} sparse target layer(s)=NVFP4/P128, "
+                f"{len(dense_target_layers)} dense target layer(s)=FP8/P128, "
+                f"{len(self._shared_draft_layer_ids)} shared Eagle layer(s)=FP8/P32"
+            )
+
         self._draft_subpage_view_obj: Optional["MiniMaxM3DraftSubpageView"] = None
         if self._shared_draft_layer_ids and self.sparse_layer_ids and not self.is_draft:
             # Paired with the "view active" log at first dispatch.
@@ -309,6 +346,160 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+
+    def _build_cache_config(self, config):
+        """Use NVFP4 only on MSA sparse layers and FP8 on dense/Eagle layers.
+
+        M3's 57 sparse target layers have a native MSA NVFP4 consumer.  The
+        three dense target layers and the appended one-model Eagle layer do
+        not have a matching TRTLLM-Gen NVFP4 cubin, so those buffers retain
+        the proven FP8 representation.  Target dense layers retain their
+        established P128 layout; only the shared Eagle layer uses physical
+        P32 pages because its SM100/SM103 kernels require that geometry.
+        """
+        if self.dtype != DataType.NVFP4:
+            return super()._build_cache_config(config)
+
+        physical_page = self.nvfp4_dense_tokens_per_block
+        assert config.tokens_per_block % physical_page == 0, (
+            f"M3 logical page P{config.tokens_per_block} must be divisible by "
+            f"the dense/Eagle physical page P{physical_page}."
+        )
+        scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        for layer in config.layers:
+            local_layer_idx = int(layer.layer_id)
+            global_layer_idx = int(self.pp_layers[local_layer_idx])
+            if global_layer_idx in self.sparse_layer_ids:
+                continue
+            layer.buffers[:] = [
+                buffer for buffer in layer.buffers if buffer.role not in scale_roles
+            ]
+            for buffer in layer.buffers:
+                if buffer.role not in (Role.KEY, Role.VALUE):
+                    continue
+                if global_layer_idx in self._shared_draft_layer_ids:
+                    buffer.size = (
+                        self.get_layer_bytes_per_token(local_layer_idx, buffer.role) * physical_page
+                    )
+                    buffer.tokens_per_block_override = physical_page
+        return super()._build_cache_config(config)
+
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
+        """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
+        if self.dtype != DataType.NVFP4:
+            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
+        if global_layer_idx in self.sparse_layer_ids:
+            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+
+        if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+            return 0
+        if data_role == Role.ALL:
+            kv_factor = self.kv_factor
+        elif data_role in (Role.KEY, Role.VALUE):
+            kv_factor = 1
+        else:
+            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        return (
+            kv_factor
+            * self.num_kv_heads_per_layer[int(local_layer_idx)]
+            * self.head_dim_per_layer[int(local_layer_idx)]
+        )
+
+    def is_nvfp4_layer(self, layer_idx: int) -> bool:
+        """Whether ``layer_idx`` stores packed NVFP4 data and block scales."""
+        return self.dtype == DataType.NVFP4 and int(layer_idx) in self.sparse_layer_ids
+
+    def is_fp8_dense_layer(self, layer_idx: int) -> bool:
+        """Whether a dense target/Eagle layer is the FP8 half of hybrid KV."""
+        return self.dtype == DataType.NVFP4 and int(layer_idx) not in self.sparse_layer_ids
+
+    def is_fp8_subpaged_layer(self, layer_idx: int) -> bool:
+        """Whether the shared Eagle layer uses physical P32 FP8 pages."""
+        return self.is_fp8_dense_layer(layer_idx) and int(layer_idx) in self._shared_draft_layer_ids
+
+    @property
+    def uses_hybrid_nvfp4_kv_cache(self) -> bool:
+        return self.dtype == DataType.NVFP4
+
+    def _build_pool_mapping_tensors(self):
+        """Publish scale pointers only for physical pools that own them.
+
+        The base NVFP4 implementation assumes every layer has a scale buffer.
+        Hybrid M3 deliberately omits scales from dense/Eagle layers, while the
+        target metadata still needs the nested NVFP4 pointer envelope for the
+        sparse pools.  Dense consumers use the direct P32 views below and the
+        shared Eagle view publishes itself as an ordinary FP8 manager.
+        """
+        if self.dtype != DataType.NVFP4:
+            return super()._build_pool_mapping_tensors()
+
+        pointer_rows = []
+        mapping_rows = []
+        if self.enable_swa_scratch_reuse:
+            for local_layer_idx in range(self.num_local_layers):
+                global_layer_idx = int(self.pp_layers[local_layer_idx])
+                data_addr = self.impl.get_mem_pool_base_address(
+                    local_layer_idx, Role.KEY, PageIndexMode.PER_LAYER
+                )
+                scale_addr = (
+                    self.impl.get_mem_pool_base_address(
+                        local_layer_idx, Role.KEY_BLOCK_SCALE, PageIndexMode.PER_LAYER
+                    )
+                    if self.is_nvfp4_layer(global_layer_idx)
+                    else 0
+                )
+                pointer_rows.append([[data_addr, scale_addr], [0, 0]])
+                mapping_rows.append([local_layer_idx, 0])
+        else:
+            for pool_id in range(self.num_pools):
+                local_layer_idx = int(self.impl.layer_grouping[pool_id][0])
+                group_layers = [int(layer) for layer in self.impl.layer_grouping[pool_id]]
+                group_is_uniform_nvfp4 = all(
+                    self.is_nvfp4_layer(int(self.pp_layers[layer])) for layer in group_layers
+                )
+                data_addr = self.impl.get_mem_pool_base_address(
+                    local_layer_idx, Role.KEY, PageIndexMode.SHARED
+                )
+                scale_addr = (
+                    self.impl.get_mem_pool_base_address(
+                        local_layer_idx, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                    )
+                    if group_is_uniform_nvfp4
+                    else 0
+                )
+                pointer_rows.append([[data_addr, scale_addr], [0, 0]])
+
+            for local_layer_idx in range(self.num_local_layers):
+                pool_id = int(self.impl.get_layer_group_id(local_layer_idx))
+                data_base = pointer_rows[pool_id][0][0]
+                offset = self._kv_pool_mapping_offset(local_layer_idx, pool_id, data_base)
+                if (
+                    self.is_nvfp4_layer(int(self.pp_layers[local_layer_idx]))
+                    and pointer_rows[pool_id][0][1] != 0
+                ):
+                    scale_base = pointer_rows[pool_id][0][1]
+                    scale_addr = self.impl.get_mem_pool_base_address(
+                        local_layer_idx, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                    )
+                    scale_layers = sorted(
+                        self.impl.layer_grouping[pool_id],
+                        key=lambda lid: self.impl.get_mem_pool_base_address(
+                            lid, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                        ),
+                    )
+                    scale_offset = scale_layers.index(local_layer_idx)
+                    assert scale_addr >= scale_base and scale_offset == offset, (
+                        "M3 hybrid NVFP4 data/scale layer ordering differs: "
+                        f"layer={local_layer_idx} data_offset={offset} "
+                        f"scale_offset={scale_offset}."
+                    )
+                mapping_rows.append([pool_id, offset])
+
+        return (
+            torch.tensor(pointer_rows, dtype=torch.int64, pin_memory=prefer_pinned()),
+            torch.tensor(mapping_rows, dtype=torch.int32, pin_memory=prefer_pinned()),
+        )
 
     def get_draft_subpage_view(self) -> Optional["MiniMaxM3DraftSubpageView"]:
         """Sub-page view over the shared drafter pool, or None.
@@ -448,6 +639,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kv_layout = self._main_kv_layout
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+        if self.is_fp8_subpaged_layer(layer_idx):
+            raise RuntimeError(
+                f"hybrid FP8 layer {layer_idx} uses four physical P32 pages; "
+                "use get_fp8_dense_buffers/get_dense_kv_subpage_pool instead"
+            )
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
             raise NotImplementedError(
                 "MiniMaxM3KVCacheManagerV2 does not support the SELFKONLY cache type"
@@ -460,10 +656,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         page_stride_value = self.impl.get_page_stride(layer_offset, Role.VALUE)
         # V2 always lays V immediately after K within the per-layer
         # contribution to a slot. The slice ``[:, :2]`` depends on this.
-        assert addr_key + page_stride_value == addr_value, (
+        assert addr_key + page_stride_key == addr_value, (
             f"MiniMaxM3 requires addr_K + page_stride "
             f"== addr_V (V immediately after K in slot); got "
-            f"addr_K={addr_key} page_stride_V={page_stride_value} "
+            f"addr_K={addr_key} page_stride_K={page_stride_key} "
             f"addr_V={addr_value} for layer {layer_idx}."
         )
         assert page_stride_key == page_stride_value, (
@@ -486,10 +682,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         element_per_container = 1
         dtype = self.dtype
-        if dtype == DataType.NVFP4:
+        if self.is_nvfp4_layer(layer_idx):
             element_per_container = 2
             torch_dtype = torch.int8
         else:
+            dtype = DataType.FP8 if self.is_fp8_dense_layer(layer_idx) else dtype
             torch_dtype = binding_to_torch_dtype(dtype)
 
         layer_head_dim = self.head_dim_per_layer[layer_offset]
@@ -522,12 +719,177 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
         When omitted, ``kv_layout`` follows the selected sparse backend.
         """
+        if self.is_fp8_subpaged_layer(layer_idx):
+            if kv_layout not in (None, "HND"):
+                raise ValueError(
+                    "hybrid FP8 dense/Eagle buffers have a physical P32 HND layout; "
+                    f"requested {kv_layout}"
+                )
+            k, _v, slot_stride, pages_per_role = self._fp8_dense_data_buffers(layer_idx)
+            num_slots, _pages, num_heads, page_size, head_dim = k.shape
+            full = convert_to_torch_tensor(
+                TensorWrapper(
+                    k.data_ptr(),
+                    k.dtype,
+                    [num_slots, slot_stride, num_heads, page_size, head_dim],
+                )
+            )
+            return full[:, : 2 * pages_per_role].unflatten(1, (2, pages_per_role))
+
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
         )
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
+
+    def _kv_scale_slot_geometry(
+        self, layer_idx: int, kv_layout: Optional[str]
+    ) -> Tuple[int, torch.dtype, int, int, List[int]]:
+        """Resolve one layer's NVFP4 K/V scale pages in their coalesced pool.
+
+        The scale pool mirrors the packed-data pool's K-then-V ordering, but
+        its page unit is one E4M3 byte per 16 logical cache elements.  Keeping
+        this geometry separate from :meth:`_kv_slot_geometry` is important:
+        the two pools have different byte strides even when their page-index
+        converters have the same scale.
+        """
+        if not self.is_nvfp4_layer(layer_idx):
+            raise RuntimeError("NVFP4 block-scale buffers require an NVFP4 KV cache")
+        if kv_layout is None:
+            kv_layout = self._main_kv_layout
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+        if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
+            raise NotImplementedError(
+                "MiniMaxM3KVCacheManagerV2 does not support the SELFKONLY cache type"
+            )
+
+        layer_offset = self.layer_offsets[layer_idx]
+        k_role = Role.KEY_BLOCK_SCALE
+        v_role = Role.VALUE_BLOCK_SCALE
+        addr_key = self.impl.get_mem_pool_base_address(layer_offset, k_role)
+        addr_value = self.impl.get_mem_pool_base_address(layer_offset, v_role)
+        page_stride_key = self.impl.get_page_stride(layer_offset, k_role)
+        page_stride_value = self.impl.get_page_stride(layer_offset, v_role)
+        assert addr_key + page_stride_key == addr_value, (
+            "MiniMaxM3 NVFP4 scale pool requires K scale immediately followed "
+            f"by V scale; got K={addr_key} stride={page_stride_key} V={addr_value}."
+        )
+        assert page_stride_key == page_stride_value, (
+            "MiniMaxM3 NVFP4 K/V scale page strides differ: "
+            f"K={page_stride_key} V={page_stride_value}."
+        )
+
+        converter = self.impl.get_page_index_converter(layer_offset, k_role)
+        scale = int(converter.scale)
+        layer_offset_pages = int(converter.layer_offset)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, k_role)
+        num_slots_total = page_upper + layer_offset_pages
+        assert num_slots_total % scale == 0, (
+            "NVFP4 scale storage inconsistency: page_upper + layer_offset = "
+            f"{num_slots_total} is not divisible by scale={scale}."
+        )
+        num_slots = num_slots_total // scale
+
+        head_dim = self.head_dim_per_layer[layer_offset]
+        assert head_dim % 16 == 0, f"NVFP4 head_dim must be divisible by 16, got {head_dim}"
+        num_kv_heads = self.num_kv_heads_per_layer[layer_offset]
+        scale_cols = head_dim // 16
+        if kv_layout == "NHD":
+            page_shape = [self.tokens_per_block, num_kv_heads, scale_cols]
+        else:
+            page_shape = [num_kv_heads, self.tokens_per_block, scale_cols]
+        return addr_key, torch.uint8, num_slots, scale, page_shape
+
+    def get_block_scale_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> torch.Tensor:
+        """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``."""
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
+            layer_idx, kv_layout
+        )
+        full_slot_shape = [num_slots, scale, *page_shape]
+        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
+        return full_view[:, :2]
+
+    def _fp8_dense_data_buffers(
+        self, layer_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Return hybrid FP8 K/V views backed by physical P32 pages.
+
+        Each logical P128 role page is laid out as four consecutive P32 HND
+        pages.  ``slot_stride`` is measured in those physical pages and already
+        includes the V2 converter's expansion factor.
+        """
+        if not self.is_fp8_subpaged_layer(layer_idx):
+            raise RuntimeError(f"layer {layer_idx} is not a physical-P32 hybrid FP8 layer")
+        local_layer_idx = self.layer_offsets[layer_idx]
+        physical_page = self.nvfp4_dense_tokens_per_block
+        pages_per_role = self.tokens_per_block // physical_page
+        addr_key = self.impl.get_mem_pool_base_address(local_layer_idx, Role.KEY)
+        addr_value = self.impl.get_mem_pool_base_address(local_layer_idx, Role.VALUE)
+        page_stride_key = self.impl.get_page_stride(local_layer_idx, Role.KEY)
+        page_stride_value = self.impl.get_page_stride(local_layer_idx, Role.VALUE)
+        assert page_stride_key == page_stride_value
+        assert addr_key + pages_per_role * page_stride_key == addr_value, (
+            "M3 hybrid FP8 storage requires V immediately after K's physical "
+            f"P{physical_page} pages; layer={layer_idx} K={addr_key} "
+            f"stride={page_stride_key} V={addr_value}."
+        )
+
+        converter = self.impl.get_page_index_converter(local_layer_idx, Role.KEY)
+        assert int(converter.expansion) == pages_per_role, (
+            f"layer {layer_idx} expected V2 expansion {pages_per_role}, got "
+            f"{int(converter.expansion)}"
+        )
+        slot_stride = int(converter.scale) * pages_per_role
+        layer_offset_pages = int(converter.layer_offset) * pages_per_role
+        page_upper = self.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY)
+        total_pages = int(page_upper) + layer_offset_pages
+        assert total_pages % slot_stride == 0
+        num_slots = total_pages // slot_stride
+
+        num_heads = self.num_kv_heads_per_layer[local_layer_idx]
+        head_dim = self.head_dim_per_layer[local_layer_idx]
+        full = convert_to_torch_tensor(
+            TensorWrapper(
+                addr_key,
+                torch.float8_e4m3fn,
+                [num_slots, slot_stride, num_heads, physical_page, head_dim],
+            )
+        )
+        return (
+            full[:, :pages_per_role],
+            full[:, pages_per_role : 2 * pages_per_role],
+            slot_stride,
+            pages_per_role,
+        )
+
+    def get_fp8_dense_buffers(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return physical-P32 hybrid FP8 views as ``K, V``."""
+        k, v, _slot_stride, _pages_per_role = self._fp8_dense_data_buffers(layer_idx)
+        return k, v
+
+    def get_dense_kv_subpage_pool(self, layer_idx: int) -> Tuple[torch.Tensor, int, int]:
+        """Flat dense-attention pool, slot stride, and pages per K/V role."""
+        if not self.is_fp8_subpaged_layer(layer_idx):
+            pool, slot_stride = self.get_kv_subpage_pool(layer_idx, "HND")
+            return pool, slot_stride, 1
+        k, _v, slot_stride, pages_per_role = self._fp8_dense_data_buffers(layer_idx)
+        num_slots, _pages, num_heads, page_size, head_dim = k.shape
+        num_pages = (num_slots - 1) * slot_stride + 2 * pages_per_role
+        addr = k.data_ptr()
+        pool = convert_to_torch_tensor(
+            TensorWrapper(addr, k.dtype, [num_pages, num_heads, page_size, head_dim])
+        )
+        return pool, slot_stride, pages_per_role
+
+    def get_dense_kv_scale_subpage_pool(self, layer_idx: int) -> Tuple[torch.Tensor, int, int]:
+        """Dense/Eagle layers are FP8 in the hybrid cache and have no scales."""
+        raise RuntimeError(
+            f"hybrid FP8 dense/Eagle layer {layer_idx} has no NVFP4 block-scale pool"
+        )
 
     def get_kv_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
@@ -546,8 +908,38 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         spanning ``num_slots * scale``, which would run off the pool by
         whatever this layer's K offset is inside a slot.
         """
+        if self.is_fp8_subpaged_layer(layer_idx):
+            if kv_layout != "HND":
+                raise ValueError("hybrid FP8 dense/Eagle sub-pages are HND only")
+            pool, slot_stride, _pages_per_role = self.get_dense_kv_subpage_pool(layer_idx)
+            return pool, slot_stride
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
+        )
+        num_subpages = (num_slots - 1) * scale + 2
+        flat = convert_to_torch_tensor(
+            TensorWrapper(addr_key, torch_dtype, [num_subpages, *page_shape])
+        )
+        return flat, scale
+
+    def get_kv_scale_subpage_pool(
+        self, layer_idx: int, kv_layout: str = "HND"
+    ) -> Tuple[torch.Tensor, int]:
+        """Return the flat NVFP4 scale pool paired with ``get_kv_subpage_pool``.
+
+        The returned factor must match the packed-data factor so one K/V block
+        table addresses both pools. Token-size subdivision, when needed by the
+        Eagle draft view, is expressed by that view's expanded block table.
+        """
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
+            layer_idx, kv_layout
+        )
+        _data_addr, _data_dtype, data_slots, data_scale, _data_shape = self._kv_slot_geometry(
+            layer_idx, kv_layout
+        )
+        assert (num_slots, scale) == (data_slots, data_scale), (
+            "MiniMaxM3 NVFP4 data and scale pools require identical page-index "
+            f"geometry; data={(data_slots, data_scale)} scale={(num_slots, scale)}."
         )
         num_subpages = (num_slots - 1) * scale + 2
         flat = convert_to_torch_tensor(
@@ -680,27 +1072,38 @@ class MiniMaxM3DraftSubpageView:
     def __init__(self, manager, draft_layer_ids: Sequence[int], subpage_tokens: int):
         self._manager = manager
         self.tokens_per_block = int(subpage_tokens)
+        layer_id = draft_layer_ids[0]
+        is_hybrid_fp8 = bool(
+            getattr(manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_id)
+        )
+        if is_hybrid_fp8:
+            assert self.tokens_per_block == manager.nvfp4_dense_tokens_per_block, (
+                "hybrid FP8 Eagle draft attention must use the physical dense-cache "
+                f"page size P{manager.nvfp4_dense_tokens_per_block}, got "
+                f"P{self.tokens_per_block}"
+            )
         assert manager.tokens_per_block % self.tokens_per_block == 0, (
             f"subpage size {subpage_tokens} must divide manager "
             f"tokens_per_block {manager.tokens_per_block}"
         )
         self._subdiv = manager.tokens_per_block // self.tokens_per_block
-        # Everything below rests on M3's single mega-slot pool holding every
-        # layer: raw slot ids come from pool 0 and the pool pointer is rooted
-        # at the draft layer's K address within the slot.
-        layer_id = draft_layer_ids[0]
-        assert manager.num_pools == 1, (
-            f"draft sub-page view requires M3's single mega-slot pool, "
-            f"got num_pools={manager.num_pools}"
-        )
+        # The hybrid layout puts dense/Eagle FP8 pages in a separate physical
+        # pool from sparse NVFP4 data/scales.  Root this single-pool view at the
+        # draft layer's K address, while sourcing raw logical slot IDs from the
+        # draft layer's actual V2 pool.
         local = manager.layer_offsets[layer_id]
-        assert int(manager.kv_cache_pool_mapping[int(local), 0]) == 0, (
-            f"draft layer {layer_id} is not in pool 0: "
-            f"{manager.kv_cache_pool_mapping[int(local)].tolist()}"
-        )
-        addr_key, _dt, num_slots, scale, _shape = manager._kv_slot_geometry(layer_id, None)
-        self._num_slots = num_slots
-        self._slot_units = scale * self._subdiv  # slot stride in 32-tok units
+        self._source_pool_id = int(manager.kv_cache_pool_mapping[int(local), 0])
+        if is_hybrid_fp8:
+            k, _v, slot_stride, pages_per_role = manager._fp8_dense_data_buffers(layer_id)
+            assert pages_per_role == self._subdiv
+            addr_key = k.data_ptr()
+            self._num_slots = int(k.shape[0])
+            self._slot_units = slot_stride
+            self.dtype = DataType.FP8
+        else:
+            addr_key, _dt, num_slots, scale, _shape = manager._kv_slot_geometry(layer_id, None)
+            self._num_slots = int(num_slots)
+            self._slot_units = scale * self._subdiv
         self.num_pools = 1
         self.num_attention_op_pools = 1
         self.max_blocks_per_seq = manager.max_blocks_per_seq * self._subdiv
@@ -716,7 +1119,7 @@ class MiniMaxM3DraftSubpageView:
         # Placeholder host mirror: the dense TRTLLM path plans from device
         # offsets; nothing reads the host table during the draft window.
         self.host_kv_cache_block_offsets = torch.zeros(
-            (manager.num_pools, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
+            (1, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
         )
         self._slots_host: Optional[np.ndarray] = None
         self._arange: Optional[torch.Tensor] = None
@@ -743,7 +1146,7 @@ class MiniMaxM3DraftSubpageView:
 
     @property
     def host_kv_cache_pool_pointers(self):
-        return self._manager.kv_cache_pool_pointers
+        return self.kv_cache_pool_pointers
 
     def free_resources(self, request) -> None:
         """No-op: block lifecycle belongs to the shared manager."""
@@ -807,8 +1210,10 @@ class MiniMaxM3DraftSubpageView:
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
-        # Raw mega-pool slot ids per request (M3's bypass semantics).
-        slot_rows = self._manager._get_batch_cache_indices_by_pool_id(request_ids, pool_id=0)
+        # Raw logical slot ids from the draft layer's physical pool.
+        slot_rows = self._manager._get_batch_cache_indices_by_pool_id(
+            request_ids, pool_id=self._source_pool_id
+        )
         host = self._host_block_table(
             slot_rows, num_seqs, dst_tensor.shape[-1] // self._subdiv, dst_tensor.dtype
         )
