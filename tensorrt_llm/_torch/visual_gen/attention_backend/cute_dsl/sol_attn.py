@@ -15,10 +15,12 @@
 """
 Sol-Attn backend for visual generation models.
 
-Sol-Attn (arXiv:2607.24027) is dynamic block routing + sparse computation +
-approximation correction folded into one online-softmax pass. The kernel
-itself is vendored wholesale from its reference implementation
-(github.com/NVlabs/Sana, branch sol-engine, commit 5fe5feb -- see
+Sol-Attn (https://arxiv.org/abs/2607.24027) is dynamic block routing +
+sparse computation + approximation correction folded into one online-softmax
+pass. The kernel itself is vendored wholesale from its reference
+implementation (https://github.com/NVlabs/Sana, branch
+https://github.com/NVlabs/Sana/tree/sol-engine, pinned at commit
+https://github.com/NVlabs/Sana/commit/5fe5feb -- see
 ``cute_dsl_kernels/blackwell/sol_attn/THIRD_PARTY_NOTICES.md`` for the pin
 and its currency-check note) under ``..cute_dsl_kernels.blackwell.sol_attn``
 / ``sol_attn_backend.py`` -- this file is only the TRT-LLM AttentionBackend
