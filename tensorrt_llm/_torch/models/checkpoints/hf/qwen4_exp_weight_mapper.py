@@ -49,12 +49,14 @@ What differs from the stock HF loader (why a bespoke mapper is required):
   loaded through ``MoEWeightLoadingMode.FUSED_GATE_UP_PROJ``. The shared expert
   (``gate_proj``/``up_proj`` -> fused ``gate_up_proj``) and router ``gate`` use
   the stock fusion / direct-copy paths.
-* **PLE n-gram embedding (C4)** — the ~100 GB n-gram table is stored as
+* **PLE n-gram embedding (C4)** — the n-gram table is stored as
   ``split_ngram_parts`` (128) equal prime-tiled shards
   ``ple_embedding.ngram_embedding.shard_{i}.weight``; each rank streams only
   its overlapping row range into the local ``ngram_embedding`` shard (no 100 GB
-  concat or replicated table),
-  and the three recurrent-hash metadata buffers (``layer_multipliers`` /
+  concat or replicated table). FP8 checkpoints additionally store the scalar
+  ``ngram_embedding.weight_scale``; the table stays FP8 in device memory and
+  only selected rows are dequantized after lookup. The three recurrent-hash
+  metadata buffers (``layer_multipliers`` /
   ``ngram_heads_offsets`` / ``ngram_heads_vocab_sizes``) are copied into the
   module's registered buffers.
 * **QSA full attention (C3)** — ``q_proj`` (output-gated, 2x q heads) / ``k_proj``
@@ -407,13 +409,29 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             # N-gram table shards: copy only the overlap with this rank's row
             # partition. This works for replicated, TP, and attention-DP tables
             # without materialising a global concatenation.
-            table = module.ngram_embedding.weight
             vocab_start = int(getattr(module, "vocab_start_index", 0))
             vocab_end = int(getattr(module, "vocab_end_index", module.padded_vocab_size))
             shard_leaves = sorted(
                 (leaf for leaf in leaves if leaf.startswith("ngram_embedding.shard_")),
                 key=lambda s: int(s.split(".shard_")[1].split(".")[0]),
             )
+            weight_scale = leaves.get("ngram_embedding.weight_scale")
+            if weight_scale is not None:
+                if not shard_leaves:
+                    raise ValueError(
+                        f"PLE n-gram weight scale for {ple_prefix} has no table shards"
+                    )
+                shard_dtypes = {leaves[leaf].dtype for leaf in shard_leaves}
+                if len(shard_dtypes) != 1:
+                    raise ValueError(
+                        f"PLE n-gram shards for {ple_prefix} have mixed dtypes: "
+                        f"{sorted(map(str, shard_dtypes))}"
+                    )
+                module.configure_fp8_weight_storage(
+                    weight_scale,
+                    next(iter(shard_dtypes)),
+                )
+            table = module.ngram_embedding.weight
             row = 0
             copied_rows = 0
             for leaf in shard_leaves:
@@ -426,9 +444,9 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     source_start = overlap_start - row
                     target_start = overlap_start - vocab_start
                     overlap_rows = overlap_end - overlap_start
-                    table.data[target_start : target_start + overlap_rows].copy_(
-                        shard[source_start : source_start + overlap_rows].to(table.dtype)
-                    )
+                    source = shard[source_start : source_start + overlap_rows]
+                    target = table.data[target_start : target_start + overlap_rows]
+                    target.copy_(source.to(table.dtype))
                     copied_rows += overlap_rows
                 row += rows
             if shard_leaves and row != module.padded_vocab_size:
