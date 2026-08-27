@@ -72,7 +72,7 @@ class TestLocalityDomainSupport:
         result = is_locality_domain_supported()
         assert isinstance(result, bool)
 
-    def test_is_locality_domain_enabled_requires_supported_arch(self):
+    def test_is_locality_domain_enabled_requires_rubin(self):
         is_locality_domain_enabled.cache_clear()
         with (
             patch("torch.cuda.is_available", return_value=True),
@@ -85,7 +85,7 @@ class TestLocalityDomainSupport:
             assert not is_locality_domain_enabled()
         is_locality_domain_enabled.cache_clear()
 
-    def test_is_locality_domain_enabled_allows_supported_arch(self):
+    def test_is_locality_domain_enabled_allows_rubin_when_supported(self):
         is_locality_domain_enabled.cache_clear()
         with (
             patch("torch.cuda.is_available", return_value=True),

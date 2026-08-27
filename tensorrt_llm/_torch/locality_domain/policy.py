@@ -121,7 +121,7 @@ class LocalityDomainExecutionPlanner:
         """
         from tensorrt_llm._torch.cute_dsl_utils import (
             IS_CUTLASS_DSL_AVAILABLE,
-            IS_CUTLASS_DSL_EXTENDED_AVAILABLE,
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE,
         )
         from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
         from tensorrt_llm._torch.modules.linear import WeightMode
@@ -178,12 +178,12 @@ class LocalityDomainExecutionPlanner:
                 reason_if_disabled=f"{op_kind} not in allowed_ops",
             )
 
-        # locality domain requires the extended CuTeDSL kernel set.
+        # locality domain uses the Rubin CuTeDSL kernels.
         if not IS_CUTLASS_DSL_AVAILABLE:
             return LinearPartitionPlan(enabled=False, reason_if_disabled="CuteDSL not available")
-        if not IS_CUTLASS_DSL_EXTENDED_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return LinearPartitionPlan(
-                enabled=False, reason_if_disabled="extended CuTeDSL kernels not available"
+                enabled=False, reason_if_disabled="CuTeDSL Rubin kernels not available"
             )
 
         supported_weight_modes = (
@@ -260,7 +260,7 @@ class LocalityDomainExecutionPlanner:
         MoE locality domain replicates weights on each partition (not partitioned like Linear).
         Each partition runs the full GroupGemm with inplace output into shared buffers.
         """
-        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_EXTENDED_AVAILABLE
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
         from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 
         if not self.policy.enabled:
@@ -313,9 +313,9 @@ class LocalityDomainExecutionPlanner:
                 enabled=False, reason_if_disabled="locality domain MoE requires fused finalize"
             )
 
-        if not IS_CUTLASS_DSL_EXTENDED_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return PartitionPlan(
-                enabled=False, reason_if_disabled="extended CuTeDSL kernels not available"
+                enabled=False, reason_if_disabled="CuTeDSL Rubin kernels not available"
             )
 
         return PartitionPlan(
@@ -331,10 +331,10 @@ class LocalityDomainExecutionPlanner:
         dtype: torch.dtype,
         use_cute_dsl_bf16_bmm: bool,
     ) -> PartitionPlan:
-        """Decide whether BF16 BMM may use two locality domain partitions."""
+        """Decide whether Rubin BF16 BMM may use two locality domain partitions."""
         from tensorrt_llm._torch.cute_dsl_utils import (
             IS_CUTLASS_DSL_AVAILABLE,
-            IS_CUTLASS_DSL_EXTENDED_AVAILABLE,
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE,
         )
         from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 
@@ -361,10 +361,10 @@ class LocalityDomainExecutionPlanner:
             )
         if not IS_CUTLASS_DSL_AVAILABLE:
             return PartitionPlan(enabled=False, reason_if_disabled="CuteDSL not available")
-        if not IS_CUTLASS_DSL_EXTENDED_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return PartitionPlan(
                 enabled=False,
-                reason_if_disabled="extended CuTeDSL kernels not available",
+                reason_if_disabled="CuTeDSL Rubin kernels not available",
             )
         return PartitionPlan(
             enabled=True,

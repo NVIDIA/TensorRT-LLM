@@ -44,10 +44,8 @@ from tensorrt_llm._torch.utils import model_extra_attrs
 
 
 @pytest.fixture(autouse=True)
-def _enable_cutedsl_extended(monkeypatch):
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_EXTENDED_AVAILABLE", True
-    )
+def _enable_cutedsl_rubin(monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +332,13 @@ class TestLocalityDomainExecutionPlanner:
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
-    def test_cutedsl_extended_unavailable_disables(self, mock_locality_domain, monkeypatch):
+    def test_cutedsl_rubin_unavailable_disables(self, mock_locality_domain, monkeypatch):
         monkeypatch.setattr(
-            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_EXTENDED_AVAILABLE", False
+            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", False
         )
         plan = self._plan()
         assert not plan.enabled
-        assert "extended" in plan.reason_if_disabled
+        assert "Rubin" in plan.reason_if_disabled
 
     # --- Weight mode check ---
 
@@ -770,12 +768,12 @@ class TestLocalityDomainMoePlanner:
     )
     def test_moe_disabled_without_cutedsl_extended(self, mock_locality_domain, monkeypatch):
         monkeypatch.setattr(
-            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_EXTENDED_AVAILABLE", False
+            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", False
         )
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True))
         assert not plan.enabled
-        assert "extended" in plan.reason_if_disabled
+        assert "Rubin" in plan.reason_if_disabled
 
 
 class TestLocalityDomainBf16BmmPlanner:
