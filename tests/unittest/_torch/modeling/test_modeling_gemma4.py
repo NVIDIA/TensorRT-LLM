@@ -1300,6 +1300,7 @@ class TestGemma4HFComparison(unittest.TestCase):
             quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
         )
 
+    @unittest.skipUnless(is_sm_100f(), "TRTLLM shared-KV Q-only requires trtllm-gen")
     @torch.no_grad()
     def test_kv_sharing_real_headdim_config_trtllm(self):
         """TRTLLM backend reuses cached KV for Q-only H256/H512 layers."""

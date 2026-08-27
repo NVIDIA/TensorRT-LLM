@@ -76,8 +76,10 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del q, k, v, metadata, phase
-        return forward_args.attention_mask != CustomAttentionMask.CUSTOM
+        del q, k, v, phase
+        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
+            forward_args.update_kv_cache or metadata.is_cross
+        )
 
     def forward(
         self,
