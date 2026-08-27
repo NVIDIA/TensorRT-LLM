@@ -5233,6 +5233,13 @@ class TorchCompileConfig(StrictBaseModel):
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
+    compile_generation: bool = Field(
+        default=True,
+        description="Apply torch.compile to generation-only batches. When "
+        "disabled, context and mixed batches remain compiled while "
+        "generation-only batches use eager execution.",
+        status="prototype")
+
     enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
 

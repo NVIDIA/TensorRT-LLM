@@ -745,6 +745,8 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_enabled = bool(self.torch_compile_config is not None)
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
+        torch_compile_generation = self.torch_compile_config.compile_generation if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'compile_generation'].default
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
         torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
@@ -802,17 +804,50 @@ class PyTorchModelEngine(ModelEngine):
                                                   "apply_llm_torch_compile",
                                                   None)
                 if isinstance(self.model, DecoderModelForCausalLM):
+                    eager_decoder = self.model.model
                     self.model.model = torch.compile(
                         self.model.model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
+                    if not torch_compile_generation:
+                        compiled_decoder = self.model.model
+                        compiled_forward = compiled_decoder.forward
+                        logger.info(
+                            "torch.compile is disabled for generation-only "
+                            "batches")
+
+                        def phase_selective_forward(*args, **kwargs):
+                            attrs = get_model_extra_attrs()
+                            attn_metadata_ref = attrs.get(
+                                "attention_metadata") if attrs else None
+                            attn_metadata = (attn_metadata_ref()
+                                             if attn_metadata_ref is not None
+                                             else None)
+                            # This is the finalized batch classification after
+                            # any context-to-generation promotion.
+                            if (attn_metadata is not None
+                                    and attn_metadata.num_contexts == 0):
+                                return eager_decoder(*args, **kwargs)
+                            return compiled_forward(*args, **kwargs)
+
+                        compiled_decoder.forward = phase_selective_forward
                 elif callable(apply_llm_torch_compile):
+                    if not torch_compile_generation:
+                        raise ValueError(
+                            "TorchCompileConfig.compile_generation=False is "
+                            "only supported for DecoderModelForCausalLM models."
+                        )
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
                     # scope through the mixin.
                     apply_llm_torch_compile(backend=self._torch_compile_backend,
                                             fullgraph=torch_compile_fullgraph)
                 else:
+                    if not torch_compile_generation:
+                        raise ValueError(
+                            "TorchCompileConfig.compile_generation=False is "
+                            "only supported for DecoderModelForCausalLM models."
+                        )
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
