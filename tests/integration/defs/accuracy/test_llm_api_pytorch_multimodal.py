@@ -222,6 +222,49 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
+class TestGemma4Unified_12B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-12B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-12B-it"
+    MAX_NUM_TOKENS = 12800
+    EXTRA_EVALUATOR_KWARGS = {
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+        # MMMU's lm-eval task uses this stop sequence.
+        stop="<|endoftext|>",
+    )
+
+    # Gemma 4 multimodal attention requires custom masks, which are incompatible with KV reuse.
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+    )
+
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_seq_len=MMMU.MAX_INPUT_LEN + MMMU.MAX_OUTPUT_LEN,
+            kv_cache_config=self.kv_cache_config,
+            attn_backend="FLASHINFER",
+            enable_chunked_prefill=False,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
 @pytest.mark.skip_device_not_contain(["B200"])
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
