@@ -4730,9 +4730,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        if self.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
 
         final_position_ids = self.position_ids_cuda[:
                                                     virtual_num_tokens].unsqueeze(
@@ -4945,9 +4942,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        if self.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
 
         final_position_ids = self.position_ids_cuda[:
                                                     virtual_num_tokens].unsqueeze(
