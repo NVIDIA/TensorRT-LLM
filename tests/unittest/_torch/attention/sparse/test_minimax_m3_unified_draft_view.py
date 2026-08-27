@@ -22,12 +22,18 @@ import torch
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftKVCacheView,
     MiniMaxM3KVCacheManagerV2,
-    _derive_shared_draft_layout,
 )
 
 DRAFT_LAYER = 60
 SCALE = 178  # P128 pages per M3 mega-slot
 ADDR = 0x7000_0000
+
+
+class _FakeFlatPool:
+    shape = ((1024 - 1) * SCALE + 2,)
+
+    def data_ptr(self):
+        return ADDR
 
 
 class _FakeManager:
@@ -47,10 +53,10 @@ class _FakeManager:
         self.slot_rows = [[5, 7]]
         self.copy_args = None
 
-    def _kv_slot_geometry(self, layer_idx, kv_layout):
+    def get_kv_subpage_pool(self, layer_idx, kv_layout):
         assert layer_idx == DRAFT_LAYER
-        page_shape = [self.tokens_per_block, 16, 128]
-        return ADDR, torch.int8, 1024, SCALE, page_shape
+        assert kv_layout == "HND"
+        return _FakeFlatPool(), SCALE
 
     def copy_batch_block_offsets(
         self,
@@ -82,7 +88,6 @@ def _make_view():
 def test_view_geometry():
     view = _make_view()
     assert view.tokens_per_block == 128
-    assert view._slot_stride == SCALE
     assert view.max_blocks_per_seq == 16
     assert view.num_pools == view.num_attention_op_pools == 1
     assert view.kv_cache_pool_pointers.tolist() == [[ADDR, 0]]
@@ -153,34 +158,3 @@ def test_view_rejects_draft_layer_outside_pool_zero():
     manager.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([1, 0], dtype=torch.int32)
     with pytest.raises(ValueError, match="not in pool 0"):
         MiniMaxM3DraftKVCacheView(manager, [DRAFT_LAYER])
-
-
-def test_draft_layout_target_only_num_layers():
-    heads = [4] * 60 + [64]
-    draft_ids, num_target = _derive_shared_draft_layout(60, heads, 1)
-    assert draft_ids == [60]
-    assert num_target == 60
-
-
-def test_draft_layout_equal_head_drafter():
-    draft_ids, num_target = _derive_shared_draft_layout(60, [4] * 61, 1)
-    assert draft_ids == [60]
-    assert num_target == 60
-
-
-def test_draft_layout_pre_extended_num_layers():
-    heads = [4] * 60 + [64]
-    draft_ids, num_target = _derive_shared_draft_layout(61, heads, 1)
-    assert draft_ids == [60]
-    assert num_target == 60
-
-
-def test_draft_layout_no_draft():
-    draft_ids, num_target = _derive_shared_draft_layout(60, [4] * 60, 0)
-    assert draft_ids == []
-    assert num_target == 60
-    assert _derive_shared_draft_layout(60, 4, 0) == ([], 60)
-
-
-def test_draft_layout_unpinned_range():
-    assert _derive_shared_draft_layout(None, 4, 1) == ([], None)

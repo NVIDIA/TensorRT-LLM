@@ -135,38 +135,6 @@ class MiniMaxM3SparseIndexCache:
         buf.index_copy_(0, out_cache_loc.to(torch.long), idx_v.to(buf.dtype))
 
 
-def _derive_shared_draft_layout(
-    num_layers: Optional[int],
-    num_kv_heads: int | Sequence[Optional[int]] | None,
-    num_draft: int,
-) -> tuple[list[int], Optional[int]]:
-    """Locate the appended one-model draft tail in the manager's layer range.
-
-    ``num_layers`` is ambiguous at the creation site: for M3 + Eagle3 it
-    carries the pretrained TARGET count (60) while the per-layer
-    ``num_kv_heads`` list is already extended with the draft entries
-    (61); other flows pass the extended count directly. The heads list's
-    length is the unambiguous total, so anchor on it and fall back to
-    ``num_layers`` for scalar heads.
-
-    Returns ``(draft_layer_ids, num_target_layers)``; the target range is
-    ``[0, num_target_layers)`` and the draft tail sits directly above it.
-    ``num_target_layers`` is ``None`` when neither input pins the range.
-    """
-    total = (
-        len(num_kv_heads)
-        if isinstance(num_kv_heads, Sequence)
-        else (int(num_layers) if num_layers is not None else None)
-    )
-    if total is None:
-        return [], None
-    if num_layers is not None:
-        total = max(total, int(num_layers))
-    num_target = total - max(0, int(num_draft))
-    draft_ids = list(range(num_target, total))
-    return draft_ids, num_target
-
-
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
@@ -186,9 +154,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``disable_index_value_layer_ids`` — subset whose index-V is
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
-      * ``num_one_model_draft_layers`` — how many one-model draft layers
-        the creation site appended after the target's (0 when the drafter
-        is separate or speculation is off).
     """
 
     _main_kv_layout = "NHD"
@@ -199,7 +164,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_layer_ids=None,
         disable_index_value_layer_ids=None,
         sparse_index_dim: Optional[int] = None,
-        num_one_model_draft_layers: int = 0,
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first,
@@ -212,17 +176,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             "sparse_attention_config"
         )
         num_layers = kwargs.get("num_layers")
+        num_target_layers = int(num_layers) if num_layers is not None else None
+        spec_config = kwargs.get("spec_config")
         implementation = getattr(sparse_attn_config, "implementation", "triton")
         self._main_kv_layout = "HND" if implementation == "msa" else "NHD"
 
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
-        # One-model speculative decoding with shared draft layers appends the
-        # drafter's layers after the target's (dense, no MSA index cache);
-        # ``_create_kv_cache_manager`` passes the appended count explicitly.
-        self._shared_draft_layer_ids, num_target_layers = _derive_shared_draft_layout(
-            num_layers, kwargs.get("num_kv_heads"), num_one_model_draft_layers
-        )
         if sparse_layer_ids is None:
             if num_target_layers is not None:
                 sparse_layer_ids = list(range(3, num_target_layers))
@@ -253,8 +213,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         super().__init__(*args, **kwargs)
 
+        shares_eagle_draft = (
+            not self.is_draft
+            and spec_config is not None
+            and spec_config.spec_dec_mode.is_eagle3_one_model()
+        )
+        self._shared_draft_layer_ids = (
+            [layer for layer in self.pp_layers if layer >= num_target_layers]
+            if shares_eagle_draft and num_target_layers is not None
+            else []
+        )
+
         self._draft_kv_cache_view_obj: Optional["MiniMaxM3DraftKVCacheView"] = None
-        if self._shared_draft_layer_ids and self.sparse_layer_ids and not self.is_draft:
+        if self._shared_draft_layer_ids and self.sparse_layer_ids:
             # Paired with the "view active" log at first dispatch.
             logger.info(
                 f"[unified-kv] draft layers {self._shared_draft_layer_ids} "
@@ -294,7 +265,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         Only meaningful on a target manager carrying appended one-model
         draft layers; built lazily so the manager's page tables exist. A
         method rather than a property so ``getattr`` fetches it without
-        executing it (see ``resolve_draft_kv_cache_manager``).
+        executing it (see ``get_draft_kv_cache_manager``).
 
         The view is required because M3's sparse layers add an index-K page to
         the otherwise dense K/V mega-slot layout.
@@ -659,19 +630,17 @@ class MiniMaxM3DraftKVCacheView:
         if int(manager.kv_cache_pool_mapping[int(local_layer_id), 0]) != 0:
             raise ValueError(f"draft layer {layer_id} is not in pool 0")
 
-        addr_key, _dtype, num_slots, scale, _shape = manager._kv_slot_geometry(layer_id, None)
+        flat_pool, slot_stride = manager.get_kv_subpage_pool(layer_id, "HND")
         if (
-            int(manager.index_scales[0]) != scale
+            int(manager.index_scales[0]) != slot_stride
             or int(manager.kv_offset[0]) != 1
             or manager._stream is None
         ):
             raise ValueError("MiniMax-M3's native P128 draft block-table mapping is unavailable")
 
-        self._num_slots = num_slots
-        self._slot_stride = scale
-
+        self._flat_pool = flat_pool
         self.kv_cache_pool_pointers = torch.tensor(
-            [[addr_key, 0]], dtype=torch.int64, pin_memory=prefer_pinned()
+            [[flat_pool.data_ptr(), 0]], dtype=torch.int64, pin_memory=prefer_pinned()
         )
         self.kv_cache_pool_mapping = manager.kv_cache_pool_mapping.clone()
         self.kv_cache_pool_mapping[int(local_layer_id)] = 0
@@ -682,7 +651,7 @@ class MiniMaxM3DraftKVCacheView:
     @property
     def blocks_in_primary_pool(self) -> int:
         """Return the flat P128 page bound relative to the draft K pointer."""
-        return (self._num_slots - 1) * self._slot_stride + 2
+        return int(self._flat_pool.shape[0])
 
     def __getattr__(self, name):
         manager = self.__dict__.get("_manager")

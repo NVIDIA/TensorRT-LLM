@@ -573,8 +573,10 @@ class KvCacheCreator:
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
                 # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
-                    effective_draft_config, kv_cache_config)
+                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                    effective_draft_config,
+                    kv_cache_config,
+                    is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
                     kv_cache_config)
@@ -1145,7 +1147,6 @@ class KvCacheCreator:
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
             return False
-
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
@@ -1174,17 +1175,6 @@ class KvCacheCreator:
         if self._speculative_config.spec_dec_mode.is_external_drafter():
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
-
-    def _get_draft_kv_cache_manager_cls(self, effective_draft_config,
-                                        draft_kv_config):
-        """Resolve the draft manager class from the draft config, promoted
-        to V2 when the target manager is V2."""
-        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-        if self._is_kv_cache_manager_v2 and not issubclass(
-                draft_kv_cache_manager_cls, KVCacheManagerV2):
-            draft_kv_cache_manager_cls = KVCacheManagerV2
-        return draft_kv_cache_manager_cls
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -1238,8 +1228,8 @@ class KvCacheCreator:
                 f"Derived draft KV cache max_attention_window for separate "
                 f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
-        draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config)
+        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
         draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
@@ -1807,15 +1797,9 @@ def _build_per_layer_num_kv_heads(
         draft_pretrained, 'num_key_value_heads',
         getattr(draft_pretrained, 'num_attention_heads', None))
 
-    if draft_num_kv_heads is None:
+    if (draft_num_kv_heads is None
+            or draft_num_kv_heads == num_key_value_heads):
         return num_key_value_heads
-
-    # Return the extended per-layer list even when the drafter's head count
-    # equals the target's: the list's draft tail is what tells shared-draft
-    # managers that the appended layers exist. An equal-head drafter (e.g.
-    # MiniMax-M3's GQA Eagle head, 4 KV heads like the target) otherwise
-    # disappears into the target's layer range and gets routed through the
-    # target's attention machinery.
     num_spec_layers = get_num_spec_layers(spec_config)
     logger.info(f"Per-layer KV heads for speculative decoding: "
                 f"target={num_key_value_heads} x {num_hidden_layers} layers, "
@@ -1996,19 +1980,6 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
-        if hasattr(kv_cache_manager_cls, "get_draft_kv_cache_view"):
-            # One-model spec with shared draft layers appends the drafter's
-            # layers to managers that expose a draft KV-cache view. Anchor on
-            # the pretrained TARGET layer count because local num_hidden_layers
-            # may already include the draft tail. Masked/cross flows yield a
-            # non-positive delta and correctly report 0.
-            target_num_layers = getattr(config, "num_hidden_layers", None)
-            num_appended_draft_layers = (
-                len(per_layer_num_kv_heads) -
-                target_num_layers if isinstance(per_layer_num_kv_heads, list)
-                and target_num_layers is not None else 0)
-            manager_extra_kwargs["num_one_model_draft_layers"] = max(
-                0, num_appended_draft_layers)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

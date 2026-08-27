@@ -816,7 +816,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # state the target model expects.
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        # Get the draft KV cache manager if using separate layouts
+        # Resolve a separate draft manager or shared-layout adapter, if needed.
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 

@@ -2108,14 +2108,10 @@ class SpecWorkerBase(nn.Module, ABC):
             return torch.empty(0, dtype=torch.int32, device="cuda")
 
     def get_draft_kv_cache_manager(self, resource_manager):
-        """
-        Get the draft-side KV manager (separate manager or a target-manager
-        draft view); see resolve_draft_kv_cache_manager.
-        """
-        if resource_manager is None:
-            return None
-        from .utils import resolve_draft_kv_cache_manager
-        return resolve_draft_kv_cache_manager(resource_manager)
+        """Get the draft-side manager or shared-layout adapter, if any."""
+        from .utils import get_draft_kv_cache_manager
+
+        return get_draft_kv_cache_manager(self.spec_config, resource_manager)
 
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
