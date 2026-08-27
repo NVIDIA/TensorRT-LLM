@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -15,9 +29,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-# Aggregated mode will run install together with pytest in slurm_run.sh
+# Aggregated mode and infrastructure dry runs install in slurm_run.sh.
 # Disaggregated mode will run install separately in slurm_install.sh
-if [[ "$stageName" != *Disagg* ]]; then
+if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
@@ -98,7 +112,9 @@ slurm_wait_all_ranks() {
     touch "$readyDir/rank_${SLURM_PROCID}.ready"
 
     # Bounded so a dead rank fails the stage loudly instead of hanging until the
-    # partition walltime kills it; the ceiling exceeds the 2700s pip3 retry budget
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
     # in slurm_install.sh so a merely slow rank still releases the barrier.
     local timeoutSecs=3600
     local deadline=$((SECONDS + timeoutSecs))
@@ -117,10 +133,7 @@ slurm_wait_all_ranks() {
                  "all $numRanks ranks to be ready; ready: $ready/$numRanks"
             return 1
         fi
-        # One rank reports progress; all of them would spam the log every 10s.
-        if [ "$SLURM_PROCID" -eq 0 ]; then
-            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
-        fi
+        echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
         sleep 10
     done
 }
@@ -137,8 +150,10 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-python3 "$llmSrcNode/tests/test_common/s3_output.py" \
-    --drain-spool "$jobWorkspace" || true
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

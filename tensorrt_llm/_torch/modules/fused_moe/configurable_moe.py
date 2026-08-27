@@ -34,6 +34,7 @@ from typing import Dict, List, Optional, Type, Union
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_moe.impl_base import MoEImplBase
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -77,10 +78,12 @@ _BACKEND_SYNC_ATTRS = (
 
 class ConfigurableMoE(MoE):
     # ConfigurableMoE is a thin wrapper that dispatches to a concrete backend
-    # (CuteDslFusedMoE / CutlassFusedMoE / ...). Allow the wrapper itself to
-    # pass the non-divisible-EP gate so the inner backend's own gate is the
-    # authoritative check -- if the chosen inner backend doesn't opt in, its
-    # ``MoE.__init__`` will still raise.
+    # (CuteDslFusedMoE / CutlassFusedMoE / ...). ``MoE.__init__`` ->
+    # ``_init_load_balancer`` runs before the backend exists, so the wrapper
+    # cannot answer for it there and passes its own gate. The real check runs in
+    # ``_reject_non_divisible_ep_backend()`` once the backend class is known.
+    # Do not treat this ``True`` as "the wrapper supports it": nothing else
+    # checks, because the backend is built with ``init_load_balancer=False``.
     _supports_non_divisible_ep: bool = True
     """
     Configurable MoE layer using composition pattern with automatic configuration
@@ -377,6 +380,7 @@ class ConfigurableMoE(MoE):
         # returns). Backends like ``MegaMoECuteDsl`` rely on that to
         # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
+        self._reject_non_divisible_ep_backend()
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
@@ -396,6 +400,35 @@ class ConfigurableMoE(MoE):
         has_post_init_quant_config = model_config.quant_config_dict is not None
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()
+
+    def _reject_non_divisible_ep_backend(self) -> None:
+        """Enforce the non-divisible-EP contract on the resolved backend.
+
+        This is the wrapper half of the check documented in ``MoE.__init__``.
+        ``_init_load_balancer`` cannot do it: the wrapper runs it before the
+        backend exists, and the backend never runs it at all because it is
+        constructed with ``init_load_balancer=False``. So this is the only place
+        that can consult the class actually executing the ceil/floor partition.
+
+        Skipped when EPLB is active -- there every rank holds ``num_slots //
+        ep_size`` slots and ``_init_load_balancer`` already required that to
+        divide evenly, so local slot counts are uniform whatever
+        ``num_experts % ep_size`` is.
+        """
+        if self.backend is None or self.layer_load_balancer is not None:
+            return
+        if self.num_experts % self.ep_size == 0:
+            return
+        if type(self.backend)._supports_non_divisible_ep:
+            return
+        raise ValueError(
+            f"{type(self.backend).__name__} does not support non-divisible EP: "
+            f"num_experts ({self.num_experts}) must be divisible by ep_size "
+            f"({self.ep_size}). Enable EPLB with num_slots divisible by "
+            f"ep_size, pick a backend that opts in, or override "
+            f"`_supports_non_divisible_ep = True` on that backend after "
+            f"verifying its kernel/comm path handles ceil/floor partitioning."
+        )
 
     def _supports_load_balancer(self) -> bool:
         """Check if this MoE implementation supports load balancer.
@@ -673,7 +706,7 @@ class ConfigurableMoE(MoE):
 
     # ========== Backend Validation ==========
 
-    def validate_backend(self, backend: MoE):
+    def validate_backend(self, backend: MoE | MoEImplBase | None) -> None:
         """Validate MoE backend compatibility with this ConfigurableMoE.
 
         Generic checks (always run):

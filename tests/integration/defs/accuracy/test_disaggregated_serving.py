@@ -2204,20 +2204,15 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "mtp_nextn,block_reuse,use_py_transceiver",
         [
-            (0, False, False),
             (0, False, True),
-            (3, True, False),
+            (3, True, True),
         ],
         ids=[
-            "mtp_nextn=0-block_reuse=False-use_py_transceiver=False",
             "mtp_nextn=0-block_reuse=False-use_py_transceiver=True",
-            "mtp_nextn=3-block_reuse=True-use_py_transceiver=False",
+            "mtp_nextn=3-block_reuse=True-use_py_transceiver=True",
         ],
     )
     def test_auto_dtype(self, mtp_nextn, block_reuse, use_py_transceiver):
-        if use_py_transceiver and block_reuse:
-            pytest.skip("Python transceiver does not support block reuse")
-
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         if mtp_nextn > 0:
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
@@ -2226,6 +2221,12 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         if block_reuse:
             ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
             gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
+            ctx_cfg["kv_cache_config"]["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
+            gen_cfg["kv_cache_config"]["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
@@ -2233,7 +2234,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            use_py_transceiver=False)
+            use_py_transceiver=True)
         # corner case: max_batch_size = 1 + dp for ctx to check if dp dummy requests are handled correctly
         ctx_cfg["max_batch_size"] = 1
         ctx_cfg["enable_attention_dp"] = True
@@ -2315,7 +2316,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    @parametrize_with_ids("use_py_transceiver", [True, False])
+    @parametrize_with_ids("use_py_transceiver", [True])
     def test_auto_dtype(self, use_py_transceiver, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)

@@ -16,6 +16,7 @@
 #   Disaggregated Serving    			  @NVIDIA/trt-llm-disagg-devs
 #   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
 #   MoE                      			  @NVIDIA/trt-llm-moe-devs
+#   Top-K                     			  @NVIDIA/trt-llm-topk-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
 #   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
@@ -69,6 +70,7 @@
 /docker @NVIDIA/trt-llm-infra-devs
 /enroot @NVIDIA/trt-llm-infra-devs
 /jenkins @NVIDIA/trt-llm-infra-devs
+/jenkins/scripts/cbts @NVIDIA/trt-llm-devs
 /ruff-legacy-baseline.json @NVIDIA/trt-llm-infra-devs
 /ruff-legacy.toml @NVIDIA/trt-llm-infra-devs
 /scripts @NVIDIA/trt-llm-infra-devs
@@ -378,6 +380,13 @@
 /tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
 
+# ===== TOP-K =====
+/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k @NVIDIA/trt-llm-topk-devs
+/tensorrt_llm/_torch/modules/top_k.py @NVIDIA/trt-llm-topk-devs
+/tests/scripts/cute_dsl_kernels/top_k @NVIDIA/trt-llm-topk-devs
+/tests/unittest/_torch/attention/sparse/*topk* @NVIDIA/trt-llm-topk-devs
+/tests/unittest/_torch/modules/test_top_k.py @NVIDIA/trt-llm-topk-devs
+
 # ===== VisualGen / AIGV =====
 /cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-torch-visual-gen-devs
 /examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
@@ -392,7 +401,6 @@
 /tests/integration/defs/examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/integration/defs/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit* @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 

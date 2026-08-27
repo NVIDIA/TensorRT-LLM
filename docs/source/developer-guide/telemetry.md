@@ -45,7 +45,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
-| `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
+| `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
 | `batch_wait_max_tokens_ratio` | `<class 'float'>` | `value` |  |  |
 | `batch_wait_timeout_iters` | `<class 'int'>` | `value` |  |  |
@@ -58,9 +58,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
 | `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
-| `cp_config.block_size` | `Optional[int]` | `value` |  |  |
-| `cp_config.cp_anchor_size` | `Optional[int]` | `value` |  |  |
-| `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `STAR`, `RING`, `HELIX` |
+| `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `RING`, `HELIX` |
 | `cp_config.fifo_version` | `Optional[int]` | `value` |  |  |
 | `cp_config.tokens_per_block` | `Optional[int]` | `value` |  |  |
 | `cp_config.use_nccl_for_alltoall` | `Optional[bool]` | `value` |  |  |

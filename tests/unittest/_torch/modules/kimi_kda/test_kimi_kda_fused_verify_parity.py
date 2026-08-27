@@ -191,7 +191,7 @@ def test_fused_vs_sequential_two_rounds():
     rt_fused.finalize_decode_weights()
     assert rt_fused._qkvg_proj_weight is not None
     assert rt_fused._bfa_proj_weight is not None
-    slot_indices = torch.arange(B, dtype=torch.long, device="cuda")
+    slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)
     conv_pool_fused = conv_pool_seq.clone()
