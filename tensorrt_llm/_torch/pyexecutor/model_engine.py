@@ -638,6 +638,8 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_enabled = bool(self.torch_compile_config is not None)
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
+        torch_compile_generation = self.torch_compile_config.compile_generation if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'compile_generation'].default
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
         torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
@@ -703,17 +705,28 @@ class PyTorchModelEngine(ModelEngine):
                         fullgraph=torch_compile_fullgraph)
                     self._torch_compile_prefill_only = (
                         self._torch_compile_piecewise_cuda_graph
-                        and not self.model.use_fx_for_pcg_fallback)
+                        and (not torch_compile_generation
+                             or not self.model.use_fx_for_pcg_fallback))
                     self.model.model = (
                         _PrefillCompiledModel(eager_model, compiled_model)
                         if self._torch_compile_prefill_only else compiled_model)
                 elif callable(apply_llm_torch_compile):
+                    if not torch_compile_generation:
+                        raise ValueError(
+                            "TorchCompileConfig.compile_generation=False is "
+                            "only supported for DecoderModelForCausalLM models."
+                        )
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
                     # scope through the mixin.
                     apply_llm_torch_compile(backend=self._torch_compile_backend,
                                             fullgraph=torch_compile_fullgraph)
                 else:
+                    if not torch_compile_generation:
+                        raise ValueError(
+                            "TorchCompileConfig.compile_generation=False is "
+                            "only supported for DecoderModelForCausalLM models."
+                        )
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
