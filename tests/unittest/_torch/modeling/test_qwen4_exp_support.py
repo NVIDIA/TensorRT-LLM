@@ -429,6 +429,34 @@ def _tiny_ngram_config(*, exclude_table: bool = False) -> SimpleNamespace:
     )
 
 
+def test_mapper_streams_only_local_ple_row_overlap(monkeypatch) -> None:
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
+        Qwen4ExpHfWeightMapper,
+    )
+
+    module = nn.Module()
+    module.padded_vocab_size = 10
+    module.vocab_start_index = 3
+    module.vocab_end_index = 8
+    module.ngram_embedding = nn.Embedding(5, 2)
+    with torch.no_grad():
+        module.ngram_embedding.weight.fill_(-1)
+
+    mapper = Qwen4ExpHfWeightMapper()
+    monkeypatch.setattr(mapper, "_ngram_module_for_prefix", lambda _prefix: module)
+    full_table = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+    leaves = {
+        "ngram_embedding.shard_1.weight": full_table[4:],
+        "ngram_embedding.shard_0.weight": full_table[:4],
+    }
+
+    table_ptr = module.ngram_embedding.weight.data_ptr()
+    mapper._load_ngram_tables({"model.layers.1.ple": leaves})
+
+    assert module.ngram_embedding.weight.data_ptr() == table_ptr
+    torch.testing.assert_close(module.ngram_embedding.weight, full_table[3:8])
+
+
 def test_mapper_keeps_fp8_ple_table_quantized(monkeypatch) -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
@@ -512,6 +540,7 @@ def test_fp8_ple_rejects_nonfinite_or_negative_scale(scale) -> None:
 @pytest.mark.parametrize(
     ("leaves", "match"),
     [
+        ({}, "has no table shards"),
         (
             {"ngram_embedding.shard_0.weight": torch.empty((4, 2), dtype=torch.float8_e4m3fn)},
             "have no weight scale",

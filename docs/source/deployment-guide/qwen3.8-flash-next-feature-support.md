@@ -56,6 +56,7 @@ intended model-specific runtime path executed.
 | Gated DeltaNet | **Validated** | **Validated** | Prefill, decode, chunk continuation, cache compaction, request reuse, and speculative-state promotion are covered. |
 | Hyper-Connections | **Validated** | **Validated** | Multi-stream residual mixing and topology-specific reductions are part of the accepted end-to-end paths. |
 | PLE | **Validated** | **Validated** | Token and short-convolution state are managed per request and participate in reuse, offload, MTP promotion, and text disaggregation where applicable. |
+| PLE embedding-weight sharding and pinned-host offload | **Validated** | **Validated** | The 320,001,536-row table can remain row-sharded in device memory or move to pinned host memory. The host path gathers only the 16 selected rows per token and overlaps the UVA gather with the first decoder block. |
 | QSA/GDN/PLE state with KV cache manager V2 | **Validated** | **Validated** | KV cache manager V2 is the required lifecycle owner for the model-specific auxiliary state. |
 
 ### Parallelism, communication, and speculative decoding
@@ -63,8 +64,8 @@ intended model-specific runtime path executed.
 | Feature | BF16 checkpoint | Block-FP8 checkpoint | Notes |
 |---|---|---|---|
 | Tensor parallelism | **Validated** | **Validated with constraints** | BF16 TP4 is validated. Block-FP8 TP1 is validated on one GB300. For block-FP8, routed-expert tensor-parallel partitions must preserve 128-element scale blocks. |
-| Tensor/expert parallelism (TEP) | **Validated** | **Validated** | TEP4 is validated for both precisions. Block-FP8 also has a validated two-GPU TEP topology. Use `moe_tensor_parallel_size: 1` and expert parallelism when a pure MoE-TP split would cut a scale block. |
-| Attention data parallelism (ADP) | **Validated** | **Validated** | ADP4 is validated with expert-parallel routed experts and model-specific recurrent-state ownership. Small topology-sensitive BF16 numerical differences are expected and are not treated as request-integrity failures. |
+| Tensor/expert parallelism (TEP) | **Validated** | **Validated** | BF16 TEP2 and TEP4 are validated. Block-FP8 also has validated two- and four-GPU TEP topologies. Use `moe_tensor_parallel_size: 1` and expert parallelism when a pure MoE-TP split would cut a scale block. |
+| Attention data parallelism (ADP) | **Validated** | **Validated** | BF16 ADP2/EP2 and ADP4 are validated with expert-parallel routed experts and model-specific recurrent-state ownership. Small topology-sensitive BF16 numerical differences are expected and are not treated as request-integrity failures. |
 | Pipeline parallelism | **Validated** | **Not validated** | BF16 PP4 and PP2+TP2 functional paths are validated. No block-FP8 PP release claim is made by this matrix. |
 | MTP with draft depth 3 | **Validated** | **Validated** | The recurrent MTP layer supports a configured maximum draft length of three, including accepted-prefix promotion of GDN, QSA, and PLE state. Greedy decoding uses strict acceptance; distribution-correct non-greedy decoding uses rejection sampling with the full advanced sampler. Other draft depths are not part of this release claim. |
 | GDN replay under MTP | **Validated** | **Validated** | Replay and accepted-state commit are covered together with semantic output checks. |
@@ -107,6 +108,73 @@ For reproducibility, retain the resolved server configuration and final LLM
 arguments, individual responses and finish reasons, per-request performance
 records, and backend-resolution logs. A configured feature is not considered
 verified unless the effective runtime state and request records show that it ran.
+
+### PLE embedding-weight residency and pinned-host offload
+
+The PLE embedding table has shape `[320001536, 160]`: 51.2 billion parameters,
+95.37 GiB in BF16 or 47.68 GiB in FP8. This is fixed model-weight storage, not
+KV-cache or mutable recurrent state.
+
+By default the table remains in device memory. Ordinary TP assigns a disjoint
+row range to each rank and combines partial embedding activations with an
+AllReduce. Attention DP first exchanges row IDs, performs the local-shard
+lookup, and ReduceScatters the embedding activations back to their token owners.
+The mapper loads only the intersection between each checkpoint shard and the
+rank-local row range; it does not materialize a full-table destination first.
+
+The optional pinned-host path preserves the same row ownership and collective
+semantics. A Triton UVA kernel gathers the 16 sparse rows selected for each
+token into a BF16 device buffer. The gather runs on a dedicated CUDA stream and
+starts before the decoder loop, allowing it to overlap the first decoder block.
+Stable mapped pointers and graph output buffers allow decode CUDA graph capture
+and replay without moving the complete table to HBM.
+
+The retained GB300 measurements are:
+
+| Checkpoint and PLE placement | PLE storage per rank | GPU memory after weight load | Profile peak | Semantic/runtime evidence |
+|---|---:|---:|---:|---|
+| BF16, legacy replicated device table, TP2 | 95.37 GiB device | 215.79 GiB | 221.53 GiB | Historical resident baseline |
+| BF16, row-sharded device table, TEP2 | 47.68 GiB device | 168.10 GiB | 174.29 GiB | Concurrent batch 2, long QSA, CUDA graph, MTP3, and GSM8K 8/8 passed |
+| BF16, row-sharded device table, ADP2/EP2 | 47.68 GiB device | 172.02 GiB | 178.17 GiB | Real ID-AllGather/activation-ReduceScatter, concurrent batch 2, long QSA, CUDA graph, MTP3, and GSM8K 8/8 passed |
+| BF16, pinned host, TP2 | 47.68 GiB host | 120.42 GiB | 126.17 GiB | Long QSA, CUDA graph, MTP3, and GSM8K 8/8 passed |
+| BF16, pinned host, TP1 | 95.37 GiB host | 239.18 GiB | 243.49 GiB | Complete BF16 model fits one GB300; long QSA, CUDA graph, MTP3, and GSM8K 8/8 passed |
+| Block-FP8, device table, TP1 | 47.68 GiB device | 169.53 GiB | 173.44 GiB | Resident baseline |
+| Block-FP8, pinned host, TP1 | 47.68 GiB host | 121.85 GiB | 125.77 GiB | Long QSA, CUDA graph, and GSM8K 8/8 passed |
+
+The matched block-FP8 TP1 comparison isolates a 47.68-GiB HBM reduction, equal
+to the complete FP8 table. For BF16, two-GPU row sharding first reduces the
+resident table from 95.37 to 47.68 GiB per rank, and host offload removes that
+remaining rank-local shard from HBM. The BF16 TP1 result is also a capacity
+result: keeping the additional 95.37-GiB table in device memory would exceed a
+276.62-GiB GB300, while the host-offloaded model completed at a 243.49-GiB
+profile peak.
+
+These are functionality and memory-capacity measurements, not throughput
+claims. The semantic smokes retained every individual response and used eight
+GSM8K questions, five shots, temperature 0, seed 42, and a 512-token maximum.
+Both new resident-sharding runs additionally completed two simultaneous
+deterministic requests and a 4,853-token QSA retrieval request.
+
+This branch exposes PLE weight offload as an opt-in environment setting. Set it
+before importing PyTorch or starting serving workers:
+
+```bash
+export TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1
+export PYTORCH_ALLOC_CONF=pinned_use_cuda_host_register:True,pinned_max_round_threshold_mb:128,pinned_max_cached_size_mb:512,pinned_num_register_threads:8
+
+trtllm-llmapi-launch trtllm-serve /path/to/Qwen3.8-Flash-Next \
+  --config serving.yaml \
+  --served_model_name Qwen3.8-Flash-Next \
+  --host 0.0.0.0 --port 8000 \
+  --generation-config trtllm --no-telemetry
+```
+
+The bounded pinned-allocation settings avoid table-sized power-of-two rounding
+and retaining a freed table-sized block in the host cache. The host must have
+enough pinned-memory capacity for every local serving rank. The path currently
+supports the standard Hugging Face `AUTO` loader. Attention DP combined with
+context parallelism greater than one is rejected because that PLE token/group
+collective contract is not implemented.
 
 ### Block-FP8 accuracy
 
@@ -259,7 +327,8 @@ tune from a matched validated baseline.
 
 | Deployment goal | Starting point | Validation status |
 |---|---|---|
-| BF16 on two GB300 GPUs with MTP3 | BF16 TEP2 with MTP3 | Supported starting point; constituent TP2 MTP3 and TEP4 MTP3 paths are validated |
+| BF16 on two GB300 GPUs with MTP3 | BF16 TEP2 with MTP3 | Validated with a resident row-sharded PLE table at batch size 2; resize capacity fields for larger workloads |
+| BF16 attention-DP on two GB300 GPUs with MTP3 | BF16 ADP2/EP2 with MTP3 | Validated with a resident row-sharded PLE table and real ID-AllGather/activation-ReduceScatter |
 | Block-FP8 on one GB300 with MTP3 | Block-FP8 TP1 with MTP3 | Validated |
 | BF16 tensor-parallel text serving | BF16 TP4 with CUTLASS MoE | Validated |
 | BF16 expert-parallel text serving | BF16 TEP4 with TRTLLM MoE | Validated |
@@ -332,12 +401,71 @@ trtllm-llmapi-launch trtllm-serve /path/to/Qwen3.8-Flash-Next \
   --generation-config trtllm --no-telemetry
 ```
 
-This is the two-GPU form of the supported TEP and MTP3 paths. Retained
-production-size evidence separately covers BF16 TP2 with MTP3 and BF16 TEP4
-with MTP3. Validate the selected batch, sequence, and cache capacities before
-using this TEP2 recipe as a production SLA baseline. `allreduce_strategy` is
-intentionally omitted so that the GB300 `AUTO` policy selects among supported
-collective implementations.
+This two-GPU TEP and MTP3 path is validated with the complete checkpoint. The
+resident PLE table was split into 160,000,768 BF16 rows (47.68 GiB) per rank and
+completed concurrent batch-2 requests, long-context QSA, decode graph capture,
+MTP3, and the deterministic GSM8K smoke. Validate the selected batch, sequence,
+and cache capacities before using the larger values in this recipe as a
+production SLA baseline. `allreduce_strategy` is intentionally omitted so that
+the GB300 `AUTO` policy selects among supported collective implementations.
+
+#### BF16 ADP2/EP2 with MTP3
+
+This topology replicates attention computation over two token-owner ranks,
+partitions routed experts with EP2, and row-shards the resident PLE table over
+the attention-DP group. PLE exchanges global row IDs before lookup and
+ReduceScatters BF16 embedding activations afterward. Save the validated
+functionality configuration as `bf16-adp2-ep2-mtp3.yaml`:
+
+```yaml
+tensor_parallel_size: 2
+moe_tensor_parallel_size: 1
+moe_expert_parallel_size: 2
+pipeline_parallel_size: 1
+context_parallel_size: 1
+enable_attention_dp: true
+enable_lm_head_tp_in_adp: false
+disable_mm_encoder: true
+
+max_batch_size: 2
+max_num_tokens: 2048
+max_seq_len: 13312
+enable_chunked_prefill: true
+disable_overlap_scheduler: true
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 2
+
+moe_config:
+  backend: TRTLLM
+  max_num_tokens: 2048
+  disable_finalize_fusion: true
+
+sparse_attention_config:
+  algorithm: qsa
+
+kv_cache_config:
+  max_tokens: 32768
+  avg_seq_len: 8192
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: false
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+```
+
+Start the server with the same command as the TEP2 recipe, substituting this
+configuration. The production-size smoke completed two simultaneous requests,
+a 4,853-token QSA request, decode graph capture for batch sizes one and two,
+MTP3, and GSM8K 8/8. It measured 172.02 GiB after weight loading and a
+178.17-GiB profile peak per rank. Attention DP with context parallelism greater
+than one is not supported by the PLE row-sharding collective.
+
+Both two-GPU recipes use device-resident PLE shards by default. Set
+`TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1` and the pinned allocator configuration
+from the PLE validation section to move those rank-local shards to host memory.
 
 #### BF16 TP4 with CUTLASS MoE
 

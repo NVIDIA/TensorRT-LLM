@@ -640,6 +640,19 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
+            has_qwen4_exp_ple_host_offload = any(
+                getattr(module, "host_offload", False)
+                and type(module).__name__ == "Qwen4ExpNGramEmbedding"
+                for module in model.modules())
+            if has_qwen4_exp_ple_host_offload and (
+                    load_format != LoadFormat.AUTO
+                    or checkpoint_loader.checkpoint_format == "MX"):
+                raise ValueError(
+                    "Qwen4-Exp PLE host offload currently supports only the "
+                    "standard Hugging Face AUTO loading path; DUMMY, "
+                    "VISION_ONLY, GMS, and MX loaders cannot materialize the "
+                    "intentional pinned-CPU parameter")
+
             loads_draft_weights = (
                 self.spec_config is not None
                 and self.spec_config.needs_separate_draft_weights)

@@ -154,7 +154,11 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         self.ple: Optional[Qwen4ExpPLE] = None
         if is_ple_layer:
             self.ple = Qwen4ExpPLE(
-                config, dtype=dtype, ple_layer_index=ple_layer_index, layer_id=layer_idx
+                config,
+                dtype=dtype,
+                ple_layer_index=ple_layer_index,
+                layer_id=layer_idx,
+                mapping=model_config.mapping,
             )
 
         self.enable_tp_output_reduction = _qwen4_exp_tp_output_reduction_enabled(self.mapping)
@@ -450,6 +454,8 @@ class Qwen4ExpModel(DecoderModel):
             num_contexts=num_contexts,
             use_spec_decoding=use_spec_decoding,
             uniform_row_width=uniform_row_width,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            is_cuda_graph=attn_metadata.is_cuda_graph,
         )
 
         conv_state, ngram_context = self._resolve_ple_pools(
@@ -582,6 +588,10 @@ class Qwen4ExpModel(DecoderModel):
             if input_ids is not None
             else None
         )
+        if ple_state is not None:
+            ple_layer_idx = next(i for i, enabled in enumerate(self.ple_layer_mask) if enabled)
+            ple_meta, _, ngram_context = ple_state
+            self.layers[ple_layer_idx].ple.start_prefetch(ple_meta, ngram_context)
 
         for layer_idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
             hidden_states = decoder_layer(
