@@ -62,7 +62,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
-from tensorrt_llm.visual_gen.params import MediaContentFormat, MediaRole
+from tensorrt_llm.visual_gen.params import MediaRole
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
@@ -2027,12 +2027,12 @@ class MediaReferenceItem(OpenAIBaseModel):
     content: str = Field(
         description="The reference payload, in the form declared by ``format``."
     )
-    format: MediaContentFormat = Field(description=(
+    format: Literal["path", "url", "base64"] = Field(description=(
         "Wire form of ``content``: ``path`` (a file readable by the server; a "
         "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
         "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
-        "also accepted). ``bytes`` cannot be carried in JSON — upload the file "
-        "as multipart/form-data instead. Distinct from the top-level "
+        "also accepted). Raw bytes reach the server as a multipart upload, "
+        "which carries no ``format`` of its own. Distinct from the top-level "
         "``format``, which selects the *output* encoding."))
     role: Optional[MediaRole] = Field(
         default=None,
@@ -2040,15 +2040,6 @@ class MediaReferenceItem(OpenAIBaseModel):
         "when the target model accepts this modality in more than one slot; omit "
         "it when the model leaves no ambiguity.",
     )
-
-    @field_validator("format")
-    @classmethod
-    def _reject_bytes_over_json(cls, v: str) -> str:
-        if v == "bytes":
-            raise ValueError(
-                "format='bytes' cannot be carried in JSON; upload the file as "
-                "multipart/form-data, or send format='base64'.")
-        return v
 
 
 class VideoGenerationRequest(OpenAIBaseModel):
@@ -2114,7 +2105,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
          "ignored whenever a typed ``image_reference`` or ``video_reference`` "
          "is provided. A string form requires ``input_reference_format``."),
     )
-    input_reference_format: Optional[MediaContentFormat] = Field(
+    input_reference_format: Optional[Literal["path", "url", "base64"]] = Field(
         default=None,
         description=(
             "Deprecated, alongside ``input_reference``: the wire form of that "
@@ -2203,17 +2194,13 @@ class VideoGenerationRequest(OpenAIBaseModel):
         field here would break exactly what the field is for. A multipart
         upload carries its own form and needs no sibling either way.
         """
-        if isinstance(self.input_reference, str):
-            if self.input_reference_format is None:
-                logger.warning(
-                    "'input_reference' without 'input_reference_format' is read as "
-                    "base64; both are deprecated, use 'image_reference' / "
-                    "'video_reference' with an explicit format.")
-                self.input_reference_format = "base64"
-            elif self.input_reference_format == "bytes":
-                raise ValueError(
-                    "input_reference_format='bytes' cannot be carried in JSON; upload "
-                    "the file as multipart/form-data, or send 'base64'")
+        if isinstance(self.input_reference,
+                      str) and self.input_reference_format is None:
+            logger.warning(
+                "'input_reference' without 'input_reference_format' is read as "
+                "base64; both are deprecated, use 'image_reference' / "
+                "'video_reference' with an explicit format.")
+            self.input_reference_format = "base64"
         return self
 
 

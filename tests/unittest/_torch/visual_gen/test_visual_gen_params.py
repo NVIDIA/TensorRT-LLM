@@ -1591,11 +1591,13 @@ class TestDeprecatedInputReferenceStaysCompatible:
         assert request.input_reference_format == "path"
 
     def test_bytes_over_json_is_still_rejected(self):
+        """The wire form a JSON body can declare stops at ``base64``, so the
+        generated schema never advertises a value that is certain to 422."""
         from pydantic import ValidationError
 
         from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
 
-        with pytest.raises(ValidationError, match="cannot be carried in JSON"):
+        with pytest.raises(ValidationError, match="'path', 'url' or 'base64'"):
             VideoGenerationRequest(
                 prompt="x", input_reference="aGk=", input_reference_format="bytes"
             )

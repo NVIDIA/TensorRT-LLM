@@ -29,12 +29,6 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
 MediaRole = Literal["reference", "first_frame", "last_frame"]
 
-# Wire form of a reference's ``content``. Declared explicitly rather than
-# sniffed: a bare string is otherwise ambiguous between a local path and
-# base64, and guessing lets a mistyped path silently become base64 (or a
-# malformed base64 silently become a filesystem read).
-MediaContentFormat = Literal["path", "url", "base64", "bytes"]
-
 
 @set_api_status("prototype")
 class MediaRef(StrictBaseModel):
@@ -50,7 +44,10 @@ class MediaRef(StrictBaseModel):
     content: Union[str, bytes] = Field(
         description="The reference payload, in the form declared by ``format``."
     )
-    format: MediaContentFormat = Field(
+    # Declared rather than sniffed: a bare string is otherwise ambiguous between
+    # a local path and base64, and guessing lets a mistyped path silently become
+    # base64 (or a malformed base64 silently become a filesystem read).
+    format: Literal["path", "url", "base64", "bytes"] = Field(
         description=(
             "Wire form of ``content``: ``path`` (local file; a ``file://`` URI is "
             "also accepted), ``url`` (``http(s)``, fetched through the SSRF-guarded "

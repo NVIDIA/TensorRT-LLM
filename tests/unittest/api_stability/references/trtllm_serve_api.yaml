@@ -1497,7 +1497,7 @@ models:
         required: false
       input_reference_format:
         kind: extension
-        type: Optional[MediaContentFormat]
+        type: Optional[Literal['path', 'url', 'base64']]
         default: null
         status: deprecated
         required: false
@@ -1583,7 +1583,7 @@ models:
         required: true
       format:
         kind: extension
-        type: MediaContentFormat
+        type: Literal['path', 'url', 'base64']
         default: null
         status: prototype
         required: true
