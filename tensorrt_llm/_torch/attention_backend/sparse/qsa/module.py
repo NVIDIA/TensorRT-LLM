@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from tensorrt_llm.logger import logger
 
+from ....modules.multi_stream_utils import maybe_execute_in_parallel
 from ..hooks import AttentionSparseHooks, register_attention_sparse_hooks
 from .indexer import QSAIndexer, qsa_sparse_gqa, select_qsa_paged_tokens
 from .metadata import QSAAttentionMetadata
@@ -22,6 +24,13 @@ if TYPE_CHECKING:
 
 _DEFAULT_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024
 _FP32_BYTES = 4
+_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+@dataclass(frozen=True)
+class _QSAIndexResult:
+    q_index: torch.Tensor
+    selected_tokens: Optional[torch.Tensor]
 
 
 def _query_chunk_size(query_len: int, score_columns: int) -> int:
@@ -48,6 +57,105 @@ class QSASparseHooks(AttentionSparseHooks):
         if not isinstance(params, QSASparseParams):
             raise TypeError("QSASparseHooks requires QSASparseParams")
         attention.indexer = QSAIndexer(attention, params)
+
+    @staticmethod
+    def _project_and_select_decode(
+        attention: "Attention",
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        attn_metadata: QSAAttentionMetadata,
+    ) -> _QSAIndexResult:
+        num_tokens = attn_metadata.num_tokens
+        q_index = attention.indexer.project_and_update_cache(
+            hidden_states[:num_tokens],
+            position_ids,
+            attention.layer_idx,
+            attn_metadata,
+        )
+        params = attention.sparse_params
+        max_kv_len = int(attn_metadata.kv_lens_runtime.max())
+        if max_kv_len <= params.dense_seq_len_threshold:
+            return _QSAIndexResult(q_index=q_index, selected_tokens=None)
+
+        index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
+        if index_cache is None:
+            raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")
+        req_idx = attn_metadata.qsa_req_idx_per_token[:num_tokens]
+        logical = attn_metadata.qsa_logical_positions[:num_tokens]
+        sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
+        selected = select_qsa_paged_tokens(
+            q_index,
+            index_cache,
+            logical,
+            sequence_lengths,
+            req_idx,
+            attn_metadata,
+            params,
+            top_k=attention.indexer.top_k,
+            top_k_output=attn_metadata.qsa_topk_indices,
+            top_k_row_starts=attn_metadata.qsa_topk_row_starts,
+        )
+        return _QSAIndexResult(q_index=q_index, selected_tokens=selected)
+
+    def prepare_qkv(
+        self,
+        attention: "Attention",
+        prepare_qkv: Callable[
+            [],
+            tuple[
+                torch.Tensor,
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+            ],
+        ],
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata,
+    ):
+        aux_stream = getattr(attention, "qsa_aux_stream", None)
+        fork_event = getattr(attention, "qsa_projection_fork_event", None)
+        join_event = getattr(attention, "qsa_projection_join_event", None)
+        overlap = (
+            os.environ.get("TRTLLM_QSA_INDEXER_OVERLAP", "1") != "0"
+            and isinstance(attn_metadata, QSAAttentionMetadata)
+            and attn_metadata.is_cuda_graph
+            and attn_metadata.num_contexts == 0
+            and attn_metadata.num_tokens == attn_metadata.num_seqs
+            and attn_metadata.num_tokens < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+            and not torch.compiler.is_compiling()
+            and position_ids is not None
+            and aux_stream is not None
+            and fork_event is not None
+            and join_event is not None
+        )
+        if not overlap:
+            return prepare_qkv(), None
+
+        logger.info_once(
+            "QSA indexer overlaps QKV preparation on an auxiliary stream",
+            key="qsa_indexer_qkv_overlap_active",
+        )
+
+        def prepare_index():
+            return self._project_and_select_decode(
+                attention,
+                hidden_states,
+                position_ids,
+                attn_metadata,
+            )
+
+        qkv, index_result = maybe_execute_in_parallel(
+            prepare_qkv,
+            prepare_index,
+            fork_event,
+            join_event,
+            aux_stream,
+            disable_on_compile=True,
+        )
+        if index_result.selected_tokens is not None:
+            index_result.selected_tokens.record_stream(torch.cuda.current_stream())
+        return qkv, index_result
 
     def forward(
         self,
@@ -84,13 +192,17 @@ class QSASparseHooks(AttentionSparseHooks):
             raise ValueError("QSA sparse attention requires hidden states and position IDs")
 
         num_tokens = attn_metadata.num_tokens
-        hidden_states = hidden_states[:num_tokens]
-        q_index = attention.indexer.project_and_update_cache(
-            hidden_states,
-            position_ids,
-            attention.layer_idx,
-            attn_metadata,
-        )
+        precomputed = kwargs.get("sparse_precomputed")
+        if isinstance(precomputed, _QSAIndexResult):
+            q_index = precomputed.q_index
+        else:
+            hidden_states = hidden_states[:num_tokens]
+            q_index = attention.indexer.project_and_update_cache(
+                hidden_states,
+                position_ids,
+                attention.layer_idx,
+                attn_metadata,
+            )
 
         params = attention.sparse_params
         max_kv_len = int(attn_metadata.kv_lens_runtime.max())
@@ -143,19 +255,23 @@ class QSASparseHooks(AttentionSparseHooks):
             # KV-length mirror: speculative decoding advances the authoritative
             # lengths on device and the host mirror is not updated between its
             # sub-steps.
-            sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
-            selected = select_qsa_paged_tokens(
-                q_index,
-                index_cache,
-                logical,
-                sequence_lengths,
-                req_idx,
-                attn_metadata,
-                params,
-                top_k=attention.indexer.top_k,
-                top_k_output=attn_metadata.qsa_topk_indices,
-                top_k_row_starts=attn_metadata.qsa_topk_row_starts,
+            selected = (
+                precomputed.selected_tokens if isinstance(precomputed, _QSAIndexResult) else None
             )
+            if selected is None:
+                sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
+                selected = select_qsa_paged_tokens(
+                    q_index,
+                    index_cache,
+                    logical,
+                    sequence_lengths,
+                    req_idx,
+                    attn_metadata,
+                    params,
+                    top_k=attention.indexer.top_k,
+                    top_k_output=attn_metadata.qsa_topk_indices,
+                    top_k_row_starts=attn_metadata.qsa_topk_row_starts,
+                )
             output = qsa_sparse_gqa(
                 q=q,
                 k_cache=k_cache,
