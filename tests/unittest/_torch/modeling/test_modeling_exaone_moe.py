@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -95,7 +110,7 @@ class Scenario:
 
 
 class TestExaoneMoe(unittest.TestCase):
-    def test_config_defaults(self):
+    def test_config_defaults(self) -> None:
         config_dict = deepcopy(EXAONE_MOE_CONFIG)
         config = ExaoneMoeConfig.from_dict(config_dict)
 
@@ -106,7 +121,7 @@ class TestExaoneMoe(unittest.TestCase):
         self.assertIsNone(get_exaone_attention_window(config, 4, True))
         self.assertIsNone(get_exaone_swiglu_limit(config, 62))
 
-    def test_per_layer_config_lists(self):
+    def test_per_layer_config_lists(self) -> None:
         config_dict = deepcopy(EXAONE_MOE_CONFIG)
         # 0 is the config's spelling of "not enabled for this layer".
         config_dict["sliding_windows"] = [4096, 8192, WINDOW_SIZE, 0]
