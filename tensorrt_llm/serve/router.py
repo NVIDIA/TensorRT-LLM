@@ -625,7 +625,8 @@ class Router(ABC):
             # Wait before next poll
             await asyncio.sleep(poll_interval)
 
-    def _filter_servers_by_role(self, servers, server_key_map):
+    def _filter_servers_by_role(self, servers: List[str],
+                                server_key_map: Dict[str, str]) -> List[str]:
         """Filter servers by role (context or generation)
 
         Returns an empty list when no server of this role is live. That is a
