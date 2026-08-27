@@ -233,14 +233,44 @@ class QSASparseHooks(AttentionSparseHooks):
         req_idx = attn_metadata.qsa_req_idx_per_token[:num_tokens]
         logical = attn_metadata.qsa_logical_positions[:num_tokens]
         tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
-        page_columns = logical // tokens_per_block
-        pages = attn_metadata.qsa_block_table[
-            req_idx.to(torch.long),
-            page_columns,
-        ].to(torch.long)
-        within = (logical % tokens_per_block).to(torch.long)
-        k_cache[pages, :, within, :] = k.to(k_cache.dtype)
-        v_cache[pages, :, within, :] = v.to(v_cache.dtype)
+        # The direct row-wise kernel removes launch overhead for small decode
+        # batches. Larger batches and prefill chunks have enough work for
+        # PyTorch's vectorized store path.
+        fused_kv_store = (
+            os.environ.get("TRTLLM_QSA_FUSED_KV_STORE", "1") != "0"
+            and attn_metadata.num_contexts == 0
+            and num_tokens <= 32
+            and k.is_cuda
+            and v.is_cuda
+            and k_cache.is_cuda
+            and v_cache.is_cuda
+        )
+        if fused_kv_store:
+            from .kernels import triton_qsa_paged_kv_store
+
+            logger.info_once(
+                "QSA fused decode paged K/V store Triton kernel is active",
+                key="qsa_fused_decode_paged_kv_store_active",
+            )
+            triton_qsa_paged_kv_store(
+                k=k,
+                v=v,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                request_indices=req_idx,
+                logical_positions=logical,
+                block_table=attn_metadata.qsa_block_table,
+                tokens_per_block=tokens_per_block,
+            )
+        else:
+            page_columns = logical // tokens_per_block
+            pages = attn_metadata.qsa_block_table[
+                req_idx.to(torch.long),
+                page_columns,
+            ].to(torch.long)
+            within = (logical % tokens_per_block).to(torch.long)
+            k_cache[pages, :, within, :] = k.to(k_cache.dtype)
+            v_cache[pages, :, within, :] = v.to(v_cache.dtype)
 
         if attn_metadata.num_contexts == 0:
             index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
