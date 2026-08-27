@@ -546,15 +546,16 @@ class PyTorchModelEngine(ModelEngine):
         # Item scheduling is declared once, as a model capability (the
         # `MultimodalModelMixin` ClassVar). The engine stores only the
         # actionable flag: whether the item-scheduling wiring is engaged this
-        # run (setup below, scheduler wrap, executor encoder step). A
-        # `DISABLED` policy keeps the capability but runs only the base LLM
-        # scheduler with legacy inline encode.
+        # run (setup below, scheduler wrap, executor encoder step).
+        # `disable_mm_encoder` and a `DISABLED` policy both keep the capability
+        # but run only the base LLM scheduler.
         _mm_config = getattr(self.llm_args, "multimodal_config", None)
         _mm_scheduling_policy = (_mm_config.encoder_scheduling_policy
                                  if _mm_config is not None else
                                  MultimodalEncoderSchedulingPolicy.DEFAULT)
         self.mm_encoder_item_scheduling_enabled = (
-            isinstance(self.model, MultimodalModelMixin)
+            not self.llm_args.disable_mm_encoder
+            and isinstance(self.model, MultimodalModelMixin)
             and self.model.supports_mm_encoder_item_scheduling and
             _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
         _validate_mm_encoder_scheduling_compatibility(
