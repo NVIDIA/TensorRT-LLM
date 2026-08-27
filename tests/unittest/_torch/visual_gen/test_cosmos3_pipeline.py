@@ -27,6 +27,7 @@ Override checkpoint:
 import gc
 import json
 import os
+from collections.abc import Generator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +57,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
+from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -655,19 +658,30 @@ class TestDefaultNegativePrompt:
 
 
 @pytest.fixture(scope="class")
-def cosmos3_pipeline():
-    checkpoint = _require_checkpoint()
-    pipeline = _load_pipeline(checkpoint)
-    yield pipeline
-    del pipeline
-    gc.collect()
-    torch.cuda.empty_cache()
+def cosmos3_pipeline() -> Generator[Cosmos3OmniMoTPipeline, None, None]:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
+        checkpoint = _require_checkpoint()
+        pipeline = _load_pipeline(checkpoint)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2v
 @pytest.mark.high_cuda_memory
 class TestCosmos3T2V:
+    def test_native_wan_vae_is_default(self, cosmos3_pipeline: Cosmos3OmniMoTPipeline) -> None:
+        assert isinstance(cosmos3_pipeline.vae, WanVAE)
+
+        config = cosmos3_pipeline.vae.config
+        assert len(config.latents_mean) == config.z_dim
+        assert len(config.latents_std) == config.z_dim
+        assert config.scale_factor_spatial == cosmos3_pipeline.vae_scale_factor_spatial
+        assert config.scale_factor_temporal == cosmos3_pipeline.vae_scale_factor_temporal
+
     def test_t2v_smoke(self, cosmos3_pipeline):
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
@@ -985,6 +999,118 @@ class TestCosmos3V2V:
                 height=T2I_HEIGHT,
                 width=T2I_WIDTH,
             )
+
+
+class TestCosmos3TransferRouting:
+    def test_transfer_rejects_an_image_reference(self):
+        """`_forward_transfer` takes no image, so a request carrying both used
+        to have its image silently dropped. The sibling guards already reject
+        transfer with image output and with audio; this one completes them."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        # __new__ skips __init__, where the real pipeline resolves this.
+        pipeline.family = QWEN3_RECIPE.name
+        pipeline.audio_gen = False
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        pipeline._forward_transfer = lambda **kwargs: None
+        # A precomputed control and no video: an existing guard already rejects
+        # image+video, so this is the shape where the image used to reach
+        # `_forward_transfer` and be discarded.
+        cfg = resolve_transfer_config(
+            {"edge": _V2V_FIXTURE_MP4.read_bytes()},
+            SimpleNamespace(num_frames=93, guidance_scale=None),
+            None,
+        )
+
+        with pytest.raises(ValueError, match="cannot be combined with an image reference"):
+            pipeline.forward(
+                prompt="bounce",
+                image="frame.png",
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+            )
+
+    def test_transfer_use_system_prompt_defaults_off(self):
+        """Reference parity: transfer defaults ``use_system_prompt=False`` even
+        when a video input is present — V2V's default-True rule must not leak
+        into the transfer branch (vllm-omni ``_forward_transfer`` defaults False).
+        An explicit request value is still honored."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        # __new__ skips __init__, where the real pipeline resolves this.
+        pipeline.family = QWEN3_RECIPE.name
+        pipeline.audio_gen = False
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        captured = {}
+
+        def fake_forward_transfer(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        pipeline._forward_transfer = fake_forward_transfer
+        cfg = resolve_transfer_config(
+            {"edge": True}, SimpleNamespace(num_frames=93, guidance_scale=None), None
+        )
+
+        for explicit, expected in ((None, False), (True, True)):
+            captured.clear()
+            pipeline.forward(
+                prompt="bounce",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=explicit,
+                use_guardrails=False,
+            )
+            assert captured["use_system_prompt"] is expected
 
 
 @pytest.mark.integration

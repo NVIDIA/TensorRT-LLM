@@ -1196,14 +1196,60 @@ class KVCacheTruncateTokensRequest(OpenAIBaseModel):
     num_tokens_to_keep: List[int]
 
 
+# The trailing dict keeps a client's own item types from failing the request
+# outright. Codex multi-agent sessions carry "agent_message" items, which no
+# SDK model describes; without a permissive member the union rejects the whole
+# input and every request from a spawned agent comes back 422, so agent
+# collaboration cannot work at all. Known shapes still match their typed
+# member first; see _response_output_item_to_chat_completion_message for how
+# an unrecognised item is replayed.
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
                                            ResponseReasoningItem,
-                                           ResponseFunctionToolCall]
+                                           ResponseFunctionToolCall, dict[str,
+                                                                          Any]]
+
+# Roles whose message items map to EasyInputMessageParam / Message, both of
+# which forbid ``id``. An assistant message maps to ResponseOutputMessageParam
+# instead, which *requires* ``id`` and ``status`` - stripping ``id`` there
+# leaves the item matching no variant of the input union, so a conversation
+# breaks as soon as it carries one assistant turn.
+#
+# Module level on purpose: pydantic turns a leading-underscore class attribute
+# into a ModelPrivateAttr, so referring to it from a validator would raise
+# "argument of type 'ModelPrivateAttr' is not iterable" at request time.
+_ID_STRIPPED_ROLES = ("user", "system", "developer")
+
+
+def _materialize_validator_iterators(value, _depth=0):
+    """Recursively replace pydantic ValidatorIterator objects with lists.
+
+    Matched by type name rather than by import: the class lives in the
+    pydantic_core extension module and is not part of its public API.
+    """
+    if _depth > 12:
+        return value
+    if type(value).__name__ == "ValidatorIterator":
+        return [_materialize_validator_iterators(v, _depth + 1) for v in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _materialize_validator_iterators(item, _depth + 1)
+        return value
+    if isinstance(value, list):
+        return [_materialize_validator_iterators(v, _depth + 1) for v in value]
+    return value
 
 
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
+    #
+    # Unlike the rest of the OpenAI models this one accepts unknown fields.
+    # Real Responses API clients attach evolving telemetry and routing keys -
+    # Codex CLI sends client_metadata and prompt_cache_key, for instance - and
+    # rejecting the whole request over a field the server would ignore anyway
+    # makes those clients unusable for no benefit.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     background: Optional[bool] = False
     include: Optional[list[
         Literal[
@@ -1217,6 +1263,84 @@ class ResponsesRequest(OpenAIBaseModel):
     ]] = None
     input: Union[str, list[ResponseInputOutputItem]]
     instructions: Optional[str] = None
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def _drop_unsupported_input_item_keys(cls, value):
+        """Strip per-item keys the vendored Responses item types reject.
+
+        Clients echo back items exactly as the server emitted them, so input
+        message items arrive carrying the ``id`` the server assigned, which
+        ``EasyInputMessageParam`` / ``Message`` forbid. That fails the whole
+        request over a field with no prompt content.
+
+        Assistant messages and tool-call items keep their ids: the former
+        needs it to validate, the latter uses it to pair calls with results.
+        """
+        if not isinstance(value, list):
+            return value
+
+        def _with_annotations(part):
+            """output_text requires annotations; clients often omit it."""
+            if (isinstance(part, dict) and part.get("type") == "output_text"
+                    and "annotations" not in part):
+                return {**part, "annotations": []}
+            return part
+
+        cleaned = []
+        for item in value:
+            # A client may send a bare content part as a top-level item, not
+            # only nested inside a message.
+            item = _with_annotations(item)
+            if isinstance(item, dict) and item.get("type") in (None, "message"):
+                role = item.get("role")
+                if "id" in item and role in _ID_STRIPPED_ROLES:
+                    item = {k: v for k, v in item.items() if k != "id"}
+                elif role == "assistant":
+                    # ResponseOutputMessageParam requires status, and each
+                    # output_text part requires annotations. Clients rebuild an
+                    # assistant turn from the streamed deltas rather than from
+                    # the server's content-part objects, so both routinely
+                    # arrive absent and fail the whole request. Default them
+                    # rather than reject a conversation over fields that carry
+                    # no prompt content.
+                    item = dict(item)
+                    item.setdefault("status", "completed")
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        item["content"] = [
+                            {
+                                **part, "annotations": part.get(
+                                    "annotations", [])
+                            } if isinstance(part, dict)
+                            and part.get("type") == "output_text" else part
+                            for part in content
+                        ]
+            cleaned.append(item)
+        return cleaned
+
+    @field_validator("input", mode="after")
+    @classmethod
+    def _materialize_lazy_item_content(cls, value):
+        """Force lazily-validated sequences anywhere in ``input`` into lists.
+
+        Several vendored Responses item types declare sequence fields as
+        ``Iterable[...]`` - ``ResponseOutputMessageParam.content`` and
+        ``ResponseOutputTextParam.annotations`` among them - and pydantic
+        validates an Iterable lazily into a ``ValidatorIterator``. That object
+        cannot be pickled, so a request carrying structured input dies with
+
+            cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator'
+
+        the moment it is handed to a postprocess worker. It is also
+        single-consumption, so even with workers disabled anything that reads
+        the field twice sees an empty sequence the second time.
+
+        The walk has to be recursive: the lazy fields are nested inside items,
+        e.g. input[1].content[0].annotations.
+        """
+        return _materialize_validator_iterators(value)
+
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
@@ -1312,6 +1436,12 @@ class ResponsesRequest(OpenAIBaseModel):
 
 class InputTokensDetails(OpenAIBaseModel):
     cached_tokens: int
+    # Required by the openai SDK models that re-validate this payload when it
+    # is embedded in a streaming event. Omitting it fails validation while the
+    # response is being streamed, which truncates the stream with no
+    # terminating event and leaves the client waiting forever. Prompt cache
+    # writes are not tracked separately, so this is reported as zero.
+    cache_write_tokens: int = 0
 
 
 class OutputTokensDetails(OpenAIBaseModel):
@@ -1628,7 +1758,7 @@ class ImageGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport (OpenAI-standard, always honored)
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
         default="png",
         description=(
@@ -1762,6 +1892,7 @@ class ImageObject(OpenAIBaseModel):
     """Generated image object in the response."""
     b64_json: Optional[str] = None
     url: Optional[str] = None
+    path: Optional[str] = None
     revised_prompt: Optional[str] = None
 
 
@@ -1792,7 +1923,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["file", "path"] = "file"
     format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = Field(
         default="auto",
         description=(
@@ -1865,6 +1996,26 @@ class VideoGenerationRequest(OpenAIBaseModel):
                 f"{self.width!r}, height={self.height!r}")
         return self
 
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def _reject_removed_response_format(cls, value):
+        """Give migrating callers an actionable error for removed values.
+
+        ``url``/``b64_json`` were valid before the transport rewrite; run
+        before the ``Literal`` check so the error names the replacement
+        instead of the generic "Input should be 'file' or 'path'".
+        """
+        removed = {
+            "url":
+            ("'url' was removed for video; use 'file' (raw bytes -- the "
+             "old 'url' behavior, renamed) or 'path' (server-side path)."),
+            "b64_json": ("'b64_json' was removed for video; use 'file' (raw "
+                         "bytes) or 'path' (server-side path)."),
+        }
+        if isinstance(value, str) and value in removed:
+            raise ValueError(removed[value])
+        return value
+
 
 class VideoJob(OpenAIBaseModel):
     """Metadata for an asynchronous video generation job.
@@ -1886,8 +2037,13 @@ class VideoJob(OpenAIBaseModel):
         default=None,
         description="Progress of the video generation job (0-100)")
     prompt: str = Field(description="The prompt used to generate the video")
-    status: Literal["queued", "in_progress", "completed", "failed"] = Field(
-        description="Current status of the video generation job")
+    status: Literal["queued", "generating", "postprocessing", "completed",
+                    "failed"] = Field(description=(
+                        "Current status of the video generation job. "
+                        "``generating`` (model inference) becomes "
+                        "``postprocessing`` (encode and/or write the output "
+                        "file) when inference finishes, then ``completed`` "
+                        "once downloadable via ``/content``."))
 
     # Video properties
     duration: Optional[float] = Field(default=None,
@@ -1900,17 +2056,35 @@ class VideoJob(OpenAIBaseModel):
     )
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    # exclude=True: internal file-location for /content resolution + delete;
+    # never on the wire (the path payload is the hand-built {id, output_path}
+    # envelope in /content), so status/list model_dump() stays status-only.
     output_path: Optional[str] = Field(
-        default=None, description="Actual path where the video file was saved")
+        default=None,
+        exclude=True,
+        description="Server-side saved path (internal; excluded from the wire)."
+    )
     output_paths: Optional[List[str]] = Field(
-        default=None, description="Paths for all generated videos when n > 1")
-    response_format: Optional[Literal["url", "b64_json"]] = Field(
+        default=None,
+        exclude=True,
+        description=
+        "Server-side paths for n>1 (internal; excluded from the wire).")
+    # exclude=True internal timings, never on the wire (status/list
+    # model_dump() stays status-only). ``request_started`` is a
+    # ``perf_counter()`` stamped at the POST handler; the background task
+    # computes ``total`` from it and stores the header timings
+    # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
+    # ``/content`` emits the same Server-Timing header as the sync route.
+    request_started: Optional[float] = Field(default=None, exclude=True)
+    timing_metrics: Optional[Dict[str, float]] = Field(default=None,
+                                                       exclude=True)
+    response_format: Optional[Literal["file", "path"]] = Field(
         default=None,
         description=(
             "Transport the client requested. ``GET /v1/videos/{id}/content`` "
-            "honors this: ``b64_json`` returns the encoded payload as a "
-            "base64 string inside a JSON envelope; ``url`` (or unset) "
-            "returns the file as a ``FileResponse`` download."),
+            "honors this: ``path`` returns the server-side output path(s) in a "
+            "JSON envelope; ``file`` (or unset) returns the file as a "
+            "``FileResponse`` download."),
     )
 
 

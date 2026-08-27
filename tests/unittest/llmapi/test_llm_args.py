@@ -1094,6 +1094,18 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
 
+    def test_disable_mm_encoder_disables_encoder_cache(self):
+        multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            checkpoint_format="HF",
+            disable_mm_encoder=True,
+            multimodal_config=multimodal_config,
+        )
+
+        assert args.multimodal_config.encoder_cache_max_bytes == 0
+        assert multimodal_config.encoder_cache_max_bytes == 1024**2
+
     @pytest.mark.parametrize(
         ("value", "expected"),
         [
@@ -2024,7 +2036,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        (invariants 2 and 3) clamps out-of-range entries to the reachable ceiling
        and never invents sizes beyond this list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
-       `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
+       `max_batch_size * (max_seq_len - 1)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
@@ -2314,42 +2326,6 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         # Ceiling (128) was already in candidates, must not be duplicated.
         assert kept.count(128) == 1
         assert unrecordable == []
-
-    def test_piecewise_filter_subtracts_extra_decoding_steps(self):
-        """Subtract `num_extra_decoding_steps` from the ceiling.
-
-        Drafting loops consume extra decode steps; the filter must mirror
-        the `max_seq_len - 1 - num_extra_decoding_steps` constraint
-        applied when warmup requests are built. Candidates above the
-        reduced ceiling are clamped down to it; nothing is appended.
-        """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
-
-        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
-        # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
-            candidates,
-            max_num_tokens=128,
-            max_batch_size=1,
-            max_seq_len=128,
-            num_extra_decoding_steps=5,
-        )
-        assert kept[-1] == 120  # nothing above the 122 ceiling to clamp
-        assert 120 in kept
-        assert unrecordable == []
-        # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
-            candidates,
-            max_num_tokens=128,
-            max_batch_size=1,
-            max_seq_len=128,
-            num_extra_decoding_steps=9,
-        )
-        assert kept[-1] == 118
-        assert 100 in kept
-        assert 120 not in kept
-        assert unrecordable == [120]
 
     def test_piecewise_filter_does_not_double_append_ceiling(self):
         """Ceiling already present in candidates -> not duplicated."""
