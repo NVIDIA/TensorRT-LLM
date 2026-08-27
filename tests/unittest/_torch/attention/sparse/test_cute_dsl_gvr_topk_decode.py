@@ -1357,7 +1357,10 @@ def _pack_seed_row(logits_f32, n_eff, lines, block_max=None):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+# One K only: the four modes exercise count-based admission, which is
+# K-independent, while K is a compile-time parameter - sweeping it cost
+# two extra kernel compiles (~43s) for no extra coverage.
+@pytest.mark.parametrize("top_k", [2048])
 @pytest.mark.parametrize("mode", ["band", "fat", "miss", "inf"])
 def test_cute_dsl_gvr_topk_decode_ext_counts(top_k, mode, tie_aware_check):
     """Packed seed row ([rows, 8]: lines + exact counts) consumption.
@@ -1482,6 +1485,10 @@ def test_cute_dsl_gvr_topk_decode_ext_list(mode, tie_aware_check):
         cand_ctl[r, 0] = int(hits.numel()) + pads
         cand_ctl[r, 1] = 1 if int(in_c.sum()) > LIST_CAP_C - pads else 0
     out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    # xstate is passed even though this test does not chain: it is part of
+    # the kernel's compile key, so sharing it with ext_closed_loop's list
+    # shape lets both reuse one compiled kernel instead of paying two.
+    xstate = torch.zeros((batch, 8), dtype=torch.float32, device=dev)
     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
         pre_idx,
@@ -1495,6 +1502,7 @@ def test_cute_dsl_gvr_topk_decode_ext_list(mode, tie_aware_check):
         cand_ctl=cand_ctl,
         accept_cap=LIST_SEG_A,
         num_threads=512,
+        xstate=xstate,
     )
     torch.cuda.synchronize()
     _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1)
