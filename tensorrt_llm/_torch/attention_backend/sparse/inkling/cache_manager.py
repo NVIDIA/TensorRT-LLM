@@ -97,6 +97,17 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         self._kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
         # A property of the model, so warn once per manager, not per request.
         self._warned_multimodal_reuse = False
+        # A draft manager covers only the chain's layers, addressed by the
+        # global layer index its KV layer offsets already use. Size its conv
+        # pool by the chain's layer count and offset it past the trunk, or it
+        # allocates trunk-many rows to hold a few and indexes past them.
+        _is_draft = bool(kwargs.get("is_draft"))
+        _conv_num_layers = None
+        _conv_layer_offset = 0
+        if _is_draft:
+            _conv_num_layers = int(kwargs.get("num_layers") or 0) or None
+            _text = getattr(pretrained_config, "text_config", pretrained_config)
+            _conv_layer_offset = int(getattr(_text, "num_hidden_layers", 0))
         super().__init__(
             *args,
             pretrained_config=pretrained_config,
@@ -104,6 +115,25 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             max_batch_size=max_batch_size,
             **kwargs,
         )
+        if self.max_draft_len:
+            # The first verify step of a request needs KV room for all
+            # ``1 + max_draft_len`` positions it writes, and the context phase is
+            # what has to have reserved it: capacity there is
+            # ``prompt + num_extra_kv_tokens``, and the generic one-engine reserve
+            # is ``max_draft_len - 1``. Measured on a real run: prompt 669,
+            # capacity 671, first verify step writing positions 669..672 -- two
+            # short, and only when that last position lands on a page boundary.
+            self.num_extra_kv_tokens = max(self.num_extra_kv_tokens, self.max_draft_len + 1)
+            # num_extra_kv_tokens is set inside super().__init__() from the spec
+            # config, so raising it here means re-deriving max_blocks_per_seq --
+            # which the base computed from the old value -- with the base's own
+            # formula, rather than leaving a per-sequence bound short by exactly
+            # the tokens just reserved.
+            max_seq_capacity = (
+                self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+            )
+            blocks = -(-max_seq_capacity // self.tokens_per_block)
+            self.max_blocks_per_seq = ((blocks + 3) // 4) * 4
         # Resolved on first use: `impl` is not guaranteed live at the end of
         # the base constructor. From the first conv layer, as Mamba does.
         self._conv_layer_group_id = None
@@ -115,9 +145,14 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             self._conv_dtype,
             reserve_attention_dp_slot=self._reserve_attention_dp_slot,
             max_draft_len=self.max_draft_len,
+            num_layers=_conv_num_layers,
+            layer_offset=_conv_layer_offset,
             allocate=self._conv_state_buffer,
             resolve_slot=self._conv_slot_for_request,
         )
+        # Retained for the post-verify conv commit, which runs from the spec
+        # worker after the forward context has exited and so cannot rebuild it.
+        self._last_conv_rt = None
         logger.info(
             f"Inkling short-conv state pool: {self._conv_cache.num_slots} rows "
             f"({self._num_conv_request_slots} request + "
@@ -480,6 +515,11 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         express four convs at two widths, and Inkling backs no SSM state at all.
         """
         return self._conv_cache.layer_state(layer_idx)
+
+    def get_conv_captures(self, layer_idx: int) -> InklingConvState:
+        """``layer_idx``'s verify-step captures; the four entries are None when
+        speculative decoding is off."""
+        return self._conv_cache.layer_capture(layer_idx)
 
     def get_state_indices(self) -> torch.Tensor:
         """Pool rows of the current batch, in packed batch order."""
