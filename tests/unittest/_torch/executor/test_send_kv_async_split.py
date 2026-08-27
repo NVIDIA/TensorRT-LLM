@@ -16,7 +16,9 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
 pytestmark = pytest.mark.cpu_only
 
@@ -57,8 +59,9 @@ def test_wrapper_keeps_connector_leg_without_transceiver() -> None:
 def test_disagg_send_leg_is_noop_without_transceiver() -> None:
     executor = _stub_executor()
     executor.kv_cache_transceiver = None
-    # Anything past the guard would hit unset executor attributes and raise.
-    PyExecutor._send_disagg_ctx_kv_async(executor, [Mock()])
+    # Use a request that passes the send filter: without the guard, the loop
+    # body would hit unset executor attributes and raise.
+    PyExecutor._send_disagg_ctx_kv_async(executor, [_finished_ctx_only_request()])
 
 
 def test_connector_save_leg_is_noop_without_connector() -> None:
@@ -174,3 +177,73 @@ def test_connector_save_skips_transfer_when_connector_declines() -> None:
     PyExecutor._save_kv_to_connector_async(executor, [finished])
 
     executor.async_transfer_manager.start_transfer.assert_not_called()
+
+
+def _dual_claim_executor() -> PyExecutor:
+    """Executor running the real wrapper, real legs, and a real
+    AsyncTransferManager; only the transceiver, connector, and KV cache
+    manager boundaries are mocked."""
+    executor = _stub_executor()
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_cache_indices.return_value = [7]
+    executor.kv_cache_manager = kv_cache_manager
+    resource_manager = SimpleNamespace(
+        resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
+    )
+    executor.async_transfer_manager = AsyncTransferManager(resource_manager)
+    transceiver = Mock()
+    transceiver.kv_transfer_timeout_ms = None
+    executor.kv_cache_transceiver = transceiver
+    executor.kv_connector_manager = Mock()
+    executor.disable_overlap_scheduler = True
+    executor.active_requests = []
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor._disagg_timed_out_ctx_cancelled_ids = set()
+    executor._terminate_request = Mock()
+    # Make the reap's trailing _check_cache_transfer_errors a no-op.
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(world_size=2)
+    return executor
+
+
+def _dual_claim_request(request_id: int) -> SimpleNamespace:
+    req = _finished_ctx_only_request(request_id)
+    req.is_finished = True  # the connector leg selects finished requests
+    req.py_kv_transfer_timed_out = False
+    req.state = None  # start_transfer overwrites
+    return req
+
+
+def test_reap_keeps_request_still_claimed_by_connector() -> None:
+    """The hazard the wrapper order exists for: a send that completes within
+    the same iteration must not release a request the connector also claimed.
+    Reaping before the connector leg would drop the transfer refcount to zero
+    and terminate the request; this test fails under that reordering."""
+    executor = _dual_claim_executor()
+    executor.kv_connector_manager.request_finished.return_value = True
+    req = _dual_claim_request(9)
+    # The send completes instantly, so the reap sees it in the same call.
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([9], [])
+
+    PyExecutor._send_kv_async(executor, [req])
+
+    # The reap released only the send's claim; the connector's claim keeps
+    # the request pinned.
+    assert 9 in executor.async_transfer_manager.requests_in_transfer()
+    executor.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    executor._terminate_request.assert_not_called()
+
+
+def test_reap_releases_request_once_connector_declines() -> None:
+    """Counterpart: with only the send's claim outstanding, the same fast
+    completion does release and terminate the request."""
+    executor = _dual_claim_executor()
+    executor.kv_connector_manager.request_finished.return_value = False
+    req = _dual_claim_request(9)
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([9], [])
+
+    PyExecutor._send_kv_async(executor, [req])
+
+    assert 9 not in executor.async_transfer_manager.requests_in_transfer()
+    executor.kv_cache_manager.unpin_blocks_by_id.assert_called_once()
+    executor._terminate_request.assert_called_once_with(req)

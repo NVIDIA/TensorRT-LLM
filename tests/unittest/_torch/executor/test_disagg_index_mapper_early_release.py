@@ -67,13 +67,10 @@ def create_mock_resource_manager(kv_cache_manager=None, seq_slot_manager=None):
     return resource_manager
 
 
-class _FakeExecutor:
-    """Minimal stand-in for PyExecutor so we can call the unbound
-    `_send_kv_async` method without constructing the real object."""
-
-    # `_send_kv_async` delegates to these legs; borrow the real implementations.
-    _send_disagg_ctx_kv_async = PyExecutor._send_disagg_ctx_kv_async
-    _save_kv_to_connector_async = PyExecutor._save_kv_to_connector_async
+class _FakeExecutor(PyExecutor):
+    """Minimal PyExecutor stand-in: inherits the real methods (so it keeps
+    working as `_send_kv_async` internals evolve) but skips
+    `PyExecutor.__init__` so no engine or distributed wiring is required."""
 
     def __init__(self, kv_cache_manager, async_transfer_manager, kv_cache_transceiver):
         self.kv_cache_manager = kv_cache_manager
