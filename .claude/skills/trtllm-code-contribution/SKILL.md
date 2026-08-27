@@ -82,7 +82,7 @@ grep -r "mla_rope_append_paged_kv\|append_paged_kv" tensorrt_llm/_torch/
 
 ```
 # Find all forward methods in a class
-grep -n "def forward" tensorrt_llm/_torch/attention/attention.py
+grep -n "def forward" tensorrt_llm/_torch/attention/mla.py
 # Then READ each one to understand what it does
 ```
 

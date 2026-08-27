@@ -78,7 +78,8 @@ measured: []
   access is.
 - **Apply via:** **not a server knob** — an FMHA kernel/dispatch change,
   auto-selected for DSA/sparse-MLA on SM100+ (`useSparseMLA()`, `mSparseMla`,
-  `forward_absorption` / `forward_generation_dsa`). The selection budget
+  `forward_absorption_context` / `forward_absorption_generation` /
+  `forward_generation_sparse_attn`). The selection budget
   (`sparse_mla_topk`) is a model/config property; the per-tensor FP8 KV rides on
   `kv_cache_config.dtype` (see [FP8 MLA KV](fp8-mla-kv-cache.md)). Delegate kernel
   work to **kernel-cuda-specialist**; profile with **perf-nsight-compute-analysis**.
@@ -108,8 +109,11 @@ measured: []
   `cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp` (`useSparseMLA()`, `mSparseMla`),
   `cpp/tensorrt_llm/kernels/.../fmhaReduction.cu`,
   `cpp/tensorrt_llm/common/attentionOp.cpp` (`mFP8ContextMLA`, K/V buffer sizing),
-  `tensorrt_llm/_torch/attention/attention.py` (`forward_absorption`,
-  `forward_generation_dsa`), `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py`
+  `tensorrt_llm/_torch/attention/mla.py` (`forward_absorption_context`,
+  `forward_absorption_generation`),
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/module.py`
+  (`forward_generation_sparse_attn`),
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py`
   (`sparse_mla_topk`). Owning specialist: **kernel-cuda-specialist**. Related: the
   [top-k selection kernel](specialize-topk-selection-kernel.md) (the producer of
   the indices), [split MLA reduction](split-mla-reduction-kernel.md) (the same

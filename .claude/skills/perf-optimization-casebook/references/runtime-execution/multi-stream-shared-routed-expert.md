@@ -34,4 +34,4 @@ measured: []
 - **Accuracy risk:** lossless (pure scheduling; identical math, only ordered by events).
 - **Verify:** TPOT/ITL + end-to-end latency at low concurrency with vs without CUDA Graphs; confirm two streams concurrently active in nsys. No parity check needed.
 - **Rollback:** pass `aux_stream=None` (disables multi-stream) or disable CUDA Graphs — falls back to sequential `fn0(); fn1()`. Trigger: throughput regression at high batch (tuned for low latency), or no measured overlap.
-- **Prior art:** PR #3459. Files: `_torch/modules/multi_stream_utils.py` (`maybe_execute_in_parallel`), `modeling_deepseekv3.py` (`Deepseekv3MoE.forward`), `_torch/attention/attention.py` (MLA), `_torch/utils.py` (`AuxStreamType`, `EventType`). Owning specialist: **perf-torch-cuda-graph-specialist**.
+- **Prior art:** PR #3459. Files: `_torch/modules/multi_stream_utils.py` (`maybe_execute_in_parallel`), `modeling_deepseekv3.py` (`Deepseekv3MoE.forward`), `_torch/attention/mla.py` (MLA), `_torch/utils.py` (`AuxStreamType`, `EventType`). Owning specialist: **perf-torch-cuda-graph-specialist**.

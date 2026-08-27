@@ -81,8 +81,9 @@ measured: []
   `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py` (`prepare_dense_topk_indices`),
   `tensorrt_llm/_torch/attention/backends/sparse/dsa/params.py`
   (`skip_indexer_for_short_seqs`, `q_split_threshold`),
-  `tensorrt_llm/_torch/attention/attention.py` (`_should_use_short_mha`,
-  `forward_context_dsa`), `tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py`
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/module.py`
+  (`should_use_short_mha`, `forward_context_sparse_attn`),
+  `tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py`
   (`short_seq_len_mode`). Owning skills: **trtllm-serve-config-guide**,
   **perf-torch-cuda-graph-specialist**. Related: the
   [sparse-MLA top-k attention](../kernel-and-fusion/sparse-mla-topk-attention.md) and

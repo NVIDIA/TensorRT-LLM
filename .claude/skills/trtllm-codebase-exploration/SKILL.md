@@ -37,7 +37,9 @@ grep -n "def " tensorrt_llm/_torch/attention/attention.py | head -50
 grep -n "self\." tensorrt_llm/_torch/attention/attention.py | grep "__init__" -A 200 | head -80
 
 # Find the class hierarchy
-grep -n "class MLA\|class Attention\|class TrtllmAttention" tensorrt_llm/_torch/attention/attention.py
+grep -n "class Attention" tensorrt_llm/_torch/attention/attention.py
+grep -n "class MLA" tensorrt_llm/_torch/attention/mla.py
+grep -n "class TrtllmAttention" tensorrt_llm/_torch/attention/backends/trtllm.py
 ```
 
 ### Step 2: Trace Existing Forward Methods
@@ -113,7 +115,7 @@ After identifying a method to reuse, understand what it does **NOT** handle:
 
 ```bash
 # Find all callers of the method to see its dispatch context
-grep -rn "forward_context_default\|forward_context(" tensorrt_llm/_torch/attention/attention.py
+grep -rn "forward_context_default\|forward_context(" tensorrt_llm/_torch/attention/mla.py
 
 # Look for the dispatcher that routes to this method
 # Often named similarly but without a suffix (e.g., forward_context dispatches to forward_context_default)
@@ -152,7 +154,7 @@ grep -rn "forward_context_default\|forward_context(" tensorrt_llm/_torch/attenti
 
 ```bash
 # Find what calls forward_context_default to discover the dispatch chain
-grep -n "forward_context_default" tensorrt_llm/_torch/attention/attention.py
+grep -n "forward_context_default" tensorrt_llm/_torch/attention/mla.py
 ```
 
 ### Pattern: "Does a Utility Already Exist?"

@@ -35,4 +35,4 @@ measured: []
 - **Accuracy risk:** lossy (FP8 e4m3 KV + FP8 Q); output BF16 but KV/Q rounding perturbs logits — needs accuracy record (GSM8K/MMLU vs BF16-KV) + rollback criterion before promotion.
 - **Verify:** decode throughput + KV bytes/step; accuracy parity vs `kv_cache_config.dtype="auto"`; confirm output stays BF16 (code asserts FP8-KV MLA requires bf16 output).
 - **Rollback:** `kv_cache_config.dtype="auto"`. Trigger: accuracy regression beyond recorded threshold, or FP8 gen-MLA kernel unavailable for the SM/head config.
-- **Prior art:** PR #3190. Files: `cpp/.../common/attentionOp.cpp` (`mFP8GenerationMLA`), `kernels/mlaKernels.cu`, `kernels/flashMLA/flash_fwd_mla_fp8_sm90.cu`, `_torch/attention/attention.py`. Owning specialist: **kernel-cuda-specialist**.
+- **Prior art:** PR #3190. Files: `cpp/.../common/attentionOp.cpp` (`mFP8GenerationMLA`), `kernels/mlaKernels.cu`, `kernels/flashMLA/flash_fwd_mla_fp8_sm90.cu`, `_torch/attention/mla.py`. Owning specialist: **kernel-cuda-specialist**.
