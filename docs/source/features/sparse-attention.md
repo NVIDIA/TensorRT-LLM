@@ -2,6 +2,7 @@
 
 - [Overview](#overview)
 - [Supported Algorithms](#supported-algorithms)
+- [Sparse MHA Kernel Support](#sparse-mha-kernel-support)
 - [Sparse MQA/GQA Kernel Support](#sparse-mqagqa-kernel-support)
 - [Configure Sparse Attention](#configure-sparse-attention)
 - [Algorithm Details](#algorithm-details)
@@ -32,7 +33,7 @@ model-specific guide says they are tunable.
 
 | `algorithm` | Config class | Sparse mechanism | Attention implementation | Typical use |
 |---|---|---|---|---|
-| `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for standard attention models |
+| `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
 | `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek V3.2 and compatible model-native DSA architectures |
 | `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
 | `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or MSA implementation | MiniMax-M3 sparse layers |
@@ -55,6 +56,40 @@ execution backend.
 "No" for RocketKV prefill means that prompt attention is still computed
 densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
 size and later decode work.
+
+## Sparse MHA Kernel Support
+
+RocketKV uses the shared page-sparse MHA path after its selector produces block
+indices and per-request offsets. Prefill attention remains dense: RocketKV can
+compact the retained KV cache after prefill, but sparse attention computation
+starts during generation.
+
+### Support Matrix
+
+| Parameter | Support |
+|---|---|
+| GPU architecture | SM100 is runtime-tested; SM103 is source-supported and enabled by the tests |
+| Sparse compute phase | Single-token and linear draft-token generation (`qSeqLen=4` is tested) |
+| Attention type | MHA (`num_q_heads == num_kv_heads`) |
+| Query heads per KV head | `1` |
+| Number of MHA heads | No additional discrete source restriction beyond `num_q_heads == num_kv_heads > 0`; tests cover `1`, `2`, `3`, `4`, `8`, `16`, `24`, `32`, `48`, `64`, `96`, and `128` |
+| Model Q/K/V input dtype | BF16 or FP16 |
+| Model Q/K/V input layout | Fused QKV |
+| Output dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` with an FP8 KV cache |
+| KV-cache dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` |
+| Q/K/V dimensions | Equal head dimensions of `64`, `80`, `128`, or `256` |
+| KV-cache layout | Paged KV cache; page sizes `8`, `16`, `32`, `64`, `128`, `256`, and `512` are tested |
+| Selection granularity | Block indices expanded to KV-cache pages |
+| Sparse indices | `int32` block indices with `int32` per-request offsets; per-head patterns, unordered indices, and variable request offsets are tested |
+| Sparse index block size | Blocks may cross KV-page boundaries; sizes `1`, `2`, `3`, `4`, `5`, `8`, `16`, `24`, `32`, and `48` are tested |
+| Attention semantics | Causal self-attention |
+
+Backend developers can use
+[`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
+as an architecture-level integration example. It supplies static page
+selections, invokes `TrtllmAttention.forward`, and compares the result with an
+equivalent token-level PyTorch reference. RocketKV selector, metadata, and KT
+cache tests remain under the `rocketkv/` subdirectory.
 
 ## Sparse MQA/GQA Kernel Support
 
@@ -161,10 +196,10 @@ The following sections list algorithm-specific settings and constraints.
 ### RocketKV
 
 [RocketKV](https://arxiv.org/pdf/2502.14051) is a training-free, two-stage
-algorithm for standard attention architectures. During prefill, it computes
-dense attention and permanently evicts prompt KV entries beyond a prompt
-budget. During decode, it scores retained pages and attends to the selected
-Top-K pages.
+algorithm for MHA, MQA, and GQA architectures. During prefill, it computes dense
+attention and permanently evicts prompt KV entries beyond a prompt budget.
+During decode, it scores retained pages and attends to the selected Top-K
+pages.
 
 RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
 block reuse and chunked prefill must be disabled, and disaggregated serving is
