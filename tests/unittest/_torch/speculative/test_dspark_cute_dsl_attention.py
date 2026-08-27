@@ -63,61 +63,68 @@ def _make_inputs(
     return q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs
 
 
-def _precompile_inputs(q, kv_cache):
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        precompile_dspark_attention,
-    )
-
-    precompile_dspark_attention(
-        q.shape[1],
-        q.shape[2],
-        kv_cache,
-        q.shape[-1] ** -0.5,
-    )
-
-
 def _legacy_valid_len(start_pos):
     return (start_pos.long() + 1).clamp(max=128)
 
 
-def _reference(q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, blk_freqs):
+def _prepare_attention_inputs(main_kv, block_kv, kv_cache, slots, start_pos):
+    kv_cache[slots.long(), (start_pos % kv_cache.shape[1]).long()] = main_kv
+    draft_block = block_kv.new_zeros((block_kv.shape[0], 8, block_kv.shape[2]))
+    draft_block[:, : block_kv.shape[1]].copy_(block_kv)
+    return draft_block, slots.to(torch.int32), start_pos.to(torch.int32)
+
+
+def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
+    storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
+    padded = storage[..., : x.shape[-1]]
+    padded.copy_(x)
+    return padded
+
+
+def _reference(
+    q,
+    main_kv,
+    block_kv,
+    kv_cache,
+    slots,
+    start_pos,
+    valid_len,
+    sink,
+    blk_freqs,
+    softmax_scale,
+):
     cache = kv_cache.clone()
     window = cache.shape[1]
     cache[slots.long(), (start_pos % window).long()] = main_kv
     kv_full = torch.cat([cache[slots.long()], block_kv], dim=1)
     topk = get_dspark_topk_idxs_batched(window, q.shape[1], start_pos.long(), valid_len)
-    o = dspark_sparse_attn(q, kv_full, sink, topk, q.shape[-1] ** -0.5)
+    o = dspark_sparse_attn(q, kv_full, sink, topk, softmax_scale)
     return _rope_last_dims_batched(o, _ROPE_DIM, blk_freqs, inverse=True), cache
 
 
 @pytest.mark.parametrize(
-    "invalid_case,reason",
+    ("invalid_case", "reason"),
     [
         ("q_dtype", "q dtype must be BF16"),
-        ("head_dim", "q must have 128 heads and head_dim 512"),
-        ("q_layout", "q must be contiguous"),
-        ("index_dtype", "slots and start_pos must use INT32 or INT64"),
-        ("q_rank", "expected q/main_kv/block_kv/kv_cache ranks 4/2/3/3"),
+        ("block_size", "draft block size must be 5 or 6"),
+        ("valid_len_dtype", "valid_len must use INT64"),
+        ("freqs_shape", "inverse_rope_freqs shape must be"),
     ],
 )
-def test_fused_dspark_attention_support_gate_rejects_invalid_inputs(
-    monkeypatch, invalid_case, reason
-):
+def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, invalid_case, reason):
     import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
 
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs()
-    valid_len = _legacy_valid_len(start_pos)
-    inputs = [q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, freqs]
+    q, _, _, kv_cache, _, start_pos, sink, _, freqs = _make_inputs()
+    inputs = [q, kv_cache, _legacy_valid_len(start_pos), sink, freqs]
     if invalid_case == "q_dtype":
-        inputs[0] = inputs[0].float()
-    elif invalid_case == "head_dim":
-        inputs[0] = inputs[0][..., :-1].contiguous()
-    elif invalid_case == "q_layout":
-        inputs[0] = inputs[0].transpose(0, 1).contiguous().transpose(0, 1)
-    elif invalid_case == "index_dtype":
-        inputs[5] = inputs[5].float()
+        inputs[0] = q.float()
+    elif invalid_case == "block_size":
+        inputs[0] = q[:, :4].contiguous()
+        inputs[4] = freqs[:, :4].contiguous()
+    elif invalid_case == "valid_len_dtype":
+        inputs[2] = inputs[2].to(torch.int32)
     else:
-        inputs[0] = inputs[0][0]
+        inputs[4] = freqs[:, :, :-1].contiguous()
 
     messages = []
     monkeypatch.setattr(
@@ -126,21 +133,48 @@ def test_fused_dspark_attention_support_gate_rejects_invalid_inputs(
         lambda *message, key: messages.append((" ".join(map(str, message)), key)),
     )
 
-    assert not dspark_attention_op.is_cute_dsl_dspark_attention_supported(*inputs)
+    assert not dspark_attention_op.is_fused_dsv4_dspark_attention_supported(*inputs)
     assert len(messages) == 1
     assert reason in messages[0][0]
-    assert messages[0][1][0] == "fused_dspark_attention_unsupported"
+    assert messages[0][1][0] == "fused_dsv4_dspark_attention_unsupported"
 
 
-def test_cute_dsl_dspark_attention_rejects_invalid_inputs():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+@pytest.mark.parametrize("invalid_case", ("draft_block_shape", "draft_block_layout", "index_dtype"))
+def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
+    monkeypatch, invalid_case
+):
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
 
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs()
     valid_len = _legacy_valid_len(start_pos)
-    inputs = [q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, freqs]
-    inputs[0] = inputs[0].float()
-    with pytest.raises(ValueError, match="requires contiguous BF16"):
-        cute_dsl_dspark_attention(*inputs, 512**-0.5)
+    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
+        main_kv, block_kv, kv_cache, slots, start_pos
+    )
+    if invalid_case == "draft_block_shape":
+        draft_block = draft_block[:, :-1].contiguous()
+    elif invalid_case == "draft_block_layout":
+        draft_block = _with_row_padding(draft_block)
+        assert not draft_block.is_contiguous()
+    else:
+        slots_i32 = slots_i32.long()
+
+    monkeypatch.setattr(
+        dspark_attention_op,
+        "_run_dspark_attention",
+        lambda *args: pytest.fail("invalid inputs reached the kernel launch"),
+    )
+    with pytest.raises(ValueError, match="requires contiguous supported DSV4 DSpark tensors"):
+        dspark_attention_op.fused_dsv4_dspark_attention(
+            q,
+            draft_block,
+            kv_cache,
+            slots_i32,
+            cache_seqs,
+            valid_len,
+            sink,
+            freqs,
+            q.shape[-1] ** -0.5,
+        )
 
 
 @pytest.mark.parametrize("block", (5, 6))
@@ -152,32 +186,42 @@ def test_cute_dsl_dspark_attention_rejects_invalid_inputs():
         ([257, 390], [128, 128]),
         # Partially filled windows: only rows 0..start_pos are attended.
         ([5, 100], [6, 101]),
-        # An odd batch exercises the same dynamic kernel as the even batches.
-        ([257, 5, 390], [128, 6, 128]),
         # Bootstrapped positions with short physical suffixes exercise wraparound.
         ([257, 390], [3, 5]),
     ],
-    ids=["full_window", "partial_window", "odd_batch", "wrapped_suffix"],
+    ids=["full_window", "partial_window", "wrapped_suffix"],
 )
-def test_cute_dsl_dspark_attention_matches_reference(block, start_pos_values, valid_len_values):
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+def test_fused_dsv4_dspark_attention_matches_reference(block, start_pos_values, valid_len_values):
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        fused_dsv4_dspark_attention,
+    )
 
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
         _make_inputs(29, block=block, start_pos_values=start_pos_values)
     )
     valid_len = torch.tensor(valid_len_values, device=q.device, dtype=torch.long)
     expected, expected_cache = _reference(
-        q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, blk_freqs
-    )
-    _precompile_inputs(q, kv_cache)
-
-    actual = cute_dsl_dspark_attention(
         q,
         main_kv,
         block_kv,
         kv_cache,
         slots,
         start_pos,
+        valid_len,
+        sink,
+        blk_freqs,
+        q.shape[-1] ** -0.5,
+    )
+    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
+        main_kv, block_kv, kv_cache, slots, start_pos
+    )
+
+    actual = fused_dsv4_dspark_attention(
+        q,
+        draft_block,
+        kv_cache,
+        slots_i32,
+        cache_seqs,
         valid_len,
         sink,
         inverse_rope_freqs,
@@ -188,9 +232,10 @@ def test_cute_dsl_dspark_attention_matches_reference(block, start_pos_values, va
     torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
 
 
-def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
+def test_fused_dsv4_dspark_attention_cuda_graph_replay():
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        cute_dsl_dspark_attention_prepared,
+        fused_dsv4_dspark_attention,
+        warmup_fused_dsv4_dspark_attention,
     )
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         cute_dsl_dspark_rmsnorm_rope,
@@ -214,15 +259,16 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
     start_pos = start_pos.long()
     valid_len = _legacy_valid_len(start_pos)
 
-    # All three dynamic-batch kernels are precompiled before capture.
-    _precompile_inputs(q, kv_cache)
+    # The named best-effort prewarm calls the same self-JIT ops used below,
+    # so graph capture sees only hot compile-cache entries.
+    warmup_fused_dsv4_dspark_attention(block, 1e-6)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         slots_i32, cache_seqs = cute_dsl_dspark_rmsnorm_rope_cache_write(
             main_x, weight, main_freqs, kv_cache, slots, start_pos, 1e-6
         )
         draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(block_x, weight, block_freqs, 1e-6)
-        captured = cute_dsl_dspark_attention_prepared(
+        captured = fused_dsv4_dspark_attention(
             q,
             draft_block,
             kv_cache,
@@ -253,6 +299,7 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
         valid_len,
         sink,
         blk_freqs,
+        scale,
     )
     graph.replay()
 
@@ -264,50 +311,9 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
     )
 
 
-def test_cute_dsl_dspark_attention_rejects_unsupported_shapes():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        is_cute_dsl_dspark_attention_supported,
-    )
-
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs()
-    valid_len = _legacy_valid_len(start_pos)
-    assert is_cute_dsl_dspark_attention_supported(
-        q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, freqs
-    )
-    # Draft lengths outside 5/6 and unsupported head counts fall back to
-    # the pure-PyTorch path.
-    q4 = q[:, :4].contiguous()
-    assert not is_cute_dsl_dspark_attention_supported(
-        q4,
-        main_kv,
-        block_kv[:, :4].contiguous(),
-        kv_cache,
-        slots,
-        start_pos,
-        valid_len,
-        sink,
-        freqs,
-    )
-    q_heads = q[:, :, :24].contiguous()
-    assert not is_cute_dsl_dspark_attention_supported(
-        q_heads,
-        main_kv,
-        block_kv,
-        kv_cache,
-        slots,
-        start_pos,
-        valid_len,
-        sink[:24].contiguous(),
-        freqs,
-    )
-
-
 @pytest.mark.parametrize("persist", (False, True))
 def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist):
     import tensorrt_llm._torch.models.dspark.attention as dspark_attention
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        precompile_dspark_attention,
-    )
 
     torch.manual_seed(17)
     device = torch.device("cuda")
@@ -347,20 +353,19 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     cache_storage = torch.randn(3, 3, window, head_dim, device=device, dtype=dtype) * 0.1
     op_cache = cache_storage[:, 1]
     fallback_cache = op_cache.clone()
-    precompile_dspark_attention(block, heads, op_cache, head_dim**-0.5)
     calls = {
-        "attention_prepared": 0,
+        "fused_attention": 0,
         "cache_write": 0,
         "draft_block": 0,
         "rmsnorm_rope": 0,
     }
-    op_attention = dspark_attention.cute_dsl_dspark_attention_prepared
+    op_attention = dspark_attention.fused_dsv4_dspark_attention
     op_cache_write = dspark_attention.cute_dsl_dspark_rmsnorm_rope_cache_write
     op_draft_block = dspark_attention.cute_dsl_dspark_rmsnorm_rope_draft_block
     op_rmsnorm_rope = dspark_attention.cute_dsl_dspark_rmsnorm_rope
 
     def counted_attention(*args):
-        calls["attention_prepared"] += 1
+        calls["fused_attention"] += 1
         return op_attention(*args)
 
     def counted_cache_write(*args):
@@ -376,7 +381,7 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
         return op_rmsnorm_rope(*args)
 
     with monkeypatch.context() as patch:
-        patch.setattr(dspark_attention, "cute_dsl_dspark_attention_prepared", counted_attention)
+        patch.setattr(dspark_attention, "fused_dsv4_dspark_attention", counted_attention)
         patch.setattr(
             dspark_attention,
             "cute_dsl_dspark_rmsnorm_rope_cache_write",
@@ -395,7 +400,7 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     # Main K/V and block K/V reuse their existing RMSNorm/RoPE launches for
     # physical preparation; only q_a and per-head q use the generic op.
     assert calls == {
-        "attention_prepared": 1,
+        "fused_attention": 1,
         "cache_write": 1,
         "draft_block": 1,
         "rmsnorm_rope": 2,
@@ -404,12 +409,7 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     with monkeypatch.context() as patch:
         patch.setattr(
             dspark_attention,
-            "is_cute_dsl_dspark_attention_prepared_supported",
-            lambda *args: False,
-        )
-        patch.setattr(
-            dspark_attention,
-            "is_cute_dsl_dspark_attention_supported",
+            "is_fused_dsv4_dspark_attention_supported",
             lambda *args: False,
         )
         patch.setattr(
@@ -425,12 +425,31 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     torch.testing.assert_close(op_cache, fallback_cache, rtol=2e-2, atol=2e-2)
 
 
-def test_precompile_builds_one_dynamic_batch_kernel_without_runtime_jit():
+def test_warmup_is_best_effort(monkeypatch):
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
+
+    warnings = []
+    monkeypatch.setattr(dspark_attention_op, "_get_dspark_arch_str", lambda: "sm_100")
+    monkeypatch.setattr(
+        dspark_attention_op,
+        "cute_dsl_dspark_rmsnorm_rope_cache_write",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic compile failure")),
+    )
+    monkeypatch.setattr(dspark_attention_op.logger, "warning", warnings.append)
+
+    dspark_attention_op.warmup_fused_dsv4_dspark_attention(5, 1e-6)
+
+    assert len(warnings) == 1
+    assert "self-JIT on first use" in warnings[0]
+    assert "synthetic compile failure" in warnings[0]
+
+
+def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales():
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        _compile_dspark_attention,
+        _dspark_attention_kernel_cache,
         _get_dspark_arch_str,
-        cute_dsl_dspark_attention,
-        precompile_dspark_attention,
+        fused_dsv4_dspark_attention,
+        is_dsv4_dspark_attention_config_supported,
     )
 
     assert [_get_dspark_arch_str(sm) for sm in (100, 103)] == [
@@ -440,53 +459,58 @@ def test_precompile_builds_one_dynamic_batch_kernel_without_runtime_jit():
     assert _get_dspark_arch_str(101) is None
     assert _get_dspark_arch_str(109) is None
     assert _get_dspark_arch_str() in ("sm_100", "sm_103")
+    assert is_dsv4_dspark_attention_config_supported(5, 128, 512, 128)
+    assert not is_dsv4_dspark_attention_config_supported(4, 128, 512, 128)
+    assert not is_dsv4_dspark_attention_config_supported(5, 24, 512, 128)
 
-    _compile_dspark_attention.cache_clear()
+    _dspark_attention_kernel_cache.clear()
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(
         11, start_pos_values=[300, 4, 250], cache_pages=40
     )
     scale = q.shape[-1] ** -0.5
     valid_len = _legacy_valid_len(start_pos)
 
-    # A missing key must fail before mutating cache and must never invoke JIT.
-    cache_before = kv_cache.clone()
-    with pytest.raises(RuntimeError, match="not precompiled"):
-        cute_dsl_dspark_attention(
-            q,
-            main_kv,
-            block_kv,
-            kv_cache,
-            slots,
-            start_pos,
-            valid_len,
-            sink,
-            freqs,
-            scale,
-        )
-    torch.testing.assert_close(kv_cache, cache_before, rtol=0, atol=0)
-    info = _compile_dspark_attention.cache_info()
-    assert info.currsize == 0
-    assert info.misses == 1
-    _compile_dspark_attention.cache_clear()
+    expected, expected_cache = _reference(
+        q,
+        main_kv,
+        block_kv,
+        kv_cache,
+        slots,
+        start_pos,
+        valid_len,
+        sink,
+        torch.view_as_complex(freqs),
+        scale,
+    )
+    # A missing key self-JITs through the production op.
+    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
+        main_kv, block_kv, kv_cache, slots, start_pos
+    )
+    actual = fused_dsv4_dspark_attention(
+        q,
+        draft_block,
+        kv_cache,
+        slots_i32,
+        cache_seqs,
+        valid_len,
+        sink,
+        freqs,
+        scale,
+    )
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
+    torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
+    assert len(_dspark_attention_kernel_cache) == 1
 
-    # Unsupported geometry silently no-ops rather than compiling at runtime.
-    precompile_dspark_attention(4, 128, kv_cache, scale)
-    precompile_dspark_attention(q.shape[1], 24, kv_cache, scale)
-    assert _compile_dspark_attention.cache_info().misses == 0
-
-    precompile_dspark_attention(q.shape[1], 128, kv_cache, scale)
-    info = _compile_dspark_attention.cache_info()
-    assert info.currsize == 1
-    assert info.misses == 1
-
-    # One compiled object covers different batch, page-count, and stride values.
-    for batch in (1, 3, 8, 32):
+    # Every runtime batch, page count, page stride, and softmax scale is a hot
+    # hit on the same compiled object without compiler calls or runtime padding.
+    for batch in (1, 3, 32):
         values = [5 + (37 * i) % 386 for i in range(batch)]
         args = _make_inputs(17 + batch, start_pos_values=values, cache_pages=batch + 41)
         q_b, main_b, block_b, cache_b, slots_b, pos_b, sink_b, blk_freqs_b, freqs_b = args
         if batch == 3:
             cache_b = cache_b.clone()
             assert cache_b.is_contiguous()
+        runtime_scale = scale if batch % 2 else scale * 0.5
         valid_len_b = _legacy_valid_len(pos_b)
         expected, expected_cache = _reference(
             q_b,
@@ -498,28 +522,133 @@ def test_precompile_builds_one_dynamic_batch_kernel_without_runtime_jit():
             valid_len_b,
             sink_b,
             blk_freqs_b,
+            runtime_scale,
         )
-        actual = cute_dsl_dspark_attention(
+        draft_block_b, slots_i32_b, cache_seqs_b = _prepare_attention_inputs(
+            main_b, block_b, cache_b, slots_b, pos_b
+        )
+        actual = fused_dsv4_dspark_attention(
             q_b,
-            main_b,
-            block_b,
+            draft_block_b,
             cache_b,
-            slots_b,
-            pos_b,
+            slots_i32_b,
+            cache_seqs_b,
             valid_len_b,
             sink_b,
             freqs_b,
-            scale,
+            runtime_scale,
         )
         torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
         torch.testing.assert_close(cache_b, expected_cache, rtol=0, atol=0)
-    assert _compile_dspark_attention.cache_info().misses == 1
+    assert len(_dspark_attention_kernel_cache) == 1
 
 
-def test_preparation_precompile_covers_dynamic_batches_without_runtime_jit():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        precompile_dspark_attention,
+def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypatch):
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
+
+    dspark_attention_op._dspark_attention_kernel_cache.clear()
+    arch_str = dspark_attention_op._get_dspark_arch_str()
+    assert arch_str is not None
+
+    def unexpected_compile_op(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("DSpark compilation used a real tensor specimen")
+
+    # Compile before runtime inputs exist. Compile-only pointers and the fake
+    # output anchor must not allocate or wrap a PyTorch tensor.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", unexpected_compile_op)
+        patch.setattr(torch, "empty_like", unexpected_compile_op)
+        patch.setattr(dspark_attention_op.cute.runtime, "from_dlpack", unexpected_compile_op)
+        compiled = dspark_attention_op._compile_dspark_attention(5, arch_str)
+    dspark_attention_op._dspark_attention_kernel_cache[(5, arch_str)] = compiled
+
+    args = _make_inputs(41, block=5, start_pos_values=[257, 9])
+    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = args
+    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
+        main_kv, block_kv, kv_cache, slots, start_pos
     )
+    valid_len = _legacy_valid_len(start_pos)
+    scale = q.shape[-1] ** -0.5
+
+    def unexpected_host_op(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("cached DSpark host wrapper used a Python tensor conversion or view")
+
+    monkeypatch.setattr(dspark_attention_op.cute.runtime, "from_dlpack", unexpected_host_op)
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_host_op)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", unexpected_host_op)
+    monkeypatch.setattr(torch.Tensor, "permute", unexpected_host_op)
+    monkeypatch.setattr(torch.Tensor, "unsqueeze", unexpected_host_op)
+    monkeypatch.setattr(torch.Tensor, "reshape", unexpected_host_op)
+
+    output = dspark_attention_op._run_dspark_attention(
+        q,
+        draft_block,
+        kv_cache,
+        slots_i32,
+        cache_seqs,
+        valid_len,
+        sink,
+        freqs,
+        scale,
+    )
+    assert output.shape == q.shape
+
+
+def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
+
+    dspark_attention_op._dspark_attention_kernel_cache.clear()
+    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(43, block=5)
+    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
+        main_kv, block_kv, kv_cache, slots, start_pos
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        dspark_attention_op,
+        "_compile_dspark_attention",
+        lambda *args: pytest.fail("compiler was called during CUDA graph capture"),
+    )
+    monkeypatch.setattr(
+        torch,
+        "empty_like",
+        lambda *args, **kwargs: pytest.fail("output allocated before the capture guard"),
+    )
+
+    with pytest.raises(RuntimeError, match="must be warmed up before CUDA graph capture"):
+        dspark_attention_op._run_dspark_attention(
+            q,
+            draft_block,
+            kv_cache,
+            slots_i32,
+            cache_seqs,
+            _legacy_valid_len(start_pos),
+            sink,
+            freqs,
+            q.shape[-1] ** -0.5,
+        )
+
+
+def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
+    import tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op as preparation_op
+
+    preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
+    preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        preparation_op.cute,
+        "compile",
+        lambda *args: pytest.fail("preparation compiler was called during CUDA graph capture"),
+    )
+
+    with pytest.raises(RuntimeError, match="cache-write must be warmed up"):
+        preparation_op._compile_dspark_rmsnorm_rope_cache_write(1e-6)
+    with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
+        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6)
+
+
+def test_preparation_self_jit_covers_dynamic_batches():
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         _compile_dspark_rmsnorm_rope_cache_write,
         _compile_dspark_rmsnorm_rope_draft_block,
@@ -538,26 +667,7 @@ def test_preparation_precompile_covers_dynamic_batches_without_runtime_jit():
     main_freqs[..., 0] = 1
     block_freqs[..., 0] = 1
 
-    cache_before = kv_cache.clone()
-    with pytest.raises(RuntimeError, match="not precompiled"):
-        cute_dsl_dspark_rmsnorm_rope_cache_write(
-            main_kv.unsqueeze(1),
-            weight,
-            main_freqs,
-            kv_cache,
-            slots.long(),
-            start_pos.long(),
-            1e-6,
-        )
-    with pytest.raises(RuntimeError, match="not precompiled"):
-        cute_dsl_dspark_rmsnorm_rope_draft_block(block_kv, weight, block_freqs, 1e-6)
-    torch.testing.assert_close(kv_cache, cache_before, rtol=0, atol=0)
-
-    _compile_dspark_rmsnorm_rope_cache_write.cache_clear()
-    _compile_dspark_rmsnorm_rope_draft_block.cache_clear()
-    precompile_dspark_attention(q.shape[1], q.shape[2], kv_cache, q.shape[-1] ** -0.5)
-
-    for batch in (1, 3, 8, 32):
+    for batch in (1, 3, 32):
         args = _make_inputs(31 + batch, batch=batch, cache_pages=40)
         q_b, main_b, block_b, cache_b, slots_b, pos_b, _, _, _ = args
         main_freqs_b = torch.zeros(batch, _ROPE_DIM // 2, 2, device=q.device)

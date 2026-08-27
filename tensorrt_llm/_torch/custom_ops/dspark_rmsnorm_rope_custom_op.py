@@ -16,19 +16,15 @@ from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
     DSparkRMSNormRoPEKernel,
 )
 
-_DSPARK_HEAD_DIM = 512
-_DSPARK_ROPE_DIM = 64
-_DSPARK_WINDOW_SIZE = 128
-_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSPARK_BLOCK_SIZES = (5, 6)
-_DSPARK_ARCH_BY_SM = {
+_DSV4_DSPARK_HEAD_DIM = 512
+_DSV4_DSPARK_ROPE_DIM = 64
+_DSV4_DSPARK_WINDOW_SIZE = 128
+_DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
+_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
+_DSV4_DSPARK_ARCH_BY_SM = {
     100: "sm_100",
     103: "sm_103",
 }
-
-# Worker initialization is process-local and single-threaded. This flag only
-# permits compile-cache misses during that initialization window.
-_dspark_preparation_compile_allowed = False
 
 
 @functools.cache
@@ -36,7 +32,7 @@ def _get_dspark_arch_str(sm_version: int | None = None) -> str | None:
     """Return the CuTe allocator arch for a supported DSpark GPU."""
     if sm_version is None:
         sm_version = get_sm_version()
-    return _DSPARK_ARCH_BY_SM.get(sm_version)
+    return _DSV4_DSPARK_ARCH_BY_SM.get(sm_version)
 
 
 def is_fused_dspark_rmsnorm_rope_supported(
@@ -85,15 +81,15 @@ def _is_dspark_cache_write_supported(
 ) -> bool:
     batch = x.shape[0] if x.ndim == 3 else -1
     return (
-        x.shape == (batch, 1, _DSPARK_HEAD_DIM)
+        x.shape == (batch, 1, _DSV4_DSPARK_HEAD_DIM)
         and is_fused_dspark_rmsnorm_rope_supported(
-            x, weight, freqs, num_heads=1, rope_dim=_DSPARK_ROPE_DIM
+            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
         )
         and kv_cache.is_cuda
         and kv_cache.dtype == x.dtype
         and kv_cache.ndim == 3
-        and kv_cache.shape[1:] == (_DSPARK_WINDOW_SIZE, _DSPARK_HEAD_DIM)
-        and kv_cache.stride(1) == _DSPARK_HEAD_DIM
+        and kv_cache.shape[1:] == (_DSV4_DSPARK_WINDOW_SIZE, _DSV4_DSPARK_HEAD_DIM)
+        and kv_cache.stride(1) == _DSV4_DSPARK_HEAD_DIM
         and kv_cache.stride(2) == 1
         and slots.is_cuda
         and slots.dtype == torch.int64
@@ -113,10 +109,10 @@ def _is_dspark_draft_block_supported(
 ) -> bool:
     block_size = x.shape[1] if x.ndim == 3 else -1
     return (
-        block_size in _DSPARK_BLOCK_SIZES
-        and x.shape[-1:] == (_DSPARK_HEAD_DIM,)
+        block_size in _DSV4_DSPARK_BLOCK_SIZES
+        and x.shape[-1:] == (_DSV4_DSPARK_HEAD_DIM,)
         and is_fused_dspark_rmsnorm_rope_supported(
-            x, weight, freqs, num_heads=1, rope_dim=_DSPARK_ROPE_DIM
+            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
         )
     )
 
@@ -186,47 +182,29 @@ def _compile_fused_dspark_rmsnorm_rope(
     )
 
 
-def precompile_dspark_attention_preparation(block_size: int, eps: float) -> None:
-    """Precompile the dynamic-batch cache-write and block-page variants."""
-    global _dspark_preparation_compile_allowed
-    if _get_dspark_arch_str() is None or block_size not in _DSPARK_BLOCK_SIZES:
-        return
-    if _dspark_preparation_compile_allowed:
-        raise RuntimeError("DSpark attention preparation precompile is already in progress")
-
-    _dspark_preparation_compile_allowed = True
-    try:
-        _compile_dspark_rmsnorm_rope_cache_write(eps)
-        _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
-    finally:
-        _dspark_preparation_compile_allowed = False
-
-
 @functools.cache
 def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
-    if not _dspark_preparation_compile_allowed:
+    if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "DSpark RMSNorm/RoPE cache-write kernel was not precompiled "
-            "during worker initialization"
+            "DSpark RMSNorm/RoPE cache-write must be warmed up before CUDA graph capture"
         )
-
     rows = cute.sym_int()
     pages = cute.sym_int()
     x_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (rows, _DSPARK_HEAD_DIM), stride_order=(1, 0)
+        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
     )
     weight_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (_DSPARK_HEAD_DIM,), stride_order=(0,)
+        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
     )
     freqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (rows, _DSPARK_ROPE_DIM // 2, 2),
+        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
         stride_order=(2, 1, 0),
     )
     cache_fake = cute.runtime.make_fake_tensor(
         cutlass.BFloat16,
-        (pages, _DSPARK_WINDOW_SIZE, _DSPARK_HEAD_DIM),
-        stride=(cute.sym_int64(), _DSPARK_HEAD_DIM, 1),
+        (pages, _DSV4_DSPARK_WINDOW_SIZE, _DSV4_DSPARK_HEAD_DIM),
+        stride=(cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
     )
     slots_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (rows,), stride_order=(0,))
     start_pos_fake = cute.runtime.make_fake_compact_tensor(
@@ -240,10 +218,10 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = DSparkRMSNormRoPECacheWriteKernel(
-        _DSPARK_HEAD_DIM,
-        _DSPARK_ROPE_DIM,
+        _DSV4_DSPARK_HEAD_DIM,
+        _DSV4_DSPARK_ROPE_DIM,
         eps,
-        _DSPARK_WINDOW_SIZE,
+        _DSV4_DSPARK_WINDOW_SIZE,
     )
     return cute.compile(
         kernel,
@@ -262,36 +240,35 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 @functools.cache
 def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float):
-    if not _dspark_preparation_compile_allowed:
+    if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "DSpark RMSNorm/RoPE draft-block kernel was not precompiled during worker initialization"
+            "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
         )
-
     rows = cute.sym_int()
     batch = cute.sym_int()
     x_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (rows, _DSPARK_HEAD_DIM), stride_order=(1, 0)
+        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
     )
     weight_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (_DSPARK_HEAD_DIM,), stride_order=(0,)
+        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
     )
     freqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (rows, _DSPARK_ROPE_DIM // 2, 2),
+        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
         stride_order=(2, 1, 0),
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
-        (batch, _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSPARK_HEAD_DIM),
+        (batch, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM),
         stride_order=(2, 1, 0),
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = DSparkRMSNormRoPEDraftBlockKernel(
-        _DSPARK_HEAD_DIM,
-        _DSPARK_ROPE_DIM,
+        _DSV4_DSPARK_HEAD_DIM,
+        _DSV4_DSPARK_ROPE_DIM,
         eps,
         block_size,
-        _DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
+        _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
     )
     return cute.compile(
         kernel,
@@ -378,7 +355,7 @@ def cute_dsl_dspark_rmsnorm_rope_cache_write(
     slots_i32 = torch.empty_like(slots, dtype=torch.int32)
     cache_seqs = torch.empty_like(start_pos, dtype=torch.int32)
     compiled(
-        x.view(-1, _DSPARK_HEAD_DIM),
+        x.view(-1, _DSV4_DSPARK_HEAD_DIM),
         weight,
         freqs,
         kv_cache,
@@ -421,9 +398,9 @@ def cute_dsl_dspark_rmsnorm_rope_draft_block(
     """Prepare a zero-padded draft block after validating the fused contract."""
     block_size = x.shape[1]
     compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
-    output = x.new_empty((x.shape[0], _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSPARK_HEAD_DIM))
+    output = x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
     compiled(
-        x.view(-1, _DSPARK_HEAD_DIM),
+        x.view(-1, _DSV4_DSPARK_HEAD_DIM),
         weight,
         freqs,
         output,
@@ -439,4 +416,4 @@ def _(
     eps: float,
 ) -> torch.Tensor:
     del weight, freqs, eps
-    return x.new_empty((x.shape[0], _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSPARK_HEAD_DIM))
+    return x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))

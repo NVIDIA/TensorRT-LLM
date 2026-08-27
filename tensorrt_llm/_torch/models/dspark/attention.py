@@ -41,10 +41,8 @@ from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from ...custom_ops.dspark_attention_custom_op import (
-        cute_dsl_dspark_attention,
-        cute_dsl_dspark_attention_prepared,
-        is_cute_dsl_dspark_attention_prepared_supported,
-        is_cute_dsl_dspark_attention_supported,
+        fused_dsv4_dspark_attention,
+        is_fused_dsv4_dspark_attention_supported,
     )
     from ...custom_ops.dspark_rmsnorm_rope_custom_op import (
         cute_dsl_dspark_rmsnorm_rope,
@@ -526,10 +524,10 @@ def dspark_attention_forward_batched(
 
     # The fused kernel requires explicit physical-window validity; None keeps
     # the reference path.
-    use_prepared_attention = (
+    use_fused_dsv4_dspark_attention = (
         valid_len is not None
         and IS_CUTLASS_DSL_AVAILABLE
-        and is_cute_dsl_dspark_attention_prepared_supported(
+        and is_fused_dsv4_dspark_attention_supported(
             q, write_target, valid_len, attn_sink, inverse_rope_freqs
         )
         and is_fused_dspark_attention_preparation_supported(
@@ -543,7 +541,7 @@ def dspark_attention_forward_batched(
             start_pos,
         )
     )
-    if use_prepared_attention:
+    if use_fused_dsv4_dspark_attention:
         slots_i32, cache_seqs = cute_dsl_dspark_rmsnorm_rope_cache_write(
             main_kv_input,
             kv_norm_w,
@@ -559,7 +557,7 @@ def dspark_attention_forward_batched(
             block_rope_freqs,
             eps,
         )
-        o = cute_dsl_dspark_attention_prepared(
+        o = fused_dsv4_dspark_attention(
             q,
             draft_block,
             write_target,
@@ -575,55 +573,25 @@ def dspark_attention_forward_batched(
         kv = _rmsnorm_rope_batched(block_kv_input, kv_norm_w, eps, rd, blk_freqs)
         main_kv_flat = main_kv.squeeze(1).to(write_target.dtype)
 
-        # Compatibility path for direct/int32 callers; the main path uses
-        # preparation.
-        if (
-            valid_len is not None
-            and IS_CUTLASS_DSL_AVAILABLE
-            and is_cute_dsl_dspark_attention_supported(
-                q,
-                main_kv_flat,
-                kv,
-                write_target,
-                slots,
-                start_pos,
-                valid_len,
-                attn_sink,
-                inverse_rope_freqs,
-            )
-        ):
-            o = cute_dsl_dspark_attention(
-                q,
-                main_kv_flat,
-                kv,
-                write_target,
-                slots,
-                start_pos,
-                valid_len,
-                attn_sink,
-                inverse_rope_freqs,
-                softmax_scale,
-            )
-        else:
-            slot_pos = start_pos % window_size  # [G]
-            write_target[slots, slot_pos] = main_kv_flat
-            cache_rows = write_target[slots]  # [G, window, head_dim]
-            kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
-            topk = get_dspark_topk_idxs_batched(window_size, block, start_pos, valid_len)
-            o = dspark_sparse_attn(
-                q, kv_full, attn_sink, topk, softmax_scale
-            )  # [G, block, h, head_dim]
-            o = _rmsnorm_rope_batched(
-                o,
-                kv_norm_w,
-                eps,
-                rd,
-                blk_freqs,
-                num_heads=n_heads,
-                apply_weight=False,
-                apply_rmsnorm=False,
-                inverse_rope=True,
-            )
+        slot_pos = start_pos % window_size  # [G]
+        write_target[slots, slot_pos] = main_kv_flat
+        cache_rows = write_target[slots]  # [G, window, head_dim]
+        kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
+        topk = get_dspark_topk_idxs_batched(window_size, block, start_pos, valid_len)
+        o = dspark_sparse_attn(
+            q, kv_full, attn_sink, topk, softmax_scale
+        )  # [G, block, h, head_dim]
+        o = _rmsnorm_rope_batched(
+            o,
+            kv_norm_w,
+            eps,
+            rd,
+            blk_freqs,
+            num_heads=n_heads,
+            apply_weight=False,
+            apply_rmsnorm=False,
+            inverse_rope=True,
+        )
 
     # Grouped low-rank O projection.
     o = o.reshape(g, block, n_groups, -1)

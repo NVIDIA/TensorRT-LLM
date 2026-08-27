@@ -5,6 +5,7 @@
 
 from typing import Tuple, Type
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
@@ -282,3 +283,95 @@ class DSparkAttention(DSparkAttentionKernel):
         self.tma_page_size_draft = self.qk_tiler_mn[1]
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
+
+    @cute.jit
+    def wrapper(
+        self,
+        batch_size: cutlass.Int32,
+        num_window_pages: cutlass.Int32,
+        window_page_stride: cutlass.Int64,
+        q_ptr: cute.Pointer,
+        window_ptr: cute.Pointer,
+        draft_ptr: cute.Pointer,
+        page_table_ptr: cute.Pointer,
+        cache_seqs_ptr: cute.Pointer,
+        valid_len_ptr: cute.Pointer,
+        attn_sink_ptr: cute.Pointer,
+        inverse_rope_freqs_ptr: cute.Pointer,
+        o_tensor: cute.Tensor,
+        softmax_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        """Build the runtime tensor layouts from pointers, then launch attention.
+
+        The pointer ABI keeps runtime inputs out of Python-side DLPack and view
+        conversion. ``o_tensor`` remains a tensor so TVM-FFI can select the
+        calling PyTorch stream, matching the CuTe DSL host-wrapper convention.
+        """
+        q_layout = cute.make_layout(
+            (self.num_heads, self.head_dim, self.seq_len_q, batch_size),
+            stride=(
+                self.head_dim,
+                1,
+                self.num_heads * self.head_dim,
+                self.seq_len_q * self.num_heads * self.head_dim,
+            ),
+        )
+        q = cute.make_tensor(q_ptr, layout=q_layout)
+        window = cute.make_tensor(
+            window_ptr,
+            layout=cute.make_layout(
+                (self.window_size, self.head_dim, num_window_pages),
+                stride=(self.head_dim, 1, window_page_stride),
+            ),
+        )
+        draft = cute.make_tensor(
+            draft_ptr,
+            layout=cute.make_layout(
+                (self.page_size_draft, self.head_dim, batch_size),
+                stride=(
+                    self.head_dim,
+                    1,
+                    self.page_size_draft * self.head_dim,
+                ),
+            ),
+        )
+        page_table = cute.make_tensor(
+            page_table_ptr,
+            layout=cute.make_layout((1, batch_size), stride=(1, 1)),
+        )
+        output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
+        cache_seqs = cute.make_tensor(
+            cache_seqs_ptr,
+            layout=cute.make_layout((batch_size,), stride=(1,)),
+        )
+        valid_len = cute.make_tensor(
+            valid_len_ptr,
+            layout=cute.make_layout((batch_size,), stride=(1,)),
+        )
+        attn_sink = cute.make_tensor(
+            attn_sink_ptr,
+            layout=cute.make_layout((self.num_heads,), stride=(1,)),
+        )
+        inverse_rope_freqs = cute.make_tensor(
+            inverse_rope_freqs_ptr,
+            layout=cute.make_layout(
+                (batch_size * self.seq_len_q * self.inverse_rope_dim,),
+                stride=(1,),
+            ),
+        )
+
+        self(
+            q,
+            window,
+            draft,
+            page_table,
+            output,
+            cache_seqs,
+            valid_len,
+            softmax_scale,
+            cutlass.Float32(1.0),
+            attn_sink,
+            inverse_rope_freqs,
+            stream,
+        )
