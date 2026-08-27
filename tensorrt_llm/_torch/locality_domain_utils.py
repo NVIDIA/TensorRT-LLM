@@ -151,6 +151,24 @@ class LocalityDomainResourceManager:
 _locality_domain_resource_manager: LocalityDomainResourceManager | None = None
 _manager_lock = threading.Lock()
 
+# Per-device locks guarding resource initialization. A device's lock is held across the
+# whole check-create-mark sequence, so concurrent callers cannot both create resources for
+# the same device. Distinct devices initialize concurrently. This must not be _manager_lock:
+# the initialization path calls get_locality_domain_resource_manager(), which takes that
+# lock, and threading.Lock is not reentrant.
+_init_locks: dict[int, threading.Lock] = {}
+_init_locks_lock = threading.Lock()
+
+
+def _get_init_lock(device_id: int) -> threading.Lock:
+    """Return the initialization lock for a device, creating it on first use."""
+    with _init_locks_lock:
+        lock = _init_locks.get(device_id)
+        if lock is None:
+            lock = threading.Lock()
+            _init_locks[device_id] = lock
+        return lock
+
 
 def get_locality_domain_resource_manager() -> LocalityDomainResourceManager:
     """
@@ -196,16 +214,23 @@ def cleanup_locality_domain_resources() -> None:
             _locality_domain_resource_manager.cleanup()
 
 
-def is_locality_domain_supported() -> bool:
+def is_locality_domain_supported(device: int | None = None) -> bool:
     """
     Check if LOCALITY_DOMAIN localization is supported on this system.
+
+    This issues a driver attribute query only. It creates no CUDA context and does not
+    partition the device, so it is safe to call before the caller has selected its device.
+
+    Args:
+        device: CUDA device ordinal to query. Defaults to the current device.
 
     Returns:
         bool: True if LOCALITY_DOMAIN localization is supported, False otherwise.
     """
     try:
-        handle = _tbr.LocalizationHandle()
-        return handle.supports_localization()
+        if device is None:
+            device = torch.cuda.current_device()
+        return _tbr.device_supports_locality_domain(device)
     except Exception:
         return False
 
@@ -373,6 +398,19 @@ def initialize_locality_domain_resources() -> None:
     if manager.is_initialized(device_id):
         return
 
+    with _get_init_lock(device_id):
+        # Re-check under the lock: another thread may have initialized this device
+        # between the check above and acquiring the lock.
+        if manager.is_initialized(device_id):
+            return
+
+        _initialize_locality_domain_resources_locked(manager, device_id)
+
+
+def _initialize_locality_domain_resources_locked(
+    manager: LocalityDomainResourceManager, device_id: int
+) -> None:
+    """Create this device's resources. Caller must hold the device's init lock."""
     initialize_locality_domain_allocators()
 
     # Create the LocalizationHandle for this device

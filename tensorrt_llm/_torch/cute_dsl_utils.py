@@ -6,7 +6,7 @@ IS_CUTLASS_DSL_AVAILABLE = False
 
 # Whether the additional CuTeDSL kernel set is present. Features that need those
 # kernels stay disabled when it is False, falling back to their default paths.
-IS_CUTLASS_DSL_INTERNAL_AVAILABLE = False
+IS_CUTLASS_DSL_EXTENDED_AVAILABLE = False
 
 if platform.system() != "Windows":
     try:

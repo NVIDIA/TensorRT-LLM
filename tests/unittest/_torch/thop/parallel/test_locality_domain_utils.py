@@ -23,6 +23,7 @@ Tests cover:
 """
 
 import os
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -71,7 +72,7 @@ class TestLocalityDomainSupport:
         result = is_locality_domain_supported()
         assert isinstance(result, bool)
 
-    def test_is_locality_domain_enabled_requires_rubin(self):
+    def test_is_locality_domain_enabled_requires_supported_arch(self):
         is_locality_domain_enabled.cache_clear()
         with (
             patch("torch.cuda.is_available", return_value=True),
@@ -84,7 +85,7 @@ class TestLocalityDomainSupport:
             assert not is_locality_domain_enabled()
         is_locality_domain_enabled.cache_clear()
 
-    def test_is_locality_domain_enabled_allows_rubin_when_supported(self):
+    def test_is_locality_domain_enabled_allows_supported_arch(self):
         is_locality_domain_enabled.cache_clear()
         with (
             patch("torch.cuda.is_available", return_value=True),
@@ -417,6 +418,49 @@ class TestLocalityDomainInitialization:
         initialize_locality_domain_resources()
         initialize_locality_domain_resources()
         initialize_locality_domain_resources()
+
+    def test_initialize_locality_domain_resources_concurrent(self, check_locality_domain_support):
+        """Concurrent callers must not each create their own set of resources.
+
+        Without a lock held across the check-create-mark sequence, every thread that passes
+        the is_initialized() check before any of them reaches mark_initialized() creates its
+        own streams, mempools and events. The later writer wins, while an earlier mempool may
+        already have been handed to a caller. Assert the pools are created exactly once.
+        """
+        locality_domain_utils.reset_locality_domain_resource_manager()
+
+        real_mempool = torch.cuda.MemPool
+        created = []
+        created_lock = threading.Lock()
+
+        def counting_mempool(*args, **kwargs):
+            with created_lock:
+                created.append(1)
+            return real_mempool(*args, **kwargs)
+
+        num_threads = 8
+        barrier = threading.Barrier(num_threads)
+        errors = []
+
+        def worker():
+            try:
+                barrier.wait()  # release all threads into the check at once
+                initialize_locality_domain_resources()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(torch.cuda, "MemPool", counting_mempool):
+            threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert not errors, f"concurrent initialization raised: {errors}"
+        # One mempool per locality domain, no matter how many threads raced.
+        assert len(created) == 2, (
+            f"expected 2 mempools, {num_threads} threads created {len(created)}"
+        )
 
 
 class TestLocalityDomainStream:

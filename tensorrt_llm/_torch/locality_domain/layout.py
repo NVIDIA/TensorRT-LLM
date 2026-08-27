@@ -160,7 +160,7 @@ def make_bf16_linear_output_layout(
 ) -> PartitionedTensorLayout:
     """Build padding-free BF16 Linear layout metadata for an output-N split.
 
-    The Rubin BF16 kernel requires each partition's contiguous N dimension to
+    The BF16 kernel requires each partition's contiguous N dimension to
     be 16-byte aligned. BF16 elements are two bytes, so the full output
     dimension must be a multiple of ``8 * num_partitions`` elements.
     """
