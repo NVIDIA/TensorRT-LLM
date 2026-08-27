@@ -73,6 +73,18 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
 
 
+def _uses_scaled_fp8_ngram_table(config) -> bool:
+    """Return whether the HF config declares the custom scaled-FP8 PLE table."""
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return False
+    if quantization_config.get("quant_method") != "fp8":
+        return False
+    excluded = quantization_config.get("modules_to_not_convert") or ()
+    marker = "ple.ple_embedding.ngram_embedding"
+    return not any(marker in module_name for module_name in excluded)
+
+
 def _splitmix64(x: int) -> int:
     """The finalizer mix used to seed the per-layer n-gram hash multipliers."""
     x = (x + _SPLITMIX_GAMMA) & _MASK64
@@ -313,6 +325,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.mapping = mapping
         self.tp_size = mapping.tp_size if mapping is not None else 1
         self.tp_rank = mapping.tp_rank if mapping is not None else 0
+        self.embedding_output_dtype = dtype
+        self.register_buffer(
+            "ngram_embedding_weight_scale",
+            None,
+            persistent=False,
+        )
         self.use_attention_dp_sharding = bool(
             mapping is not None and mapping.enable_attention_dp and self.tp_size > 1
         )
@@ -354,6 +372,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             // self.make_ngram_vocab_size_divisible_by
         ) * self.make_ngram_vocab_size_divisible_by
         self.padded_vocab_size = padded_vocab_size
+        weight_dtype = torch.float8_e4m3fn if _uses_scaled_fp8_ngram_table(config) else dtype
         if self.use_attention_dp_sharding:
             slice_width = math.ceil(padded_vocab_size / self.tp_size)
             self.vocab_start_index = self.tp_rank * slice_width
@@ -361,13 +380,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.ngram_embedding = Embedding(
                 slice_width,
                 self.head_dim_per_ngram,
-                dtype=dtype,
+                dtype=weight_dtype,
             )
         elif self.tp_size > 1:
             self.ngram_embedding = Embedding(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
-                dtype=dtype,
+                dtype=weight_dtype,
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
             )
@@ -379,8 +398,68 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.ngram_embedding = Embedding(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
-                dtype=dtype,
+                dtype=weight_dtype,
             )
+
+    def configure_fp8_weight_storage(
+        self,
+        weight_scale: torch.Tensor,
+        weight_dtype: torch.dtype,
+    ) -> None:
+        """Keep a scaled-FP8 n-gram table quantized until after lookup."""
+        if weight_scale.numel() != 1:
+            raise ValueError(
+                f"PLE n-gram weight scale must be scalar, got shape {tuple(weight_scale.shape)}"
+            )
+        scale = float(weight_scale.item())
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(f"PLE n-gram weight scale must be finite and positive, got {scale}")
+        if not weight_dtype.is_floating_point or weight_dtype.itemsize != 1:
+            raise ValueError(f"PLE scaled weight dtype must be FP8, got {weight_dtype}")
+
+        weight = self.ngram_embedding.weight
+        if weight.dtype != weight_dtype:
+            weight_shape = weight.shape
+            weight_device = weight.device
+            # Drop the checkpoint-sized BF16 allocation before creating the
+            # FP8 table. Evaluating a replacement Parameter in one assignment
+            # would transiently retain both tables and add roughly 50 GiB to
+            # peak device memory for the production shape.
+            self.ngram_embedding.register_parameter("weight", None)
+            del weight
+            self.ngram_embedding.weight = nn.Parameter(
+                torch.empty(weight_shape, device=weight_device, dtype=weight_dtype),
+                requires_grad=False,
+            )
+        self.ngram_embedding_weight_scale = (
+            weight_scale.detach()
+            .reshape(())
+            .to(
+                device=self.ngram_embedding.weight.device,
+                dtype=torch.float32,
+            )
+        )
+
+    def _dequantize_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if self.ngram_embedding_weight_scale is None:
+            return embeddings
+        output_dtype = self.embedding_output_dtype or torch.get_default_dtype()
+        return embeddings.float().mul_(self.ngram_embedding_weight_scale).to(output_dtype)
+
+    def _embed_fp8_tp(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+        """Look up a row-sharded FP8 table and communicate BF16 activations."""
+        owned = (ngram_ids >= self.vocab_start_index) & (ngram_ids < self.vocab_end_index)
+        local_ids = torch.where(
+            owned,
+            ngram_ids - self.vocab_start_index,
+            torch.zeros_like(ngram_ids),
+        )
+        partial = F.embedding(local_ids, self.ngram_embedding.weight)
+        partial = self._dequantize_embeddings(partial)
+        partial.masked_fill_(~owned.unsqueeze(-1), 0)
+        if self.tp_size > 1:
+            partial = self.ngram_embedding.all_reduce(partial)
+        return partial
 
     def _build_layer_multipliers(self, size: int) -> torch.Tensor:
         max_long = (1 << 63) - 1
@@ -468,6 +547,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         the physical token rows, look up only the locally-owned vocabulary rows,
         and reduce-scatter the summed embeddings back to the source rank.
         """
+        if not self.use_attention_dp_sharding and self.ngram_embedding_weight_scale is not None:
+            return self._embed_fp8_tp(ngram_ids)
         if not self.use_attention_dp_sharding:
             return self.ngram_embedding(ngram_ids)
 
@@ -504,6 +585,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             torch.zeros_like(gathered_ids),
         )
         partial = F.embedding(local_ids, self.ngram_embedding.weight)
+        partial = self._dequantize_embeddings(partial)
         partial.masked_fill_(~owned.unsqueeze(-1), 0)
         local_embeddings = reducescatter(
             partial,
