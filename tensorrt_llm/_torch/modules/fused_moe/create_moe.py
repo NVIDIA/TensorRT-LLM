@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Optional, Type
+from typing import Dict, Optional
 
 import torch
 
@@ -18,10 +18,11 @@ from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
+from .impl_base import MoEImplBase
 from .interface import MoE, MoEWeightLoadingMode
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
-from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE,
+from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE, MoEImplClass,
                              derive_moe_layer_shapes, infer_swiglu_gptoss_style,
                              resolve_moe_cls, resolve_moe_impl)
 from .routing import BaseMoeRoutingMethod
@@ -30,6 +31,7 @@ __all__ = [
     "create_moe",
     "create_moe_backend",
     "infer_swiglu_gptoss_style",
+    "MoEImplClass",
     "resolve_moe_cls",
     "resolve_moe_impl",
     "WIDEEP_DEPRECATION_MESSAGE",
@@ -37,7 +39,7 @@ __all__ = [
 
 
 def create_moe_backend(
-    moe_cls: Type[MoE],
+    moe_cls: MoEImplClass,
     routing_method: BaseMoeRoutingMethod,
     # TODO: remove num_experts, hidden_size, intermediate_size, dtype parameters
     # these parameters will be inferred from model_config.pretrained_config.
@@ -56,7 +58,7 @@ def create_moe_backend(
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
-    init_load_balancer: bool = True,
+    init_load_balancer: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
     activation: Optional[str] = None,
     situ_beta: Optional[float] = None,
@@ -64,12 +66,18 @@ def create_moe_backend(
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
-) -> MoE:
+) -> MoE | MoEImplBase | VanillaMoE:
     """
-    Create MoE backend instance with validation.
+    Create a MoE backend or a self-contained MoE layer.
+
+    Execution units (``MoEImplBase`` subclasses) are only ever constructed as
+    backends, so ``init_load_balancer`` defaults to ``False`` -- ``True`` asks
+    for a standalone layer and the impl constructor rejects it with a
+    ``TypeError``. The ``TritonFusedMoE`` and ``VanillaMoE`` branches are
+    complete layers and do not take the parameter at all.
 
     Args:
-        moe_cls: MoE backend class to instantiate
+        moe_cls: MoE backend or self-contained layer class to instantiate
         routing_method: Routing method for token-to-expert assignment
         num_experts: Total number of experts (if None, get from model_config.pretrained_config)
         hidden_size: Hidden dimension size (if None, get from model_config.pretrained_config)
@@ -95,7 +103,8 @@ def create_moe_backend(
         trtllm_gen_activation_beta: Optional backend-local activation beta
 
     Returns:
-        MoE: MoE backend instance
+        A ``MoEImplBase`` execution unit, a self-contained ``MoE`` layer, or
+        ``VanillaMoE``.
     """
     shapes = derive_moe_layer_shapes(
         model_config,
@@ -238,8 +247,10 @@ def create_moe_backend(
             activation_type=activation_type,
         )
     elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
-        # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
-        # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
+        # Both are constructed through the narrower CuteDsl argument set (no
+        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
+        # CutlassFusedMoE.__init__, which does accept those four, so widening
+        # this branch would need the allow-lists above to admit b12x first.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -372,7 +383,7 @@ def create_moe(
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
     communication_method: Optional[str] = None,
-) -> MoE:
+) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
 
@@ -404,7 +415,9 @@ def create_moe(
         communication_method: Optional ConfigurableMoE communication method
 
     Returns:
-        MoE: MoE instance
+        A complete MoE layer: a ``MoE`` (``ConfigurableMoE`` around an
+        execution unit, or ``TritonFusedMoE``), or ``VanillaMoE``. Never a bare
+        execution unit -- those only reach a model as ``ConfigurableMoE.backend``.
     """
     shapes = derive_moe_layer_shapes(
         model_config,
@@ -463,9 +476,11 @@ def create_moe(
             "TRTLLMGenFusedMoE without backend fallback, but resolved "
             f"{moe_cls.__name__}.")
 
-    if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                   CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
-                   MegaMoEDeepGemm, MegaMoECuteDsl, MarlinFusedMoE):
+    # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
+    # enough to be wrapped. Becoming *selectable* still needs the constructor
+    # branch in ``create_moe_backend`` above plus ``moe_resolution``'s
+    # ``IMPL_PRIORITY`` / ``BACKEND_FAMILY``.
+    if issubclass(moe_cls, MoEImplBase):
         return ConfigurableMoE(
             moe_cls=moe_cls,
             routing_method=routing_method,

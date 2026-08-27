@@ -109,7 +109,7 @@ def test_placeholder_registry_resolves_in_fresh_process():
         assert MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid("llama4", "image")
         assert MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
             "llama4", "image")
-        assert "qwen2_vl" in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()
+        assert "qwen3_vl" in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()
         """)
     )
 

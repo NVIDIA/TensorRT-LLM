@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,8 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -56,6 +58,52 @@ class _MultimodalModel(MultimodalModelMixin):
 
 class _EncoderCacheMultimodalModel(_MultimodalModel):
     supports_encoder_cache = True
+
+
+@dataclass
+class _ModelEngine:
+    model: _TextModel | _MultimodalModel
+    mm_encoder_output_budget_bytes: int | None = None
+
+
+def _make_reserve_creator(
+    model: _TextModel | _MultimodalModel,
+    *,
+    mm_encoder_output_budget_bytes: int | None = None,
+    disable_mm_encoder: bool = False,
+) -> KvCacheCreator:
+    llm_args = TorchLlmArgs(
+        model="dummy",
+        checkpoint_format="HF",
+        disable_mm_encoder=disable_mm_encoder,
+        multimodal_config=model.model_config.multimodal_config,
+    )
+    # Match ModelLoader: the model receives the effective, normalized config
+    # from TorchLlmArgs rather than retaining the caller's input object.
+    model.model_config.multimodal_config = llm_args.multimodal_config
+    model_engine = _ModelEngine(
+        model=model,
+        mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
+    )
+    return KvCacheCreator(
+        model_engine=model_engine,
+        draft_model_engine=None,
+        mapping=Mapping(),
+        net_max_seq_len=1,
+        kv_connector_manager=None,
+        max_num_tokens=1,
+        max_beam_width=1,
+        tokens_per_block=1,
+        max_seq_len=1,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(),
+        llm_args=llm_args,
+        speculative_config=None,
+        sparse_attention_config=None,
+        profiling_stage_data=None,
+        is_disagg=False,
+        skip_est=True,
+    )
 
 
 def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
@@ -105,6 +153,7 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         encoder_max_num_tokens=8192,
         use_mrope=False,
     )
+    creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
     creator._profiling_stage_data = {"enable_mm_reqs": True}
     creator._mapping = SimpleNamespace(enable_attention_dp=False)
     creator._max_num_tokens = 18
@@ -139,12 +188,14 @@ def _make_creator(
     sliding_window=None,
     use_sliding_window=None,
     max_attention_window=None,
+    max_beam_width=1,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
     _get_token_num_for_estimation only."""
     c = object.__new__(KvCacheCreator)
 
     c._tokens_per_block = tokens_per_block
+    c._max_beam_width = max_beam_width
     c._net_max_seq_len = 2048
     c._speculative_config = None
     c._dummy_reqs = dummy_reqs
@@ -240,6 +291,23 @@ def test_without_adp_all_blocks_counted():
     assert c._get_token_num_for_estimation() == n_reqs * 3 * tpb
 
 
+def test_max_beam_width_scales_estimation_blocks():
+    """Warm-up capacity uses the same configured beam width as dummy requests."""
+    tpb = 64
+    beam_width = 4
+    c = _make_creator(
+        tpb,
+        [_make_mock_request(128, beam_width=beam_width)],
+        enable_attention_dp=False,
+        tp_size=1,
+        max_beam_width=beam_width,
+    )
+    # Beam search falls back to V1; exercise the V1 memory-cap path.
+    c._is_kv_cache_manager_v2 = False
+
+    assert c._get_token_num_for_estimation() == 3 * beam_width * tpb
+
+
 @pytest.mark.parametrize("tp_size", [2, 4, 8])
 def test_adp_various_tp_sizes(tp_size):
     """ADP division must hold for several representative tp_size values."""
@@ -292,17 +360,27 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     encoder_cache_max_bytes,
     expected_reserve,
 ):
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(model=model_cls(encoder_cache_max_bytes))
+    creator = _make_reserve_creator(model_cls(encoder_cache_max_bytes))
 
     assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
 
 
+def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
+    model = _EncoderCacheMultimodalModel(64)
+    creator = _make_reserve_creator(
+        model,
+        disable_mm_encoder=True,
+    )
+
+    assert model.model_config.multimodal_config.encoder_cache_max_bytes == 0
+    assert creator._create_dummy_encoder_inputs() == []
+    assert creator._get_multimodal_encoder_memory_reserve() == 0
+
+
 def test_reserve_adds_only_unprofiled_output_capacity():
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(
+    creator = _make_reserve_creator(
+        _MultimodalModel(0),
         mm_encoder_output_budget_bytes=512,
-        model=_MultimodalModel(0),
     )
     assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
@@ -590,6 +668,7 @@ def test_creator_uses_v2_affine_cache_cost():
 
 def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
+    manager._has_cp_helix = False
     manager.num_local_layers = 3
     manager.pp_layers = [0, 1, 2]
     manager.max_attention_window_vec = [128, 128, None]
