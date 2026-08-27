@@ -235,6 +235,7 @@ class QwenImageBenchEvaluatorArgs:
     top_p: float = 1.0
     repetition_penalty: float = 1.05
     use_fast_processor: bool = False
+    trust_remote_code: bool = False
     enable_block_reuse: bool = False
     include_raw_outputs: bool = False
     max_batch_size: int = 1
@@ -552,7 +553,7 @@ class QwenImageBenchEvaluator:
         self._processor = AutoProcessor.from_pretrained(
             str(self.model_path),
             use_fast=self.args.use_fast_processor,
-            trust_remote_code=True,
+            trust_remote_code=self.args.trust_remote_code,
         )
         self._sampling_params = SamplingParams(
             max_tokens=self.args.max_tokens,
@@ -564,7 +565,7 @@ class QwenImageBenchEvaluator:
         self._llm_context = LLM(
             model=str(self.model_path),
             backend="pytorch",
-            trust_remote_code=True,
+            trust_remote_code=self.args.trust_remote_code,
             kv_cache_config=KvCacheConfig(
                 enable_block_reuse=self.args.enable_block_reuse,
                 max_tokens=self.args.kv_cache_max_tokens,
@@ -581,6 +582,9 @@ class QwenImageBenchEvaluator:
             self._llm_context.__exit__(None, None, None)
         self._llm = None
         self._llm_context = None
+        self._processor = None
+        self._model_type = None
+        self._sampling_params = None
 
     def evaluate_batch(
         self,
@@ -596,7 +600,7 @@ class QwenImageBenchEvaluator:
         self.start()
         return [
             self._evaluate_one(prompt, image, dimension_list)
-            for prompt, image in zip(prompt_list, image_list)
+            for prompt, image in zip(prompt_list, image_list, strict=True)
         ]
 
     def _evaluate_one(self, prompt: str, image: Any, dimensions: list[str]) -> QwenImageBenchResult:
@@ -701,7 +705,7 @@ class ImageGenerationEvaluationPipeline:
         eval_image_paths: dict[int, str] = {}
         image_output_path = Path(image_output_dir) if image_output_dir is not None else None
 
-        for idx, (prompt, output) in enumerate(zip(prompt_list, outputs)):
+        for idx, (prompt, output) in enumerate(zip(prompt_list, outputs, strict=True)):
             error = getattr(output, "error", None)
             image = getattr(output, "image", None)
             if error is not None:
@@ -743,7 +747,9 @@ class ImageGenerationEvaluationPipeline:
                 "Evaluator returned a different number of results than generated images"
             )
 
-        for idx, eval_result, image in zip(eval_indices, evaluator_results, eval_images):
+        for idx, eval_result, image in zip(
+            eval_indices, evaluator_results, eval_images, strict=True
+        ):
             results[idx] = ImageGenerationEvaluationResult(
                 prompt=eval_result.prompt,
                 score=eval_result.total_score,
@@ -763,7 +769,13 @@ class ImageGenerationEvaluationPipeline:
             for result in finalized_results
             if result.error is None and result.score is not None
         ]
-        aggregate_score = mean_non_none(successful_scores)
+        aggregate_scores = [
+            result.score if result.error is None and result.score is not None else 0.0
+            for result in finalized_results
+        ]
+        if len(aggregate_scores) < len(prompt_list):
+            aggregate_scores.extend([0.0] * (len(prompt_list) - len(aggregate_scores)))
+        aggregate_score = sum(aggregate_scores) / len(prompt_list)
         aggregation_seconds = time.monotonic() - aggregation_start
 
         return GenerationEvaluationResponse(

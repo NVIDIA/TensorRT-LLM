@@ -112,6 +112,14 @@ def _close_runtime(runtime: Any) -> None:
 class ImageGenerationEval:
     @click.command("image_generation_eval")
     @click.option(
+        "--visual_gen_args",
+        "--config",
+        "visual_gen_args",
+        type=str,
+        default=None,
+        help="Optional YAML file with VisualGen generator args. --config is an alias.",
+    )
+    @click.option(
         "--evaluator",
         required=True,
         type=str,
@@ -149,6 +157,7 @@ class ImageGenerationEval:
     @click.pass_context
     def command(
         ctx,
+        visual_gen_args: str | None,
         evaluator: str,
         evaluator_options: str | None,
         prompts: str,
@@ -160,15 +169,25 @@ class ImageGenerationEval:
         model = root_config.get("model")
         if not model:
             raise click.UsageError("image_generation_eval requires root --model.")
+        root_visual_gen_args = root_config.get("extra_llm_api_options")
+        if (
+            visual_gen_args is not None
+            and root_visual_gen_args is not None
+            and visual_gen_args != root_visual_gen_args
+        ):
+            raise click.UsageError(
+                "Specify generator config once. Prefer image_generation_eval "
+                "--visual_gen_args; root --config is only a compatibility alias "
+                "for this task."
+            )
+        generator_config = visual_gen_args or root_visual_gen_args
 
         prompt_ids, prompt_texts = _load_prompt_records(prompts, num_samples)
         output_path = Path(output_dir)
         generator = None
         evaluator_runtime = None
         try:
-            generator, generation_params = _build_visual_generator(
-                model, root_config.get("extra_llm_api_options")
-            )
+            generator, generation_params = _build_visual_generator(model, generator_config)
             evaluator_runtime = _build_image_evaluator(evaluator, evaluator_options)
             pipeline = ImageGenerationEvaluationPipeline(generator, evaluator_runtime)
             response = pipeline.run(
@@ -189,7 +208,7 @@ class ImageGenerationEval:
                 image_paths=image_paths,
                 metadata={
                     "generator_model": model,
-                    "generator_config": root_config.get("extra_llm_api_options"),
+                    "generator_config": generator_config,
                     "evaluator_model": evaluator,
                     "evaluator_options": evaluator_options,
                     "criteria": list(criteria) if criteria else None,

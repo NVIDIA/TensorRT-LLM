@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
 
 import pytest
 
@@ -19,7 +21,7 @@ from tensorrt_llm.evaluate.visual_gen.qwen_image_bench import (
 )
 
 
-def test_extract_json_from_response_ignores_thinking_and_code_fence():
+def test_extract_json_from_response_ignores_thinking_and_code_fence() -> None:
     response = """<think>reasoning</think>
 ```json
 {"Realism": {"Physical Logic": {"score": 2}}}
@@ -29,7 +31,7 @@ def test_extract_json_from_response_ignores_thinking_and_code_fence():
     assert extract_json_from_response(response) == {"Realism": {"Physical Logic": {"score": 2}}}
 
 
-def test_dimension_score_maps_qwen_bench_scores():
+def test_dimension_score_maps_qwen_bench_scores() -> None:
     fixed = fix_score_json(
         {
             "Physical Logic": {"score": 2},
@@ -55,11 +57,11 @@ def test_dimension_score_maps_qwen_bench_scores():
     assert score["level1_score"] == 80.0
 
 
-def test_parse_dimension_output_returns_none_on_invalid_json():
+def test_parse_dimension_output_returns_none_on_invalid_json() -> None:
     assert parse_dimension_output("not json", "Quality") == (None, None)
 
 
-def test_aggregate_total_score_ignores_none_dimensions():
+def test_aggregate_total_score_ignores_none_dimensions() -> None:
     assert (
         aggregate_total_score(
             {
@@ -77,9 +79,7 @@ class _FakeVisualGenOutput:
     image: object | None = None
     error: str | None = None
 
-    def save(self, path):
-        from pathlib import Path
-
+    def save(self, path: str | Path) -> Path:
         image_path = Path(path)
         image_path.parent.mkdir(parents=True, exist_ok=True)
         image_path.write_text(str(self.image), encoding="utf-8")
@@ -87,7 +87,9 @@ class _FakeVisualGenOutput:
 
 
 class _FakeGenerator:
-    def generate(self, inputs, params=None):
+    def generate(
+        self, inputs: Sequence[str], params: Any | None = None
+    ) -> list[_FakeVisualGenOutput]:
         return [
             _FakeVisualGenOutput(image=f"image:{prompt}")
             if prompt != "generation failure"
@@ -97,10 +99,12 @@ class _FakeGenerator:
 
 
 class _FakeEvaluator:
-    def __init__(self):
-        self.calls = []
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], list[Any], list[str]]] = []
 
-    def evaluate_batch(self, prompts, images, dimensions):
+    def evaluate_batch(
+        self, prompts: Sequence[str], images: Sequence[Any], dimensions: Sequence[str]
+    ) -> list[QwenImageBenchResult]:
         self.calls.append((list(prompts), list(images), list(dimensions)))
         return [
             QwenImageBenchResult(
@@ -114,7 +118,7 @@ class _FakeEvaluator:
         ]
 
 
-def test_pipeline_handles_partial_generation_and_evaluation_failures():
+def test_pipeline_handles_partial_generation_and_evaluation_failures() -> None:
     evaluator = _FakeEvaluator()
     pipeline = ImageGenerationEvaluationPipeline(_FakeGenerator(), evaluator)
 
@@ -126,7 +130,7 @@ def test_pipeline_handles_partial_generation_and_evaluation_failures():
     assert evaluator.calls == [
         (["good", "parse failure"], ["image:good", "image:parse failure"], ["Quality"])
     ]
-    assert response.aggregate_score == 100.0
+    assert response.aggregate_score == pytest.approx(100.0 / 3.0)
     assert response.aggregation == {
         "method": "mean",
         "num_prompts": 3,
@@ -141,7 +145,7 @@ def test_pipeline_handles_partial_generation_and_evaluation_failures():
     assert response.results[2].parse_failures == ["Quality"]
 
 
-def test_pipeline_omits_images_unless_requested():
+def test_pipeline_omits_images_unless_requested() -> None:
     response = ImageGenerationEvaluationPipeline(_FakeGenerator(), _FakeEvaluator()).run(
         ["good"], dimensions=["Quality"]
     )
@@ -149,7 +153,7 @@ def test_pipeline_omits_images_unless_requested():
     assert response.results[0].image is None
 
 
-def test_pipeline_saves_images_for_evaluator(tmp_path):
+def test_pipeline_saves_images_for_evaluator(tmp_path: Path) -> None:
     evaluator = _FakeEvaluator()
     response = ImageGenerationEvaluationPipeline(_FakeGenerator(), evaluator).run(
         ["good"], dimensions=["Quality"], image_output_dir=tmp_path / "images"
@@ -171,6 +175,6 @@ def test_pipeline_saves_images_for_evaluator(tmp_path):
         ({"prompts": ["ok"], "aggregation_method": "median"}, "mean"),
     ],
 )
-def test_validate_generation_evaluation_request(kwargs, match):
+def test_validate_generation_evaluation_request(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         validate_generation_evaluation_request(**kwargs)

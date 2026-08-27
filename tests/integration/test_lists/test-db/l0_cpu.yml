@@ -47,6 +47,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_flux_infer.py
+  - unittest/_torch/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
@@ -61,6 +62,7 @@ l0_cpu:
   - unittest/bindings
   - unittest/disaggregated
   - unittest/dynamo
+  - unittest/evaluate/test_image_generation_eval_cli.py
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py

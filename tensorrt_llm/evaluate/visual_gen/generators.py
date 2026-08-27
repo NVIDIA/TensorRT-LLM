@@ -38,14 +38,18 @@ def build_visual_generator(model: str, config_path: str | None):
         VisualGenArgs.from_dict(visual_gen_args_config) if visual_gen_args_config else None
     )
     generator = VisualGenGeneratorBackend(model=model, args=visual_gen_args)
-    params = generator.default_params
+    try:
+        params = generator.default_params
 
-    for key, value in generation_params_config.items():
-        if key not in type(params).model_fields:
-            raise click.BadParameter(
-                f"Unknown VisualGenParams field in --visual_gen_args: {key}",
-                param_hint="--visual_gen_args",
-            )
-        setattr(params, key, value)
+        for key, value in generation_params_config.items():
+            if key not in type(params).model_fields:
+                raise click.BadParameter(
+                    f"Unknown VisualGenParams field in --visual_gen_args: {key}",
+                    param_hint="--visual_gen_args",
+                )
+            setattr(params, key, value)
+    except Exception:
+        generator.close()
+        raise
 
     return generator, params

@@ -125,16 +125,14 @@ _CLICK_TO_LLM_ARG = {
               default=None,
               help="The revision to use for the HuggingFace model "
               "(branch name, tag name, or commit id).")
-@click.option("--visual_gen_args",
-              "--config",
+@click.option("--config",
               "--extra_llm_api_options",
               "extra_llm_api_options",
               type=str,
               default=None,
               help="Path to a YAML configuration file. Explicit CLI flags "
-              "take precedence over values in this file. Specify this as "
-              "--visual_gen_args. --config and --extra_llm_api_options are "
-              "supported aliases.")
+              "take precedence over values in this file. Can be specified "
+              "as either --config or --extra_llm_api_options.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
               default=False,

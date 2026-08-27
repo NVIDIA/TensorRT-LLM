@@ -11,8 +11,9 @@ import pytest
 from click.testing import CliRunner
 
 import tensorrt_llm.commands.eval as eval_cmd
-from tensorrt_llm.evaluate.visual_gen.config import split_generator_config
+from tensorrt_llm.evaluate.visual_gen.config import load_prompt_records, split_generator_config
 from tensorrt_llm.evaluate.visual_gen.evaluators import build_image_evaluator
+from tensorrt_llm.evaluate.visual_gen.generators import build_visual_generator
 from tensorrt_llm.evaluate.visual_gen.types import QwenImageBenchResult
 
 
@@ -80,11 +81,21 @@ def test_image_generation_eval_help_does_not_construct_text_llm(monkeypatch):
     assert "--evaluator-options" in result.output
 
 
-def test_visual_gen_args_is_documented_primary_config_option():
-    result = CliRunner().invoke(eval_cmd.main, ["--help"])
+def test_visual_gen_args_is_scoped_to_image_generation_eval():
+    runner = CliRunner()
+    root_result = runner.invoke(eval_cmd.main, ["--help"])
+    subcommand_result = runner.invoke(
+        eval_cmd.main,
+        ["--model", "generator", "image_generation_eval", "--help"],
+    )
 
-    assert result.exit_code == 0
-    assert result.output.index("--visual_gen_args") < result.output.index("--config")
+    assert root_result.exit_code == 0
+    assert "--visual_gen_args" not in root_result.output
+    assert "--config" in root_result.output
+    assert subcommand_result.exit_code == 0
+    assert subcommand_result.output.index("--visual_gen_args") < subcommand_result.output.index(
+        "--config"
+    )
 
 
 def test_config_alias_reaches_image_generation_eval_help():
@@ -93,9 +104,9 @@ def test_config_alias_reaches_image_generation_eval_help():
         [
             "--model",
             "generator",
+            "image_generation_eval",
             "--config",
             "generator.yaml",
-            "image_generation_eval",
             "--help",
         ],
     )
@@ -142,9 +153,9 @@ def test_image_generation_eval_cli_runs_pipeline_with_fakes(tmp_path, monkeypatc
         [
             "--model",
             "generator",
+            "image_generation_eval",
             "--visual_gen_args",
             str(generator_config),
-            "image_generation_eval",
             "--evaluator",
             "judge",
             "--evaluator-options",
@@ -181,6 +192,68 @@ def test_image_generation_eval_cli_runs_pipeline_with_fakes(tmp_path, monkeypatc
 def test_generator_config_rejects_backend_selector():
     with pytest.raises(click.BadParameter, match="Do not set a generator backend"):
         split_generator_config({"backend": "pytorch"})
+
+
+def test_prompt_records_reports_invalid_json(tmp_path):
+    prompts = tmp_path / "prompts.json"
+    prompts.write_text("{bad json", encoding="utf-8")
+
+    with pytest.raises(click.BadParameter, match="Invalid JSON prompt file"):
+        load_prompt_records(str(prompts))
+
+
+def test_prompt_records_reports_invalid_jsonl_line(tmp_path):
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text('{"prompt": "ok"}\n{bad json\n', encoding="utf-8")
+
+    with pytest.raises(click.BadParameter, match="Invalid JSON on line 2"):
+        load_prompt_records(str(prompts))
+
+
+def test_build_visual_generator_closes_on_generation_param_validation_error(tmp_path, monkeypatch):
+    import tensorrt_llm.evaluate.visual_gen.generators as generators
+    import tensorrt_llm.visual_gen as visual_gen
+
+    closed = []
+
+    class FakeVisualGenArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return config
+
+    class FakeParams:
+        model_fields = {"seed": object()}
+
+    class FakeBackend:
+        def __init__(self, model, args=None):
+            self.model = model
+            self.args = args
+
+        @property
+        def default_params(self):
+            return FakeParams()
+
+        def close(self):
+            closed.append(self)
+
+    config = tmp_path / "generator.yaml"
+    config.write_text("generation_params:\n  unknown: 1\n", encoding="utf-8")
+    monkeypatch.setattr(visual_gen, "VisualGenArgs", FakeVisualGenArgs)
+    monkeypatch.setattr(generators, "VisualGenGeneratorBackend", FakeBackend)
+
+    with pytest.raises(click.BadParameter, match="Unknown VisualGenParams field"):
+        build_visual_generator("generator", str(config))
+
+    assert len(closed) == 1
+
+
+def test_evaluator_options_pass_trust_remote_code(tmp_path):
+    evaluator_config = tmp_path / "evaluator.yaml"
+    evaluator_config.write_text("trust_remote_code: true\n", encoding="utf-8")
+
+    evaluator = build_image_evaluator("qwen-image-bench", str(evaluator_config))
+
+    assert evaluator.args.trust_remote_code is True
 
 
 @pytest.mark.parametrize("selector_key", ["model", "type", "backend"])

@@ -41,7 +41,13 @@ def load_prompt_records(
         raise click.BadParameter("--num-samples must be >= 1", param_hint="--num-samples")
 
     if path.suffix == ".json":
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise click.BadParameter(
+                f"Invalid JSON prompt file {path}: {exc}",
+                param_hint="--prompts",
+            ) from exc
         if not isinstance(parsed, list):
             raise click.BadParameter(
                 "JSON prompt files must contain a list", param_hint="--prompts"
@@ -49,12 +55,18 @@ def load_prompt_records(
         items = parsed
     else:
         items = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
             if line.startswith("{"):
-                items.append(json.loads(line))
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise click.BadParameter(
+                        f"Invalid JSON on line {line_number} of {path}: {exc}",
+                        param_hint="--prompts",
+                    ) from exc
             else:
                 items.append(line)
 
