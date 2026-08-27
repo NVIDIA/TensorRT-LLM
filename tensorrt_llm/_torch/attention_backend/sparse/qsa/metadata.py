@@ -109,6 +109,16 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         if num_seqs <= 0 or num_tokens <= 0:
             return
         seq_lens = self.seq_lens_cuda[:num_seqs]
+        if self.num_contexts == 0 and num_tokens == num_seqs:
+            from .kernels import triton_qsa_decode_token_mapping
+
+            triton_qsa_decode_token_mapping(
+                kv_lens=self.kv_lens_cuda_runtime[:num_seqs],
+                seq_lens=seq_lens,
+                request_indices=self.qsa_req_idx_per_token[:num_tokens],
+                logical_positions=self.qsa_logical_positions[:num_tokens],
+            )
+            return
         torch.cumsum(
             seq_lens,
             dim=0,
