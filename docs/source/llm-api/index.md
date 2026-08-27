@@ -126,20 +126,23 @@ The following tips typically assist new LLM API users who are familiar with othe
 
   This limitation is applicable for multi-GPU inference only.
 
-### FlashInfer JIT workspace for dynamically spawned MPI workers
+### FlashInfer JIT workspaces for MPI workers
 
-When the LLM API dynamically spawns multiple MPI workers, users affected by
-concurrent FlashInfer source-generation races can enable persistent, per-worker
-cache slots for FlashInfer JIT artifacts. Set
-`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1` before creating the LLM instance.
-The workaround preserves compiled artifacts between launches, and downloaded
-cubins remain in FlashInfer's shared cache. It is disabled by default and can
-be removed once FlashInfer guards source generation before writing shared
-workspace files.
+`trtllm-llmapi-launch` isolates FlashInfer JIT source-generation workspaces for
+multi-rank launches by default. Each rank claims a locked, persistent cache slot
+under `~/.cache/tensorrt_llm/flashinfer`, while downloaded cubins remain in
+FlashInfer's shared cache. This prevents concurrent ranks and jobs from writing
+the same generated source files without forcing a cold JIT compilation on every
+launch. Set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the
+launcher to disable this behavior.
 
-An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence. Workers
-started outside the LLM API's dynamic MPI pool must configure their own
-workspace isolation.
+For multiple MPI workers dynamically spawned by an LLM API process, set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1` before creating the LLM instance to
+enable the same persistent workspace isolation. Dynamic worker isolation remains
+disabled by default.
+
+An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
+launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is also preserved.
 
 ### Cannot quit after generation
 

@@ -5,6 +5,7 @@ import os
 import subprocess  # nosec B404
 import sys
 import threading
+from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
 
@@ -72,17 +73,27 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
-def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
+@pytest.mark.parametrize("task_type",
+                         ["submit", "submit_sync", "flashinfer_workspace"])
+def test_remote_mpi_session(
+    task_type: Literal["submit", "submit_sync", "flashinfer_workspace"],
+    tmp_path: Path,
+):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
     assert os.path.exists(test_file), f"Test file {test_file} does not exist"
     command = ["bash", test_file, task_type]
     print(' '.join(command))
+    env = os.environ.copy()
+    if task_type == "flashinfer_workspace":
+        env["HOME"] = str(tmp_path)
+        env.pop("FLASHINFER_WORKSPACE_BASE", None)
+        env.pop("FLASHINFER_CUBIN_DIR", None)
+        env.pop("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", None)
 
     with Popen(command,
-               env=os.environ,
+               env=env,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,

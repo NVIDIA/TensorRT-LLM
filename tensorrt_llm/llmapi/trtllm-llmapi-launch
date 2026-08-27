@@ -1,9 +1,14 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 set -Eeo pipefail
 
 task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
+
+flashinfer_workspace_lock_fd=200
 
 log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
 log_stderr "mpi_rank: $mpi_rank"
@@ -18,9 +23,98 @@ function mpi_world_size {
         echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
+    elif [ -n "$PMI_SIZE" ]; then
+        echo "$PMI_SIZE"
     else
         echo "1"
     fi
+}
+
+function set_shared_flashinfer_cubin_dir {
+    if [ -z "$FLASHINFER_CUBIN_DIR" ] && [ -n "$HOME" ]; then
+        export FLASHINFER_CUBIN_DIR="$HOME/.cache/flashinfer/cubins"
+    fi
+}
+
+function use_unique_flashinfer_workspace {
+    local temporary_root=${TMPDIR:-/tmp}
+    local workspace
+
+    if ! workspace=$(mktemp -d "$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.XXXXXXXX"); then
+        log_stderr "Failed to create a temporary FlashInfer JIT workspace"
+        return 1
+    fi
+
+    export FLASHINFER_WORKSPACE_BASE="$workspace"
+    set_shared_flashinfer_cubin_dir
+    log_stderr "Using temporary FlashInfer JIT workspace after persistent workspace isolation failed: $FLASHINFER_WORKSPACE_BASE"
+}
+
+function try_lock_flashinfer_workspace {
+    # flock(2) is attached to the inherited open file description, so the lock
+    # remains held by this launcher after the Python helper exits.
+    python3 - "$flashinfer_workspace_lock_fd" <<'PY'
+import sys
+
+try:
+    import fcntl
+
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(1)
+except (ImportError, OSError, TypeError, ValueError) as error:
+    print(f"Failed to lock the FlashInfer JIT workspace: {error}", file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
+function configure_flashinfer_workspace {
+    if [ -n "$FLASHINFER_WORKSPACE_BASE" ] || [ "$tllm_mpi_size" -le 1 ] || \
+        [ "${TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS:-1}" = "0" ]; then
+        return
+    fi
+
+    if [ -z "$HOME" ]; then
+        log_stderr "HOME is unset; persistent FlashInfer JIT workspace isolation is unavailable"
+        use_unique_flashinfer_workspace
+        return
+    fi
+
+    local workspace_root="$HOME/.cache/tensorrt_llm/flashinfer"
+    if ! mkdir -p "$workspace_root"; then
+        log_stderr "Failed to create the persistent FlashInfer JIT workspace root: $workspace_root"
+        use_unique_flashinfer_workspace
+        return
+    fi
+
+    local workspace_slot="$mpi_rank"
+    local workspace
+    local lock_status
+    while true; do
+        workspace="$workspace_root/rank-$workspace_slot"
+        if ! mkdir -p "$workspace" || ! exec 200>"$workspace/.lock"; then
+            log_stderr "Failed to prepare the persistent FlashInfer JIT workspace: $workspace"
+            exec 200>&-
+            use_unique_flashinfer_workspace
+            return
+        fi
+
+        if try_lock_flashinfer_workspace; then
+            export FLASHINFER_WORKSPACE_BASE="$workspace"
+            set_shared_flashinfer_cubin_dir
+            log_stderr "FlashInfer JIT workspace: $FLASHINFER_WORKSPACE_BASE"
+            return
+        else
+            lock_status=$?
+        fi
+
+        exec 200>&-
+        if [ "$lock_status" -ne 1 ]; then
+            use_unique_flashinfer_workspace
+            return
+        fi
+        workspace_slot=$((workspace_slot + tllm_mpi_size))
+    done
 }
 
 function maybe_export_free_tcp_addr_for_spawn_proxy_process {
@@ -37,11 +131,15 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 }
 
 
-export tllm_mpi_size=$(mpi_world_size)
+tllm_mpi_size=$(mpi_world_size)
+export tllm_mpi_size
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
+configure_flashinfer_workspace
 
 unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
+# The launcher owns the workspace lock. Long-lived child commands close its
+# descriptor so detached descendants cannot keep a stale slot locked.
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     if ! hmac_key=$(openssl rand -hex 32); then
         log_stderr "Failed to generate TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
@@ -83,12 +181,12 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         set +e
 
         # Execute the task with cleaned environment
-        "${task_with_command[@]}"
+        "${task_with_command[@]}" 200>&-
         task_exit_code=$?
         log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
         # Stop the MPI Comm server
-        python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
+        python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop 200>&-
         mpi_exit_code=$?
         log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
 
@@ -109,7 +207,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
     log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
     log_stderr "Rank0 host: $HOSTNAME"
-    python3 -m tensorrt_llm.llmapi.mgmn_leader_node
+    python3 -m tensorrt_llm.llmapi.mgmn_leader_node 200>&-
     mgmn_leader_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN leader node exit code: $mgmn_leader_node_exit_code"
 
@@ -130,7 +228,7 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
-    python3 -m tensorrt_llm.llmapi.mgmn_worker_node
+    python3 -m tensorrt_llm.llmapi.mgmn_worker_node 200>&-
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
 
