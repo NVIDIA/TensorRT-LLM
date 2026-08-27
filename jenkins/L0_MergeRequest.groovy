@@ -2224,6 +2224,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            // Canonical images carry BOLT profiles: the raw build is
+                            // published as <tag>-noprofiles and <tag> is produced by the
+                            // overlay. A missing bundle is fatal only on the release path;
+                            // elsewhere it retags the plain build. boltProfileBranch is
+                            // left unset so the job resolves LLM_BRANCH -> main, which is
+                            // correct for release branches and PR refs alike.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': runMode == "nightly_release",
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2290,7 +2298,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'buildInternalRelease': false,
                             'buildCiImage': false,
                             'artifactPath': ARTIFACT_PATH,
-                            'uploadPath': UPLOAD_PATH
+                            'uploadPath': UPLOAD_PATH,
+                            // Must match Build-Docker-Images above: this path pushes the
+                            // same tags, so the scanned+registered image has to be the
+                            // BOLTed canonical one rather than a plain build.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': runMode == "nightly_release",
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
