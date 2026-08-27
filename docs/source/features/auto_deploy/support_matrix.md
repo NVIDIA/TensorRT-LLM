@@ -14,7 +14,6 @@ In addition, the following models have been officially validated using the defau
 <details>
 <summary>Click to expand supported models list</summary>
 
-- Qwen/QwQ-32B
 - Qwen/Qwen2.5-0.5B-Instruct
 - Qwen/Qwen2.5-1.5B-Instruct
 - Qwen/Qwen2.5-3B-Instruct
@@ -30,7 +29,6 @@ In addition, the following models have been officially validated using the defau
 - apple/OpenELM-3B-Instruct
 - apple/OpenELM-450M-Instruct
 - bigcode/starcoder2-15b-instruct-v0.1
-- bigcode/starcoder2-7b
 - deepseek-ai/DeepSeek-Prover-V1.5-SFT
 - deepseek-ai/DeepSeek-Prover-V2-7B
 - deepseek-ai/DeepSeek-R1-Distill-Llama-70B

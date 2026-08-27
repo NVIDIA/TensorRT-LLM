@@ -680,14 +680,6 @@ def llama_model_root(request):
     elif request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-v3-8b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3", "8B")
-    elif request.param == "llama-v3-8b-instruct-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "llama-v3-8b-instruct-hf")
-    elif request.param == "Llama-3-8B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-8B-Instruct-Gradient-1048k")
     elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
         llama_model_root = os.path.join(models_root, "llama-models-v3",
                                         "Llama-3-70B-Instruct-Gradient-1048k")
@@ -703,21 +695,6 @@ def llama_model_root(request):
     elif request.param == "llama-3.1-8b-hf-nvfp4":
         llama_model_root = os.path.join(models_root, "nvfp4-quantized",
                                         "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.2-1b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B")
-    elif request.param == "llama-3.2-1b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B-Instruct")
-    elif request.param == "llama-3.2-3b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B")
-    elif request.param == "llama-3.2-3b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B-Instruct")
-    elif request.param == "llama-3.3-70b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.3-models",
-                                        "Llama-3.3-70B-Instruct")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -910,21 +887,6 @@ def mamba_model_root(request):
 
 
 @pytest.fixture(scope="function")
-def nemotron_nas_model_root(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-
-    nemotron_nas_model_root = os.path.join(models_root, "nemotron-nas",
-                                           request.param)
-
-    assert exists(
-        nemotron_nas_model_root), f"{nemotron_nas_model_root} doesn't exist!"
-
-    return nemotron_nas_model_root
-
-
-@pytest.fixture(scope="function")
 def llm_lora_model_root(request):
     "get lora model path"
     models_root = llm_models_root()
@@ -953,43 +915,10 @@ def llm_lora_model_root(request):
                     "starcoder",
                     "peft-lora-starcoder2-15b-unity-copilot",
                 ))
-        elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
-            model_root_list.append(
-                os.path.join(
-                    models_root, "nemotron-nas",
-                    "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
         elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
             model_root_list.append(
                 os.path.join(models_root, "gpt_oss",
                              "gpt-oss-20b-lora-adapter_NIM_r8"))
-
-    return ",".join(model_root_list)
-
-
-@pytest.fixture(scope="function")
-def llm_dora_model_root(request):
-    "get dora model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-    model_list = []
-    model_root_list = []
-    if isinstance(request.param, tuple):
-        model_list = list(request.param)
-    else:
-        model_list = [request.param]
-
-    for item in model_list:
-        if item == "commonsense-llama-v3-8b-dora-r32":
-            model_root_list.append(
-                os.path.join(
-                    models_root,
-                    "llama-models-v3",
-                    "DoRA-weights",
-                    "llama_dora_commonsense_checkpoints",
-                    "LLama3-8B",
-                    "dora_r32",
-                ))
 
     return ",".join(model_root_list)
 

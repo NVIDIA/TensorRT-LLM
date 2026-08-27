@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import sys
 import unittest
@@ -68,16 +83,18 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
 
 @pytest.mark.high_cuda_memory
 def test_llama_draft_target_rejection():
-    """DraftTarget one-model with rejection sampling on: the rejection path
-    (draft-prob capture -> fail-closed guard -> rejection acceptance) runs
-    end-to-end with non-greedy sampling and produces coherent output."""
+    """Run rejection sampling with a distinct retained Llama-3.1 drafter.
+
+    The test verifies that drafting occurs and at least one draft token is
+    rejected under deterministic non-greedy sampling.
+    """
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 60:
         pytest.skip("Not enough memory to load target model")
 
     models_path = llm_models_root()
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    draft_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B-Instruct"
+    draft_model_dir = f"{models_path}/llama-3.1-model/Meta-Llama-3.1-8B"
 
     spec_config = DraftTargetDecodingConfig(
         max_draft_len=4,
@@ -94,6 +111,7 @@ def test_llama_draft_target_rejection():
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=8192),
         max_num_tokens=2048,
         speculative_config=spec_config,
+        return_perf_metrics=True,
     )
     prompts = [
         "The capital of France is",
@@ -101,15 +119,28 @@ def test_llama_draft_target_rejection():
     ]
     # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
     sampling_params = SamplingParams(
-        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234
+        max_tokens=32,
+        temperature=0.8,
+        top_p=0.95,
+        top_k=50,
+        seed=1234,
+        return_perf_metrics=True,
     )
     outputs = llm.generate(prompts, sampling_params)
     llm.shutdown()
 
     assert len(outputs) == len(prompts)
+    total_drafted = 0
+    total_accepted = 0
     for out in outputs:
         assert len(out.outputs[0].token_ids) > 0
         assert out.outputs[0].text.strip()
+        metrics = out.outputs[0].request_perf_metrics.speculative_decoding
+        total_drafted += metrics.total_draft_tokens
+        total_accepted += metrics.total_accepted_draft_tokens
+
+    assert total_drafted > 0
+    assert total_accepted < total_drafted
 
 
 if __name__ == "__main__":

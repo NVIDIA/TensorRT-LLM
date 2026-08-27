@@ -248,13 +248,6 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "nemotron_nas_ultra_mha",
-        "Nemotron-NAS Ultra 253B",
-        num_heads=128,
-        num_kv_heads=128,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
         "generic_16h_mha_hd64",
         "Generic RoPE MHA backend shape retained for head-dimension coverage",
         num_heads=16,
@@ -281,13 +274,6 @@ _STANDARD = [
         num_heads=40,
         num_kv_heads=10,
         head_dim=128,
-    ),
-    ModelAttnConfig(
-        "nemotron_nas_mha_hd64",
-        "Nemotron-NAS / DeciLM mini",
-        num_heads=32,
-        num_kv_heads=32,
-        head_dim=64,
     ),
     ModelAttnConfig(
         "gpt_oss_gqa_hd64_gptj",

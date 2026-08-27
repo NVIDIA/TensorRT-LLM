@@ -1377,25 +1377,6 @@ _allowed_configs = {
                logits_soft_cap=30.0,
                state_dtype="float32",
            )),
-    "llama_v3_8b_instruct":
-    Config(name="llama_v3_8b_instruct",
-           family="llama",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=1024,
-               max_seq_len=2048,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=8,
-               hidden_size=4096,
-               vocab_size=128256,
-               hidden_act='silu',
-               n_positions=8192,
-               inter_size=14336,
-           ))
 }
 
 

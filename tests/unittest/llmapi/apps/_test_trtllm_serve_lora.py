@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import subprocess
 import sys
@@ -12,9 +27,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import get_model_path
 
 
-@pytest.fixture(scope="module", ids=["llama-models/llama-7b-hf"])
+@pytest.fixture(scope="module", ids=["Llama-3.1-8B-Instruct"])
 def model_name() -> str:
-    return "llama-models/llama-7b-hf"
+    return "Llama-3.1-8B-Instruct"
 
 
 @pytest.fixture(scope="module")
@@ -24,10 +39,14 @@ def temp_extra_llm_api_options_file():
     try:
         extra_llm_api_options_dict = {
             "lora_config": {
-                "lora_target_modules": ['attn_q', 'attn_k', 'attn_v'],
-                "max_lora_rank": 8,
-                "max_loras": 4,
-                "max_cpu_loras": 4,
+                "lora_dir":
+                [get_model_path("lora/llama-3-chinese-8b-instruct-v2-lora")],
+                "max_lora_rank":
+                64,
+                "max_loras":
+                4,
+                "max_cpu_loras":
+                4,
             }
         }
 
@@ -42,7 +61,7 @@ def temp_extra_llm_api_options_file():
 
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
-    model_path = get_model_path(model_name)
+    model_path = get_model_path(f"llama-3.1-model/{model_name}")
     args = [
         "--backend", "pytorch", "--extra_llm_api_options",
         temp_extra_llm_api_options_file

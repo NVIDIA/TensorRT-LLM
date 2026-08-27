@@ -20,7 +20,7 @@
 """Slimmed down PyTorch Starcoder2 model implementation for auto_deploy export.
 
 Source:
-https://huggingface.co/bigcode/starcoder2-7b
+https://huggingface.co/bigcode/starcoder2-15b
 
 This implementation differs from the original HuggingFace version in the following ways:
 * Simplified for prefill-only inference (no KV caching)
