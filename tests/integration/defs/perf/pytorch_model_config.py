@@ -129,7 +129,7 @@ def get_model_yaml_config(model_label: str,
                     'free_gpu_memory_fraction': 0.5,
                 },
                 'enable_chunked_prefill': False,
-                'disable_overlap_scheduler': True,
+                'disable_overlap_scheduler': False,
                 'custom_tokenizer': 'deepseek_v4',
                 'speculative_config': {
                     'decoding_type':
@@ -444,7 +444,7 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': False,
-                'disable_overlap_scheduler': True,
+                'disable_overlap_scheduler': False,
                 'enable_autotuner': False,
                 'cuda_graph_config': {
                     'enable_padding': True,

@@ -21,7 +21,7 @@ server_configs:
     attn_backend: "TRTLLM"
     enable_attention_dp: true
     enable_chunked_prefill: true
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     allreduce_strategy: MNNVL
     num_postprocess_workers: 8
     print_iter_log: true
