@@ -247,31 +247,6 @@ class PersistentDenseGemmKernelDynamicPreferredCluster(PersistentDenseGemmKernel
         self.cta_sync_bar_id = 0
         # tmem_alloc_sync_bar_id, tmem_dealloc_sync_bar_id already set by parent
 
-    def check_mma_tiler_and_cluster_shape(self):
-        """Validate the MMA tiler and both preferred and fallback clusters."""
-        super().check_mma_tiler_and_cluster_shape()
-
-        def is_power_of_2(value: int) -> bool:
-            return value > 0 and (value & (value - 1)) == 0
-
-        preferred_m, preferred_n = self.preferred_cluster_shape_mn
-        fallback_m, fallback_n = self.fallback_cluster_shape_mn
-        if (
-            not is_power_of_2(preferred_m)
-            or not is_power_of_2(preferred_n)
-            or preferred_m * preferred_n > 16
-        ):
-            raise testing.CantImplementError(
-                f"Invalid preferred cluster shape: {self.preferred_cluster_shape_mn}"
-            )
-        if preferred_m % (2 if self.use_2cta_instrs else 1) != 0:
-            raise testing.CantImplementError(f"Invalid preferred cluster shape M: {preferred_m}")
-        if preferred_m % fallback_m != 0 or preferred_n % fallback_n != 0:
-            raise testing.CantImplementError(
-                f"Preferred cluster shape {self.preferred_cluster_shape_mn} must be "
-                f"a multiple of fallback cluster shape {self.fallback_cluster_shape_mn}"
-            )
-
     def _create_tiled_mma(self):
         return utils.sm100.make_trivial_tiled_mma(
             self.a_dtype,
