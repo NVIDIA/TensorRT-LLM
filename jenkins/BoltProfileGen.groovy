@@ -602,9 +602,23 @@ pipeline {
     // "" default wherever the real default is derived at run time (from targetArch,
     // the resolved partition, or parent env) and so can't be a static value: the
     // resolution chains above handle those, and "" is falsy, so empty == default.
-    // Parent pass-throughs the job also reads (artifactCommit, gitlabCommit,
-    // gitlabTargetBranch, boltModelsRoot) arrive as env; not redeclared here.
+    // gitlabSourceRepoHttpUrl/gitlabCommit are declared because this block REPLACES
+    // the job's parameter list on every run, and an undeclared parameter is dropped
+    // even when the parent sends it -- so the job config's ${gitlabSourceRepoHttpUrl}
+    // SCM URL, which fetches this file, would never resolve. The remaining
+    // pass-throughs (artifactCommit, gitlabTargetBranch, boltModelsRoot) are optional
+    // and stay undeclared.
     parameters {
+        string(
+            name: "gitlabSourceRepoHttpUrl",
+            defaultValue: "",
+            description: "Repo the job config's SCM step clones to read this Jenkinsfile. Passed by the parent, already resolved via its default-llm-repo credential; set explicitly for a standalone run. Left empty here so no repo is hardcoded and the per-instance credential stays authoritative."
+        )
+        string(
+            name: "gitlabCommit",
+            defaultValue: "",
+            description: "Commit the SCM step checks out, and the boltRef fallback recorded in the bundle manifest. Passed by the parent; empty lets boltRef fall through to \"unknown\"."
+        )
         string(
             name: "targetArch",
             defaultValue: "",
