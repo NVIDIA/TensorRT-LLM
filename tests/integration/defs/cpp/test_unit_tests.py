@@ -4,11 +4,11 @@ import defs.cpp.cpp_common as _cpp
 import pytest
 
 
-@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90", "100"],
                          indirect=True)
 @pytest.mark.parametrize("test_group", [
-    "batch_manager", "common", "executor", "kernels", "layers", "runtime",
-    "thop"
+    "batch_manager", "common", "executor", "kernels", "kv_cache_compression",
+    "layers", "runtime", "thop"
 ])
 def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
 

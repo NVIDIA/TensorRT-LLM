@@ -346,21 +346,39 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             cold_page_bytes=cold_page_bytes,
         )
 
-    def _invoke_kernel(
+    def encode_cold_pages(
         self,
-        operation: str,
-        metadata: _Nvfp4ColdPageMetadata,
+        lifecycle_index: int,
         cold_base: int,
         page_indices: int,
         num_pages: int,
         stream: int,
     ) -> None:
-        op = (
-            torch.ops.trtllm.nvfp4_cold_page_encode
-            if operation == "encode"
-            else torch.ops.trtllm.nvfp4_cold_page_decode
+        metadata = self._lifecycle_metadata[lifecycle_index]
+        torch.ops.trtllm.nvfp4_cold_page_encode(
+            page_indices,
+            num_pages,
+            metadata.wide.data_ptr(),
+            metadata.integers.data_ptr(),
+            metadata.scales.data_ptr(),
+            metadata.num_buffers,
+            metadata.max_half_groups_per_tile,
+            metadata.cold_page_bytes,
+            self._runtime_type,
+            cold_base,
+            stream,
         )
-        op(
+
+    def decode_cold_pages(
+        self,
+        lifecycle_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        metadata = self._lifecycle_metadata[lifecycle_index]
+        torch.ops.trtllm.nvfp4_cold_page_decode(
             page_indices,
             num_pages,
             metadata.wide.data_ptr(),

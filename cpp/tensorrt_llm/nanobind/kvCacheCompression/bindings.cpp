@@ -100,13 +100,13 @@ private:
     void encodePolicy(std::size_t lifecycleIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
-        invoke("encode", lifecycleIndex, coldBase, pageIndices, numPages, stream);
+        invoke("encode_cold_pages", lifecycleIndex, coldBase, pageIndices, numPages, stream);
     }
 
     void decodePolicy(std::size_t lifecycleIndex, void const* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream) override
     {
-        invoke("decode", lifecycleIndex, coldBase, pageIndices, numPages, stream);
+        invoke("decode_cold_pages", lifecycleIndex, coldBase, pageIndices, numPages, stream);
     }
 
     template <typename ColdPointer>

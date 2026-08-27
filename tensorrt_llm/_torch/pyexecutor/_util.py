@@ -2810,9 +2810,12 @@ def validate_kv_cache_compression_compatibility(
     if spec_config is None:
         return
     if not config.supports_speculative_decoding():
+        guidance = ("; TriAttention requires eviction_mode='union'"
+                    if config.algorithm == "triattention" else "")
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
-            "support speculative decoding with its current configuration")
+            "support speculative decoding with its current configuration"
+            f"{guidance}")
     mode = spec_config.spec_dec_mode
     if config.algorithm == "quantization_for_cold_page":
         supported = mode.is_mtp_eagle_one_model() or mode.is_eagle3_one_model()

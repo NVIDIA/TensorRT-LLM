@@ -323,7 +323,7 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
     assert draft_callback is not provider
 
 
-def test_callback_forwards_a_4096_page_batch_through_one_native_launch() -> None:
+def test_callback_forwards_a_4096_page_batch_through_one_custom_op_call() -> None:
     native, _ = _native()
 
     with (
@@ -348,8 +348,8 @@ def test_callback_forwards_a_4096_page_batch_through_one_native_launch() -> None
             for index, role in enumerate(("key", "value"))
         }
         properties = callback.configure([SimpleNamespace(layers={0: hot})])
-        callback.encode(0, 0x3000, 0x4000, 4096, 0x5000)
-        callback.decode(0, 0x3000, 0x4000, 4096, 0x5000)
+        callback.encode_cold_pages(0, 0x3000, 0x4000, 4096, 0x5000)
+        callback.decode_cold_pages(0, 0x3000, 0x4000, 4096, 0x5000)
 
     assert properties[0].cold_page_bytes == 1152
     assert properties[0].page_index_location == "host"

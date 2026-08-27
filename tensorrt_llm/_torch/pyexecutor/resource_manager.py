@@ -2819,6 +2819,28 @@ class KVCacheCompressionManager(BaseResourceManager):
         """Create a native cold-page codec when the algorithm provides one."""
         return None
 
+    def encode_cold_pages(
+        self,
+        lifecycle_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        """Encode one complete KVCM migration batch into cold storage."""
+        raise NotImplementedError
+
+    def decode_cold_pages(
+        self,
+        lifecycle_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        """Decode one complete KVCM migration batch from cold storage."""
+        raise NotImplementedError
+
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #
     # Subclasses override what they need; all default to no-op.          #

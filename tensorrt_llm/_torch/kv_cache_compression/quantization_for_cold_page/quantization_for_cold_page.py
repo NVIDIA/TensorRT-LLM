@@ -60,40 +60,6 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             properties.append(lifecycle)
         return properties
 
-    def encode(
-        self,
-        lifecycle_index: int,
-        cold_base: int,
-        page_indices: int,
-        num_pages: int,
-        stream: int,
-    ) -> None:
-        self._invoke_kernel(
-            "encode",
-            self._lifecycle_metadata[lifecycle_index],
-            cold_base,
-            page_indices,
-            num_pages,
-            stream,
-        )
-
-    def decode(
-        self,
-        lifecycle_index: int,
-        cold_base: int,
-        page_indices: int,
-        num_pages: int,
-        stream: int,
-    ) -> None:
-        self._invoke_kernel(
-            "decode",
-            self._lifecycle_metadata[lifecycle_index],
-            cold_base,
-            page_indices,
-            num_pages,
-            stream,
-        )
-
     def _initialize_codec(
         self,
         cache_config: object,
@@ -109,16 +75,4 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
 
     def _build_lifecycle_metadata(self, lifecycle: object) -> object:
         """Resolve one KVCM lifecycle into format-specific launch metadata."""
-        raise NotImplementedError
-
-    def _invoke_kernel(
-        self,
-        operation: str,
-        metadata: object,
-        cold_base: int,
-        page_indices: int,
-        num_pages: int,
-        stream: int,
-    ) -> None:
-        """Submit one complete codec batch to the format-specific kernel."""
         raise NotImplementedError

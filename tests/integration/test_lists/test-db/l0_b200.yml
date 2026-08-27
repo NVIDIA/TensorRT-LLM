@@ -12,6 +12,21 @@ l0_b200:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
+      backend: cpp
+  tests:
+  - cpp/test_unit_tests.py::test_unit_tests[kv_cache_compression-100]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b100*'
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
