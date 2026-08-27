@@ -397,9 +397,7 @@ def build_metrics_record_from_headers(
         name, separator, timestamp = item.strip().partition(";ts=")
         if separator and name in fields:
             try:
-                timing_metrics[fields[name]] = _to_reference_time(
-                    float(timestamp), adjusted_clock
-                )
+                timing_metrics[fields[name]] = _to_reference_time(float(timestamp), adjusted_clock)
             except ValueError:
                 logger.warning("Ignoring invalid %s timestamp: %s", name, timestamp)
 

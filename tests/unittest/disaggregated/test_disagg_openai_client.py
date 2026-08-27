@@ -39,8 +39,7 @@ from tensorrt_llm.serve.perf_metrics import (
     PerfMetricsMiddleware,
     adjusted_clock_from_headers,
 )
-from tensorrt_llm.serve.responses_utils import (ResponseHooks,
-                                                 ServerArrivalTimeMiddleware)
+from tensorrt_llm.serve.responses_utils import ResponseHooks, ServerArrivalTimeMiddleware
 from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only
@@ -71,10 +70,13 @@ async def test_worker_clock_calibration_uses_global_clock():
     server = object.__new__(OpenAIServer)
     global_clock = Mock(side_effect=[10.0, 10.2])
     delay = AsyncMock()
-    with patch(
-        "tensorrt_llm.serve.openai_server.get_global_steady_clock_now_in_seconds",
-        global_clock,
-    ), patch("tensorrt_llm.serve.openai_server.asyncio.sleep", delay):
+    with (
+        patch(
+            "tensorrt_llm.serve.openai_server.get_global_steady_clock_now_in_seconds",
+            global_clock,
+        ),
+        patch("tensorrt_llm.serve.openai_server.asyncio.sleep", delay),
+    ):
         response = await server.get_steady_clock_offset()
 
     assert json.loads(response.body) == {
@@ -155,9 +157,7 @@ async def test_perf_metrics_middleware_reports_effective_frontend_clock(process_
     async def send(message):
         sent.append(message)
 
-    clock = AdjustedSteadyClock(
-        process_offset, time_source=Mock(side_effect=[10.0, 10.25])
-    )
+    clock = AdjustedSteadyClock(process_offset, time_source=Mock(side_effect=[10.0, 10.25]))
     middleware = ServerArrivalTimeMiddleware(
         PerfMetricsMiddleware(
             app,
@@ -721,7 +721,6 @@ class TestHttpErrorBodyPreservation:
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
 
-
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
@@ -782,7 +781,6 @@ class TestDisaggIdRegenOnRetry:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
-
 
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
@@ -884,7 +882,6 @@ class TestSelectiveTransientTcpRetry:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
-
 
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]

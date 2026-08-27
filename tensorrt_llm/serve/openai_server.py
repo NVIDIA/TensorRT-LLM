@@ -1779,9 +1779,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 raw_request.state.server_first_token_time = (
                     self._adjusted_steady_clock.now())
             record = build_request_metrics_record(
-                res,
-                raw_request,
-                adjusted_clock=self._adjusted_steady_clock)
+                res, raw_request, adjusted_clock=self._adjusted_steady_clock)
             if record is not None and raw_request is not None:
                 raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:

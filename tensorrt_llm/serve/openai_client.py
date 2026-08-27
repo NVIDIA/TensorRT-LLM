@@ -42,8 +42,8 @@ from tensorrt_llm.serve.perf_metrics import (
     RETURN_METRICS_HEADER,
     SSE_METRICS_EVENT,
     ClientMetricsCollector,
-    build_metrics_record_from_headers,
     adjusted_clock_from_headers,
+    build_metrics_record_from_headers,
 )
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,

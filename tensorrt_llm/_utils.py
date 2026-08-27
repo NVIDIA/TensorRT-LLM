@@ -63,8 +63,8 @@ except ImportError:
     has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import (DataType, LayerType,
-                                   global_steady_clock_now, steady_clock_now)
+from tensorrt_llm.bindings import (DataType, LayerType, global_steady_clock_now,
+                                   steady_clock_now)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -136,7 +136,8 @@ class AdjustedSteadyClock:
     def __init__(
         self,
         reference_offset: float = 0,
-        time_source: Callable[[], float] = get_global_steady_clock_now_in_seconds,
+        time_source: Callable[[],
+                              float] = get_global_steady_clock_now_in_seconds,
     ) -> None:
         self._time_source = time_source
         self.set_reference_offset(reference_offset)
