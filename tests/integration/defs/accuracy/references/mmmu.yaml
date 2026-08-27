@@ -36,14 +36,6 @@ LGAI-EXAONE/EXAONE-4.5-33B:
   # model was added (PR #12873). The original 51.22 was committed without
   # pre-merge CI validation and was never reproduced. See nvbugs/6211189.
   - accuracy: 46.5
-Qwen/Qwen2-VL-7B-Instruct:
-  - accuracy: 48.44
-Qwen/Qwen2.5-VL-7B-Instruct:
-  - accuracy: 51.22
-  - quant_algo: FP8
-    accuracy: 45.44
-  - quant_algo: NVFP4
-    accuracy: 40.67
 nvidia/Nano-v2-VLM:
   - accuracy: 43.78
 # MMMU for Nemotron-Nano-* models require reasoning on.
