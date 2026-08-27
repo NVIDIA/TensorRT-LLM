@@ -1828,6 +1828,11 @@ class GvrTopKKernel:
         # ---- Secant refinement loop ----
         it = cutlass.Int32(0)
         while it < cutlass.Int32(self.MAX_REFINE_ITERS) and s_iscalars[1] == cutlass.Int32(0):
+            # All threads must finish reading the loop guard (s_iscalars[1])
+            # before tid0 can rewrite it below (done = 2/3 on bracket
+            # exhaustion): a straggler warp reading the rewritten flag would
+            # skip the guarded barriers — barrier divergence.
+            cute.arch.barrier()
             # tid==0 computes new threshold via secant interpolation.
             if tidx == 0:
                 vlo = s_thr[1]
@@ -1929,6 +1934,11 @@ class GvrTopKKernel:
         ):
             itc = cutlass.Int32(0)
             while itc < cutlass.Int32(64) and s_iscalars[1] == cutlass.Int32(0):
+                # Loop-guard read vs tid0's done=3 rewrite below: barrier so
+                # a straggler warp cannot read the terminal flag early and
+                # skip the guarded barrier (same discipline as the refine
+                # loop above).
+                cute.arch.barrier()
                 if tidx == 0:
                     vlo_c = s_thr[1]
                     vhi_c = s_thr[2]
@@ -1989,6 +1999,11 @@ class GvrTopKKernel:
                 cute.arch.barrier()
 
         # ---- Post-loop fallback: if still not done, force threshold ----
+        # Barrier: the guard reads above (done == 3 / the loop exits) must
+        # complete on every warp before tid0 rewrites done = 2 (the 0 -> 2
+        # transition keeps every predicate equivalent, but the unsynchronized
+        # window is still a data race).
+        cute.arch.barrier()
         if tidx == 0:
             if s_iscalars[1] == cutlass.Int32(0):
                 if s_iscalars[2] <= cutlass.Int32(kCC * 2):
@@ -3008,6 +3023,12 @@ class GvrTopKKernel:
                 s_iscalars[3] = tw
             cute.arch.barrier()
             target_warp = s_iscalars[3]
+            # Same read-vs-rewrite discipline as the degenerate-hint guard:
+            # the target warp overwrites s_iscalars[2]/[3] with
+            # rank_above/b_star below, so every thread must finish reading
+            # target_warp first — a straggler warp reading b_star as a warp
+            # id could become a second (garbage) writer.
+            cute.arch.barrier()
             if warp_id == target_warp and lane == cutlass.Int32(0):
                 base_cum = s_iscalars[2]
                 b_star = cutlass.Int32(kBins - 1)
@@ -4468,6 +4489,15 @@ class GvrTopKKernel:
         # budget-collapse guard cannot fire on this unmeasured bracket.
         v_lo = s_thr[1]
         v_hi = s_thr[2]
+        # Every thread must finish reading the Phase-1 bracket BEFORE tid0
+        # rewrites it below: without this barrier a straggler warp can read
+        # the already-rewritten synthetic bracket, evaluate the degenerate
+        # condition differently, and skip the guarded barrier — barrier
+        # divergence, i.e. wrong sets / unwritten output slots / illegal
+        # memory access. Fires whenever the gathered hint values are
+        # degenerate: all-zeros pre_idx (production cold start) on any row,
+        # or any hint whose gathered values land in one tie class.
+        cute.arch.barrier()
         if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
             if tidx == 0:
                 s_thr[0] = cutlass.Float32(0.0)
@@ -4723,6 +4753,12 @@ class GvrTopKKernel:
                         ):
                             it4 = cutlass.Int32(40)  # guard: skip collapse
                         while it4 < cutlass.Int32(40) and s_iscalars[1] == cutlass.Int32(0):
+                            # Loop-guard read vs tid0's done=3 rewrite below:
+                            # barrier so a straggler warp cannot read the
+                            # terminal flag early and skip the guarded
+                            # barrier (same discipline as the degenerate-
+                            # hint rewrite).
+                            cute.arch.barrier()
                             if tidx == cutlass.Int32(0):
                                 lo4 = s_thr[1]
                                 hi4 = s_thr[2]
@@ -4791,6 +4827,11 @@ class GvrTopKKernel:
                             # ship a -1-padded row (e.g. ReLU-sparse rows
                             # with a 0.0 plateau wider than kC); done = 2
                             # routes it into the Phase-3 repair instead.
+                            # Barrier: the guard reads above must complete
+                            # on every warp before tid0 rewrites done = 2
+                            # (0 -> 2 keeps every predicate equivalent, but
+                            # the unsynchronized window is still a race).
+                            cute.arch.barrier()
                             if tidx == cutlass.Int32(0):
                                 s_thr[0] = s_thr[2]
                                 s_iscalars[1] = cutlass.Int32(2)
