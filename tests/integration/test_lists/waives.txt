@@ -166,6 +166,7 @@ full:B300/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_servi
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633268)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy SKIP (https://nvbugs/6571418)
 full:DGX_B200/disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b] SKIP (https://nvbugs/6594241)
+full:DGX_B200/examples/test_deepseek_v4_pro.py::test_short_token_boundary_smoke SKIP (https://nvbugs/6670227)
 full:DGX_B200/unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6669275)
 full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False] SKIP (https://nvbugs/6633927)
 full:DGX_H100/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633927)
