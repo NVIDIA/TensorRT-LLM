@@ -61,8 +61,10 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kCROSS_ATTN_K:
         case ModuleType::kATTN_V:
         case ModuleType::kCROSS_ATTN_V: modules.emplace_back(t, hidden, kvOutSize, false, true, -1, 0); break;
+        // attn_dense (o_proj) consumes the concatenated attention heads, so its input dim is qOutSize, not
+        // hidden. Those coincide for most models but not all, e.g. GPT-OSS-20B has hidden=2880 and 64x64 heads.
         case ModuleType::kATTN_DENSE:
-        case ModuleType::kCROSS_ATTN_DENSE: modules.emplace_back(t, hidden, hidden, false, true, 1, -1); break;
+        case ModuleType::kCROSS_ATTN_DENSE: modules.emplace_back(t, qOutSize, hidden, false, true, 1, -1); break;
         case ModuleType::kMLP_H_TO_4H: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_GATE: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_4H_TO_H: modules.emplace_back(t, mlpHidden, hidden, false, true, 1, -1); break;

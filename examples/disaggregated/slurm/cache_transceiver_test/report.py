@@ -323,8 +323,12 @@ class _TransportAcc:
 
     def feed(self, line):
         if _CONFIG_HEADER.search(line):
+            # Supports the older UCX single-line format.
             self._in_kv = _is_kv_data_header(line)
             return
+        # UCX 1.22 may put the operation description on the next line.
+        if _is_kv_data_header(line):
+            self._in_kv = True
         transports = _proto_row_transports(line)
         if not transports:
             return

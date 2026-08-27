@@ -43,7 +43,7 @@ keys match). It implements `__init__`, `_get_image_features`,
 `_get_audio_features`, and `load_weights` for the encoder-free projections.
 
 TRT-LLM provides its own `gemma4_unified` config classes
-(`_torch/configs/gemma4_unified.py`) and multimodal preprocessing (the vendored
+(`_torch/configs/gemma4.py`) and multimodal preprocessing (the vendored
 section at the end of this file), used whenever the installed transformers does
 not ship them natively — the full model (text + image + audio + video) runs on
 the repo's pinned transformers.

@@ -29,7 +29,8 @@ class NotRequiredForHelp(click.Option):
     required=True,
     type=str,
     cls=NotRequiredForHelp,
-    help="The Huggingface name of the model to benchmark.",
+    help=
+    "The Huggingface name of the model to benchmark. Also used as the tokenizer source for the prepare-dataset subcommand.",
 )
 @click.option(
     "--model_path",

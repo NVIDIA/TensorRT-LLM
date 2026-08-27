@@ -14,6 +14,8 @@ from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TestSamplingParams(ApiStabilityTestHarness):
     TEST_CLASS = SamplingParams

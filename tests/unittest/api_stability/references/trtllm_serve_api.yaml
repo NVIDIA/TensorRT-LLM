@@ -207,14 +207,14 @@ models:
         required: false
       length_penalty:
         kind: extension
-        type: float
-        default: 1.0
+        type: Optional[float]
+        default: null
         status: stable
         required: false
       early_stopping:
         kind: extension
-        type: bool
-        default: false
+        type: Optional[Union[bool, Literal['never']]]
+        default: null
         status: stable
         required: false
       stop_token_ids:
@@ -678,14 +678,14 @@ models:
         required: false
       length_penalty:
         kind: extension
-        type: float
-        default: 1.0
+        type: Optional[float]
+        default: null
         status: stable
         required: false
       early_stopping:
         kind: extension
-        type: bool
-        default: false
+        type: Optional[Union[bool, Literal['never']]]
+        default: null
         status: stable
         required: false
       stop_token_ids:
@@ -1311,7 +1311,7 @@ models:
         required: true
       response_format:
         kind: openai
-        type: Literal['url', 'b64_json']
+        type: Literal['url', 'b64_json', 'path']
         default: url
         status: stable
         required: false
@@ -1449,8 +1449,8 @@ models:
         required: true
       response_format:
         kind: extension
-        type: Literal['url', 'b64_json']
-        default: url
+        type: Literal['file', 'path']
+        default: file
         status: stable
         required: false
       format:

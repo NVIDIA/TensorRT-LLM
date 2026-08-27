@@ -55,11 +55,6 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
-    "llama_v3.3_nemotron_super_49b",
-    "llama_v3.3_nemotron_super_49b_fp8",
-    "llama_v3.1_nemotron_ultra_253b",
-    "llama_v3.1_nemotron_ultra_253b_fp8",
-    "kimi_k2_nvfp4",
     "kimi_k2.5_fp4",
     "minimax_m3_fp4",
     "nemotron_3_super_120b_nvfp4",
@@ -71,18 +66,17 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_nano_12b_v2",
-    "phi_4_multimodal_instruct",
-    "phi_4_multimodal_instruct_fp4",
-    "phi_4_multimodal_instruct_fp8",
 }
 
-# Models that use random_image dataset in serve mode benchmarks.
+# Models that use random_image dataset in serve mode benchmarks. Also used by
+# get_fixed_dataset_sequence_length() to exclude variable image-token counts.
 # Maps model name to (width, height, num_images) tuple.
 SERVE_IMAGE_MODELS = {
     "nemotron_3_nano_omni_nvfp4_image": (1526, 1024, 1),
 }
 
-# Models that require openai-chat backend for benchmark_serving
+# Models that require openai-chat backend for benchmark_serving. Also used by
+# get_fixed_dataset_sequence_length() to exclude chat-template tokens.
 # (e.g., reasoning / multimodal models that use chat completions API).
 OPENAI_CHAT_BACKEND_MODELS = {
     "nemotron_3_nano_omni_nvfp4",
@@ -95,8 +89,8 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
-# benchmark client commands: forcing generation past EOS produces unstable
-# acceptance rates for spec-dec.
+# benchmark client commands and fixed sequence-length inference: forcing
+# generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
     "qwen3_4b_eagle3",
     "qwen3_235b_a22b_fp4_eagle3",
@@ -925,6 +919,36 @@ class PerfTestConfig:
         """
         return self.get_benchmark_type() == "enc_dec"
 
+    def get_fixed_dataset_sequence_length(self) -> int | None:
+        """Return the common total length when every dataset shape is fixed."""
+        if self.build_only or not self.output_lens:
+            return None
+
+        if len(self.input_lens) != len(self.output_lens):
+            return None
+
+        # LoRA data is generated with nonzero input/output length deviations.
+        if self.num_loras > 0:
+            return None
+
+        # These serve requests may terminate at EOS, add chat-template tokens,
+        # or include image tokens, so their configured text lengths are not
+        # fixed runtime lengths.
+        if self.runtime == "serve" and (self.model_name in SPEC_DEC_MODELS
+                                        or self.model_name in SERVE_IMAGE_MODELS
+                                        or self.model_name
+                                        in OPENAI_CHAT_BACKEND_MODELS):
+            return None
+
+        sequence_lengths = {
+            input_len + output_len
+            for input_len, output_len in zip(
+                self.input_lens, self.output_lens, strict=True)
+        }
+        if len(sequence_lengths) != 1:
+            return None
+        return sequence_lengths.pop()
+
 
 class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     """
@@ -990,6 +1014,43 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_trtllm_bench_model(self):
         return get_model_dir(self._config.model_name)
+
+    def _get_model_yaml_config(self) -> dict:
+        config = get_model_yaml_config(self._config.to_string(),
+                                       lora_dirs=self.lora_dirs)
+        uses_pytorch_backend = (self._config.runtime == "serve"
+                                or self._config.backend == "pytorch")
+        fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
+        if not uses_pytorch_backend or fixed_sequence_length is None:
+            return config
+
+        kv_cache_config = config.get('kv_cache_config')
+        if kv_cache_config is not None and 'avg_seq_len' in kv_cache_config:
+            return config
+
+        configured_max_seq_len = config.get('max_seq_len')
+        if configured_max_seq_len is not None:
+            fixed_sequence_length = min(fixed_sequence_length,
+                                        int(configured_max_seq_len))
+
+        # Perf definitions are sometimes reused with an older wheel during
+        # release walkbacks and bisection. Do not pass a field that its strict
+        # KvCacheConfig schema does not recognize.
+        try:
+            from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+        except ImportError:
+            return config
+        kv_cache_fields = getattr(KvCacheConfig, 'model_fields', None)
+        if kv_cache_fields is None:
+            kv_cache_fields = getattr(KvCacheConfig, '__fields__', {})
+        if 'avg_seq_len' not in kv_cache_fields:
+            return config
+
+        if kv_cache_config is None:
+            kv_cache_config = {}
+            config['kv_cache_config'] = kv_cache_config
+        kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
+        return config
 
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
@@ -1166,8 +1227,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
-            config = get_model_yaml_config(self._config.to_string(),
-                                           lora_dirs=self.lora_dirs)
+            config = self._get_model_yaml_config()
             if config:
                 print_info(f"pytorch/TRT model config: {config}")
                 with open(pytorch_config_path, 'w') as f:
@@ -1230,8 +1290,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "pytorch",
         ]
 
-        config = get_model_yaml_config(self._config.to_string(),
-                                       lora_dirs=self.lora_dirs)
+        config = self._get_model_yaml_config()
         serve_config = config or {}
         serve_config.setdefault('max_batch_size', self._config.max_batch_size)
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)

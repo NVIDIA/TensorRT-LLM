@@ -687,7 +687,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
 
 _WORKER_ENV = {
     "TRTLLM_CAN_USE_DEEP_EP": "1",
-    "TRTLLM_ENABLE_PDL": "0",
+    "TRTLLM_ENABLE_PDL": "1",
 }
 
 

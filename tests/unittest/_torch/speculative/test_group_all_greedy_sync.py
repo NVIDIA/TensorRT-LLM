@@ -36,6 +36,7 @@ def _fake_meta(group_all_greedy_sample=None, force_capture=False):
     return types.SimpleNamespace(
         runtime_draft_len=2,
         dummy_slot_row=0,
+        spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
         group_all_greedy_sample=group_all_greedy_sample,
         _force_non_greedy_for_capture=force_capture,
     )
@@ -43,6 +44,10 @@ def _fake_meta(group_all_greedy_sample=None, force_capture=False):
 
 def _scan(meta, requests):
     return SpecMetadata._scan_one_model_sampling(meta, requests)
+
+
+def _refresh(meta, requests):
+    return SpecMetadata.update_is_all_greedy_sample(meta, requests)
 
 
 def test_local_value_used_when_no_group_sync():
@@ -85,4 +90,25 @@ def test_capture_override_composes_with_group_sync():
     # flag stays False regardless of composition order.
     meta = _fake_meta(group_all_greedy_sample=False, force_capture=True)
     _scan(meta, [_fake_request()])
+    assert meta.is_all_greedy_sample is False
+
+
+def test_refresh_discards_warmup_group_value_for_real_request():
+    meta = _fake_meta()
+
+    # Model warmup carries no sampling parameters and is synchronized as an
+    # all-greedy group decision.
+    warmup = _fake_request()
+    warmup.state = LlmRequestState.CONTEXT_INIT
+    _scan(meta, [warmup])
+    assert meta.is_all_greedy_sample is True
+    meta.group_all_greedy_sample = True
+
+    # The first real request requires rejection sampling. Refresh must derive
+    # its local non-greedy value without reapplying the warmup decision; the
+    # model engine synchronizes a fresh group value immediately afterwards.
+    real_request = _fake_request(temperature=0.7, top_k=50, top_p=0.9)
+    _refresh(meta, [real_request])
+
+    assert meta.group_all_greedy_sample is None
     assert meta.is_all_greedy_sample is False

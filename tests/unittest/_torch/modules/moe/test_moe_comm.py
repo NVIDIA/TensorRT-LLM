@@ -2613,6 +2613,12 @@ class TestMoEComm:
         _run_full_test_group(mpi_pool_executor, group)
 
     @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.skip(
+        reason=(
+            "Temporarily waived pending NCCL-EP CUDA-graph replay fix: "
+            "https://nvbugspro.nvidia.com/bug/6523820"
+        )
+    )
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""

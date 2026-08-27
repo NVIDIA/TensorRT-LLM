@@ -17,8 +17,10 @@
 import copy
 import fcntl
 import glob
+import math
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,13 +31,14 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
+from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info
-from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
-from .perf_regression_utils import process_and_upload_test_results
+from .perf_regression_utils import _percentile, process_and_upload_test_results
 
 # Sanity-side path differs from test_perf for this key; preserve historical value.
 MODEL_PATH_DICT = {
@@ -102,8 +105,16 @@ DEFAULT_TIMEOUT = 10800
 # per-test pytest kill both saves GPU-hours and leaves a classifiable failure
 # in the CI log. The disagg bound is larger because its /health only answers
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
-AGG_SERVER_READY_TIMEOUT = 1800
+# 1800 proved too tight for the largest agg cases: gb300 DeepSeek-V4-Pro
+# ctx_only (con4301) needs ~2000s of model load + autotune before /health
+# answers, so it failed readiness while the server was still coming up
+# (nvbugs/6517846). Raised to match the disagg bound.
+AGG_SERVER_READY_TIMEOUT = 3600
 DISAGG_SERVER_READY_TIMEOUT = 3600
+# GEN workers normally reap within seconds after benchmark_status is written.
+# Keep this well below the whole-test timeout so a stuck multi-node srun cannot
+# turn the optional log-flush synchronization into a pytest/Slurm cancellation.
+GEN_LOG_SENTINEL_TIMEOUT = 120
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -168,14 +179,65 @@ SPEC_DECODING_PERF_METRIC_LOG_QUERIES = {
     "al": re.compile(r"Mean Avg Decoded Tokens per Iter:\s+(-?[\d\.]+)"),
 }
 
-# gen_only-only metric: appended to each trtllm-benchmark log by
+# gen_only-only metrics: appended to each trtllm-benchmark log by
 # DisaggTestCmds.run_cmd after parsing gen_server_*.log; only forwarded to
 # the database for gen_only mode.
+#
+# The distribution is published, not just the mean, because the mean alone is
+# not self-diagnosing: a single anomalous iteration can move it by >30% while
+# the workload is unchanged (nvbugs 6627789), and the only way a reader can
+# tell that from a real regression is to see the spread next to it. The mean
+# and median are both regression-gated (see regression_metrics in the gen_only
+# branch) because they fail on different shapes of slowdown; std/p75/p99 are
+# uploaded for diagnosis only.
+#
+# One statistic per line, and the leading words must stay mutually exclusive:
+# parse_metrics_from_output breaks out of the regex loop on the first match per
+# line, so a shared prefix would silently shadow whichever pattern lost the
+# ordering race.
 GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
     "mean_gen_worker_per_iter_device_step_time": re.compile(
         r"Average Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
     ),
+    "median_gen_worker_per_iter_device_step_time": re.compile(
+        r"Median Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+    "std_gen_worker_per_iter_device_step_time": re.compile(
+        r"Stdev Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+    "p75_gen_worker_per_iter_device_step_time": re.compile(
+        r"P75 Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+    "p99_gen_worker_per_iter_device_step_time": re.compile(
+        r"P99 Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
 }
+
+# Every gen_only device-step-time metric, in log-line order. The mean is first
+# because it is the one check_test_failure keys on; mean and median are both
+# regression-gated, std/p75/p99 are diagnostic.
+GEN_ONLY_DEVICE_STEP_TIME_METRICS = (
+    "mean_gen_worker_per_iter_device_step_time",
+    "median_gen_worker_per_iter_device_step_time",
+    "std_gen_worker_per_iter_device_step_time",
+    "p75_gen_worker_per_iter_device_step_time",
+    "p99_gen_worker_per_iter_device_step_time",
+)
+
+# The regression gate for disagg gen_only lanes. Mean and median are both gated
+# because they fail on different shapes of slowdown: the mean catches a cost
+# spread thinly across many iterations, the median catches a shift in the typical
+# iteration while ignoring outliers. A real slowdown moves both; a single
+# anomalous iteration moves only the mean, so the pair is self-diagnosing on the
+# CI report itself. std/p75/p99 are uploaded for diagnosis but not gated.
+#
+# Every name here must also appear in MINIMIZE_METRICS (or MAXIMIZE_METRICS):
+# check_regression only iterates those two lists, so a gated name absent from
+# both is silently never checked. test_perf_sanity_helpers.py pins that.
+GEN_ONLY_REGRESSION_METRICS = (
+    "d_mean_gen_worker_per_iter_device_step_time",
+    "d_median_gen_worker_per_iter_device_step_time",
+)
 
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
 #   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
@@ -193,6 +255,73 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 # _scan_gen_worker_device_step_time.
 _DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
 _NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
+# num_scheduled_requests from the same line. An iteration that scheduled zero
+# requests did no GPU work, so its loop period is pure idle (waiting on KV-cache
+# transfer) -- and because the device runs async that period is reported by the
+# NEXT iteration's prev_device_step_time. Such a row is excluded; see
+# _scan_gen_worker_device_step_time. The ' = ' spelling is what
+# py_executor.py's iteration log actually emits (do not copy the ': ' form in
+# examples/wide_ep/slurm_scripts/process_gen_iterlog.py, which is stale).
+_ITER_NSR_RE = re.compile(r"iter\s*=\s*(\d+),.*?num_scheduled_requests\s*=\s*(\d+)")
+# The emitting rank, used to key _scan_gen_worker_device_step_time's predecessor
+# bookkeeping so that interleaved ranks in one file cannot be read as each
+# other's predecessor.
+# py_executor.py only logs rank 0 by default (TLLM_PROFILE_LOG_RANKS, default
+# "0"), and no lane sets that variable today -- both artifact sets for nvbug
+# 6627789 are 518/518 global_rank = 0. But the variable accepts "all" or a rank
+# list and lane YAML can inject arbitrary server env vars, and in a mixed-rank
+# file the failure would be silent in the WRONG direction: the contaminated
+# row's immediate predecessor line would usually belong to a different rank,
+# whose num_scheduled_requests is nonzero, so the exclusion would quietly stop
+# excluding while still looking armed. Matching global_rank (not the trailing
+# 'rank = ') keeps this unambiguous; a line with neither shares one bucket,
+# which is exactly the pre-existing single-rank behaviour.
+_ITER_RANK_RE = re.compile(r"global_rank\s*=\s*(\d+)")
+
+# Hard cap on retained per-iteration samples per gen worker. The percentile and
+# stdev statistics need the whole sample, so the scan cannot be O(1) memory the
+# way a streaming mean could. A steady-state run holds ~512 rows per worker
+# (~16 KB), so this bound is ~1000x headroom and exists only to keep a
+# pathological log (a runaway worker, a concatenated log) from growing the
+# scan without limit. Excess rows are dropped, not sampled: truncating the tail
+# keeps the steady-state plateau these statistics describe.
+_MAX_RETAINED_ITER_ROWS = 500_000
+
+
+class _IterRow(NamedTuple):
+    """One usable per-iteration sample from a gen worker log.
+
+    ngen is the line's num_generation_tokens, or None when it did not parse
+    (see _scan_gen_worker_device_step_time for why such rows are retained).
+    """
+
+    ngen: Optional[int]
+    device_step_time: float
+
+
+class _DeviceStepTimeStats(NamedTuple):
+    """Distribution of gen-worker per-iter device step time, in ms."""
+
+    mean: float
+    median: float
+    std: float
+    p75: float
+    p99: float
+
+
+def _stdev(values: List[float]) -> float:
+    """Sample standard deviation (ddof=1). Returns 0.0 for fewer than 2 values.
+
+    ddof=1 because the iterations are a sample of the workload's steady state,
+    not its entire population. A single-sample file reports 0.0 rather than
+    raising: the metric is diagnostic, and a run that produced one usable
+    iteration has bigger problems than its spread.
+    """
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1))
 
 
 def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
@@ -213,36 +342,48 @@ def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Tuple[List[Tuple[Dict[int, Tuple[int, float]], int, float]], int]:
+) -> List[List[_IterRow]]:
     """Single-pass scan of the gen logs.
 
-    Returns (per_file_scans, total_count):
-      - per_file_scans: one entry per file that produced >=1 usable row, each
-        a tuple (by_ngen, all_count, all_mean):
-          * by_ngen maps num_generation_tokens -> (count, Welford mean of
-            prev_device_step_time) over rows with iter >= 5, a numeric
-            prev_device_step_time, and a parseable num_generation_tokens on
-            the same line.
-          * all_count / all_mean are the count and Welford mean of
-            prev_device_step_time over ALL iter >= 5 numeric rows in the file,
-            including those whose num_generation_tokens did not parse. This is
-            the fallback aggregate used when a worker never emits a parseable
-            num_generation_tokens (nvbugs 6487036 / 6487040): PR #16298 began
-            requiring num_generation_tokens on every line, so a worker whose
-            states dict renders it as e.g. tensor(256) would drop to no
-            buckets and the metric would wrongly parse to None.
-      - total_count: the number of iter >= 5 rows with a numeric
-        prev_device_step_time across all files.
+    Returns one list of _IterRow per file that produced at least one usable
+    row. A row is usable when iter >= 5, prev_device_step_time is numeric, and
+    the row is not the successor of an empty iteration (below). _IterRow.ngen
+    is None when num_generation_tokens did not parse on that line; such rows
+    are retained rather than dropped so a worker whose states dict renders it
+    unparseably (e.g. tensor(256), nvbugs 6487036 / 6487040) still produces a
+    metric instead of None -- PR #16298 began requiring num_generation_tokens
+    on every line, and dropping those rows would silently lose the metric.
 
-    Memory is O(distinct num_generation_tokens per file), a small constant
-    in practice (steady-state plus a shrinking tail).
+    Empty-iteration successors are excluded. An iteration with
+    num_scheduled_requests == 0 did no GPU work, so its loop period is entirely
+    idle -- typically waiting for KV-cache transfer in a disaggregated run --
+    and because the device runs one step behind, that idle period is what the
+    NEXT iteration reports as prev_device_step_time. Averaging it in credits
+    the GPU with hundreds or thousands of milliseconds of "step time" that no
+    kernel spent, which is how nvbug 6627789 read a +19% regression out of two
+    runs whose steady-state iterations were both ~7.3 ms.
+
+    The row is dropped only when that rank's immediately preceding parsed line
+    is provably the predecessor iteration: pred_iter == cur_iter - 1.
+    Predecessor state is kept per emitting rank (_ITER_RANK_RE), so ranks
+    interleaved in one file are never read as each other's predecessor. If the
+    predecessor is missing, unparsable, or non-adjacent (a restarted iteration
+    counter, the first line after a seek), the row is KEPT.
+    That is the safe direction to fail: the exclusion is an accuracy
+    improvement on a metric that must keep reporting, so a scan that cannot
+    prove a row is idle-contaminated should behave exactly as it did before.
+    Note the num_scheduled_requests == 0 row itself is kept -- its own
+    prev_device_step_time describes the previous iteration, which did work.
+
+    Memory is O(retained rows), bounded by _MAX_RETAINED_ITER_ROWS per file:
+    the percentile and stdev statistics need the whole sample, unlike the
+    streaming mean this replaced.
 
     errors="replace" guards against invalid UTF-8: tqdm progress bars
     (model load) write partial multibyte sequences that would otherwise raise
     UnicodeDecodeError mid-scan.
     """
-    per_file_scans: List[Tuple[Dict[int, Tuple[int, float]], int, float]] = []
-    total_count = 0
+    per_file_rows: List[List[_IterRow]] = []
     for i in range(num_gen_servers):
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
         if not os.path.isfile(log_path):
@@ -254,102 +395,142 @@ def _scan_gen_worker_device_step_time(
             else 0
         )
 
-        by_ngen: Dict[int, Tuple[int, float]] = {}
-        all_count = 0
-        all_mean = 0.0
+        rows: List[_IterRow] = []
+        # rank -> (iter, num_scheduled_requests) of that rank's previous line.
+        prev_by_rank: Dict[Optional[int], Tuple[Optional[int], Optional[int]]] = {}
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
             for line in f:
+                # Every iteration line carries this literal, including the ones
+                # whose value is 'N/A', so this fast-reject cannot skip a line
+                # the num_scheduled_requests tracking below needs to see.
+                if "prev_device_step_time" not in line:
+                    continue
+                # Snapshot this rank's predecessor before this line overwrites it.
+                rank_m = _ITER_RANK_RE.search(line)
+                rank = int(rank_m.group(1)) if rank_m is not None else None
+                pred_iter, pred_nsr = prev_by_rank.get(rank, (None, None))
+                nsr_m = _ITER_NSR_RE.search(line)
+                if nsr_m is None:
+                    prev_by_rank[rank] = (None, None)
+                else:
+                    prev_by_rank[rank] = (int(nsr_m.group(1)), int(nsr_m.group(2)))
+
                 m = _DEVICE_STEP_TIME_RE.search(line)
                 if m is None:
                     continue
-                if int(m.group(1)) < 5:
+                cur_iter = int(m.group(1))
+                # iter 0/1 include KV-cache transfer wait; 2-4 are warmup.
+                if cur_iter < 5:
                     continue
-                total_count += 1
-                dt = float(m.group(2))
-                # All-iter fallback aggregate (every usable row).
-                all_count += 1
-                all_mean += (dt - all_mean) / all_count
-                # Per-ngen bucket (only rows with a parseable ngen).
+                if pred_nsr == 0 and pred_iter is not None and pred_iter == cur_iter - 1:
+                    continue
+                if len(rows) >= _MAX_RETAINED_ITER_ROWS:
+                    continue
                 ngen_m = _NUM_GEN_TOKENS_RE.search(line)
-                if ngen_m is None:
-                    continue
-                ngen = int(ngen_m.group(1))
-                count, mean = by_ngen.get(ngen, (0, 0.0))
-                count += 1
-                mean += (dt - mean) / count
-                by_ngen[ngen] = (count, mean)
-        if all_count:
-            per_file_scans.append((by_ngen, all_count, all_mean))
-    return per_file_scans, total_count
+                rows.append(
+                    _IterRow(
+                        ngen=int(ngen_m.group(1)) if ngen_m is not None else None,
+                        device_step_time=float(m.group(2)),
+                    )
+                )
+        if rows:
+            per_file_rows.append(rows)
+    return per_file_rows
 
 
-def _mean_at_mode_ngen(
-    per_file_scans: List[Tuple[Dict[int, Tuple[int, float]], int, float]],
-) -> Optional[float]:
-    """Aggregate per-file scans into a single mean.
+def _stats_at_mode_ngen(
+    per_file_rows: List[List[_IterRow]],
+) -> Optional[_DeviceStepTimeStats]:
+    """Aggregate per-file rows into one set of distribution statistics.
 
     Within each file pick the num_generation_tokens value with the most
-    iterations (the mode) and take its Welford mean; ties break to the
+    iterations (the mode) and describe only that bucket; ties break to the
     largest ngen because the steady-state plateau is the upper of any tied
-    clusters. Mode is more robust than strict == max — a one-off spike where
+    clusters. Mode is more robust than strict == max -- a one-off spike where
     a single iter's ngen briefly exceeds the sustained batch would otherwise
-    collapse the mean to 1-2 samples. When a file produced usable rows but no
-    parseable num_generation_tokens on any of them, fall back to the file's
-    all-iter mean so a present metric is never lost (nvbugs 6487036 /
-    6487040). Then average the per-file means across workers. Returns None if
-    no file had a usable row.
+    collapse the statistics to 1-2 samples. Iterations near the end of a run
+    have a shrinking num_generation_tokens as sequences finish and land in
+    smaller-ngen buckets, so they do not drag the mean below steady state.
+    When a file produced usable rows but no parseable num_generation_tokens on
+    any of them, fall back to that file's whole sample so a present metric is
+    never lost (nvbugs 6487036 / 6487040).
+
+    Then average each statistic across workers, unweighted -- one vote per
+    worker, matching how the mean has always been combined. Averaging a median
+    or a percentile across workers is not itself a median or a percentile of
+    the pooled sample; these are per-worker statistics summarised across
+    workers, which is the comparison the regression check makes.
+
+    Returns None if no file had a usable row.
     """
-    means: List[float] = []
-    for by_ngen, _all_count, all_mean in per_file_scans:
+    per_file_stats: List[_DeviceStepTimeStats] = []
+    for rows in per_file_rows:
+        by_ngen: Dict[int, List[float]] = {}
+        for row in rows:
+            if row.ngen is not None:
+                by_ngen.setdefault(row.ngen, []).append(row.device_step_time)
         if by_ngen:
-            _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
-            means.append(mean)
+            _mode_ngen, values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
         else:
-            # No parseable ngen anywhere in this worker; use the all-iter mean.
-            means.append(all_mean)
-    if not means:
+            # No parseable ngen anywhere in this worker; use every row.
+            values = [row.device_step_time for row in rows]
+        if not values:
+            continue
+        per_file_stats.append(
+            _DeviceStepTimeStats(
+                mean=sum(values) / len(values),
+                median=_percentile(values, 50),
+                std=_stdev(values),
+                p75=_percentile(values, 75),
+                p99=_percentile(values, 99),
+            )
+        )
+    if not per_file_stats:
         return None
-    return sum(means) / len(means)
+    num_files = len(per_file_stats)
+    return _DeviceStepTimeStats(*(sum(column) / num_files for column in zip(*per_file_stats)))
 
 
 def parse_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Optional[float]:
-    """Mean per-iter prev_device_step_time (ms) across all gen workers.
+) -> Optional[_DeviceStepTimeStats]:
+    """Per-iter prev_device_step_time statistics (ms) across all gen workers.
 
-    For each gen_server_{i}.log, bucket iter >= 5 rows by
-    num_generation_tokens, pick the bucket with the most rows (the mode; ties
-    break to the largest ngen), and take that bucket's mean. Then average
-    those per-file means across the num_gen_servers workers. Iterations near
-    the end of a run have a shrinking num_generation_tokens as sequences
-    finish and land in smaller-ngen buckets, so they don't drag the mean
-    below the steady-state cost. Using the mode (rather than strict == max)
-    is robust against a single iter whose ngen briefly spikes above the
-    sustained batch, which would otherwise collapse the mean to 1-2 samples.
-    A worker whose num_generation_tokens never parses falls back to its
-    all-iter mean rather than being dropped to None. Returns None only if no
-    usable line is found in any file.
+    For each gen_server_{i}.log, take the iter >= 5 rows that are not the
+    successor of an empty (num_scheduled_requests == 0) iteration, bucket them
+    by num_generation_tokens, pick the bucket with the most rows (the mode;
+    ties break to the largest ngen), and describe that bucket with mean,
+    median, stdev, P75 and P99. Then average each statistic across the
+    num_gen_servers workers. A worker whose num_generation_tokens never parses
+    falls back to its whole sample rather than being dropped to None. Returns
+    None only if no usable line is found in any file.
+
+    The mean and the median are the regression-gated statistics
+    (GEN_ONLY_REGRESSION_METRICS); the other three are uploaded for diagnosis,
+    because a mean on its own cannot distinguish a slower workload from one
+    anomalous iteration. See
+    _scan_gen_worker_device_step_time for the empty-iteration exclusion and
+    _stats_at_mode_ngen for the bucket selection.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
     end-of-file are considered for gen_server_{i}.log — used to slice out a
     single client's iteration segment.
 
-    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) blocks
-    on the gen_server_{i}.done sentinels before calling this, so every gen
-    srun has already exited and its &> aggregate log is fully flushed — there
-    is no partially-written tail to poll for. This replaces the earlier
-    settle-poll heuristic, which could return a mean over a truncated prefix
-    when it accepted the first repeated row count while the log was still
-    flushing across NFS (nvbugs 6487036 / 6487040).
+    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) normally
+    waits for the gen_server_{i}.done sentinels first, so every gen srun has
+    exited and its &> aggregate log is fully flushed. If the dedicated
+    sentinel wait expires, the caller parses the current contents instead of
+    consuming the whole-test timeout; a missing metric then hard-fails before
+    upload. This replaces the earlier settle-poll heuristic, which could
+    accept a truncated prefix while the log was still flushing across NFS
+    (nvbugs 6487036 / 6487040 / 6487038).
     """
-    per_file_scans, _total_count = _scan_gen_worker_device_step_time(
-        output_dir, num_gen_servers, start_offsets
-    )
-    return _mean_at_mode_ngen(per_file_scans)
+    per_file_rows = _scan_gen_worker_device_step_time(output_dir, num_gen_servers, start_offsets)
+    return _stats_at_mode_ngen(per_file_rows)
 
 
 def add_perf_metric_value(
@@ -363,17 +544,27 @@ def add_perf_metric_value(
     - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
     - Adds `d_al` only when spec_decoding=True; non-spec rows omit it so
       OpenSearch baselines don't blend the two populations.
-    - Adds `d_mean_gen_worker_per_iter_device_step_time` only for the
-      disagg gen_only mode (the only mode whose regression is gated on it).
+    - Adds the `d_*_gen_worker_per_iter_device_step_time` family only for the
+      disagg gen_only mode (the only mode that emits them). Of these the mean
+      and the median are regression-gated (GEN_ONLY_REGRESSION_METRICS); the
+      rest are uploaded for diagnosis.
+
+    A missing or non-numeric gen_only statistic is omitted rather than
+    forwarded: typeCheckForOpenSearchDB rejects both None and int for a `d_`
+    key, so uploading one would fail the whole row instead of just losing a
+    diagnostic column. check_test_failure separately hard-fails a gen_only run
+    whose mean is absent, before results are uploaded.
     """
     for metric_name in PERF_METRIC_LOG_QUERIES:
         new_data[f"d_{metric_name}"] = metrics[metric_name]
     if spec_decoding:
         new_data["d_al"] = metrics["al"]
     if benchmark_mode == "gen_only":
-        new_data["d_mean_gen_worker_per_iter_device_step_time"] = metrics[
-            "mean_gen_worker_per_iter_device_step_time"
-        ]
+        for metric_name in GEN_ONLY_DEVICE_STEP_TIME_METRICS:
+            value = metrics.get(metric_name)
+            if value is None:
+                continue
+            new_data[f"d_{metric_name}"] = float(value)
 
 
 # Metrics where larger is better
@@ -399,8 +590,16 @@ MINIMIZE_METRICS = [
     "d_mean_e2el",
     "d_median_e2el",
     "d_p99_e2el",
-    # gen_only-only: per-iter device step time averaged across gen workers
+    # gen_only-only: per-iter device step time across gen workers. Lower is
+    # better for all five, including the spread statistics -- a tighter
+    # distribution is a more trustworthy measurement as well as a steadier
+    # workload. Mean and median are listed in regression_metrics; std/p75/p99
+    # get baselines but cannot fail a build (see check_regression).
     "d_mean_gen_worker_per_iter_device_step_time",
+    "d_median_gen_worker_per_iter_device_step_time",
+    "d_std_gen_worker_per_iter_device_step_time",
+    "d_p75_gen_worker_per_iter_device_step_time",
+    "d_p99_gen_worker_per_iter_device_step_time",
 ]
 
 # Default key metrics that determine regression (throughput metrics only).
@@ -456,6 +655,28 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     """Add host and port to command."""
     return cmd + ["--host", host, "--port", str(port)]
+
+
+def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
+    """Run a benchmark while streaming its combined output to an artifact log."""
+    benchmark_env = env.copy()
+    benchmark_env.setdefault("PYTHONUNBUFFERED", "1")
+    with open(log_path, "wb") as log_file:
+        result = subprocess.run(
+            cmd,
+            env=benchmark_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+    with open(log_path, "rb") as log_file:
+        raw_output = log_file.read()
+
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=raw_output)
+
+    return raw_output.decode("utf-8", errors="replace")
 
 
 class ServerConfig:
@@ -586,7 +807,6 @@ class ServerConfig:
             "gpus_per_node",
             "match_mode",
             "client_configs",
-            "match_mode",
             "backend",
             "extra_llm_api_config_path",
             "server_env_var",
@@ -622,30 +842,7 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "s_model_name",
-            "l_tp",
-            "l_ep",
-            "l_pp",
-            "l_cp",
-            "l_gpus_per_node",
-            "l_max_batch_size",
-            "b_enable_attention_dp",
-            "s_serving_backend",
-            # kv_cache_config
-            "s_kv_cache_dtype",
-            # cache_transceiver_config
-            "s_cache_transceiver_backend",
-            # speculative_config
-            # Keep baseline matching on the legacy key during DB migration.
-            # l_max_draft_len is written to DB but not used for matching until
-            # backfill completes.
-            "s_spec_decoding_type",
-            "l_num_nextn_predict_layers",
-            "l_force_num_accepted_tokens",
-            # moe_config
-            "l_load_balancer_num_slots",
-        ]
+        return get_server_match_keys(self.match_mode)
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -884,6 +1081,17 @@ class ClientConfig:
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
         self.iterations = client_config_data.get("iterations", 1)
+        # BOLT knob: extend the measured serving window (num_requests =
+        # concurrency * iterations) without touching the shared perf-sanity
+        # config, so a longer run dilutes startup in the profile. Set by the
+        # BOLT profile-gen job via EXTRA_CONTAINER_EXPORTS; unset/absent
+        # (every normal build) is a no-op.
+        try:
+            _bolt_iter_mult = int(os.environ.get("BOLT_ITER_MULT", "1") or "1")
+        except ValueError:
+            _bolt_iter_mult = 1
+        if _bolt_iter_mult > 1:
+            self.iterations *= _bolt_iter_mult
         self.isl = client_config_data.get("isl", 1024)
         self.osl = client_config_data.get("osl", 1024)
         self.random_range_ratio = client_config_data.get("random_range_ratio", 0.0)
@@ -1013,18 +1221,7 @@ class ClientConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "l_concurrency",
-            "l_iterations",
-            "l_isl",
-            "l_osl",
-            "d_random_range_ratio",
-            "s_backend",
-            "b_use_chat_template",
-            "b_streaming",
-            "b_use_nv_sa_benchmark",
-            "b_eos",
-        ]
+        return get_client_match_keys()
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
@@ -1069,6 +1266,7 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        internal_request_auth_key: str | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1079,6 +1277,7 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.internal_request_auth_key = internal_request_auth_key
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1097,7 +1296,10 @@ class AggrTestCmds(NamedTuple):
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
-        return [server_file_path]
+        benchmark_logs = sorted(
+            glob.glob(os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log"))
+        )
+        return [server_file_path, *benchmark_logs]
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs.
@@ -1114,8 +1316,16 @@ class AggrTestCmds(NamedTuple):
 
         try:
             server_hostname = "localhost"
-            server_port = get_free_port()
-            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
+            # port 0 + --report_addr: let the server bind a kernel-assigned
+            # port and tell us which one, instead of reserving one here and
+            # racing whoever takes it before the server binds.
+            server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
+            if os.path.exists(server_addr_path):
+                os.remove(server_addr_path)
+            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
+                "--report_addr",
+                server_addr_path,
+            ]
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
@@ -1129,6 +1339,7 @@ class AggrTestCmds(NamedTuple):
                     stdout=server_ctx,
                     stderr=subprocess.STDOUT,
                 )
+                _, server_port = wait_for_reported_addr(server_addr_path, self.timeout, server_proc)
 
                 wait_for_endpoint_ready(
                     f"http://{server_hostname}:{server_port}/health",
@@ -1158,14 +1369,11 @@ class AggrTestCmds(NamedTuple):
                     client_env = copy.deepcopy(os.environ)
                     if client_config:
                         client_env.update(client_config.to_env())
-                    output = subprocess.check_output(
+                    output = _run_benchmark_with_log(
                         client_cmd_with_port,
-                        stderr=subprocess.STDOUT,
-                        env=client_env,
-                    ).decode()
-
-                    with open(client_file_path, "w") as client_ctx:
-                        client_ctx.write(output)
+                        client_env,
+                        client_file_path,
+                    )
                     outputs.append(output)
                 else:
                     print_info(
@@ -1210,6 +1418,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    internal_request_auth_key: str = ""
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1218,19 +1427,28 @@ class DisaggTestCmds(NamedTuple):
     # receive env via SLURM env propagation set up by submit.py.
     server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
 
-    def _generate_hostname_file(self, server_idx: int, port: int):
-        """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
-        if not os.path.exists(hostnames_dir):
-            os.makedirs(hostnames_dir, exist_ok=True)
-        hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
-        with open(hostname_file, "w") as f:
-            f.write(f"{self.hostname}:{port}")
+    def _hostnames_dir(self, server_idx: int) -> str:
+        """Directory the disagg tasks exchange bound addresses through.
+
+        Scoped by SLURM job id so a rerun never reads the previous run's files:
+        test_output_dir is derived from the test case name alone and is created
+        with exist_ok=True, so it is reused across runs. The step id is
+        deliberately excluded -- each role runs as a separate srun step within
+        one job, and they must all agree on this path.
+        """
+        run_id = os.environ.get("SLURM_JOB_ID", "local")
+        return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
+
+    def _hostname_file(self, server_idx: int) -> str:
+        """Path this task's server reports its bound address to."""
+        hostnames_dir = self._hostnames_dir(server_idx)
+        os.makedirs(hostnames_dir, exist_ok=True)
+        return os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
 
     def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = self._hostnames_dir(server_idx)
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
@@ -1247,7 +1465,11 @@ class DisaggTestCmds(NamedTuple):
             time.sleep(10)
             if not os.path.exists(hostnames_folder):
                 continue
-            hostnames = os.listdir(hostnames_folder)
+            # Only completed files: trtllm-serve publishes its address by
+            # renaming a "<name>.<rand>.tmp" sibling into place, and counting
+            # those transient entries would both inflate the count and get
+            # parsed as a CTX/GEN url below.
+            hostnames = [f for f in os.listdir(hostnames_folder) if f.endswith(".txt")]
             if len(hostnames) >= expected_count:
                 break
 
@@ -1265,15 +1487,14 @@ class DisaggTestCmds(NamedTuple):
             elif hostname_file.startswith("GEN"):
                 gen_hostnames.append(hostname_port)
 
-        # Allocate port here (after waiting) to minimize the window between
-        # port allocation and actual use, avoiding TOCTOU race conditions
-        # where another process on the same node grabs the port.
-        disagg_server_port = get_free_port()
-
+        # port 0: the disagg server binds a kernel-assigned port and reports it
+        # back via --report_addr, so there is no window between choosing a port
+        # here and the server binding it.
         server_config = {
             "hostname": self.hostname,
-            "port": disagg_server_port,
+            "port": 0,
             "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
             "context_servers": {
                 "num_instances": self.num_ctx_servers,
                 "urls": ctx_hostnames,
@@ -1289,25 +1510,19 @@ class DisaggTestCmds(NamedTuple):
         print_info(f"Server config file {config_path} generated")
         return config_path
 
-    def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
-        """Wait for and read disagg server config."""
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
-        start_time = time.time()
-        while True:
-            if os.path.exists(config_path):
-                print_info(f"Server config file found: {config_path}")
-                break
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
-                raise RuntimeError(
-                    f"Server config file {config_path} not found after {self.timeout}s"
-                )
-            print_info(f"Waiting for server config file, elapsed time: {elapsed_time}s")
-            time.sleep(10)
+    def _disagg_server_addr_file(self, server_idx: int) -> str:
+        """Path the disagg server reports its bound address to."""
+        return os.path.join(self._hostnames_dir(server_idx), f"DISAGG_SERVER.{server_idx}.addr")
 
-        with open(config_path, "r") as f:
-            server_config = yaml.safe_load(f)
-        return server_config["hostname"], server_config["port"]
+    def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
+        """Wait for the disagg server to report the address it bound.
+
+        The config carries port 0, so the address is only known once the server
+        has bound; reading it from the config would yield 0.
+        """
+        addr_path = self._disagg_server_addr_file(server_idx)
+        print_info(f"Waiting for disagg server address file {addr_path}")
+        return wait_for_reported_addr(addr_path, self.timeout)
 
     def wait_for_benchmark_ready(
         self,
@@ -1348,7 +1563,11 @@ class DisaggTestCmds(NamedTuple):
                 )
             time.sleep(10)
 
-    def wait_for_gen_log_sentinels(self, poll_interval: float = 2.0) -> bool:
+    def wait_for_gen_log_sentinels(
+        self,
+        timeout: float = GEN_LOG_SENTINEL_TIMEOUT,
+        poll_interval: float = 2.0,
+    ) -> bool:
         """Block until every gen worker signals that its log is fully written.
 
         Each gen worker's srun in slurm_launch_draft.sh redirects all of its
@@ -1357,25 +1576,26 @@ class DisaggTestCmds(NamedTuple):
         flushed). The benchmark writes benchmark_status *before* calling this,
         which is what lets the gen srun exit — so this is not circular.
 
-        Returns True once all sentinels exist, or False if self.timeout is
-        reached first. On False the caller still parses whatever is on disk:
-        the sentinel is a correctness optimization against reading a
-        mid-flush log (nvbugs 6487036 / 6487040), never a hang risk for CI.
+        Returns True once all sentinels exist, or False if the dedicated
+        sentinel timeout is reached first. On False the caller falls back to
+        parsing the current log contents. The bounded wait prevents a stuck
+        multi-node srun from consuming the whole-test timeout and triggering
+        Slurm's kill-on-bad-exit cascade (nvbugs 6487036 / 6487040 / 6487038).
         """
         sentinels = [
             os.path.join(self.test_output_dir, f"gen_server_{i}.done")
             for i in range(self.num_gen_servers)
         ]
-        start_time = time.time()
+        start_time = time.monotonic()
         while True:
             missing = [p for p in sentinels if not os.path.exists(p)]
             if not missing:
                 print_info("All gen worker log sentinels present; log flush complete.")
                 return True
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
+            elapsed_time = time.monotonic() - start_time
+            if elapsed_time > timeout:
                 print_info(
-                    f"Timeout ({self.timeout}s) waiting for gen worker log "
+                    f"Timeout ({timeout}s) waiting for gen worker log "
                     f"sentinels {missing}; parsing current log contents."
                 )
                 return False
@@ -1383,6 +1603,51 @@ class DisaggTestCmds(NamedTuple):
                 f"Waiting for gen worker log sentinels {missing}, elapsed time: {elapsed_time:.0f}s"
             )
             time.sleep(poll_interval)
+
+    def _append_gen_worker_device_step_time(
+        self,
+        pending_device_step_time: List[dict],
+        outputs: List[str],
+    ) -> None:
+        """Wait for GEN log flush, then append each pending client's metrics.
+
+        A sentinel timeout is a bounded teardown fallback, not a reason to
+        discard metrics that are already present in the GEN logs. If the
+        fallback parse finds no usable metric, check_test_failure still fails
+        the gen_only run before results are uploaded.
+
+        Five lines are written, one statistic each -- see
+        GEN_ONLY_PERF_METRIC_LOG_QUERIES for why they must not share a leading
+        word. The mean keeps its original wording and 2 decimals so existing
+        log readers and dashboards are unaffected; the four new lines use 4
+        decimals because the stdev of a healthy run is O(0.1 ms) and would
+        round to two significant figures away at 2.
+        """
+        if not pending_device_step_time:
+            return
+
+        self.wait_for_gen_log_sentinels()
+        for record in pending_device_step_time:
+            stats = parse_gen_worker_device_step_time(
+                self.test_output_dir,
+                self.num_gen_servers,
+                start_offsets=record["start_offsets"],
+            )
+            if stats is None:
+                continue
+            summary_lines = "\n".join(
+                [
+                    f"Average Per Iter Device Step Time (ms): {stats.mean:.2f}",
+                    f"Median Per Iter Device Step Time (ms): {stats.median:.4f}",
+                    f"Stdev Per Iter Device Step Time (ms): {stats.std:.4f}",
+                    f"P75 Per Iter Device Step Time (ms): {stats.p75:.4f}",
+                    f"P99 Per Iter Device Step Time (ms): {stats.p99:.4f}",
+                ]
+            )
+            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+                benchmark_ctx.write(f"\n{summary_lines}\n")
+            idx = record["output_index"]
+            outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -1400,6 +1665,13 @@ class DisaggTestCmds(NamedTuple):
             os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
         )
         server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
+        server_logs.extend(
+            sorted(
+                glob.glob(
+                    os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log")
+                )
+            )
+        )
         return server_logs
 
     @staticmethod
@@ -1426,8 +1698,11 @@ class DisaggTestCmds(NamedTuple):
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
-            port = get_free_port()
-            self._generate_hostname_file(server_idx, port)
+            # port 0 + --report_addr: the worker binds a kernel-assigned port
+            # and publishes host:port itself, so no port is reserved here and
+            # left unbound while anything on the node could take it. The disagg
+            # server reads these files to build its config, exactly as before.
+            hostname_file = self._hostname_file(server_idx)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
 
@@ -1436,7 +1711,10 @@ class DisaggTestCmds(NamedTuple):
                 config_idx = server_cmd.index("--config") + 1
                 self._wait_for_config_file(server_cmd[config_idx])
 
-            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
+            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, 0) + [
+                "--report_addr",
+                hostname_file,
+            ]
             try:
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
@@ -1468,7 +1746,18 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
+                # _hostnames_dir is scoped by job, so a new job never sees an
+                # older one's files, but a retry within the same job and the
+                # same server_idx would. Drop the previous attempt's address
+                # first, or the BENCHMARK task connects to a dead port. This
+                # task owns the file exclusively, so removing it here is safe.
+                disagg_addr_path = self._disagg_server_addr_file(server_idx)
+                if os.path.exists(disagg_addr_path):
+                    os.remove(disagg_addr_path)
                 self._generate_disagg_server_config(server_idx)
+                # The config carries port 0; publish the resolved address so
+                # the BENCHMARK task can find the server.
+                disagg_cmd = disagg_cmd + ["--report_addr", disagg_addr_path]
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
@@ -1497,13 +1786,16 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "BENCHMARK":
             # Perf-benchmark clients whose gen-worker device step time must be
-            # parsed once the gen logs are flushed. The parse is deferred out of
+            # parsed after the gen-log flush wait. The parse is deferred out of
             # the client loop because gen_server_*.log keeps being written until
             # the gen srun exits, and the gen srun only exits after
             # benchmark_status is written in the finally below. Parsing inside
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
+            collect_device_step_time = (
+                configs_for_idx is not None and configs_for_idx[2].benchmark_mode == "gen_only"
+            )
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -1535,35 +1827,37 @@ class DisaggTestCmds(NamedTuple):
                         )
                         print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                        # Snapshot gen_server log sizes so the per-client
-                        # average covers only iterations driven by this client.
-                        gen_log_start_offsets = gen_worker_log_sizes(
-                            self.test_output_dir, self.num_gen_servers
-                        )
+                        # Snapshot gen_server log sizes so the gen_only
+                        # per-client average covers only iterations driven by
+                        # this client. Other modes do not emit this metric and
+                        # must not wait for the GEN teardown sentinel.
+                        gen_log_start_offsets = None
+                        if collect_device_step_time:
+                            gen_log_start_offsets = gen_worker_log_sizes(
+                                self.test_output_dir, self.num_gen_servers
+                            )
 
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
-                        output = subprocess.check_output(
+                        output = _run_benchmark_with_log(
                             client_cmd_with_port,
-                            env=bench_env,
-                            stderr=subprocess.STDOUT,
-                        ).decode()
-
-                        with open(benchmark_file_path, "w") as benchmark_ctx:
-                            benchmark_ctx.write(output)
+                            bench_env,
+                            benchmark_file_path,
+                        )
 
                         outputs.append(output)
-                        # Defer the gen-worker device-step-time parse until the
-                        # gen logs are flushed (see below); remember where to
-                        # write the summary back.
-                        pending_device_step_time.append(
-                            {
-                                "output_index": len(outputs) - 1,
-                                "benchmark_file_path": benchmark_file_path,
-                                "start_offsets": gen_log_start_offsets,
-                            }
-                        )
+                        if collect_device_step_time:
+                            # Defer the gen-worker device-step-time parse until
+                            # the gen logs are flushed (see below); remember
+                            # where to write the summary back.
+                            pending_device_step_time.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "start_offsets": gen_log_start_offsets,
+                                }
+                            )
                     else:
                         print_info(
                             f"Skipping perf benchmark for client {client_idx}: "
@@ -1599,27 +1893,12 @@ class DisaggTestCmds(NamedTuple):
 
             # benchmark_status is written, so the gen workers can now stop and
             # their srun will exit and drop gen_server_{i}.done. Wait once for
-            # those sentinels (bounded by self.timeout), then parse each
-            # benchmark client's gen-worker device step time a single time: the
-            # flushed log is complete, so no settle polling is needed. Only
-            # gen_only runs emit prev_device_step_time; other modes parse to
-            # None and skip the summary line.
-            if pending_device_step_time:
-                self.wait_for_gen_log_sentinels()
-                for record in pending_device_step_time:
-                    device_step_time_mean = parse_gen_worker_device_step_time(
-                        self.test_output_dir,
-                        self.num_gen_servers,
-                        start_offsets=record["start_offsets"],
-                    )
-                    if device_step_time_mean is not None:
-                        summary_line = (
-                            f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
-                        )
-                        with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                            benchmark_ctx.write(f"\n{summary_line}\n")
-                        idx = record["output_index"]
-                        outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
+            # those sentinels (bounded independently of the whole-test timeout),
+            # then parse each benchmark client's gen-worker device step time a
+            # single time. A timeout falls back to the current log contents.
+            # Only gen_only runs populate this queue; other modes skip both the
+            # sentinel wait and device-step-time parsing.
+            self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
 
         return outputs
 
@@ -1892,6 +2171,7 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        internal_request_auth_key = self._resolve_internal_request_auth_key(config)
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1933,6 +2213,7 @@ class PerfSanityTestConfig:
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
             ctx_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1942,6 +2223,7 @@ class PerfSanityTestConfig:
             }
 
             gen_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1963,6 +2245,7 @@ class PerfSanityTestConfig:
                 model_name=model_name,
                 hardware=hardware,
                 server_env_var=server_env_var,
+                internal_request_auth_key=internal_request_auth_key,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -2013,6 +2296,32 @@ class PerfSanityTestConfig:
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
+
+    def _resolve_internal_request_auth_key(self, config: dict) -> str:
+        explicit_key = config.get("internal_request_auth_key")
+        if explicit_key:
+            return explicit_key
+
+        test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(test_output_dir, exist_ok=True)
+        key_path = os.path.join(test_output_dir, "internal_request_auth_key.txt")
+        lock_path = f"{key_path}.lock"
+
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if os.path.exists(key_path):
+                    with open(key_path, "r") as key_file:
+                        internal_request_auth_key = key_file.read().strip()
+                    if internal_request_auth_key:
+                        return internal_request_auth_key
+
+                internal_request_auth_key = secrets.token_hex(32)
+                with open(key_path, "w") as key_file:
+                    key_file.write(f"{internal_request_auth_key}\n")
+                return internal_request_auth_key
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def get_commands(self):
         """Get commands based on runtime and benchmark_mode."""
@@ -2126,6 +2435,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )
@@ -2272,8 +2582,10 @@ class PerfSanityTestConfig:
                         f"is missing 'Mean Avg Decoded Tokens per Iter' in benchmark output. "
                     )
                 # gen_only tests must report mean_gen_worker_per_iter_device_step_time
-                # (parsed from gen_server_*.log). It is the sole regression metric for
-                # gen_only, so a missing value must hard-fail rather than silently upload.
+                # (parsed from gen_server_*.log). It is a regression metric for gen_only,
+                # so a missing value must hard-fail rather than silently upload. Checking
+                # the mean alone is sufficient: all five statistics come from the same
+                # _DeviceStepTimeStats, so the mean is absent only if all of them are.
                 if (
                     self.runtime == "multi_node_disagg_server"
                     and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
@@ -2461,7 +2773,11 @@ class PerfSanityTestConfig:
         if self.runtime == "multi_node_disagg_server" and any(
             sc[2].benchmark_mode == "gen_only" for sc in self.server_configs
         ):
-            regression_metrics = ["d_mean_gen_worker_per_iter_device_step_time"]
+            # See GEN_ONLY_REGRESSION_METRICS for why the median is gated too.
+            # It has no baseline history yet, and check_regression skips any
+            # metric whose baseline is absent or non-positive, so it stays inert
+            # until enough runs accrue -- it cannot fail a build before then.
+            regression_metrics = list(GEN_ONLY_REGRESSION_METRICS)
         else:
             regression_metrics = list(REGRESSION_METRICS)
             has_spec_decoding = any(

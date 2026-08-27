@@ -836,7 +836,8 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithHalfRecurrentStatesPoolTest)
         /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
         CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
-        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
+        /*indexerKCacheUseFp4=*/false, /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata,
+        poolConfigurations);
     kvCacheManager.allocatePools(/*useUvm=*/false);
     auto const& blockManager = kvCacheManager.getBlockManager();
 
@@ -886,6 +887,100 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithHalfRecurrentStatesPoolTest)
     EXPECT_EQ(layerToPoolMappingRange[2], 1);
 }
 #endif
+
+TEST_F(KVCacheManagerTest, IndexerKCachePoolLayerMaskTest)
+{
+    // Masked indexer K cache pool: only masked-in (full-indexer) layers own a
+    // row, mirroring GLM 5.2 cross-layer indexer sharing (freq=4, offset=2 over
+    // 6 layers -> full layers {0, 1, 5}).
+    auto constexpr numLayers = 6;
+    auto constexpr numHeads = 1;
+    auto constexpr sizePerHead = 576;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr indexerKCacheIndexHeadDim = 128;
+    auto constexpr indexerKCacheQuantBlockSize = 128;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    auto const indexerLayerMask = std::vector<bool>{true, true, false, false, false, true};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+        /*sinkTokenLength=*/0, stream, maxAttentionWindow, maxAttentionWindow, /*enableBlockReuse=*/false,
+        CacheType::kSELFKONLY, std::nullopt, nullptr, /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, nullptr,
+        /*enableIndexerKCache=*/true, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
+        /*indexerKCacheUseFp4=*/false, indexerLayerMask);
+
+    kvCacheManager.allocatePools(/*useUvm=*/false);
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
+    // One KV pool plus one (masked) indexer pool.
+    EXPECT_EQ(blockManager.getNumPools(), 2);
+    EXPECT_EQ(blockManager.getNumPools(/*includeBlockScalePools=*/true, /*includeIndexerKCachePools=*/false), 1);
+
+    // The indexer pool holds one row per masked-in layer only.
+    auto const indexerPool = kvCacheManager.getIndexerKCachePool();
+    ASSERT_NE(indexerPool, nullptr);
+    EXPECT_EQ(indexerPool->getShape().d[1], 3);
+
+    // Layer -> pool-row mapping: full layers get consecutive rows in layer
+    // order, shared layers map to -1.
+    EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(0), 0);
+    EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(1), 1);
+    EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(2), -1);
+    EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(3), -1);
+    EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(4), -1);
+    EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(5), 2);
+
+    // Indexer pool block size: 1 head x (dataBytes + scaleBytes) x tokensPerBlock.
+    auto constexpr perTokenBytes
+        = indexerKCacheIndexHeadDim + indexerKCacheIndexHeadDim / indexerKCacheQuantBlockSize * 4;
+    EXPECT_EQ(blockManager.getBlockSize(1), perTokenBytes * tokensPerBlock);
+}
+
+TEST_F(KVCacheManagerTest, IndexerKCachePoolDenseDefaultTest)
+{
+    // Without a per-layer indexer mask the indexer pool keeps the dense legacy
+    // layout: one row per layer, identity layer -> row mapping.
+    auto constexpr numLayers = 4;
+    auto constexpr numHeads = 1;
+    auto constexpr sizePerHead = 576;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+        /*sinkTokenLength=*/0, stream, maxAttentionWindow, maxAttentionWindow, /*enableBlockReuse=*/false,
+        CacheType::kSELFKONLY, std::nullopt, nullptr, /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, nullptr,
+        /*enableIndexerKCache=*/true, /*indexerKCacheQuantBlockSize=*/128,
+        /*indexerKCacheIndexHeadDim=*/128, /*indexerKCacheUseFp4=*/false);
+
+    kvCacheManager.allocatePools(/*useUvm=*/false);
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
+    auto const indexerPool = kvCacheManager.getIndexerKCachePool();
+    ASSERT_NE(indexerPool, nullptr);
+    EXPECT_EQ(indexerPool->getShape().d[1], numLayers);
+    for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+    {
+        EXPECT_EQ(blockManager.getIndexerKCachePoolLayerIdx(layerIdx), layerIdx);
+    }
+}
 
 TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 {
@@ -7546,7 +7641,7 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
         std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
         0,
         /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
-        false, linearAttentionMetadata);
+        false, /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata);
     blockManager.allocatePools(false);
 
     ASSERT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -7692,7 +7787,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
         0,
         /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
-        false, linearAttentionMetadata);
+        false, /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata);
     blockManager.allocatePools(false);
 
     auto inputTokens0 = std::make_shared<VecTokens>();
@@ -7930,6 +8025,7 @@ void testKVCacheManagerLinearAttention_DecodingBlockGrowth(
         /*indexerKCacheQuantBlockSize*/ 128,
         /*indexerKCacheIndexHeadDim*/ 0,
         /*indexerKCacheUseFp4=*/false,
+        /*indexerKCacheLayerMask=*/std::nullopt,
         /*linearAttentionMetadata*/ linearAttentionMetadata);
 
     auto inputTokens0 = std::make_shared<VecTokens>();
@@ -8027,7 +8123,8 @@ void testKVCacheManagerLinearAttention_BlockCopying(
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow},
         tensorrt_llm::DataType::kHALF, sinkTokenLen, stream, maxAttentionWindow, /*chunkSize*/ 0, enableContextReuse,
-        CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, false, 128, 0, false, linearAttentionMetadata);
+        CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, false, 128, 0, false,
+        /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata);
     kvCacheManager.allocatePools(false);
 
     char* poolBaseAddr
@@ -10282,6 +10379,79 @@ TEST_F(KVCacheManagerTest, VSWAEvictedPlaceholderAnchorAllowsTrailingReuse)
     ASSERT_NE(kvCacheManager.findBlocksInReuseTreeByBlockKeys(b6PartialKeys, window), nullptr);
 }
 
+// Regression for the O(matched_blocks^2) -> O(matched_blocks) rewrite of
+// findReusableBlockMatches: when an SWA missing anchor appears late enough that
+// no trailing window of full matches can re-validate it, the safe-prefix
+// boundary must FREEZE before the anchor and the still-matched-but-unsafe tail
+// must be dropped. The original code kept the last full-vector copy; the rewrite
+// records the boundary and truncates the tail once after the walk. Unlike the
+// fail->pass re-advance case above, this exercises truncation of a non-empty
+// tail (the missing-anchor placeholder AND a real trailing match).
+TEST_F(KVCacheManagerTest, VSWASafePrefixFreezesAtMissingAnchorWhenNoTrailingReuse)
+{
+    auto constexpr tpb = 4;
+    auto constexpr window = 3 * tpb;  // 12 tokens = 3 blocks
+    auto constexpr numBlocksSeq0 = 7; // 7 blocks = 28 tokens in seq0
+    auto constexpr blocksInPrimaryPool = 16;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+
+    auto const blocksPerWindow = BlocksPerWindow{{window, {blocksInPrimaryPool, 0}}};
+    KVCacheManager kvCacheManager(2, 2, 64, tpb, blocksPerWindow, 8, kVSWA_BEAM_WIDTH, std::vector<SizeType32>{window},
+        tensorrt_llm::DataType::kHALF, 0, stream,
+        /*maxSequenceLength=*/128, /*chunkSize=*/128, /*enableBlockReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    auto const makeBlockKeys = [&](SizeType32 usableTokens, bool allowPartial)
+    {
+        auto prefixTokens = std::make_shared<VecTokens>(usableTokens);
+        std::iota(prefixTokens->begin(), prefixTokens->end(), kVSWA_FIRST_TOKEN);
+        auto prefixRequest
+            = std::make_shared<LlmRequest>(99, kVSWA_MAX_NEW_TOKENS, prefixTokens, samplingConfig, kVSWA_IS_STREAMING);
+        auto const& uniqueTokens = prefixRequest->getUniqueTokens(kVSWA_BEAM_IDX);
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableTokens, tpb, allowPartial);
+        return buildBlockKeys(blockedUniqueTokens, *prefixRequest);
+    };
+
+    // Seq 0: 28 tokens covering 7 blocks; b0..b5 land in the reuse trie (b6 is
+    // partial and not stored).
+    auto inputTokens0 = std::make_shared<VecTokens>(numBlocksSeq0 * tpb);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager.addSequenceBatch({{{0, numBlocksSeq0 * tpb, kVSWA_BEAM_WIDTH}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(0, std::nullopt)));
+
+    // Evict the KV of b4 (index 4). Its trie node survives (b5 is its
+    // descendant), so on the next lookup b4 is a traversal-only missing anchor at
+    // token offset 20. Re-validation would require matching another window (12
+    // tokens) past it -- reaching token 32 == block 8 -- but only b5 (one more
+    // full block) exists before the absent b6, so the safe boundary freezes at b3
+    // and never re-advances.
+    auto const b4Keys = makeBlockKeys(5 * tpb, /*allowPartial=*/false);
+    auto b4Block = kvCacheManager.findBlocksInReuseTreeByBlockKeys(b4Keys, window);
+    ASSERT_NE(b4Block, nullptr);
+    b4Block->detachFromLookupNode();
+
+    // Seq 2: same 28-token prompt. The walk matches b0..b3 (safe), hits the b4
+    // missing anchor (guard freezes at token 20), then matches b5 (still unsafe:
+    // token 24 < 20 + 12). Safe prefix is 4 blocks; the b4 placeholder and the
+    // trailing b5 match must be truncated away.
+    auto inputTokens2 = std::make_shared<VecTokens>(numBlocksSeq0 * tpb);
+    std::iota(inputTokens2->begin(), inputTokens2->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest2
+        = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, inputTokens2, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager.addSequenceBatch({{{2, numBlocksSeq0 * tpb, kVSWA_BEAM_WIDTH}}}, {std::ref(*llmRequest2)});
+
+    EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 4 * tpb)
+        << "safe SWA reuse must freeze before the missing anchor and drop the unsafe tail";
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest2);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(2, llmRequest2)));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // KvCacheConnector decode-time block allocation tests
 //
@@ -10807,7 +10977,7 @@ TEST_F(KVCacheManagerTest, VswaMixedHeadDimReuseSmoke)
         /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
         /*kvCacheConnectorManager=*/nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
-        /*indexerKCacheUseFp4=*/false,
+        /*indexerKCacheUseFp4=*/false, /*indexerKCacheLayerMask=*/std::nullopt,
         /*linearAttentionMetadata=*/std::nullopt, poolConfigurations);
     kvCacheManager.allocatePools(/*useUvm=*/false);
 
@@ -10902,7 +11072,8 @@ TEST_F(KVCacheManagerTest, HybridDisaggUsesAttentionPoolDtype)
         /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
         CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
-        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
+        /*indexerKCacheUseFp4=*/false, /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata,
+        poolConfigurations);
     kvCacheManager->allocatePools(/*useUvm=*/false);
 
     CacheTransBufferManager cacheTransBufferManager(kvCacheManager.get(), /*maxNumTokens=*/tokensPerBlock);
@@ -10954,7 +11125,7 @@ TEST_F(KVCacheManagerTest, VswaDisaggDtypeMismatchTriggersGuard)
         /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
         /*kvCacheConnectorManager=*/nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
-        /*indexerKCacheUseFp4=*/false,
+        /*indexerKCacheUseFp4=*/false, /*indexerKCacheLayerMask=*/std::nullopt,
         /*linearAttentionMetadata=*/std::nullopt, poolConfigurations);
     kvCacheManager->allocatePools(/*useUvm=*/false);
 

@@ -36,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
 # ---------------------------------------------------------------------- #
 # Mock infra: in-memory managers / requests (avoid touching V2 / model).  #
@@ -47,7 +48,7 @@ class _RecordingMixin:
     translation without real algorithm side-effects."""
 
     def __init__(self, kv_cache_manager, record_list, name="m"):
-        super().__init__(kv_cache_manager)
+        super().__init__(_compression_config(), kv_cache_manager)
         self._record_list = record_list
         self._name = name
 
@@ -71,8 +72,17 @@ class _MockCompressionManager(_RecordingMixin, KVCacheCompressionManager):
         self._record("on_request_finish")
 
 
-class _LengthAdjustingCompressionManager(KVCacheCompressionManager):
-    adjusts_generation_kv_length: ClassVar[bool] = True
+class _PhysicalLengthChangingConfig(KvCacheCompressionConfig):
+    changes_physical_kv_length: ClassVar[bool] = True
+
+
+class _BlockReuseCompatibleConfig(KvCacheCompressionConfig):
+    def supports_block_reuse(self) -> bool:
+        return True
+
+
+def _compression_config() -> KvCacheCompressionConfig:
+    return KvCacheCompressionConfig(algorithm="test")
 
 
 def _v2_manager(*, is_draft: bool):
@@ -87,8 +97,7 @@ def _v2_manager(*, is_draft: bool):
 
 @pytest.fixture
 def fake_kv_cache_manager():
-    """A stand-in KVCacheManagerV2. The framework reads enable_block_reuse off
-    it in __init__; default it to False, like a normal run with reuse off."""
+    """A stand-in KVCacheManagerV2 for compression-manager unit tests."""
     return _v2_manager(is_draft=False)
 
 
@@ -118,7 +127,7 @@ class TestBaseABC:
         assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
     def test_four_hooks_default_noop(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -128,24 +137,25 @@ class TestBaseABC:
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking
         # existing overrides.
-        m = KVCacheCompressionManager(fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
         assert m.on_request_init(MagicMock(), future_arg=1) is None
         assert m.on_generation_step_end(MagicMock(), future_arg=1) is None
 
     def test_resource_counts_are_zero(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
         # The manager owns no physical resources (the V2 cache manager does),
         # so it must not gate the scheduler.
         assert m.get_max_resource_count() == 0
         assert m.get_needed_resource_to_completion(MagicMock()) == 0
 
-    def test_length_adjustment_marks_target_and_draft_v2(self):
+    def test_physical_length_change_marks_target_and_draft_v2(self):
         # The draft cache is compacted together with the target, so both
         # managers diverge from the logical length in the same way.
         target = _v2_manager(is_draft=False)
         draft = _v2_manager(is_draft=True)
 
-        manager = _LengthAdjustingCompressionManager(target, draft)
+        config = _PhysicalLengthChangingConfig(algorithm="test")
+        manager = KVCacheCompressionManager(config, target, draft)
 
         assert manager.kv_cache_manager is target
         assert manager.draft_kv_cache_manager is draft
@@ -154,10 +164,11 @@ class TestBaseABC:
         assert draft.kv_compression_manages_history is True
 
     def test_rejects_non_v2_ownership(self):
+        config = _compression_config()
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            KVCacheCompressionManager(MagicMock())
+            KVCacheCompressionManager(config, MagicMock())
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            KVCacheCompressionManager(_v2_manager(is_draft=False), MagicMock())
+            KVCacheCompressionManager(config, _v2_manager(is_draft=False), MagicMock())
 
     def test_request_field_defaults_to_zero(self):
         """LlmRequest carries the compression count (the manager's only
@@ -293,26 +304,43 @@ class TestFactory:
             is None
         )
 
-    def test_eviction_method_predicate_defaults_false(self):
-        # Non-evicting methods (e.g. offloading) are never restricted by the
-        # speculative mode: the call-site gate reads this config predicate.
-        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+    def test_triattention_requires_sm100_family(self, fake_kv_cache_manager):
+        cfg = MagicMock()
+        cfg.algorithm = "triattention"
+        with (
+            patch.object(util_mod, "is_sm_100f", return_value=False),
+            pytest.raises(RuntimeError, match="SM100-family"),
+        ):
+            create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
 
+    def test_capabilities_default_false(self):
         config = KvCacheCompressionConfig(algorithm="offload")
-        assert config.kv_cache_compression_mode.is_eviction_method() is False
-        m = KVCacheCompressionManager(_v2_manager(is_draft=False))
+        target = _v2_manager(is_draft=False)
+        assert config.changes_physical_kv_length is False
+        assert config.supports_block_reuse() is False
+        assert config.supports_speculative_decoding() is False
+        m = KVCacheCompressionManager(config, target)
+        assert target.kv_compression_manages_history is False
         assert not hasattr(m, "spec_config")
 
-    def test_spec_gate_only_restricts_eviction_methods(self):
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
+    def test_spec_gate_uses_config_capability(self):
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
         from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
-        # Non-evicting methods pass with any speculative mode; no exception.
         config = KvCacheCompressionConfig(algorithm="offload")
+        kv_cache_config = SimpleNamespace(enable_block_reuse=False)
         spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
-        validate_kv_cache_compression_with_spec(config, spec_config, None)
-        validate_kv_cache_compression_with_spec(config, None, None)
+        with pytest.raises(ValueError, match="speculative decoding"):
+            validate_kv_cache_compression_compatibility(
+                config,
+                kv_cache_config,
+                spec_config,
+            )
+        validate_kv_cache_compression_compatibility(
+            config,
+            kv_cache_config,
+            None,
+        )
 
 
 # ---------------------------------------------------------------------- #
@@ -339,22 +367,31 @@ class TestCanonicalImports:
 
 
 # ---------------------------------------------------------------------- #
-# 5. Block-reuse guard                                                    #
+# 5. Compression compatibility gate                                      #
 # ---------------------------------------------------------------------- #
 
 
-class TestBlockReuseGuard:
-    """__init__ refuses block reuse for a method that changes the stored keys
-    and values, the same check RocketKVCacheManager makes."""
-
-    def _mgr(self, enable_block_reuse):
-        m = _v2_manager(is_draft=False)
-        m.enable_block_reuse = enable_block_reuse
-        return m
-
+class TestCompressionCompatibility:
     def test_raises_when_reuse_on(self):
+        config = _compression_config()
         with pytest.raises(ValueError, match="block reuse"):
-            KVCacheCompressionManager(self._mgr(enable_block_reuse=True))
+            util_mod.validate_kv_cache_compression_compatibility(
+                config,
+                SimpleNamespace(enable_block_reuse=True),
+                None,
+            )
 
     def test_ok_when_reuse_off(self):
-        KVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise
+        util_mod.validate_kv_cache_compression_compatibility(
+            _compression_config(),
+            SimpleNamespace(enable_block_reuse=False),
+            None,
+        )
+
+    def test_block_reuse_capability_allows_reuse(self):
+        config = _BlockReuseCompatibleConfig(algorithm="test")
+        util_mod.validate_kv_cache_compression_compatibility(
+            config,
+            SimpleNamespace(enable_block_reuse=True),
+            None,
+        )

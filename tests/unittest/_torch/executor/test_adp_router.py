@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _MockRequest(MagicMock):
     """Mock executor Request whose ``num_input_tokens`` mirrors the real binding
@@ -1340,6 +1342,23 @@ class TestConversationAwareADPRouter:
         final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
         assert all(expected >= f for f in final), (expected, final)
         assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
+
+    def test_new_conversations_never_exceed_slot_capacity(self):
+        """Regression: the spreading target must be clamped to
+        max_num_active_requests. Unclamped it reaches 2 * fair_share, so a rank
+        already holding every sequence slot still passes the `< soft_cap` gate
+        and add_slot later raises NoFreeSlotsError mid-collective."""
+        router = self._router(tp_size=4)
+        cap = 64
+        # 2 * ceil((184 + 8) / 4) = 96 > cap, so the unclamped target admits the
+        # full rank 3 and pushes it to 66 sequence slots.
+        states = self._states(4, active=[40, 40, 40, cap])
+        items = [_make_conv_request_item(i, None) for i in range(8)]
+        assign, expected = router.route_requests(states, items, max_num_active_requests=cap)
+        final = [states[r].num_active_requests + len(assign[r]) for r in range(4)]
+        assert all(f <= cap for f in final), final
+        assert expected <= cap
+        assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
 
 
 class TestNumInputTokens:

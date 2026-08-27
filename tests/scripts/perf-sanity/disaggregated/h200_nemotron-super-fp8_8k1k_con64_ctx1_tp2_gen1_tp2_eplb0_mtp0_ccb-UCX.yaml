@@ -86,4 +86,4 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       backend: UCX
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false

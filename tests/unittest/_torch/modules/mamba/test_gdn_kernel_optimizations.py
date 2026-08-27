@@ -30,9 +30,9 @@ skip_no_cuda = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "value,expected",
-    [(None, False), ("", False), ("0", False), ("false", False), ("typo", False), ("1", True)],
+    [(None, True), ("", False), ("0", False), ("false", False), ("typo", False), ("1", True)],
 )
-def test_gdn_replay_env_requires_one(monkeypatch, value, expected):
+def test_gdn_replay_env_defaults_on_and_requires_one_when_set(monkeypatch, value, expected):
     from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 
     if value is None:
@@ -198,6 +198,40 @@ def test_rms_norm_gated_token_major(num_tokens, heads, N):
         is_rms_norm=True,
     )
     assert torch.equal(y, y_dense)
+
+
+def test_rms_norm_gated_token_major_custom_op_is_functional():
+    """The compile boundary returns fresh storage and mutates no arguments."""
+    from tensorrt_llm._torch.modules.mamba import layernorm_gated  # noqa: F401
+
+    op = torch.ops.trtllm.rms_norm_gated_token_major.default
+    assert all(
+        argument.alias_info is None or not argument.alias_info.is_write
+        for argument in op._schema.arguments
+    )
+    assert op._schema.returns[0].alias_info is None
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("output_fp8", [False, True])
+def test_rms_norm_gated_token_major_compiles_fullgraph(output_fp8):
+    """The functional custom op must remain opaque to torch.compile."""
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+    torch.manual_seed(42)
+    num_tokens, heads, N = 16, 2, 128
+    M = num_tokens * heads
+    x = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    weight = torch.rand(N, dtype=torch.bfloat16, device="cuda") + 0.5
+    wide = torch.randn(num_tokens, heads * N + 64, dtype=torch.bfloat16, device="cuda")
+    z = wide[:, 64:].view(num_tokens, heads, N)
+    fp8_scale = torch.tensor(0.13, device="cuda") if output_fp8 else None
+
+    expected = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale)
+    compiled = torch.compile(rms_norm_gated_token_major, fullgraph=True)
+    actual = compiled(x, z, weight, 1e-6, fp8_scale)
+
+    assert torch.equal(actual, expected)
 
 
 def _ref_gdn_post_conv(
@@ -482,8 +516,8 @@ def test_pack_gdn_decode_qkv(
 
 
 @skip_no_cuda
-def test_reset_gdn_states_preserves_initialized_and_invalid_slots():
-    from tensorrt_llm._torch.modules.mamba.gdn_mixer import _reset_gdn_states
+def test_recurrent_state_reset_supports_gdn_pool_views():
+    from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurrent_state_rows
 
     num_slots = 4
     ssm_state_size = 6
@@ -503,11 +537,11 @@ def test_reset_gdn_states_preserves_initialized_and_invalid_slots():
     state_indices = torch.tensor([1, 3, -1], device="cuda", dtype=torch.int32)
     has_initial_states = torch.tensor([False, True, False], device="cuda", dtype=torch.bool)
 
-    _reset_gdn_states(
+    reset_recurrent_state_rows(
         ssm_states,
-        conv_states,
         state_indices,
         has_initial_states,
+        conv_states,
     )
 
     torch.testing.assert_close(state_pool[1], torch.zeros_like(state_pool[1]))

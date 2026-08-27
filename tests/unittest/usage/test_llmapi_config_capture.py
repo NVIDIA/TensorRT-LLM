@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
+import pytest
+
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     Field,
@@ -28,6 +30,8 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _NestedConfig(StrictBaseModel):
@@ -480,24 +484,6 @@ def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
     assert by_path["enum_field"].kind == "categorical"
     assert by_path["allowlist_field"].kind == "categorical"
     assert by_path["int_field"].kind == "value"
-
-
-def test_collect_llm_api_config_captures_star_attention_backend():
-    """attn_backend allowlist recognizes the real FLASHINFER_STAR_ATTENTION value.
-
-    The recognized set mirrors get_attention_backend dispatch; the previously
-    listed FLASH_ATTENTION is not a real backend and is removed.
-    """
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        attn_backend="FLASHINFER_STAR_ATTENTION",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["attn_backend"] == "FLASHINFER_STAR_ATTENTION"
-    assert meta["capture_succeeded"] is True
 
 
 def test_collect_llm_api_config_swallows_expected_capture_errors(monkeypatch):

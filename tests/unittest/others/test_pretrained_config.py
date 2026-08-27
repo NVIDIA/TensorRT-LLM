@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,21 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_pretrained_config_parses_runtime_defaults_correctly():
     assert_runtime_defaults_are_parsed_correctly(
-        lambda defaults: PretrainedConfig.from_dict(
-            {
-                'architecture': 'DeciLMForCausalLM',
-                'dtype': 'float16',
-                'num_hidden_layers': 2,
-                'num_attention_heads': 12,
-                'hidden_size': 768,
-                'vocab_size': 51200,
-                'max_position_embeddings': 1024,
-                'runtime_defaults': defaults,
-            }).runtime_defaults)
+        PretrainedConfig.create_runtime_defaults)

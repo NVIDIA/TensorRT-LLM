@@ -16,11 +16,13 @@ l0_b300:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   # ------------- modules (non-MoE) ---------------
@@ -30,6 +32,7 @@ l0_b300:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -37,8 +40,35 @@ l0_b300:
   - unittest/_torch/modules/test_moe_routing.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
+  # ------------- Kimi K3 NVFP4: expert loading + SiTU ---------------
+  # Listed test-by-test on purpose. The rest of this file has 19 failures that
+  # predate this work (verified by running the base revision's copy against the
+  # same source), so registering the whole module would import them into CI as
+  # if they were ours. Those are reported separately; these are green.
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_expert_ckpt_spec_selection
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_block_scaled_dequantization
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_materialize_handles_scalar_lazy_safetensors
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads1]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads4]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_w1_w3_order_is_load_bearing
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_rejects_duplicate_slot
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_drains_staging_per_expert
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_forward_runs
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTLASS]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[TRTLLM]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[CUTLASS-static_1.0]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[TRTLLM-static_1.0]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_megamoe_overrides_finalize_streamed_expert
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_mega_format_transform_is_slot_blockwise
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (specific quant per backend) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]

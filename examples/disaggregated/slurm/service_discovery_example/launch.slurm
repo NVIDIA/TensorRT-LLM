@@ -11,6 +11,7 @@ enable_etcd="${enable_etcd:-0}"
 disagg_port="8000"
 ctx_port="8001"
 gen_port="8002"
+internal_request_auth_key="${internal_request_auth_key:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 
 # use the first node as the disaggregated server node
 disagg_server_node=$(head -n 1 <(scontrol show hostnames $SLURM_JOB_NODELIST))
@@ -33,6 +34,7 @@ cat >${work_path}/disagg_config.yaml << EOL
 hostname: localhost
 port: ${disagg_port}
 backend: pytorch
+internal_request_auth_key: ${internal_request_auth_key}
 disagg_cluster:
   cluster_uri: ${disagg_cluster_uri}
   cluster_name: example_cluster
@@ -40,12 +42,14 @@ EOL
 
 cat >${work_path}/ctx_config.yaml << EOL
 disable_overlap_scheduler: True
+internal_request_auth_key: ${internal_request_auth_key}
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
 EOL
 
 cat >${work_path}/gen_config.yaml << EOL
+internal_request_auth_key: ${internal_request_auth_key}
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048

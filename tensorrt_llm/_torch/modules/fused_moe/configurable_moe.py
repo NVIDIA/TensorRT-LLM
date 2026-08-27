@@ -29,20 +29,31 @@ Design Principles:
 
 import copy
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Type, Union
 
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind
+from tensorrt_llm._torch.modules.fused_moe.impl_base import MoEImplBase
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERejectReason,
+)
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    ActType_TrtllmGen,
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
-from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -67,17 +78,20 @@ _BACKEND_SYNC_ATTRS = (
 
 class ConfigurableMoE(MoE):
     # ConfigurableMoE is a thin wrapper that dispatches to a concrete backend
-    # (CuteDslFusedMoE / CutlassFusedMoE / ...). Allow the wrapper itself to
-    # pass the non-divisible-EP gate so the inner backend's own gate is the
-    # authoritative check -- if the chosen inner backend doesn't opt in, its
-    # ``MoE.__init__`` will still raise.
+    # (CuteDslFusedMoE / CutlassFusedMoE / ...). ``MoE.__init__`` ->
+    # ``_init_load_balancer`` runs before the backend exists, so the wrapper
+    # cannot answer for it there and passes its own gate. The real check runs in
+    # ``_reject_non_divisible_ep_backend()`` once the backend class is known.
+    # Do not treat this ``True`` as "the wrapper supports it": nothing else
+    # checks, because the backend is built with ``init_load_balancer=False``.
     _supports_non_divisible_ep: bool = True
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
     This class orchestrates the MoE execution flow by composing:
     - moe_backend: Existing FusedMoE implementation used as a pluggable backend.
-                   Currently supported backends (see ``create_moe.get_moe_cls``):
+                   Currently supported backends (see
+                   ``moe_resolution.IMPL_PRIORITY``):
                    CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
                    CuteDslFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm.
                    Note: Current FusedMoE implementations are used as backends (transitional).
@@ -107,40 +121,29 @@ class ConfigurableMoE(MoE):
 
     Auto-Detection:
         - EPLB: Enabled if get_moe_load_balancer() is not None
-        - Backend: Selected by ``model_config.moe_backend`` via ``create_moe.get_moe_cls``;
-                   defaults to CutlassFusedMoE when the requested backend is unsupported
-                   for the active quant/SM config.
+        - Backend: Resolved from ``model_config.moe_backend`` by
+                   ``moe_resolution.resolve_moe_impl``, which degrades to
+                   CutlassFusedMoE when the requested backend cannot serve the
+                   layer and records the reason in the returned report.
+                   ``create_moe`` passes the resolved class in as ``moe_cls``;
+                   constructing this wrapper directly resolves on demand.
         - Communication: Auto-selected based on hardware (NVLINK > DeepEP > AllGather);
                          skipped entirely for FUSED_COMM backends (e.g. MegaMoEDeepGemm).
     """
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo,
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ):
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Always ineligible: ConfigurableMoE delegates, it does not compute.
+
+        Answering ``False`` rather than raising is what lets a registry walk
+        include this class harmlessly. Query the backend it would delegate to
+        (``CutlassFusedMoE``, ``TRTLLMGenFusedMoE``, ...) instead.
         """
-        ConfigurableMoE is a wrapper class that delegates to specific backends.
-
-        To check capability, query the specific backend class directly:
-        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
-        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
-        - etc.
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation data type
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
-
-        Returns:
-            Tuple[bool, Optional[str]]: Always returns (False, reason)
-        """
-        del quant_algo, dtype_activation, swiglu_gptoss_style  # Unused - wrapper class
-        return False, (
+        del p, d  # a wrapper's answer cannot depend on the question
+        return _reject(
+            MoERejectReason.NOT_AN_IMPL,
             "ConfigurableMoE is a wrapper class. "
-            "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly."
+            "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly.",
         )
 
     def __init__(
@@ -158,6 +161,14 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        moe_cls: Optional[Type] = None,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+        trtllm_gen_activation_alpha: Optional[float] = None,
+        trtllm_gen_activation_beta: Optional[float] = None,
+        communication_method: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -172,12 +183,14 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        self._override_quant_config = override_quant_config
         if override_quant_config is not None:
             self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
+        self.communication_method = communication_method
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -187,6 +200,13 @@ class ConfigurableMoE(MoE):
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
+            moe_cls=moe_cls,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            trtllm_gen_activation_type=trtllm_gen_activation_type,
+            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             **kwargs,
         )
 
@@ -270,6 +290,13 @@ class ConfigurableMoE(MoE):
         model_config: ModelConfig,
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
+        moe_cls: Optional[Type] = None,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+        trtllm_gen_activation_alpha: Optional[float] = None,
+        trtllm_gen_activation_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
@@ -288,15 +315,30 @@ class ConfigurableMoE(MoE):
         """
         from tensorrt_llm._torch.modules.fused_moe.create_moe import (
             create_moe_backend,
+            infer_swiglu_gptoss_style,
             resolve_moe_cls,
         )
 
-        moe_cls = resolve_moe_cls(
-            model_config,
-            routing_method,
-            self.dtype,
-            override_quant_config=override_quant_config,
-        )
+        # create_moe already resolved; direct constructors resolve here.
+        if moe_cls is None:
+            moe_cls = resolve_moe_cls(
+                model_config,
+                override_quant_config=override_quant_config,
+                dtype=self.dtype,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                swiglu_gptoss_style=infer_swiglu_gptoss_style(
+                    bias=kwargs.get("bias", False),
+                    swiglu_alpha=kwargs.get("swiglu_alpha"),
+                    swiglu_beta=kwargs.get("swiglu_beta"),
+                    activation_type=self.activation_type,
+                ),
+                bias=kwargs.get("bias", False),
+                activation_type=self.activation_type,
+                routing=self.routing_method,
+                layer_idx=self.layer_idx,
+            )
 
         backend_model_config = model_config
         if override_quant_config is not None:
@@ -324,6 +366,12 @@ class ConfigurableMoE(MoE):
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 activation_type=self.activation_type,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                trtllm_gen_activation_type=trtllm_gen_activation_type,
+                trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+                trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             )
 
         # Backend acceptance is validated at the end of ``__init__`` instead
@@ -332,6 +380,7 @@ class ConfigurableMoE(MoE):
         # returns). Backends like ``MegaMoECuteDsl`` rely on that to
         # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
+        self._reject_non_divisible_ep_backend()
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
@@ -343,8 +392,43 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        if not backend_model_config.skip_create_weights_in_init:
-            self.backend.create_weights()
+        # Layerwise quantization is applied after the model is constructed.
+        # Defer allocation so the backend is built from the final wrapper
+        # quant_config rather than an earlier global value. Module exclusions
+        # reset _weights_created on matching modules during __post_init__, so
+        # unrelated exclusions retain the historical eager allocation path.
+        has_post_init_quant_config = model_config.quant_config_dict is not None
+        if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
+            self.create_weights()
+
+    def _reject_non_divisible_ep_backend(self) -> None:
+        """Enforce the non-divisible-EP contract on the resolved backend.
+
+        This is the wrapper half of the check documented in ``MoE.__init__``.
+        ``_init_load_balancer`` cannot do it: the wrapper runs it before the
+        backend exists, and the backend never runs it at all because it is
+        constructed with ``init_load_balancer=False``. So this is the only place
+        that can consult the class actually executing the ceil/floor partition.
+
+        Skipped when EPLB is active -- there every rank holds ``num_slots //
+        ep_size`` slots and ``_init_load_balancer`` already required that to
+        divide evenly, so local slot counts are uniform whatever
+        ``num_experts % ep_size`` is.
+        """
+        if self.backend is None or self.layer_load_balancer is not None:
+            return
+        if self.num_experts % self.ep_size == 0:
+            return
+        if type(self.backend)._supports_non_divisible_ep:
+            return
+        raise ValueError(
+            f"{type(self.backend).__name__} does not support non-divisible EP: "
+            f"num_experts ({self.num_experts}) must be divisible by ep_size "
+            f"({self.ep_size}). Enable EPLB with num_slots divisible by "
+            f"ep_size, pick a backend that opts in, or override "
+            f"`_supports_non_divisible_ep = True` on that backend after "
+            f"verifying its kernel/comm path handles ceil/floor partitioning."
+        )
 
     def _supports_load_balancer(self) -> bool:
         """Check if this MoE implementation supports load balancer.
@@ -360,6 +444,17 @@ class ConfigurableMoE(MoE):
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
 
+    @property
+    def num_fused_shared_expert(self) -> int:
+        """Expose the backend's fused-shared-expert count so model code (e.g.
+        DeepseekV3 post_load_weights / shared-expert TP sizing) sees it through
+        this wrapper. Returns 0 when the backend does not support fusion."""
+        return getattr(self.backend, "num_fused_shared_expert", 0)
+
+    def fuse_shared_expert(self, shared_experts):
+        """Delegate shared-expert fusion to the backend (e.g. TRTLLMGenFusedMoE)."""
+        return self.backend.fuse_shared_expert(shared_experts)
+
     def validate_config(self):
         """
         Validate configuration parameters
@@ -373,8 +468,9 @@ class ConfigurableMoE(MoE):
             )
 
     def _should_enable_dwdp(self) -> bool:
-        # DWDP is currently supported only for CuteDslFusedMoE with NVFP4 quantization.
-        if not isinstance(self.backend, CuteDslFusedMoE):
+        # DWDP is currently supported only by CuteDSL backends, and only with
+        # NVFP4 quantization.
+        if not self.backend.capabilities.supports_dwdp:
             return False
 
         quant_config = getattr(self.backend, "quant_config", None)
@@ -424,6 +520,11 @@ class ConfigurableMoE(MoE):
         """
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
+        elif self.enable_dwdp:
+            # DWDP prefetches expert weights instead of dispatching tokens, so a
+            # rank only ever processes its own tokens, never more. Keyed off
+            # ``enable_dwdp`` so no non-DWDP path changes the branch it takes.
+            num_rows = max(all_rank_num_tokens)
         else:
             # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
             # from [x.shape[0]] before calling here, so it must be a single-element list.
@@ -539,6 +640,7 @@ class ConfigurableMoE(MoE):
             alltoall_result_do_sum=True,
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
+            communication_method=self.communication_method,
         )
 
     def forward_impl(
@@ -604,7 +706,7 @@ class ConfigurableMoE(MoE):
 
     # ========== Backend Validation ==========
 
-    def validate_backend(self, backend: MoE):
+    def validate_backend(self, backend: MoE | MoEImplBase | None) -> None:
         """Validate MoE backend compatibility with this ConfigurableMoE.
 
         Generic checks (always run):
@@ -644,6 +746,14 @@ class ConfigurableMoE(MoE):
         """
         assert hasattr(self.backend, "create_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement create_weights()"
+        )
+        # An explicit override is authoritative. Otherwise use the wrapper's
+        # final value, after model __post_init__ has applied layerwise and
+        # exclusion-based quantization settings.
+        self.backend.quant_config = (
+            self._override_quant_config
+            if self._override_quant_config is not None
+            else self.quant_config
         )
         return self.backend.create_weights()
 
@@ -724,6 +834,14 @@ class ConfigurableMoE(MoE):
             f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
         )
         return self.backend._weights_created
+
+    @_weights_created.setter
+    def _weights_created(self, value: bool) -> None:
+        """Update backend weight state during post-init quantization changes."""
+        assert hasattr(self.backend, "_weights_created"), (
+            f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
+        )
+        self.backend._weights_created = value
 
     # ========== Explicit Backend Attribute Proxies ==========
     # These properties delegate to backend for commonly accessed attributes

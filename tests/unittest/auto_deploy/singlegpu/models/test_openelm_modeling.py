@@ -519,6 +519,7 @@ _EXPECTED_3B_NUM_KV_HEADS = [
 # fmt: on
 
 
+@pytest.mark.cpu_only
 def test_openelm_config_derivation_matches_apple():
     # `use_cache=True` would crash Apple's remote config under transformers 5.x;
     # the vendored class must accept it without raising.
@@ -534,6 +535,7 @@ def test_openelm_config_derivation_matches_apple():
     assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads, strict=True))
 
 
+@pytest.mark.cpu_only
 def test_openelm_config_derivation_matches_apple_3b():
     """Derivation must also be correct for a different size point (3B, head_dim=128)."""
     config = OpenELMConfig(use_cache=True, **_OPENELM_3B)
@@ -547,6 +549,7 @@ def test_openelm_config_derivation_matches_apple_3b():
     assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads, strict=True))
 
 
+@pytest.mark.cpu_only
 def test_openelm_config_fulfills_config_subclass_contract():
     """Pin the two duties of a PreTrainedConfig subclass.
 
@@ -585,6 +588,7 @@ def test_openelm_config_fulfills_config_subclass_contract():
     assert len(config.num_query_heads) == 16
 
 
+@pytest.mark.cpu_only
 def test_openelm_config_registered_as_local_class():
     assert "openelm" in CONFIG_MAPPING
     registered = CONFIG_MAPPING["openelm"]
@@ -594,6 +598,7 @@ def test_openelm_config_registered_as_local_class():
     assert not registered.__module__.startswith("transformers.")
 
 
+@pytest.mark.cpu_only
 def test_openelm_autoconfig_prefers_local_over_remote(tmp_path):
     """AutoConfig must prefer the local class over remote code.
 

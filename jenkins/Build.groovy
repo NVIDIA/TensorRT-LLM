@@ -35,6 +35,9 @@ LLM_DOCKER_IMAGE = env.dockerImage
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
@@ -105,10 +108,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (TRTLLM_VERSION_OVERRIDE): null,
 ]
 
 // TODO: Move common variables to an unified location
@@ -224,6 +230,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:
@@ -361,22 +369,27 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
     })
 }
 
-def prepareLLMBuild(pipeline, config)
+def prepareLLMBuild(pipeline, config, versionOverride)
 {
     def buildFlags = BUILD_CONFIGS[config]
     def tarName = buildFlags[TARNAME]
 
     def is_linux_x86_64 = config.contains("linux_x86_64")
+    // Type checking is a platform-independent static analysis, so run it once,
+    // on the x86_64 vanilla build only, rather than in every build config.
+    def typeCheck = (config == CONFIG_LINUX_X86_64_VANILLA)
     def artifacts = ["${tarName}": tarName]
     def runner = {
-        runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
+        runLLMBuild(
+            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck)
     }
 
     return [artifacts, runner]
 
 }
 
-def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
+def runLLMBuild(
+    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false)
 {
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
@@ -420,9 +433,31 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 
     def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
 
-    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+    withEnv([
+        "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
+        "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
+    ]) {
+        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+            sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        }
     }
+
+    // Type-check with the compiled bindings that build_wheel.py just produced in
+    // place. Runs mypy directly (not via pre-commit) so this step does zero
+    // network: the pre-commit orchestrator clones every remote hook repo from
+    // github up front, which flakes on nodes without github access. mypy and its
+    // config come from requirements-dev.txt (installed above) via the internal
+    // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
+    // bindings can't be imported, rather than silently degrading to the
+    // lightweight (no-bindings) check.
+    if (typeCheck) {
+        echo "-- Running mypy type check with compiled bindings..."
+        withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
+            sh "cd ${LLM_ROOT} && bash scripts/run_mypy.sh"
+        }
+    }
+
+    sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
@@ -446,6 +481,48 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
         sh "bash -c 'tar --use-compress-program=\"pigz -k\" -cf ${tarName} TensorRT-LLM/'"
     } else {
         sh "tar -czvf ${tarName} TensorRT-LLM/"
+    }
+
+    // BOLT consume (premerge): opt-in via BOLT_CONSUME. Pull the branch's latest
+    // postmerge-promoted profile bundle and re-BOLT the just-packed
+    // tarball IN PLACE, so the artifact that gets uploaded (and every downstream
+    // test) exercises the bolted binaries. No-op unless BOLT_CONSUME=true, so
+    // normal builds are unaffected. STRICT by design: apply_latest.sh exits
+    // non-zero on any failure (missing bundle / apply error) and we do NOT catch
+    // it -- a build that asked to consume BOLT profiles fails loudly rather than
+    // silently shipping an un-BOLTed tarball that tests would wrongly bless.
+    if ((env.BOLT_CONSUME ?: "false").toString() == "true") {
+        applyLatestBolt(pipeline, tarName, is_linux_x86_64)
+    }
+}
+
+// Premerge consumption helper: stage llvm-bolt if needed, then run the OSS
+// engine's apply_latest.sh (pull-latest + apply_bolt) to replace <tarName> with
+// its bolted equivalent. Runs inside the build pod after packing.
+def applyLatestBolt(pipeline, tarName, is_linux_x86_64)
+{
+    def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
+    def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
+    def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
+    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
+    stage("BOLT consume") {
+        sh """
+            set -e
+            export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+            if ! command -v llvm-bolt >/dev/null 2>&1; then
+                echo '[bolt-consume] staging llvm-bolt ${llvmVer}'
+                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                mkdir -p .bolt-llvm
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
+                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
+                rm -f /tmp/\$tb
+            fi
+            bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
+                 ${branch} ${triple} ${tarName} bolted-${tarName}
+            mv -f bolted-${tarName} ${tarName}
+            echo '[bolt-consume] ${tarName} is now BOLTed'
+        """
     }
 }
 
@@ -512,17 +589,24 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         wheelDockerImage = env.dockerImage
     }
 
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA,
+            versionOverride),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM,
+            versionOverride),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {
         buildConfigs += [
         "Build TRT-LLM SingleDevice": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE),
+            pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE, versionOverride),
         ]
     }
 

@@ -346,6 +346,136 @@ def _get_cv2():
     return cv2
 
 
+# --- Reference-payload classification ----------------------------------------
+# The serve boundary routes a metadata-free reference payload (JSON base64
+# carries no filename or MIME type; multipart metadata is client-typed) to the
+# image or video slot by its container signature. Routing only, never
+# acceptance: for both modalities the worker's decoder is what accepts, and
+# its failure is reported as a client error. So the signature can never
+# disagree with what actually decodes, and the boundary never spends a full
+# decode — on an async request path — to answer a routing question.
+
+
+# ISO-BMFF brands that mark a still image or image sequence (HEIF/AVIF/AVC
+# image). `ftyp` identifies the ISO-BMFF *family*, not video — HEIC photos
+# (the iOS camera default) share it with MP4 — so these are split out and
+# rejected at the boundary instead of being sent to a video decoder that
+# cannot use them.
+#
+# Deliberately NOT an exhaustive image registry: an unfamiliar ISO-BMFF
+# still-image brand simply stays a video candidate and gets a 400 from the
+# worker's decoder, which is safe. Registered names per MP4RA
+# (https://mp4ra.org/registered-types/brands).
+_ISOBMFF_IMAGE_BRANDS = frozenset(
+    {
+        b"mif1",
+        b"mif2",
+        b"msf1",  # MIAF image / image sequence
+        b"heic",
+        b"heix",
+        b"heim",
+        b"heis",  # HEVC image
+        b"hevc",
+        b"hevx",
+        b"hevm",
+        b"hevs",  # HEVC image sequence
+        b"avif",
+        b"avis",  # AVIF image / sequence
+        b"avci",
+        b"avcs",  # AVC image / sequence
+    }
+)
+
+# Work bound, not a format rule. The declared box size is client-controlled,
+# so without a ceiling the scan below costs O(payload): 1.6 s of interpreter
+# time for a 64 MB buffer, on the serving event loop. This admits 1020
+# compatible brands against a registry holding a few hundred in total, so no
+# encoder output comes near it; real boxes are tens of bytes.
+_MAX_FTYP_BOX_BYTES = 4096
+
+
+def _isobmff_brands(data) -> Optional[frozenset]:
+    """Brands declared by a leading ``ftyp`` box, or ``None`` if undeterminable.
+
+    Layout per ISO/IEC 14496-12 — ``size`` [0:4], ``'ftyp'`` [4:8], then::
+
+        normal    major [8:12]   minor [12:16]  compatible from 16
+        size == 1 largesize [8:16], major [16:20], minor [20:24], compat from 24
+
+    ``None`` means "do not classify" and callers must treat the payload as
+    unrecognized rather than assuming video: the box is malformed, extends
+    past the payload, or exceeds the scan bound, and a partial scan could
+    miss an image brand late in the compatible-brand list.
+    """
+    buf = bytes(data[:_MAX_FTYP_BOX_BYTES])
+    if len(buf) < 16:
+        return None
+
+    size = int.from_bytes(buf[0:4], "big")
+    if size == 1:
+        # Extended size: the 64-bit largesize occupies 8:16, shifting the
+        # brands. Reading 8:12 as the major brand here is what makes naive
+        # parsers misclassify.
+        box_end, brands_at = int.from_bytes(buf[8:16], "big"), 16
+    elif size == 0:
+        box_end, brands_at = len(data), 8  # box runs to EOF
+    else:
+        box_end, brands_at = size, 8
+
+    if box_end > len(data) or box_end > _MAX_FTYP_BOX_BYTES:
+        return None  # truncated, or past the work bound — refuse to guess
+    # `FileTypeBox` is a major brand plus a mandatory `minor_version`,
+    # followed by whole compatible brands. A short or misaligned box is
+    # malformed; reject it rather than rounding down to what parses.
+    if box_end < brands_at + 8 or (box_end - brands_at) % 4:
+        return None
+
+    brands = {buf[brands_at : brands_at + 4]}
+    # Skip the 4-byte minor_version between the major and compatible brands.
+    for off in range(brands_at + 8, box_end - 3, 4):
+        brands.add(buf[off : off + 4])
+    return frozenset(brands)
+
+
+def is_isobmff_image_bytes(data) -> bool:
+    """True when the payload is an ISO-BMFF still image (HEIF/AVIF/AVC image).
+
+    Lets the boundary say "this format is unsupported, convert it" instead of
+    "this file is corrupt" — the payload is perfectly valid, we just do not
+    decode it.
+    """
+    if bytes(data[4:8]) != b"ftyp":
+        return False
+    brands = _isobmff_brands(data)
+    return bool(brands and brands & _ISOBMFF_IMAGE_BRANDS)
+
+
+def sniff_media_kind(data) -> Optional[str]:
+    """Classify a reference payload by container signature.
+
+    Returns ``"image"`` (PNG/JPEG, or an ISO-BMFF still-image brand such as
+    HEIF/AVIF), ``"video"`` (other ISO-BMFF/MP4 family, or AVI), or ``None``
+    for anything unrecognized.
+    """
+    header = bytes(data[:12])
+    if header.startswith(b"\x89PNG\r\n\x1a\n") or header.startswith(b"\xff\xd8\xff"):
+        return "image"
+    if header[4:8] == b"ftyp":
+        brands = _isobmff_brands(data)
+        if not brands:
+            # Box unreadable (truncated / malformed / past the work bound):
+            # classify nothing rather than defaulting to video on a partial scan.
+            return None
+        # AVIF requires `avif`/`avis` among the *compatible* brands, so the
+        # major brand alone is not sufficient to identify still images.
+        if brands & _ISOBMFF_IMAGE_BRANDS:
+            return "image"
+        return "video"
+    if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
+        return "video"
+    return None
+
+
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
     """Return a VideoCapture backend that can read from a Python `BytesIO`.
 

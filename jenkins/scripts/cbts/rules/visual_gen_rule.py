@@ -15,7 +15,8 @@
 
 VisualGen is a self-contained subsystem under
 `tensorrt_llm/_torch/visual_gen/` (Flux / LTX-2 / Wan diffusion models)
-plus the public API surface at `tensorrt_llm/visual_gen/`.
+plus the public API surface at `tensorrt_llm/visual_gen/` and the media
+helpers at `tensorrt_llm/media/`.
 
 Block selection — entry-pattern based only:
 VisualGen does NOT have its own `condition.terms.backend`; VG test
@@ -27,11 +28,11 @@ Outward-facing fallback:
 Unlike AutoDeploy, VG is imported eagerly (module-level) by non-VG
 code: `commands/serve.py`, `commands/utils.py`, and
 `serve/openai_server.py` import `VisualGenArgs` / `ParallelConfig` /
-`VisualGen` / `VisualGenParams` at top level. A signature change to
-those symbols can break trtllm-serve startup, which would affect
-non-VG tests. The public API package prefix is listed in
-`_VG_OUTWARD_PREFIXES`; touching any file under it forces fallback even
-if the rest of the diff is VG-internal.
+`VisualGen` / `VisualGenParams` and `tensorrt_llm.media.*` at top level.
+A signature change to those symbols can break trtllm-serve startup,
+which would affect non-VG tests. Those package prefixes are listed in
+`_VG_OUTWARD_PREFIXES`; touching any file under them forces fallback
+even if the rest of the diff is VG-internal.
 """
 
 from __future__ import annotations
@@ -43,19 +44,26 @@ from blocks import Stage, YAMLIndex, _entry_target
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
-# VG source-path prefixes the rule may claim. Tests under tests/** are
-# left to TestsDefRule; the two rules' scopes combine via
-# _TESTSONLY_FAMILY.
+# VG source-path prefixes the rule may claim, mirroring the VisualGen
+# section of `.github/CODEOWNERS`. Tests under tests/** are left to
+# TestsDefRule; the two rules' scopes combine via _TESTSONLY_FAMILY.
+# fused-DiT paths stay unclaimed: those diffs also touch `inplace_info()`
+# in `tensorrt_llm/_torch/compilation/utils.py`, which no VG rule claims.
 _VG_SRC_PREFIXES: tuple[str, ...] = (
     "examples/visual_gen/",
+    "scripts/visualgen_eval/",
     "tensorrt_llm/_torch/visual_gen/",
+    "tensorrt_llm/media/",
     "tensorrt_llm/visual_gen/",
 )
 
-# Public VisualGen API package imported eagerly by non-VG code. Touching
-# any non-doc file under this prefix can break trtllm-serve / trtllm-bench
-# startup paths, so the rule defers to baseline rather than narrowing.
-_VG_OUTWARD_PREFIXES: tuple[str, ...] = ("tensorrt_llm/visual_gen/",)
+# VG-owned packages imported eagerly by non-VG code. Touching any non-doc
+# file under these prefixes can break trtllm-serve / trtllm-bench startup
+# paths, so the rule defers to baseline rather than narrowing.
+_VG_OUTWARD_PREFIXES: tuple[str, ...] = (
+    "tensorrt_llm/media/",
+    "tensorrt_llm/visual_gen/",
+)
 
 # Substrings that mark a test entry as VG. VG tests are expected to live
 # under dedicated visual_gen test directories, except the perf-sanity

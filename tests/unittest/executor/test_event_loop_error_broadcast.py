@@ -12,15 +12,14 @@ neither GPUs nor models.
 
 import datetime
 import queue as _stdlib_queue
+import threading
 
 import pytest
 
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
+from tensorrt_llm.executor.worker import GenerationExecutorWorker
 
-# CI's CPU stages select tests with ``-m "cpu_only and not disabled"``; without
-# this marker the whole file is deselected and pytest exits 5 (no tests ran),
-# which the runner reports as a failure. These are pure stub-based unit tests.
 pytestmark = pytest.mark.cpu_only
 
 
@@ -39,6 +38,9 @@ class _EngineStub:
         self._event_loop_error = event_loop_error
         self.is_shutdown = is_shutdown
         self.calls = 0
+        # The rank-crash kill's delivery gate. Real PyExecutor creates this in
+        # __init__; the helper only ever sets it, never reads it.
+        self._event_loop_error_delivered = threading.Event()
 
     def await_responses(self, timeout: datetime.timedelta):
         self.calls += 1
@@ -57,11 +59,13 @@ class _ResultStub:
 class _WorkerStub:
     """Stub for BaseWorker exposing only the attributes the helper touches."""
 
-    def __init__(self, engine, num_pending: int = 1):
+    def __init__(self, engine, num_pending: int = 1, ipc: bool = False):
         self.engine = engine
         self._results = {cid: _ResultStub() for cid in range(1, num_pending + 1)}
         self.popped = []
-        self.result_queue = None
+        # A non-None result_queue is what makes the helper resolve to
+        # ipc_batched -- i.e. the proxy/spawned-worker deployment.
+        self.result_queue = object() if ipc else None
         self.postproc_queues = None
         # responses_handler() reads this unguarded (base_worker.py); BaseWorker
         # sets it in __init__, which this stub bypasses, so seed it to None.
@@ -81,13 +85,103 @@ class _WorkerStub:
         self._results.pop(client_id, None)
 
 
-def _make_helper(engine, num_pending: int = 1):
+def _make_helper(engine, num_pending: int = 1, ipc: bool = False):
     helper = AwaitResponseHelper.__new__(AwaitResponseHelper)
-    helper.worker = _WorkerStub(engine, num_pending=num_pending)
+    helper.worker = _WorkerStub(engine, num_pending=num_pending, ipc=ipc)
     helper.handler_kind = AwaitResponseHelper.HandlerKind.unknown
     helper.enable_postprocprocess_parallel = False
     helper.temp_error_responses = _stdlib_queue.Queue()
     return helper
+
+
+class _ThreadStub:
+    """ManagedThread stand-in: ident set + not alive means "already exited"."""
+
+    def __init__(self, *, alive=False, ident=1):
+        self._alive = alive
+        self.ident = ident
+        self.starts = 0
+
+    def is_alive(self):
+        return self._alive
+
+    def start(self):
+        self.starts += 1
+
+
+class _StartThreadWorkerStub:
+    """Minimal stand-in for the worker start_thread() binds to.
+
+    It only reads self.engine, so a plain object avoids an uninitialized
+    GenerationExecutorWorker whose destructor would raise at collection time.
+    """
+
+    def __init__(self, event_loop_error=None, can_enqueue=True):
+        self.engine = _EngineStub(event_loop_error=event_loop_error)
+        self.engine.can_enqueue_requests = lambda: can_enqueue
+
+
+class TestStartThreadAfterExit:
+    """start_thread must surface an engine crash instead of restarting."""
+
+    def test_surfaces_engine_error_as_request_error(self):
+        original = RuntimeError("kv cache OOM")
+        worker = _StartThreadWorkerStub(event_loop_error=original)
+        thread = _ThreadStub()
+
+        with pytest.raises(RequestError) as excinfo:
+            GenerationExecutorWorker.start_thread(worker, thread)
+
+        # Chained, not re-raised: the caller still sees the real cause.
+        assert excinfo.value.__cause__ is original
+        assert "kv cache OOM" in str(excinfo.value)
+        assert thread.starts == 0
+
+    def test_repeated_calls_do_not_accumulate_traceback(self):
+        # start() runs on every submit(); re-raising the same object would grow
+        # its __traceback__ one frame per call.
+        original = RuntimeError("kv cache OOM")
+        worker = _StartThreadWorkerStub(event_loop_error=original)
+        thread = _ThreadStub()
+
+        raised = []
+        for _ in range(3):
+            with pytest.raises(RequestError) as excinfo:
+                GenerationExecutorWorker.start_thread(worker, thread)
+            raised.append(excinfo.value)
+
+        assert len({id(e) for e in raised}) == 3
+        assert all(e.__cause__ is original for e in raised)
+
+    def test_post_shutdown_exit_returns_quietly(self):
+        # The other exit path: shutdown() called ManagedThread.stop(), so
+        # stop_event ended run() and there is no error to report.
+        worker = _StartThreadWorkerStub(event_loop_error=None)
+        thread = _ThreadStub()
+
+        GenerationExecutorWorker.start_thread(worker, thread)
+
+        assert thread.starts == 0
+
+    def test_fresh_thread_is_started(self):
+        worker = _StartThreadWorkerStub(event_loop_error=None)
+        thread = _ThreadStub(ident=None)
+
+        GenerationExecutorWorker.start_thread(worker, thread)
+
+        assert thread.starts == 1
+
+    def test_does_not_start_when_enqueueing_is_disabled(self):
+        # The can_enqueue_requests() guard returns before the error check, so a
+        # stashed error must not surface either.
+        worker = _StartThreadWorkerStub(
+            event_loop_error=RuntimeError("should not surface"), can_enqueue=False
+        )
+        thread = _ThreadStub(ident=None)
+
+        GenerationExecutorWorker.start_thread(worker, thread)
+
+        assert thread.starts == 0
 
 
 class TestAwaitResponseHelperEventLoopError:
@@ -165,3 +259,64 @@ class TestAwaitResponseHelperEventLoopError:
         assert sorted(helper.worker.popped) == [1, 2]
         # second time around: nothing left to wake.
         assert helper._broadcast_event_loop_error(original) is False
+
+
+class TestEventLoopErrorDeliveryGate:
+    """The gate that stands the rank-crash hard kill down.
+
+    Setting it means "a client is holding the real error, so killing the
+    world would only replace a traceback with exit 137". It may therefore
+    only be set when a client verifiably woke. Setting it optimistically on
+    the proxy/IPC path -- the default when the LLM spawns MPI workers --
+    disarms the 10s kill while the peer ranks are still stranded, regressing
+    exactly the case the kill exists for back to the 300s HangDetector.
+    """
+
+    def test_gate_set_when_client_woken_in_single_process_mode(self):
+        original = RuntimeError("KV cache OOM")
+        engine = _EngineStub(event_loop_error=original, is_shutdown=True)
+        helper = _make_helper(engine, num_pending=2, ipc=False)
+
+        assert helper(timeout=0.01) is False
+        assert helper.handler_kind is AwaitResponseHelper.HandlerKind.single_process_worker
+        assert engine._event_loop_error_delivered.is_set()
+
+    def test_gate_stays_clear_on_ipc_batched_path(self):
+        """The regression this class exists for.
+
+        On ``ipc_batched`` the worker-side ``_results`` queues written by the
+        broadcast have no reader -- responses travel via
+        ``handle_for_ipc_batched`` -- so nothing reached the client even
+        though the puts succeeded.
+        """
+        original = RuntimeError("KV cache OOM")
+        engine = _EngineStub(event_loop_error=original, is_shutdown=True)
+        helper = _make_helper(engine, num_pending=2, ipc=True)
+
+        assert helper(timeout=0.01) is False
+        assert helper.handler_kind is AwaitResponseHelper.HandlerKind.ipc_batched
+        assert not engine._event_loop_error_delivered.is_set()
+
+    def test_gate_stays_clear_when_there_was_nobody_to_wake(self):
+        """No pending request means nobody is holding the error.
+
+        So the kill must stay armed even in single-process mode.
+        """
+        original = RuntimeError("crash")
+        engine = _EngineStub(event_loop_error=original, is_shutdown=True)
+        helper = _make_helper(engine, num_pending=0, ipc=False)
+
+        assert helper(timeout=0.01) is False
+        assert not engine._event_loop_error_delivered.is_set()
+
+    def test_gate_set_on_the_await_responses_raises_path_too(self):
+        """The defensive branch also delivers, so it may stand the kill down.
+
+        Previously it never set the gate at all.
+        """
+        original = RuntimeError("unexpected")
+        engine = _EngineStub(await_responses_raises=original)
+        helper = _make_helper(engine, num_pending=1, ipc=False)
+
+        assert helper(timeout=0.01) is False
+        assert engine._event_loop_error_delivered.is_set()

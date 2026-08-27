@@ -70,8 +70,8 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS);
     static_assert(std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value,                   \
         "only float16 and bfloat16 is supported");
 
-// Empty kernel stub for non-Hopper device passes; see marlin.cuh.
-#if defined(__CUDA_ARCH__) && !(__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000)
+// Empty kernel stub for unsupported device passes; see marlin.cuh.
+#if defined(__CUDA_ARCH__) && !MARLIN_NVFP4_DEVICE_SUPPORTED
 
 template <typename scalar_t,   // compute type (nv_bfloat16)
     int const threads,         // threads per block (128 or 256)

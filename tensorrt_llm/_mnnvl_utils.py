@@ -56,9 +56,9 @@ class MnnvlMemory:
 
     # Shared across all subclasses (global/device state).
     initialized: bool = False
-    allocation_granularity: int = 0
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
+    force_fabric_handle: bool = False
 
     # Per-class state attributes. These will be auto-initialized for each subclass
     # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
@@ -69,6 +69,8 @@ class MnnvlMemory:
         "comm": None,  # MPI communicator.
         "allocated_map": dict,  # callable for fresh dict.
         "address_refcnt": dict,  # callable for fresh dict.
+        # Derived from get_allocation_prop(), whose handle type differs per class.
+        "allocation_granularity": 0,
     }
 
     # Initialize per-class state for the base class.
@@ -78,6 +80,7 @@ class MnnvlMemory:
     comm = None
     allocated_map = {}
     address_refcnt = {}
+    allocation_granularity: int = 0
 
     def __init_subclass__(cls, **kwargs):
         """Auto-initialize per-class attributes for each subclass to avoid sharing state with parent."""
@@ -104,17 +107,28 @@ class MnnvlMemory:
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
 
+    @property
+    def local_mem_handle(self) -> int:
+        """Return the local rank's CUmemGenericAllocationHandle."""
+        _, _, mem_handles, _, _, _ = type(self).allocated_map[self.ptr]
+        comm_rank = type(self).comm.Get_rank()
+        return int(mem_handles[comm_rank])
+
     @staticmethod
     def initialize():
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device="cuda")
-            # ensure nvml is initialized.
-            try:
-                pynvml.nvmlDeviceGetCount()
-            except pynvml.NVMLError_Uninitialized:
-                pynvml.nvmlInit()
+            MnnvlMemory._ensure_nvml_initialized()
             MnnvlMemory.initialized = True
+
+    @staticmethod
+    def _ensure_nvml_initialized() -> None:
+        """Initialize NVML when it has not already been initialized."""
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
 
     @classmethod
     def get_comm(cls, mapping: Mapping):
@@ -129,8 +143,8 @@ class MnnvlMemory:
         cls.comm = comm
         return comm
 
-    @staticmethod
-    def get_allocation_prop(dev_id: int):
+    @classmethod
+    def get_allocation_prop(cls, dev_id: int):
         location = cuda.CUmemLocation()
         location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         location.id = dev_id
@@ -141,7 +155,7 @@ class MnnvlMemory:
         # May need to find a better way to handle this.
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
-        if is_on_aarch64:
+        if cls.force_fabric_handle or is_on_aarch64:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -152,19 +166,19 @@ class MnnvlMemory:
         allocation_prop.location = location
         return allocation_prop
 
-    @staticmethod
-    def get_allocation_granularity(dev_id: int):
-        if MnnvlMemory.allocation_granularity != 0:
-            return MnnvlMemory.allocation_granularity
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+    @classmethod
+    def get_allocation_granularity(cls, dev_id: int):
+        if cls.allocation_granularity != 0:
+            return cls.allocation_granularity
+        allocation_prop = cls.get_allocation_prop(dev_id)
         option = cuda.CUmemAllocationGranularity_flags(
             cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
         )
         granularity = _check_cu_result(
             cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
         )
-        MnnvlMemory.allocation_granularity = granularity
-        return MnnvlMemory.allocation_granularity
+        cls.allocation_granularity = granularity
+        return cls.allocation_granularity
 
     @classmethod
     def new_mnnvl_memory_address(cls, mapping: Mapping, size: int):
@@ -199,7 +213,7 @@ class MnnvlMemory:
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
-        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
+        granularity = cls.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
         previous_address_state = (
@@ -213,7 +227,7 @@ class MnnvlMemory:
 
         assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
 
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+        allocation_prop = cls.get_allocation_prop(dev_id)
         allocated_mem_handle = _check_cu_result(
             cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
         )
@@ -390,16 +404,13 @@ class MnnvlMemory:
     @staticmethod
     @functools.cache
     def support_nvlink(dev_id: int, need_all_up: bool = True):
-        # ensure nvml is initialized; do not rely on other modules having
-        # initialized it as an import side effect.
-        try:
-            pynvml.nvmlDeviceGetCount()
-        except pynvml.NVMLError_Uninitialized:
-            pynvml.nvmlInit()
+        # Do not rely on other modules having initialized NVML as an import side effect.
+        MnnvlMemory._ensure_nvml_initialized()
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
         available_links = 0
+        probed_links = link_count
         for link_idx in range(link_count):
             try:
                 if pynvml.nvmlDeviceGetNvLinkCapability(
@@ -411,11 +422,64 @@ class MnnvlMemory:
                         active_links += 1
             except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
                 continue
-        return (
+            except pynvml.NVMLError_InvalidArgument:
+                # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
+                # the driver rejects indices past this GPU's link count (18 on GB200).
+                probed_links = link_idx
+                break
+        supported = (
             active_links == available_links and available_links > 0
             if need_all_up
             else available_links > 0
         )
+        logger.info(
+            f"[MnnvlMemory] dev {dev_id} NVLink: {active_links}/{available_links} links up "
+            f"({probed_links} of {link_count} link indices accepted by the driver), "
+            f"need_all_up={need_all_up}, supported={supported}"
+        )
+        return supported
+
+    @staticmethod
+    @functools.cache
+    def _is_pcie_nvl_sku(dev_id: int) -> bool:
+        """Return whether visible H100/H200 GPUs form PCIe-connected NVLink islands."""
+        # H100/H200 NVL PCIe SKUs bond GPUs into local NVLink islands joined
+        # only through PCIe/SYS. Per-device NVLink state therefore cannot
+        # distinguish them from an NVSwitch fabric.
+        device_name = torch.cuda.get_device_name(dev_id).upper()
+        # NVML may report SYSTEM between peers on later NVSwitch platforms, so
+        # use this fallback only for the affected Hopper SKUs.
+        if not any(sku in device_name for sku in ("H100", "H200")):
+            return False
+
+        if " NVL" in device_name:
+            return True
+
+        try:
+            MnnvlMemory._ensure_nvml_initialized()
+            self_handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            for peer_id in range(pynvml.nvmlDeviceGetCount()):
+                if peer_id == dev_id:
+                    continue
+                peer_handle = pynvml.nvmlDeviceGetHandleByIndex(peer_id)
+                if (
+                    pynvml.nvmlDeviceGetTopologyCommonAncestor(self_handle, peer_handle)
+                    == pynvml.NVML_TOPOLOGY_SYSTEM
+                ):
+                    # SYSTEM is only a distance classification. A dual-socket
+                    # HGX can still provide NVLink P2P to such a peer through
+                    # NVSwitch. Split islands instead have local NVLink but no
+                    # NVLink P2P path to the SYSTEM peer.
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        self_handle,
+                        peer_handle,
+                        pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
+        except pynvml.NVMLError:
+            return False
+        return False
 
     @staticmethod
     def supports_mnnvl() -> bool:
@@ -429,8 +493,16 @@ class MnnvlMemory:
         if get_sm_version() in (120, 121):
             return False
         dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
+            return False
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
+
+
+class CftMnnvlMemory(MnnvlMemory):
+    """MNNVL memory with FABRIC handles so CFT logical endpoints can bind it."""
+
+    force_fabric_handle: bool = True
 
 
 class HelixCpMnnvlMemory(MnnvlMemory):

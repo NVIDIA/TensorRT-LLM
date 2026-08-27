@@ -24,6 +24,10 @@ import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.disagg_auth import (
+    build_internal_disagg_auth_headers,
+    request_requires_internal_disagg_auth,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -142,6 +146,7 @@ class OpenAIHttpClient(OpenAIClient):
         session: Optional[aiohttp.ClientSession] = None,
         disagg_id_generator: Optional[Callable[[], Awaitable[int]]] = None,
         request_perf_metrics: bool = False,
+        internal_disagg_auth_key: Optional[str] = None,
     ):
         self._router = router
         self._role = role
@@ -161,6 +166,14 @@ class OpenAIHttpClient(OpenAIClient):
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
+        self._internal_disagg_auth_key = internal_disagg_auth_key
+
+    def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
+        if self._role != ServerRole.GENERATION:
+            return {}
+        if not request_requires_internal_disagg_auth(request):
+            return {}
+        return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
 
     async def _send_request(
         self,
@@ -236,19 +249,20 @@ class OpenAIHttpClient(OpenAIClient):
                 # subtypes); the X-TRTLLM-Msgpack header tells the worker's
                 # Request.json() to decode with msgspec instead of stdlib json.
                 body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
-                req_headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+                headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
             else:
                 body = request.model_dump_json(exclude_unset=True)
-                req_headers = {"Content-Type": "application/json"}
+                headers = {"Content-Type": "application/json"}
             if self._request_perf_metrics:
-                req_headers[RETURN_METRICS_HEADER] = "1"
+                headers[RETURN_METRICS_HEADER] = "1"
+            headers.update(self._get_request_headers(request))
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(
                     url,
                     data=body,
-                    headers=req_headers,
+                    headers=headers,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
                     if self._request_perf_metrics:
@@ -360,6 +374,7 @@ class OpenAIHttpClient(OpenAIClient):
             last_token_time = start_time
             chunk_count = 0
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
+            event_delimiter = b"\n\n"
             pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
@@ -393,8 +408,9 @@ class OpenAIHttpClient(OpenAIClient):
                     metrics_event = pending[marker_index:]
                     pending = b""
                     continue
-                emit_size = len(pending) - len(marker) + 1
-                if emit_size > 0:
+                event_end = pending.rfind(event_delimiter)
+                if event_end >= 0:
+                    emit_size = event_end + len(event_delimiter)
                     yield pending[:emit_size]
                     pending = pending[emit_size:]
                 await asyncio.sleep(0)

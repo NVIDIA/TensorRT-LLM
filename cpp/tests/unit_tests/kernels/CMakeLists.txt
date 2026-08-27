@@ -100,6 +100,8 @@ set(ROUTING_KERNEL_TEST_SRC
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
+add_gtest(blockScaleMoeActivationTest blockScaleMoeActivationTest.cu)
+
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
 if(USING_OSS_CUTLASS_MOE_GEMM)

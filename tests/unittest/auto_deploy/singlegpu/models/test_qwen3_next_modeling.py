@@ -403,6 +403,7 @@ def test_qwen3_next_gdn_patch_float32():
     torch.testing.assert_close(ref_output, test_output, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.cpu_only
 def test_qwen3_next_layer_types():
     """Test that layers have correct types (linear vs full attention) and MoE."""
     config = _create_small_config()
@@ -422,6 +423,7 @@ def test_qwen3_next_layer_types():
         )
 
 
+@pytest.mark.cpu_only
 def test_qwen3_next_tied_embeddings():
     """Test that embeddings are tied when tie_word_embeddings=True."""
     config = _create_small_config()
@@ -430,6 +432,7 @@ def test_qwen3_next_tied_embeddings():
     assert model.lm_head.weight is model.model.embed_tokens.weight
 
 
+@pytest.mark.cpu_only
 def test_qwen3_next_expert_structure():
     """Test that experts have correct structure for checkpoint loading."""
     config = _create_small_config()

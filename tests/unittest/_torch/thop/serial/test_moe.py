@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,6 +43,49 @@ class ActType(Enum):
     SwiGlu = 0
     Relu2 = 1
     Silu = 2
+    SiTu = 3
+
+
+def test_act_type_enum_values_stable():
+    assert ActType.SwiGlu.value == 0
+    assert ActType.Relu2.value == 1
+    assert ActType.Silu.value == 2
+    assert ActType.SiTu.value == 3
+
+
+def _mxfp4_situ_tactics(num_tokens):
+    """MXFP8 activations x MXFP4 weights: group-32 scales, padded shapes."""
+    runner = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
+        ActType.SiTu.value, True)
+    return runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
+
+
+def _nvfp4_situ_tactics(num_tokens):
+    """NVFP4 in/out: group-16 scales, and no valid hidden/intermediate sizes
+    (padding is absorbed by the padded weight buffers instead)."""
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
+    return runner.get_valid_configs(2, 512, 256, 8, num_tokens)
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("get_tactics",
+                         [_mxfp4_situ_tactics, _nvfp4_situ_tactics],
+                         ids=["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 512])
+def test_situ_runner_has_valid_configs(num_tokens, get_tactics):
+    """Both fused SiTu FC1 cubin families must be reachable through tactic
+    selection. There is no standalone SiTu activation kernel, so an empty
+    tactic list here means the whole path is unreachable.
+
+    Numerics and launch evidence for both families live in
+    tests/unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py.
+    """
+    assert get_tactics(
+        num_tokens), f"No valid SiTu tactic for num_tokens={num_tokens}"
 
 
 class moe_args:
@@ -353,7 +396,8 @@ def run_moe_dequant(args,
             permuted_idx = expanded_idx_to_permuted_idx[i * args.top_k + j]
             permute_output[permuted_idx] = args.hidden_states[i]
     # Gemm1
-    intermediate_size_factor = 2 if args.act_type == ActType.SwiGlu else 1
+    intermediate_size_factor = 2 if args.act_type in (ActType.SwiGlu,
+                                                      ActType.SiTu) else 1
     gemm1_output = torch.full(
         (total_num_padded_tokens,
          intermediate_size_factor * args.intermediate_size),
@@ -400,9 +444,9 @@ def run_moe_dequant(args,
         if args.gemm1_bias is not None:
             my_a += args.gemm1_bias[expert_idx]
 
-        # For gated activations (SwiGLU), split into gate and up projections
+        # For gated activations (SwiGLU/SiTu), split into gate and up projections
         # For non-gated activations (ReLU2), only use up projection
-        is_gated_activation = (args.act_type == ActType.SwiGlu)
+        is_gated_activation = args.act_type in (ActType.SwiGlu, ActType.SiTu)
         if is_gated_activation:
             my_x1 = my_a[:, :args.intermediate_size]
             my_x2 = my_a[:, args.intermediate_size:]
@@ -430,6 +474,12 @@ def run_moe_dequant(args,
             activation_output[i:i + my_num_tokens] = F.relu(my_x1)**2
         elif args.act_type == ActType.Silu:
             activation_output[i:i + my_num_tokens] = F.silu(my_x1)
+        elif args.act_type == ActType.SiTu:
+            alpha = args.gemm1_alpha[expert_idx]
+            beta = args.gemm1_beta[expert_idx]
+            linear = beta * torch.tanh(my_x1 / beta)
+            gate = alpha * torch.tanh(my_x2 / alpha) * torch.sigmoid(my_x2)
+            activation_output[i:i + my_num_tokens] = linear * gate
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -2251,7 +2301,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     # Data Generation
     #
     test_invalid_topk_input = False
-    act_type = ActType.SwiGlu
+    act_type = ActType.SiTu if act_type_str == "SiTu" else ActType.SwiGlu
     num_experts = routing_info["num_experts"]
     top_k = routing_info["top_k"]
     n_groups = routing_info["n_groups"]
@@ -2272,6 +2322,9 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     if act_type_str == "GatedSilu":
         if not use_autotune or dtype_activation != "mxfp8":
             pytest.skip("GatedSilu is tested only with autotune and mxfp8")
+    if act_type == ActType.SiTu:
+        if not use_autotune or dtype_activation != "mxfp8":
+            pytest.skip("SiTu is tested only with autotune and mxfp8")
     if not use_autotune:
         if dtype_activation != "mxfp8":
             pytest.skip("No autotune is tested only with mxfp8")
@@ -2317,29 +2370,50 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     else:
         routing_bias = None
 
-    hidden_states = 2 * torch.randn(
+    input_scale = 0.5 if act_type == ActType.SiTu else 2.0
+    weight_scale = 0.1 if act_type == ActType.SiTu else 1.0
+    hidden_states = input_scale * torch.randn(
         (num_tokens, hidden_size), device='cuda', dtype=torch.float32)
-    gemm1_weights = torch.randn(
+    gemm1_weights = weight_scale * torch.randn(
         (num_experts, 2 * intermediate_size, hidden_size),
         device='cuda',
         dtype=torch.bfloat16)
-    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
-                                device='cuda',
-                                dtype=torch.bfloat16)
-    gemm1_bias = 50 * torch.randn(
-        num_experts, 2 * intermediate_size, device='cuda', dtype=torch.float)
+    gemm2_weights = weight_scale * torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device='cuda',
+        dtype=torch.bfloat16)
+    gemm1_bias = None
+    if act_type != ActType.SiTu:
+        gemm1_bias = 50 * torch.randn(num_experts,
+                                      2 * intermediate_size,
+                                      device='cuda',
+                                      dtype=torch.float)
     gemm1_alpha = None
     gemm1_beta = None
     if act_type_str == "SwiGlu":
         gemm1_alpha = torch.randn(num_experts, device='cuda', dtype=torch.float)
         gemm1_beta = torch.randn(num_experts, device='cuda', dtype=torch.float)
+    elif act_type == ActType.SiTu:
+        # Asymmetric values detect alpha/beta swaps between the gate and linear
+        # halves of FC1. These are the Kimi-K3 defaults.
+        gemm1_alpha = torch.full((num_experts, ),
+                                 4.0,
+                                 device='cuda',
+                                 dtype=torch.float)
+        gemm1_beta = torch.full((num_experts, ),
+                                25.0,
+                                device='cuda',
+                                dtype=torch.float)
 
-    gemm1_clamp_limit = torch.full((num_experts, ),
-                                   7.0,
-                                   device='cuda',
-                                   dtype=torch.float)
-    gemm2_bias = 50 * torch.randn(
-        num_experts, hidden_size, device='cuda', dtype=torch.float)
+    gemm1_clamp_limit = None
+    gemm2_bias = None
+    if act_type != ActType.SiTu:
+        gemm1_clamp_limit = torch.full((num_experts, ),
+                                       7.0,
+                                       device='cuda',
+                                       dtype=torch.float)
+        gemm2_bias = 50 * torch.randn(
+            num_experts, hidden_size, device='cuda', dtype=torch.float)
 
     hidden_states_mxe4m3 = None
     hidden_states_scale_linear_mxe4m3 = None
@@ -2459,9 +2533,10 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         gemm1_scales_mxe2m1_interleaved.append(
             reorder_rows_for_gated_act_gemm(
                 gemm1_scales_linear_mxe2m1[i].clone()))
-        gemm1_bias_interleaved.append(
-            reorder_rows_for_gated_act_gemm(gemm1_bias[i].clone().reshape(
-                -1, 1)))
+        if gemm1_bias is not None:
+            gemm1_bias_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_bias[i].clone().reshape(
+                    -1, 1)))
 
     # Stack weights and scales for all experts
     gemm1_weights_mxe2m1_interleaved = torch.stack(
@@ -2490,8 +2565,9 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm1_scales_mxe2m1_interleaved[i].view(torch.uint8),
                 epilogue_tile_m))
 
-        gemm1_bias_shuffled.append(
-            shuffle_matrix_a(gemm1_bias_interleaved[i], epilogue_tile_m))
+        if gemm1_bias is not None:
+            gemm1_bias_shuffled.append(
+                shuffle_matrix_a(gemm1_bias_interleaved[i], epilogue_tile_m))
 
         gemm2_weights_mxe2m1_shuffled.append(
             shuffle_matrix_a(gemm2_weights_mxe2m1[i].view(torch.uint8),
@@ -2500,9 +2576,10 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             shuffle_matrix_sf_a(gemm2_scales_linear_mxe2m1[i].view(torch.uint8),
                                 epilogue_tile_m))
 
-        gemm2_bias_shuffled.append(
-            shuffle_matrix_a(gemm2_bias[i].clone().reshape(-1, 1),
-                             epilogue_tile_m))
+        if gemm2_bias is not None:
+            gemm2_bias_shuffled.append(
+                shuffle_matrix_a(gemm2_bias[i].clone().reshape(-1, 1),
+                                 epilogue_tile_m))
 
     # Stack weights for all experts
     gemm1_weights_mxe2m1_shuffled = torch.stack(gemm1_weights_mxe2m1_shuffled)
@@ -2515,10 +2592,10 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         gemm2_scales_mxe2m1_shuffled).view(torch.uint8).reshape(
             num_experts, hidden_size, intermediate_size // sf_block_size)
 
-    gemm1_bias_shuffled = torch.stack(gemm1_bias_shuffled).reshape(
-        num_experts, -1)
-    gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
-        num_experts, -1)
+    gemm1_bias_shuffled = (torch.stack(gemm1_bias_shuffled).reshape(
+        num_experts, -1) if gemm1_bias_shuffled else None)
+    gemm2_bias_shuffled = (torch.stack(gemm2_bias_shuffled).reshape(
+        num_experts, -1) if gemm2_bias_shuffled else None)
 
     if dtype_activation == "fp8":
         # c_global_sf: fc2_input_scale
@@ -2561,37 +2638,43 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 hidden_states_mxe4m3.cuda().view(torch.float8_e4m3fn),
                 hidden_states_scale_linear_mxe4m3.cuda(),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
-                gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                gemm1_scales_mxe2m1_shuffled.cuda(),
+                gemm1_bias_shuffled.cuda() if gemm1_bias_shuffled is not None
+                else None, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                 gemm2_weights_mxe2m1_shuffled.cuda(),
-                gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                None, None, 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, topk_weights, topk_ids)
+                gemm2_scales_mxe2m1_shuffled.cuda(),
+                gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
+                else None, num_experts, top_k, n_groups, top_k_groups,
+                intermediate_size, None, None, 0, num_experts, routed_scaling,
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 hidden_states.cuda().to(torch.bfloat16),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
-                gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                gemm1_scales_mxe2m1_shuffled.cuda(),
+                gemm1_bias_shuffled.cuda() if gemm1_bias_shuffled is not None
+                else None, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                 gemm2_weights_mxe2m1_shuffled.cuda(),
-                gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                None, None, 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, topk_weights, topk_ids)
+                gemm2_scales_mxe2m1_shuffled.cuda(),
+                gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
+                else None, num_experts, top_k, n_groups, top_k_groups,
+                intermediate_size, None, None, 0, num_experts, routed_scaling,
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 input_hidden_states.cuda().to(torch.float8_e4m3fn),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
-                gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                gemm1_scales_mxe2m1_shuffled.cuda(),
+                gemm1_bias_shuffled.cuda() if gemm1_bias_shuffled is not None
+                else None, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                 gemm2_weights_mxe2m1_shuffled.cuda(),
-                gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-                scale_c_fc1, scale_gate_fc1, scale_c_fc2, num_experts, top_k,
-                n_groups, top_k_groups, intermediate_size, None, None, 0,
-                num_experts, routed_scaling, routing_method_type,
+                gemm2_scales_mxe2m1_shuffled.cuda(),
+                gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
+                else None, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
+                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
+                None, None, 0, num_experts, routed_scaling, routing_method_type,
                 act_type.value, topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
@@ -2600,9 +2683,45 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     output_dequant_reference = output_dequant_reference[:, :
                                                         unpadded_hidden_size].contiguous(
                                                         )
-    percent = 0.8 if dtype_activation == "mxfp8" else 0.85
-    check_accuracy(output_dequant_reference,
-                   output_dequant_actual,
-                   atol=0.0,
-                   rtol=0.10,
-                   percent=percent)
+    if act_type == ActType.SiTu:
+        check_accuracy(output_dequant_reference,
+                       output_dequant_actual,
+                       atol=0.1,
+                       rtol=0.15,
+                       percent=0.95)
+    else:
+        percent = 0.8 if dtype_activation == "mxfp8" else 0.85
+        check_accuracy(output_dequant_reference,
+                       output_dequant_actual,
+                       atol=0.0,
+                       rtol=0.10,
+                       percent=percent)
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 256])
+def test_mxe4m3_mxe2m1_situ_matches_reference(num_tokens):
+    """Compare the fused SiTu cubin with the dequantized PyTorch reference."""
+    routing_info = {
+        "num_experts": 8,
+        "top_k": 2,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize
+    }
+    # Reuse the established THOP packing/reference harness directly; its
+    # deprecated parameter matrix remains skipped when collected by pytest.
+    test_moe_mxe2m1_weights(num_tokens=num_tokens,
+                            hidden_size=512,
+                            intermediate_size=256,
+                            routing_info=routing_info,
+                            dtype_activation="mxfp8",
+                            act_type_str="SiTu",
+                            use_autotune=True,
+                            use_topk_as_input=False)

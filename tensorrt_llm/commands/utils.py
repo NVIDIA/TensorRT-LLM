@@ -8,7 +8,6 @@ import click
 from click.core import ParameterSource
 
 from tensorrt_llm.llmapi.utils import download_hf_partial
-from tensorrt_llm.visual_gen.args import ParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +91,16 @@ def has_registered_llm_architecture(model_path: str) -> bool:
     with open(config_path) as f:
         architectures = json.load(f).get("architectures") or []
 
-    # Importing the models package runs the @register_auto_model decorators
-    # that populate MODEL_CLASS_MAPPING. Done lazily to avoid a heavy import at
-    # module load time and to sidestep circular imports via commands.serve.
-    import tensorrt_llm._torch.models  # noqa: F401
+    # The model zoo is imported lazily, so MODEL_CLASS_MAPPING only holds what
+    # has been resolved so far; the static index knows every built-in
+    # architecture without importing anything. Imported here (not at module
+    # load) to sidestep circular imports via commands.serve.
+    from tensorrt_llm._torch.models._arch_index import MODEL_ARCH_TO_MODULE
     from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 
-    return any(arch in MODEL_CLASS_MAPPING for arch in architectures)
+    return any(
+        arch in MODEL_CLASS_MAPPING or arch in MODEL_ARCH_TO_MODULE for arch in architectures
+    )
 
 
 def get_is_diffusion_only_model(model_path: str):
@@ -197,6 +199,10 @@ def get_visual_gen_num_gpus(diffusion_config: dict) -> int:
     Uses ParallelConfig.model_construct (skips env validators)
     so this is safe to call from non-worker processes.
     """
+    # Imported here (not at module load) so LLM-only CLI processes never pull
+    # the visual_gen tree.
+    from tensorrt_llm.visual_gen.args import ParallelConfig
+
     parallel = diffusion_config.get("parallel_config", {})
     if isinstance(parallel, dict):
         parallel = ParallelConfig.model_construct(**parallel)

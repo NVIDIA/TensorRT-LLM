@@ -35,11 +35,16 @@ public:
     using ActivePageStats = std::tuple<TypedVec<CacheLevel, int>, TypedVec<CacheLevel, int>>;
 
     static ActivePageStats activePageStats(KvCache const& kvCache);
+
+    // Whether the sequence's page at (ordinal, lcId) still points at a tree block;
+    // nullopt when the slot is empty or holds an uncommitted page. Test hook for the
+    // back-pointer invariant Block::replacePage() maintains.
+    static std::optional<bool> committedPageIsLinked(KvCache const& kvCache, int ordinal, int lcId);
     static bool allTreePagesDroppable(KvCacheManager& manager);
     static TypedVec<PoolGroupIndex, StorageStatistics> storageStatistics(KvCacheManager& manager, CacheLevel level);
 
     // White-box hook: minimum per-pool-group slot counts to support a BatchDesc.
-    // Reaches StorageManager::computeSlotsForBatch() (private) via friendship.
+    // Reaches StorageManager::computePoolGroupSlotsForBatch() (private) via friendship.
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse);
 

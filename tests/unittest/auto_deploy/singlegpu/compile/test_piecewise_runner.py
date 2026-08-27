@@ -30,6 +30,7 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestADPiecewiseRunnerContextManagement:
     def setup_method(self):
         ADPiecewiseRunner._current_num_tokens = None
@@ -57,6 +58,7 @@ class TestADPiecewiseRunnerContextManagement:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestADPiecewiseRunnerInit:
     def test_entries_initially_empty(self):
         submod = nn.Linear(4, 4)
@@ -80,6 +82,7 @@ class TestADPiecewiseRunnerInit:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestOutputInfo:
     def test_creation(self):
         info = OutputInfo(
@@ -91,6 +94,7 @@ class TestOutputInfo:
         assert info.dtype == torch.float16
 
 
+@pytest.mark.cpu_only
 class TestSegmentEntry:
     def test_default_values(self):
         entry = SegmentEntry()
@@ -116,6 +120,7 @@ class _MambaMetadataModule(nn.Module):
         return chunk_values, chunk_values.clone(), seq_idx_values.to(torch.int32).view(1, -1)
 
 
+@pytest.mark.cpu_only
 class TestMetadataWrapper:
     def setup_method(self):
         ADPiecewiseRunner._current_num_tokens = None
@@ -185,6 +190,7 @@ class TestMetadataWrapper:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestDynamicOutBuf:
     def test_set_and_get_returns_none_before_capture(self):
         submod = nn.Linear(4, 4)

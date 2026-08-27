@@ -11,12 +11,20 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
+    TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE,
+    _native_decode_chunk_size,
+)
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
     TRTLLM_USE_DIFFUSER_VAE_ENV,
     _use_native_wan_vae,
     load_wan_vae,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
+    WanVAE,
+    WanVAEConfig,
+    _decode_chunk_slices,
+)
 
 DEVICE = "cuda"
 # Parity runs in fp32 to check whether our implementation matches diffusers'
@@ -97,6 +105,14 @@ def test_load_wan_vae_defaults_to_native(monkeypatch):
     assert isinstance(wan_vae, WanVAE)
 
 
+def test_load_wan_vae_honors_diffusers_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint_dir = _require_wan22_ti2v_checkpoint()
+
+    monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "1")
+    wan_vae = load_wan_vae(str(checkpoint_dir), torch.device("cpu"))
+    assert isinstance(wan_vae, AutoencoderKLWan)
+
+
 def test_use_native_wan_vae_default(monkeypatch):
     """Native VAE is the default when the diffusers-fallback env is unset."""
     monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
@@ -112,6 +128,69 @@ def test_use_diffuser_vae_env_forces_diffusers(monkeypatch, fallback_value):
 def test_use_diffuser_vae_env_zero_keeps_native(monkeypatch):
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "0")
     assert _use_native_wan_vae()
+
+
+@pytest.mark.parametrize(
+    ("num_frames", "chunk_size", "expected"),
+    [
+        (0, 3, []),
+        (1, 4, [(0, 1)]),
+        (5, 1, [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]),
+        (5, 2, [(0, 1), (1, 3), (3, 5)]),
+        (6, 4, [(0, 1), (1, 5), (5, 6)]),
+    ],
+)
+def test_decode_chunk_slices_preserve_first_frame(
+    num_frames: int,
+    chunk_size: int,
+    expected: list[tuple[int, int]],
+) -> None:
+    actual = [(chunk.start, chunk.stop) for chunk in _decode_chunk_slices(num_frames, chunk_size)]
+    assert actual == expected
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_decode_chunk_slices_reject_invalid_chunk_size(chunk_size: int) -> None:
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        _decode_chunk_slices(num_frames=5, chunk_size=chunk_size)
+
+
+@pytest.mark.parametrize(
+    ("parallel_size", "dtype", "expected"),
+    [
+        (1, torch.bfloat16, 1),
+        (1, torch.float32, 1),
+        (2, torch.bfloat16, 2),
+        (4, torch.bfloat16, 4),
+        (4, torch.float32, 2),
+        (8, torch.bfloat16, 2),
+    ],
+)
+def test_native_decode_chunk_size_uses_tuned_or_conservative_value(
+    monkeypatch: pytest.MonkeyPatch,
+    parallel_size: int,
+    dtype: torch.dtype,
+    expected: int,
+) -> None:
+    monkeypatch.delenv(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, raising=False)
+    assert _native_decode_chunk_size(parallel_size, dtype) == expected
+
+
+def test_native_decode_chunk_size_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, "5")
+    assert _native_decode_chunk_size(1, torch.bfloat16) == 5
+
+
+@pytest.mark.parametrize("override", ["0", "-1", "invalid"])
+def test_native_decode_chunk_size_rejects_invalid_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+    override: str,
+) -> None:
+    monkeypatch.setenv(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, override)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _native_decode_chunk_size(4, torch.bfloat16)
 
 
 @pytest.mark.parametrize(
@@ -144,7 +223,7 @@ def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
 
     with torch.inference_mode():
         reference_decoded = reference_vae.decode(latents).sample
-        wan_decoded = wan_vae.decode(latents).sample
+        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=4).sample
 
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.
@@ -228,11 +307,33 @@ def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
 
     with torch.inference_mode():
         reference_decoded = reference_vae.decode(latents).sample
-        wan_decoded = wan_vae.decode(latents).sample
+        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=4).sample
 
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.
     _assert_close_metrics(wan_decoded, reference_decoded, max_abs=4e-3, relative_mean=1e-3)
+
+
+def test_wan22_temporal_chunk4_matches_chunk1_checkpoint() -> None:
+    checkpoint_dir = _require_wan22_ti2v_checkpoint()
+    _, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
+
+    torch.manual_seed(3)
+    latents = torch.randn(
+        1,
+        wan_vae.config.z_dim,
+        5,
+        8,
+        8,
+        device=DEVICE,
+        dtype=DTYPE,
+    ).to(memory_format=torch.channels_last_3d)
+
+    with torch.inference_mode():
+        framewise = wan_vae.decode(latents, temporal_chunk_size=1).sample
+        batched = wan_vae.decode(latents, temporal_chunk_size=4).sample
+
+    _assert_close_metrics(batched, framewise, max_abs=4e-3, relative_mean=1e-3)
 
 
 def test_wan21_t2v_vae_matches_diffusers_encode_checkpoint():

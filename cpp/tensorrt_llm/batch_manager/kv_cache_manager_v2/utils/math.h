@@ -231,7 +231,14 @@ public:
     explicit DynamicBitset(size_t capacity)
         : mWords(divUp(capacity, size_t{64}), uint64_t{0})
         , mNumSetBits(0)
+        , mSize(capacity)
     {
+    }
+
+    // Logical bit capacity (as last set by the constructor / resize()).
+    [[nodiscard]] size_t size() const noexcept
+    {
+        return mSize;
     }
 
     void set(size_t index)
@@ -289,6 +296,7 @@ public:
 
         // Grow (zero-filled) or shrink storage to the new word count.
         mWords.resize(newWords, uint64_t{0});
+        mSize = newCapacity;
     }
 
     // Returns true if any bit in [start, end) is set.
@@ -329,6 +337,7 @@ public:
 private:
     std::vector<uint64_t> mWords;
     size_t mNumSetBits;
+    size_t mSize; // logical bit capacity (mWords holds divUp(mSize, 64) words)
 };
 
 // ---------------------------------------------------------------------------

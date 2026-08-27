@@ -400,6 +400,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
 
 COORDINATOR_UDS_SCHEME = "unix:"
+# Idle lifetime of a pooled connection to the coordinator. Must stay strictly
+# below the coordinator listener's own keep-alive (see ``coordinator_server``)
+# so the CLIENT always closes an idle connection first; see
+# ``make_coordinator_session``. Mirrors ``openai_client``'s worker-facing pool.
+COORDINATOR_KEEPALIVE_TIMEOUT_S = 1
 
 
 def coordinator_base_url(remote_url: str) -> str:
@@ -427,11 +432,23 @@ def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
     connection, which was the real ~hundreds-of-ms client.select latency (not the
     ~0.1ms handler, not the transport). Uncapping lets all concurrent calls hold
     a connection. The coordinator is a trusted local socket, so no cap needed.
+
+    keepalive_timeout below the coordinator's server-side keep-alive: aiohttp
+    does not probe a pooled connection before reuse, so whenever the SERVER
+    closes an idle connection first, the next /select borrows a half-closed
+    socket and fails instantly with BrokenPipeError/ConnectionResetError -- a
+    500 on a live request. Closing client-side first keeps that window shut.
     """
     if remote_url.startswith(COORDINATOR_UDS_SCHEME):
         sock_path = remote_url[len(COORDINATOR_UDS_SCHEME) :]
-        return aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=sock_path, limit=0))
-    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0))
+        return aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(
+                path=sock_path, limit=0, keepalive_timeout=COORDINATOR_KEEPALIVE_TIMEOUT_S
+            )
+        )
+    return aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=0, keepalive_timeout=COORDINATOR_KEEPALIVE_TIMEOUT_S)
+    )
 
 
 class CoordinatorClient(DisaggCoordinator):

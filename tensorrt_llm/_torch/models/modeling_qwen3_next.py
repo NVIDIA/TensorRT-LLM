@@ -248,11 +248,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if quant_config_dict and layer_idx is not None:
             expert_quant_config = quant_config_dict.get(
                 f"model.layers.{layer_idx}.mlp.experts")
-        # Excluded experts end up bf16 whatever the per-layer entry says, so
-        # hand create_moe a bf16 config and let it pick a backend serving bf16.
+        moe_model_config = model_config
         if _experts_excluded_from_quant(model_config, layer_idx):
+            # These experts end up bf16 whatever the per-layer entry says, so
+            # build them on CUTLASS, the only backend that serves bf16
+            # unconditionally.
             expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
                                               quant_config.kv_cache_quant_algo)
+            if model_config.moe_backend != "CUTLASS":
+                moe_model_config = copy.copy(model_config)
+                moe_model_config._frozen = False
+                moe_model_config.moe_backend = "CUTLASS"
+                moe_model_config._frozen = True
+                logger.warning(
+                    f"Layer {layer_idx} MoE experts are excluded from "
+                    "quantization; using moe_backend=CUTLASS for this layer "
+                    f"(other layers keep {model_config.moe_backend}).")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -261,7 +272,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=False,
-            model_config=model_config,
+            model_config=moe_model_config,
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
             override_quant_config=expert_quant_config,
@@ -807,25 +818,11 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
         # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the whole MTP layer in
-        # bf16. Given a bf16 config most backends switch to CUTLASS on their
-        # own; DEEPGEMM and WIDEEP do not, so switch for them here.
-        mtp_model_config = model_config
-        if (model_config.moe_backend != "CUTLASS"
-                and _experts_excluded_from_quant(model_config, layer_idx)):
-            original_backend = model_config.moe_backend
-            mtp_model_config = copy.copy(model_config)
-            mtp_model_config._frozen = False
-            mtp_model_config.moe_backend = "CUTLASS"
-            mtp_model_config._frozen = True
-            logger.warning(
-                "Qwen3Next MTP layer is unquantized in the checkpoint; "
-                "falling back to moe_backend=CUTLASS for the MTP layer "
-                f"(regular layers keep moe_backend={original_backend}).")
-
-        super().__init__(mtp_model_config, layer_idx,
+        # bf16. Qwen3NextSparseMoeBlock handles that for every layer, MTP
+        # included, so nothing layer-specific is needed here.
+        super().__init__(model_config, layer_idx,
                          aux_stream_dict[AuxStreamType.Attention])
-        config = mtp_model_config.pretrained_config
-        self.model_config = mtp_model_config
+        config = model_config.pretrained_config
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -845,13 +842,13 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
             use_gemma=True,
         )
 
-        if mtp_model_config.mapping.enable_attention_dp:
+        if model_config.mapping.enable_attention_dp:
             self.fc = Linear(
                 config.hidden_size * 2,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                skip_create_weights_in_init=mtp_model_config.
+                skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
@@ -862,13 +859,13 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 bias=False,
                 dtype=config.torch_dtype,
                 tensor_parallel_mode=TensorParallelMode.ROW,
-                mapping=mtp_model_config.mapping,
+                mapping=model_config.mapping,
                 reduce_output=True,
-                skip_create_weights_in_init=mtp_model_config.
+                skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
-        self.shared_head = Qwen3NextMTPHead(mtp_model_config)
+        self.shared_head = Qwen3NextMTPHead(model_config)
         # MTP applies shared_head.norm after the base decoder forward, so its
         # MoE-output all-reduce cannot consume next_layer_layernorm.
         self.fusion_config.POST_MOE_FUSION = False
@@ -884,44 +881,60 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        del all_rank_num_tokens
+        # Install this draft step's attention-DP token distribution: the draft
+        # loop passes it as a kwarg and leaves attn_metadata alone, matching
+        # Eagle3DraftModel.forward. The MoE below reads the per-rank counts off
+        # attn_metadata, and an MTP Eagle draft runs one token per sequence
+        # after step 0, so a stale target value mismatches collective sizes.
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        def norm_embeds():
-            return self.pre_fc_norm_embedding(embed_tokens(input_ids))
+        try:
 
-        def norm_hidden():
-            return self.pre_fc_norm_hidden(hidden_states)
+            def norm_embeds():
+                return self.pre_fc_norm_embedding(embed_tokens(input_ids))
 
-        inputs_embeds, hidden_states = maybe_execute_in_parallel(
-            norm_embeds,
-            norm_hidden,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-            disable_on_compile=True,
-        )
-        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+            def norm_hidden():
+                return self.pre_fc_norm_hidden(hidden_states)
 
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
-            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+            inputs_embeds, hidden_states = maybe_execute_in_parallel(
+                norm_embeds,
+                norm_hidden,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
+            hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
 
-        hidden_states = self.fc(hidden_states)
+            tp_size = self.model_config.mapping.tp_size
+            tp_rank = self.model_config.mapping.tp_rank
+            if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+                hidden_states = torch.chunk(hidden_states, tp_size,
+                                            dim=-1)[tp_rank]
 
-        hidden_states, residual = super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            residual=None,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+            hidden_states = self.fc(hidden_states)
 
-        return hidden_states
+            hidden_states, residual = super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=None,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if spec_metadata is not None:
+                spec_metadata.maybe_capture_hidden_states(
+                    0, hidden_states, None)
+
+            return hidden_states
+        finally:
+            # Shared with the target forward, so restore on the exception path
+            # too; otherwise a failed draft step corrupts every later forward.
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1056,17 +1069,15 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Use V2 for the hybrid state layout.
+        """Disable block reuse until a snapshot policy is configured."""
+        return {"kv_cache_config": {"enable_block_reuse": False}}
 
-        Block reuse remains opt-in because it also requires a recurrent-state
-        snapshot policy.
-        """
-        return {
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True,
-            }
-        }
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for the hybrid state layout."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(cls,

@@ -2,9 +2,9 @@ from typing import Generic, Optional, Type
 
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
-from .modeling_utils import (MODEL_CLASS_MAPPING,
-                             MODEL_CLASS_VISION_ENCODER_MAPPING,
-                             DecoderModelForCausalLM, TConfig, TModel)
+from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
+                             get_registered_model_class,
+                             get_registered_vision_encoder)
 
 
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
@@ -19,8 +19,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         model_arch = pretrained_config.architectures[0]
 
         if config.mm_encoder_only:
-            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                model_arch)
+            vision_encoder_info = get_registered_vision_encoder(model_arch)
             if vision_encoder_info is None:
                 return None
             vision_encoder_cls, _ = vision_encoder_info
@@ -40,7 +39,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         ) and config.spec_config is not None and config.spec_config.max_draft_len == 0:
             model_arch = "MTPDraftModelForCausalLM"
 
-        return MODEL_CLASS_MAPPING.get(model_arch)
+        return get_registered_model_class(model_arch)
 
     @staticmethod
     def from_config(
@@ -48,8 +47,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
         if config.mm_encoder_only:
             model_arch = config.pretrained_config.architectures[0]
-            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                model_arch)
+            vision_encoder_info = get_registered_vision_encoder(model_arch)
             if vision_encoder_info is None:
                 raise ValueError(
                     f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"

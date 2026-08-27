@@ -38,24 +38,32 @@ from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_
 
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
+    LlmRequestState,
     convert_wordlist,
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
+    SampleStateTensorsHostTorch,
+    SampleStateTorch,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
     _request_strategy,
+    _SeedManager,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
+    UtilsSamplingParams,
+    _get_max_beam_width,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
     FlashInferGroupedStrategySampler,
     Greedy,
     MinP,
+    RequestSeeds,
     Strategy,
     StrategyMetadata,
     TemperatureOnly,
@@ -142,6 +150,9 @@ class TestStrategySelection:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
         py_sampling_strategy: Strategy | None
+        # Read by the row_stride query in sampler_common; these tests are
+        # single-beam, so the static admission width is 1.
+        py_beam_width: int
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -165,6 +176,7 @@ class TestStrategySelection:
         request.sampling_config = SamplingConfig(params._get_sampling_config())
         request.is_context_init_state = False  # Not used in this test
         request.py_sampling_strategy = None  # used for caching
+        request.py_beam_width = 1
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -557,6 +569,8 @@ def test_select_generated_logits(
             def __init__(self, draft_len: int):
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
+                # Read by the row_stride query in sampler_common.
+                self.py_beam_width = 1
 
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
@@ -747,11 +761,222 @@ def test_select_generated_logits(
     run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
+def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.MonkeyPatch):
+    sampler = object.__new__(TorchSampler)
+    sampler.max_beam_width = 1
+    sampler._stable_greedy_request_ids = []
+    sampler._stable_greedy_seq_slots = []
+    sampler._stable_greedy_seq_slots_host = None
+    sampler._stable_greedy_seq_slots_cuda = None
+    monkeypatch.setattr(sampler, "_copy_to_host", lambda tensor: tensor.clone())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.sampler.sampler.prefer_pinned", lambda: False
+    )
+
+    original_tensor_to = torch.Tensor.to
+
+    def copy_without_cuda(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", copy_without_cuda)
+
+    logits = torch.tensor([[0.0, 1.0, 2.0]])
+    new_tokens = torch.zeros((1, 2, 1), dtype=torch.int32)
+    requests = [
+        LlmRequest(
+            request_id=0,
+            max_new_tokens=4,
+            input_tokens=[1],
+            sampling_config=SamplingConfig(),
+            seq_slot=seq_slot,
+            is_streaming=False,
+            is_draft=is_draft,
+        )
+        for seq_slot, is_draft in ((0, False), (1, True))
+    ]
+
+    for seq_slot, request in enumerate(requests):
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.generation_requests = [request]
+
+        (
+            _,
+            seq_slots_host,
+            _,
+            seq_slots_cuda,
+            _,
+            _,
+            single_step_greedy,
+        ) = sampler._process_requests(
+            scheduled_requests,
+            {"logits": logits},
+            new_tokens,
+            [0],
+        )
+
+        assert single_step_greedy
+        assert seq_slots_host.tolist() == [seq_slot]
+        assert seq_slots_cuda.tolist() == [seq_slot]
+        assert new_tokens[0, seq_slot, 0].item() == 2
+
+
+@force_ampere
+def test_greedy_no_repeat_ngram_uses_token_ban_path():
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
+        )
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1, 2, 1],
+        sampling_config=SamplingConfig(),
+        seq_slot=0,
+        is_streaming=False,
+    )
+    setattr(request, "py_no_repeat_ngram_size", 2)
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 0.0, 10.0, 9.0]], device="cuda")
+
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 3
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    ("penalty_name", "penalty_value"),
+    [
+        pytest.param("repetition_penalty", 100.0, id="repetition"),
+        pytest.param("presence_penalty", 2.0, id="presence"),
+        pytest.param("frequency_penalty", 2.0, id="frequency"),
+    ],
+)
+def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penalty_value: float):
+    if penalty_name == "repetition_penalty":
+        sampling_params = SamplingParams(repetition_penalty=penalty_value)
+    elif penalty_name == "presence_penalty":
+        sampling_params = SamplingParams(presence_penalty=penalty_value)
+    else:
+        assert penalty_name == "frequency_penalty"
+        sampling_params = SamplingParams(frequency_penalty=penalty_value)
+
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
+        )
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+        seq_slot=0,
+        is_streaming=False,
+    )
+
+    admission = ScheduledRequests()
+    admission.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(admission)
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 10.0, 9.0]], device="cuda")
+
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 2
+
+
 class TestFinishReasons:
     NOT_FINISHED = FinishReason.NOT_FINISHED
     STOP_WORDS = FinishReason.STOP_WORDS
     END_ID = FinishReason.END_ID
     LENGTH = FinishReason.LENGTH
+
+    def test_single_step_greedy_updates_finish_reasons_and_filters_completed_requests(self):
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        requests = [
+            LlmRequest(
+                request_id=0,
+                seq_slot=0,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=1,
+                seq_slot=1,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=2,
+                seq_slot=2,
+                input_tokens=[2, 0],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+        ]
+        requests[2].finish_by(FinishReason.LENGTH, 0)
+        new_tokens = torch.tensor([2, 7, 99], dtype=torch.int32)
+        state = SampleStateTorch(
+            requests=requests,
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=new_tokens,
+                finish_reasons=None,
+                first_finish_reasons=None,
+                single_step_greedy=True,
+            ),
+        )
+
+        sampler.update_requests(state)
+
+        assert all(request.is_finished for request in requests)
+        # The first request reaches EOS and length together; EOS takes precedence.
+        assert not requests[0].is_finished_due_to_length
+        assert requests[1].is_finished_due_to_length
+        assert requests[0].get_tokens(0)[-1] == 2
+        assert requests[1].get_tokens(0)[-1] == 7
+        assert requests[2].get_tokens(0) == [2, 0]
 
     class RequestCase:
         MAX_NEW_TOKENS = 10
@@ -1203,6 +1428,125 @@ class TestFinishReasons:
         )
         run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
+    @staticmethod
+    def _all_beams_finished_reference(row: torch.Tensor, beam_width: int) -> bool:
+        """The per-request reduction the batched prefix count replaces."""
+        return bool(
+            (row[:beam_width] != FinishReason.NOT_FINISHED.value).sum().item() == beam_width
+        )
+
+    def test_finished_beam_prefix_lengths_matches_per_request_reduction(self):
+        """The batched prefix count answers the per-request question for every width."""
+        store_width = 4
+        reasons = [
+            FinishReason.NOT_FINISHED.value,
+            FinishReason.END_ID.value,
+            FinishReason.STOP_WORDS.value,
+            FinishReason.LENGTH.value,
+        ]
+        rows = list(product(reasons, repeat=store_width))
+        finish_reasons = torch.tensor(rows, dtype=torch.int32)
+
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+
+        assert len(prefix_lengths) == len(rows)
+        for row, prefix_length in zip(finish_reasons, prefix_lengths):
+            for beam_width in range(1, store_width + 1):
+                assert (prefix_length >= beam_width) == self._all_beams_finished_reference(
+                    row, beam_width
+                ), f"row={row.tolist()} beam_width={beam_width}"
+
+    def test_finished_beam_prefix_lengths_ignores_columns_past_beam_width(self):
+        """Reasons beyond a request's beam width must not complete it, or vice versa."""
+        # Slot 0 uses 2 beams and both finished; the padding columns are unfinished.
+        # Slot 1 uses 2 beams, only the second finished; the padding columns are set.
+        finish_reasons = torch.tensor(
+            [
+                [FinishReason.END_ID.value, FinishReason.LENGTH.value, 0, 0],
+                [
+                    0,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                ],
+            ],
+            dtype=torch.int32,
+        )
+
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+
+        assert prefix_lengths[0] >= 2
+        assert prefix_lengths[1] < 2
+
+    def test_handle_first_finish_reasons_completes_only_fully_finished_requests(self):
+        """Requests are completed, and their per-beam reasons recorded, only when all
+        of their own beams finished -- across differing beam widths in one batch."""
+        sampler = object.__new__(TorchSampler)
+        store_width = 4
+        # Slot 0: beam_width 2, both finished -> completes.
+        # Slot 1: beam_width 4, first beam unfinished -> stays running.
+        # Slot 2: beam_width 1, finished -> completes.
+        finish_reasons = torch.tensor(
+            [
+                [FinishReason.END_ID.value, FinishReason.LENGTH.value, 0, 0],
+                [
+                    0,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                ],
+                [FinishReason.STOP_WORDS.value, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        assert finish_reasons.size(1) == store_width
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+        finish_reasons_list = finish_reasons.tolist()
+
+        class RecordingLlmRequest(LlmRequest):
+            """LlmRequest that records the per-beam reasons the sampler sets."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.recorded_reasons: list[tuple[int, FinishReason]] = []
+
+            def set_finished_reason(self, finish_reason: FinishReason, beam: int) -> None:
+                self.recorded_reasons.append((beam, finish_reason))
+                super().set_finished_reason(finish_reason, beam)
+
+        requests = []
+        for seq_slot, beam_width in enumerate([2, 4, 1]):
+            # The beam width must come from the sampling config: it sizes the
+            # request's C++ per-beam state, which set_finished_reason indexes.
+            request = RecordingLlmRequest(
+                request_id=seq_slot,
+                seq_slot=seq_slot,
+                input_tokens=[1],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(beam_width=beam_width),
+                is_streaming=False,
+            )
+            assert request.py_beam_width == beam_width
+            requests.append(request)
+
+        completed = [
+            sampler._handle_first_finish_reasons(request, prefix_lengths, finish_reasons_list)
+            for request in requests
+        ]
+
+        assert completed == [True, False, True]
+        assert requests[0].state == LlmRequestState.GENERATION_COMPLETE
+        assert requests[1].state != LlmRequestState.GENERATION_COMPLETE
+        assert requests[2].state == LlmRequestState.GENERATION_COMPLETE
+        # Only the request's own beams are reported, in beam order.
+        assert requests[0].recorded_reasons == [
+            (0, FinishReason.END_ID),
+            (1, FinishReason.LENGTH),
+        ]
+        assert requests[1].recorded_reasons == []
+        assert requests[2].recorded_reasons == [(0, FinishReason.STOP_WORDS)]
+
 
 @pytest.mark.parametrize("min_p", [0.0, 0.1, 0.5, 0.9])
 def test_min_p_renorm_probs(min_p: float):
@@ -1644,7 +1988,14 @@ class TestBatchedSampling:
             assert sample_state.sampler_event is not None
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
-            new_tokens_tensors.append(sample_state.host.new_tokens.unsqueeze(-1))
+            host_new_tokens = sample_state.host.new_tokens
+            if sample_state.host.single_step_greedy:
+                # The stable greedy path copies one token per active request instead of
+                # the full [step, slot, beam] buffer. This fixture uses dense sequence
+                # slots, so restore that layout before comparing sampling results.
+                assert host_new_tokens.shape == (len(sample_state.requests),)
+                host_new_tokens = host_new_tokens.reshape(1, -1, 1)
+            new_tokens_tensors.append(host_new_tokens.unsqueeze(-1))
         new_tokens = torch.cat(new_tokens_tensors, dim=-1)
         if num_repeats is None:
             new_tokens = new_tokens.squeeze(-1)
@@ -1963,6 +2314,7 @@ class TestBatchedSampling:
             generator: Optional[torch.Generator] = None,
             return_probs: bool,
             group_metadata: StrategyMetadata | None = None,
+            seeds: Optional[RequestSeeds] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
             assert generator is sampler.get_generator(logits.device)
             if isinstance(group_key, tuple):
@@ -1981,6 +2333,7 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                     group_metadata=group_metadata,
+                    seeds=seeds,
                 )
             )
             return result
@@ -2886,6 +3239,185 @@ class TestBatchedSampling:
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)
 
 
+class TestRequestSeed:
+    """Functional guards for per-request ``SamplingParams.seed``.
+
+    The property that matters is reproducibility that does not depend on batch
+    composition: a seeded request must draw the same tokens whether it runs
+    alone or beside unrelated requests, which is exactly what a single
+    batch-wide generator cannot provide.
+    """
+
+    VOCAB_SIZE = 128
+    NUM_STEPS = 8
+
+    @staticmethod
+    def _sampling_params(seed: Optional[int]) -> SamplingParams:
+        # Temperature+top_k keeps sampling stochastic, so matching tokens across
+        # runs indicate the seed is being honored rather than coincidence.
+        return SamplingParams(temperature=1.0, top_k=64, seed=seed)
+
+    def _run(
+        self,
+        sampling_params_list: list[SamplingParams],
+        *,
+        logits: torch.Tensor,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> torch.Tensor:
+        """Sample ``NUM_STEPS`` steps; returns tokens indexed by [step, seq slot]."""
+        harness = TestBatchedSampling()
+        seq_slot_assignment = (list(range(len(sampling_params_list))), len(sampling_params_list))
+        scheduled_requests = harness._build_mock_requests(
+            sampling_params_list=sampling_params_list,
+            seq_slot_assignment=seq_slot_assignment,
+            draft_lens=[0] * len(sampling_params_list),
+        )
+        sampler = TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=321,
+                max_draft_len=42,
+                max_beam_width=1,
+                max_num_sequences=len(sampling_params_list),
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=False,
+            )
+        )
+        return harness._sample(
+            sampler,
+            scheduled_requests,
+            {"logits": logits},
+            num_repeats=self.NUM_STEPS,
+            monkeypatch=monkeypatch,
+        )
+
+    def _logits(self, num_requests: int) -> torch.Tensor:
+        return torch.testing.make_tensor(
+            (num_requests, self.VOCAB_SIZE), dtype=torch.float32, device="cuda"
+        )
+
+    def test_seed_is_independent_of_batch_composition(self, monkeypatch: pytest.MonkeyPatch):
+        """The core guarantee: batching must not perturb a seeded stream."""
+        logits = self._logits(3)
+        seeded = self._sampling_params(1234)
+
+        alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
+
+        # Same seeded request, now in slot 0 of a batch whose other members
+        # draw from the same strategy group and would advance a shared
+        # generator's state.
+        batched = self._run(
+            [seeded, self._sampling_params(None), self._sampling_params(999)],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+
+        torch.testing.assert_close(alone[:, 0], batched[:, 0])
+
+        # Negative control, disabled until FlashInfer honors per-row seeds.
+        #
+        # The assertion above passes even if the seed path is entirely inert,
+        # because slot 0 is the one row whose seed is read either way. This
+        # check would catch that -- but flashinfer-python 0.6.15 reads only
+        # seed[0]/offset[0] for the whole call and distinguishes rows by
+        # blockIdx.x, so rows 1..N sample from row 0's seed and this assertion
+        # fails for reasons outside this code. Re-enable once the pinned
+        # FlashInfer supports per-row seeds -- tracked upstream in
+        # https://github.com/flashinfer-ai/flashinfer/pull/2345 (note it lands
+        # the feature as generator=(seed_arr, offset_arr), so the sampler call
+        # sites change with it).
+        #
+        # assert not torch.equal(batched[:, 0], batched[:, 2])
+
+    def test_draft_batch_does_not_disturb_target_seed_state(self):
+        """Draft slots come from a different SeqSlotManager over the same range.
+
+        Observing a draft batch must not look like a change of occupant for the
+        target request holding that slot number, which would reset its offset
+        and make it replay part of its stream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+
+        target = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=100,
+                py_is_draft=False,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([target])
+        manager.advance([0, 0, 0])
+        assert manager.any_seeded is False  # target carries no user seed
+        offset_before = manager._offsets[0].item()
+
+        # A draft request lands on slot 0, owned by `target` above.
+        draft = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=200,
+                py_is_draft=True,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([draft])
+        assert manager.any_seeded is False  # draft never uses the per-row path
+        assert manager._offsets[0].item() == offset_before
+        assert manager._slot_owner[0] == 100  # still the target request
+
+        # The target is unchanged when it comes back around.
+        manager.observe([target])
+        assert manager._offsets[0].item() == offset_before
+
+    def test_multi_row_offsets_do_not_overlap(self):
+        """Speculative decoding draws several rows per request per step.
+
+        Those rows must be assigned distinct stretches of the request's stream,
+        and the next step must resume past all of them -- otherwise a request
+        would replay the same random numbers across steps.
+
+        This asserts the offsets ``_SeedManager`` produces, not what the kernel
+        does with them: the pinned flashinfer reads only ``offset[0]``, so the
+        per-row values are not yet honored downstream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 1234
+        manager._seeds[1] = 999
+        manager._any_seeded = True
+
+        rows = [0, 0, 0, 1]  # slot 0 draws 3 tokens this step, slot 1 draws 1
+        device = torch.device("cpu")
+
+        first = manager.make_row_seeds(rows, device=device)
+        assert first.seed.tolist() == [1234, 1234, 1234, 999]
+
+        manager.advance(rows)
+        second = manager.make_row_seeds(rows, device=device)
+
+        # Each row reserves a stretch of the stream; the invariant is that no
+        # two stretches overlap, within a step or across steps. Asserted as a
+        # property rather than against OFFSET_STRIDE, so that a stride too small
+        # for the kernel's per-row consumption fails here instead of silently
+        # rescaling the expected values.
+        #
+        # flashinfer 0.6.15 reserves 32 offset units per row for the top-k/top-p
+        # rejection samplers, so a stride below that would replay random values.
+        # Only within a slot: distinct slots carry distinct seeds, so they are
+        # independent streams and may legitimately share offsets.
+        assert _SeedManager.OFFSET_STRIDE >= 32
+        per_slot: dict[int, set[int]] = {}
+        for offsets in (first.offset.tolist(), second.offset.tolist()):
+            for slot, off in zip(rows, offsets):
+                stretch = range(off, off + _SeedManager.OFFSET_STRIDE)
+                used = per_slot.setdefault(slot, set())
+                assert used.isdisjoint(stretch), (
+                    f"slot {slot} reuses offsets {off}..{off + _SeedManager.OFFSET_STRIDE - 1}; "
+                    "the stream is replayed"
+                )
+                used.update(stretch)
+
+
 class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
 
@@ -3052,6 +3584,9 @@ class TestTopPDecay:
             is_context_init_state=False,
             py_sampling_strategy=None,
             py_draft_tokens=draft_tokens,
+            # Read by the row_stride query in sampler_common; these tests are
+            # single-beam, so the static admission width is 1.
+            py_beam_width=1,
         )
         req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
         return cast(LlmRequest, req)
@@ -3083,3 +3618,51 @@ class TestTopPDecay:
             )
         # Same request without decay is accepted.
         sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))
+
+    @pytest.mark.parametrize(
+        "beam_width_array, expected_max_width",
+        [([], 1), (None, 1), ([1], 1), ([1, 2], 2), ([3, 5, 7], 7)],
+    )
+    def test_beam_width_array_max_handles_empty(
+        self, beam_width_array: list[int] | None, expected_max_width: int
+    ) -> None:
+        # An empty beam_width_array reaches the sampler: the executor's
+        # checkBeamWidthArray bounds only the array's length, so [] passes
+        # admission. _get_max_beam_width must fall back to beam_width instead of
+        # reducing over the empty array, and must still take the array's maximum
+        # when it has entries.
+        #
+        # Build the request through SamplingParams, the way production does:
+        # _get_sampling_config() converts the flat list into the nested form the
+        # runtime SamplingConfig stores (OptVec<vector<SizeType32>>), which its
+        # setter accepts but a direct flat/None assignment does not.
+        request = self._mock_request(SamplingParams(top_p=0.9, beam_width_array=beam_width_array))
+        assert _get_max_beam_width(request) == expected_max_width
+        # The same request must survive admission: top_p_decay is unset, but
+        # TopPDecayHandler.validate_request resolves the sampling params -- and
+        # with them the beam width -- before it checks whether decay is active.
+        self._make_sampler().validate_request(request)
+
+    @pytest.mark.parametrize(
+        "beam_width_array, expected_max_width",
+        [
+            (None, 1),
+            ([], 1),
+            # [[]] is how "no schedule" reaches the runtime config once the
+            # empty array has been wrapped; it must not be reduced over.
+            ([[]], 1),
+            ([[1]], 1),
+            ([[1, 2]], 2),
+            ([[3, 5, 7]], 7),
+        ],
+    )
+    def test_beam_width_array_max_accepts_nested_shape(
+        self, beam_width_array: list[list[int]] | None, expected_max_width: int
+    ) -> None:
+        # The runtime SamplingConfig stores OptVec<vector<SizeType32>>, so the
+        # nested form reaches _get_max_beam_width. SamplingParams' list[int]
+        # annotation cannot express it, so drive the helper directly with a stub
+        # carrying just the two fields it reads.
+        config = SimpleNamespace(beam_width=1, beam_width_array=beam_width_array)
+        request = cast(LlmRequest, SimpleNamespace(sampling_config=config))
+        assert _get_max_beam_width(request) == expected_max_width

@@ -24,6 +24,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEProblem,
+    canonical_activation,
+    canonical_quant,
+)
+from tensorrt_llm._torch.modules.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -39,7 +47,7 @@ def _is_deepep_feasible(num_ranks: int) -> bool:
 
     Intranode: num_ranks in {2, 4, 8} and num_ranks == local_mpi_size().
     Internode: exactly 8 ranks per node, with 2/4/8/16 RDMA nodes.
-    Mirrors the feasibility check in fused_moe_wide_ep.py::select_alltoall_method_type.
+    Mirrors the feasibility check in communication/deep_ep.py::DeepEP._is_deepep_feasible.
     """
     _INTRANODE_RANKS = {2, 4, 8}
     _REQUIRED_LOCAL_SIZE = 8
@@ -57,20 +65,41 @@ def _check_backend_can_implement(
     quant_algo: Optional[QuantAlgo],
     dtype_activation: torch.dtype,
     swiglu_gptoss_style: bool,
+    activation_type: ActivationType,
 ) -> Tuple[bool, Optional[str]]:
-    """Resolve backend_str to its MoE class and forward to can_implement."""
+    """Resolve backend_str to its MoE class and ask whether it can serve this.
+
+    The topology-dependent gates are deliberately not exercised here: this runs
+    before ``_resolve_mapping_layout``, and the EP / comm constraints get their
+    own explicit checks in :func:`is_candidate_valid` with better messages.
+    """
     try:
         backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
     except (ImportError, KeyError, RuntimeError, ValueError) as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
+    problem = MoEProblem(
+        quant=canonical_quant(quant_algo),
+        dtype_act=dtype_activation,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+        # Defaults to SwiGLU when unset, which would make every upstream
+        # activation gate evaluate the wrong activation.
+        activation=canonical_activation(activation_type),
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=0,
+        env=collect_moe_environment(),
+    )
     try:
-        return backend_cls.can_implement(
-            quant_algo=quant_algo,
-            dtype_activation=dtype_activation,
-            swiglu_gptoss_style=swiglu_gptoss_style,
-        )
+        verdict = backend_cls.can_implement(problem, deployment)
     except Exception as exc:
         return False, (f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}")
+    if verdict.eligible:
+        return True, None
+    return False, f"{verdict.reject_reason.value}: {verdict.detail}"
 
 
 def _expand_axis(values: Iterable[Any], default: Any) -> Tuple[Any, ...]:
@@ -152,7 +181,11 @@ def is_candidate_valid(
     """Return ``(ok, reason)`` based on backend / mapping / comm gates."""
     # Backend can_implement gate.
     ok, reason = _check_backend_can_implement(
-        config.backend, model.quant_algo_enum, act_dtype, model.swiglu_gptoss_style
+        config.backend,
+        model.quant_algo_enum,
+        act_dtype,
+        model.swiglu_gptoss_style,
+        model.activation_type_enum,
     )
     if not ok:
         return False, reason

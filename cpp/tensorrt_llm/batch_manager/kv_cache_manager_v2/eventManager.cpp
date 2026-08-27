@@ -57,6 +57,14 @@ uint64_t hash64Mix(int64_t input, uint64_t seed)
     return seed ^ (value + static_cast<uint64_t>(kHashCombineConst) + (seed << 6U) + (seed >> 2U));
 }
 
+// A page whose recorded token count is short of the block's span cannot be announced: the
+// event payload carries the block's full token list and cannot express a shorter valid
+// prefix.
+bool pageCoversBlock(CommittedPage const* page, Block const& block)
+{
+    return page != nullptr && page->numTokensInBlock >= static_cast<int>(block.tokens.size());
+}
+
 } // namespace
 
 EventManager::EventManager(int maxKvEventEntries, int windowSize, std::optional<int> attentionDpRank,
@@ -176,7 +184,7 @@ void EventManager::addStoredBlockUnlocked(Block const& block)
     std::set<int> lifeCycleIds;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
     {
-        if (block.storage[lifeCycle] != nullptr)
+        if (pageCoversBlock(block.getPage(lifeCycle), block))
         {
             lifeCycleIds.insert(lifeCycle.value());
         }
@@ -529,7 +537,7 @@ std::optional<EventBlockHash> EventManager::parentHashFromBlock(Block const& blo
 std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     Block const& block, std::optional<std::set<int>> const& lifeCycleIds)
 {
-    CacheLevel cacheLevel = kGpuLevel;
+    CacheLevel cacheLevel = kHotLevel;
     Priority priority = kPriorityDefault;
     bool foundPage = false;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
@@ -538,8 +546,8 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         {
             continue;
         }
-        auto const* page = block.storage[lifeCycle];
-        if (page != nullptr)
+        auto const* page = block.getPage(lifeCycle);
+        if (pageCoversBlock(page, block))
         {
             cacheLevel = page->cacheLevel;
             priority = page->priority;
@@ -556,17 +564,16 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     tokens.reserve(block.tokens.size());
     for (auto const& token : block.tokens)
     {
-        if (auto const* tokenId = std::get_if<TokenId>(&token))
+        if (!token.isDigest())
         {
             UniqueToken uniqueToken;
-            uniqueToken.tokenId = EventTokenId{std::in_place_index<0>, *tokenId};
+            uniqueToken.tokenId = EventTokenId{std::in_place_index<0>, token.tokenId()};
             tokens.push_back(std::move(uniqueToken));
         }
         else
         {
             UniqueToken uniqueToken;
-            uniqueToken.tokenId
-                = EventTokenId{std::in_place_index<1>, digestToHex(std::get<DigestToken>(token).digest())};
+            uniqueToken.tokenId = EventTokenId{std::in_place_index<1>, digestToHex(token.digest())};
             tokens.push_back(std::move(uniqueToken));
         }
     }
@@ -637,13 +644,12 @@ uint64_t EventManager::v1HashFromBlock(Block const& block)
         {
             for (auto const& token : currentBlock.tokens)
             {
-                auto const* tokenId = std::get_if<TokenId>(&token);
-                if (tokenId == nullptr)
+                if (token.isDigest())
                 {
                     parentIsV1Compatible = false;
                     break;
                 }
-                textTokens.push_back(*tokenId);
+                textTokens.push_back(token.tokenId());
             }
         }
         if (parentIsV1Compatible)

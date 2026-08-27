@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 import pytest
 
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
@@ -32,6 +33,7 @@ from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
+from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
@@ -45,6 +47,8 @@ from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
     _find_matching_brace, _parse_gemma4_args, _parse_gemma4_array,
     _parse_gemma4_value,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 # Test fixtures for common tools
@@ -221,6 +225,16 @@ class TestBaseToolParser:
         assert len(results) == 1
         assert json.loads(results[0].parameters) == {}
 
+    def test_parse_base_json_null_arguments(self, sample_tools):
+        """Test parse_base_json handles an explicit null arguments value."""
+        parser = ConcreteToolParser()
+        action = {"name": "get_weather", "arguments": None}
+
+        results = parser.parse_base_json(action, sample_tools)
+
+        assert len(results) == 1
+        assert json.loads(results[0].parameters) == {}
+
     def test_ends_with_partial_token(self):
         """Test _ends_with_partial_token detection."""
         parser = ConcreteToolParser()
@@ -339,6 +353,25 @@ class TestBaseToolParser:
         assert isinstance(info, StructureInfo)
         assert "test_function" in info.begin
         assert info.trigger == "[TOOL_CALLS]"
+
+    def test_finish_default_noop(self, sample_tools):
+        """The default finalization hook emits nothing and keeps state.
+
+        Existing parsers manage ``self._buffer`` incrementally; the
+        end-of-stream hook must not change their behavior.
+        """
+        parser = ConcreteToolParser()
+        parser._buffer = '[TOOL_CALLS] {"name":"get_weather"'
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
+        assert parser._buffer == '[TOOL_CALLS] {"name":"get_weather"'
+
+    def test_extracts_forced_tool_calls_default_false(self):
+        """Forced tool_choice extraction is opt-in per parser."""
+        assert ConcreteToolParser.extracts_forced_tool_calls is False
 
 
 # ============================================================================
@@ -1011,6 +1044,58 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
             ',"arguments":{"location":"SF"}}\n</tool_call>', sample_tools)
         assert len(r_args.calls) == 1
         assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
+
+    @pytest.mark.parametrize(
+        "arguments_chunk",
+        [', "arguments": {}}', "}", ', "arguments": null}'],
+        ids=["empty_object", "key_absent", "explicit_null"],
+    )
+    def test_streaming_zero_arg_tool(self, parser, arguments_chunk):
+        """Test streaming a zero-argument tool call.
+
+        A model can express "no arguments" as an empty object, by omitting the
+        key, or as an explicit null. All three have to complete the call and
+        stream "{}".
+        """
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        chunks = [
+            "<tool_call>\n",
+            '{"name": "get_time"',
+            arguments_chunk,
+            "\n</tool_call>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+
+        names = [c.name for r in results for c in r.calls if c.name]
+        assert "get_time" in names
+
+        # A zero-argument call still has to stream its arguments, otherwise the
+        # client is left with arguments="", which is not valid JSON.
+        params = "".join(c.parameters for r in results for c in r.calls)
+        assert params == "{}", f"Expected '{{}}', got {params!r}"
+
+        # The one-shot path resolves all three shapes to the same "{}".
+        oneshot = parser.detect_and_parse("".join(chunks), tools)
+        assert oneshot.calls[0].parameters == "{}"
+
+        # The completed call must also be consumed from the buffer, otherwise the
+        # parser stays in the tool-call branch and swallows the rest of the output.
+        assert "<tool_call>" not in parser._buffer
 
 
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
@@ -1772,6 +1857,138 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
              '<｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> '
              "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
         )
+
+
+# ============================================================================
+# DeepSeek streaming text preservation
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # A delta that is itself a prefix of a tool-call start token.
+        ["Use ", "<", "div> for a block element."],
+        # A delta that ends on such a prefix after other text.
+        ["The condition is a <", " b, so it holds."],
+        # Text that starts like a start token and then diverges from it, for
+        # both of the tokens the V3.2 and V4 parsers look for.
+        ["Use <｜DSML｜function", "ality and <｜DSML｜invoke", "ality"],
+    ],
+)
+def test_deepseek_streaming_preserves_withheld_text(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """Withholding a delta may delay text but must never drop it."""
+    parser = parser_cls()
+
+    streamed = "".join(
+        parser.parse_streaming_increment(delta, sample_tools).normal_text
+        for delta in deltas)
+
+    expected = "".join(deltas)
+    assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(expected,
+                                         sample_tools).normal_text == expected
+
+
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"),
+        ),
+    ],
+)
+def test_deepseek_streaming_emits_text_before_tool_call(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """Text that precedes a tool call in the same delta is content."""
+    text = "Normal text" + tool_call_text
+
+    result = parser_cls().parse_streaming_increment(text, sample_tools)
+
+    assert result.normal_text == "Normal text"
+    assert result.normal_text == parser_cls().detect_and_parse(
+        text, sample_tools).normal_text
+    assert "get_weather" in [call.name for call in result.calls if call.name]
+
+
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜function_calls>'),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜tool_calls>'),
+        ),
+    ],
+)
+def test_deepseek_streaming_prefix_is_delta_independent(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """The prefix is streamed verbatim however the deltas are cut."""
+    prefix = "  Normal text  "
+    text = prefix + tool_call_text
+    splits = [
+        [text],
+        [prefix, tool_call_text],
+        [text[:8], text[8:]],
+    ]
+
+    for deltas in splits:
+        parser = parser_cls()
+        results = [
+            parser.parse_streaming_increment(delta, sample_tools)
+            for delta in deltas
+        ]
+        streamed = "".join(result.normal_text for result in results)
+        names = [
+            call.name for result in results for call in result.calls
+            if call.name
+        ]
+
+        assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
+        assert names == ["get_weather"], f"{deltas!r} called {names!r}"
 
 
 # ============================================================================
@@ -4066,3 +4283,680 @@ class TestBuildToolStrictGuidedDecoding:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestKimiK3ToolParser(BaseToolParserTestClass):
+    """Test suite for KimiK3ToolParser (XTML tool-call format).
+
+    Fixture strings follow the checkpoint's `encoding_k3.py` rendering:
+    `<|open|>tag key="value"<|sep|>` / `<|close|>tag<|sep|>`, attributes
+    space-prefixed and `&`/`"`-escaped, call indices 1-based, string
+    argument bodies raw and non-string bodies JSON.
+    """
+
+    BOT = "<|open|>tools<|sep|>"
+    EOT = "<|close|>tools<|sep|>"
+
+    @staticmethod
+    def _call(name: str, index: int, body: str) -> str:
+        return (f'<|open|>call tool="{name}" index="{index}"<|sep|>'
+                f'{body}<|close|>call<|sep|>')
+
+    @staticmethod
+    def _argument(key: str, type_: str, value: str) -> str:
+        return (f'<|open|>argument key="{key}" type="{type_}"<|sep|>'
+                f'{value}<|close|>argument<|sep|>')
+
+    def _section(self, *calls: str) -> str:
+        return self.BOT + "".join(calls) + self.EOT
+
+    def make_parser(self):
+        return KimiK3ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        single_call = self._section(
+            self._call("get_weather", 1,
+                       self._argument("location", "string", "NYC")))
+        return ToolParserTestCases(
+            has_tool_call_true="Some text " + single_call,
+            detect_and_parse_single_tool=(
+                "Normal text" + single_call,
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                self._section(
+                    self._call("get_weather", 1,
+                               self._argument("location", "string", "LA")),
+                    self._call("search_web", 2,
+                               self._argument("query", "string", "AI")),
+                ),
+                ("get_weather", "search_web"),
+            ),
+            # A call without the mandatory tool="..." attribute is skipped.
+            detect_and_parse_malformed_tool=self._section(
+                '<|open|>call index="1"<|sep|>'
+                '<|open|>argument key="location" type="string"<|sep|>NYC'
+                '<|close|>argument<|sep|><|close|>call<|sep|>'),
+            # K3 has no JSON "parameters" key wrapper; the closest analogue
+            # is the raw-JSON call body variant.
+            detect_and_parse_with_parameters_key=(
+                self._section(
+                    self._call(
+                        "search_web", 1,
+                        '<|open|>json type="object"<|sep|>{"query": "test"}'
+                        '<|close|>json<|sep|>')),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<|open|>too",
+            undefined_tool=self._section(
+                self._call("undefined_func", 1,
+                           self._argument("arg", "string", "any value"))),
+        )
+
+    def test_initialization(self, parser):
+        assert parser.bot_token == self.BOT
+        assert parser.eot_token == self.EOT
+
+    def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
+        """Keep undefined-tool calls at their positional index.
+
+        K3 warns about undefined tools rather than remapping ``tool_index`` to
+        ``-1``.
+        """
+        text = tool_parser_test_cases.undefined_tool
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "undefined_func"
+        assert result.calls[0].tool_index == 0
+
+    def test_supports_structural_tag(self):
+        """Reject JSON-schema structural tagging for XTML bodies.
+
+        XTML bodies already use tag-structured text, so JSON-schema
+        structural-tag constrained decoding does not apply.
+        """
+        parser = KimiK3ToolParser()
+        assert parser.supports_structural_tag() is False
+        with pytest.raises(NotImplementedError):
+            parser.structure_info()
+
+    def test_argument_type_coercion(self, sample_tools, parser):
+        """Non-string argument bodies are JSON; string bodies stay raw."""
+        text = self._section(
+            self._call(
+                "get_weather", 1,
+                self._argument("location", "string", '"quoted" & raw') +
+                self._argument("count", "number", "3") +
+                self._argument("celsius", "boolean", "true") +
+                self._argument("extra", "null", "null") +
+                self._argument("nested", "object", '{"a": [1, 2]}') +
+                self._argument("tags", "array", '["x", "y"]')))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {
+            "location": '"quoted" & raw',
+            "count": 3,
+            "celsius": True,
+            "extra": None,
+            "nested": {
+                "a": [1, 2]
+            },
+            "tags": ["x", "y"],
+        }
+
+    def test_argument_invalid_json_falls_back_to_raw(self, sample_tools,
+                                                     parser):
+        """Keep a non-string argument's invalid JSON body as raw text.
+
+        Invalid JSON should fall back to its original text instead of raising.
+        """
+        text = self._section(
+            self._call("get_weather", 1,
+                       self._argument("count", "number", "not-a-number")))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert json.loads(result.calls[0].parameters) == {
+            "count": "not-a-number"
+        }
+
+    def test_attribute_unescaping(self, sample_tools, parser):
+        """Unescape encoded XTML attribute values.
+
+        K3 attributes arrive escaped by ``encoding_k3._escape_attr_value``.
+        """
+        text = self._section(
+            self._call(
+                "get_weather", 1,
+                self._argument("say &quot;hi&quot; &amp; bye", "string", "v")))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert json.loads(result.calls[0].parameters) == {'say "hi" & bye': "v"}
+
+    def test_empty_arguments(self, sample_tools, parser):
+        """A call with no argument tags yields an empty JSON object."""
+        text = self._section(self._call("search_web", 1, ""))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].parameters == "{}"
+
+    def test_trailing_structural_markup_stripped(self, sample_tools, parser):
+        """Strip trailing XTML terminators from standalone normal text.
+
+        This covers parsing without a tools section or reasoning parser.
+        """
+        text = "The answer is 4.<|close|>message<|sep|><|end_of_msg|>"
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == "The answer is 4."
+        assert len(result.calls) == 0
+
+    def test_streaming_buffers_section_until_complete(self, sample_tools,
+                                                      parser):
+        """Buffer an incomplete tools section while streaming response text.
+
+        Response text is emitted immediately, but calls wait for the closing
+        ``<|close|>tools<|sep|>`` marker.
+        """
+        result = parser.parse_streaming_increment("Checking. ", sample_tools)
+        assert result.normal_text == "Checking. "
+        assert result.calls == []
+
+        # Section opener + call header: everything buffered.
+        result = parser.parse_streaming_increment(
+            self.BOT + '<|open|>call tool="get_weather" index="1"<|sep|>',
+            sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+
+        # Arguments still buffered.
+        result = parser.parse_streaming_increment(
+            self._argument("location", "string", "NYC"), sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+
+        # Section close: the complete call is emitted.
+        result = parser.parse_streaming_increment(
+            "<|close|>call<|sep|>" + self.EOT, sample_tools)
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+
+    def test_composes_with_kimi_k3_reasoning_parser(self, sample_tools, parser):
+        """Parse tools passed through the Kimi-K3 reasoning parser.
+
+        The reasoning parser preserves the tools section verbatim for this
+        parser.
+        """
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        completion = (
+            "Need the weather.<|close|>think<|sep|>"
+            "<|open|>response<|sep|>Checking."
+            "<|close|>response<|sep|>" + self._section(
+                self._call("get_weather", 1,
+                           self._argument("location", "string", "NYC"))) +
+            "<|close|>message<|sep|><|end_of_msg|>")
+
+        reasoning = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+        stage1 = reasoning.parse(completion)
+        assert stage1.reasoning_content == "Need the weather."
+
+        stage2 = parser.detect_and_parse(stage1.content, sample_tools)
+        assert stage2.normal_text == "Checking."
+        assert len(stage2.calls) == 1
+        assert stage2.calls[0].name == "get_weather"
+        assert json.loads(stage2.calls[0].parameters) == {"location": "NYC"}
+
+    def test_extracts_forced_tool_calls(self):
+        """K3 opts in to serve-level extraction on forced tool_choice.
+
+        XTML has no structural-tag grammar, so a forced call still arrives
+        as preamble + markup and must not be passed through raw.
+        """
+        assert KimiK3ToolParser.extracts_forced_tool_calls is True
+
+    def test_streaming_early_end_flush(self, sample_tools, parser):
+        """Emit a buffered complete call when the stream ends before EOT.
+
+        Without the finalization hook the buffered section was silently
+        dropped.
+        """
+        result = parser.parse_streaming_increment(
+            "Sure. " + self.BOT + self._call(
+                "get_weather", 1, self._argument("location", "string", "NYC")),
+            sample_tools)
+        assert result.normal_text == "Sure. "
+        assert result.calls == []
+
+        result = parser.finish(sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+        assert parser._buffer == ""
+
+    def test_streaming_early_end_flush_salvages_complete_calls(
+            self, sample_tools, parser):
+        """A stream truncated mid-call still emits the calls that completed."""
+        parser.parse_streaming_increment(
+            self.BOT + self._call("get_weather", 1,
+                                  self._argument("location", "string", "LA")) +
+            '<|open|>call tool="search_web" index="2"<|sep|>'
+            '<|open|>argument key="query" type="str', sample_tools)
+
+        result = parser.finish(sample_tools)
+
+        assert [call.name for call in result.calls] == ["get_weather"]
+        assert json.loads(result.calls[0].parameters) == {"location": "LA"}
+
+    def test_finish_after_complete_section_is_empty(self, sample_tools, parser):
+        """A cleanly closed section leaves nothing for the flush to emit."""
+        result = parser.parse_streaming_increment(
+            self._section(
+                self._call("get_weather", 1,
+                           self._argument("location", "string", "NYC"))),
+            sample_tools)
+        assert len(result.calls) == 1
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
+
+    @pytest.mark.parametrize("residue", [
+        "<|close|>message<|sep|>", "<|end_of_msg|>",
+        "<|close|>message<|sep|><|end_of_msg|>"
+    ])
+    def test_streaming_post_section_residue_never_leaks(self, sample_tools,
+                                                        parser, residue):
+        """Structural framing after the section is stripped, not streamed.
+
+        ``parse_streaming_increment`` leaves post-section residue in the
+        buffer; if it arrives in a later increment the no-``bot_token`` path
+        must not emit it as content. Streaming must match non-streaming, which
+        strips the same residue via ``_trailing_structural``. Regression:
+        without the ``_section_done`` guard the residue leaked as ``content``.
+        """
+        preamble = "Sure. "
+        section = self._section(
+            self._call("get_weather", 1,
+                       self._argument("location", "string", "NYC")))
+        # Section completes in the first increment; residue trickles in one
+        # character at a time in later increments (worst case for partial
+        # structural tokens).
+        chunks = [preamble + section] + list(residue)
+
+        normal_text = ""
+        calls = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        result = parser.finish(sample_tools)
+        normal_text += result.normal_text
+        calls.extend(result.calls)
+
+        assert normal_text == preamble
+        assert [call.name for call in calls] == ["get_weather"]
+        # Streaming agrees with the non-streaming path on the same full text.
+        non_streaming = self.make_parser().detect_and_parse(
+            preamble + section + residue, sample_tools)
+        assert non_streaming.normal_text == preamble
+
+    def test_finish_flushes_held_partial_bot_token_as_text(
+            self, sample_tools, parser):
+        """A held-back bot_token prefix is plain text once the stream ends."""
+        result = parser.parse_streaming_increment("A <|open|>too", sample_tools)
+        assert result.normal_text == "A "
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == "<|open|>too"
+        assert result.calls == []
+
+    def test_streaming_multiple_calls_split_across_chunks(
+            self, sample_tools, parser):
+        """Both calls of a two-call section arrive once EOT lands."""
+        first = self._call("get_weather", 1,
+                           self._argument("location", "string", "LA"))
+        second = self._call("search_web", 2,
+                            self._argument("query", "string", "AI"))
+        section = self.BOT + first + second + self.EOT
+        # Split inside the second call header and inside the EOT token.
+        chunks = [
+            section[:len(self.BOT) + len(first) + 14],
+            section[len(self.BOT) + len(first) + 14:-7],
+            section[-7:],
+        ]
+
+        collected = []
+        for chunk in chunks:
+            collected.extend(
+                parser.parse_streaming_increment(chunk, sample_tools).calls)
+
+        assert [call.name
+                for call in collected] == ["get_weather", "search_web"]
+        assert json.loads(collected[0].parameters) == {"location": "LA"}
+        assert json.loads(collected[1].parameters) == {"query": "AI"}
+
+    def test_literal_lt_in_attribute_value(self, sample_tools, parser):
+        """Attribute values may contain a literal ``<``.
+
+        The K3 encoder escapes only ``&`` and ``"``, so ``<`` reaches the
+        parser raw; the old header pattern (``[^<]*?``) silently dropped the
+        whole call.
+        """
+        text = self._section(
+            self._call("a<b", 1, self._argument("expr", "string", "x")) +
+            self._call("get_weather", 2, self._argument("k<ey", "string", "v")))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert [call.name for call in result.calls] == ["a<b", "get_weather"]
+        assert json.loads(result.calls[1].parameters) == {"k<ey": "v"}
+
+
+class TestForcedToolChoicePostprocessing:
+    """Serve-level tests for named/forced ``tool_choice`` and stream flush.
+
+    Drives the real ``chat_response_post_processor`` /
+    ``chat_stream_post_processor`` with fake generation results, since the
+    named-choice extraction and the end-of-stream flush live in the serving
+    layer, above the parsers the rest of this file tests.
+    """
+
+    BOT = TestKimiK3ToolParser.BOT
+    EOT = TestKimiK3ToolParser.EOT
+
+    WEATHER_CALL_SECTION = (
+        BOT + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>NYC'
+        '<|close|>argument<|sep|>'
+        '<|close|>call<|sep|>' + EOT)
+
+    @staticmethod
+    def _make_args(sample_tools,
+                   tool_parser=None,
+                   forced_tool_name=None,
+                   stream=False):
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs
+
+        request_kwargs = dict(
+            model="test-model",
+            messages=[{
+                "role": "user",
+                "content": "What is the weather in NYC?"
+            }],
+            tools=sample_tools,
+            stream=stream,
+        )
+        if forced_tool_name is not None:
+            request_kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {
+                    "name": forced_tool_name
+                },
+            }
+        req = ChatCompletionRequest(**request_kwargs)
+        args = ChatPostprocArgs.from_request(req)
+        args.tool_parser = tool_parser
+        args.num_prompt_tokens = 5
+        return args
+
+    @staticmethod
+    def _fake_response(text, finish_reason="stop"):
+        from types import SimpleNamespace
+        output = SimpleNamespace(index=0,
+                                 text=text,
+                                 token_ids=[1, 2, 3],
+                                 finish_reason=finish_reason,
+                                 stop_reason=None,
+                                 disaggregated_params=None)
+        return SimpleNamespace(outputs=[output], cached_tokens=0)
+
+    @staticmethod
+    def _stream_deltas(args, chunks, finish_reason="stop"):
+        """Feed text chunks through the streaming postprocessor.
+
+        Returns the decoded SSE payloads (one dict per emitted chunk).
+        """
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        payloads = []
+        for chunk_index, chunk in enumerate(chunks):
+            last = chunk_index == len(chunks) - 1
+            output = SimpleNamespace(
+                index=0,
+                text_diff=chunk,
+                token_ids_diff=[chunk_index],
+                logprobs_diff=[],
+                finish_reason=finish_reason if last else None,
+                stop_reason=None,
+                length=chunk_index + 1,
+                disaggregated_params=None,
+            )
+            rsp = SimpleNamespace(outputs=[output],
+                                  cached_tokens=0,
+                                  id="test-request",
+                                  _done=last)
+            for line in chat_stream_post_processor(rsp, args):
+                payloads.append(json.loads(line[len("data: "):]))
+        return payloads
+
+    def test_forced_choice_k3_extracts_arguments(self, sample_tools):
+        """The headline TRTLLM-15176 bug.
+
+        A forced tool_choice must return the extracted JSON, not the raw
+        preamble + XTML markup.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("Let me check. " + self.WEATHER_CALL_SECTION)
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "tool_calls"
+        assert len(choice.message.tool_calls) == 1
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+        assert choice.message.content == "Let me check. "
+
+    def test_forced_choice_k3_name_mismatch_uses_request_name(
+            self, sample_tools):
+        """The caller chose the tool; a disagreeing model only earns a log."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="search_web")
+        rsp = self._fake_response(self.WEATHER_CALL_SECTION)
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        function = choice.message.tool_calls[0].function
+        assert function.name == "search_web"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+
+    def test_forced_choice_k3_no_markup_returns_content(self, sample_tools):
+        """Return content when a K3 forced call produced no markup.
+
+        Nothing constrains K3 forced calls; if the model emits no markup,
+        return the text as content rather than garbage arguments.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("I cannot help with that.")
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "stop"
+        assert not choice.message.tool_calls
+        assert choice.message.content == "I cannot help with that."
+
+    def test_forced_choice_raw_passthrough_keeps_text_as_arguments(
+            self, sample_tools):
+        """Ungated parsers keep the legacy raw passthrough on forced calls.
+
+        Parsers without ``extracts_forced_tool_calls`` pass text through as
+        arguments, but now report finish_reason="tool_calls".
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response('{"location": "NYC"}')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "tool_calls"
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert function.arguments == '{"location": "NYC"}'
+
+    def test_forced_choice_k3_streaming_extracts(self, sample_tools):
+        """Extract the forced call from a streamed K3 response.
+
+        The preamble streams as content deltas and the extracted call as a
+        tool_calls delta with the forced name.
+        """
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        section = self.WEATHER_CALL_SECTION
+        payloads = self._stream_deltas(
+            args, ["Let me check. ", section[:40], section[40:]])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        content = "".join(d.get("content") or "" for d in deltas)
+        assert content == "Let me check. "
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        assert len(tool_deltas) == 1
+        function = tool_deltas[0]["tool_calls"][0]["function"]
+        assert function["name"] == "get_weather"
+        assert json.loads(function["arguments"]) == {"location": "NYC"}
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "tool_calls"
+
+    def test_streaming_early_end_flushes_buffered_call(self, sample_tools):
+        """Flush the buffered call when an auto-choice stream ends early.
+
+        A stream that ends before EOT still emits the buffered call via the
+        finalization hook instead of dropping it.
+        """
+        args = self._make_args(sample_tools, tool_parser="kimi_k3", stream=True)
+        truncated = self.WEATHER_CALL_SECTION[:-len(self.EOT)]
+        payloads = self._stream_deltas(
+            args, ["Sure. ", truncated[:30], truncated[30:]])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        assert len(tool_deltas) == 1
+        function = tool_deltas[0]["tool_calls"][0]["function"]
+        assert function["name"] == "get_weather"
+        assert json.loads(function["arguments"]) == {"location": "NYC"}
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "tool_calls"
+
+    def test_forced_choice_k3_streaming_no_markup_is_content(
+            self, sample_tools):
+        """Streaming honest fallback: no markup means content, not a call."""
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        payloads = self._stream_deltas(args, ["I cannot ", "help with that."])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        assert not any(d.get("tool_calls") for d in deltas)
+        content = "".join(d.get("content") or "" for d in deltas)
+        assert content == "I cannot help with that."
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "stop"
+
+
+class TestConfigureParserSpecialTokenDecoding:
+    """Test parser-specific detokenization settings in the OpenAI server."""
+
+    @staticmethod
+    def _configure(reasoning_parser_name: str | None = None,
+                   tool_parser_name: str | None = None,
+                   has_tools: bool = False) -> SamplingParams:
+        from tensorrt_llm.serve.openai_server import \
+            _configure_parser_special_token_decoding
+
+        sampling_params = SamplingParams()
+        _configure_parser_special_token_decoding(
+            sampling_params,
+            reasoning_parser_name=reasoning_parser_name,
+            tool_parser_name=tool_parser_name,
+            has_tools=has_tools)
+        return sampling_params
+
+    def test_kimi_k3_reasoning_parser_preserves_compact_xtml(self) -> None:
+        sampling_params = self._configure(reasoning_parser_name="kimi_k3")
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is False
+
+    def test_kimi_k3_tool_parser_preserves_compact_xtml(self) -> None:
+        sampling_params = self._configure(tool_parser_name="KIMI_K3",
+                                          has_tools=True)
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is False
+
+    def test_tool_parser_does_not_apply_without_tools(self) -> None:
+        sampling_params = self._configure(tool_parser_name="kimi_k3")
+
+        assert sampling_params.skip_special_tokens is True
+        assert sampling_params.spaces_between_special_tokens is True
+
+    def test_other_raw_token_parser_keeps_spacing_contract(self) -> None:
+        sampling_params = self._configure(tool_parser_name="deepseek_v32",
+                                          has_tools=True)
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is True

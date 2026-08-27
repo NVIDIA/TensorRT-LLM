@@ -19,78 +19,41 @@ l0_a10:
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
   - unittest/utils/test_util.py
-  - unittest/utils/test_logger.py
-  - unittest/_torch/test_model_config.py
-  - unittest/models/test_quant_config_utils.py
-  - unittest/quantization/test_mode.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
-  - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
-  - unittest/_torch/modeling/test_modeling_step3p7.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/sampler/test_token_ban.py
-  - unittest/_torch/executor/test_async_transfer_manager.py
-  - unittest/_torch/executor/test_scheduler_serializable_output.py
-  - unittest/_torch/executor/test_kv_cache_estimation.py
-  - unittest/_torch/executor/test_kv_cache_budget_split.py
-  - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
-  - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
-  - unittest/_torch/modules/dwdp/test_dwdp_manager.py
-  - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
-  - unittest/_torch/modules/dwdp/test_dwdp_peer_ranges.py
+  - unittest/_torch/executor/test_resource_manager.py
+  - unittest/_torch/modules/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
+  - unittest/_torch/models/test_qwen3_next_eager_fusion.py
   - unittest/_torch/weight_sharing
-  - unittest/inputs/test_chat_template_dispatch.py
-  - unittest/inputs/test_content_format.py
-  - unittest/inputs/test_url_validation.py
-  - unittest/inputs/test_multimodal.py
   - unittest/inputs/test_multimodal_input_processor.py
-  - unittest/inputs/test_video_decode.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
-  - unittest/others/test_convert_utils.py
-  - unittest/others/test_lm_eval.py
   - unittest/others/test_lora_manager.py
-  - unittest/others/test_lora_module_count.py
-  - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
-  - unittest/disaggregated/test_disagg_openai_client.py
-  - unittest/disaggregated/test_disagg_utils.py
+  - unittest/grpc/test_grpc_optional.py
+  - unittest/grpc/smg/test_smg.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
-  - unittest/disaggregated/test_openai_disagg_server.py
-  - unittest/disaggregated/test_openai_disagg_service.py
-  - unittest/disaggregated/test_router.py
-  - unittest/disaggregated/test_remoteDictionary.py
   - unittest/disaggregated/test_agent_multi_backends.py
-  - unittest/disaggregated/test_messenger.py
-  - unittest/disaggregated/test_disagg_cluster_manager_worker.py
-  - unittest/disaggregated/test_cluster_storage.py
   - unittest/disaggregated/test_extractor.py
-  - unittest/disaggregated/test_peer.py
-  - unittest/disaggregated/test_cache_reuse_adapter.py
   - unittest/disaggregated/test_bounce.py
-  - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/test_mamba_transfer.py
   - unittest/tools
-  - unittest/usage/test_collectors.py
-  - unittest/usage/test_config.py
-  - unittest/usage/test_llmapi_config_telemetry_docs.py
-  - unittest/usage/test_opt_out.py
-  - unittest/usage/test_reporter.py
-  - unittest/usage/test_schema.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
@@ -104,6 +67,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
@@ -135,35 +99,21 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py
-  - unittest/_torch/visual_gen/test_visual_gen_params.py
-  - unittest/visual_gen/test_output.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
-  - unittest/_torch/visual_gen/test_tensor_payload.py
-  - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   # llmapi
-  - unittest/llmapi/test_llm_utils.py
-  - unittest/llmapi/test_gc_utils.py
-  - unittest/llmapi/test_reasoning_parser.py
-  - unittest/llmapi/test_serialization.py
-  - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_llm_args.py
-  - unittest/llmapi/test_kv_cache_dtype_override.py
+  - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
-  - unittest/llmapi/test_request_priority.py
   # executor
-  - unittest/executor/test_ipc.py
-  - unittest/executor/test_fatal_error_health_check.py
+  - unittest/executor/test_spec_dec_stats_pairing.py
   - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_proxy_postproc_terminate.py
   - unittest/executor/test_proxy_fast_death.py
   # trtllm-serve CPU-only
-  - unittest/llmapi/apps/test_chat_utils.py
-  - unittest/llmapi/apps/test_tool_parsers.py
-  - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_encode_batcher.py
   - unittest/llmapi/test_embedding_arch_routing.py
   # usage telemetry
@@ -194,7 +144,6 @@ l0_a10:
   # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
   - unittest/kv_cache_manager_v2_tests # 4 min
-  - unittest/dynamo
   - unittest/api_stability
   - unittest/bindings
 - condition:
@@ -214,7 +163,7 @@ l0_a10:
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
-  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
+  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen3/Qwen3-0.6B]
   - test_e2e.py::test_openai_health
   - test_e2e.py::test_trtllm_serve_example
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit

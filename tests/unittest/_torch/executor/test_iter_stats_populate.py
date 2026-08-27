@@ -41,6 +41,8 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
     _ITERATION_STATS_OPTIONAL_FIELDS,
     _ITERATION_STATS_SCALAR_FIELDS,
@@ -48,6 +50,8 @@ from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, SpecDecodingStats
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _StubRequest:
@@ -109,10 +113,17 @@ class _StubRequest:
 
 
 class _StubScheduledBatch:
-    def __init__(self, context_reqs=None, gen_reqs=None, paused_reqs=None):
+    def __init__(
+        self,
+        context_reqs=None,
+        gen_reqs=None,
+        paused_reqs=None,
+        recompute_paused_reqs=None,
+    ):
         self.context_requests = list(context_reqs or [])
         self.generation_requests = list(gen_reqs or [])
         self.paused_requests = list(paused_reqs or [])
+        self.recompute_paused_requests = list(recompute_paused_reqs or [])
 
     @property
     def num_context_requests(self):
@@ -425,10 +436,15 @@ def test_paused_decode_requests():
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
     ]
-    stats = _invoke_update_iter_stats(_StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0)
+    recompute_paused = [_StubRequest(num_tokens=700)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(paused_reqs=paused, recompute_paused_reqs=recompute_paused),
+        [],
+        num_ctx_tokens=0,
+    )
     ifb = stats.inflight_batching_stats
-    assert ifb.num_paused_requests == 2
-    assert ifb.num_paused_kv_tokens == 1100
+    assert ifb.num_paused_requests == 3
+    assert ifb.num_paused_kv_tokens == 1800
 
 
 def test_dummy_filtering_on_kv_token_fields():

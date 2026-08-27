@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_queue(max_batch_size=128):
     """Create an ExecutorRequestQueue with mocked Distributed."""
@@ -70,7 +72,7 @@ def _make_recv_task(ctx_request_id, disagg_request_id, unique_rid=123):
     return SimpleNamespace(
         _params=SimpleNamespace(ctx_request_id=ctx_request_id, disagg_request_id=disagg_request_id),
         _unique_rid=unique_rid,
-        _kv_slice=SimpleNamespace(block_ids_per_layer_groups=[], mamba_state_index=None),
+        _kv_slice=SimpleNamespace(block_ids_per_layer_groups=[]),
         _aux_slot=None,
         slice_id=0,
     )

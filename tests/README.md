@@ -123,11 +123,13 @@ In file `jenkins/L0_Test.groovy`, the variables `x86TestConfigs`, `SBSATestConfi
 
 Currently the yml files are manually maintained, which requires developer to update them when new test cases are added.
 
-### How to choose GPU type
+### How to choose whether a GPU is needed and which GPU type
 
-The CI resource of each GPU type is different. Usually you should choose the cheapest GPU that fulfills test requirements. In most cases, an integration test case should only run on one GPU type, unless it's very important or has different behaviours on different GPUs.
+While TensorRT LLM is GPU-centric, the specific feature covered by a unit test may not need to interact with a GPU on its own. For unit tests that do not intrinsically require a GPU, prefer the CPU-only stages to avoid reserving unnecessary GPU resources. The CPU-only option applies only to unit tests.
 
-The priority is A10 > A30 > L40s > A100 > H100 > B200.
+When a test requires a GPU, choose the cheapest GPU that fulfills its requirements. In most cases, an integration test case should run on only one GPU type, unless it is especially important or behaves differently on different GPUs.
+
+The priority is A10 > A30 > L40S > A100 > H100 > B200.
 
 ## 2. Add an integration test
 
@@ -140,6 +142,8 @@ Once a new integration test case is added, the yml files must be updated to cont
 ## 3. Add a unit test
 
 A unit test are used to test a standalone feature or building block, and only runs partial workflow.
+
+Mark a unit test that does not require a GPU to run with `@pytest.mark.cpu_only` or file-level `pytestmark = pytest.mark.cpu_only`. Only these tests run in the CPU-only stages. You can define CPU and GPU cases in the same test file.
 
 For legacy and case management reason, the CI doesn't run unit tests directly. It uses a bridge to map multiple unit test cases into one integration test case, and manages these bridged cases.
 The bridge is implemented in `integration/defs/test_unittests.py` and `pytest_generate_tests` function in `tests/integration/defs/conftest.py`.
@@ -161,9 +165,9 @@ pytest unittest/an_existing_file.py -m "part0 and gpu2" # run some cases in a fi
 ```
 
 2. Check existing bridge cases and make sure your cases are not covered by an existing one.
-For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not thrid_keyword"` which covers your filter.
+For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not third_keyword"` which covers your filter.
 
-3. Choose a suitable GPU and add a line of your cases. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
+3. Choose a suitable CI stage and add a line to the corresponding test list config. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
 
 ## 4. Run a CI stage locally
 

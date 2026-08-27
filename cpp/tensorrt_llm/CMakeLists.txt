@@ -181,11 +181,14 @@ set(TRTLLM_LINK_LIBS
     decoder_attention_src
     trtllm_gen_fmha
     trtllm_gen_fp8_block_scale_moe
+    trtllm_gen_fp8_block_scale_moe_routing
     trtllm_gen_gemm
     trtllm_gen_gemm_gated_act
     trtllm_gen_batched_gemm
     selective_scan_src
     mamba2_mtp_ssm_cache_src
+    kda_decode_src
+    kimi_k3_attn_res_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src

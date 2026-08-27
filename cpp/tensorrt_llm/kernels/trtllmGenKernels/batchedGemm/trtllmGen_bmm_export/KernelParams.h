@@ -89,7 +89,8 @@ bool useTmaOobOptB(BatchedGemmOptions const& options)
 template <typename BatchedGemmOptions>
 bool useTmaOobOptC(BatchedGemmOptions const& options)
 {
-    return options.mUseTmaStore && options.mUseTmaOobOpt;
+    // C multicast uses direct pointers instead of TMA store
+    return options.mUseTmaStore && !options.mUseCMultiCast && options.mUseTmaOobOpt;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -247,6 +248,15 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
     {
     case tg::SfLayout::R128c4:
     {
+        // The scaling factor tensor packs 128x4 tiles into contiguous 512B blocks.
+        // The 512B block maps to a 32x16B (32x128b) block in TMEM.
+        //
+        // Additionally, we have to meet constraints of TMA that the box dimensions are less
+        // than 256 and boxDim[0] is a multiple of 16B.
+        //
+        // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
+        // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 4,    512]
+        // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 4, 2, 256]
         auto shape = std::vector<uint64_t>{256, 2, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4)),
             static_cast<uint64_t>(ceilDiv(numTokens, 128))};
 
@@ -354,10 +364,11 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     [[maybe_unused]] void const* ptrSparsityInfoA, void const* ptrBias, int32_t const* ptrPermutedIdxToBiasRowIdx,
     void* dSfC, float const* ptrScaleC, float const* ptrScaleAct, float const* ptrScaleGate, float const* ptrClampLimit,
     float const* ptrGatedActAlpha, float const* ptrGatedActBeta, int32_t const* routeMap, float* rowMax,
-    uint32_t* rowMaxBars, int32_t const* ptrNumNonExitingCtas = nullptr,
-    int32_t const* ptrTotalNumPaddedTokens = nullptr, int32_t const* ptrCtaIdxXyToBatchIdx = nullptr,
-    int32_t const* ptrCtaIdxXyToMnLimit = nullptr, int32_t const maxNumCtas = KernelParams::MaxNumCtas,
-    uint32_t* ptrDynamicTileCounter = nullptr)
+    uint32_t* rowMaxBars, int rank, int worldSize, uint32_t* ptrMulticastCompletionBarUc,
+    uint32_t* ptrMulticastCompletionBarMc, int32_t const* permutedIdxToExpandedIdx, void const* expertWeightsPtr,
+    int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
+    int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
+    int32_t const maxNumCtas = KernelParams::MaxNumCtas, uint32_t* ptrDynamicTileCounter = nullptr)
 {
 
     static_assert(sizeof(KernelParams) <= 32 * 1024, "sizeof(KernelParams) has to be less or equal than 32KB");
@@ -598,7 +609,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         }
 
         // C is the output activation
-        if (options.mUseTmaStore)
+        // Skip TMA descriptor setup when using C multicast - direct pointers are used instead
+        if (options.mUseTmaStore && !options.mUseCMultiCast)
         {
             // Shape/stride for gmem tensor C.
             // NOTE: Output is *always* sanitized across the whole MNK range. This ensures maximum
@@ -711,7 +723,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         }
 
         // C is the output activation
-        if (options.mUseTmaStore)
+        // Skip TMA descriptor setup when using C multicast - direct pointers are used instead
+        if (options.mUseTmaStore && !options.mUseCMultiCast)
         {
             // Shape/stride for gmem tensor C.
             // NOTE: Output is *always* sanitized across the whole MNK range. This ensures maximum
@@ -732,8 +745,10 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     params.k = options.mK;
     params.numBatches = options.mNumBatches;
 
-    params.rank = 0;
-    params.tpGrpSize = 1;
+    params.rank = rank;
+    params.tpGrpSize = worldSize;
+    params.ptrMulticastCompletionBarUc = ptrMulticastCompletionBarUc;
+    params.ptrMulticastCompletionBarMc = ptrMulticastCompletionBarMc;
 
     params.ptrPartialRowMax = rowMax;
     params.ptrRowMaxCompletionBars = rowMaxBars;
@@ -745,6 +760,9 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     params.ptrPerTokenSfB = ptrPerTokenSfB;
     params.ptrBias = ptrBias;
 
+    // Set MoE finalize parameters for direct register-to-gmem store
+    params.permutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+    params.expertWeightsPtr = expertWeightsPtr;
     // Set the dynamic tile counter pointer for dynamic scheduling.
     params.ptrDynamicTileCounter = ptrDynamicTileCounter;
 
