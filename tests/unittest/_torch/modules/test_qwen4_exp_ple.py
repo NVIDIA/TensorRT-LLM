@@ -407,6 +407,24 @@ def _run_parity(dtype: torch.dtype, tol_max: float):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ple_metadata_accepts_existing_host_lengths() -> None:
+    device = torch.device("cuda")
+    metadata = PLEMetadata.build(
+        torch.arange(5, device=device),
+        torch.tensor([2, 3], dtype=torch.int32, device=device),
+        torch.arange(2, device=device),
+        is_decode=False,
+        eos_token_id=EOS_TOKEN_ID,
+        num_contexts=1,
+        host_seq_lens=[2, 3],
+    )
+
+    assert metadata.row_width == 3
+    assert metadata.context_tokens == 2
+    torch.testing.assert_close(metadata.req_indices, torch.tensor([0, 0, 1, 1, 1], device=device))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ple_parity_fp32():
     _run_parity(torch.float32, tol_max=1e-4)
 

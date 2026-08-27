@@ -423,13 +423,10 @@ class Qwen4ExpModel(DecoderModel):
 
         # ``num_seq`` (one new token per sequence on decode) is derived from the
         # device-side, static-shape ``input_ids`` on the decode path rather than
-        # copying ``attn_metadata.seq_lens`` host->device: that pageable H2D copy
-        # runs *inside* the captured model forward and would both host-sync (breaking
-        # the overlap-scheduler no-host-sync contract) and break CUDA-graph capture
-        # path. ``PLEMetadata.build`` ignores ``seq_lens`` on decode (it
-        # reconstructs the layout from ``input_ids``), so no decode information is
-        # lost. The per-sequence chunk lengths are only needed for prefill, which is
-        # never graph-captured, so the seq_lens H2D there is harmless.
+        # copying ``attn_metadata.seq_lens`` host->device. ``PLEMetadata.build``
+        # ignores ``seq_lens`` on decode (it reconstructs the layout from
+        # ``input_ids``), so no decode information is lost. Prefill reuses the
+        # device mirror already owned by attention metadata below.
         uniform_row_width = None
         if is_decode:
             input_ids = input_ids[:num_seq]
@@ -446,16 +443,31 @@ class Qwen4ExpModel(DecoderModel):
             sequence_lengths = [int(length) for length in attn_metadata.seq_lens[:num_seq]]
             semantic_tokens = sum(sequence_lengths)
             input_ids = input_ids[:semantic_tokens]
-            seq_lens = torch.tensor(sequence_lengths, device=device, dtype=torch.long)
+            # Attention metadata already staged these query lengths in pinned
+            # memory and copied them asynchronously. Reuse its device mirror:
+            # rebuilding a CUDA tensor from the Python list here introduces a
+            # pageable H2D copy and synchronizes every mixed-IFB prefill step.
+            seq_lens_cuda = getattr(attn_metadata, "seq_lens_cuda", None)
+            if seq_lens_cuda is None:
+                seq_lens = torch.tensor(sequence_lengths, device=device, dtype=torch.long)
+            else:
+                seq_lens = seq_lens_cuda[:num_seq]
 
         state_indices = None
         if (
             mamba_metadata is not None
             and getattr(mamba_metadata, "state_indices", None) is not None
         ):
-            state_indices = mamba_metadata.state_indices[:num_seq].to(
-                device=device, dtype=torch.long
-            )
+            # Mamba metadata refreshes this int64 mirror once per step for
+            # consumers that index recurrent-state pools. Reusing it avoids a
+            # redundant int32-to-int64 conversion in the PLE side path.
+            state_indices_long = getattr(mamba_metadata, "state_indices_long", None)
+            if state_indices_long is not None and state_indices_long.shape[0] >= num_seq:
+                state_indices = state_indices_long[:num_seq]
+            else:
+                state_indices = mamba_metadata.state_indices[:num_seq].to(
+                    device=device, dtype=torch.long
+                )
         if state_indices is None:
             state_indices = torch.arange(num_seq, device=device, dtype=torch.long)
 
@@ -475,6 +487,7 @@ class Qwen4ExpModel(DecoderModel):
             num_contexts=num_contexts,
             use_spec_decoding=use_spec_decoding,
             uniform_row_width=uniform_row_width,
+            host_seq_lens=sequence_lengths if not is_decode and uniform_row_width is None else None,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             is_cuda_graph=attn_metadata.is_cuda_graph,
         )
@@ -484,22 +497,32 @@ class Qwen4ExpModel(DecoderModel):
         )
 
         # Reset the slots of sequences STARTING this forward (fresh prefill, no
-        # prior recurrent state) — device-indexed, no host sync; a no-op on the
-        # decode path (num_contexts == 0). Context requests are the first
-        # ``num_contexts`` sequences; honour ``has_initial_states`` when the mamba
-        # metadata exposes it (chunked-prefill continuations keep their state),
-        # else reset every context slot (no chunked prefill here).
+        # prior recurrent state); this is a no-op on the decode path
+        # (num_contexts == 0). Context requests are the first ``num_contexts``
+        # sequences; honour ``has_initial_states`` when the mamba metadata
+        # exposes it (chunked-prefill continuations keep their state), else reset
+        # every context slot (no chunked prefill here).
         if num_contexts > 0:
             ctx_slots = state_indices[:num_contexts]
             has_init = getattr(mamba_metadata, "has_initial_states", None)
             if has_init is not None:
                 has_init = has_init[:num_contexts].to(device=device).bool()
-                fresh = ctx_slots[~has_init]
+                # Keep the update fixed-shape. Boolean-indexing ``ctx_slots``
+                # launches ``nonzero`` to determine a dynamic result size and
+                # synchronizes the host once per mixed-IFB prefill iteration.
+                conv_rows = conv_state.index_select(0, ctx_slots)
+                conv_rows.masked_fill_((~has_init).view(-1, *([1] * (conv_rows.ndim - 1))), 0)
+                conv_state.index_copy_(0, ctx_slots, conv_rows)
+
+                context_rows = ngram_context.index_select(0, ctx_slots)
+                context_rows.masked_fill_(
+                    (~has_init).view(-1, *([1] * (context_rows.ndim - 1))),
+                    self.eos_token_id,
+                )
+                ngram_context.index_copy_(0, ctx_slots, context_rows)
             else:
-                fresh = ctx_slots
-            if fresh.numel():
-                conv_state[fresh] = 0
-                ngram_context[fresh] = self.eos_token_id
+                conv_state.index_fill_(0, ctx_slots, 0)
+                ngram_context.index_fill_(0, ctx_slots, self.eos_token_id)
 
         # Surface the resolved pools on metadata so graph capture and the
         # decoder layer observe the same tensors.
