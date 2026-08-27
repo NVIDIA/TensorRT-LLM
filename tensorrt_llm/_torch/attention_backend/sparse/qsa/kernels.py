@@ -10,6 +10,14 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import get_sm_version
+
+
+def _qsa_pdl_enabled(rows: int) -> bool:
+    # PDL helps the two- and four-row speculative target graphs. Larger IFB
+    # batches already expose enough split-K parallelism to hide the merge.
+    return rows <= 4 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
+
 
 @triton.jit
 def _qsa_unscale_block_table_kernel(
@@ -1225,10 +1233,13 @@ def _qsa_paged_sparse_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     split = tl.program_id(2)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     request = tl.load(request_indices + row).to(tl.int64)
     valid_request = (request >= 0) & (request < NUM_REQUESTS)
     safe_request = tl.minimum(tl.maximum(request, 0), NUM_REQUESTS - 1)
@@ -1348,6 +1359,8 @@ def _qsa_paged_sparse_gqa_splitk_kernel(
             partial_lse_values,
             mask=head_offsets < GROUP_SIZE,
         )
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1363,9 +1376,13 @@ def _qsa_merge_splitk_kernel(
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     split_offsets = tl.arange(0, BLOCK_SPLITS)
     dim_offsets = tl.arange(0, HEAD_DIM)
     split_mask = split_offsets < NUM_SPLITS
@@ -1432,6 +1449,7 @@ def triton_qsa_paged_sparse_gqa(
         num_tiles = triton.cdiv(selected_tokens.shape[1], block_n)
         max_useful_splits = 1 << (num_tiles.bit_length() - 1)
         num_splits = min(max_useful_splits, target_splits)
+        use_pdl = num_splits > 1 and _qsa_pdl_enabled(rows)
         if num_splits == 1:
             partial_output = output
             partial_lse = output
@@ -1488,8 +1506,10 @@ def triton_qsa_paged_sparse_gqa(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             HEAD_DIM=head_dim,
+            USE_PDL=use_pdl,
             num_warps=num_warps,
             num_stages=2,
+            launch_pdl=use_pdl,
         )
         if num_splits == 1:
             return output
@@ -1505,8 +1525,10 @@ def triton_qsa_paged_sparse_gqa(
             NUM_SPLITS=num_splits,
             BLOCK_SPLITS=triton.next_power_of_2(num_splits),
             HEAD_DIM=head_dim,
+            USE_PDL=use_pdl,
             num_warps=2,
             num_stages=1,
+            launch_pdl=use_pdl,
         )
         return output
 
