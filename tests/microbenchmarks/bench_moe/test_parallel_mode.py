@@ -23,6 +23,8 @@ resolution and the search-time comm-axis collapse.
 
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
 from .mapping import (
@@ -32,7 +34,11 @@ from .mapping import (
     parallel_mode_enable_attention_dp,
     resolve_named_layout,
 )
-from .search import _comm_axis_for_parallel_mode, _default_parallel_axis_values
+from .search import (
+    _axis_values_from_args,
+    _comm_axis_for_parallel_mode,
+    _default_parallel_axis_values,
+)
 from .specs import ConfigSpec
 
 
@@ -202,3 +208,80 @@ def test_default_axis_has_no_duplicates():
     for world_size in (1, 2, 4, 6, 8, 16, 32, 64):
         values = _default_parallel_axis_values(world_size)
         assert len(values) == len(set(values))
+
+
+# --------------------------------------------------------------------------
+# Regressions: world size / config-file plumbing into the default axis.
+# --------------------------------------------------------------------------
+
+
+def _args(**kwargs) -> argparse.Namespace:
+    """Minimal Namespace for the search-axis resolution helpers."""
+    base = {
+        "search": ("parallel",),
+        "world_size": None,
+        "backend": ("TRTLLM",),
+        "parallel_mode": ("DEP",),
+        "comm_method": ("AUTO",),
+        "_cli_provided": set(),
+        "_config_search_axes": {},
+    }
+    base.update(kwargs)
+    return argparse.Namespace(**base)
+
+
+def test_external_world_size_reaches_the_default_axis():
+    """The detected world size must reach the default axis.
+
+    ``--world_size`` is optional under external mpirun; worker.main pins the
+    detected size onto args before the context is built. If that write-back is
+    lost, the axis silently resolves against world_size=1 and drops hybrids.
+    """
+    resolved = _axis_values_from_args(
+        _args(world_size=8),
+        cli_dest="parallel_mode",
+        cli_flag_name="--parallel_mode",
+        config_key="parallel_mode",
+        full_set=_default_parallel_axis_values(8),
+    )
+    assert resolved == _default_parallel_axis_values(8)
+    assert "DTP2EP4" in resolved and "DTP4EP2" in resolved
+
+
+def test_world_size_none_would_lose_the_hybrids():
+    """Guards the failure mode above: world_size=1 legitimately has no split."""
+    assert _default_parallel_axis_values(1) == ("DEP", "TEP", "DTP", "TTP")
+
+
+@pytest.mark.parametrize("modes", [("CUSTOM",), ("DEP",), ("DTP2EP4",)])
+def test_single_value_config_axis_is_not_replaced_by_the_default_set(modes):
+    """A single-value config axis must survive axis resolution.
+
+    A single-value ``search.parallel_mode`` in the JSON config is an explicit
+    search set, not a scalar default, so it must not fall through to the
+    world-size default expansion.
+    """
+    resolved = _axis_values_from_args(
+        _args(world_size=8, _config_search_axes={"parallel_mode": modes}),
+        cli_dest="parallel_mode",
+        cli_flag_name="--parallel_mode",
+        config_key="parallel_mode",
+        full_set=_default_parallel_axis_values(8),
+    )
+    assert resolved == modes
+
+
+def test_cli_parallel_mode_still_wins_over_config_axis():
+    resolved = _axis_values_from_args(
+        _args(
+            world_size=8,
+            parallel_mode=("TEP", "DEP"),
+            _cli_provided={"parallel_mode"},
+            _config_search_axes={"parallel_mode": ("CUSTOM",)},
+        ),
+        cli_dest="parallel_mode",
+        cli_flag_name="--parallel_mode",
+        config_key="parallel_mode",
+        full_set=_default_parallel_axis_values(8),
+    )
+    assert resolved == ("TEP", "DEP")

@@ -791,10 +791,14 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
     def normalize_search_axis(key: str, value: Any) -> Optional[Tuple[str, ...]]:
         """Project a config-file search-axis entry onto ``args`` (list form).
 
-        Returns the tuple of canonical values if it should be recorded as a
-        sweep axis in ``_config_search_axes`` (multi-value or backend=ALL).
-        Returns ``None`` when the value was instead written to the matching
-        ``args.<key>`` scalar-list flag.
+        Returns the tuple of canonical values to record as a sweep axis in
+        ``_config_search_axes``, or ``None`` when the entry carries no explicit
+        axis of its own. Living in the ``search`` block *is* the explicit
+        request, so a single-value entry is recorded too -- otherwise it would
+        fall through to the world-size default set and be silently replaced
+        (and, combined with explicit --moe_ep_size/--moe_tp_size, rejected as a
+        sweep). ``backend=ALL`` is the one entry that genuinely means "no
+        explicit set, expand to everything".
         """
         if key in provided:
             return None
@@ -808,9 +812,9 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
             set_if_unset("backend", ("ALL",))
             return None
         if len(values) == 1:
-            # Single-value config entry behaves like a CLI scalar default.
+            # Still seed the matching scalar flag (base-config resolution reads
+            # it), but record the axis as well.
             set_if_unset(key, values)
-            return None
         return values
 
     if search_cfg:
