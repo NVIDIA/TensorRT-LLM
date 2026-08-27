@@ -32,6 +32,9 @@ if ENABLE_MULTI_DEVICE:
 T = TypeVar("T")
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
+_FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
+_FLASHINFER_WORKSPACE_FROM_LAUNCHER_ENV = (
+    "TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER")
 _FLASHINFER_WORKER_BOOTSTRAP = """
 import fcntl
 import os
@@ -544,10 +547,21 @@ class MpiPoolSession(MpiSession):
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
                 "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
+        workspace_from_launcher = (
+            env.get(_FLASHINFER_WORKSPACE_FROM_LAUNCHER_ENV) == "1")
         env.update(self._env_overrides)
-        isolate_workspace = (self.n_workers > 1 and env.get(
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
-                             and "FLASHINFER_WORKSPACE_BASE" not in env)
+        explicit_workspace_override = (_FLASHINFER_WORKSPACE_ENV
+                                       in self._env_overrides)
+        isolate_workspace = (
+            self.n_workers > 1
+            and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            and (_FLASHINFER_WORKSPACE_ENV not in env or
+                 (workspace_from_launcher and not explicit_workspace_override)))
+        if isolate_workspace:
+            env.pop(_FLASHINFER_WORKSPACE_ENV, None)
+        elif explicit_workspace_override:
+            # The override is user-owned, including in any further nested pool.
+            env.pop(_FLASHINFER_WORKSPACE_FROM_LAUNCHER_ENV, None)
         python_args = ([
             "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
         ] if isolate_workspace else None)

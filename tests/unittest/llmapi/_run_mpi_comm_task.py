@@ -20,7 +20,8 @@ from typing import Literal
 import click
 
 from tensorrt_llm.executor.utils import get_spawn_proxy_process_ipc_hmac_key_env
-from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
+from tensorrt_llm.llmapi.mpi_session import (MpiPoolSession,
+                                             RemoteMpiCommSessionClient)
 from tensorrt_llm.llmapi.utils import print_colored
 
 
@@ -32,12 +33,15 @@ def get_flashinfer_workspace() -> tuple[str | None, str | None]:
 
 @click.command()
 @click.option("--task_type",
-              type=click.Choice(
-                  ["submit", "submit_sync", "flashinfer_workspace"]),
+              type=click.Choice([
+                  "submit", "submit_sync", "flashinfer_workspace",
+                  "flashinfer_temporary_cleanup"
+              ]),
               default="submit")
 def main(
-    task_type: Literal["submit", "submit_sync",
-                       "flashinfer_workspace"]) -> None:
+    task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
+                       "flashinfer_temporary_cleanup"]
+) -> None:
     """Run the requested remote MPI session test task."""
     tasks = [0]
     assert os.environ[
@@ -48,7 +52,7 @@ def main(
     for task in tasks:
         if task_type == "submit":
             client.submit(print_colored, f"{task}\n", "green")
-        elif task_type == "submit_sync":
+        elif task_type in ("submit_sync", "flashinfer_temporary_cleanup"):
             res = client.submit_sync(print_colored, f"{task}\n", "green")
             print(res)
         elif task_type == "flashinfer_workspace":
@@ -65,6 +69,22 @@ def main(
             assert cubin_dirs == {
                 str(Path.home() / ".cache" / "flashinfer" / "cubins")
             }
+
+            nested_session = MpiPoolSession(n_workers=2)
+            try:
+                nested_worker_envs = nested_session.submit_sync(
+                    get_flashinfer_workspace)
+            finally:
+                nested_session.shutdown()
+            nested_workspaces = {
+                workspace
+                for workspace, _ in nested_worker_envs
+            }
+            assert None not in nested_workspaces
+            assert len(nested_workspaces) == 2
+            assert all(
+                Path(workspace).parent == workspace_root
+                for workspace in nested_workspaces)
 
 
 if __name__ == "__main__":

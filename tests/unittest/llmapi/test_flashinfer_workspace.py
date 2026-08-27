@@ -28,6 +28,7 @@ from tensorrt_llm.llmapi import mpi_session
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _FLASHINFER_CUBIN_ENV = "FLASHINFER_CUBIN_DIR"
 _FLASHINFER_ISOLATION_ENV = "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"
+_FLASHINFER_FROM_LAUNCHER_ENV = "TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER"
 pytestmark = pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 
 
@@ -206,6 +207,7 @@ def test_mpi_pool_configures_worker_bootstrap(
         _FLASHINFER_WORKSPACE_ENV,
         _FLASHINFER_CUBIN_ENV,
         _FLASHINFER_ISOLATION_ENV,
+        _FLASHINFER_FROM_LAUNCHER_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
     captured: dict[str, object] = {}
@@ -227,6 +229,54 @@ def test_mpi_pool_configures_worker_bootstrap(
     env = captured["env"]
     assert isinstance(env, dict)
     assert all(env[key] == value for key, value in env_overrides.items())
+
+
+@pytest.mark.parametrize(
+    "env_overrides, expected_workspace, expected_marker, expect_bootstrap",
+    [
+        ({}, None, "1", True),
+        ({_FLASHINFER_WORKSPACE_ENV: "/explicit"}, "/explicit", None, False),
+    ],
+)
+def test_mpi_pool_distinguishes_launcher_and_explicit_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+    env_overrides: dict[str, str],
+    expected_workspace: str | None,
+    expected_marker: str | None,
+    expect_bootstrap: bool,
+) -> None:
+    monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, "/launcher-assigned")
+    monkeypatch.setenv(_FLASHINFER_FROM_LAUNCHER_ENV, "1")
+    monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
+    captured: dict[str, object] = {}
+
+    class FakeMpiPoolExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
+    session = SimpleNamespace(
+        n_workers=2,
+        _env_overrides=env_overrides,
+        mpi_pool=None,
+    )
+
+    mpi_session.MpiPoolSession._start_mpi_pool(session)
+
+    expected_python_args = (
+        [
+            "-c",
+            mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+            mpi_session._FLASHINFER_WORKSPACE_ROOT,
+        ]
+        if expect_bootstrap
+        else None
+    )
+    assert captured["python_args"] == expected_python_args
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env.get(_FLASHINFER_WORKSPACE_ENV) == expected_workspace
+    assert env.get(_FLASHINFER_FROM_LAUNCHER_ENV) == expected_marker
 
 
 def test_mpi_pool_shares_cubins_but_isolates_workspaces(

@@ -73,10 +73,13 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("task_type",
-                         ["submit", "submit_sync", "flashinfer_workspace"])
+@pytest.mark.parametrize("task_type", [
+    "submit", "submit_sync", "flashinfer_workspace",
+    "flashinfer_temporary_cleanup"
+])
 def test_remote_mpi_session(
-    task_type: Literal["submit", "submit_sync", "flashinfer_workspace"],
+    task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
+                       "flashinfer_temporary_cleanup"],
     tmp_path: Path,
 ) -> None:
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
@@ -91,6 +94,11 @@ def test_remote_mpi_session(
         env.pop("FLASHINFER_WORKSPACE_BASE", None)
         env.pop("FLASHINFER_CUBIN_DIR", None)
         env.pop("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", None)
+    elif task_type == "flashinfer_temporary_cleanup":
+        invalid_home = tmp_path / "home-file"
+        invalid_home.touch()
+        env["HOME"] = str(invalid_home)
+        env["TMPDIR"] = str(tmp_path)
 
     with Popen(command,
                env=env,
@@ -126,6 +134,9 @@ def test_remote_mpi_session(
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
+
+    if task_type == "flashinfer_temporary_cleanup":
+        assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
 
 
 def task1():

@@ -9,6 +9,7 @@ native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 
 flashinfer_workspace_lock_held=0
+flashinfer_temporary_workspace=
 
 log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
 log_stderr "mpi_rank: $mpi_rank"
@@ -36,6 +37,21 @@ function set_shared_flashinfer_cubin_dir {
     fi
 }
 
+function cleanup_flashinfer_temporary_workspace {
+    local exit_status=$?
+
+    if [ -n "$flashinfer_temporary_workspace" ]; then
+        if ! rm -rf -- "$flashinfer_temporary_workspace"; then
+            log_stderr "Failed to remove temporary FlashInfer JIT workspace: $flashinfer_temporary_workspace"
+        fi
+    fi
+
+    trap - EXIT
+    exit "$exit_status"
+}
+
+trap cleanup_flashinfer_temporary_workspace EXIT
+
 function use_unique_flashinfer_workspace {
     local temporary_root=${TMPDIR:-/tmp}
     local workspace
@@ -45,7 +61,9 @@ function use_unique_flashinfer_workspace {
         return 1
     fi
 
+    flashinfer_temporary_workspace="$workspace"
     export FLASHINFER_WORKSPACE_BASE="$workspace"
+    export TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER=1
     set_shared_flashinfer_cubin_dir
     log_stderr "Using temporary FlashInfer JIT workspace after persistent workspace isolation failed: $FLASHINFER_WORKSPACE_BASE"
 }
@@ -111,6 +129,7 @@ function configure_flashinfer_workspace {
         if try_lock_flashinfer_workspace; then
             flashinfer_workspace_lock_held=1
             export FLASHINFER_WORKSPACE_BASE="$workspace"
+            export TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER=1
             set_shared_flashinfer_cubin_dir
             log_stderr "FlashInfer JIT workspace: $FLASHINFER_WORKSPACE_BASE"
             return
