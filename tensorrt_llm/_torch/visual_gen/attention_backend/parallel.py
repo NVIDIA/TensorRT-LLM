@@ -211,6 +211,8 @@ class UlyssesAttention(AttentionBackend):
             return False
         if not q.is_cuda or q.dtype != torch.bfloat16 or q.shape[-1] % 8 != 0:
             return False
+        if q.shape[2] % self.world_size != 0:
+            return False
         # ulysses_packed_qkv_post_unscatter launches one block of
         # H_local * (D / 8) threads.
         if (q.shape[2] // self.world_size) * (q.shape[-1] // 8) > 1024:
