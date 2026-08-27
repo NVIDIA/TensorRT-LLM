@@ -140,6 +140,7 @@ Still on old path (standalone, with embedded communication):
 | `impl_identity.py` | `MoEImplId` / `MoEImplDescriptor` / registry — the stable one-id-per-leaf-class mechanism used after an implementation migrates |
 | `interface.py` | Complete-layer base `MoE` and enums (`MoEWeightLoadingMode`, `MoESchedulerKind`) |
 | `impl_base.py` | Execution-unit base `MoEImplBase` — weights + `run_moe`, no `forward`; plus `apply_moe_impl_construction_state()`, which every execution unit must call |
+| `activation.py` | Activation vocabulary — the `MoEActivation` carrier a model builds, the `MoEActivationSupport` a backend declares, and `install_activation_params` / `materialize_activation_params`, the only place a semantic constant becomes a kernel register |
 | `impl_blocks.py` | The blocks `MoE` and `MoEImplBase` share — `MoEExecutionContractMixin` (scheduler-facing declarations, `forward_fake`) and `MoEWeightOwnerMixin` (`create_weights` / `load_weights` / `_check_configs`) |
 | `quantization.py` | Quantization method implementations (`FusedMoEMethod` subclasses: weight creation, loading, quant/dequant ops per quant mode) |
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
@@ -157,7 +158,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (it heads that family's candidate list, so it wins on SM120/121 when flashinfer is present and yields to `CuteDslFusedMoE` otherwise); single-GPU-shaped topology only — it rejects both `ep_size > 1` and attention-DP, because it has no dispatch/combine kernel and has never been exercised behind a DP allgather | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `MegaMoEDeepGemm` | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
-| `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103 | NVFP4 via ported CuteDSL `Sm100MegaMoEKernel` fused dispatch+FC1+act+FC2+combine kernel; requires CUDA 13 Cutlass DSL runtime (PR #14354) and NVSHMEM provider (hard gate); threads per-expert `fc31_alpha`/`fc2_alpha`/`fc1_norm_const` through the kernel ABI and supports SwiGLU clamp via `swiglu_limit`; default deepgemm graph (topk score folded before fc1-out quant, host `combine_output.sum(dim=1)`) | `FUSED_COMM` |
+| `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103 | NVFP4 via ported CuteDSL `Sm100MegaMoEKernel` fused dispatch+FC1+act+FC2+combine kernel; requires CUDA 13 Cutlass DSL runtime (PR #14354) and NVSHMEM provider (hard gate); threads per-expert `fc31_alpha`/`fc2_alpha`/`fc1_norm_const` through the kernel ABI and takes the SwiGLU clamp as a `UNIFORM_SCALAR` (`gate_up_clamp=self.act_clamp`); default deepgemm graph (topk score folded before fc1-out quant, host `combine_output.sum(dim=1)`) | `FUSED_COMM` |
 | `fused_moe_marlin.py` | `MarlinFusedMoE` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); supports attention-DP + EP via external comm (scheduler precomputes routing; dispatch payload is plain BF16, no activation scales); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass in `resolve_moe_impl`, recorded in the layer's `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
 | `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
 | `fused_moe_vanilla.py` | `VanillaMoE` | All devices | Reference / debugging only | (legacy path) |
@@ -367,12 +368,79 @@ again.
 
 ### Activation Support
 
-The matrix above is quantization only; activation style is a separate axis. The
-gpt-oss SwiGLU package (per-expert bias plus `swiglu_alpha` / `swiglu_beta` /
-`swiglu_limit`, surfaced as `MoEProblem.swiglu_gptoss_style`) is rejected by
-every specialized backend — `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
-`DeepGemmFusedMoE`, `DenseGEMMFusedMoE`, `MarlinFusedMoE` — while
-`TRTLLMGenFusedMoE` accepts only the algorithms in its `_GPTOSS_SUPPORTED_ALGOS`.
+Activation is **declared, never inspected**: no factory or selection code asks
+what class a backend is in order to decide whether it can run a checkpoint's
+activation. Three types in `activation.py` carry that instead.
+
+| Layer | Type | Written by |
+|-------|------|------------|
+| Carrier | `MoEActivation` = `SwigluActivation` \| `SwigluBiasActivation` \| `SiTuActivation` \| `SimpleActivation` | The **model**, passed as `create_moe(activation=...)`; the default `DEFAULT_MOE_ACTIVATION` is plain SwiGLU. One frozen dataclass per kind, so a kind and its constants cannot disagree, and a constant the kind does not have cannot be written down at all |
+| Declaration | `MoEActivationSupport` — `kinds`, plus an `ActivationParamShape` for `alpha_beta` and one for `limit` | The **backend**, as an `activation_support` class attribute. Every backend declares one; `resolve_activation_support` raises if a module does not |
+| Adapter | `install_activation_params` → `materialize_activation_params` | Not the backend: the `apply_moe_impl_construction_state()` every execution unit already calls installs the slots, and `ConfigurableMoE` re-installs after the EPLB sync and inside `create_weights`. A complete layer that owns kernels directly (`TritonFusedMoE`, `VanillaMoE`) calls it itself — `MoE.__init__` deliberately does not, because a wrapper's declaration is the backend's |
+
+The carrier names constants **semantically**, per kind; only the declaration and
+the adapter speak the ABI. `SwigluActivation` has just `clamp`;
+`SwigluBiasActivation` has `gate_sigmoid_scale` / `linear_offset` / `clamp`;
+`SiTuActivation` has `gate_softcap` / `linear_softcap` and no clamp at all;
+`SimpleActivation(kind)` covers the kinds that take no constants. `constants()`
+is the single seam where those become the functor's `alpha` / `beta` / `limit`
+registers — and it has to be a seam, because the registers are borrowed for
+unrelated jobs: `SwigluBias` reads `alpha` as a scale inside the sigmoid and
+`beta` as an additive offset (neutral `0.0`), while `SiTu` reads both as tanh
+soft-cap magnitudes the kernel divides by, so they must be positive (neutral
+`1.0`). A single nullable `beta` has no coherent default without first finding
+the kind, which is exactly the lookup this split removes.
+
+`kinds` is what the kernels **execute**, not what the gate tolerates — several
+backends quietly narrow an accepted kind to SwiGLU or SiLU, and those kinds must
+stay out of the declaration.
+
+The adapter assigns exactly three slots — `act_alpha`, `act_beta`, `act_clamp` —
+and those are the only names a forward path or a quantization method reads. The
+op schemas keep their historical spelling, so a backend passes
+`torch.ops.trtllm.fused_moe(swiglu_alpha=self.act_alpha, ...)`; only the Python
+plumbing was renamed. The slots' *types* come from the backend's declaration,
+never from the checkpoint:
+
+- `PER_EXPERT_TENSOR` → `float32[expert_size_per_partition]`. A scalar is
+  broadcast; a caller tensor of the right length is cloned, because
+  `quantization.py` divides these buffers in place by the FC31 scale.
+- `UNIFORM_SCALAR` → one `float`. A per-expert tensor whose values are not
+  *exactly* equal is rejected rather than averaged: the kernel bakes one value,
+  so a tolerance here would discard the experts that differ instead of
+  approximating them.
+- `UNSUPPORTED` → the candidate is declined during resolution
+  (`MoERejectReason.ACTIVATION_UNSUPPORTED`) whenever the layer's activation
+  fills that register, so a backend that can serve it is still reachable.
+
+Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
+`CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the
+clamp functor. It is substituted *before* coercion, so a `PER_EXPERT_TENSOR`
+backend gets it broadcast like any other scalar, and `MoEActivationSupport`
+rejects it outright next to `limit=UNSUPPORTED`.
+
+`TRTLLMGenFusedMoE` is the one instance-level exception: its clamp is a
+per-expert tensor for the FP4 fused-activation cubins but a by-value `double`
+for the FP8 block-scale kernel, which is not a property of the class, so it
+defines `resolve_activation_support` and narrows the shape per instance from
+`quant_config`. That is also why `ConfigurableMoE.create_weights` re-installs
+the slots: `apply_layerwise_quant_config` can move one layer onto that path
+after `__init__` has already run.
+
+Selection keeps both halves of the picture in the tuning key —
+`MoEProblem.activation` (the kind) and `MoEProblem.activation_constants` (which
+registers the carrier actually fills) — because the kind alone does not separate
+a clamped layer from an unclamped one, and those compile to different kernels.
+
+Quantization support (the matrix above) is a separate axis, and a backend can
+execute a kind while still rejecting the quant algorithm it arrives with. The
+gpt-oss SwiGLU package — per-expert bias plus a filled `alpha` / `beta` /
+`limit` triple, summarized for selection as `MoEProblem.swiglu_gptoss_style` —
+is declined by every specialized backend (`CuteDslFusedMoE`,
+`CuteDslB12xFusedMoE`, `DeepGemmFusedMoE`, `DenseGEMMFusedMoE`,
+`MarlinFusedMoE`) for the plain reason that none of them lists `SwigluBias` in
+`kinds`, while `TRTLLMGenFusedMoE` executes it and then accepts only the
+algorithms in its `_GPTOSS_SUPPORTED_ALGOS`.
 
 Cutlass gates gpt-oss / MiniMax SwiGLU on unquantized, MXFP8, NVFP4, and the
 MXFP4 family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `MXFP8`,
@@ -382,7 +450,8 @@ is not the constraint — `torch.ops.trtllm.fused_moe` takes `swiglu_alpha` /
 NVFP4 (`CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1>`), and TMA-WS GEMM1
 applies `SwigluBiasAdaptor` in `doActivation`. NVFP4 is eligible only when
 there is no expert bias (`MoEProblem.bias is not True`): MiniMax-M3 NVFP4
-passes `ActivationType.SwigluBias` + alpha/beta/limit with `bias=False`.
+builds a `SwigluBiasActivation` (`gate_sigmoid_scale` / `linear_offset` /
+`clamp`) with `bias=False`.
 gpt-oss 1-D bias still goes through `NVFP4CutlassFusedMoEMethod`'s 2-D
 weight pad and is rejected at selection. Unquantized and the MXFP4 family
 can load that 1-D bias. W8A16 / W4A8_AWQ stay rejected because they inherit
@@ -427,7 +496,7 @@ When adding new components, use these reference implementations:
 
 | Task | Reference | Key methods to implement |
 |------|-----------|--------------------------|
-| New `EXTERNAL_COMM` Backend | `fused_moe_cutlass.py` (`CutlassFusedMoE`) | Declare `MoEImplBase`; implement `capabilities`, `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`; call `apply_moe_impl_construction_state()` in `__init__` (`create_weights` / `load_weights` come from `MoEWeightOwnerMixin` — override only if allocation needs more); then add the class to `moe_resolution.IMPL_PRIORITY` and `BACKEND_FAMILY`, and add a branch in `create_moe_backend`. Add a fixed `descriptor.identity` only for a one-implementation leaf class |
+| New `EXTERNAL_COMM` Backend | `fused_moe_cutlass.py` (`CutlassFusedMoE`) | Declare `MoEImplBase`; implement `capabilities`, `activation_support`, `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`; call `apply_moe_impl_construction_state()` in `__init__` (`create_weights` / `load_weights` come from `MoEWeightOwnerMixin` — override only if allocation needs more); then add the class to `moe_resolution.IMPL_PRIORITY` and `BACKEND_FAMILY`, and add a branch in `create_moe_backend`. Add a fixed `descriptor.identity` only for a one-implementation leaf class |
 | New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`MegaMoEDeepGemm`), `mega_moe/mega_moe_cute_dsl.py` (`MegaMoECuteDsl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `MegaMoECuteDsl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel import via `cute_dsl_kernels/mega_moe_nvfp4/import_kernel()`, and `quantize_input` that short-circuits zero-token input. |
 | New Quantization Method | `quantization.py` → `FP8QDQFusedMoEMethod` | Subclass `FusedMoEMethod`, implement quant/dequant ops |
 | New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine` |
@@ -449,6 +518,7 @@ Five backends declare `MoEImplBase` directly — `CutlassFusedMoE`, `TRTLLMGenFu
 - **Do NOT add new tests to `test_fused_moe.py` or `test_moe.py`** — Use `test_moe_backend.py` and `test_moe_module.py`
 - **Do NOT skip `can_implement()` checks** — Every backend must declare what it supports; an unsupported combination returns `MoEEligibility.no(MoERejectReason.<CODE>, detail)`, never a bare `False` and never a free-form string a test would have to pattern-match
 - **Do NOT probe the machine inside `can_implement()`** — No `get_sm_version()`, no `import` as a presence test, no `os.environ`. Read `d.env`; add the probe to `impl_environment.py` if it does not exist yet
+- **Do NOT gate an activation on a class name** — No `isinstance`, no `moe_cls in [...]`, no ad-hoc `swiglu_gptoss_style` branch in a factory. A backend states what its kernels execute in `activation_support`; `_reject_unsupported_activation` reads that one declaration for every candidate, and `materialize_activation_params` enforces it again at construction. A per-class check re-creates the `assert moe_cls in [...]` this replaced, in a place the backend's own author will not find
 - **Do NOT add a second selection entry point** — `resolve_moe_impl` is the only one. A helper that picks a class on the side is how `get_moe_cls` and the old `resolve_moe_cls` drifted apart in the first place
 - **Do NOT substitute a backend without recording it** — A degradation must be visible in the `MoEResolutionReport`, not only in a log line
 - **Do NOT pick `scheduler_kind` opportunistically** — Use `EXTERNAL_COMM` (default) unless your backend's fused kernel genuinely owns cross-rank exchange via SymmBuffer / equivalent in-kernel collective; `FUSED_COMM` brings hard invariants (no host comm, lockstep launches, no multi-stream overlap)

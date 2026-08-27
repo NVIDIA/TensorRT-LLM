@@ -5247,7 +5247,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         self._finalize_shared_expert_alphas(module)
 
         # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
-        # output domain (i.e. divided by fc31_alpha / fc2_alpha).
+        # output domain (i.e. divided by fc31_alpha / fc2_alpha). The ``act_*``
+        # slots are per-expert tensors on every path this method class serves.
         #
         # The bias division is gated on module.bias to stay consistent with
         # _shuffle_all_experts() below. Hoisting this block into the base method
@@ -5258,10 +5259,10 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         if module.bias:
             module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
             module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
-        if getattr(module, 'swiglu_beta', None) is not None:
-            module.swiglu_beta.data.div_((module.fc31_alpha.data))
-        if getattr(module, 'swiglu_limit', None) is not None:
-            module.swiglu_limit.data.div_((module.fc31_alpha.data))
+        if getattr(module, 'act_beta', None) is not None:
+            module.act_beta.data.div_((module.fc31_alpha.data))
+        if getattr(module, 'act_clamp', None) is not None:
+            module.act_clamp.data.div_((module.fc31_alpha.data))
 
     def _shuffle_shared_expert_tensors(self,
                                        module: torch.nn.Module,

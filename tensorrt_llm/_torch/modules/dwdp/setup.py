@@ -632,6 +632,17 @@ def fixup_moe_backends(
             target.initial_local_expert_ids = list(range(num_experts_total))
             target.initial_global_assignments = list(range(num_experts_total))
 
+        # ``expert_size_per_partition`` just changed, and it sizes every
+        # PER_EXPERT_TENSOR activation constant. This function is the layout's
+        # last writer, so re-materialize them here. Backend only: the wrapper
+        # declares no ``activation_support`` of its own. Imported locally because
+        # ``fused_moe`` reads the DWDP manager, so a module-scope import here
+        # would close that cycle.
+        from ..fused_moe.activation import install_activation_params
+
+        if getattr(experts_module, "activation", None) is not None:
+            install_activation_params(experts_module)
+
         logger.debug(
             f"[DWDP Setup] Layer {layer_idx}: patched "
             f"{'ConfigurableMoE + ' if len(targets) > 1 else ''}backend "
