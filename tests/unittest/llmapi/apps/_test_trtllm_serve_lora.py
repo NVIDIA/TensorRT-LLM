@@ -45,6 +45,7 @@ def temp_extra_llm_api_options_file(lora_adapter_path: str):
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
         extra_llm_api_options_dict = {
+            "max_batch_size": 8,
             "lora_config": {
                 "lora_dir": [lora_adapter_path],
                 "lora_target_modules": ["attn_dense"],

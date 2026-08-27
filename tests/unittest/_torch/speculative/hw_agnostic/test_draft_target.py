@@ -30,14 +30,14 @@ from utils.util import similar
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"], [True, "TRTLLM"]])
 @pytest.mark.high_cuda_memory
-def test_qwen3_5_draft_target(use_cuda_graph: bool, attn_backend: str):
+def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 30:
         pytest.skip("Not enough memory to load target and draft models")
 
     models_path = llm_models_root()
-    draft_model_dir = f"{models_path}/Qwen3.5-0.8B"
-    target_model_dir = f"{models_path}/Qwen3.5-4B"
+    draft_model_dir = f"{models_path}/Qwen3/Qwen3-0.6B"
+    target_model_dir = f"{models_path}/Qwen3/Qwen3-8B"
 
     max_batch_size = 2
     max_draft_len = 4
@@ -82,7 +82,7 @@ def test_qwen3_5_draft_target(use_cuda_graph: bool, attn_backend: str):
 
 
 @pytest.mark.high_cuda_memory
-def test_qwen3_5_draft_target_rejection():
+def test_qwen3_draft_target_rejection():
     """DraftTarget one-model with rejection sampling on: the rejection path
     (draft-prob capture -> fail-closed guard -> rejection acceptance) runs
     end-to-end with non-greedy sampling and produces coherent output."""
@@ -91,8 +91,8 @@ def test_qwen3_5_draft_target_rejection():
         pytest.skip("Not enough memory to load target and draft models")
 
     models_path = llm_models_root()
-    target_model_dir = f"{models_path}/Qwen3.5-4B"
-    draft_model_dir = f"{models_path}/Qwen3.5-0.8B"
+    target_model_dir = f"{models_path}/Qwen3/Qwen3-8B"
+    draft_model_dir = f"{models_path}/Qwen3/Qwen3-0.6B"
 
     spec_config = DraftTargetDecodingConfig(
         max_draft_len=4,

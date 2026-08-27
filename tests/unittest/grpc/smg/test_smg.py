@@ -665,6 +665,7 @@ def grpc_service():
     model_path = get_model_path(default_model_name)
     llm = LLM(
         model=model_path,
+        max_batch_size=8,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
     tokenizer = llm.tokenizer

@@ -55,8 +55,8 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         pytest.skip(f"Not enough memory (need {memory_required}GB, have {total_mem_gb:.1f}GB)")
 
     models_path = llm_models_root()
-    target_model = f"{models_path}/Qwen3.5-4B"
-    draft_model = f"{models_path}/Qwen3.5-0.8B"
+    target_model = f"{models_path}/Qwen3/Qwen3-8B"
+    draft_model = f"{models_path}/Qwen3/Qwen3-0.6B"
 
     max_batch_size = 8
     max_draft_len = max(schedule.values())  # Use max from schedule
@@ -179,7 +179,7 @@ def test_draft_len_schedule_functionality(
     )
 
     llm_common_config = dict(
-        model=llm_models_root() / "Qwen3.5-4B",
+        model=llm_models_root() / "Qwen3" / "Qwen3-8B",
         backend="pytorch",
         attn_backend="TRTLLM",
         disable_overlap_scheduler=True,
@@ -197,7 +197,7 @@ def test_draft_len_schedule_functionality(
     else:
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=5,
-            speculative_model=str(llm_models_root() / "Qwen3.5-0.8B"),
+            speculative_model=str(llm_models_root() / "Qwen3" / "Qwen3-0.6B"),
             draft_len_schedule=draft_schedule,
         )
     prompts = ["The capital of France is" for i in range(7)]
