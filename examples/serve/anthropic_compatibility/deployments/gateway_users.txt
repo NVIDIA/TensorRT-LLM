@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # Who may use the gateway. One username per line; blank lines and everything
 # after a '#' are ignored. The gateway rereads this file when it changes, so
 # adding somebody does not need a restart.
@@ -8,11 +11,13 @@
 # who they say. Fine among colleagues on an internal network; do not treat the
 # log as an audit record, and do not expose the gateway beyond that network.
 #
-# The entries below are placeholders. Replace them with the usernames of the
-# people who should reach your deployment; an unedited copy of this file grants
-# nothing useful.
-your-username
-teammate-username
+# The examples below are commented out on purpose, so an unedited copy of this
+# file admits nobody. Uncomment and replace them with the usernames of the
+# people who should reach your deployment. Leaving a literal placeholder active
+# would be a live credential: the username IS the key, and "your-username" is
+# the first thing an unwelcome caller would try.
+# your-username
+# teammate-username
 
 # Uncomment to let clients that send no key at all through. They are all logged
 # under this one shared identity, so the access log stops naming anybody.

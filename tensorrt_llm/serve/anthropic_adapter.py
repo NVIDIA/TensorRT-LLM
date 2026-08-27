@@ -101,13 +101,12 @@ def anthropic_error_response(
 # instruction for the model, so forwarding it just spends tokens on every turn
 # and pollutes the system prompt.
 #
-# Matched by SHAPE rather than by an inventory of known fields: literal marker,
-# then any number of `key=value;` pairs in any order. An earlier implementation
-# elsewhere pinned the exact field list (requiring `cch=<5 hex>` and allowing
-# only cc_entrypoint=cli|sdk-cli); the client then added `cc_is_subagent` and a
-# `sdk-py` entrypoint, and the pattern silently matched nothing at all. Shape
-# survives that kind of drift, and `sdk-py` is what the Claude Agent SDK sends,
-# which is the path our own agent workloads use.
+# Matched by shape, not by an inventory of known fields: a literal marker,
+# then any number of `key=value;` pairs in any order. The client's field list
+# drifts (`cc_is_subagent`, and the `sdk-py` entrypoint the Claude Agent SDK
+# sends), and a pattern pinned to a fixed inventory stops matching as soon as
+# it does -- silently, leaving the telemetry in every prompt with nothing to
+# indicate the strip has become a no-op.
 _ANTHROPIC_BILLING_SYSTEM_BLOCK = re.compile(
     r"x-anthropic-billing-header:\s*"
     r"(?:[A-Za-z_][\w.-]*=[^;]*;\s*)+"
@@ -260,7 +259,7 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                     "redacted_thinking history is not supported by this server"
                 )
             else:
-                logger.warning("Unsupported Anthropic content block %r skipped", block_type)
+                logger.warning(f"Unsupported Anthropic content block {block_type!r} skipped")
 
         if message.role == "assistant" and tool_calls:
             text_content = "".join(p["text"] for p in parts if p.get("type") == "text")
@@ -359,9 +358,8 @@ def _convert_tool_choice(
         # without running a tool parser, so the call arrives with an empty
         # arguments string. Converting that to a tool_use block would mean
         # inventing an input the model never produced - a call the client would
-        # execute with missing arguments. Declining is the honest answer, and it
-        # keeps the failure at request time instead of surfacing as a 500 from
-        # the response converter.
+        # execute with missing arguments. Declining keeps the failure at request
+        # time instead of surfacing as a 500 from the response converter.
         raise AnthropicRequestError(
             "Anthropic tool_choice type 'tool' is not supported because the "
             "chat pipeline emits a forced call without parsed arguments; use "
@@ -416,10 +414,8 @@ def _thinking_retention_kwargs(
         if keep == "all":
             return dict(_KEEP_ALL_THINKING_KWARGS)
         logger.warning(
-            "Unsupported %r retention policy %r; falling back to the chat "
-            "template default (earlier-turn reasoning is pruned).",
-            edit_type,
-            keep,
+            f"Unsupported {edit_type!r} retention policy {keep!r}; falling back "
+            "to the chat template default (earlier-turn reasoning is pruned)."
         )
     return {}
 
@@ -561,7 +557,7 @@ def map_stop_reason(finish_reason: Optional[str]) -> AnthropicStopReason:
         return "end_turn"
     mapped = STOP_REASON_MAP.get(finish_reason)
     if mapped is None:
-        logger.warning("Unmapped finish_reason %r defaulted to 'end_turn'", finish_reason)
+        logger.warning(f"Unmapped finish_reason {finish_reason!r} defaulted to 'end_turn'")
         return "end_turn"
     return mapped
 
@@ -718,6 +714,17 @@ class AnthropicStreamReframer:
 
     # -- chunk handling -------------------------------------------------------
 
+    def adopt_model(self, model: Optional[str]) -> None:
+        """Take the model name from the upstream response.
+
+        The non-streaming path reports ChatCompletionResponse.model, so reading
+        it from the chunk here keeps both paths reporting the same name for the
+        same request. The constructor value is the fallback for a stream that
+        fails before its first chunk.
+        """
+        if model and not self.message_started:
+            self.model = model
+
     def _start_message(self, usage: Optional[AnthropicUsage]) -> List[str]:
         if self.message_started:
             return []
@@ -734,6 +741,8 @@ class AnthropicStreamReframer:
 
     def process_chunk(self, chunk: ChatCompletionStreamResponse) -> List[str]:
         frames: List[str] = []
+
+        self.adopt_model(getattr(chunk, "model", None))
 
         usage = None
         if chunk.usage is not None:
@@ -775,16 +784,16 @@ class AnthropicStreamReframer:
                 function = tool_call.function
                 if function is None:
                     continue
-                # A named fragment starts a NEW tool call only when it is
+                # A named fragment starts a new tool call only when it is
                 # not the call already open. Some producers repeat the name on
                 # every chunk - the forced tool_choice path in
                 # postprocess_handlers does - and reopening on each one splits
                 # a single call into one block per fragment, so the
                 # accumulated partial_json is never valid JSON. Parallel calls
                 # still get their own block because they carry distinct
-                # indices; when no index is available the old behaviour of
-                # opening a block is kept, since that is the only way to keep
-                # parallel calls apart.
+                # indices; when no index is available a named fragment still
+                # opens a block, since that is the only way to keep parallel
+                # calls apart.
                 same_call_already_open = (
                     self.open_block_type == "tool_use"
                     and tool_call.index is not None
@@ -805,9 +814,8 @@ class AnthropicStreamReframer:
                         and tool_call.index != self.open_tool_index
                     ):
                         logger.warning(
-                            "Dropping tool argument fragment without a "
-                            "matching open tool_use block (index=%s)",
-                            tool_call.index,
+                            "Dropping tool argument fragment without a matching "
+                            f"open tool_use block (index={tool_call.index})"
                         )
                         continue
                     frames.append(
@@ -924,8 +932,20 @@ async def reframe_openai_stream(
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
-        # Upstream ended without [DONE]; still terminate the message cleanly.
-        for frame in reframer.finish():
+        # Upstream ended without [DONE]. Both streaming producers emit it only
+        # after the response is complete, so its absence means the stream was
+        # cut short. Calling finish() here would close the message with
+        # message_stop / end_turn and the client would accept truncated output
+        # as a finished answer -- a silent wrong result rather than a failure.
+        raise AnthropicResponseError(
+            "Upstream stream ended before [DONE]; the response is incomplete"
+        )
+    except AnthropicResponseError as e:
+        # Raised only on upstream framing this module can describe precisely,
+        # so the text originates here and carries no internal detail: pass it
+        # through rather than flattening it to a generic message.
+        logger.error(f"Anthropic stream failed: {e}")
+        for frame in reframer.error(str(e)):
             yield frame
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")

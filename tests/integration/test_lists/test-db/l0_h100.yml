@@ -217,6 +217,7 @@ l0_h100:
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses
+  - test_e2e.py::test_anthropic_messages
   - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v2]

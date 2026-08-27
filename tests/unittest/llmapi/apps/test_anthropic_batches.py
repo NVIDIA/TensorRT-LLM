@@ -23,7 +23,11 @@ import json
 
 import pytest
 
-from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore, results_to_jsonl
+from tensorrt_llm.serve.anthropic_batches import (
+    AnthropicBatchStore,
+    BatchStoreFullError,
+    results_to_jsonl,
+)
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicBatchRequestItem,
     AnthropicCreateBatchRequest,
@@ -141,7 +145,7 @@ def test_a_failing_request_does_not_kill_the_batch():
 
 
 def test_processing_status_uses_the_documented_enum():
-    """in_progress/canceling/ended - NOT processing/completed/failed.
+    """in_progress/canceling/ended, not processing/completed/failed.
 
     A client deserializing MessageBatch rejects anything else, so this is
     pinned rather than left to a future refactor.
@@ -280,9 +284,9 @@ def test_delete_refuses_while_processing_and_succeeds_after():
 def test_list_reports_has_more_and_pages_by_cursor():
     """A truncated page must be distinguishable from the end of the list.
 
-    has_more was previously hardcoded false, so a client that asked for N and
-    received N could not tell a full page from the last one, and stopped early
-    having silently missed batches.
+    A hardcoded has_more=false leaves a client that asked for N and received N
+    unable to tell a full page from the last one, so it stops early having
+    silently missed batches.
     """
 
     async def scenario():
@@ -412,9 +416,9 @@ def test_retention_evicts_only_ended_batches():
 def test_concurrency_is_bounded_and_actually_reached(concurrency, size, delay):
     """Both bounds matter, and the lower one is the load-bearing assertion.
 
-    An earlier version held the semaphore inside a sequential loop, so a single
-    batch only ever had one request in flight. `peak <= limit` passed happily
-    against that bug - it is satisfied by doing no concurrency at all. Asserting
+    `peak <= limit` on its own is satisfied by doing no concurrency at all, so
+    it passes happily against a store that holds the semaphore inside a
+    sequential loop and never has more than one request in flight. Asserting
     the limit is *reached* is what proves requests are dispatched together;
     asserting it is not exceeded is what protects interactive traffic.
 
@@ -445,3 +449,127 @@ def test_concurrency_is_bounded_and_actually_reached(concurrency, size, delay):
         assert store.get(batch.id).request_counts.succeeded == size
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Expiry
+# ---------------------------------------------------------------------------
+
+
+def test_expiry_pads_every_unfinished_request_exactly_once():
+    """Padding must match on custom_id, not list position.
+
+    Items are dispatched concurrently and each result is appended as it lands,
+    so `results` is ordered by completion, not by submission. Padding by
+    slicing `items` would expire the wrong requests -- duplicating some
+    custom_ids and dropping others. Here 'b' finishes first, which makes the
+    two orderings disagree.
+    """
+
+    async def finish_b_first(request):
+        text = request.messages[0].content
+        await asyncio.sleep(0.0 if text == "b" else 5.0)
+        return "succeeded", {"type": "message", "role": "assistant", "content": []}
+
+    async def scenario():
+        store = AnthropicBatchStore(runner=finish_b_first, concurrency=4)
+        items = [_item(cid, text=cid) for cid in ("a", "b", "c")]
+        batch = store.create(AnthropicCreateBatchRequest(requests=items).requests)
+
+        # Let 'b' land while 'a' and 'c' are still in flight.
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if store._batches[batch.id].results:
+                break
+
+        # Force the batch past its TTL and re-read it.
+        record = store._batches[batch.id]
+        record.batch.expires_at = "2000-01-01T00:00:00.000Z"
+        store.get(batch.id)
+
+        assert store.status_of(batch.id) == "ended"
+        return store.results(batch.id), batch.id
+
+    results, _ = asyncio.run(scenario())
+
+    ids = [obj["custom_id"] for obj in results]
+    assert sorted(ids) == ["a", "b", "c"], f"expected each id once, got {ids}"
+
+    by_id = {obj["custom_id"]: obj["result"]["type"] for obj in results}
+    assert by_id["b"] == "succeeded"
+    assert by_id["a"] == "expired"
+    assert by_id["c"] == "expired"
+
+
+def test_expiry_reports_expired_not_canceled():
+    """Padding state is per-reason: expiry must not masquerade as cancellation."""
+
+    async def never_finishes(request):
+        await asyncio.sleep(30.0)
+        return "succeeded", {}
+
+    async def scenario():
+        store = AnthropicBatchStore(runner=never_finishes)
+        batch = store.create([_item("only")])
+        await asyncio.sleep(0.02)
+        store._batches[batch.id].batch.expires_at = "2000-01-01T00:00:00.000Z"
+        store.get(batch.id)
+        return store.results(batch.id), store.get(batch.id)
+
+    results, batch = asyncio.run(scenario())
+    assert [obj["result"]["type"] for obj in results] == ["expired"]
+    assert batch.request_counts.expired == 1
+    assert batch.request_counts.canceled == 0
+
+
+# ---------------------------------------------------------------------------
+# Admission control
+# ---------------------------------------------------------------------------
+
+
+def test_store_full_of_running_batches_refuses_instead_of_growing():
+    """The retention limit has to bind even when nothing can be evicted.
+
+    _evict_if_needed cannot drop a running batch -- that would strand the
+    client polling it -- so once every retained slot holds live work there is
+    nothing to reclaim. Inserting anyway makes the limit meaningless: batches,
+    their queued requests and their results accumulate until the process dies,
+    taking every other in-flight batch with it. Refusing is recoverable.
+    """
+
+    async def never_finishes(request):
+        await asyncio.sleep(30.0)
+        return "succeeded", {}
+
+    async def scenario():
+        store = AnthropicBatchStore(runner=never_finishes, max_retained=2)
+        store.create([_item("a")])
+        store.create([_item("b")])
+        await asyncio.sleep(0.02)
+
+        with pytest.raises(BatchStoreFullError):
+            store.create([_item("c")])
+
+        # The refusal must not have partially admitted the third batch.
+        return len(store._batches)
+
+    assert asyncio.run(scenario()) == 2
+
+
+def test_capacity_frees_up_once_a_batch_ends():
+    """Refusal is a back-off signal, not a permanent wall."""
+
+    async def scenario():
+        store = AnthropicBatchStore(runner=_ok_runner(), max_retained=2)
+        first = store.create([_item("a")])
+        second = store.create([_item("b")])
+        await _drain(store, first.id)
+        await _drain(store, second.id)
+
+        # Both ended, so the oldest is evictable and a new batch fits.
+        third = store.create([_item("c")])
+        return store.get(third.id) is not None, len(store._batches)
+
+    admitted, held = asyncio.run(scenario())
+    assert admitted
+    assert held == 2

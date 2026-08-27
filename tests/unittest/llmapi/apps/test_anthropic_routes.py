@@ -222,7 +222,9 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
     disagg = object.__new__(OpenAIDisaggServer)
     disagg.app = FastAPI()
     disagg._service = SimpleNamespace(
-        openai_completion=AsyncMock(), openai_chat_completion=AsyncMock()
+        openai_completion=AsyncMock(),
+        openai_chat_completion=AsyncMock(),
+        anthropic_count_tokens=AsyncMock(),
     )
     disagg._perf_metrics_collector = SimpleNamespace(get_perf_metrics=AsyncMock())
     disagg._disagg_cluster_storage = None
@@ -237,13 +239,12 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
 
     # Claude Code calls count_tokens before most turns to size its context.
     # An unregistered route 404s every call, which the client cannot act on,
-    # so registration is asserted separately from /v1/messages.
-    assert "/v1/messages/count_tokens" in {r.path for r in standard.app.routes}
-
-    # The disagg server deliberately does not serve it: it holds no tokenizer,
-    # so a count there would need a worker round-trip. Pinned so that adding
-    # one is a conscious change rather than an accident.
-    assert "/v1/messages/count_tokens" not in {r.path for r in disagg.app.routes}
+    # so registration is asserted separately from /v1/messages -- and on both
+    # servers, because a client pointed at a disaggregated deployment cannot
+    # tell the difference and must not lose the endpoint.
+    for server in (standard, disagg):
+        paths = {route.path for route in server.app.routes}
+        assert "/v1/messages/count_tokens" in paths
 
 
 def _batch_client(runner=None):
@@ -494,21 +495,18 @@ def _handle(exception):
     ],
 )
 def test_handle_exception_maps_status_and_counter(exception, expected_status, expected_counter):
-    """Pins a deliberate cross-cutting change, and that it is narrow.
+    """Upstream status survives, and only for aiohttp errors.
 
     _handle_exception is shared by every route on the disagg server, including
-    /v1/completions, which predates this work. Before the aiohttp branch existed
-    an upstream ClientResponseError fell through to the generic handler and every
-    upstream failure reached the client as 500. The Anthropic adapter maps
-    upstream status onto Anthropic error types, so a worker's 400 arriving as a
-    500 would be reported to the client as an api_error rather than an
-    invalid_request_error.
-
-    The change is an improvement for the older routes too - a 429 or 503 now
-    survives instead of being flattened - but it IS a behaviour change on
-    endpoints outside this feature, so it is pinned here rather than left
-    implicit. The RuntimeError case pins the other half: the generic path is
-    unchanged, only the aiohttp case was carved out of it.
+    /v1/completions, so the aiohttp branch is cross-cutting and is pinned here
+    for that reason. It reports an upstream ClientResponseError under its own
+    status rather than flattening every upstream failure to 500: the Anthropic
+    adapter derives Anthropic error types from that status, so a worker's 400
+    arriving as a 500 would reach the client as an api_error rather than an
+    invalid_request_error. The non-Anthropic routes gain the same fidelity - a
+    429 or 503 survives instead of being flattened. The RuntimeError case pins
+    the other half: anything that is not an aiohttp error still takes the
+    generic 500 path.
 
     The counter matters as much as the status. Each exception must increment
     exactly one of the two, so an upstream 400 is not also filed as an internal
@@ -596,7 +594,7 @@ def test_count_tokens_counts_the_rendered_prompt_not_the_raw_messages():
 
 
 def test_count_tokens_honours_the_server_chat_template():
-    """A server started with --chat_template must count THAT prompt.
+    """A server started with --chat_template must count the prompt it renders.
 
     The renderer only consults request.chat_template; openai_chat resolves
     `request.chat_template or self.chat_template`. Without the same resolution
@@ -648,3 +646,162 @@ def test_count_tokens_rejects_a_malformed_request():
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+# ---------------------------------------------------------------------------
+# Disaggregated count_tokens forwarding
+# ---------------------------------------------------------------------------
+
+
+def _disagg_service(servers, post_json=None):
+    """A disagg service with only what anthropic_count_tokens touches."""
+    from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
+
+    service = object.__new__(OpenAIDisaggregatedService)
+    service._ctx_router = SimpleNamespace(servers=servers)
+    service._ctx_client = SimpleNamespace(post_json=post_json or AsyncMock())
+    service._count_tokens_rr_counter = 0
+    service.is_ready = AsyncMock(return_value=True)
+    return service
+
+
+def test_count_tokens_forwards_to_a_context_worker():
+    """The disagg server has no tokenizer, so the count must come from a worker."""
+    from tensorrt_llm.serve.anthropic_protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+    )
+
+    post_json = AsyncMock(return_value=AnthropicCountTokensResponse(input_tokens=7))
+    service = _disagg_service(["ctx0:8000"], post_json)
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    response = asyncio.run(service.anthropic_count_tokens(request))
+
+    assert response.input_tokens == 7
+    endpoint, sent, response_type, server = post_json.await_args.args
+    assert endpoint == "v1/messages/count_tokens"
+    assert server == "ctx0:8000"
+    assert response_type is AnthropicCountTokensResponse
+    assert sent is request
+
+
+def test_count_tokens_spreads_over_context_workers():
+    """Round-robin: one worker must not absorb every count."""
+    from tensorrt_llm.serve.anthropic_protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+    )
+
+    post_json = AsyncMock(return_value=AnthropicCountTokensResponse(input_tokens=1))
+    service = _disagg_service(["ctx0:8000", "ctx1:8000"], post_json)
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    async def four_counts():
+        for _ in range(4):
+            await service.anthropic_count_tokens(request)
+
+    asyncio.run(four_counts())
+
+    picked = [call.args[3] for call in post_json.await_args_list]
+    assert picked == ["ctx0:8000", "ctx1:8000", "ctx0:8000", "ctx1:8000"]
+
+
+def test_count_tokens_without_context_workers_is_an_error_not_a_zero():
+    """A missing worker must raise rather than report zero.
+
+    Returning 0 would read as an empty prompt and silently skew a client's
+    context budgeting.
+    """
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicCountTokensRequest
+
+    service = _disagg_service([])
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(RuntimeError, match="No context servers"):
+        asyncio.run(service.anthropic_count_tokens(request))
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        pytest.param(
+            'Bad Request: {"type":"error","error":{"type":"invalid_request_error",'
+            '"message":"messages must not be empty"}}',
+            "messages must not be empty",
+            id="anthropic_envelope_is_unwrapped",
+        ),
+        pytest.param(
+            'Bad Request: {"message":"plain body"}',
+            "plain body",
+            id="plain_message_body",
+        ),
+        pytest.param(
+            "Bad Request: <html>gateway said no</html>",
+            "context worker rejected the request with status 400",
+            id="unrecognised_body_reports_status_only",
+        ),
+        pytest.param(
+            "Bad Request: {truncated",
+            "context worker rejected the request with status 400",
+            id="unparseable_body_reports_status_only",
+        ),
+    ],
+)
+def test_upstream_error_never_leaks_the_worker_url(message, expected):
+    """The client must learn what went wrong, not where the worker lives.
+
+    str(ClientResponseError) embeds the upstream URL, so propagating it
+    verbatim publishes a context worker's internal host and port to every
+    caller -- and nests an error envelope inside an error envelope, which no
+    Anthropic SDK unwraps.
+    """
+    from tensorrt_llm.serve.openai_disagg_server import _upstream_error_message
+
+    error = aiohttp.ClientResponseError(
+        request_info=Mock(), history=(), status=400, message=message
+    )
+
+    result = _upstream_error_message(error)
+
+    assert result == expected
+    assert "http://" not in result
+    assert "8001" not in result
+
+
+def test_create_batch_at_capacity_is_429_not_400():
+    """A full store is a back-off signal, not a malformed request.
+
+    400 tells the client to change the request, which cannot help here: the
+    identical body succeeds once a batch ends. 429 is what makes a client retry
+    instead of surfacing a hard failure to the user.
+
+    This pins the status mapping only. Whether the store actually refuses at
+    capacity is store policy, covered in test_anthropic_batches.py -- driving a
+    real store to its limit through TestClient is not possible anyway, since
+    each request runs in its own event loop and a batch's task does not
+    survive between them.
+    """
+    from tensorrt_llm.serve.anthropic_batches import BatchStoreFullError
+
+    app = FastAPI()
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+
+    def full(_requests):
+        raise BatchStoreFullError(
+            "the server is holding 100 unfinished batches (limit 100); retry once one of them ends"
+        )
+
+    server._anthropic_batch_store = SimpleNamespace(create=full)
+    app.add_api_route("/v1/messages/batches", server.anthropic_create_batch, methods=["POST"])
+
+    response = TestClient(app).post("/v1/messages/batches", json=_batch_body("a"))
+
+    assert response.status_code == 429
+    body = response.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "rate_limit_error"
+    # The message has to say what to do about it; an "invalid request" shape
+    # would send the client editing a body that was never the problem.
+    assert "retry" in body["error"]["message"].lower()

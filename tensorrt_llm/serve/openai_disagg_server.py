@@ -41,7 +41,8 @@ from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
                                                   convert_anthropic_request,
                                                   convert_chat_response,
                                                   reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
+                                                   AnthropicMessagesRequest)
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
@@ -146,6 +147,33 @@ class RawRequestResponseHooks(ResponseHooks):
             ))
 
 
+def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
+    """Recover the worker's own error text without leaking the worker.
+
+    str(ClientResponseError) embeds the full upstream URL, so returning it
+    verbatim tells every client the internal host and port of a context worker.
+    The worker is itself an Anthropic-shaped server, so its body is usually an
+    error envelope; lifting the inner message out also avoids handing the
+    client an envelope nested inside an envelope, which no SDK will unwrap.
+    """
+    raw = error.message or ""
+    start = raw.find("{")
+    if start != -1:
+        try:
+            payload = json.loads(raw[start:])
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            inner = payload.get("error")
+            if isinstance(inner, dict) and inner.get("message"):
+                return str(inner["message"])
+            if payload.get("message"):
+                return str(payload["message"])
+    # Not a body this server recognises. Report the status only: anything else
+    # in `raw` may still carry the upstream URL.
+    return f"context worker rejected the request with status {error.status}"
+
+
 class OpenAIDisaggServer:
     def __init__(self,
                  config: DisaggServerConfig,
@@ -239,7 +267,9 @@ class OpenAIDisaggServer:
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request: Request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
-            if request.url.path == "/v1/messages":
+            # Anthropic clients parse the error envelope, so every /v1/messages
+            # route must fail in that shape rather than the generic one below.
+            if request.url.path.startswith("/v1/messages"):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             self._val_err_n += 1
@@ -277,6 +307,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
+        self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -410,6 +441,22 @@ class OpenAIDisaggServer:
                                             "api_error", 500)
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def anthropic_count_tokens(
+            self, request: AnthropicCountTokensRequest) -> Response:
+        """Count Anthropic input tokens on a context worker."""
+        try:
+            response = await self._service.anthropic_count_tokens(request)
+        except aiohttp.ClientResponseError as error:
+            error_type = ("invalid_request_error"
+                          if 400 <= error.status < 500 else "api_error")
+            return anthropic_error_response(_upstream_error_message(error),
+                                            error_type, error.status or 500)
+        except (RuntimeError, ValueError) as error:
+            # Raised when the cluster is not ready or has no context worker;
+            # 503 tells the caller to retry rather than to fix the request.
+            return anthropic_error_response(str(error), "api_error", 503)
+        return JSONResponse(content=response.model_dump())
 
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):

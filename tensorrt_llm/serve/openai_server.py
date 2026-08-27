@@ -64,6 +64,7 @@ from tensorrt_llm.serve.anthropic_adapter import (
     convert_anthropic_count_tokens_request, convert_anthropic_request,
     convert_chat_response, reframe_openai_stream)
 from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
+                                                  BatchStoreFullError,
                                                   results_to_jsonl)
 from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicBatchList,
@@ -1939,14 +1940,22 @@ class OpenAIServer(_VideoRoutesMixin):
             if chat_request.chat_template is None:
                 chat_request.chat_template = getattr(self, "chat_template",
                                                      None)
-            rendered = render_chat_request_for_tokenizer(
-                chat_request, self.tokenizer)
-            # The renderer returns token ids when the template tokenizes for
-            # itself, and text otherwise; both are valid, so handle each.
-            if isinstance(rendered, str):
-                input_tokens = len(self.tokenizer.encode(rendered))
-            else:
-                input_tokens = len(rendered)
+            # Both the render and the encode are synchronous and both scale
+            # with prompt size. Claude Code calls this before most turns with
+            # the whole conversation attached, so running them inline would
+            # block the event loop -- and therefore every other in-flight
+            # request on this server -- for a full template render plus a
+            # tokenizer pass. The chat path avoids this the same way.
+            def _count() -> int:
+                rendered = render_chat_request_for_tokenizer(
+                    chat_request, self.tokenizer)
+                # The renderer returns token ids when the template tokenizes
+                # for itself, and text otherwise; both are valid.
+                if isinstance(rendered, str):
+                    return len(self.tokenizer.encode(rendered))
+                return len(rendered)
+
+            input_tokens = await asyncio.to_thread(_count)
         except Exception:
             logger.error("count_tokens failed to render the prompt:\n"
                          f"{traceback.format_exc()}")
@@ -1992,8 +2001,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 # return_perf_metrics enabled, _extract_metrics appends to this
                 # list unconditionally and every batched request would otherwise
                 # die with AttributeError and come back "errored".
+                # No socket sits behind this request, so await_disconnected
+                # keys off no_client_connection to avoid polling forever on a
+                # connection that can never drop.
                 "state": {
-                    "perf_metrics_records": []
+                    "perf_metrics_records": [],
+                    "no_client_connection": True
                 },
             },
             receive,
@@ -2058,6 +2071,10 @@ class OpenAIServer(_VideoRoutesMixin):
             self, request: AnthropicCreateBatchRequest) -> Response:
         try:
             batch = self._batch_store().create(request.requests)
+        except BatchStoreFullError as e:
+            # 429, not 400: the request is valid and an identical one will
+            # succeed later, so the client should back off rather than edit it.
+            return anthropic_error_response(str(e), "rate_limit_error", 429)
         except ValueError as e:
             return anthropic_error_response(str(e), "invalid_request_error",
                                             400)

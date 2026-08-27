@@ -167,11 +167,11 @@ def test_system_field_becomes_leading_system_message():
     assert chat.messages[1]["role"] == "user"
 
 
-# Each of these was observed in the wild. The first is the format that broke a
-# field-list-based matcher elsewhere (no `cch=`, extra `cc_is_subagent`); the
-# third uses the Claude Agent SDK's entrypoint, which is what our own agent
-# workloads send. Pinned so a client-side format change fails loudly here
-# instead of silently reverting the strip to a no-op.
+# Real formats emitted by Claude Code, spanning the variation a field-list
+# matcher would trip over: no `cch=`, an extra `cc_is_subagent`, and the
+# `sdk-py` entrypoint the Claude Agent SDK sends. Pinned so a client-side
+# format change fails loudly here instead of silently turning the strip into a
+# no-op.
 @pytest.mark.parametrize(
     "payload",
     [
@@ -230,9 +230,9 @@ def test_text_hiding_behind_the_billing_marker_is_not_stripped():
 def test_inline_system_message_keeps_its_position():
     """A system message sent mid-conversation stays where it was sent.
 
-    It used to be folded into the leading system block, which moves the
-    instruction ahead of the turns it was meant to qualify and changes what
-    it applies to. The top-level system prompt still leads.
+    Folding it into the leading system block would move the instruction ahead
+    of the turns it was meant to qualify and change what it applies to. The
+    top-level system prompt still leads.
     """
     chat = convert_anthropic_request(
         make_request(
@@ -1068,16 +1068,17 @@ def test_stream_reframer_surfaces_malformed_upstream_chunk_as_error():
 # ---------------------------------------------------------------------------
 #
 # With tool_choice={"type": "tool", ...} the upstream producer emits
-# function.name on EVERY delta rather than only the first (see the named
+# function.name on every delta rather than only the first (see the named
 # tool_choice branch in postprocess_handlers). The reframer must treat those as
 # fragments of one call, not as a new call each time.
 
 
 def test_repeated_tool_name_stays_one_block():
-    """Regression: one tool call was split into one block per chunk.
+    """One tool call must stay one block, however many chunks repeat its name.
 
-    Each block then held a fragment of the arguments, so the accumulated
-    partial_json never parsed and the call was unusable by any client.
+    A block per chunk leaves each block holding a fragment of the arguments, so
+    the accumulated partial_json never parses and the call is unusable by any
+    client.
     """
     events = run_reframer(
         [
@@ -1127,7 +1128,7 @@ def test_repeated_tool_name_stays_one_block():
 def test_streaming_stop_reason_when_a_tool_was_called(
     finish_reason, arguments, expected_stop_reason
 ):
-    """Regression: streams ended with end_turn, so the client's tool loop stopped.
+    """A stream that called a tool must not end with end_turn, or the tool loop stops.
 
     Truncation is the one exception: max_tokens outranks tool_use because the
     content - here the tool arguments, cut off mid-JSON - did not finish.
@@ -1155,14 +1156,14 @@ def test_streaming_stop_reason_when_a_tool_was_called(
 def test_stop_reason_of_a_response_carrying_a_tool_use_block(
     finish_reason, upstream_stop_sequence, expected_stop_reason
 ):
-    """Regression: a response with a tool_use block must not end the tool loop.
+    """A response with a tool_use block must not end the tool loop.
 
     even_when_upstream_said_stop: a forced tool_choice yields
     finish_reason="stop", not "tool_calls" - the upstream promotion to
     "tool_calls" only happens when a tool parser ran, and the forced
-    tool_choice path skips it. Mapping that straight through produced
-    stop_reason="end_turn" on a response that carries a tool_use block, so the
-    client ended the turn instead of running the tool.
+    tool_choice path skips it. Mapping that straight through would report
+    stop_reason="end_turn" on a response that carries a tool_use block, and the
+    client would end the turn instead of running the tool.
 
     stop_sequence_does_not_mask_tool_use: a matched stop sequence must not hide
     that a tool was called - and the reported stop_sequence has to be cleared
@@ -1185,3 +1186,46 @@ def test_stop_reason_of_a_response_carrying_a_tool_use_block(
     )
     assert resp.stop_reason == expected_stop_reason
     assert resp.stop_sequence is None
+
+
+def test_stream_dropped_before_done_is_an_error_not_a_clean_stop():
+    """A truncated upstream must not look like a finished answer.
+
+    Both streaming producers emit [DONE] only after the response is complete,
+    so its absence means the stream was cut short. Closing the message with
+    message_stop / end_turn there would hand the client a partial answer
+    labelled as complete -- it would neither retry nor warn, and the user would
+    silently receive truncated output. An error event is recoverable; a
+    plausible wrong answer is not.
+    """
+
+    async def source():
+        yield f"data: {chunk({'role': 'assistant', 'content': 'par'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({'content': 'tial'}).model_dump_json()}\n\n"
+        # Upstream disconnects here: no finish_reason chunk, no [DONE].
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    names = [name for name, _ in events]
+
+    assert "error" in names, f"expected an error event, got {names}"
+    assert "message_stop" not in names, (
+        f"a truncated stream must not report a clean stop; got {names}"
+    )
+
+    error_payload = next(payload for name, payload in events if name == "error")
+    assert error_payload["error"]["type"] == "api_error"
+    # The message has to name the actual failure: "internal server error" would
+    # send whoever debugs this looking at the wrong layer.
+    assert "[DONE]" in error_payload["error"]["message"]
+
+    # The partial text is still delivered -- the client can show what arrived,
+    # it just must not be told the turn ended normally.
+    text = "".join(
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
+    )
+    assert text == "partial"

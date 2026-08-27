@@ -47,6 +47,7 @@ import collections
 import glob
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -116,6 +117,21 @@ SSE_ROTATED = (
 # ---------------------------------------------------------------------------
 # Fleet state
 # ---------------------------------------------------------------------------
+def finite_float(value, field, source=""):
+    """Coerce to float, rejecting NaN and infinity.
+
+    float() happily accepts "nan" and "inf", and NaN then poisons every
+    comparison it touches: `now - nan > stale_after` is False, so a dead
+    backend with a NaN heartbeat never goes stale and is never retired, while
+    a NaN end_time makes the max() in the election return an arbitrary winner.
+    Both fail silently, which is why they are rejected at the boundary.
+    """
+    number = float(value or 0)
+    if not math.isfinite(number):
+        raise ValueError("%s is not finite (%r)%s" % (field, value, source))
+    return number
+
+
 class Backend:
     """One serving job, as seen through its registration file."""
 
@@ -124,8 +140,8 @@ class Backend:
         self.url = record["url"].rstrip("/")
         self.run_dir = record.get("run_dir", "")
         self.state = record.get("state", "")
-        self.end_time = float(record.get("end_time") or 0)
-        self.heartbeat = float(record.get("heartbeat") or 0)
+        self.end_time = finite_float(record.get("end_time"), "end_time")
+        self.heartbeat = finite_float(record.get("heartbeat"), "heartbeat")
         self.healthy = False
         self.timeouts = 0  # consecutive probe timeouts
         self.healthy_since = 0.0
@@ -140,20 +156,22 @@ class Backend:
         """Take every mutable field, not just state and heartbeat.
 
         A registration file is rewritten as the job learns about itself. Two
-        fields in particular arrive late and were previously latched at first
-        read: `end_time`, absent until the job resolves its wall clock - and
-        `end_time == 0` makes the supervisor skip relay entirely, so the fleet
-        would expire with no successor queued, which is the one failure the
-        relay exists to prevent. And `url`, which changes when a failed
+        fields in particular arrive late, so latching the first value read is
+        not enough: `end_time`, absent until the job resolves its wall clock -
+        and `end_time == 0` makes the supervisor skip relay entirely, so the
+        fleet would expire with no successor queued, which is the one failure
+        the relay exists to prevent. And `url`, which changes when a failed
         successor is restarted in place and binds a different port, leaving the
         gateway proxying a dead address while a fresh heartbeat keeps the entry
         from ever being retired.
         """
         self.state = record.get("state", self.state)
-        self.heartbeat = float(record.get("heartbeat") or 0)
-        self.end_time = float(record.get("end_time") or self.end_time or 0)
+        self.heartbeat = finite_float(record.get("heartbeat"), "heartbeat")
+        self.end_time = finite_float(record.get("end_time") or self.end_time, "end_time")
         self.run_dir = record.get("run_dir", self.run_dir)
-        url = record.get("url")
+        # Normalised the same way as in __init__, so a rewrite that differs
+        # only by a trailing slash does not read as a move.
+        url = (record.get("url") or "").rstrip("/")
         if url and url != self.url:
             match = re.match(r"^http://([^:/]+):(\d+)$", url)
             if not match:
@@ -228,21 +246,44 @@ class Fleet:
                 with open(path) as handle:
                     record = json.load(handle)
             except (OSError, ValueError):
-                # Mid-rename, or truncated. The writer replaces the file
-                # atomically, so the next sweep gets a whole one.
+                # Mid-rename or truncated. The writer replaces the file
+                # atomically, so the next sweep gets a whole one. Stay quiet:
+                # this is expected and would otherwise log on every sweep.
                 continue
-            job_id = str(record.get("job_id", ""))
+            # A registration has to be a JSON object. Valid JSON that is not one
+            # (a bare array, string or number) would otherwise reach .get() and
+            # raise AttributeError, which is not a coercion error and escapes
+            # the guard below -- aborting the sweep before the retirement pass.
+            if not isinstance(record, dict):
+                LOG.warning("ignoring %s: registration is not a JSON object", path)
+                continue
+            try:
+                job_id = str(record.get("job_id", ""))
+                heartbeat = finite_float(record.get("heartbeat"), "heartbeat")
+            except (ValueError, TypeError) as exc:
+                # One unusable field must not cost every other backend its
+                # sweep, so the failure stays local to this file.
+                LOG.warning("ignoring %s: %s", path, exc)
+                continue
             if not job_id:
                 continue
-            if now - float(record.get("heartbeat") or 0) > self.args.stale_after:
+            if now - heartbeat > self.args.stale_after:
                 continue
             seen.add(job_id)
             if job_id in self.backends:
-                self.backends[job_id].refresh(record)
+                try:
+                    self.backends[job_id].refresh(record)
+                except (ValueError, TypeError, AttributeError) as exc:
+                    # Same exposure as construction: keep a bad rewrite local to
+                    # its own file and hold the last good view of the backend.
+                    LOG.warning("ignoring refresh from %s: %s", path, exc)
             else:
                 try:
                     self.backends[job_id] = Backend(record)
-                except (KeyError, ValueError) as exc:
+                # AttributeError covers a non-string url, which reaches
+                # .rstrip() in __init__. One unusable record must cost only
+                # itself, never the rest of the sweep.
+                except (KeyError, ValueError, TypeError, AttributeError) as exc:
                     LOG.warning("ignoring %s: %s", path, exc)
                     continue
                 self.inflight.setdefault(job_id, 0)
@@ -576,7 +617,12 @@ class Gateway:
             if head is None:
                 return
             method, path, headers = parse_request_head(head)
-        except (ValueError, ConnectionError) as exc:
+        # OSError, not just ConnectionError: reader.read raises other OSError
+        # subclasses (a socket timeout, for one). ConnectionError is itself an
+        # OSError subclass, so this only widens. Letting one escape means the
+        # task dies with an unretrieved exception and close(writer) never runs,
+        # leaking the connection.
+        except (ValueError, OSError) as exc:
             LOG.debug("bad request from %s: %s", peer, exc)
             await close(writer)
             return
@@ -609,7 +655,13 @@ class Gateway:
         try:
             try:
                 status = await self.proxy(backend, method, path, headers, rest, reader, writer, key)
-            except (ConnectionError, OSError) as exc:
+            # ValueError covers an unusable upstream head: read_head raises it
+            # past MAX_HEAD_BYTES and parse_response_head on a malformed one.
+            # Both happen before anything is written downstream, so 502 is
+            # safe here -- without it the client just sees the socket close
+            # with no status at all. Framing failures after the head is out are
+            # caught in relay_response, which cannot use this path.
+            except (ConnectionError, OSError, ValueError) as exc:
                 LOG.warning("upstream %s failed: %s", backend.url, exc)
                 status = "502"
                 await respond(writer, error_response(502))
@@ -749,21 +801,35 @@ class Gateway:
         await writer.drain()
         source = BufferedUpstream(up_reader, rest)
         tracker = SseTracker()
-        if "chunked" in encodings:
-            clean_end = await relay_chunked_sse(source, writer, tracker)
-        else:
-            content_length = header_value(headers, "content-length")
-            if content_length is None:
-                clean_end = await relay_close_delimited_sse(source, writer, tracker)
+        # The head is already on the wire, so a framing failure from here on
+        # cannot become a 502: writing error_response would put a second HTTP
+        # head inside a response the client is already reading. Degrade to the
+        # truncated-stream path instead and let the terminal-event injection
+        # below give the client a valid end to the stream.
+        try:
+            if "chunked" in encodings:
+                clean_end = await relay_chunked_sse(source, writer, tracker)
             else:
-                try:
-                    length = int(content_length)
-                except ValueError:
-                    length = -1
-                if length < 0:
-                    clean_end = False
+                content_length = header_value(headers, "content-length")
+                if content_length is None:
+                    clean_end = await relay_close_delimited_sse(source, writer, tracker)
                 else:
-                    clean_end = await relay_sized_sse(source, writer, tracker, length)
+                    try:
+                        length = int(content_length)
+                    except ValueError:
+                        length = -1
+                    if length < 0:
+                        clean_end = False
+                    else:
+                        clean_end = await relay_sized_sse(source, writer, tracker, length)
+        # The response head is already on the wire, so a failure from here on
+        # cannot become a 502 -- that would put a second HTTP head inside a
+        # body the client is reading. OSError covers an upstream that dies
+        # mid-stream, which is the common case during a handover. Both degrade
+        # to the truncated path so the terminal event below closes the stream.
+        except (ValueError, OSError) as exc:
+            LOG.warning("upstream framing failed mid-stream: %s", exc)
+            clean_end = False
 
         if not tracker.terminal:
             ending = "clean end" if clean_end else "truncated upstream framing"

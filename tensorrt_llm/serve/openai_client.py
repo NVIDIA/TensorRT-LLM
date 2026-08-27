@@ -18,9 +18,21 @@ import json
 import os
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tuple, Type
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
 import aiohttp
+from pydantic import BaseModel
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
@@ -67,6 +79,20 @@ if _MSGSPEC_ENABLED:
             "(listed in requirements.txt)."
         ) from exc
     _msgpack_encoder = msgspec.msgpack.Encoder()
+
+
+# post_json's request and response are ordinary pydantic models, but not the
+# UCompletion* union: it carries auxiliary payloads such as count-tokens. The
+# protocol names the one method actually called, and the TypeVar ties the
+# returned object to the type the caller asked for, so a mismatch is a type
+# error rather than an Any that silently propagates.
+class _SerializableRequest(Protocol):
+    def model_dump_json(self, *, exclude_unset: bool = ...) -> str: ...
+
+    def model_dump(self, *, mode: str = ..., exclude_unset: bool = ...) -> dict: ...
+
+
+_ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
 
 def _metrics_phase(role: ServerRole) -> str:
@@ -116,6 +142,22 @@ class OpenAIClient(ABC):
     @abstractmethod
     async def check_ready(self) -> Tuple[List[str], List[str]]:
         """Return the list of ready servers and the list of unready servers."""
+        ...
+
+    @abstractmethod
+    async def post_json(
+        self,
+        endpoint: str,
+        request: _SerializableRequest,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        """Post a non-streaming auxiliary request to a selected worker.
+
+        Unlike _send_request this carries no disaggregation state and does not
+        touch the router's in-flight accounting: it is for side endpoints such
+        as token counting, which need a worker's tokenizer but no KV transfer.
+        """
         ...
 
     async def shutdown(self) -> None: ...
@@ -174,6 +216,37 @@ class OpenAIHttpClient(OpenAIClient):
         if not request_requires_internal_disagg_auth(request):
             return {}
         return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
+
+    async def post_json(
+        self,
+        endpoint: str,
+        request: _SerializableRequest,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        server_url = server if server.startswith("http") else f"http://{server}"
+        url = f"{server_url.rstrip('/')}/{endpoint}"
+        # A count-tokens body carries the whole conversation, so it is as large
+        # as a chat body and serialising it inline costs the orchestrator's
+        # event loop the same way. The worker decodes either form: _MsgspecRoute
+        # is the app's route_class, so it covers every route.
+        if _MSGSPEC_ENABLED:
+            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+        else:
+            body = request.model_dump_json(exclude_unset=True)
+            headers = {"Content-Type": "application/json"}
+        async with self._session.post(url, data=body, headers=headers) as response:
+            if response.status >= 400:
+                error_body = await response.text()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {error_body[:2048]}",
+                    headers=response.headers,
+                )
+            return response_type(**await response.json())
 
     async def _send_request(
         self,

@@ -79,10 +79,10 @@ def _int_env(name: str, default: int) -> int:
     try:
         value = int(raw)
     except ValueError:
-        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        logger.warning(f"{name}={raw!r} is not an integer; using {default}")
         return default
     if value < 1:
-        logger.warning("%s=%d must be >= 1; using %d", name, value, default)
+        logger.warning(f"{name}={value} must be >= 1; using {default}")
         return default
     return value
 
@@ -100,7 +100,7 @@ class _ItemResult:
             result: Dict[str, Any] = {"type": "succeeded", "message": self.payload}
         elif self.result_type == "errored":
             # MessageBatchErroredResult.error is an ErrorResponse, which wraps
-            # the ErrorObject in ANOTHER layer: {type: "error", error: {...},
+            # the ErrorObject in another layer: {type: "error", error: {...},
             # request_id}. Emitting the bare ErrorObject here breaks SDK
             # deserialization of result.error, so keep both levels.
             result = {
@@ -138,6 +138,15 @@ class _BatchRecord:
 BatchItemRunner = Callable[[AnthropicMessagesRequest], Awaitable[Tuple[str, Dict[str, Any]]]]
 
 
+class BatchStoreFullError(RuntimeError):
+    """No room for another batch; every retained slot holds unfinished work.
+
+    Distinct from ValueError, which this module raises for a bad request: this
+    one says the request was fine and the server is at capacity, so it maps to
+    429 and the client should retry rather than change anything.
+    """
+
+
 class AnthropicBatchStore:
     """Owns every batch this process knows about."""
 
@@ -172,6 +181,18 @@ class AnthropicBatchStore:
                 )
             seen.add(item.custom_id)
 
+        # Admission control. Without this the store accepts batches it has no
+        # room for: _evict_if_needed cannot drop a running batch, so once every
+        # retained slot holds live work the limit stops being a limit and
+        # batches, their queued requests and their results grow unbounded until
+        # the process dies. Refusing is recoverable; running out of memory with
+        # other people's batches in flight is not.
+        if not self._evict_if_needed():
+            raise BatchStoreFullError(
+                f"the server is holding {len(self._batches)} unfinished batches "
+                f"(limit {self._max_retained}); retry once one of them ends"
+            )
+
         created = _now()
         batch = AnthropicMessageBatch(
             created_at=_rfc3339(created),
@@ -179,10 +200,9 @@ class AnthropicBatchStore:
             request_counts=AnthropicBatchRequestCounts(processing=len(items)),
         )
         record = _BatchRecord(batch=batch, items=list(items))
-        self._evict_if_needed()
         self._batches[batch.id] = record
         record.task = asyncio.create_task(self._run(record))
-        logger.info("Anthropic batch %s created with %d request(s)", batch.id, len(items))
+        logger.info(f"Anthropic batch {batch.id} created with {len(items)} request(s)")
         return batch
 
     def get(self, batch_id: str) -> Optional[AnthropicMessageBatch]:
@@ -232,7 +252,7 @@ class AnthropicBatchStore:
             index = next((i for i, b in enumerate(batches) if b.id == before_id), None)
             if index is None:
                 raise LookupError(before_id)
-            # Everything before the cursor, then the LAST `limit` of them: with
+            # Everything before the cursor, then the last `limit` of them: with
             # newest-first ordering the page immediately before the cursor is
             # the tail of that prefix. Taking the head returns the newest
             # batches instead, and a client walking backwards from there
@@ -249,8 +269,8 @@ class AnthropicBatchStore:
         if record is None:
             return None
         # Expiry is evaluated on read, so it has to run on every entry point.
-        # Skipping it here let an already-expired batch be marked "canceling",
-        # reporting its requests as canceled rather than expired.
+        # Skipping it here would let an already-expired batch be marked
+        # "canceling", reporting its requests as canceled rather than expired.
         self._expire_if_due(record)
         if record.batch.processing_status == "in_progress":
             record.cancel_requested = True
@@ -296,9 +316,10 @@ class AnthropicBatchStore:
 
     # -- internals ---------------------------------------------------------
 
-    def _evict_if_needed(self) -> None:
+    def _evict_if_needed(self) -> bool:
+        """Make room for one more batch. False if the store is full of live work."""
         if len(self._batches) < self._max_retained:
-            return
+            return True
         # Drop the oldest ended batch. Never evict one that is still running:
         # losing a live batch would strand the client polling it.
         ended = [
@@ -308,16 +329,15 @@ class AnthropicBatchStore:
         ]
         if not ended:
             logger.warning(
-                "Anthropic batch store holds %d unfinished batches (limit %d); "
-                "not evicting a running batch",
-                len(self._batches),
-                self._max_retained,
+                f"Anthropic batch store holds {len(self._batches)} unfinished "
+                f"batches (limit {self._max_retained}); refusing new batches"
             )
-            return
+            return False
         ended.sort()
         evicted = ended[0][1]
         del self._batches[evicted]
-        logger.info("Evicted ended Anthropic batch %s to stay within the retention limit", evicted)
+        logger.info(f"Evicted ended Anthropic batch {evicted} to stay within the retention limit")
+        return True
 
     def _expire_if_due(self, record: _BatchRecord) -> None:
         """Expire lazily, on read.
@@ -328,26 +348,23 @@ class AnthropicBatchStore:
         """
         if record.batch.processing_status == "ended" or not record.is_expired():
             return
-        remaining = len(record.items) - len(record.results)
-        if remaining > 0:
-            record.results.extend(
-                _ItemResult(item.custom_id, "expired", {})
-                for item in record.items[len(record.results) :]
-            )
         if record.task is not None and not record.task.done():
             record.task.cancel()
-        self._finalize(record)
+        # _finalize pads by custom_id, which is the only safe key here:
+        # requests run concurrently and each result is appended as it lands,
+        # so results are ordered by completion and cannot be zipped with items.
+        self._finalize(record, pad_state="expired")
 
     async def _run(self, record: _BatchRecord) -> None:
         """Run every request in the batch, self._concurrency at a time.
 
-        Items are dispatched together and gated by the semaphore, NOT awaited
-        one after another. An earlier version held the semaphore inside a
-        sequential loop, which pinned a single batch to one in-flight request
-        no matter how the limit was configured - a 1000-request batch became
-        1000 serial round-trips, which is precisely the latency a batch API is
-        meant to amortise. The semaphore still bounds the total in flight, so
-        interactive traffic is protected exactly as before.
+        Items are dispatched together and gated by the semaphore, not awaited
+        one after another. Holding the semaphore inside a sequential loop would
+        pin a single batch to one in-flight request no matter how the limit is
+        configured - a 1000-request batch would become 1000 serial round-trips,
+        which is precisely the latency a batch API is meant to amortise. The
+        semaphore still bounds the total in flight, so interactive traffic
+        stays protected.
         """
 
         async def run_one(item: AnthropicBatchRequestItem) -> None:
@@ -369,10 +386,7 @@ class AnthropicBatchStore:
                     raise
                 except Exception as exc:  # noqa: BLE001 - one bad request must not kill the batch
                     logger.error(
-                        "Anthropic batch %s request %s failed: %s",
-                        record.batch.id,
-                        item.custom_id,
-                        exc,
+                        f"Anthropic batch {record.batch.id} request {item.custom_id} failed: {exc}"
                     )
                     result_type, payload = (
                         "errored",
@@ -394,7 +408,8 @@ class AnthropicBatchStore:
         finally:
             self._finalize(record)
 
-    def _finalize(self, record: _BatchRecord) -> None:
+    def _finalize(self, record: _BatchRecord, pad_state: str = "canceled") -> None:
+        """Close the batch out, recording pad_state for anything unreached."""
         if record.batch.processing_status == "ended":
             return
         # Pad anything the worker never reached. _run finalizes from a finally
@@ -405,7 +420,7 @@ class AnthropicBatchStore:
         if len(record.results) < len(record.items):
             done = {result.custom_id for result in record.results}
             record.results.extend(
-                _ItemResult(item.custom_id, "canceled", {})
+                _ItemResult(item.custom_id, pad_state, {})
                 for item in record.items
                 if item.custom_id not in done
             )
@@ -420,9 +435,7 @@ class AnthropicBatchStore:
         # than a relative one the client can resolve itself.
         record.batch.results_url = f"/v1/messages/batches/{record.batch.id}/results"
         logger.info(
-            "Anthropic batch %s ended: %s",
-            record.batch.id,
-            record.batch.request_counts.model_dump(),
+            f"Anthropic batch {record.batch.id} ended: {record.batch.request_counts.model_dump()}"
         )
 
 
