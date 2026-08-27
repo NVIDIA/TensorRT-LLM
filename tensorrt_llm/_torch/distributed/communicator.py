@@ -208,14 +208,14 @@ class Distributed(ABC):
         return obj
 
     @abstractmethod
-    def tp_allgather(self, obj, small_payload: bool = False):
+    def tp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
     @abstractmethod
-    def cp_allgather(self, obj, small_payload: bool = False):
+    def cp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
-    def tp_cp_allgather(self, obj, small_payload: bool = False):
+    def tp_cp_allgather(self, obj, *, small_payload: bool = False):
         """Allgather across both TP and CP dimensions.
 
         First gathers within CP group, then across TP groups, returning
@@ -733,6 +733,7 @@ class MPIDist(Distributed):
     def cp_allgather(self,
                      obj,
                      chunk_size: int = 4 * 1024 * 1024,
+                     *,
                      small_payload: bool = False):
         comm = self.cp_comm
         if small_payload:
@@ -752,6 +753,7 @@ class MPIDist(Distributed):
     def tp_allgather(self,
                      obj,
                      chunk_size: int = 4 * 1024 * 1024,
+                     *,
                      small_payload: bool = False):
         comm = self.tp_comm
         if small_payload:
@@ -1046,7 +1048,7 @@ class TorchDist(Distributed):
         return obj
 
     @log_op
-    def tp_allgather(self, obj, small_payload: bool = False):
+    def tp_allgather(self, obj, *, small_payload: bool = False):
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)
@@ -1118,7 +1120,7 @@ class TorchDist(Distributed):
             return ret[0]
 
     @log_op
-    def cp_allgather(self, obj, small_payload: bool = False):
+    def cp_allgather(self, obj, *, small_payload: bool = False):
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)
