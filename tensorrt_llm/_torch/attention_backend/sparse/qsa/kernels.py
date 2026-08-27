@@ -940,13 +940,25 @@ def _qsa_paged_index_scores_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     TILES_PER_PROGRAM: tl.constexpr,
+    ONLY_VISIBLE_BLOCKS: tl.constexpr,
 ):
     row = tl.program_id(0)
-    dim_offsets = tl.arange(0, INDEX_HEAD_DIM)
-    head_offsets = tl.arange(0, BLOCK_H)
     request = tl.load(request_indices + row).to(tl.int64)
     query_position = tl.load(query_positions + row)
     visible_blocks = (query_position + 1) // COMPRESS_RATIO
+    first_tile = tl.program_id(1) * TILES_PER_PROGRAM
+    if ONLY_VISIBLE_BLOCKS and first_tile * BLOCK_N >= visible_blocks:
+        return
+
+    last_tile = tl.minimum(
+        first_tile + TILES_PER_PROGRAM,
+        tl.cdiv(
+            visible_blocks if ONLY_VISIBLE_BLOCKS else MAX_COMPRESSED_BLOCKS,
+            BLOCK_N,
+        ),
+    )
+    dim_offsets = tl.arange(0, INDEX_HEAD_DIM)
+    head_offsets = tl.arange(0, BLOCK_H)
     query_values = tl.load(
         q
         + row * q_stride_row
@@ -954,12 +966,6 @@ def _qsa_paged_index_scores_kernel(
         + head_offsets[None, :] * q_stride_head,
         mask=head_offsets[None, :] < NUM_INDEX_HEADS,
         other=0.0,
-    )
-
-    first_tile = tl.program_id(1) * TILES_PER_PROGRAM
-    last_tile = tl.minimum(
-        first_tile + TILES_PER_PROGRAM,
-        tl.cdiv(MAX_COMPRESSED_BLOCKS, BLOCK_N),
     )
     column_offsets = tl.arange(0, BLOCK_N)
     for tile in tl.range(first_tile, last_tile, num_stages=2):
@@ -993,11 +999,15 @@ def _qsa_paged_index_scores_kernel(
             ),
             axis=1,
         )
-        tl.store(
-            output + row * output_stride_row + block_columns * output_stride_block,
-            tl.where(valid_blocks, scores * score_scale, -float("inf")),
-            mask=block_columns < MAX_COMPRESSED_BLOCKS,
-        )
+        output_ptrs = output + row * output_stride_row + block_columns * output_stride_block
+        if ONLY_VISIBLE_BLOCKS:
+            tl.store(output_ptrs, scores * score_scale, mask=valid_blocks)
+        else:
+            tl.store(
+                output_ptrs,
+                tl.where(valid_blocks, scores * score_scale, -float("inf")),
+                mask=block_columns < MAX_COMPRESSED_BLOCKS,
+            )
 
 
 def triton_qsa_paged_index_scores(
@@ -1009,8 +1019,14 @@ def triton_qsa_paged_index_scores(
     request_indices: torch.Tensor,
     tokens_per_block: int,
     compress_ratio: int,
+    only_visible_blocks: bool = False,
 ) -> torch.Tensor:
-    """Score every visible compressed key directly in the paged side cache."""
+    """Score compressed keys directly in the paged side cache.
+
+    ``only_visible_blocks`` leaves columns at and beyond each row's causal
+    boundary unspecified. Callers may enable it only when their consumer uses
+    the same per-row boundary and cannot inspect those columns.
+    """
     rows, num_index_heads, index_head_dim = q.shape
     max_compressed_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
     output = torch.empty(
@@ -1055,6 +1071,7 @@ def triton_qsa_paged_index_scores(
         BLOCK_H=max(16, triton.next_power_of_2(num_index_heads)),
         BLOCK_N=block_n,
         TILES_PER_PROGRAM=tiles_per_program,
+        ONLY_VISIBLE_BLOCKS=only_visible_blocks,
         num_warps=2,
     )
     return output

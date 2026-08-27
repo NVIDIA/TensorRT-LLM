@@ -771,6 +771,10 @@ def select_qsa_paged_tokens(
         request_indices=request_indices,
         tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
         compress_ratio=params.compress_ratio,
+        # CUDA radix Top-K scans only [row_starts, row_ends), so score tiles
+        # outside the causal boundary need not be materialized. Preserve fully
+        # initialized logits for the Torch fallback below.
+        only_visible_blocks=top_k is not None and q.is_cuda,
     )
     if top_k is not None and logits.is_cuda:
         if top_k_output is None or top_k_row_starts is None:
