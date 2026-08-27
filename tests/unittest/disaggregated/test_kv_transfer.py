@@ -1603,5 +1603,121 @@ def test_incompatible_peer_fails_only_affected_requests():
                 worker.shutdown()
 
 
+# ---------------------------------------------------------------------------
+# Completion-signal ordering (https://nvbugs/6669114): perf logging must never
+# delay task.complete(). A stalled perf-CSV write on the receive completion
+# path used to hold the completion event past kv_transfer_timeout, so the gen
+# block-all waiter reported a spurious transfer failure although both
+# endpoints had already recorded the transfer as landed.
+# ---------------------------------------------------------------------------
+class _PerfStubReceiver:
+    """Receiver stand-in for RxSession completion-path tests: no ZMQ, no agent."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
+
+        self._bounce = NoBounceTransport()
+        self._registrar = SimpleNamespace(
+            self_rank_info=SimpleNamespace(instance_name="gen_perf_stub", instance_rank=0)
+        )
+        self.dispatched = []
+
+    def setup_session(self, session):
+        pass
+
+    def clear_session(self, unique_rid):
+        pass
+
+    def dispatch_task(self, task):
+        # Single writer, like the failing CI topology (one ctx peer per gen rank).
+        task.expected_transfers = 1
+        self.dispatched.append(task)
+
+
+def _make_rx_session_with_one_task(timeout_s):
+    session = transfer_mod.RxSession(
+        request_id=64,
+        params=DisaggregatedParams(disagg_request_id=64),
+        receiver=_PerfStubReceiver(),
+        timeout_s=timeout_s,
+    )
+    session.receive(KVSlice(is_last_slice=True, block_ids_per_layer_groups=[]))
+    return session
+
+
+@pytest.mark.cpu_only
+@pytest.mark.timeout(30)
+def test_rx_block_all_not_delayed_by_slow_perf_logging(monkeypatch):
+    """Regression test for https://nvbugs/6669114.
+
+    The completion callback used to run perf-CSV logging BEFORE signalling
+    task completion, so a stalled CSV write (e.g. a shared-filesystem hiccup
+    on the listener thread) held the completion event past the blocking
+    waiter's timeout and the fully-landed transfer was reported FAILED.
+    Completion must be observable while perf logging is still in flight.
+    """
+    import threading
+
+    timeout_s = 2.0
+    stall_s = 5.0
+    perf_entered = threading.Event()
+
+    def slow_print_perf_info(self, peer_rank, instance_name, instance_rank):
+        perf_entered.set()
+        time.sleep(stall_s)
+
+    monkeypatch.setattr(transfer_mod.KVRecvTask, "print_perf_info", slow_print_perf_info)
+
+    session = _make_rx_session_with_one_task(timeout_s)
+    listener = threading.Thread(
+        target=session.process_kv_agent_result,
+        kwargs=dict(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=transfer_mod.AgentResult.SUCCESS,
+        ),
+        daemon=True,
+    )
+    start = time.monotonic()
+    listener.start()
+    result = session.wait_complete(blocking=True)
+    elapsed = time.monotonic() - start
+
+    assert result == WaitResult.COMPLETED, f"blocking wait returned {result}"
+    assert elapsed < timeout_s / 2, (
+        f"completion took {elapsed:.2f}s; it must not ride out the perf-logging stall"
+    )
+    assert session.is_completed()
+    listener.join(timeout=stall_s + 10)
+    assert not listener.is_alive()
+    assert perf_entered.is_set(), "perf logging was skipped entirely"
+    session.close()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.timeout(30)
+def test_rx_completion_survives_perf_logging_error(monkeypatch):
+    """A raising perf logger must not fail or hang the transfer (perf is best-effort)."""
+
+    def raising_print_perf_info(self, peer_rank, instance_name, instance_rank):
+        raise RuntimeError("synthetic perf logging failure")
+
+    monkeypatch.setattr(transfer_mod.KVRecvTask, "print_perf_info", raising_print_perf_info)
+
+    session = _make_rx_session_with_one_task(timeout_s=5.0)
+    session.process_kv_agent_result(
+        peer_rank=0,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=transfer_mod.AgentResult.SUCCESS,
+    )
+    assert session.wait_complete(blocking=True) == WaitResult.COMPLETED
+    assert session.is_completed()
+    session.close()
+
+
 if __name__ == "__main__":
     test_transfer_worker_v1(1, 1, False, 1, 1, False, False)
