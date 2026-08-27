@@ -14,7 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
+                    Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -28,9 +29,9 @@ except ImportError:
 
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
-                                 is_trace_enabled, mpi_comm, mpi_disabled,
-                                 nvtx_range, set_thread_local_mpi_comm,
-                                 trace_func)
+                                 global_mpi_size, is_trace_enabled, mpi_comm,
+                                 mpi_disabled, nvtx_range,
+                                 set_thread_local_mpi_comm, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -44,7 +45,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
@@ -309,6 +310,39 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     # Clearing it is also the byte-budget release: the scheduler derives
     # occupancy from live states, so this request stops counting next tick.
     request.py_mm_encoder_state = None
+
+
+@contextmanager
+def _distributed_warmup_guard(dist: Distributed,
+                              mapping: Mapping) -> Iterator[None]:
+    """Arm the rank-crash watchdog when warmup fails on a subset of ranks.
+
+    Warmup runs from ``PyExecutor.__init__``, before the executor loop and so
+    before ``_event_loop_wrapper`` arms this watchdog itself. A rank that
+    raises here leaves every peer blocked in a warmup collective it will
+    never join, until that peer's own HangDetector times out.
+
+    The watchdog's grace period is what keeps the failure diagnosable: the
+    worker's setup/RPC error path reports the exception before the abort
+    tears the world down, and ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` tunes it.
+
+    ``SystemExit`` / ``KeyboardInterrupt`` are excluded for the same reason
+    ``_event_loop_wrapper`` leaves them unarmed: they are teardown signals
+    the launcher is already acting on, and an MPI_Abort on top would turn a
+    clean Ctrl-C into exit 137.
+
+    Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
+    peers live only in the latter, while a TorchDist launch can have several
+    model ranks in a single-process MPI world.
+    """
+    try:
+        yield
+    except Exception:
+        if dist.world_size > 1 or mapping.dwdp_enabled:
+            start_rank_crash_kill_watchdog(max(dist.world_size,
+                                               global_mpi_size()),
+                                           error_delivered=None)
+        raise
 
 
 @dataclasses.dataclass
@@ -747,7 +781,8 @@ class PyExecutor:
         self.is_warmup = True
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+        with torch.cuda.stream(self.execution_stream), \
+                _distributed_warmup_guard(self.dist, self.dist.mapping):
             self.model_engine.warmup(self.resource_manager)
             if self.draft_model_engine is not None:
                 self.draft_model_engine.warmup(self.resource_manager)
@@ -763,8 +798,9 @@ class PyExecutor:
             # CUDA graph capture inherits per-thread CUDA library state. Capture
             # on the same single worker that owns every runtime encoder replay.
             self.encoder_stream.wait_stream(self.execution_stream)
-            self.encoder_launch_executor.submit(
-                self._warmup_encoder_cuda_graphs_enc_dec).result()
+            with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                self.encoder_launch_executor.submit(
+                    self._warmup_encoder_cuda_graphs_enc_dec).result()
 
         self.is_warmup = False
 
