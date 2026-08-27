@@ -328,15 +328,20 @@ class FusedMoEMethodBase(ABC):
         w3_w1_bias_shape: Optional[tuple[int, int]] = None,
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
+        from ...locality_domain_utils import get_current_locality_domain
+        is_locality_domain_weights = get_current_locality_domain() is not None
+        device = torch.device('cuda') if is_locality_domain_weights else None
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                dtype=weight_dtype),
+                                                dtype=weight_dtype,
+                                                device=device),
                                     requires_grad=False)
         module.register_parameter("w3_w1_weight", w3_w1_weight)
 
         # down_proj (row parallel)
         w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                             dtype=weight_dtype),
+                                             dtype=weight_dtype,
+                                             device=device),
                                  requires_grad=False)
         module.register_parameter("w2_weight", w2_weight)
 
@@ -760,6 +765,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
+
+
+class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
+    """Weight loading for BF16/FP16 CuTE DSL MoE on Rubin (SM107).
+
+    Extends UnquantizedFusedMoEMethod by interleaving FC1 (w3_w1) weights
+    for the fused gather + grouped GEMM + SwiGLU kernel. The SwiGLU fusion
+    requires gate/up weights to be interleaved with granularity=32 along
+    the intermediate dimension (dim=1).
+    """
+
+    def load_expert_w3_w1_weight(
+        self,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        allow_partial_loading: bool = False,
+    ):
+        super().load_expert_w3_w1_weight(
+            module,
+            w1_weight,
+            w3_weight,
+            dst_w3_w1_weight,
+            allow_partial_loading,
+        )
+        # Interleave gate/up weights for GEMM + SwiGLU fusion.
+        # Per-expert weight layout after super(): [w3(up), w1(gate)] along dim=0.
+        # interleave produces [up_0:32, gate_0:32, up_32:64, gate_32:64, ...].
+        w3_w1 = dst_w3_w1_weight.cuda()
+        w3_w1_interleaved = interleave_linear_and_gate(w3_w1,
+                                                       group_size=32,
+                                                       dim=0)
+        dst_w3_w1_weight.copy_(w3_w1_interleaved)
 
 
 class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -2258,6 +2297,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        block_scales_vec_size,
                        scaling_vector_size=16,
                        bias_dtype: Optional[torch.dtype] = None):
+        from ...locality_domain_utils import get_current_locality_domain
+        is_locality_domain_weights = get_current_locality_domain() is not None
+        locality_domain_factor = 2 if is_locality_domain_weights else 1
+        device = torch.device('cuda') if is_locality_domain_weights else None
 
         module.scaling_vector_size = scaling_vector_size
 
@@ -2266,16 +2309,35 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
          w2_weight_scale_shape) = self.get_weights_shapes(
              module, weight_vec_size, block_scales_vec_size)
 
+        # Apply locality_domain_factor to divide weight and scale shapes
+        if locality_domain_factor > 1:
+            w3_w1_weight_shape = (w3_w1_weight_shape[0],
+                                  w3_w1_weight_shape[1] //
+                                  locality_domain_factor, w3_w1_weight_shape[2])
+            w2_weight_shape = (w2_weight_shape[0],
+                               w2_weight_shape[1] // locality_domain_factor,
+                               w2_weight_shape[2])
+            w3_w1_weight_scale_shape = (w3_w1_weight_scale_shape[0],
+                                        w3_w1_weight_scale_shape[1] //
+                                        locality_domain_factor,
+                                        w3_w1_weight_scale_shape[2])
+            w2_weight_scale_shape = (w2_weight_scale_shape[0],
+                                     w2_weight_scale_shape[1] //
+                                     locality_domain_factor,
+                                     w2_weight_scale_shape[2])
+
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
         w3_w1_weight_scale = nn.Parameter(torch.ones(w3_w1_weight_scale_shape,
-                                                     dtype=block_scales_dtype),
+                                                     dtype=block_scales_dtype,
+                                                     device=device),
                                           requires_grad=False)
         module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
 
         # row parallel
         w2_weight_scale = nn.Parameter(torch.ones(w2_weight_scale_shape,
-                                                  dtype=block_scales_dtype),
+                                                  dtype=block_scales_dtype,
+                                                  device=device),
                                        requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -3517,6 +3579,11 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                                      w3_weight_scale,
                                                      dst_w3_w1_weight_scale,
                                                      expert_idx=expert_idx)
+        from ...locality_domain_utils import get_current_locality_domain
+        is_locality_domain_weights = get_current_locality_domain() is not None
+        locality_domain_factor = 2 if is_locality_domain_weights else 1
+        # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
+        module.intermediate_size_per_partition * 2 // locality_domain_factor
 
         # CuteDsl interleave deferred to process_weights_after_loading().
 
