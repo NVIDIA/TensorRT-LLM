@@ -3234,6 +3234,7 @@ class PyExecutor:
                     # handling can terminate the request.
                     self.kv_cache_manager.update_context_resources(
                         scheduled_requests)
+                    self._commit_draft_context_kv_blocks(scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -4370,6 +4371,7 @@ class PyExecutor:
                         # handling can terminate the request.
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
+                        self._commit_draft_context_kv_blocks(scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -5249,6 +5251,7 @@ class PyExecutor:
                             and scheduled_batch.context_requests):
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
+                        self._commit_draft_context_kv_blocks(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -7777,6 +7780,45 @@ class PyExecutor:
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
+
+    def _commit_draft_context_kv_blocks(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """Commit this iteration's newly-computed draft context KV into the
+        draft V2 KV cache manager's own prefix-reuse trie, mirroring
+        ``self.kv_cache_manager.update_context_resources()``'s commit of the
+        target manager's blocks.
+
+        Only applies to a *fused* (one-model) draft: ``self.drafter is
+        None`` there (see ``SpeculativeDecodingMode.has_spec_drafter()`` --
+        EAGLE3/MTP one-model modes don't register a ``ModelDrafter``,
+        because the draft forward is embedded directly in the target
+        engine's own forward rather than driven by a separate drafter
+        object). In that case ``scheduled_requests.context_requests`` are the
+        *same* request objects the target manager just used -- their
+        ``context_current_position`` already reflects exactly the token
+        range this iteration's fused forward computed for both target and
+        draft (the safe common reused prefix, once
+        ``KVCacheManagerV2._cap_tokens_for_paired_draft_reuse`` capped it),
+        so it is valid to pass straight to the draft manager's
+        ``try_commit_blocks``.
+
+        A two-model (separate draft engine) drafter builds its own draft
+        ``LlmRequest`` objects with independently-tracked positions and a
+        differently-transformed token stream (see ``model_drafter.py``); the
+        target's own request objects would be the wrong key for that
+        manager, so this deliberately does nothing when ``self.drafter is
+        not None``. That path is not modified by this change.
+        """
+        if self.drafter is not None:
+            return
+        draft_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if draft_kv_cache_manager is None or not getattr(
+                draft_kv_cache_manager, "enable_block_reuse", False):
+            return
+        for request in scheduled_requests.context_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                draft_kv_cache_manager.try_commit_blocks(request)
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):

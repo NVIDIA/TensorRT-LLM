@@ -2092,6 +2092,21 @@ class KvCacheCreator:
                 original_max_seq_len,
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config)
+            # One-model (fused) draft: the draft forward shares the target's
+            # own request object and compute range this iteration, so the
+            # target manager's first-chunk reuse lookup can be safely bounded
+            # by what the draft manager's own trie can back (see
+            # KVCacheManagerV2._cap_tokens_for_paired_draft_reuse). Two-model
+            # (separate draft engine, self._draft_model_engine is not None,
+            # handled in the branch above) is deliberately never wired here:
+            # its draft LlmRequest objects and token stream are independently
+            # tracked, so the target's request object is the wrong key for
+            # that manager's trie.
+            if isinstance(kv_cache_manager,
+                          KVCacheManagerV2) and isinstance(
+                              draft_kv_cache_manager, KVCacheManagerV2):
+                kv_cache_manager._paired_draft_kv_cache_manager = (
+                    draft_kv_cache_manager)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None

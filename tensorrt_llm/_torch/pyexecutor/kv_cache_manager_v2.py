@@ -121,6 +121,29 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
 
+# TEMPORARY DIAGNOSTIC INSTRUMENTATION for the EAGLE3/MTP draft-side
+# block-reuse fix (see scripts/repro.py). Not a product change; safe to
+# delete once validated. Uses plain print() (not `logger`) so it is visible
+# regardless of TLLM_LOG_LEVEL, including under TLLM_WORKER_USE_SINGLE_PROCESS=1.
+_EAGLE3_REPRO_DEBUG = os.environ.get("TLLM_EAGLE3_REPRO_DEBUG", "0") == "1"
+
+
+def _repro_debug(tag: str, **fields) -> None:
+    if not _EAGLE3_REPRO_DEBUG:
+        return
+    kv = " ".join(f"{k}={v}" for k, v in fields.items())
+    print(f"[EAGLE3-DEBUG][{tag}] {kv}", flush=True)
+
+
+def _repro_debug_token_hash(tokens) -> str:
+    """Short stable hash of a reuse lookup key, for diagnostic log lines only
+    (not used for any actual radix-tree/hashing decision)."""
+    try:
+        data = b",".join(str(int(t)).encode() for t in tokens)
+    except (TypeError, ValueError):
+        data = repr(list(tokens)).encode()
+    return hashlib.sha256(data).hexdigest()[:16]
+
 
 class Role:
     KEY = DataRole("key")
@@ -818,6 +841,19 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+
+        # Set by the creator (_util.py) for a *target* manager paired with a
+        # one-model (fused) draft V2 KV cache manager that keys its own
+        # prefix-reuse trie on the EAGLE3-shifted token sequence (see
+        # _draft_reuse_tokens). When set, first-chunk context prep bounds how
+        # much of a request's prefix this manager may attach as reused to
+        # what the paired draft manager's own trie can also back with valid
+        # KV, via a non-attaching probe -- see _cap_tokens_for_paired_draft_reuse.
+        # None for the draft manager itself, and for any target manager not
+        # paired with a one-model draft (e.g. two-model/external-drafter
+        # configurations, which must not be driven through this coupling --
+        # see the docstring on _cap_tokens_for_paired_draft_reuse).
+        self._paired_draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
 
         # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
         # can distinguish the throwaway estimation-phase managers from the
@@ -2475,6 +2511,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     tokens = self._augment_tokens_for_block_reuse(
                         all_tokens, req, end=len(all_tokens) - 1
                     )
+                    tokens = self._cap_tokens_for_paired_draft_reuse(req, tokens)
                 else:
                     tokens = None
                 kv_cache = self._create_kv_cache(
@@ -2500,6 +2537,39 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                # req.context_current_position is a C++-level DUAL-MODE field
+                # (mContextCurrentPositionTarget / mContextCurrentPositionDraft,
+                # selected by req.use_draft_model) -- see llmRequest.h
+                # getContextCurrentPosition/setContextCurrentPosition. This
+                # write, running here in target mode (not inside
+                # request_context(True, ...)), only ever touches the TARGET
+                # side. A paired one-model draft manager's own
+                # _prepare_draft_resources runs *inside*
+                # request_context(True, ...), so a plain read of
+                # req.context_current_position there resolves to the
+                # separate, independently-tracked DRAFT-side field -- which
+                # nothing above ever writes. Stash the final (already
+                # paired-capped, if applicable) target-side value as an
+                # ordinary Python attribute (bypasses the dual-mode C++
+                # property) so the draft manager can read the real number.
+                req.py_draft_reuse_safe_prefix = req.context_current_position
+                # Same reasoning: stash the end of THIS iteration's target
+                # chunk (also target-mode-only otherwise) so a paired draft
+                # manager can size its own [safe_prefix, chunk_end) split
+                # without being able to read the target-mode field directly.
+                req.py_draft_target_chunk_end = (
+                    req.context_current_position + req.context_chunk_size
+                )
+                if _EAGLE3_REPRO_DEBUG and not self.is_draft:
+                    _repro_debug(
+                        "TARGET-reuse",
+                        req_id=req.py_request_id,
+                        safe_reused_prefix_applied=req.context_current_position,
+                        target_forward_position_range=(
+                            f"[{req.context_current_position}, "
+                            f"{req.context_current_position + req.context_chunk_size})"
+                        ),
+                    )
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -2515,6 +2585,64 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache missing for non-first context chunk, request {req.py_request_id}"
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def _cap_tokens_for_paired_draft_reuse(
+        self, req: LlmRequest, tokens: Sequence[TokenIdExt]
+    ) -> Sequence[TokenIdExt]:
+        """Bound a first-chunk target reuse lookup key to what a paired
+        one-model draft V2 KV cache manager's own trie can also back with
+        valid draft KV, via a non-attaching probe of the draft trie.
+
+        Called *before* this manager's real (attaching) lookup runs, so the
+        target never commits/skips more of the prefix than the draft can
+        actually serve this iteration -- avoiding ever needing to "recompute"
+        target hidden states for an already-committed/shared prefix region
+        (not supported, and would be a target fallback/recompute path).
+        Combined with capping the draft's own real attach to
+        ``req.context_current_position`` in ``_prepare_draft_resources``
+        (which, after this runs, already reflects
+        ``min(target_trie_hit_tokens, draft_trie_hit_tokens)``), this makes
+        both managers agree on the same safe reused prefix without either
+        side ever attaching more than the other can validate.
+
+        A no-op (returns *tokens* unchanged) when: this manager has no
+        paired draft manager (only wired for one-model/fused draft configs --
+        see ``_paired_draft_kv_cache_manager``); the paired manager has block
+        reuse disabled; *req* is a dummy/warmup request (never populates the
+        draft trie); *req* has speculative decoding disabled (no draft KV
+        cache will exist for it); or *tokens* is already empty.
+        """
+        draft_mgr = self._paired_draft_kv_cache_manager
+        if (
+            draft_mgr is None
+            or not draft_mgr.enable_block_reuse
+            or req.is_dummy
+            or getattr(req, "py_disable_speculative_decoding", False)
+            or not len(tokens)
+        ):
+            return tokens
+        draft_tokens = draft_mgr._draft_reuse_tokens(req)
+        draft_hit = draft_mgr.probe_prefix_match_length(
+            draft_tokens, req.lora_task_id, req.cache_salt
+        )
+        if _EAGLE3_REPRO_DEBUG:
+            target_hit_probe = self.probe_prefix_match_length(
+                tokens, req.lora_task_id, req.cache_salt
+            )
+            _repro_debug(
+                "TARGET-draft-paired-reuse-cap",
+                req_id=req.py_request_id,
+                target_trie_hit_tokens=target_hit_probe,
+                draft_trie_hit_tokens=draft_hit,
+                safe_reused_prefix=min(target_hit_probe, draft_hit),
+            )
+        if draft_hit >= len(tokens):
+            return tokens
+        if draft_hit <= 0:
+            # No draft-side reuse at all: match the enable_block_reuse=False
+            # convention (None, not an empty sequence) for the real lookup.
+            return None
+        return tokens[:draft_hit]
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2661,10 +2789,28 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
+                    # req.context_current_position is a C++-level DUAL-MODE
+                    # field (mContextCurrentPositionTarget vs
+                    # mContextCurrentPositionDraft, selected by
+                    # req.use_draft_model -- see llmRequest.h). We are inside
+                    # request_context(True, scheduled_batch) here, so a plain
+                    # read of req.context_current_position resolves to the
+                    # DRAFT side, which nothing else ever writes before this
+                    # point -- it is NOT the target's skip boundary. The
+                    # target manager's own _prepare_context_impl stashes its
+                    # final (already paired-capped, if applicable) value as
+                    # a plain Python attribute for exactly this reason; see
+                    # the comment there.
+                    safe_prefix = getattr(req, "py_draft_reuse_safe_prefix", 0)
+                    draft_lookup_tokens = None
+                    if self.enable_block_reuse and not req.is_dummy and safe_prefix > 0:
+                        draft_lookup_tokens = self._draft_reuse_tokens(
+                            req, end=safe_prefix
+                        )
                     kv_cache = self._create_kv_cache(
                         req.py_request_id,
                         req.lora_task_id,
-                        None,
+                        draft_lookup_tokens,
                         cache_salt=req.cache_salt,
                         is_dummy=req.is_dummy,
                     )
@@ -2675,7 +2821,55 @@ class KVCacheManagerV2(BaseResourceManager):
                         # slots free up, before the request runs any spec-dec
                         # forward that needs the mirror.
                         continue
-                    kv_cache.stop_committing()
+                    if not self.enable_block_reuse or req.is_dummy:
+                        kv_cache.stop_committing()
+                    else:
+                        # Else: leave committing open. try_commit_blocks
+                        # (called for this manager from py_executor.py,
+                        # mirroring the target manager's own
+                        # update_context_resources call, and running
+                        # *outside* request_context -- i.e. in target mode,
+                        # so it reads the target-side field, which the
+                        # target manager already advances correctly)
+                        # commits whatever this draft forward actually
+                        # computes into the trie for a future request to hit.
+                        matched = kv_cache.num_committed_tokens
+                        # Reflect the real, validated split into this
+                        # manager's OWN (draft-mode) position/chunk fields --
+                        # still request_context(True, ...) here, so this
+                        # writes mContextCurrentPositionDraft/
+                        # mContextChunkSizeDraft, not the target's fields.
+                        chunk_end = getattr(req, "py_draft_target_chunk_end", None)
+                        if chunk_end is not None:
+                            req.context_current_position = matched
+                            req.context_chunk_size = chunk_end - matched
+                        if _EAGLE3_REPRO_DEBUG:
+                            try:
+                                attached_block_ids = self.get_batch_cache_indices(
+                                    [req.py_request_id])[0]
+                                attached_block_ids = (
+                                    attached_block_ids.tolist() if hasattr(
+                                        attached_block_ids, "tolist") else
+                                    list(attached_block_ids))
+                            except Exception:  # noqa: BLE001 - diagnostic only
+                                attached_block_ids = None
+                            _repro_debug(
+                                "DRAFT-reuse-lookup",
+                                req_id=req.py_request_id,
+                                safe_prefix_requested=safe_prefix,
+                                lookup_key_len=(
+                                    len(draft_lookup_tokens)
+                                    if draft_lookup_tokens is not None else 0
+                                ),
+                                lookup_key_hash=(
+                                    _repro_debug_token_hash(draft_lookup_tokens)
+                                    if draft_lookup_tokens is not None else "n/a"
+                                ),
+                                draft_trie_hit_tokens=matched,
+                                draft_context_start=req.context_current_position,
+                                draft_context_chunk=req.context_chunk_size,
+                                attached_block_ids=attached_block_ids,
+                            )
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
@@ -2687,6 +2881,20 @@ class KVCacheManagerV2(BaseResourceManager):
                     + draft_len
                     + self.num_extra_kv_tokens
                 )
+                if _EAGLE3_REPRO_DEBUG:
+                    # This manager's OWN (draft-mode) bookkeeping view, not
+                    # necessarily proof of what gets embedded/computed by the
+                    # actual forward -- see DRAFT-forward-ground-truth
+                    # (eagle3.py), logged from attn_metadata/position_ids
+                    # immediately before the real forward, for that.
+                    _repro_debug(
+                        "DRAFT-capacity-range",
+                        req_id=req.py_request_id,
+                        draft_kv_cache_manager_position_range=(
+                            f"[{req.context_current_position}, "
+                            f"{req.context_current_position + req.context_chunk_size})"
+                        ),
+                    )
                 if not kv_cache.resize(capacity):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
@@ -2726,6 +2934,40 @@ class KVCacheManagerV2(BaseResourceManager):
         if _cpp_introspection is not None:
             return req.get_tokens_view(DEFAULT_BEAM_INDEX)
         return req.get_tokens(DEFAULT_BEAM_INDEX)
+
+    def _draft_reuse_tokens(
+        self, req: LlmRequest, start: int = 0, end: int | None = None
+    ) -> Sequence[TokenIdExt]:
+        """EAGLE3-transformed token sequence used as this draft manager's own
+        radix-tree key -- both to look up (probe or attach) a draft KV
+        prefix committed by an earlier request with the same prompt, and to
+        commit newly-computed draft KV under that same key
+        (try_commit_blocks).
+
+        EAGLE3/MTP-Eagle drafts consume the target's own token stream shifted
+        left by one position (draft position ``p`` is fed
+        ``target_tokens[p + 1]``; see ``_prepare_context_input_ids`` in
+        ``speculative/interface.py`` and ``get_draft_model_prompt`` in
+        ``speculative/model_drafter.py``, which apply the same shift when
+        building the tokens actually fed to the draft model). Multimodal
+        content digests are spliced in first (via
+        ``_augment_tokens_for_block_reuse``, over the *unshifted* token
+        positions, matching where ``req.multimodal_positions`` are defined)
+        so the shift only ever reorders already-content-addressed entries.
+
+        ``start``/``end`` are positions in the *shifted* (draft) sequence.
+        When ``end`` is None, it defaults to one past the last known
+        position: the final element of the full shifted sequence is the
+        position whose token is not yet known (the next token to be
+        sampled), the same "last token cannot be recovered" convention the
+        target uses for its own first-chunk lookup key.
+        """
+        all_tokens = self._reuse_token_source(req)
+        augmented = self._augment_tokens_for_block_reuse(all_tokens, req)
+        shifted = augmented[1:]
+        if end is None:
+            end = len(shifted) - 1
+        return shifted[start:end]
 
     def _augment_tokens_for_block_reuse(
         self, tokens: Sequence[int], req: LlmRequest, start: int = 0, end: int | None = None
@@ -3495,9 +3737,23 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def try_commit_blocks(self, request: LlmRequest) -> None:
-        should_block_reuse = (
-            self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
-        )
+        """Commit this manager's own newly-computed KV for *request* into its
+        prefix-reuse trie, from ``num_committed_tokens`` up to
+        ``request.context_current_position``.
+
+        Works for both the target manager and a draft V2 manager
+        (``self.is_draft``): the draft manager keys its trie on the
+        EAGLE3-shifted token sequence (``_draft_reuse_tokens``) instead of
+        the raw target tokens, since that is what its own KV positions
+        actually hold. Callers are responsible for only invoking this with a
+        *request* object whose ``context_current_position``/token stream is
+        valid for *this* manager: for a one-model (fused) draft manager that
+        is the same shared request object the target manager uses (their
+        compute ranges are identical by construction); a two-model (separate
+        draft engine) draft manager must not be driven through this path
+        with the target's own request object.
+        """
+        should_block_reuse = self.enable_block_reuse and not request.is_dummy_request
         if not should_block_reuse:
             return
 
@@ -3506,15 +3762,36 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         if request.context_current_position > kv_cache.num_committed_tokens:
-            tokens = self._augment_tokens_for_block_reuse(
-                self._reuse_token_source(request),
-                request,
-                start=kv_cache.num_committed_tokens,
-                end=request.context_current_position,
-            )
+            if self.is_draft:
+                tokens = self._draft_reuse_tokens(
+                    request,
+                    start=kv_cache.num_committed_tokens,
+                    end=request.context_current_position,
+                )
+            else:
+                tokens = self._augment_tokens_for_block_reuse(
+                    self._reuse_token_source(request),
+                    request,
+                    start=kv_cache.num_committed_tokens,
+                    end=request.context_current_position,
+                )
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
+            if _EAGLE3_REPRO_DEBUG and self.is_draft:
+                try:
+                    block_ids = self.get_batch_cache_indices(
+                        [request.py_request_id])[0]
+                    block_ids = (block_ids.tolist() if hasattr(
+                        block_ids, "tolist") else list(block_ids))
+                except Exception:  # noqa: BLE001 - diagnostic only
+                    block_ids = None
+                _repro_debug(
+                    "DRAFT-commit",
+                    req_id=request.py_request_id,
+                    committed_tokens=kv_cache.num_committed_tokens,
+                    committed_block_ids=block_ids,
+                )
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
@@ -4033,7 +4310,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if not self.enable_block_reuse:
             return 0
-        if not input_tokens:
+        # len(), not `not input_tokens`: input_tokens may be a zero-copy
+        # numpy int32 view (get_tokens_view), whose truth value is ambiguous
+        # for more than one element.
+        if len(input_tokens) == 0:
             return 0
         salt_int = self._derive_reuse_salt(cache_salt)
         return self.impl.probe_reuse(
