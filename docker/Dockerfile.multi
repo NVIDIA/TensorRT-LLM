@@ -118,6 +118,22 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     fi && \
     bash /opt/docker/common/install_ci.sh
 
+# Allow MPI/PRTE to run as root inside the container (inherited by rubin-release
+# since it uses this image as DEVEL_IMAGE).
+ENV PIP_EXTRA_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    CUTE_DSL_LIBS=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so
+
+# ── Install flashinfer 0.6.18 internal ──
+RUN pip install \
+        "flashinfer_python==0.6.18+cf3c3a3e.nvinternal.rubin.0.8dev.devel.cu.64035134" \
+        --index-url https://gitlab-master.nvidia.com/api/v4/projects/179191/packages/pypi/simple \
+        --no-deps --force-reinstall
+
+
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
 COPY cpp cpp
