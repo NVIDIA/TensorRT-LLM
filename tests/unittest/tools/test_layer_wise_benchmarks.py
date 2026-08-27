@@ -9,11 +9,14 @@ import sys
 import tempfile
 from pathlib import Path
 from subprocess import check_call
+from typing import Iterable
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell
+
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator, Mode
 
 _LAYER_WISE_BENCHMARKS_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337228")
 
@@ -421,9 +424,12 @@ def test_performance_alignment(llm_root, world_size):
 # ---------------------------------------------------------------------------
 
 
-def _replay_calibrator(iterations, tokens=32, top_k=6, layers=4):
-    from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator, Mode
-
+def _replay_calibrator(
+    iterations: Iterable[int],
+    tokens: int = 32,
+    top_k: int = 6,
+    layers: int = 4,
+) -> Calibrator:
     calibrator = Calibrator()
     calibrator.mode = Mode.REPLAY
     calibrator._replay_db = {
@@ -438,20 +444,20 @@ def _replay_calibrator(iterations, tokens=32, top_k=6, layers=4):
     return calibrator
 
 
-def test_missing_replay_iterations_none_when_the_window_fits():
+def test_missing_replay_iterations_none_when_the_window_fits() -> None:
     calibrator = _replay_calibrator(range(100, 126))
     assert calibrator.get_missing_replay_iterations(105, 125) == []
     assert calibrator.get_missing_replay_iterations(100, 125) == []
 
 
-def test_missing_replay_iterations_past_the_end():
+def test_missing_replay_iterations_past_the_end() -> None:
     calibrator = _replay_calibrator(range(100, 126))
     assert calibrator.get_missing_replay_iterations(124, 128) == [126, 127, 128]
     assert calibrator.get_missing_replay_iterations(0, 3) == [0, 1, 2, 3]
 
 
-def test_missing_replay_iterations_sees_a_hole():
-    """The case a first/last comparison cannot answer.
+def test_missing_replay_iterations_sees_a_hole() -> None:
+    """Report the case a first/last comparison cannot answer.
 
     get_replay_iteration_range() raises on a non-contiguous calibration, so a bounds
     check has nothing to compare against and the KeyError comes back at pre_step().
@@ -462,19 +468,17 @@ def test_missing_replay_iterations_sees_a_hole():
     assert calibrator.get_missing_replay_iterations(105, 125) == [111, 112]
 
 
-def test_missing_replay_iterations_requires_replay_mode():
-    from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator
-
+def test_missing_replay_iterations_requires_replay_mode() -> None:
     with pytest.raises(ValueError, match="only valid in REPLAY mode"):
         Calibrator().get_missing_replay_iterations(0, 1)
 
 
-def test_replay_token_count_when_every_layer_agrees():
+def test_replay_token_count_when_every_layer_agrees() -> None:
     assert _replay_calibrator(range(100, 103), tokens=64).get_replay_token_count() == 64
 
 
-def test_replay_token_count_is_none_when_layers_disagree():
-    """None, rather than an error, when the recorded layers disagree.
+def test_replay_token_count_is_none_when_layers_disagree() -> None:
+    """Return None, rather than an error, when the recorded layers disagree.
 
     A calibration whose layers disagree cannot be replayed under one CUDA graph
     either; None leaves that complaint to the caller instead of raising a second
@@ -483,3 +487,39 @@ def test_replay_token_count_is_none_when_layers_disagree():
     calibrator = _replay_calibrator(range(100, 103), tokens=64)
     calibrator._replay_db[101]["metadata"][0]["token_selected_slots_shape"] = [32, 6]
     assert calibrator.get_replay_token_count() is None
+
+
+def test_replay_token_count_compares_the_whole_shape() -> None:
+    """Reject a range that agrees on tokens and differs in top_k.
+
+    One CUDA graph holds one shape, and [64, 6] is not [64, 8]; comparing only the
+    token dimension would call this range replayable.
+    """
+    calibrator = _replay_calibrator(range(100, 103), tokens=64, top_k=6)
+    calibrator._replay_db[101]["metadata"][0]["token_selected_slots_shape"] = [64, 8]
+    assert calibrator.get_replay_token_count() is None
+
+
+def test_replay_token_count_is_scoped_to_the_window() -> None:
+    """Ignore records outside the window being replayed.
+
+    Unscoped, a single stray iteration at another shape makes the whole file look
+    inconsistent and takes a perfectly replayable window down with it.
+    """
+    calibrator = _replay_calibrator(range(105, 126), tokens=64)
+    calibrator._replay_db[99] = {
+        "metadata": [{"layer_idx": k, "token_selected_slots_shape": [32, 6]} for k in range(4)]
+    }
+    assert calibrator.get_replay_token_count() is None
+    assert calibrator.get_replay_token_count(105, 125) == 64
+    assert calibrator.get_replay_token_count(99, 125) is None
+
+
+def test_replay_token_count_is_none_for_an_empty_window() -> None:
+    calibrator = _replay_calibrator(range(100, 126), tokens=64)
+    assert calibrator.get_replay_token_count(200, 300) is None
+
+
+def test_replay_token_count_requires_replay_mode() -> None:
+    with pytest.raises(ValueError, match="only valid in REPLAY mode"):
+        Calibrator().get_replay_token_count()

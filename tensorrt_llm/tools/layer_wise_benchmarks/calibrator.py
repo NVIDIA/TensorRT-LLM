@@ -680,20 +680,19 @@ class Calibrator:
             f" and {chunk_count} chunks"
         )
 
-    def get_replay_token_count(self):
-        """Tokens per iteration the calibration recorded, for the sliced layers.
+    def get_replay_token_count(
+        self, start_iter: int | None = None, stop_iter: int | None = None
+    ) -> int | None:
+        """Get the tokens per iteration recorded for the sliced layers.
 
-        This is what the replay has to reproduce: layer-wise puts
-        `batch_size * seq_len_q` tokens through MoE, and the recorded routing was
-        captured at whatever count the engine was running. If the two differ, the
-        replay is profiling a different workload than the one calibrated.
+        Args:
+            start_iter: First iteration to consider, inclusive. None means all.
+            stop_iter: Last iteration to consider, inclusive. None means all.
 
         Returns:
-            int: the token count, when every recorded layer agrees on it.
-            None: when they do not. A calibration whose layers disagree cannot be
-                replayed under one CUDA graph either, and that is a separate
-                complaint from this one -- returning None leaves it to the caller
-                rather than raising a second error about the first problem.
+            int: the count, when every record in the range agrees on it.
+            None: when they disagree or the range is empty; one CUDA graph holds
+                one shape, so such a range cannot be replayed.
 
         Raises:
             ValueError: If mode is not REPLAY.
@@ -703,25 +702,26 @@ class Calibrator:
                 f"get_replay_token_count() is only valid in REPLAY mode, "
                 f"current mode is {self.mode.name}"
             )
-        counts = {
-            m["token_selected_slots_shape"][0]
-            for entry in self._replay_db.values()
+        # The whole shape, not just its token dimension: a range agreeing on tokens
+        # and differing in top_k is still more than one shape.
+        shapes = {
+            tuple(m["token_selected_slots_shape"])
+            for iteration, entry in self._replay_db.items()
+            if (start_iter is None or iteration >= start_iter)
+            and (stop_iter is None or iteration <= stop_iter)
             for m in entry["metadata"]
         }
-        return counts.pop() if len(counts) == 1 else None
+        return shapes.pop()[0] if len(shapes) == 1 else None
 
-    def get_missing_replay_iterations(self, start_iter, stop_iter):
-        """Iterations in [start_iter, stop_iter] this rank's calibration does not hold.
-
-        Membership rather than bounds: a calibration with a hole in it satisfies a
-        first/last comparison and still raises KeyError in pre_step().
+    def get_missing_replay_iterations(self, start_iter: int, stop_iter: int) -> list[int]:
+        """Get the iterations in [start_iter, stop_iter] this rank does not hold.
 
         Args:
             start_iter: First iteration of the requested window, inclusive.
             stop_iter: Last iteration of the requested window, inclusive.
 
         Returns:
-            list[int]: The missing iterations, ascending. Empty when all are present.
+            list[int]: The missing iterations, ascending; empty when all are present.
 
         Raises:
             ValueError: If mode is not REPLAY.
