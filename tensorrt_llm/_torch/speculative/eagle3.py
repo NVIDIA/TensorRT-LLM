@@ -1363,11 +1363,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata.gather_ids,
             accepted_tokens,
             num_contexts,
-            context_prompt_lookahead_tokens=(
+            prompt_lookahead_tokens=(
                 spec_metadata.context_prompt_lookahead_tokens
-                if self.is_mtp_eagle else None),
-            context_prompt_lookahead_lens=(
-                spec_metadata.context_prompt_lookahead_lens
                 if self.is_mtp_eagle else None))
 
         # generation

@@ -5539,7 +5539,7 @@ class PyTorchModelEngine(ModelEngine):
         context_prompt_lookahead_buffer = (
             spec_metadata.context_prompt_lookahead_tokens
             if spec_metadata is not None else None)
-        if isinstance(context_prompt_lookahead_buffer, torch.Tensor):
+        if context_prompt_lookahead_buffer is not None:
             context_prompt_lookahead = []
 
         def append_cross_attention_state(request: LlmRequest,
@@ -6913,8 +6913,7 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
-            if isinstance(spec_metadata.context_prompt_lookahead_tokens,
-                          torch.Tensor):
+            if spec_metadata.context_prompt_lookahead_tokens is not None:
                 # No-cache context inputs contain the complete prompt, so
                 # there is never a valid token beyond the current chunk.
                 spec_metadata.populate_context_prompt_lookahead(

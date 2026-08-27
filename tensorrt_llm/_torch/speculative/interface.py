@@ -92,6 +92,11 @@ def rejection_sampling_one_model(
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
 
+# Prompt token IDs are nonnegative. Use a distinct value for positions without
+# a valid prompt lookahead token so CUDA-graph replay can select the sampled
+# token without a separate validity buffer.
+INVALID_PROMPT_LOOKAHEAD_TOKEN = -1
+
 # RNG pool configuration for the fractional (probabilistic) component of the
 # synthetic acceptance rate. Pool size MUST be a power of two so we can use
 # a bitmask (`& (pool_size - 1)`) for wrap-around — this stays cheap and
@@ -462,10 +467,8 @@ class SpecMetadata:
     # Shape: [max_num_requests, max_draft_len]. A consumer may use as many
     # columns as its physical draft layers require. MTP Eagle currently uses
     # only column 0 because it repeatedly executes one physical MTP layer.
+    # Unused positions contain INVALID_PROMPT_LOOKAHEAD_TOKEN.
     context_prompt_lookahead_tokens: Optional[torch.Tensor] = None
-    # Number of valid lookahead tokens in each row above.
-    # Shape: [max_num_requests].
-    context_prompt_lookahead_lens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -679,13 +682,9 @@ class SpecMetadata:
 
     def allocate_context_prompt_lookahead(self) -> None:
         """Allocate CUDA-graph-stable prompt lookahead buffers."""
-        self.context_prompt_lookahead_tokens = torch.zeros(
+        self.context_prompt_lookahead_tokens = torch.full(
             (self.max_num_requests, self.max_draft_len),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.context_prompt_lookahead_lens = torch.zeros(
-            self.max_num_requests,
+            INVALID_PROMPT_LOOKAHEAD_TOKEN,
             dtype=torch.int32,
             device="cuda",
         )
@@ -695,7 +694,6 @@ class SpecMetadata:
         """Populate prompt lookahead for the context rows of this batch."""
         if self.context_prompt_lookahead_tokens is None:
             return
-        assert self.context_prompt_lookahead_lens is not None
 
         num_contexts = len(lookahead_tokens)
         if num_contexts == 0:
@@ -708,7 +706,8 @@ class SpecMetadata:
         width = self.context_prompt_lookahead_tokens.shape[1]
         valid_lens = [min(len(tokens), width) for tokens in lookahead_tokens]
         padded_tokens = [
-            tokens[:valid_len] + [0] * (width - valid_len)
+            tokens[:valid_len] + [INVALID_PROMPT_LOOKAHEAD_TOKEN] *
+            (width - valid_len)
             for tokens, valid_len in zip(lookahead_tokens, valid_lens)
         ]
         tokens_cpu = torch.tensor(
@@ -717,16 +716,8 @@ class SpecMetadata:
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        valid_lens_cpu = torch.tensor(
-            valid_lens,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
         self.context_prompt_lookahead_tokens[:num_contexts].copy_(
             tokens_cpu, non_blocking=True)
-        self.context_prompt_lookahead_lens[:num_contexts].copy_(
-            valid_lens_cpu, non_blocking=True)
 
     def _populate_request_rng_state(
             self, requests: list["LlmRequest"],
@@ -2662,8 +2653,7 @@ class SpecWorkerBase(nn.Module, ABC):
         gather_ids,
         accepted_tokens,
         num_contexts,
-        context_prompt_lookahead_tokens=None,
-        context_prompt_lookahead_lens=None,
+        prompt_lookahead_tokens=None,
     ):
         """
         Prepare context input IDs for draft model forward.
@@ -2675,10 +2665,8 @@ class SpecWorkerBase(nn.Module, ABC):
             gather_ids: Indices for placing accepted tokens (last token positions)
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
             num_contexts: Number of context requests
-            context_prompt_lookahead_tokens: Optional prompt tokens following
+            prompt_lookahead_tokens: Optional prompt tokens following
                 each current context chunk.
-            context_prompt_lookahead_lens: Number of valid lookahead tokens for
-                each context row.
 
         Returns:
             input_ids_ctx: Prepared context input IDs
@@ -2690,11 +2678,11 @@ class SpecWorkerBase(nn.Module, ABC):
                                              device="cuda")
             input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
             context_tail_tokens = accepted_tokens[:num_contexts, 0]
-            if context_prompt_lookahead_tokens is not None:
-                assert context_prompt_lookahead_lens is not None
+            if prompt_lookahead_tokens is not None:
+                lookahead_tokens = prompt_lookahead_tokens[:num_contexts, 0]
                 context_tail_tokens = torch.where(
-                    context_prompt_lookahead_lens[:num_contexts] > 0,
-                    context_prompt_lookahead_tokens[:num_contexts, 0],
+                    lookahead_tokens != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+                    lookahead_tokens,
                     context_tail_tokens,
                 )
             input_ids_ctx[gather_ids[:num_contexts]] = context_tail_tokens

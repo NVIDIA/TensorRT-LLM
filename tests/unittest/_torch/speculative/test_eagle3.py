@@ -42,6 +42,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
                                                     MTPEagleWorker)
+from tensorrt_llm._torch.speculative.interface import \
+    INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
     MTPEagleDynamicTreeWorker
 from tensorrt_llm.executor.request import LoRARequest
@@ -293,6 +295,7 @@ def test_eagle3_one_model_capture_uses_real_token_count() -> None:
 
 @skip_num_gpus_less_than(1)
 def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
+    invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
     spec_config = MTPDecodingConfig(max_draft_len=3, mtp_eagle_one_model=True)
     spec_metadata = Eagle3OneModelSpecMetadata(
         max_num_requests=2,
@@ -311,11 +314,20 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
     assert graph_metadata.context_prompt_lookahead_tokens.shape == (1, 3)
     assert (graph_metadata.context_prompt_lookahead_tokens.data_ptr()
             != spec_metadata.context_prompt_lookahead_tokens.data_ptr())
+    assert torch.all(graph_metadata.context_prompt_lookahead_tokens == invalid)
 
     # The first row is an intermediate chunk and has prompt lookahead. The
     # second row is the final chunk and must retain the sampled-token fallback.
-    spec_metadata.populate_context_prompt_lookahead([[13, 14, 15], [22]])
-    spec_metadata.populate_context_prompt_lookahead([[13, 14, 15], []])
+    spec_metadata.populate_context_prompt_lookahead([[0, 14, 15], [22]])
+    torch.testing.assert_close(
+        spec_metadata.context_prompt_lookahead_tokens[:2],
+        torch.tensor(
+            [[0, 14, 15], [22, invalid, invalid]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+    )
+    spec_metadata.populate_context_prompt_lookahead([[0, 14, 15], []])
 
     worker = MTPEagleWorker(spec_config)
     draft_inputs = worker.prepare_1st_drafter_inputs(
@@ -337,41 +349,49 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
 
     torch.testing.assert_close(
         draft_inputs["input_ids"],
-        torch.tensor([11, 12, 13, 21, 88], dtype=torch.int32, device="cuda"),
+        torch.tensor([11, 12, 0, 21, 88], dtype=torch.int32, device="cuda"),
     )
     torch.testing.assert_close(
-        spec_metadata.context_prompt_lookahead_lens[:2],
-        torch.tensor([3, 0], dtype=torch.int32, device="cuda"),
+        spec_metadata.context_prompt_lookahead_tokens[:2],
+        torch.tensor(
+            [[0, 14, 15], [invalid] * 3],
+            dtype=torch.int32,
+            device="cuda",
+        ),
     )
 
 
 @skip_num_gpus_less_than(1)
 def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
+    invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
     worker = object.__new__(MTPEagleDynamicTreeWorker)
+    lookahead_tokens = torch.tensor(
+        [[13, 14, 15], [invalid] * 3],
+        dtype=torch.int32,
+        device="cuda",
+    )
     draft_inputs = worker._prepare_step0_drafter_inputs(
-        input_ids=torch.tensor([10, 11, 12], dtype=torch.int32, device="cuda"),
-        position_ids=torch.arange(3, dtype=torch.int32, device="cuda"),
-        last_tokens_idx=torch.tensor([2], dtype=torch.int32, device="cuda"),
-        hidden_states=torch.zeros((3, 4), device="cuda"),
-        accepted_tokens=torch.tensor([[99, 0, 0, 0]],
-                                     dtype=torch.int32,
-                                     device="cuda"),
-        attn_metadata=SimpleNamespace(num_contexts=1,
-                                      num_seqs=1,
-                                      num_ctx_tokens=3),
-        spec_metadata=SimpleNamespace(
-            context_prompt_lookahead_tokens=torch.tensor([[13, 14, 15]],
-                                                         dtype=torch.int32,
-                                                         device="cuda"),
-            context_prompt_lookahead_lens=torch.tensor([3],
-                                                       dtype=torch.int32,
-                                                       device="cuda"),
+        input_ids=torch.tensor([10, 11, 12, 20, 21],
+                               dtype=torch.int32,
+                               device="cuda"),
+        position_ids=torch.arange(5, dtype=torch.int32, device="cuda"),
+        last_tokens_idx=torch.tensor([2, 4], dtype=torch.int32, device="cuda"),
+        hidden_states=torch.zeros((5, 4), device="cuda"),
+        accepted_tokens=torch.tensor(
+            [[99, 0, 0, 0], [88, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
         ),
+        attn_metadata=SimpleNamespace(num_contexts=2,
+                                      num_seqs=2,
+                                      num_ctx_tokens=5),
+        spec_metadata=SimpleNamespace(
+            context_prompt_lookahead_tokens=lookahead_tokens),
     )
 
     torch.testing.assert_close(
         draft_inputs["input_ids"],
-        torch.tensor([11, 12, 13], dtype=torch.int32, device="cuda"),
+        torch.tensor([11, 12, 13, 21, 88], dtype=torch.int32, device="cuda"),
     )
 
 

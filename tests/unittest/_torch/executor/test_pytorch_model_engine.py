@@ -1657,7 +1657,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           max_num_tokens=32,
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
-        spec_metadata = Mock()
+        # A bare Mock auto-vivifies every attribute, so optional metadata
+        # fields read by _prepare_tp_inputs must be pinned off explicitly.
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
 
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_current_position = 3

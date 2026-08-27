@@ -788,8 +788,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             last_tokens_idx,
             accepted_tokens,
             num_contexts,
-            context_prompt_lookahead_tokens=spec_metadata.context_prompt_lookahead_tokens,
-            context_prompt_lookahead_lens=spec_metadata.context_prompt_lookahead_lens,
+            prompt_lookahead_tokens=spec_metadata.context_prompt_lookahead_tokens,
         )
 
         if num_gens > 0:
