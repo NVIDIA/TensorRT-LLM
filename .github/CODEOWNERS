@@ -247,10 +247,11 @@
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
-# Disagg tests: co-own with the owning team so disagg-devs review disagg-test changes.
-/tests/integration/defs/accuracy/*disagg* @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
-/tests/integration/defs/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
-/tests/integration/defs/stress_test/disagg_cancel @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
+# Disagg tests: sole-owned. Owners on one line are OR, so co-owning made the disagg
+# review advisory -- any co-owner approval satisfied the gate on its own.
+/tests/integration/defs/accuracy/*disagg* @NVIDIA/trt-llm-disagg-devs
+/tests/integration/defs/disaggregated @NVIDIA/trt-llm-disagg-devs
+/tests/integration/defs/stress_test/disagg_cancel @NVIDIA/trt-llm-disagg-devs
 /tests/scripts/perf-sanity/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
 /tests/scripts/perf/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/_torch/executor/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
