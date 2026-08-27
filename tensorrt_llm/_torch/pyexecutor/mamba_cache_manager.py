@@ -27,6 +27,7 @@ import triton.language as tl
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.sampling_params import SamplingParams
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
@@ -352,6 +353,13 @@ class PythonMambaCacheManager(BaseResourceManager):
                     kwargs[k] = v[layer]
             return type(self)(**kwargs)
 
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """Whether the Kimi K3 KDA fused-verify replay caches are
+            allocated. The base (non-speculative) state never has them; the
+            speculative state overrides this."""
+            return False
+
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens.
@@ -408,6 +416,31 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
+
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """True when the KDA fused-verify replay caches were allocated
+            (the fused ``trtllm::kda_mtp_decode`` verify path)."""
+            return self.kda_qkg_cache is not None
+
+        def commit_conv_window(self, slot_indices: torch.Tensor,
+                               conv_q: torch.Tensor, conv_k: torch.Tensor,
+                               conv_v: torch.Tensor, conv_size: int) -> None:
+            """Seed the KDA replay conv caches' committed window from freshly
+            advanced FLA conv windows.
+
+            The committed window (columns ``[0, W-1)`` of ``kda_conv_*``) must
+            hold the last ``W-1`` raw conv inputs whenever another path
+            (prefill, plain decode) advances the base conv pool. The FLA
+            window's oldest column drops out of every future convolution, so
+            columns ``[1, W)`` of the FLA window map 1:1 onto the committed
+            window. Keeping the invariant here, next to the field definitions,
+            is the reason this lives on the state rather than in the caller."""
+            for cache, window in ((self.kda_conv_q, conv_q),
+                                  (self.kda_conv_k, conv_k), (self.kda_conv_v,
+                                                              conv_v)):
+                cache[:, :, :conv_size - 1].index_copy_(
+                    0, slot_indices, window[:, :, 1:].to(cache.dtype))
 
     def __init__(
         self,
@@ -2502,6 +2535,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -2514,6 +2548,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests:
             self.requests.extend(requests)
@@ -3559,6 +3594,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -3571,6 +3607,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests and prepare_resource:
             self._setup_state_indices(requests)

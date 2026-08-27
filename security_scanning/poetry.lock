@@ -3709,14 +3709,14 @@ PyYAML = ">=5.1.0"
 
 [[package]]
 name = "openai"
-version = "3.3.1"
+version = "3.5.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.3.1-py3-none-any.whl", hash = "sha256:9652df7fdf8ee6f5bd58e0a12f2b1d414a18e0f06bb7a9a57c8643a5f5469bd3"},
-    {file = "openai-3.3.1.tar.gz", hash = "sha256:6f22807de1a976c932cecda620e8172a8c3fdbaeed29c7f21564e0c2410edf56"},
+    {file = "openai-3.5.0-py3-none-any.whl", hash = "sha256:7c0873d379655f65fa515c5692c8620e73bf6a6dce3e63f37589bc99bda3fdfd"},
+    {file = "openai-3.5.0.tar.gz", hash = "sha256:743738bb458a586d0d02d173bf398d29d7d7a80d182d167aa74f1c08814ecc78"},
 ]
 
 [package.dependencies]
@@ -6915,4 +6915,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "0a173ebdc2724037a33124d0d42a234aa64c257ae8b88f0f700cbd9c7b7b8429"
+content-hash = "ac8dd5c8a755cd9f431149918e77aea535137b1570ff6d7a88421459ffcc8057"
