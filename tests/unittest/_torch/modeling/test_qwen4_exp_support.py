@@ -584,6 +584,47 @@ def test_mapper_packs_hc_down_and_injection_with_alignment() -> None:
     )
 
 
+def test_mapper_packs_fused_hc_lowrank_padding_before_injection(monkeypatch) -> None:
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
+        Qwen4ExpHfWeightMapper,
+    )
+
+    monkeypatch.setenv("TRTLLM_QWEN4_EXP_HC_FUSED_MIX", "1")
+    mapper = Qwen4ExpHfWeightMapper()
+    mapper._config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=1,
+            linear_key_head_dim=4,
+            linear_num_key_heads=1,
+            linear_value_head_dim=4,
+            linear_num_value_heads=1,
+        ),
+        mapping=SimpleNamespace(
+            enable_attention_dp=False,
+            tp_size=1,
+            tp_rank=0,
+            has_pp=lambda: False,
+        ),
+        spec_config=None,
+    )
+    down = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    inject = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 100
+    weights = {
+        "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight": down,
+        "model.language_model.layers.0.attn_hyper_connection.block_inject_weight.weight": inject,
+    }
+
+    mapped = mapper.preprocess_weights(weights)
+
+    packed_name = "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"
+    packed = mapped[packed_name]
+    assert packed.shape == (144, 4)
+    torch.testing.assert_close(packed[:6], down)
+    torch.testing.assert_close(packed[6:128], torch.zeros(122, 4))
+    torch.testing.assert_close(packed[128:130], inject)
+    torch.testing.assert_close(packed[130:], torch.zeros(14, 4))
+
+
 def test_mtp_checkpoint_names_map_to_recurrent_runtime_layer() -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,

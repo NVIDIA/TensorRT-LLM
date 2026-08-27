@@ -12,7 +12,11 @@ def _reference_mix(module, hyper_input):
     normed = module._normed_bundle(hyper_input)
     if module.use_combine:
         packed = module.input_mix_weight_down_block_inject(normed)
-        down, injection, _ = packed.split((module.hc_lowrank, hc, module.input_mix_padding), dim=-1)
+        down = packed[..., : module.hc_lowrank]
+        injection = packed[
+            ...,
+            module.input_mix_injection_offset : module.input_mix_injection_offset + hc,
+        ]
     else:
         down = module.input_mix_weight_down(normed)
         injection = None
@@ -158,3 +162,49 @@ def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows, monkey
     torch.testing.assert_close(graph_hidden, actual_hidden, rtol=1e-2, atol=5e-3)
     torch.testing.assert_close(graph_mixed, actual_mixed, rtol=1e-2, atol=5e-3)
     torch.testing.assert_close(graph_residual[2], actual_residual[2], rtol=1e-2, atol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 4, 16])
+@torch.inference_mode()
+def test_cute_fused_mix_matches_reference_and_graph(rows, monkeypatch):
+    monkeypatch.setenv("TRTLLM_QWEN4_EXP_HC_FUSED_MIX", "1")
+    torch.manual_seed(42)
+    module = Qwen4ExpHyperConnection(
+        hc_count=4,
+        hidden_size=2560,
+        hc_lowrank=320,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    ).eval()
+    _initialize_test_weights(module)
+    hyper_input = torch.randn(
+        rows,
+        10240,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    expected_mixed, expected_residual = _reference_mix(module, hyper_input)
+    actual_mixed, actual_residual = module.mix(hyper_input)
+    torch.testing.assert_close(actual_mixed, expected_mixed, rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(
+        actual_residual[2],
+        expected_residual[2],
+        rtol=1e-2,
+        atol=5e-3,
+    )
+    assert module.input_mix_weight_down_block_inject.weight.shape == (400, 10240)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_mixed, graph_residual = module.mix(hyper_input)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_mixed, actual_mixed, rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(
+        graph_residual[2],
+        actual_residual[2],
+        rtol=1e-2,
+        atol=5e-3,
+    )

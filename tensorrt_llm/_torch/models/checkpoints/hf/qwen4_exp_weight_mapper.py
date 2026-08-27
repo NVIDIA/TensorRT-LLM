@@ -72,6 +72,7 @@ What differs from the stock HF loader (why a bespoke mapper is required):
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
 
@@ -83,6 +84,8 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.utils import split
+
+_HC_FUSED_MIX_ENV = "TRTLLM_QWEN4_EXP_HC_FUSED_MIX"
 
 # Source namespace of the text core inside the composite multimodal checkpoint.
 _LM_PREFIX = "model.language_model."
@@ -352,8 +355,14 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     f"Qwen4-Exp Hyper-Connection {prefix} has an injection "
                     "projection but no input-mix down projection"
                 )
-            padding = (-(down.shape[0] + inject.shape[0])) % 16
-            components = [down, inject]
+            lowrank_padding = (
+                (-down.shape[0]) % 128 if os.environ.get(_HC_FUSED_MIX_ENV, "0") == "1" else 0
+            )
+            components = [down]
+            if lowrank_padding:
+                components.append(down.new_zeros((lowrank_padding, down.shape[1])))
+            components.append(inject)
+            padding = (-(down.shape[0] + lowrank_padding + inject.shape[0])) % 16
             if padding:
                 components.append(down.new_zeros((padding, down.shape[1])))
             new_weights[f"{prefix}.input_mix_weight_down_block_inject.weight"] = torch.cat(
