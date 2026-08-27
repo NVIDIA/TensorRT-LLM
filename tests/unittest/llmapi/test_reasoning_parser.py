@@ -15,6 +15,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -944,6 +945,19 @@ def test_auto_detect_laguna(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "poolside_v1"
+
+
+def test_auto_detect_exaone_moe(tmp_path: Path) -> None:
+    model_dir = str(tmp_path / "K-EXAONE")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "exaone_moe")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "k-exaone"
+
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "k-exaone")
+    assert isinstance(reasoning_parser, NemotronV3ReasoningParser)
 
 
 @pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
