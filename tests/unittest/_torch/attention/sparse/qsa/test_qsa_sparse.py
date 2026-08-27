@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_prefill_compress,
     triton_qsa_unscale_block_table,
 )
+from tensorrt_llm._torch.attention_backend.sparse.qsa.metadata import QSAAttentionMetadata
 from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _query_chunk_size
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
@@ -895,6 +896,91 @@ def test_qsa_speculative_commit_restores_rejected_side_cache_entries() -> None:
     assert torch.all(index_cache[pages[2:], within[2:], 0] != -1)
     assert torch.all(position_cache[pages[2:], within[2:]] != -1)
     assert indexer._pending_speculative_cache is None
+
+
+@pytest.mark.parametrize(
+    ("sequence_lengths", "num_contexts", "expected"),
+    [
+        ([8, 1], 1, False),
+        ([8, 4], 1, True),
+        ([1, 1], 2, False),
+        ([4, 1, 3], 1, True),
+    ],
+)
+def test_qsa_speculative_snapshot_state_uses_host_lengths(
+    sequence_lengths: list[int],
+    num_contexts: int,
+    expected: bool,
+) -> None:
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._seq_lens = torch.tensor(sequence_lengths, dtype=torch.int32)
+    metadata._num_contexts = num_contexts
+
+    metadata._refresh_qsa_speculative_snapshot_state()
+
+    assert metadata.qsa_needs_speculative_snapshot is expected
+
+
+def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
+    indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer._pending_speculative_cache = object()
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_seqs=2,
+        num_tokens=2,
+        is_cuda_graph=False,
+        qsa_needs_speculative_snapshot=False,
+    )
+    empty = torch.empty(0, dtype=torch.long)
+
+    indexer._capture_speculative_cache_state(
+        layer_idx=0,
+        request_indices=empty,
+        pages=empty,
+        within=empty,
+        index_cache=empty,
+        position_cache=empty,
+        metadata=metadata,
+    )
+
+    assert indexer._pending_speculative_cache is None
+
+
+def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> None:
+    indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer._pending_speculative_cache = None
+    metadata = SimpleNamespace(
+        num_contexts=0,
+        num_seqs=1,
+        num_tokens=4,
+        is_cuda_graph=False,
+        qsa_needs_speculative_snapshot=True,
+        seq_lens_cuda=torch.tensor([4], dtype=torch.int32),
+        kv_cache_manager=SimpleNamespace(qsa_position_layer_id=0),
+    )
+    request_indices = torch.zeros(4, dtype=torch.long)
+    pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
+    position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
+
+    indexer._capture_speculative_cache_state(
+        layer_idx=0,
+        request_indices=request_indices,
+        pages=pages,
+        within=within,
+        index_cache=index_cache,
+        position_cache=position_cache,
+        metadata=metadata,
+    )
+
+    pending = indexer._pending_speculative_cache
+    assert pending is not None
+    assert pending["token_ordinals"].tolist() == [0, 1, 2, 3]
+    torch.testing.assert_close(pending["index_values"], index_cache[pages, within, 0])
+    torch.testing.assert_close(pending["position_values"], position_cache[pages, within])
 
 
 def test_ple_state_views_use_v2_lifecycle_buffers(monkeypatch: pytest.MonkeyPatch) -> None:

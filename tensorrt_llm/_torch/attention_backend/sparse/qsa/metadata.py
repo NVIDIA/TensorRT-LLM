@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -21,6 +21,11 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
     """Graph-stable request mapping used by the QSA index and GQA paths."""
 
     sparse_metadata_params: Optional[QSASparseMetadataParams] = None
+    qsa_needs_speculative_snapshot: bool = field(
+        init=False,
+        default=False,
+        repr=False,
+    )
 
     def __init__(self, *args, **kwargs) -> None:
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
@@ -174,8 +179,14 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             page_index_scale=self._qsa_page_index_scale,
         )
 
+    def _refresh_qsa_speculative_snapshot_state(self) -> None:
+        """Cache whether eager generation contains multi-token verification rows."""
+        generation_lens = self.seq_lens[self.num_contexts : self.num_seqs]
+        self.qsa_needs_speculative_snapshot = any(length > 1 for length in generation_lens.tolist())
+
     def prepare(self) -> None:
         super().prepare()
+        self._refresh_qsa_speculative_snapshot_state()
         self._refresh_qsa_block_table()
         self._refresh_qsa_token_mapping()
 
