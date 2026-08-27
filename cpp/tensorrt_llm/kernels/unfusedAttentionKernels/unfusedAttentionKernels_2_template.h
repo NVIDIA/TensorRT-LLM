@@ -334,6 +334,24 @@ inline __device__ void quantizeAndWriteFP4KVCache(uint8_t* kBlockScales, uint8_t
     vDst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, false>(vPacked, vSecondLevelSF, vSfOut);
 }
 
+template <typename T, int VECS_PER_HEAD>
+inline __device__ void quantizeAndWriteFP4VCache(
+    uint8_t* vBlockScales, uint32_t* vDst, float vSecondLevelSF, int inBlockIdx, PackedVec<T>& vPacked)
+{
+    uint8_t* vSfOut = nullptr;
+    constexpr int NUM_SFS_PER_HEAD = VECS_PER_HEAD / 2;
+    if (inBlockIdx % 2 == 0)
+    {
+        auto const blockScaleIdxDst = inBlockIdx / 2;
+        auto const tokenIdxV = blockScaleIdxDst / NUM_SFS_PER_HEAD;
+        auto const headDimIdxV = blockScaleIdxDst % NUM_SFS_PER_HEAD;
+        auto const blockScaleIdxDstV = (tokenIdxV / 4) * 4 * NUM_SFS_PER_HEAD + headDimIdxV * 4 + (tokenIdxV % 4);
+        vSfOut = vBlockScales + blockScaleIdxDstV;
+    }
+    constexpr int SF_VEC_SIZE = 16;
+    vDst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, false>(vPacked, vSecondLevelSF, vSfOut);
+}
+
 template <typename T, typename TCache, int Dh_MAX, bool ADD_BIAS, bool STORE_QKV, typename KVCacheBuffer,
     RotaryPositionEmbeddingType ROTARY_TYPE, bool DYNAMIC_ROTARY_SCALING, bool FP8_OUTPUT, bool GEN_PHASE>
 __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuffer> params)
@@ -384,7 +402,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 #else
     constexpr bool ENABLE_4BITS_CACHE = false;
 #endif
-    constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1 && !ENABLE_4BITS_CACHE;
+    constexpr bool ENABLE_MIXED_KV_CACHE = std::is_same_v<KVCacheBuffer, MixedKVBlockArray>;
+    constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1 && !ENABLE_4BITS_CACHE && !ENABLE_MIXED_KV_CACHE;
     int const sizePerHeadDivX = params.size_per_head / VEC_SIZE;
     // This is only used by nvfp4 kv cache where Dh_MAX is same as head size (others are not supported yet).
     constexpr int VECS_PER_HEAD = Dh_MAX / VEC_SIZE;
@@ -575,7 +594,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 // Cast float scale to dst data type.
                 using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
                 [[maybe_unused]] TScale scaleOrigQuant;
-                if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
+                if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE || ENABLE_MIXED_KV_CACHE)
                 {
                     mmha::convert_from_float(
                         &scaleOrigQuant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
@@ -617,7 +636,21 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 
                     if (valid_kv_cache_pos && !helix_inactive)
                     {
-                        if constexpr (ENABLE_8BITS_CACHE)
+                        if constexpr (ENABLE_MIXED_KV_CACHE)
+                        {
+                            using TScaleK = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
+                            TScaleK kScaleOrigQuant;
+                            mmha::convert_from_float(&kScaleOrigQuant,
+                                params.qkv_scale_orig_quant != nullptr ? params.qkv_scale_orig_quant[1] : 1.0f);
+                            auto const fp4InBlockIdx = inBlockIdx;
+                            mmha::store_8bits_vec(kDst, k_to_cache, fp4InBlockIdx * VEC_SIZE, kScaleOrigQuant);
+                            auto* vBlockScales = reinterpret_cast<uint8_t*>(
+                                params.kv_cache_block_scales_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
+                            auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
+                            quantizeAndWriteFP4VCache<T, VECS_PER_HEAD>(vBlockScales, reinterpret_cast<uint32_t*>(vDst),
+                                params.qkv_scale_orig_quant[2], fp4InBlockIdx, vPacked);
+                        }
+                        else if constexpr (ENABLE_8BITS_CACHE)
                         {
                             inBlockIdx = inBlockIdx * VEC_SIZE;
                             // Store 8bits kv cache.
@@ -659,7 +692,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
         }
         // Take the quantization scales into consideration.
         float q_scale_quant_orig, k_scale_quant_orig, v_scale_quant_orig;
-        if constexpr (ENABLE_4BITS_CACHE)
+        if constexpr (ENABLE_4BITS_CACHE || ENABLE_MIXED_KV_CACHE)
         {
             q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
             k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[1] : 1.f;
@@ -782,8 +815,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 #else
     constexpr bool ENABLE_4BITS_CACHE = false;
 #endif
+    constexpr bool ENABLE_MIXED_KV_CACHE = std::is_same_v<KVCacheBuffer, MixedKVBlockArray>;
     // int8 / fp8 kv cache.
-    constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1 && !ENABLE_4BITS_CACHE;
+    constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1 && !ENABLE_4BITS_CACHE && !ENABLE_MIXED_KV_CACHE;
 
     // Head idx.
     int const head_idx = blockIdx.y;
@@ -993,7 +1027,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             // Cast float scale to dst data type.
             using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
             [[maybe_unused]] TScale scaleOrigQuant;
-            if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
+            if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE || ENABLE_MIXED_KV_CACHE)
             {
                 mmha::convert_from_float(
                     &scaleOrigQuant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
@@ -1035,7 +1069,21 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
                 if (valid_kv_cache_pos && !helix_inactive)
                 {
-                    if constexpr (ENABLE_8BITS_CACHE)
+                    if constexpr (ENABLE_MIXED_KV_CACHE)
+                    {
+                        using TScaleK = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
+                        TScaleK kScaleOrigQuant;
+                        mmha::convert_from_float(&kScaleOrigQuant,
+                            params.qkv_scale_orig_quant != nullptr ? params.qkv_scale_orig_quant[1] : 1.0f);
+                        auto const fp4InBlockIdx = inBlockIdx;
+                        mmha::store_8bits_vec(kDst, k, fp4InBlockIdx * ELTS_PER_VEC, kScaleOrigQuant);
+                        auto* vBlockScales = reinterpret_cast<uint8_t*>(
+                            params.kv_cache_block_scales_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
+                        auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
+                        quantizeAndWriteFP4VCache<T, VECS_PER_HEAD>(vBlockScales, reinterpret_cast<uint32_t*>(vDst),
+                            params.qkv_scale_orig_quant[2], fp4InBlockIdx, vPacked);
+                    }
+                    else if constexpr (ENABLE_8BITS_CACHE)
                     {
                         inBlockIdx = inBlockIdx * ELTS_PER_VEC;
                         // Cast float scale to dst data type. Default to 1.0
@@ -1084,7 +1132,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
         // Take the quantization scales into consideration.
         float q_scale_quant_orig, k_scale_quant_orig, v_scale_quant_orig;
-        if constexpr (ENABLE_4BITS_CACHE)
+        if constexpr (ENABLE_4BITS_CACHE || ENABLE_MIXED_KV_CACHE)
         {
             q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
             k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[1] : 1.f;
@@ -1242,7 +1290,7 @@ template <typename T, typename TCache, typename KVCacheBuffer>
 void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
 #ifdef ENABLE_FP4
-    constexpr bool isFP4 = std::is_same_v<TCache, __nv_fp4_e2m1>;
+    constexpr bool isFP4 = std::is_same_v<TCache, __nv_fp4_e2m1> || std::is_same_v<KVCacheBuffer, MixedKVBlockArray>;
 #else
     constexpr bool isFP4 = false;
 #endif
@@ -1567,12 +1615,12 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     TLLM_CHECK_WITH_INFO(params.size_per_head % 8 == 0, "Head size needs to be multiple of 8!");
     TLLM_CHECK_WITH_INFO(params.rotary_embedding_dim % 8 == 0, "Rotary embedding dimension needs to be multiple of 8!");
 
-// NVFP4 kv cache requires head size to be power of 2.
+// NVFP4 data conversion requires head size to be power of 2.
 #ifdef ENABLE_FP4
-    if (std::is_same_v<TCache, __nv_fp4_e2m1>)
+    if (std::is_same_v<TCache, __nv_fp4_e2m1> || std::is_same_v<KVCacheBuffer, MixedKVBlockArray>)
     {
         TLLM_CHECK_WITH_INFO((params.size_per_head & (params.size_per_head - 1)) == 0,
-            "Head size needs to be power of 2 for nvfp4 kv cache.");
+            "Head size needs to be power of 2 for NVFP4 cache data.");
     }
 #endif
 

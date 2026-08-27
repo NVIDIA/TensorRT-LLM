@@ -139,6 +139,12 @@ public:
         return QuantMode(BaseType(1u) << 17);
     }
 
+    // Keep in sync with QuantMode.FP8_K_NVFP4_V_KV_CACHE in mode.py.
+    static constexpr QuantMode fp8KNvfp4VKvCache() noexcept
+    {
+        return QuantMode(BaseType(1u) << 19);
+    }
+
     constexpr BaseType value() const noexcept
     {
         return mValue;
@@ -199,6 +205,11 @@ public:
         return isSet(fp4KvCache());
     }
 
+    constexpr bool hasFp8KNvfp4VKvCache() const noexcept
+    {
+        return isSet(fp8KNvfp4VKvCache());
+    }
+
     constexpr bool hasFp8Qdq() const noexcept
     {
         return isSet(fp8Qdq());
@@ -236,7 +247,7 @@ public:
 
     constexpr bool hasKvCacheQuant() const noexcept
     {
-        return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache();
+        return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache() || hasFp8KNvfp4VKvCache();
     }
 
     static constexpr QuantMode fromDescription(bool quantizeWeights, bool quantizeActivations, bool perToken,
@@ -441,6 +452,10 @@ public:
         else if (kvCacheQuantAlgo == "NVFP4")
         {
             quantMode += fp4KvCache();
+        }
+        else if (kvCacheQuantAlgo == "FP8_K_NVFP4_V")
+        {
+            quantMode += fp8KNvfp4VKvCache();
         }
 
         return quantMode;

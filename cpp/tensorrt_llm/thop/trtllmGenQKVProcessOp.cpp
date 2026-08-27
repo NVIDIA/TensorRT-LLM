@@ -42,6 +42,7 @@ using tensorrt_llm::kernels::BlockSparseParams;
 using tensorrt_llm::kernels::BuildDecoderInfoParams;
 using tensorrt_llm::kernels::KVBlockArray;
 using tensorrt_llm::kernels::KvCacheDataType;
+using tensorrt_llm::kernels::MixedKVBlockArray;
 using tensorrt_llm::kernels::PositionEmbeddingType;
 using tensorrt_llm::kernels::QKVPreprocessingParams;
 using tensorrt_llm::kernels::RotaryScalingType;
@@ -248,6 +249,139 @@ GenerationWorkspaceRawViews makeGenerationWorkspaceRawViews(
     };
 }
 
+template <typename DstCacheBuffer, typename SrcCacheBuffer>
+QKVPreprocessingParams<void, DstCacheBuffer> copyQkvParams(QKVPreprocessingParams<void, SrcCacheBuffer> const& src)
+{
+    QKVPreprocessingParams<void, DstCacheBuffer> dst{};
+    dst.qkv_input = src.qkv_input;
+    dst.cross_kv_input = src.cross_kv_input;
+    dst.quantized_qkv_output = src.quantized_qkv_output;
+    dst.q_output = src.q_output;
+    dst.qkv_bias = src.qkv_bias;
+    dst.qkv_scale_quant_orig = src.qkv_scale_quant_orig;
+    dst.qkv_scale_orig_quant = src.qkv_scale_orig_quant;
+    dst.o_scale_orig_quant = src.o_scale_orig_quant;
+    dst.fmha_bmm1_scale = src.fmha_bmm1_scale;
+    dst.fmha_bmm2_scale = src.fmha_bmm2_scale;
+    dst.fmha_tile_counter = src.fmha_tile_counter;
+    dst.logn_scaling = src.logn_scaling;
+    dst.tokens_info = src.tokens_info;
+    dst.seq_lens = src.seq_lens;
+    dst.cache_seq_lens = src.cache_seq_lens;
+    dst.encoder_seq_lens = src.encoder_seq_lens;
+    dst.cu_seq_lens = src.cu_seq_lens;
+    dst.cu_kv_seq_lens = src.cu_kv_seq_lens;
+    dst.sparse_kv_offsets = src.sparse_kv_offsets;
+    dst.sparse_kv_indices = src.sparse_kv_indices;
+    dst.rotary_embedding_inv_freq = src.rotary_embedding_inv_freq;
+    dst.rotary_coef_cache_buffer = src.rotary_coef_cache_buffer;
+    dst.spec_decoding_position_offsets = src.spec_decoding_position_offsets;
+    dst.mrope_rotary_cos_sin = src.mrope_rotary_cos_sin;
+    dst.mrope_position_deltas = src.mrope_position_deltas;
+    dst.helix_position_offsets = src.helix_position_offsets;
+    dst.helix_is_inactive_rank = src.helix_is_inactive_rank;
+    dst.batch_size = src.batch_size;
+    dst.max_input_seq_len = src.max_input_seq_len;
+    dst.max_kv_seq_len = src.max_kv_seq_len;
+    dst.cyclic_kv_cache_len = src.cyclic_kv_cache_len;
+    dst.sink_token_len = src.sink_token_len;
+    dst.token_num = src.token_num;
+    dst.remove_padding = src.remove_padding;
+    dst.is_last_chunk = src.is_last_chunk;
+    dst.cross_attention = src.cross_attention;
+    dst.head_num = src.head_num;
+    dst.kv_head_num = src.kv_head_num;
+    dst.qheads_per_kv_head = src.qheads_per_kv_head;
+    dst.size_per_head = src.size_per_head;
+    dst.fmha_host_bmm1_scale = src.fmha_host_bmm1_scale;
+    dst.rotary_embedding_dim = src.rotary_embedding_dim;
+    dst.rotary_embedding_base = src.rotary_embedding_base;
+    dst.rotary_scale_type = src.rotary_scale_type;
+    dst.rotary_embedding_scale = src.rotary_embedding_scale;
+    dst.rotary_embedding_max_positions = src.rotary_embedding_max_positions;
+    dst.position_embedding_type = src.position_embedding_type;
+    dst.position_shift_enabled = src.position_shift_enabled;
+    dst.cache_type = src.cache_type;
+    dst.separate_q_kv_output = src.separate_q_kv_output;
+    dst.quantized_fp8_output = src.quantized_fp8_output;
+    dst.generation_phase = src.generation_phase;
+    dst.multi_processor_count = src.multi_processor_count;
+    dst.rotary_vision_start = src.rotary_vision_start;
+    dst.rotary_vision_length = src.rotary_vision_length;
+    return dst;
+}
+
+template <typename CacheBuffer>
+void invokeTypedQkvPreprocessing(
+    QKVPreprocessingParams<void, CacheBuffer>& params, tensorrt_llm::DataType qkvDtype, cudaStream_t stream)
+{
+    switch (qkvDtype)
+    {
+    case tensorrt_llm::DataType::kFLOAT:
+        tensorrt_llm::kernels::invokeQKVPreprocessing(
+            reinterpret_cast<QKVPreprocessingParams<float, CacheBuffer>&>(params), stream);
+        break;
+    case tensorrt_llm::DataType::kHALF:
+        tensorrt_llm::kernels::invokeQKVPreprocessing(
+            reinterpret_cast<QKVPreprocessingParams<half, CacheBuffer>&>(params), stream);
+        break;
+#ifdef ENABLE_BF16
+    case tensorrt_llm::DataType::kBF16:
+        tensorrt_llm::kernels::invokeQKVPreprocessing(
+            reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, CacheBuffer>&>(params), stream);
+        break;
+#endif
+    default: TORCH_CHECK(false, "Unsupported data type for QKV preprocessing.");
+    }
+}
+
+struct MixedPagedKvCacheBuffers
+{
+    MixedKVBlockArray kvCacheBuffer;
+    MixedKVBlockArray kvScaleCacheBuffer;
+};
+
+MixedPagedKvCacheBuffers buildMixedPagedKvCacheBuffers(at::Tensor const& kCache, at::Tensor const& vCache,
+    at::Tensor const& vScaleCache, at::Tensor const& kvCacheBlockOffsets, int32_t poolIndex, int64_t batchStart,
+    int64_t batchSize, int64_t numKvHeads, int64_t tokensPerBlock, int64_t headSize)
+{
+    TORCH_CHECK(kCache.is_cuda() && vCache.is_cuda() && vScaleCache.is_cuda(),
+        "FP8-K/NVFP4-V cache tensors must be CUDA tensors.");
+    TORCH_CHECK(kCache.is_contiguous() && vCache.is_contiguous() && vScaleCache.is_contiguous(),
+        "FP8-K/NVFP4-V cache tensors must be contiguous.");
+    TORCH_CHECK(kCache.scalar_type() == at::kFloat8_e4m3fn, "Mixed K cache must use FP8 E4M3 storage.");
+    TORCH_CHECK(vCache.scalar_type() == at::kByte, "Mixed V cache must use packed uint8 NVFP4 storage.");
+    TORCH_CHECK(
+        vScaleCache.scalar_type() == at::kFloat8_e4m3fn, "Mixed V block-scale cache must use FP8 E4M3 storage.");
+    TORCH_CHECK(kCache.dim() == 4 && vCache.dim() == 4 && vScaleCache.dim() == 4,
+        "Mixed cache tensors must use [pages, heads, page_size, head_dim] layout.");
+    TORCH_CHECK(kCache.size(1) == numKvHeads && vCache.size(1) == numKvHeads && vScaleCache.size(1) == numKvHeads,
+        "Mixed cache tensors have an invalid KV-head dimension.");
+    TORCH_CHECK(
+        kCache.size(2) == tokensPerBlock && vCache.size(2) == tokensPerBlock && vScaleCache.size(2) == tokensPerBlock,
+        "Mixed cache tensors have an invalid page size.");
+    TORCH_CHECK(kCache.size(3) == headSize && vCache.size(3) * 2 == headSize && vScaleCache.size(3) * 16 == headSize,
+        "Mixed cache tensors have invalid packed head dimensions.");
+    TORCH_CHECK(kvCacheBlockOffsets.dim() == 4 && kvCacheBlockOffsets.size(2) == 2,
+        "Mixed KV block offsets must use [pool, batch, 2, max_blocks] layout.");
+
+    auto blockTables = kvCacheBlockOffsets.select(0, poolIndex).narrow(0, batchStart, batchSize);
+    auto* blockOffsets = static_cast<MixedKVBlockArray::DataType*>(blockTables.data_ptr());
+    int32_t const maxBlocksPerSeq = static_cast<int32_t>(blockTables.size(-1));
+    int32_t const bytesPerKToken = static_cast<int32_t>(numKvHeads * headSize);
+    int32_t const bytesPerVToken = bytesPerKToken / 2;
+    int32_t const bytesPerVScaleToken = bytesPerKToken / 16;
+
+    return {
+        .kvCacheBuffer
+        = MixedKVBlockArray(static_cast<int32_t>(batchSize), maxBlocksPerSeq, static_cast<int32_t>(tokensPerBlock),
+            bytesPerKToken, bytesPerVToken, kCache.data_ptr(), vCache.data_ptr(), blockOffsets),
+        .kvScaleCacheBuffer
+        = MixedKVBlockArray(static_cast<int32_t>(batchSize), maxBlocksPerSeq, static_cast<int32_t>(tokensPerBlock),
+            bytesPerVScaleToken, bytesPerVScaleToken, vScaleCache.data_ptr(), vScaleCache.data_ptr(), blockOffsets),
+    };
+}
+
 } // anonymous namespace
 
 std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,
@@ -268,7 +402,8 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     int64_t const attention_chunk_size, bool const fp8_context_fmha, bool const paged_context_fmha,
     bool const is_mla_enable, int64_t const multi_processor_count, int64_t const total_num_blocks,
     int64_t const kv_factor, bool const need_build_kv_cache_metadata, std::optional<torch::Tensor> cross_kv,
-    bool const cross_attention)
+    bool const cross_attention, std::optional<torch::Tensor> mixed_k_cache, std::optional<torch::Tensor> mixed_v_cache,
+    std::optional<torch::Tensor> mixed_v_scale_cache)
 {
     (void) bmm2_scale;
     TORCH_CHECK(host_kv_cache_pool_pointers.has_value(), "host_kv_cache_pool_pointers is required.");
@@ -306,7 +441,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     decoderInfoParams.cpSize = 1;
     decoderInfoParams.fmhaTileCounter = ptrs.fmhaTileCounterPtr;
     decoderInfoParams.dequantScaleQkv = optPtr<float>(kv_scale_quant_orig);
-    decoderInfoParams.separateQkvScales = quantMode.hasFp4KvCache();
+    decoderInfoParams.separateQkvScales = quantMode.hasFp4KvCache() || quantMode.hasFp8KNvfp4VKvCache();
     decoderInfoParams.quantScaleO = optPtr<float>(attention_output_orig_quant);
     decoderInfoParams.fmhaHostBmm1Scale = static_cast<float>(bmm1_scale);
     decoderInfoParams.fmhaBmm1Scale = ptrs.fmhaBmm1ScalePtr;
@@ -400,23 +535,23 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qkvParams.rotary_vision_start = 0;
         qkvParams.rotary_vision_length = 0;
 
-        switch (qkvDtype)
+        if (quantMode.hasFp8KNvfp4VKvCache())
         {
-        case tensorrt_llm::DataType::kFLOAT:
-            tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
-            break;
-        case tensorrt_llm::DataType::kHALF:
-            tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
-            break;
-#ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
-            tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
-            break;
-#endif
-        default: TORCH_CHECK(false, "Unsupported data type for QKV preprocessing.");
+            TORCH_CHECK(!cross_attention, "FP8-K/NVFP4-V does not support cross attention.");
+            TORCH_CHECK(mixed_k_cache.has_value() && mixed_v_cache.has_value() && mixed_v_scale_cache.has_value(),
+                "FP8-K/NVFP4-V preprocessing requires K, V, and V-scale cache tensors.");
+            int32_t const poolIndex = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx).poolIndex;
+            auto const mixedBuffers = buildMixedPagedKvCacheBuffers(mixed_k_cache.value(), mixed_v_cache.value(),
+                mixed_v_scale_cache.value(), kv_cache_block_offsets.value(), poolIndex, 0, batch_size, num_kv_heads,
+                tokens_per_block, head_size);
+            auto mixedParams = copyQkvParams<MixedKVBlockArray>(qkvParams);
+            mixedParams.kv_cache_buffer = mixedBuffers.kvCacheBuffer;
+            mixedParams.kv_cache_block_scales_buffer = mixedBuffers.kvScaleCacheBuffer;
+            invokeTypedQkvPreprocessing(mixedParams, qkvDtype, stream);
+        }
+        else
+        {
+            invokeTypedQkvPreprocessing(qkvParams, qkvDtype, stream);
         }
         sync_check_cuda_error(stream);
     }
@@ -426,9 +561,12 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     std::optional<at::Tensor> blockTables;
     if (need_build_kv_cache_metadata)
     {
-        std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
-            host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads, tokens_per_block, head_size, kv_factor,
-            total_num_blocks, kv_cache_quant_mode, qkvScalarType);
+        if (!quantMode.hasFp8KNvfp4VKvCache())
+        {
+            std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(
+                host_kv_cache_pool_pointers.value(), host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads,
+                tokens_per_block, head_size, kv_factor, total_num_blocks, kv_cache_quant_mode, qkvScalarType);
+        }
 
         int32_t const poolIndex = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx).poolIndex;
         blockTables = kv_cache_block_offsets.value().select(0, poolIndex).narrow(0, 0, batch_size);
@@ -473,6 +611,14 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+    if (quantMode.hasFp8KNvfp4VKvCache())
+    {
+        TORCH_CHECK(
+            attention_chunk_size == 0, "FP8-K/NVFP4-V does not support chunked-attention cache postprocessing.");
+        TORCH_CHECK(cyclic_attention_window_size >= max_attention_window_size,
+            "FP8-K/NVFP4-V does not support sliding-window cache postprocessing.");
+        return;
+    }
     bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha;
     auto const ptrs = [&]
     {
@@ -588,7 +734,8 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     int64_t const position_embedding_type, double const bmm1_scale, double const bmm2_scale,
     bool const fp8_context_fmha, int64_t const predicted_tokens_per_seq, int64_t const attention_chunk_size,
     int64_t const multi_processor_count, int64_t const total_num_blocks, int64_t const kv_factor,
-    bool const need_build_kv_cache_metadata, bool const cross_attention)
+    bool const need_build_kv_cache_metadata, bool const cross_attention, std::optional<torch::Tensor> mixed_k_cache,
+    std::optional<torch::Tensor> mixed_v_cache, std::optional<torch::Tensor> mixed_v_scale_cache)
 {
     TORCH_CHECK(host_kv_cache_pool_pointers.has_value(), "host_kv_cache_pool_pointers is required.");
     TORCH_CHECK(host_kv_cache_pool_mapping.has_value(), "host_kv_cache_pool_mapping is required.");
@@ -626,7 +773,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     decoderInfoParams.cpSize = 1;
     decoderInfoParams.fmhaTileCounter = nullptr;
     decoderInfoParams.dequantScaleQkv = nullptr;
-    decoderInfoParams.separateQkvScales = quantMode.hasFp4KvCache();
+    decoderInfoParams.separateQkvScales = quantMode.hasFp4KvCache() || quantMode.hasFp8KNvfp4VKvCache();
     decoderInfoParams.quantScaleO = nullptr;
     decoderInfoParams.fmhaHostBmm1Scale = static_cast<float>(bmm1_scale);
     decoderInfoParams.fmhaBmm1Scale = nullptr;
@@ -732,23 +879,23 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         qkvParams.rotary_vision_start = 0;
         qkvParams.rotary_vision_length = 0;
 
-        switch (qkvDtype)
+        if (quantMode.hasFp8KNvfp4VKvCache())
         {
-        case tensorrt_llm::DataType::kFLOAT:
-            tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
-            break;
-        case tensorrt_llm::DataType::kHALF:
-            tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
-            break;
-#ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
-            tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
-            break;
-#endif
-        default: TORCH_CHECK(false, "Unsupported data type for QKV preprocessing.");
+            TORCH_CHECK(!cross_attention, "FP8-K/NVFP4-V does not support cross attention.");
+            TORCH_CHECK(mixed_k_cache.has_value() && mixed_v_cache.has_value() && mixed_v_scale_cache.has_value(),
+                "FP8-K/NVFP4-V preprocessing requires K, V, and V-scale cache tensors.");
+            int32_t const poolIndex = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx).poolIndex;
+            auto const mixedBuffers = buildMixedPagedKvCacheBuffers(mixed_k_cache.value(), mixed_v_cache.value(),
+                mixed_v_scale_cache.value(), kv_cache_block_offsets.value(), poolIndex, seq_offset, batch_beam,
+                num_kv_heads, tokens_per_block, head_size);
+            auto mixedParams = copyQkvParams<MixedKVBlockArray>(qkvParams);
+            mixedParams.kv_cache_buffer = mixedBuffers.kvCacheBuffer;
+            mixedParams.kv_cache_block_scales_buffer = mixedBuffers.kvScaleCacheBuffer;
+            invokeTypedQkvPreprocessing(mixedParams, qkvDtype, stream);
+        }
+        else
+        {
+            invokeTypedQkvPreprocessing(qkvParams, qkvDtype, stream);
         }
         sync_check_cuda_error(stream);
     }
@@ -758,9 +905,12 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     std::optional<at::Tensor> blockTables;
     if (need_build_kv_cache_metadata)
     {
-        std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
-            host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads, tokens_per_block, head_size, kv_factor,
-            total_num_blocks, kv_cache_quant_mode, qkvScalarType);
+        if (!quantMode.hasFp8KNvfp4VKvCache())
+        {
+            std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(
+                host_kv_cache_pool_pointers.value(), host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads,
+                tokens_per_block, head_size, kv_factor, total_num_blocks, kv_cache_quant_mode, qkvScalarType);
+        }
 
         int32_t const poolIndex = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx).poolIndex;
         blockTables = kv_cache_block_offsets.value().select(0, poolIndex).narrow(0, seq_offset, batch_beam);

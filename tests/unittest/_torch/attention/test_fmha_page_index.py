@@ -63,6 +63,83 @@ def test_flashinfer_preserves_legacy_pool_scaling() -> None:
     assert _get_total_num_blocks(manager, kv_factor=2) == 1024 * 36 * 2
 
 
+def test_mixed_kv_uses_shared_block_table_for_selected_pool() -> None:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: SimpleNamespace(local_layer_idx=1)
+    tables = torch.arange(2 * 4 * 3, dtype=torch.int32).view(2, 4, 3)
+    metadata = SimpleNamespace(
+        mixed_kv_cache_block_offsets=tables,
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0], [1, 0]], dtype=torch.int32),
+    )
+
+    selected = fmha._get_mixed_block_tables(metadata, batch_start=1, batch_size=2)
+
+    assert torch.equal(selected, tables[1, 1:3])
+    assert selected.is_contiguous()
+
+
+def test_mixed_kv_buffer_lookup_uses_global_layer_index() -> None:
+    requested_layers: list[int] = []
+    buffers = object()
+
+    def get_buffers(layer_idx: int) -> object:
+        requested_layers.append(layer_idx)
+        return buffers
+
+    class Manager:
+        is_fp8_k_nvfp4_v = True
+
+        def get_fp8_k_nvfp4_v_buffers(self, layer_idx: int) -> object:
+            return get_buffers(layer_idx)
+
+    manager = Manager()
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: SimpleNamespace(layer_idx=11, local_layer_idx=3)
+    fmha._mixed_kv_cache_buffers = None
+    fmha._mixed_kv_cache_manager_ref = None
+
+    assert fmha._get_mixed_kv_cache(SimpleNamespace(kv_cache_manager=manager)) is buffers
+    assert requested_layers == [11]
+
+
+def test_mixed_kv_buffer_lookup_refreshes_after_manager_replacement() -> None:
+    class Manager:
+        is_fp8_k_nvfp4_v = True
+
+        def __init__(self, buffers: object) -> None:
+            self.buffers = buffers
+            self.num_lookups = 0
+
+        def get_fp8_k_nvfp4_v_buffers(self, layer_idx: int) -> object:
+            assert layer_idx == 11
+            self.num_lookups += 1
+            return self.buffers
+
+    profiling_buffers = object()
+    final_buffers = object()
+    profiling_manager = Manager(profiling_buffers)
+    final_manager = Manager(final_buffers)
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: SimpleNamespace(layer_idx=11, local_layer_idx=3)
+    fmha._mixed_kv_cache_buffers = None
+    fmha._mixed_kv_cache_manager_ref = None
+
+    assert (
+        fmha._get_mixed_kv_cache(SimpleNamespace(kv_cache_manager=profiling_manager))
+        is profiling_buffers
+    )
+    assert (
+        fmha._get_mixed_kv_cache(SimpleNamespace(kv_cache_manager=profiling_manager))
+        is profiling_buffers
+    )
+    assert (
+        fmha._get_mixed_kv_cache(SimpleNamespace(kv_cache_manager=final_manager))
+        is final_buffers
+    )
+    assert profiling_manager.num_lookups == 1
+    assert final_manager.num_lookups == 1
+
+
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
     # The kernel keeps one counter per head per decoder sequence. Sizing off the
     # request count alone under-allocates under beam search, but only once the

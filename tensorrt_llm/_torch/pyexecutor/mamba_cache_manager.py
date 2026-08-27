@@ -3542,7 +3542,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # A layer group is a lifecycle, not a physical memory pool.
             # Differently sized attention buffers can share one lifecycle,
             # so scan every attention layer in this diagnostic path.
-            yield KVCacheManagerV2.get_buffers(self, global_layer_id)
+            if self.is_fp8_k_nvfp4_v:
+                buffers = self.get_fp8_k_nvfp4_v_buffers(global_layer_id)
+                yield buffers.key
+                yield buffers.value
+                yield buffers.value_scale
+            else:
+                yield KVCacheManagerV2.get_buffers(self, global_layer_id)
 
         yield from self.all_ssm_states
         yield from self.all_conv_states

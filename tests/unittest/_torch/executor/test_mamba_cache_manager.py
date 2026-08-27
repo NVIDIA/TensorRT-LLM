@@ -23,7 +23,11 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -67,6 +71,7 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
@@ -1594,6 +1599,25 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
         assert draft_cost == (64 * rank, 0)
 
 
+def test_v2_hybrid_mixed_kv_estimator_accounts_for_fp8_k_nvfp4_v():
+    model_config = _hybrid_cache_sizing_model_config(
+        ["linear_attention", "full_attention"]
+    )
+    model_config.quant_config = QuantConfig(
+        kv_cache_quant_algo=QuantAlgo.FP8_K_NVFP4_V
+    )
+
+    cache_cost = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+    )
+
+    # Per attention layer: 16 FP8 K bytes + 8 packed V bytes + 1 V scale byte.
+    assert cache_cost[0] == 25
+
+
 @pytest.mark.parametrize(
     ("spec_config", "enable_attention_dp", "expected_intercept"),
     [
@@ -2138,6 +2162,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
+    kv_cache_dtype=None,
     conv_state_layout="x_b_c",
 ):
     """Construct a real MambaHybridCacheManagerV2."""
@@ -2164,7 +2189,7 @@ def _build_v2_hybrid_with_mamba_layer(
             periodic_snapshot_interval=periodic_snapshot_interval,
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
         ),
-        dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
+        dtype=kv_cache_dtype or ("nvfp4" if dtype == DataType.NVFP4 else "auto"),
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -2302,6 +2327,29 @@ def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales():
 
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[ssm_pool_id, :, 1]) == 0
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[attention_pool_id, :, 1]) > 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp8_k_nvfp4_v_keeps_recurrent_pool_roles():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        kv_cache_dtype="fp8_k_nvfp4_v",
+    )
+    try:
+        ssm_pool_id = mgr.impl.get_layer_group_id(LayerId(0))
+        attention_pool_id = mgr.impl.get_layer_group_id(LayerId(1))
+
+        assert mgr._get_pool_roles(ssm_pool_id) == (MambaRole.SSM_STATE, None)
+        assert mgr._get_pool_roles(attention_pool_id) == (Role.KEY, Role.VALUE)
+        assert mgr.kv_cache_pool_mapping[:, 0].tolist() == [ssm_pool_id, attention_pool_id]
+
+        buffers = mgr.get_fp8_k_nvfp4_v_buffers(1)
+        assert buffers.key.dtype == torch.float8_e4m3fn
+        assert buffers.value.dtype == torch.uint8
+        assert buffers.value_scale.dtype == torch.float8_e4m3fn
+        assert len(list(mgr._iter_cache_buffers_for_invalid_check())) == 5
     finally:
         mgr.shutdown()
 

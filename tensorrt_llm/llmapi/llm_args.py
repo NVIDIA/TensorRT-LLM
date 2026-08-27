@@ -3966,13 +3966,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
-        "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
+        "is inherited as-is); 'fp8', 'fp8_ds_mla', 'nvfp4', or "
+        "'fp8_k_nvfp4_v' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4"))
+                                             "nvfp4", "fp8_k_nvfp4_v"))
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -4155,13 +4156,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_dtype(cls, v: str):
         v = v.lower()
-        if v in ("auto", "fp8", "fp8_ds_mla",
-                 "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+        if v in ("auto", "fp8", "fp8_ds_mla", "nvfp4",
+                 "fp8_k_nvfp4_v") or v in _str_to_torch_dtype_dict.keys():
             return v
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", or valid torch.dtype string')
+            '"nvfp4", "fp8_k_nvfp4_v", or valid torch.dtype string')
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -6264,6 +6265,8 @@ class TorchLlmArgs(BaseLlmArgs):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif self.kv_cache_config.dtype == 'fp8_k_nvfp4_v':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8_K_NVFP4_V
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "

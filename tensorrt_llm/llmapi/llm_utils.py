@@ -114,10 +114,12 @@ class ModelLoader:
                 )
         else:
             if quant_config.kv_cache_quant_algo not in [
-                    None, QuantAlgo.FP8, QuantAlgo.NVFP4
+                    None, QuantAlgo.FP8, QuantAlgo.NVFP4,
+                    QuantAlgo.FP8_K_NVFP4_V
             ]:
                 raise ValueError(
-                    f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                    "Only FP8, NVFP4, or FP8_K_NVFP4_V KV cache quantization "
+                    f"is allowed for a pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                 )
 
         # quantized_layers is handled separately (e.g. via LayerQuantConfig
@@ -148,6 +150,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
+            "fp8_k_nvfp4_v": QuantAlgo.FP8_K_NVFP4_V,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False
 

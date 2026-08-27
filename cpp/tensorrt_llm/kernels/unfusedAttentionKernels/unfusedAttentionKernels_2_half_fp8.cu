@@ -25,6 +25,9 @@ namespace kernels
 
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(half, __nv_fp8_e4m3, KVBlockArray);
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(half, __nv_fp8_e4m3, KVLinearBuffer);
+#ifdef ENABLE_FP4
+INSTANTIATE_ATTENTION_INPUT_PROCESSING(half, __nv_fp8_e4m3, MixedKVBlockArray);
+#endif
 
 } // namespace kernels
 

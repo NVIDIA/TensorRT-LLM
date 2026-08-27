@@ -891,7 +891,9 @@ class Attention(nn.Module):
 
         kv_scale_orig_quant = None
         kv_scale_quant_orig = None
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+        if self.quant_config is not None and (
+                self.quant_config.layer_quant_mode.has_fp4_kv_cache() or
+                self.quant_config.layer_quant_mode.has_fp8_k_nvfp4_v_kv_cache()
         ):
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales

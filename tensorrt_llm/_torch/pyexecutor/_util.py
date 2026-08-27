@@ -104,6 +104,7 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
     # require KVCacheManagerV2 for per-layer buffer sizes.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
+                or kv_cache_config.dtype == "fp8_k_nvfp4_v"
                 or is_gemma4_hybrid(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
@@ -671,6 +672,10 @@ class KvCacheCreator:
                         f"supported with "
                         f"{incompat_str}. Disable the incompatible features to "
                         f"run sparse-attention models.")
+                if kv_cache_config is not None and kv_cache_config.dtype == "fp8_k_nvfp4_v":
+                    raise NotImplementedError(
+                        "FP8-K/NVFP4-V requires KVCacheManagerV2 and is not "
+                        f"supported with {incompat_str}.")
                 # Gemma4 hybrid uses per-layer head_dim that V1 would coerce to
                 # ``max(head_dim)``, changing per-layer KV byte sizes.
                 if is_gemma4_hybrid(config):
@@ -2314,7 +2319,13 @@ def _create_kv_cache_manager(
     # use cache_layer_idx to read from the target layer's cache slot via
     # Gemma4Attention. No layer_mask exclusion needed here.
 
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+    if quant_config is not None and quant_config.quant_mode.has_fp8_k_nvfp4_v_kv_cache(
+    ):
+        # DataType has no asymmetric scalar value. KVCacheManagerV2 uses the
+        # explicit KvCacheConfig dtype to size K and V independently.
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.NVFP4
+    elif quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
+    ):
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
     ):

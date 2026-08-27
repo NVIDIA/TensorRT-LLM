@@ -26,6 +26,9 @@ namespace kernels
 #ifdef ENABLE_BF16
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(__nv_bfloat16, __nv_fp8_e4m3, KVBlockArray);
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(__nv_bfloat16, __nv_fp8_e4m3, KVLinearBuffer);
+#ifdef ENABLE_FP4
+INSTANTIATE_ATTENTION_INPUT_PROCESSING(__nv_bfloat16, __nv_fp8_e4m3, MixedKVBlockArray);
+#endif
 #endif
 
 } // namespace kernels
