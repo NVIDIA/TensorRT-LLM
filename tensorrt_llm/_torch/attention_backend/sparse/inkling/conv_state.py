@@ -55,6 +55,69 @@ CONV_ROLE = InklingRole.CONV_STATE
 CONV_SECTIONS = ("k", "v", "attn", "mlp")
 
 
+class _ConvVerifyCapture:
+    """What a speculative verify step must remember to undo itself.
+
+    A short conv carries a window of its last ``kwin`` INPUTS, mutated in place.
+    A verify step runs the conv over every drafted token, so it leaves the
+    window advanced past the tokens the target went on to reject.
+
+    The window after ``k`` tokens is a pure function of the window before the
+    step and the inputs consumed, ``last kwin of (init ++ x[:k])``, so capturing
+    those two is enough to reconstruct the accepted state for any ``k``. That is
+    cheaper than saving one window per drafted position -- the ``x`` it is
+    derived from is a factor of ``kwin`` smaller -- and needs no scatter kernel.
+
+    These buffers are a private allocation, not V2 pool memory: they are scratch
+    for one step rather than per-request state with the KV cache's lifetime, and
+    V2 has no role for something that is overwritten every forward.
+    """
+
+    def __init__(self, max_batch, channels, kwin, steps, device, dtype):
+        # The window as it stood before the verify step consumed anything.
+        self.init = torch.zeros(max_batch, channels, kwin, device=device, dtype=dtype)
+        # The verify step's pre-conv inputs, in token order per request.
+        self.x = torch.zeros(max_batch, steps, channels, device=device, dtype=dtype)
+        self.max_steps = steps
+        # How many of those step slots the last save actually filled. The buffer
+        # is sized for the TARGET's verify step (1 + max_draft_len), but the
+        # draft chain's own generation steps are shorter, and both go through
+        # here now that the chain has its own conv state.
+        self.steps_used = steps
+
+    def save(self, pool_buf, rows, x_gen, steps):
+        """Record this verify step, before the conv mutates ``pool_buf``."""
+        n = rows.shape[0]
+        if steps > self.max_steps:
+            raise ValueError(
+                f"conv capture holds {self.max_steps} steps but {steps} were "
+                "presented; it is sized from max_draft_len."
+            )
+        self.init[:n].copy_(pool_buf.index_select(0, rows))
+        self.x[:n, :steps].copy_(x_gen.view(n, steps, -1))
+        self.steps_used = steps
+
+    def accepted_window(self, num_accepted, kwin):
+        """The window each request should be left holding, given acceptances.
+
+        ``num_accepted`` is per request and at least 1 -- the target's own token
+        is never rejected -- so every request advances by something and none is
+        rolled back to before the step.
+        """
+        n = num_accepted.shape[0]
+        # Only the slots the last save filled: a shorter step than the buffer
+        # holds would otherwise concatenate stale inputs after the real ones and
+        # commit a window built from a previous batch.
+        steps = self.steps_used
+        num_accepted = num_accepted.clamp(max=steps)
+        # [n, C, kwin + steps]: the window followed by the inputs it consumed.
+        stream = torch.cat([self.init[:n], self.x[:n, :steps].transpose(1, 2)], dim=-1)
+        offs = num_accepted.view(n, 1, 1) + torch.arange(
+            kwin, device=stream.device, dtype=num_accepted.dtype
+        ).view(1, 1, kwin)
+        return stream.gather(2, offs.expand(n, stream.shape[1], kwin).to(torch.int64))
+
+
 class InklingConvStateCache:
     """Runtime-owned per-request short-conv state pool for the whole decoder.
 
@@ -89,6 +152,8 @@ class InklingConvStateCache:
         *,
         reserve_attention_dp_slot: bool = False,
         max_draft_len: int = 0,
+        num_layers: Optional[int] = None,
+        layer_offset: int = 0,
         allocate: Optional[Callable[[int, object, List[int]], torch.Tensor]] = None,
         resolve_slot: Optional[Callable[[int], Optional[int]]] = None,
     ):
@@ -118,10 +183,41 @@ class InklingConvStateCache:
             def allocate(_layer_idx, _role, state_shape):
                 return torch.zeros(num_slots, *state_shape, device=device, dtype=dtype)
 
+        # Speculative decoding replays the verify step's conv inputs after the
+        # target has decided how many tokens it accepts, so those inputs are
+        # captured per conv. Allocated up front, alongside the pool: the first
+        # verify step can happen inside a captured CUDA graph, where allocating
+        # is not an option.
+        self.verify_steps = self._max_draft_len + 1
+
+        def cap(channels):
+            if self.verify_steps < 2:
+                return None
+            return _ConvVerifyCapture(num_slots, channels, kwin, self.verify_steps, device, dtype)
+
+        # The draft chain's manager owns a pool for the chain's layers only, so
+        # it is sized by ``num_layers`` and addressed by GLOBAL layer index --
+        # the same index the draft KV cache is keyed by. Without the offset a
+        # draft block at a global index would index past this shorter pool.
+        self._layer_offset = layer_offset
+        self._num_layers = num_layers if num_layers is not None else config.num_hidden_layers
         self._layers: List[InklingConvState] = []
         self._section_channels: List[List[int]] = []
-        for i in range(config.num_hidden_layers):
-            kv_dim = (config.layer_num_kv_heads(i) * config.layer_head_dim(i)) // tp_size
+        self._captures: List[InklingConvState] = []
+        for i in range(self._num_layers):
+            if layer_offset:
+                # The draft chain's pool: rows ADDRESSED by the global layer
+                # index, but their WIDTH from the chain's own geometry. Asking
+                # the trunk's accessor at a draft index gets the trunk's answer
+                # for a layer it does not have, and the chain's banded depths
+                # then get global widths (or the reverse) -- a channel-width
+                # mismatch that only surfaces where the two differ.
+                kv_heads = config.mtp_depth_num_kv_heads(i)
+                head_dim = config.mtp_depth_head_dim(i)
+            else:
+                kv_heads = config.layer_num_kv_heads(i)
+                head_dim = config.layer_head_dim(i)
+            kv_dim = (kv_heads * head_dim) // tp_size
             hidden = config.hidden_size
             sections = [kv_dim, kv_dim, hidden, hidden]
             self._section_channels.append(sections)
@@ -142,6 +238,9 @@ class InklingConvStateCache:
                 offsets.append(offsets[-1] + width)
             self._layers.append(
                 InklingConvState(*(buf[:, a:b, :] for a, b in zip(offsets, offsets[1:])))
+            )
+            self._captures.append(
+                InklingConvState(k=cap(kv_dim), v=cap(kv_dim), attn=cap(hidden), mlp=cap(hidden))
             )
         # Refreshed in place per forward so a captured graph aliases it and every
         # replay sees the current batch. Indexed by batch position, not by slot.
@@ -171,7 +270,30 @@ class InklingConvStateCache:
 
     def layer_state(self, layer_idx: int) -> InklingConvState:
         """The four short-conv state buffers for ``layer_idx`` (pool views)."""
-        return self._layers[layer_idx]
+        return self._layers[layer_idx - self._layer_offset]
+
+    def layer_capture(self, layer_idx: int) -> InklingConvState:
+        """The four verify-step captures for ``layer_idx``; entries None if off."""
+        return self._captures[layer_idx - self._layer_offset]
+
+    def commit_after_verify(self, num_accepted: torch.Tensor, gen_rows: torch.Tensor) -> None:
+        """Roll every conv window back to each request's last accepted token.
+
+        Called once after the target has verified, with ``num_accepted`` per
+        generation request and the pool rows they occupy. Without this the
+        windows keep the rejected tokens: no shape is wrong and no kernel
+        complains, the model simply continues from a history it never produced.
+        """
+        if self.verify_steps < 2:
+            raise RuntimeError(
+                "Inkling conv state was not built for speculative decoding; "
+                "commit_after_verify has nothing captured to replay from."
+            )
+        num_accepted = num_accepted.to(torch.int64)
+        for layer_caps, layer_state in zip(self._captures, self._layers):
+            for cap, pool_buf in zip(layer_caps, layer_state):
+                window = cap.accepted_window(num_accepted, self.kwin)
+                pool_buf.index_copy_(0, gen_rows, window.to(pool_buf.dtype))
 
     def _reserved_slot_for(self, request_id: int) -> Optional[int]:
         """The reserved row ``request_id`` aliases, or None for a real request.
@@ -293,6 +415,14 @@ class InklingConvRuntime:
     gen_indices: Optional[torch.Tensor]  # int32 pool slots, generation requests
     query_start_loc: Optional[torch.Tensor]  # int32 [n_ctx+1] varlen offsets
     has_initial_state: Optional[torch.Tensor]  # bool [n_ctx]
+    # Tokens per generation request. 1 for ordinary decode; under speculative
+    # decoding the target verifies 1 + max_draft_len tokens per request in one
+    # step, and the one-token assumption below stops holding.
+    gen_tokens_per_seq: int = 1
+    # Varlen offsets/flags for a multi-token generation step, built only when
+    # gen_tokens_per_seq > 1.
+    gen_query_start_loc: Optional[torch.Tensor] = None
+    gen_has_initial_state: Optional[torch.Tensor] = None
 
     @classmethod
     def from_metadata(cls, attn_metadata) -> Optional["InklingConvRuntime"]:
@@ -327,6 +457,31 @@ class InklingConvRuntime:
                 has_initial_state = torch.tensor(
                     [c > 0 for c in cached], dtype=torch.bool, device=device
                 )
+        # Speculative decoding verifies several tokens per generation request in
+        # one step. The per-request token count is uniform (1 + max_draft_len),
+        # so it divides out of the generation seq_lens.
+        num_gen = batch_size - num_contexts
+        gen_tokens_per_seq = 1
+        gen_query_start_loc = gen_has_initial_state = None
+        if num_gen > 0:
+            gen_lens = attn_metadata.seq_lens.tolist()[num_contexts:batch_size]
+            gen_tokens_per_seq = max(1, int(gen_lens[0]))
+            if gen_tokens_per_seq > 1:
+                if any(int(sl) != gen_tokens_per_seq for sl in gen_lens):
+                    raise ValueError(
+                        "Inkling short-conv expects a uniform token count per "
+                        f"generation request; got {gen_lens}."
+                    )
+                gen_query_start_loc = torch.arange(
+                    0,
+                    (num_gen + 1) * gen_tokens_per_seq,
+                    gen_tokens_per_seq,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                # Unlike a fresh prefill, a generation request always has a
+                # prior conv window in the pool: these tokens continue a stream.
+                gen_has_initial_state = torch.ones(num_gen, dtype=torch.bool, device=device)
         return cls(
             num_ctx_tokens=sum(attn_metadata.seq_lens.tolist()[:num_contexts]),
             ctx_indices=state_indices[:num_contexts] if num_contexts else None,
@@ -335,6 +490,9 @@ class InklingConvRuntime:
             ),
             query_start_loc=query_start_loc,
             has_initial_state=has_initial_state,
+            gen_tokens_per_seq=gen_tokens_per_seq,
+            gen_query_start_loc=gen_query_start_loc,
+            gen_has_initial_state=gen_has_initial_state,
         )
 
 
@@ -343,6 +501,7 @@ def apply_short_conv(
     x: torch.Tensor,
     pool_buf: Optional[torch.Tensor],
     rt: Optional[InklingConvRuntime],
+    capture: Optional[_ConvVerifyCapture] = None,
 ) -> torch.Tensor:
     """Run one short-conv over a (possibly mixed) batch through the state pool.
 
@@ -366,9 +525,36 @@ def apply_short_conv(
             )
         )
     if x.shape[0] > nctx:
-        parts.append(
-            sconv.forward(
-                x[nctx:], conv_state=pool_buf, cache_indices=rt.gen_indices, is_decode=True
+        if rt.gen_tokens_per_seq > 1:
+            if capture is not None:
+                # Before the conv mutates the pool: the window as it stands now,
+                # plus the inputs about to be consumed, are what the post-verify
+                # commit replays from.
+                capture.save(
+                    pool_buf, rt.gen_indices.to(torch.int64), x[nctx:], rt.gen_tokens_per_seq
+                )
+            # Speculative decoding: several tokens per generation request in one
+            # step. ``causal_conv1d_update`` is a single-token kernel -- it
+            # requires one cache index per ROW, so it rejects this outright --
+            # and even reshaped it would apply the same initial state to every
+            # drafted token instead of advancing through them. The varlen path
+            # walks the run in order, which is what continuing a stream means;
+            # ``has_initial_state`` is True here rather than False as in prefill,
+            # because these tokens continue a window already in the pool.
+            parts.append(
+                sconv.forward(
+                    x[nctx:],
+                    conv_state=pool_buf,
+                    cache_indices=rt.gen_indices,
+                    query_start_loc=rt.gen_query_start_loc,
+                    has_initial_state=rt.gen_has_initial_state,
+                    is_decode=False,
+                )
             )
-        )
+        else:
+            parts.append(
+                sconv.forward(
+                    x[nctx:], conv_state=pool_buf, cache_indices=rt.gen_indices, is_decode=True
+                )
+            )
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
