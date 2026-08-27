@@ -33,6 +33,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Optional, Tuple
 
+import cudnn
 import torch
 
 from tensorrt_llm.logger import logger
@@ -40,13 +41,6 @@ from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
-
-_cudnn_import_error: Optional[BaseException] = None
-try:
-    import cudnn  # type: ignore[import-not-found]
-except (ImportError, OSError) as e:  # pragma: no cover - depends on the install
-    cudnn = None
-    _cudnn_import_error = e
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -219,6 +213,7 @@ class CuDNNAttention(AttentionBackend):
     every instance.
     """
 
+    _cudnn_lib_version = None
     _cudnn_handle: ClassVar[Optional[Any]] = None
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
 
@@ -232,12 +227,6 @@ class CuDNNAttention(AttentionBackend):
         quant_attention_config: Optional[QuantAttentionConfig] = None,
         **kwargs,
     ):
-        if _cudnn_import_error is not None:
-            raise ImportError(
-                "The cuDNN Python frontend is required by the CUDNN attention backend. "
-                "Install it with: pip install nvidia-cudnn-frontend\n"
-                f"Import error: {_cudnn_import_error}"
-            ) from _cudnn_import_error
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -247,6 +236,12 @@ class CuDNNAttention(AttentionBackend):
         self.recipe = self._resolve_recipe(quant_attention_config)
         self.scale = 1.0 / math.sqrt(head_dim)
         self._preferred_layout = AttentionTensorLayout.HND
+
+        # Check if the cuDNN library supports the requested functionality.
+        if self._get_lib_version() <= 90100:
+            raise ImportError("cuDNN attention backend requires cuDNN library v9.1.0 or later.")
+        if self.recipe == "mxfp8" and self._get_lib_version() <= 92100:
+            raise ImportError("cuDNN MXFP8 attention requires cuDNN library v9.21.0 or later.")
 
     @staticmethod
     def _resolve_recipe(quant_attention_config: Optional[QuantAttentionConfig]) -> str:
@@ -258,20 +253,32 @@ class CuDNNAttention(AttentionBackend):
             return "no_quant"
         if qk_dtype != v_dtype:
             raise ValueError(
-                f"CUDNN backend requires qk_dtype == v_dtype; got qk_dtype={qk_dtype!r}, "
+                f"cuDNN backend requires qk_dtype == v_dtype; got qk_dtype={qk_dtype!r}, "
                 f"v_dtype={v_dtype!r}. cuDNN's FP8 and MXFP8 SDPA nodes quantize both GEMMs "
                 "with the same element format."
             )
         if qk_dtype in ("fp8", "mxfp8"):
             return qk_dtype
         raise ValueError(
-            f"CUDNN backend does not support qk_dtype={qk_dtype!r}; supported recipes are "
+            f"cuDNN backend does not support qk_dtype={qk_dtype!r}; supported recipes are "
             "unquantized (quant_attention_config=None), 'fp8' and 'mxfp8'."
         )
 
     # ------------------------------------------------------------------
     # cuDNN handle and compiled-graph cache
     # ------------------------------------------------------------------
+
+    @classmethod
+    def _get_lib_version(cls):
+        if cls._cudnn_lib_version is None:
+            cls._cudnn_lib_version = cudnn.backend_version()
+            torch_cudnn_lib_version = torch.backends.cudnn.version()
+            if cls._cudnn_lib_version != torch_cudnn_lib_version:
+                logger.critical(
+                    "PyTorch and cuDNN Frontend loaded different cuDNN backends: "
+                    f"PyTorch:v{torch_cudnn_lib_version} != cuDNN-FE:v{cls._cudnn_lib_version}. "
+                )
+        return cls._cudnn_lib_version
 
     @classmethod
     def _get_handle(cls) -> Any:
@@ -463,7 +470,7 @@ class CuDNNAttention(AttentionBackend):
         for name, tensor in (("q", q), ("k", k), ("v", v)):
             if tensor.dim() != 4:
                 raise ValueError(
-                    f"CUDNN backend expects a 4D [B, H, S, D] {name}; got {tuple(tensor.shape)}."
+                    f"cuDNN backend expects a 4D [B, H, S, D] {name}; got {tuple(tensor.shape)}."
                 )
         if k.shape[:3] != v.shape[:3]:
             raise ValueError(f"K/V shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}.")
@@ -622,7 +629,7 @@ class CuDNNAttention(AttentionBackend):
     ) -> bool:
         if key_padding_mask is not None:
             raise NotImplementedError(
-                "CUDNN backend does not support key_padding_mask; use the VANILLA backend."
+                "cuDNN backend does not support key_padding_mask; use the VANILLA backend."
             )
         return attention_mask == PredefinedAttentionMask.CAUSAL
 
