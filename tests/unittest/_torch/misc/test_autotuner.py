@@ -818,7 +818,7 @@ def _distributed_worker_function(world_size, strategy):
                          tuning_config=config,
                          inputs=inputs)
         # run another normal gemm with INDEPENDENT strategy
-        tuner.choose_one(custom_op="test_distributed_normal_gemm",
+        tuner.choose_one(custom_op=f"test_distributed_normal_gemm",
                          runners=[runner_independent],
                          tuning_config=config_independent,
                          inputs=inputs)
@@ -870,7 +870,7 @@ def _distributed_worker_function(world_size, strategy):
 
         assert len(
             AutoTuner.get().profiling_cache.independent_op
-        ) == 0, "Non-INDEPENDENT ops should not be present in the cache"
+        ) == 0, f"Non-INDEPENDENT ops should not be present in the cache"
     else:
         # Non-INDEPENDENT ops go to shared section
         assert 'shared' in cache_data, "shared section should be present"
@@ -886,7 +886,7 @@ def _distributed_worker_function(world_size, strategy):
 
         assert "test_distributed_normal_gemm" not in AutoTuner.get().profiling_cache.independent_op and \
             f"test_distributed_{strategy.value}" in AutoTuner.get().profiling_cache.independent_op, \
-            "Distributed tuning strategy is not recovered correctly from cache"
+            f"Distributed tuning strategy is not recovered correctly from cache"
 
     if strategy == DistributedTuningStrategy.BROADCAST:
         # All ranks should select tactic 0
