@@ -154,6 +154,23 @@ class CompletionOutput:
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
 
+    def __getstate__(self):
+        # _incremental_states holds a tokenizers.DecodeStream (a Rust object,
+        # not picklable) used for process-local incremental detokenization.
+        # Receivers never need it, so drop it when this output crosses a
+        # process boundary — e.g. a PostprocWorker streaming a raw
+        # CompletionOutput (no postproc_params) back over IPC.
+        # slots=True dataclass: object.__getstate__ returns
+        # (dict_or_None, slots_dict).
+        state = object.__getstate__(self)
+        if isinstance(state, tuple) and len(state) == 2:
+            d, slots = state
+            if slots and '_incremental_states' in slots:
+                slots = dict(slots)
+                slots['_incremental_states'] = None
+            return (d, slots)
+        return state
+
     @property
     def length(self) -> int:
         return len(self.token_ids)
