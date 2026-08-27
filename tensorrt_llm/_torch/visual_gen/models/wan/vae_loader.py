@@ -29,7 +29,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .wan_vae import WanVAE, WanVAEConfig, _supports_nvfp4_device
+from .wan_vae import _NVFP4_SUPPORTED_GPU_NAMES, WanVAE, WanVAEConfig, _supports_nvfp4_device
 
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
 _NVFP4_DYNAMIC_MIN_CHANNELS = 64
@@ -45,10 +45,10 @@ def _nvfp4_enabled_for_device(
     if not selected or _supports_nvfp4_device(device):
         return True
     if explicit_request:
-        raise ValueError("NVFP4 Wan VAE requires an SM100-family GPU")
+        raise ValueError(f"NVFP4 Wan VAE supports {_NVFP4_SUPPORTED_GPU_NAMES} GPUs")
     logger.warning(
         "The NVFP4 VAE checkpoint will use dequantized BF16 operators "
-        "because the selected device is not an SM100-family GPU."
+        f"because the selected device is not one of the supported {_NVFP4_SUPPORTED_GPU_NAMES} GPUs."
     )
     return False
 

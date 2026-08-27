@@ -403,6 +403,8 @@ class WanConv2d(nn.Conv2d):
 # ---------------------------------------------------------------------------
 _FP4_FP8_MAX, _FP4_E2M1_MAX, _FP4_SF_VEC = 448.0, 6.0, 16
 _FP4_E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
+_NVFP4_SUPPORTED_DEVICE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0)})
+_NVFP4_SUPPORTED_GPU_NAMES = "SM100, SM103, and SM120"
 
 
 class _FP4PrequantizedWeight(TypedDict):
@@ -452,11 +454,11 @@ def _supports_nvfp4_conv3d(module: nn.Module) -> bool:
 
 
 def _supports_nvfp4_device(device: torch.device) -> bool:
-    """Return whether ``device`` belongs to the validated SM100 family."""
+    """Return whether ``device`` has a provider-validated FP4 Conv3d architecture."""
     return (
         device.type == "cuda"
         and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device)[0] == 10
+        and torch.cuda.get_device_capability(device) in _NVFP4_SUPPORTED_DEVICE_CAPABILITIES
     )
 
 
@@ -595,7 +597,7 @@ def _fp4_conv_run(
     if not x.is_cuda:
         raise ValueError("FP4 Conv3d requires a CUDA input")
     if not _supports_nvfp4_device(x.device):
-        raise ValueError("FP4 Conv3d requires an SM100-family GPU")
+        raise ValueError(f"FP4 Conv3d supports {_NVFP4_SUPPORTED_GPU_NAMES} GPUs")
     if x.dtype is not torch.bfloat16:
         raise ValueError(f"FP4 Conv3d requires a bfloat16 input, got {x.dtype}")
     if gs_static is not None and (
@@ -770,12 +772,23 @@ def _fp4_conv_run(
 
 
 class NVFP4WanCausalConv3d(WanCausalConv3d):
-    """Causal Conv3d whose 3x3x3 convolution runs on the NVFP4 Blackwell CuteDSL kernel.
+    """Run a compatible Wan causal Conv3d with the NVFP4 Blackwell CuTe DSL kernel.
 
-    Weight is pre-quantized once (lazily on first forward). ``input_scale`` (the ModelOpt
-    calibrated divisor-form scale) enables STATIC activation quant; otherwise dynamic.
-    Construction takes ownership of ``base`` parameters; callers must replace and discard
-    ``base`` rather than reuse or mutate it. ``norm_gamma`` is snapshotted at construction.
+    The BF16 weight is quantized lazily and cached until the parameters or device change. A
+    calibrated ModelOpt ``input_scale`` selects static activation quantization; otherwise the
+    activation scale is derived dynamically. The replacement reuses ``base`` parameters, so
+    callers must replace and stop using ``base``. ``norm_gamma`` is registered as a
+    non-persistent buffer.
+
+    Args:
+        base: Dense stride-1 3x3x3 Wan convolution with causal temporal and same spatial padding.
+        input_scale: Optional calibrated ModelOpt activation scale in divisor form.
+        absorb_silu: Request activation quantization of the pre-SiLU input. This is effective only
+            when ``input_scale`` is provided.
+        absorb_norm: Request activation quantization of the pre-RMSNorm input. This also absorbs
+            SiLU and is effective only with ``norm_gamma``, ``norm_scale``, and ``input_scale``.
+        norm_gamma: RMSNorm channel weights used when ``absorb_norm`` is enabled.
+        norm_scale: RMSNorm normalization scale used when ``absorb_norm`` is enabled.
     """
 
     def __init__(

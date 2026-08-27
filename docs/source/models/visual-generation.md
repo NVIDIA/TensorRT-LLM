@@ -187,8 +187,8 @@ Omit `quant_config` for BF16/FP16 baseline.
 
 Transformer and VAE quantization are selected independently. Use
 `quant_config` for transformer layers and `vae_quant_config` for the VAE.
-NVFP4 VAE execution currently supports native Wan-family VAEs on GPUs with CUDA
-compute capability 10.x. Unsupported pipelines and algorithms fail before
+NVFP4 VAE execution currently supports native Wan-family VAEs on SM100, SM103,
+and SM120 GPUs. Unsupported pipelines and algorithms fail before
 pipeline construction. On an unsupported device, an explicit NVFP4 request
 fails; checkpoint-driven NVFP4 instead uses dequantized BF16 operators.
 

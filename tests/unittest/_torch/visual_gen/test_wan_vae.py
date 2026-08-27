@@ -96,9 +96,17 @@ def test_fp4_conv_reuses_base_parameters():
 
 
 @pytest.mark.parametrize(
-    ("capability", "expected"), [((9, 0), False), ((10, 0), True), ((12, 0), False)]
+    ("capability", "expected"),
+    [
+        ((9, 0), False),
+        ((10, 0), True),
+        ((10, 3), True),
+        ((11, 0), False),
+        ((12, 0), True),
+        ((12, 1), False),
+    ],
 )
-def test_fp4_device_capability_is_sm100_family(monkeypatch, capability, expected):
+def test_fp4_device_capability_is_provider_validated(monkeypatch, capability, expected):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
 
@@ -124,7 +132,7 @@ def test_implicit_fp4_checkpoint_falls_back_on_unsupported_device(monkeypatch):
 def test_explicit_fp4_request_rejects_unsupported_device(monkeypatch):
     monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
 
-    with pytest.raises(ValueError, match="SM100-family"):
+    with pytest.raises(ValueError, match="SM100, SM103, and SM120"):
         vae_loader._nvfp4_enabled_for_device(
             torch.device("cuda"),
             {"decoder.conv1"},
@@ -301,7 +309,7 @@ def test_vae_quant_config_rejects_unsupported_device(monkeypatch):
     monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)
     monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
 
-    with pytest.raises(ValueError, match="SM100-family"):
+    with pytest.raises(ValueError, match="SM100, SM103, and SM120"):
         load_wan_vae(
             "/unused",
             torch.device("cuda"),

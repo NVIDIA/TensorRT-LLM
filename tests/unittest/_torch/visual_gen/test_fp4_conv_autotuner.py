@@ -256,7 +256,7 @@ def test_selected_tactic_fast_cache_obeys_tuning_and_capture(monkeypatch):
 
 def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
     if not _supports_nvfp4_device(torch.device("cuda")):
-        pytest.skip("NVFP4 Conv3d autotuning requires an SM100-family GPU")
+        pytest.skip("NVFP4 Conv3d autotuning requires an SM100, SM103, or SM120 GPU")
 
     AutoTuner.get().clear_cache()
     _clear_fp4_conv_tactic_cache()
@@ -310,7 +310,7 @@ def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
 
 def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
     if not _supports_nvfp4_device(torch.device("cuda")):
-        pytest.skip("NVFP4 Conv3d requires an SM100-family GPU")
+        pytest.skip("NVFP4 Conv3d requires an SM100, SM103, or SM120 GPU")
 
     AutoTuner.get().clear_cache()
     _clear_fp4_conv_tactic_cache()
@@ -329,7 +329,7 @@ def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
 def test_fixed_fp4_conv_input_fusions_match_bf16_reference(fuse_norm):
     """Exercise the fused SiLU and RMSNorm+SiLU paths through the Conv3d wrapper."""
     if not _supports_nvfp4_device(torch.device("cuda")):
-        pytest.skip("NVFP4 Conv3d requires an SM100-family GPU")
+        pytest.skip("NVFP4 Conv3d requires an SM100, SM103, or SM120 GPU")
 
     channels = 128
     torch.manual_seed(11)
