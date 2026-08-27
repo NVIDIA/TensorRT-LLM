@@ -677,6 +677,15 @@ def getGitlabMRChangedFile(pipeline, function, filePath="") {
                 rawDataList.each { rawData ->
                     result += [rawData.get("old_path"), rawData.get("new_path")]
                 }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("old_path"), rawData.get("new_path")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("diff") }
+                }
             }
             if (!rawDataList) { break }
         }
@@ -723,6 +732,15 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 }
                 rawDataList.each { rawData ->
                     result += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+                }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("filename"), rawData.get("previous_filename")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") }
                 }
             }
             if (!rawDataList) { break }
@@ -923,11 +941,18 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             returnStdout: true,
         ).trim()
         def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+        def filesNeedingDiff = changedFiles.findAll { filePath ->
+            _cbtsMatchesAnyPattern(filePath, needsDiffFor)
+        }
         def diffs = [:]
-        for (f in changedFiles) {
-            if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
+        if (filesNeedingDiff) {
+            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+            def fileChanges = githubPrApiUrl != null
+                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
-                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f) ?: ""
+                [(filePath): fileChanges[filePath] ?: ""]
             }
         }
 
