@@ -9622,13 +9622,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool]:
             """Fallback 4-tuple tactic ``(mma_qk, mma_pv, split_kv,
             is_persistent)`` for when the AutoTuner cache is not warmed and
-            ``choose_one`` returns its ``-1`` sentinel."""
+            ``choose_one`` returns its ``-1`` sentinel.
+
+            ``batch_size`` is rounded down to its tuning bucket
+            (``last_positive_power_of_2`` -- the same mapping the tuning
+            config uses) before deriving ``split_kv``: tuning profiles (and
+            therefore ``cute.compile``s) exactly the bucket-derived
+            ``split_kv`` variants, so a bucket-aligned fallback reuses an
+            already-compiled kernel where one exists instead of JIT-compiling
+            a fresh raw-batch ``split_kv`` variant in the serving loop. The
+            ``is_persistent`` choice is unaffected by the rounding (its
+            threshold is a power of two, so rounding down to a power of two
+            never crosses it), and both candidates are compiled during tuning
+            anyway."""
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
-            split_kv = self.get_default_split_kv(batch_size, self.seq_len_q,
+            bucketed_batch_size = last_positive_power_of_2(batch_size)
+            split_kv = self.get_default_split_kv(bucketed_batch_size,
+                                                 self.seq_len_q,
                                                  max_active_blocks)
-            is_persistent = self.get_default_is_persistent(batch_size)
+            is_persistent = self.get_default_is_persistent(bucketed_batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
         def forward(
