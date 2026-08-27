@@ -338,17 +338,13 @@ class TestInputReferenceResolution:
         vid_b64 = base64.b64encode(self._mp4_bytes()).decode()
 
         p = _parse_and_prepare(
-            VideoGenerationRequest(
-                prompt="x", input_reference=img_b64, input_reference_format="base64"
-            ),
+            VideoGenerationRequest(prompt="x", input_reference=img_b64),
             generator,
         )
         assert len(p.image_reference) == 1 and p.video_reference is None
 
         p = _parse_and_prepare(
-            VideoGenerationRequest(
-                prompt="x", input_reference=vid_b64, input_reference_format="base64"
-            ),
+            VideoGenerationRequest(prompt="x", input_reference=vid_b64),
             generator,
         )
         assert len(p.video_reference) == 1 and p.image_reference is None
@@ -365,7 +361,6 @@ class TestInputReferenceResolution:
                 prompt="x",
                 image_reference={"content": img_b64, "format": "base64"},
                 input_reference=vid_b64,
-                input_reference_format="base64",
             ),
             generator,
         )
@@ -1009,12 +1004,3 @@ class TestLocalMediaPathCanBeDisallowed:
 
         assert params.image_reference[0].format == "path"
         assert any("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in w for w in warnings)
-
-    def test_the_deprecated_field_is_gated_too(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
-        request = VideoGenerationRequest(
-            prompt="x", input_reference="/tmp/ref.png", input_reference_format="path"
-        )
-
-        with pytest.raises(ValueError, match="is disallowed on this server"):
-            parse_visual_gen_params(request, _StubVisualGen())

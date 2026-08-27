@@ -1495,12 +1495,6 @@ models:
         default: null
         status: deprecated
         required: false
-      input_reference_format:
-        kind: extension
-        type: Optional[Literal['path', 'url', 'base64']]
-        default: null
-        status: deprecated
-        required: false
       size:
         kind: extension
         type: Optional[str]

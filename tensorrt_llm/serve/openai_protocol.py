@@ -58,7 +58,6 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
@@ -2099,18 +2098,12 @@ class VideoGenerationRequest(OpenAIBaseModel):
         default=None,
         description=
         ("Deprecated. A single image or video reference, routed by content "
-         "signature to image-to-video or video-to-video. Kept for backward "
+         "signature to image-to-video or video-to-video. A JSON request carries "
+         "base64 bytes; a multipart request uploads the file. Kept for backward "
          "compatibility; prefer the typed ``image_reference`` / "
          "``video_reference`` fields, which take precedence — this field is "
          "ignored whenever a typed ``image_reference`` or ``video_reference`` "
-         "is provided. A string form requires ``input_reference_format``."),
-    )
-    input_reference_format: Optional[Literal["path", "url", "base64"]] = Field(
-        default=None,
-        description=(
-            "Deprecated, alongside ``input_reference``: the wire form of that "
-            "field's value (``path`` / ``url`` / ``base64``). Required when "
-            "``input_reference`` is a string; implied for a multipart upload."),
+         "is provided."),
     )
 
     # Resolution
@@ -2183,25 +2176,6 @@ class VideoGenerationRequest(OpenAIBaseModel):
         if isinstance(value, str) and value in removed:
             raise ValueError(removed[value])
         return value
-
-    @model_validator(mode="after")
-    def _check_input_reference_format(self):
-        """Fill in the deprecated ``input_reference``'s wire form when omitted.
-
-        The typed fields require an explicit ``format`` — that is the point of
-        them. This one exists only so callers written against the old API keep
-        working, and those callers sent bare base64, so demanding a new sibling
-        field here would break exactly what the field is for. A multipart
-        upload carries its own form and needs no sibling either way.
-        """
-        if isinstance(self.input_reference,
-                      str) and self.input_reference_format is None:
-            logger.warning(
-                "'input_reference' without 'input_reference_format' is read as "
-                "base64; both are deprecated, use 'image_reference' / "
-                "'video_reference' with an explicit format.")
-            self.input_reference_format = "base64"
-        return self
 
 
 class VideoJob(OpenAIBaseModel):

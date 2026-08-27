@@ -364,16 +364,15 @@ def _validate_image_edit_request_limits(
 def _apply_deprecated_input_reference(
     input_reference: str | UploadFile | None,
     params: VisualGenParams,
-    input_reference_format: Optional[str] = None,
 ) -> None:
     """Back-compat for the deprecated single ``input_reference``.
 
     Sniff-routes the payload to ``image_reference`` (image) or ``video_reference``
     (video), preserving the pre-typed-fields behavior. Ignored when a typed
     image/video reference is already set — the typed fields take precedence.
-    Routing needs the bytes, so the payload is resolved here using the wire form
-    from the sibling ``input_reference_format`` (implied for an upload); the
-    resolved bytes are then handed to the engine like any other reference.
+    The field has only ever carried base64 in JSON or a multipart upload, so the
+    wire form follows from the transport; routing needs the bytes, so they are
+    read here and handed to the engine like any other reference.
     """
     if input_reference is None:
         return
@@ -382,20 +381,13 @@ def _apply_deprecated_input_reference(
         return
     from tensorrt_llm.visual_gen.params import MediaRef
 
-    if hasattr(input_reference, "file"):  # multipart upload — form implied
+    if hasattr(input_reference, "file"):  # multipart upload
         payload = input_reference.file.read()
     else:
-        if input_reference_format == "path" and local_media_path_is_disallowed():
-            raise ValueError(
-                "reference format='path' is disallowed on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side "
-                "files and is only meaningful for co-located clients. Send the "
-                "file as base64 or upload it via multipart/form-data."
-            )
         # Local import, for the reason given at the first one.
-        from tensorrt_llm.visual_gen.params import _resolve_reference
+        from tensorrt_llm.visual_gen.params import _read_reference_payload
 
-        payload = _resolve_reference(input_reference, input_reference_format)
+        payload = _read_reference_payload(input_reference)
     kind = sniff_media_kind(payload)
     if kind == "image":
         params.image_reference = [MediaRef(content=payload, format="bytes")]
@@ -499,9 +491,7 @@ def parse_visual_gen_params(
         audio_refs = _build_reference_list(request.audio_reference)
         if audio_refs:
             params.audio_reference = audio_refs
-        _apply_deprecated_input_reference(
-            request.input_reference, params, request.input_reference_format
-        )
+        _apply_deprecated_input_reference(request.input_reference, params)
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _decode_inline_media(request.extra_params, generator.extra_param_specs)

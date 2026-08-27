@@ -1566,44 +1566,18 @@ class TestEngineFailureTransport:
 
 
 class TestDeprecatedInputReferenceStaysCompatible:
-    """The deprecated field exists so old callers keep working.
+    """The deprecated field takes a bare string, the typed ones never do.
 
-    Callers written against the old API sent bare base64 with no sibling
-    format, so requiring one here would break exactly what the field is for.
-    The typed fields still demand an explicit format — that distinction is the
-    point.
+    Old callers sent base64 with nothing declaring it, and that has to keep
+    working; a typed reference has somewhere to say what it is, so it must.
     """
 
-    def test_bare_base64_is_read_as_base64(self):
+    def test_a_bare_string_is_still_accepted(self):
         from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
 
-        request = VideoGenerationRequest(prompt="x", input_reference="aGk=")
-
-        assert request.input_reference_format == "base64"
-
-    def test_an_explicit_format_still_wins(self):
-        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
-
-        request = VideoGenerationRequest(
-            prompt="x", input_reference="/tmp/ref.png", input_reference_format="path"
-        )
-
-        assert request.input_reference_format == "path"
-
-    def test_bytes_over_json_is_still_rejected(self):
-        """The wire form a JSON body can declare stops at ``base64``, so the
-        generated schema never advertises a value that is certain to 422."""
-        from pydantic import ValidationError
-
-        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
-
-        with pytest.raises(ValidationError, match="'path', 'url' or 'base64'"):
-            VideoGenerationRequest(
-                prompt="x", input_reference="aGk=", input_reference_format="bytes"
-            )
+        assert VideoGenerationRequest(prompt="x", input_reference="aGk=").input_reference == "aGk="
 
     def test_the_typed_field_still_requires_a_format(self):
-        """Relaxing the deprecated alias must not relax the new API."""
         from pydantic import ValidationError
 
         from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest

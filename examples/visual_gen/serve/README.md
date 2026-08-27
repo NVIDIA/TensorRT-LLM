@@ -305,7 +305,7 @@ You can customize these by:
     ```
 
   - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
-- `input_reference` (deprecated): a single image or video reference, routed by content signature to I2V or V2V. Declares its wire form through the sibling `input_reference_format` field, and is ignored when `image_reference` / `video_reference` is also given. Prefer the typed fields.
+- `input_reference` (deprecated): a single image or video reference, routed by content signature to I2V or V2V. A JSON request carries base64 bytes and a multipart request uploads the file; it is ignored when `image_reference` / `video_reference` is also given. Prefer the typed fields.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
