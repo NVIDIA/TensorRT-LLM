@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=sorted(BUILT_IN_MODELS.keys()),
         help=(
-            "Built-in model shape. Examples: deepseek_v3, qwen1.5_moe. "
+            "Built-in model shape. Example: deepseek_v3. "
             "Omit only when passing all custom shape fields below."
         ),
     )
