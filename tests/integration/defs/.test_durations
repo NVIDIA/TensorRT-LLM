@@ -1282,7 +1282,6 @@
    "unittest/_torch/sampler/test_torch_sampler.py": 251.46527294117647,
    "unittest/_torch/sampler/test_trtllm_sampler.py": 78.89402733485194,
    "unittest/_torch/speculative/hw_agnostic": 192.419382629108,
-   "unittest/_torch/speculative/test_capture_override_leak.py": 18.178845569620254,
    "unittest/_torch/speculative/test_dspark_cute_dsl_attention.py": 27.91303125,
    "unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py": 20.8966,
    "unittest/_torch/speculative/test_eagle3.py": 556.1181581081081,
