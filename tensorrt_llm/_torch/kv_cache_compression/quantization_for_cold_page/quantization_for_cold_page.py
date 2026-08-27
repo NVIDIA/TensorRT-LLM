@@ -29,7 +29,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
         callback = copy.copy(self)
-        callback._initialize_codec(
+        callback.initialize_codec(
             cache_config,
             runtime_dtype=runtime_dtype,
             pp_layers=pp_layers,
@@ -50,7 +50,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
         self._lifecycle_metadata = [
-            self._build_lifecycle_metadata(lifecycle) for lifecycle in lifecycles
+            self.build_lifecycle_metadata(lifecycle) for lifecycle in lifecycles
         ]
         properties = []
         for metadata in self._lifecycle_metadata:
@@ -60,7 +60,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             properties.append(lifecycle)
         return properties
 
-    def _initialize_codec(
+    def initialize_codec(
         self,
         cache_config: object,
         *,
@@ -73,6 +73,6 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         """Build format-specific immutable state for one KVCM."""
         raise NotImplementedError
 
-    def _build_lifecycle_metadata(self, lifecycle: object) -> object:
+    def build_lifecycle_metadata(self, lifecycle: object) -> object:
         """Resolve one KVCM lifecycle into format-specific launch metadata."""
         raise NotImplementedError

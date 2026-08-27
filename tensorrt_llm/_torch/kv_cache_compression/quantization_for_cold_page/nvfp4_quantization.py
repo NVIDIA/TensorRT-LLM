@@ -155,7 +155,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         super().__init__(config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
-    def _initialize_codec(
+    def initialize_codec(
         self,
         cache_config: object,
         *,
@@ -231,7 +231,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         self._layer_ids = tuple(sorted(self._layer_layouts))
         self._runtime_type = runtime_type if runtime_type is not None else 0
 
-    def _build_lifecycle_metadata(self, lifecycle: object) -> _Nvfp4ColdPageMetadata:
+    def build_lifecycle_metadata(self, lifecycle: object) -> _Nvfp4ColdPageMetadata:
         wide_rows: list[list[int]] = []
         integer_rows: list[list[int]] = []
         scale_rows: list[list[float]] = []
