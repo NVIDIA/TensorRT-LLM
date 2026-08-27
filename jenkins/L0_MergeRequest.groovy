@@ -2226,12 +2226,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
                             // Canonical images carry BOLT profiles: the raw build is
                             // published as <tag>-noprofiles and <tag> is produced by the
-                            // overlay. A missing bundle is fatal only on the release path;
-                            // elsewhere it retags the plain build. boltProfileBranch is
-                            // left unset so the job resolves LLM_BRANCH -> main, which is
-                            // correct for release branches and PR refs alike.
+                            // overlay. Both unconditional -- the contract is a property of
+                            // the image, not of what triggered the build, so a bundle that
+                            // cannot be pulled is an error rather than a silent plain
+                            // retag. Left unset, boltProfileBranch resolves LLM_BRANCH ->
+                            // main, so a ref with no promoted bundle still gets profiles.
                             'boltOverlayEnabled': true,
-                            'boltProfilesRequired': runMode == "nightly_release",
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2303,7 +2304,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // same tags, so the scanned+registered image has to be the
                             // BOLTed canonical one rather than a plain build.
                             'boltOverlayEnabled': true,
-                            'boltProfilesRequired': runMode == "nightly_release",
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
