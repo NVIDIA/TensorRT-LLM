@@ -94,20 +94,22 @@ pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_ll
 Nightly wheels are published to a dedicated package index. Use `--extra-index-url` to add this index while keeping
 PyPI available for dependency resolution.
 
-To install the latest nightly release:
+List the nightly releases compatible with the current environment:
 
 ```bash
-pip3 install --pre tensorrt_llm \
+pip3 index versions tensorrt_llm --pre \
+    --index-url https://pypi.nvidia.com/trtllm_nightly/
+```
+
+Choose a version from the list and install it explicitly:
+
+```bash
+pip3 install --pre "tensorrt_llm==<version-from-the-list>" \
     --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 ```
 
-To install a specific nightly release, choose a version from the [available nightly wheels](https://pypi.nvidia.com/trtllm_nightly/tensorrt-llm/)
-and replace `<version>` in the following command:
-
-```bash
-pip3 install --pre "tensorrt_llm==<version>" \
-    --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
-```
+If needed, browse the [raw nightly wheel index](https://pypi.nvidia.com/trtllm_nightly/tensorrt-llm/) to inspect
+builds for other Python versions or platforms.
 
 ### Sanity check
 
