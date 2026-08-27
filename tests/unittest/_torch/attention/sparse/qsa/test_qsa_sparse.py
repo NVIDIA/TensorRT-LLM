@@ -25,6 +25,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_decode_token_mapping,
     triton_qsa_paged_index_scores,
     triton_qsa_prefill_compress,
+    triton_qsa_unscale_block_table,
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _query_chunk_size
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
@@ -221,6 +222,26 @@ def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
         torch.arange(rows, dtype=torch.int32, device="cuda"),
     )
     torch.testing.assert_close(logical_positions, (kv_lens - seq_lens).to(torch.int64))
+
+
+@pytest.mark.parametrize("rows", [1, 64, 128])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_unscale_block_table_recovers_lifecycle_slots(rows: int) -> None:
+    scale = 48
+    slots = torch.arange(rows * 289, dtype=torch.int32, device="cuda").reshape(rows, 289)
+    scaled_storage = torch.zeros((rows, 2, 289), dtype=torch.int32, device="cuda")
+    scaled = scaled_storage[:, 0, :]
+    scaled.copy_(slots * scale)
+    assert scaled.stride() == (2 * 289, 1)
+    actual = torch.empty_like(slots)
+
+    triton_qsa_unscale_block_table(
+        scaled_block_table=scaled,
+        block_table=actual,
+        page_index_scale=scale,
+    )
+
+    torch.testing.assert_close(actual, slots)
 
 
 @pytest.mark.parametrize("rows", [1, 64, 257])

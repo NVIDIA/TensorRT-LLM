@@ -12,6 +12,70 @@ import triton.language as tl
 
 
 @triton.jit
+def _qsa_unscale_block_table_kernel(
+    scaled_block_table,
+    block_table,
+    num_rows,
+    scaled_stride_row: tl.constexpr,
+    scaled_stride_column: tl.constexpr,
+    block_stride_row: tl.constexpr,
+    block_stride_column: tl.constexpr,
+    PAGE_INDEX_SCALE: tl.constexpr,
+    NUM_COLUMNS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK_SIZE)
+    valid = (row < num_rows) & (columns < NUM_COLUMNS)
+    scaled = tl.load(
+        scaled_block_table + row * scaled_stride_row + columns * scaled_stride_column,
+        mask=valid,
+        other=0,
+    )
+    tl.store(
+        block_table + row * block_stride_row + columns * block_stride_column,
+        scaled // PAGE_INDEX_SCALE,
+        mask=valid,
+    )
+
+
+def triton_qsa_unscale_block_table(
+    *,
+    scaled_block_table: torch.Tensor,
+    block_table: torch.Tensor,
+    page_index_scale: int,
+) -> None:
+    """Recover lifecycle slot IDs from V2's scaled attention page table."""
+    if scaled_block_table.shape != block_table.shape:
+        raise ValueError("QSA scaled and slot block tables must have matching shapes")
+    if scaled_block_table.ndim != 2:
+        raise ValueError("QSA block tables must be two-dimensional")
+    if scaled_block_table.dtype != torch.int32 or block_table.dtype != torch.int32:
+        raise ValueError("QSA block tables must use int32 storage")
+    if not scaled_block_table.is_cuda or not block_table.is_cuda:
+        raise ValueError("QSA block-table conversion requires CUDA tensors")
+    if page_index_scale <= 0:
+        raise ValueError(f"QSA page-index scale must be positive, got {page_index_scale}")
+    num_rows, num_columns = scaled_block_table.shape
+    if num_rows == 0 or num_columns == 0:
+        return
+    block_size = triton.next_power_of_2(num_columns)
+    _qsa_unscale_block_table_kernel[(num_rows,)](
+        scaled_block_table,
+        block_table,
+        num_rows,
+        scaled_block_table.stride(0),
+        scaled_block_table.stride(1),
+        block_table.stride(0),
+        block_table.stride(1),
+        PAGE_INDEX_SCALE=page_index_scale,
+        NUM_COLUMNS=num_columns,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _qsa_decode_token_mapping_kernel(
     kv_lens,
     seq_lens,

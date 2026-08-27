@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -14,7 +14,6 @@ from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_t
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
 QSA_INDEX_POSITION = DataRole("qsa_index_position")
@@ -195,21 +194,24 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         )
         return full_view[:, 0]
 
-    def get_qsa_slot_block_indices(
-        self,
-        request_ids: List[int],
-    ) -> List[List[int]]:
-        """Return lifecycle slot IDs shared by main and sparse side buffers."""
+    def get_qsa_attention_pool_layout(self) -> tuple[int, int]:
+        """Return the attention-pool index and its V2 page-index scale."""
         if self.qsa_position_layer_id is None:
             raise RuntimeError("QSA cache manager has no local sparse layer")
         local_idx = self.layer_offsets[self.qsa_position_layer_id]
         pool_id = self.layer_to_pool_mapping_dict[local_idx]
-        result = []
-        for request_id in request_ids:
-            cache = self.kv_cache_map[request_id]
-            pages = cache.get_base_page_indices(pool_id)[: cache.num_blocks]
-            result.append([0 if page == BAD_PAGE_INDEX else int(page) for page in pages])
-        return result
+        if pool_id >= self.num_attention_op_pools:
+            raise RuntimeError(
+                "QSA K/V pool is not represented in the attention block table: "
+                f"pool {pool_id}, attention pools {self.num_attention_op_pools}"
+            )
+        converter = self.impl.get_page_index_converter(local_idx, Role.KEY)
+        if int(converter.expansion) != 1:
+            raise RuntimeError("QSA does not support expanded V2 page indices")
+        scale = int(converter.scale)
+        if scale <= 0:
+            raise RuntimeError(f"QSA received an invalid V2 page-index scale: {scale}")
+        return pool_id, scale
 
 
 __all__ = ["QSAMambaHybridCacheManagerV2"]
