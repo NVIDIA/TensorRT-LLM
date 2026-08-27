@@ -24,6 +24,7 @@ Tests cover:
 
 import os
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -460,6 +461,58 @@ class TestLocalityDomainInitialization:
         # One mempool per locality domain, no matter how many threads raced.
         assert len(created) == 2, (
             f"expected 2 mempools, {num_threads} threads created {len(created)}"
+        )
+
+    def test_initialize_allocators_concurrent_across_devices(self, check_locality_domain_support):
+        """The shared allocators must be created once even when devices race.
+
+        The allocators are process-wide ("all devices share the same allocator"), so a
+        per-device init lock does not serialize them: threads initializing different
+        devices hold different locks. If both create holders, the second assignment drops
+        the first list's last reference and a mempool can outlive its holder.
+        """
+        if torch.cuda.device_count() < 2:
+            pytest.skip("needs at least 2 GPUs to race distinct devices")
+
+        locality_domain_utils.reset_locality_domain_resource_manager()
+
+        real_allocator = locality_domain_utils.CUDAPluggableAllocator
+        created = []
+        created_lock = threading.Lock()
+
+        def counting_allocator(*args, **kwargs):
+            with created_lock:
+                created.append(1)
+            # Hold the check-to-assign window open so a genuinely unguarded
+            # implementation lets another device's thread in. Without this the
+            # first thread finishes before the others reach the check and the
+            # race never manifests.
+            time.sleep(0.05)
+            return real_allocator(*args, **kwargs)
+
+        devices = list(range(min(4, torch.cuda.device_count())))
+        barrier = threading.Barrier(len(devices))
+        errors = []
+
+        def worker(device_id):
+            try:
+                torch.cuda.set_device(device_id)  # CUDA current device is per-thread
+                barrier.wait()
+                initialize_locality_domain_resources()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(locality_domain_utils, "CUDAPluggableAllocator", counting_allocator):
+            threads = [threading.Thread(target=worker, args=(d,)) for d in devices]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert not errors, f"concurrent initialization raised: {errors}"
+        # Two shared allocators total, regardless of how many devices raced.
+        assert len(created) == 2, (
+            f"expected 2 allocators, {len(devices)} devices created {len(created)}"
         )
 
 

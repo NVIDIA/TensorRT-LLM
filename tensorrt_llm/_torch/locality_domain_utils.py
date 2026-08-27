@@ -151,23 +151,14 @@ class LocalityDomainResourceManager:
 _locality_domain_resource_manager: LocalityDomainResourceManager | None = None
 _manager_lock = threading.Lock()
 
-# Per-device locks guarding resource initialization. A device's lock is held across the
-# whole check-create-mark sequence, so concurrent callers cannot both create resources for
-# the same device. Distinct devices initialize concurrently. This must not be _manager_lock:
-# the initialization path calls get_locality_domain_resource_manager(), which takes that
-# lock, and threading.Lock is not reentrant.
-_init_locks: dict[int, threading.Lock] = {}
-_init_locks_lock = threading.Lock()
-
-
-def _get_init_lock(device_id: int) -> threading.Lock:
-    """Return the initialization lock for a device, creating it on first use."""
-    with _init_locks_lock:
-        lock = _init_locks.get(device_id)
-        if lock is None:
-            lock = threading.Lock()
-            _init_locks[device_id] = lock
-        return lock
+# Guards resource initialization. Held across the whole check-create-mark sequence so
+# concurrent callers cannot both create resources. One global lock rather than a per-device
+# one: the allocators are shared by every device, so per-device locking would not serialize
+# their creation. Initialization runs once per device at startup, so the contention is
+# irrelevant. This must not be _manager_lock: the initialization path calls
+# get_locality_domain_resource_manager(), which takes that lock, and threading.Lock is not
+# reentrant.
+_init_lock = threading.Lock()
 
 
 def get_locality_domain_resource_manager() -> LocalityDomainResourceManager:
@@ -358,6 +349,12 @@ def initialize_locality_domain_allocators():
     if len(manager.allocators) > 0:
         assert len(manager.allocators) == 2
         return
+
+    _create_locality_domain_allocators(manager)
+
+
+def _create_locality_domain_allocators(manager: LocalityDomainResourceManager) -> None:
+    """Create the process-wide allocators. Caller must hold _allocator_lock."""
     trtllm_dir = Path(trtllm.__file__).parent
     th_common_libname = "th_common"
     th_common_dir = trtllm_dir / "libs"
@@ -398,7 +395,7 @@ def initialize_locality_domain_resources() -> None:
     if manager.is_initialized(device_id):
         return
 
-    with _get_init_lock(device_id):
+    with _init_lock:
         # Re-check under the lock: another thread may have initialized this device
         # between the check above and acquiring the lock.
         if manager.is_initialized(device_id):
