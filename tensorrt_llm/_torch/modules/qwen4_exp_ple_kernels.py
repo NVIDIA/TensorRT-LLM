@@ -16,6 +16,8 @@ _NGRAM_HEADS = 16
 _HC_COUNT = 4
 _HIDDEN_SIZE = 2560
 _MAX_SHORT_CONV_STATE_LEN = 16
+_SHORT_CONV_KERNEL_SIZE = 4
+_SHORT_CONV_STATE_LEN = 9
 
 
 @triton.jit
@@ -342,11 +344,148 @@ def _(
     return value.new_empty((value.shape[0], value.shape[1], state.shape[2] + 1))
 
 
+@triton.jit
+def _decode_short_conv_kernel(
+    state_ptr,
+    state_indices_ptr,
+    value_ptr,
+    weight_ptr,
+    output_ptr,
+    num_tokens,
+    channels: tl.constexpr,
+    kernel_size: tl.constexpr,
+    state_len: tl.constexpr,
+    block_channels: tl.constexpr,
+) -> None:
+    token = tl.program_id(0)
+    channel = tl.program_id(1) * block_channels + tl.arange(0, block_channels)
+    mask = (token < num_tokens) & (channel < channels)
+    state_index = tl.load(state_indices_ptr + token, mask=token < num_tokens, other=0)
+    state_base = state_index * channels * state_len + channel * state_len
+
+    state_0 = tl.load(state_ptr + state_base, mask=mask, other=0.0).to(tl.float32)
+    state_1 = tl.load(state_ptr + state_base + 1, mask=mask, other=0.0)
+    state_2 = tl.load(state_ptr + state_base + 2, mask=mask, other=0.0)
+    state_3 = tl.load(state_ptr + state_base + 3, mask=mask, other=0.0).to(tl.float32)
+    state_4 = tl.load(state_ptr + state_base + 4, mask=mask, other=0.0)
+    state_5 = tl.load(state_ptr + state_base + 5, mask=mask, other=0.0)
+    state_6 = tl.load(state_ptr + state_base + 6, mask=mask, other=0.0).to(tl.float32)
+    state_7 = tl.load(state_ptr + state_base + 7, mask=mask, other=0.0)
+    state_8 = tl.load(state_ptr + state_base + 8, mask=mask, other=0.0)
+    value = tl.load(value_ptr + token * channels + channel, mask=mask, other=0.0)
+
+    weight_base = channel * kernel_size
+    weight_0 = tl.load(weight_ptr + weight_base, mask=mask, other=0.0).to(tl.float32)
+    weight_1 = tl.load(weight_ptr + weight_base + 1, mask=mask, other=0.0).to(tl.float32)
+    weight_2 = tl.load(weight_ptr + weight_base + 2, mask=mask, other=0.0).to(tl.float32)
+    weight_3 = tl.load(weight_ptr + weight_base + 3, mask=mask, other=0.0).to(tl.float32)
+    conv = state_0 * weight_0
+    conv += state_3 * weight_1
+    conv += state_6 * weight_2
+    conv += value.to(tl.float32) * weight_3
+
+    # F.conv1d materializes a BF16 output before F.silu. Preserve that
+    # otherwise-observable rounding boundary while keeping both operations in
+    # this launch.
+    conv = _round_bf16_to_fp32(conv)
+    tl.store(
+        output_ptr + token * channels + channel,
+        conv * tl.sigmoid(conv),
+        mask=mask,
+    )
+
+    tl.store(state_ptr + state_base, state_1, mask=mask)
+    tl.store(state_ptr + state_base + 1, state_2, mask=mask)
+    tl.store(state_ptr + state_base + 2, state_3, mask=mask)
+    tl.store(state_ptr + state_base + 3, state_4, mask=mask)
+    tl.store(state_ptr + state_base + 4, state_5, mask=mask)
+    tl.store(state_ptr + state_base + 5, state_6, mask=mask)
+    tl.store(state_ptr + state_base + 6, state_7, mask=mask)
+    tl.store(state_ptr + state_base + 7, state_8, mask=mask)
+    tl.store(state_ptr + state_base + 8, value, mask=mask)
+
+
+def can_use_ple_decode_short_conv(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    """Return whether decode tensors match the bitwise-exact fused contract."""
+    return (
+        state.is_cuda
+        and state.dtype == torch.bfloat16
+        and state.dim() == 3
+        and state.shape[2] == _SHORT_CONV_STATE_LEN
+        and state.is_contiguous()
+        and state_indices.is_cuda
+        and state_indices.dtype == torch.long
+        and state_indices.dim() == 1
+        and state_indices.is_contiguous()
+        and value.is_cuda
+        and value.dtype == state.dtype
+        and value.dim() == 2
+        and value.is_contiguous()
+        and value.shape == (state_indices.shape[0], state.shape[1])
+        and weight.is_cuda
+        and weight.dtype == state.dtype
+        and weight.shape == (state.shape[1], 1, _SHORT_CONV_KERNEL_SIZE)
+        and weight.is_contiguous()
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::qwen4_exp_ple_decode_short_conv",
+    mutates_args=("state",),
+)
+def ple_decode_short_conv(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Advance decode state and compute dilated short-conv SiLU in one launch."""
+    assert can_use_ple_decode_short_conv(state, state_indices, value, weight)
+    output = torch.empty_like(value)
+    if value.shape[0]:
+        block_channels = 64
+        with torch.cuda.device(state.device.index):
+            _decode_short_conv_kernel[
+                (value.shape[0], triton.cdiv(value.shape[1], block_channels))
+            ](
+                state,
+                state_indices,
+                value,
+                weight,
+                output,
+                value.shape[0],
+                channels=value.shape[1],
+                kernel_size=_SHORT_CONV_KERNEL_SIZE,
+                state_len=_SHORT_CONV_STATE_LEN,
+                block_channels=block_channels,
+                num_warps=4,
+            )
+    return output
+
+
+@ple_decode_short_conv.register_fake
+def _(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    del state, state_indices, weight
+    return torch.empty_like(value)
+
+
 __all__ = [
+    "can_use_ple_decode_short_conv",
     "can_use_ple_gate_value",
     "can_use_ple_ngram_hash",
     "can_use_ple_short_conv_state",
     "ple_gate_value",
+    "ple_decode_short_conv",
     "ple_ngram_hash",
     "ple_short_conv_state",
 ]
