@@ -251,9 +251,7 @@ def _make_pipeline(sampling=None):
     pipeline.scheduler = StubScheduler()
     pipeline.sampling = sampling or StubSamplingPolicy()
     pipeline.safety_checker = None
-    pipeline.pipeline_config = SimpleNamespace(
-        torch_dtype=torch.float32, cpu_offload_config=None
-    )
+    pipeline.pipeline_config = SimpleNamespace(torch_dtype=torch.float32, cpu_offload_config=None)
     pipeline.offloader = PipelineOffloader(pipeline)
     pipeline.vae_scale_factor_temporal = 4
     pipeline._guidance_scale = None
@@ -1229,8 +1227,7 @@ class TestTransferSamplingAndSafety:
         self._run(pipeline, monkeypatch, use_guardrails=True)
         assert seen.get("called"), "transfer returned generated video unscreened"
         assert (
-            seen["offload_component"]
-            == pipeline_module.COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT
+            seen["offload_component"] == pipeline_module.COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT
         )
 
     def test_phase_timings_are_populated(self, monkeypatch):
