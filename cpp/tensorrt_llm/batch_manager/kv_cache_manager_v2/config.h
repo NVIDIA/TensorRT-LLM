@@ -301,9 +301,6 @@ struct KVCacheManagerConfig
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
 
-    // Whether committed cache blocks may be reused by later requests.
-    bool enableBlockReuse = true;
-
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

@@ -3310,6 +3310,111 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             state_quota + attention_block_quota,
         )
 
+    @staticmethod
+    def _gpu_pool_granularity(quota: int) -> int:
+        """Match the V2 GPU pool allocator's physical-memory granularity."""
+        page_size = 2 << 20
+        ratio = quota // (page_size * 512)
+        exponent = 0 if ratio == 0 else min(4, ratio.bit_length() - 1)
+        return page_size << exponent
+
+    def _non_reusable_initial_pool_ratio(
+        self,
+        config: KVCacheManagerConfigPy,
+        layers,
+        typical_step: Optional[BatchDesc],
+    ) -> Tuple[List[float], int]:
+        """Reserve only the recurrent-state floor and give the rest to attention."""
+        tokens_per_block = config.tokens_per_block
+        gpu_quota = config.cache_tiers[0].quota
+        granularity = self._gpu_pool_granularity(gpu_quota)
+        rounded_gpu_quota = math.ceil(gpu_quota / granularity) * granularity
+
+        life_cycle_keys = []
+        bytes_per_slot = {}
+        for layer in layers:
+            if isinstance(layer, SsmLayerConfig):
+                key = ("ssm", )
+            else:
+                window_size = layer.window_size
+                num_sink_blocks = math.ceil(
+                    (layer.num_sink_tokens or 0) / tokens_per_block)
+                key = ("attention", window_size, num_sink_blocks)
+            if key not in bytes_per_slot:
+                life_cycle_keys.append(key)
+                bytes_per_slot[key] = 0
+            for buffer in layer.buffers:
+                override = buffer.tokens_per_block_override
+                expansion = (tokens_per_block //
+                             override if override is not None else 1)
+                bytes_per_slot[key] += buffer.size * expansion
+
+        ssm_key = ("ssm", )
+        ssm_life_cycle = life_cycle_keys.index(ssm_key)
+        required_state_slots = (self._max_resident_sequences() +
+                                self._num_reserved_dummy_slots)
+
+        state_bytes = required_state_slots * bytes_per_slot[ssm_key]
+        state_floor_quota = (math.ceil(state_bytes / granularity) * granularity)
+        attention_life_cycles = [
+            i for i, key in enumerate(life_cycle_keys) if key != ssm_key
+        ]
+        if not attention_life_cycles:
+            return [1.0], state_floor_quota
+        if state_floor_quota >= rounded_gpu_quota:
+            # StorageManager rounds each pool up to a physical grain and may
+            # therefore allocate more than a tiny synthetic cache quota. Use
+            # the smallest two-pool denominator in that case; the ordinary
+            # live-quota validation above still rejects real undersizing.
+            rounded_gpu_quota = 2 * state_floor_quota
+
+        if config.initial_pool_ratio is not None:
+            weights = list(config.initial_pool_ratio)
+            if len(weights) != len(life_cycle_keys):
+                raise ValueError(
+                    "initial_pool_ratio length must match number of layer groups "
+                    f"({len(life_cycle_keys)}), got {len(weights)}")
+        else:
+            assert typical_step is not None
+            weights = [0.0] * len(life_cycle_keys)
+            for life_cycle in attention_life_cycles:
+                _, window_size, num_sink_blocks = life_cycle_keys[life_cycle]
+                num_slots = 0
+                for desc in typical_step.kv_caches:
+                    num_blocks = math.ceil(desc.capacity / tokens_per_block)
+                    if window_size is None:
+                        num_stale_blocks = 0
+                    else:
+                        stale_start = min(
+                            math.ceil(desc.history_length / tokens_per_block),
+                            num_sink_blocks,
+                        )
+                        stale_end = max(
+                            stale_start,
+                            (desc.history_length + 1 - window_size) //
+                            tokens_per_block,
+                        )
+                        num_stale_blocks = stale_end - stale_start
+                    num_slots += num_blocks - num_stale_blocks
+                weights[life_cycle] = (
+                    num_slots * bytes_per_slot[life_cycle_keys[life_cycle]])
+
+        attention_weight = sum(weights[i] for i in attention_life_cycles)
+        if attention_weight <= 0:
+            raise ValueError(
+                "The V2 Mamba attention pool ratio must be positive")
+        state_ratio = state_floor_quota / rounded_gpu_quota
+        attention_ratio = 1.0 - state_ratio
+        ratio = [0.0] * len(life_cycle_keys)
+        ratio[ssm_life_cycle] = state_ratio
+        for life_cycle in attention_life_cycles:
+            ratio[life_cycle] = (attention_ratio * weights[life_cycle] /
+                                 attention_weight)
+        # Avoid backend-specific floating-point sum checks disagreeing on the
+        # final bit after normalization.
+        ratio[attention_life_cycles[-1]] += 1.0 - sum(ratio)
+        return ratio, state_floor_quota
+
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
@@ -3377,11 +3482,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     for _ in range(ssm_floor_slots)
                 ]),
             ]
+        initial_pool_ratio = config.initial_pool_ratio
+        if (self.local_num_mamba_layers > 0
+                and not kv_cache_config.enable_block_reuse):
+            initial_pool_ratio, state_floor_quota = (
+                self._non_reusable_initial_pool_ratio(
+                    config,
+                    layers,
+                    typical_step,
+                ))
+            if not any(not isinstance(layer, SsmLayerConfig)
+                       for layer in layers):
+                cache_tiers = list(cache_tiers)
+                cache_tiers[0] = type(cache_tiers[0])(quota=state_floor_quota)
         return replace(
             config,
+            cache_tiers=cache_tiers,
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
+            initial_pool_ratio=initial_pool_ratio,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
             # attempted, while the runtime config still needs the invariant.

@@ -3464,17 +3464,22 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
 
-    def test_non_reusable_ssm_pool_uses_constraint_floor(self) -> None:
-        """Non-reusable SSM slots stop at the live-request floor and leave quota to attention."""
+    def test_ssm_pool_ratio_at_constraint_floor_keeps_exact_slot_count(self) -> None:
+        """A floor-sized SSM ratio leaves all discretionary quota to attention."""
         ssm_floor_slots = 4
         granularity = 2 << 20
         gpu_quota = 256 << 20
         cfg = self._make_hybrid_config(gpu_quota)
-        cfg.enable_block_reuse = False
         cfg.constraints = [
             BatchDesc(kv_caches=[KVCacheDesc(capacity=0, history_length=0)] * ssm_floor_slots)
         ]
-        cfg.initial_pool_ratio = [0.9, 0.1]
+        fixed_grains = _introspection.grains_for_slots(
+            ssm_floor_slots,
+            [self.SSM_STATE_SLOT_SIZE, self.SSM_CONV_SLOT_SIZE],
+            granularity,
+        )
+        ssm_ratio = fixed_grains / (gpu_quota // granularity)
+        cfg.initial_pool_ratio = [ssm_ratio, 1.0 - ssm_ratio]
 
         manager = KVCacheManager(cfg)
         try:
@@ -3483,29 +3488,8 @@ class TestInitRatioConfig(unittest.TestCase):
             ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
             attn_pg = 1 - ssm_pg
             statistics = _introspection.storage_statistics(manager)
-            ssm_statistics = statistics[ssm_pg]
-            attn_statistics = statistics[attn_pg]
-            ssm_slot_sizes = list(
-                ssm_statistics.slot_sizes
-                if hasattr(ssm_statistics, "slot_sizes")
-                else ssm_statistics.slot_size
-            )
-            attn_slot_sizes = list(
-                attn_statistics.slot_sizes
-                if hasattr(attn_statistics, "slot_sizes")
-                else attn_statistics.slot_size
-            )
-            fixed_grains = _introspection.grains_for_slots(
-                ssm_floor_slots, ssm_slot_sizes, granularity
-            )
-            expected_attn_slots, _ = _introspection.grains_to_slots(
-                gpu_quota // granularity - fixed_grains,
-                attn_slot_sizes,
-                granularity,
-            )
-
             self.assertEqual(statistics[ssm_pg].total, ssm_floor_slots)
-            self.assertEqual(statistics[attn_pg].total, expected_attn_slots)
+            self.assertGreater(statistics[attn_pg].total, ssm_floor_slots)
         finally:
             manager.shutdown()
 

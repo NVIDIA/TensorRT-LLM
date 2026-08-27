@@ -221,9 +221,6 @@ struct StorageConfig
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
 
-    // Whether committed cache blocks may be reused by later requests.
-    bool enableBlockReuse = true;
-
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;
 

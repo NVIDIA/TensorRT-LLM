@@ -335,8 +335,28 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mLevels.reserve(config.cacheTiers.size());
 
-    auto gpuSlotCounts
-        = computeSlotCountForLevel(kHotLevel, config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+    if (initialPoolRatio.has_value())
+    {
+        auto const ssmLifeCycle = mLifeCycles.ssmLifeCycleId();
+        if (ssmLifeCycle.has_value())
+        {
+            auto const poolGroup = getPoolGroupIndex(*ssmLifeCycle);
+            if (!poolGroupNeedsHeadroomForGrowth(poolGroup))
+            {
+                size_t const allocatedQuota = std::max(
+                    minQuotaForLevel(slotSizeLists, gpuGranularity, mMinSlots), roundUp(gpuQuota, gpuGranularity));
+                size_t const requestedGrains = static_cast<size_t>(
+                    std::nearbyint(static_cast<double>(allocatedQuota / gpuGranularity) * hotRatio[poolGroup]));
+                size_t const floorGrains
+                    = CacheLevelStorage::grainsForSlots(mMinSlots[poolGroup], slotSizeLists[poolGroup], gpuGranularity);
+                if (requestedGrains <= floorGrains)
+                {
+                    gpuSlotCounts[poolGroup] = mMinSlots[poolGroup];
+                }
+            }
+        }
+    }
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get());
 
@@ -450,7 +470,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         mSlotDescLists[level] = coldSlotDescList;
         auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
         auto slotCounts
-            = computeSlotCountForLevel(level, config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
+            = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
@@ -1622,8 +1642,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota)
             + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
     }
-    auto newNumSlots = allocateSlotCounts(
-        level, quota, lvlStorage.slotSizeLists(), ratioList, lvlStorage.poolSizeGranularity(), minSlots);
+    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -1922,8 +1941,8 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 // computeSlotCountForLevel
 // ---------------------------------------------------------------------------
 
-TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheLevel level,
-    CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
@@ -1931,73 +1950,7 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
-    return allocateSlotCounts(level, quota, slotSizeLists, ratio, granularity, minSlots);
-}
-
-TypedVec<PoolGroupIndex, SlotCount> StorageManager::allocateSlotCounts(CacheLevel level, size_t quota,
-    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
-{
-    if (level != kHotLevel || mStorageConfig.enableBlockReuse)
-    {
-        return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
-    }
-
-    std::vector<PoolGroupIndex> growablePoolGroups;
-    TypedVec<PoolGroupIndex, SlotCount> slotCounts(slotSizeLists.size(), SlotCount{0});
-    size_t fixedQuota = 0;
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
-    {
-        if (!isSsmOnlyPoolGroup(pgIdx))
-        {
-            growablePoolGroups.push_back(pgIdx);
-            continue;
-        }
-
-        slotCounts[pgIdx] = minSlots[pgIdx];
-        for (size_t slotSize : slotSizeLists[pgIdx])
-        {
-            fixedQuota += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);
-        }
-    }
-
-    if (growablePoolGroups.size() == toSizeT(slotSizeLists.size()))
-    {
-        return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
-    }
-    TLLM_CHECK_WITH_INFO(fixedQuota <= quota, "Insufficient quota to satisfy fixed SSM slot constraints");
-    if (growablePoolGroups.empty())
-    {
-        return slotCounts;
-    }
-
-    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> growableSlotSizeLists;
-    TypedVec<PoolGroupIndex, float> growableRatio;
-    TypedVec<PoolGroupIndex, SlotCount> growableMinSlots;
-    growableSlotSizeLists.reserve(slotSizeLists.size());
-    growableRatio.reserve(slotSizeLists.size());
-    growableMinSlots.reserve(slotSizeLists.size());
-    for (PoolGroupIndex pgIdx : growablePoolGroups)
-    {
-        growableSlotSizeLists.push_back(slotSizeLists[pgIdx]);
-        growableRatio.push_back(ratio[pgIdx]);
-        growableMinSlots.push_back(minSlots[pgIdx]);
-    }
-    auto const growableSlotCounts = CacheLevelStorage::ratioToSlotCountList(
-        quota - fixedQuota, growableSlotSizeLists, growableRatio, granularity, growableMinSlots);
-    for (PoolGroupIndex subPgIdx{0}; subPgIdx < growableSlotCounts.size(); ++subPgIdx)
-    {
-        slotCounts[growablePoolGroups.at(toSizeT(subPgIdx))] = growableSlotCounts[subPgIdx];
-    }
-    return slotCounts;
-}
-
-bool StorageManager::isSsmOnlyPoolGroup(PoolGroupIndex pgIdx) const
-{
-    auto const ssmLifeCycle = mLifeCycles.ssmLifeCycleId();
-    return ssmLifeCycle.has_value() && getPoolGroupIndex(*ssmLifeCycle) == pgIdx
-        && !poolGroupNeedsHeadroomForGrowth(pgIdx);
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
 }
 
 // ---------------------------------------------------------------------------
@@ -2027,8 +1980,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
     size_t granularity = gpuStorage.poolSizeGranularity();
-    auto slotCountList = allocateSlotCounts(
-        kHotLevel, gpuStorage.totalQuota(), gpuStorage.slotSizeLists(), ratio, granularity, mMinSlots);
+    auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
     auto numBytes = slotsToBytes(slotCountList, granularity);
     return normalizeToRatio(numBytes);
 }

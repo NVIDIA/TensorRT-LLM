@@ -118,7 +118,6 @@ class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     expansion: dict[BufferId, int]  # expansion factor of page due to heterogeneous tokens_per_block
-    enable_block_reuse: bool = True
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
@@ -240,5 +239,4 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         cache_tiers=tuple(config.cache_tiers),
         slot_desc_list=slot_desc_list,
         expansion=expansion_map,
-        enable_block_reuse=config.enable_block_reuse,
     )

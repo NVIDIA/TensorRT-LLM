@@ -350,14 +350,9 @@ private:
         TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheLevel level, CacheTierConfig const& tierConfig,
+    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
-    TypedVec<PoolGroupIndex, SlotCount> allocateSlotCounts(CacheLevel level, size_t quota,
-        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, size_t granularity,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
-    bool isSsmOnlyPoolGroup(PoolGroupIndex pgIdx) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 

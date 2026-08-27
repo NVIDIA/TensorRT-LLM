@@ -258,11 +258,6 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
-    enable_block_reuse: bool = True
-    """
-    Whether committed cache blocks may be reused by later requests.
-    """
-
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None

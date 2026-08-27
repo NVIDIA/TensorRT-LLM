@@ -193,7 +193,6 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
-        "_enable_block_reuse",
         "_event_manager",
         "__rawref__",
     )
@@ -207,7 +206,6 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
-    _enable_block_reuse: bool
     _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
@@ -239,7 +237,6 @@ class StorageManager:
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         self._slot_desc_list = config.slot_desc_list
-        self._enable_block_reuse = config.enable_block_reuse
         assert all(pg < self.num_pool_groups for pg in self._life_cycle_grouping)
         assert self.num_pool_groups == PoolGroupIndex(len(set(self._life_cycle_grouping)))
         slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
@@ -296,7 +293,11 @@ class StorageManager:
                     config.cache_tiers[i],
                     slot_size_lists,
                     self._compute_slot_count_for_level(
-                        i, config.cache_tiers[i], slot_size_lists, init_ratio
+                        i,
+                        config.cache_tiers[i],
+                        slot_size_lists,
+                        init_ratio,
+                        initial_pool_ratio is not None,
                     ),
                 )
                 for i in typed_range(num_levels)
@@ -855,14 +856,7 @@ class StorageManager:
                 f"Quota {new_quota} is insufficient for min_slots constraints "
                 f"(requires at least {min_quota})"
             )
-        new_num_slots = self._allocate_slot_counts(
-            level,
-            new_quota,
-            lvl_storage.slot_size_lists,
-            new_ratio_list,
-            lvl_storage.pool_size_granularity,
-            min_slots,
-        )
+        new_num_slots = lvl_storage.compute_slot_count_list(new_ratio_list, min_slots, new_quota)
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (
                 "Persistent pages should be None for non-last level cache"
@@ -917,15 +911,6 @@ class StorageManager:
         return any(
             self.get_pool_group_index(life_cycle) == pool_group and isinstance(lc, AttnLifeCycle)
             for life_cycle, lc in self.life_cycles.items()
-        )
-
-    def _is_ssm_only_pool_group(self, pool_group: PoolGroupIndex) -> bool:
-        """Return whether a hot-tier pool group contains SSM state but no attention state."""
-        ssm_life_cycle = self.life_cycles.ssm_life_cycle_id
-        return (
-            ssm_life_cycle is not None
-            and self.get_pool_group_index(ssm_life_cycle) == pool_group
-            and not self._pool_group_needs_headroom_for_growth(pool_group)
         )
 
     def ratio_from_batch(
@@ -1125,6 +1110,7 @@ class StorageManager:
         tier_config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         ratio: TypedIndexList[PoolGroupIndex, float],
+        cap_ssm_at_floor: bool,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute slot counts for a cache level from its tier config and ratio.
 
@@ -1136,77 +1122,19 @@ class StorageManager:
             self._min_quota_for_level(slot_size_lists, granularity, min_slots),
             round_up(tier_config.quota, granularity),
         )
-        return self._allocate_slot_counts(
-            level,
-            quota,
-            slot_size_lists,
-            ratio,
-            granularity,
-            min_slots,
+        slot_counts = CacheLevelStorage.ratio_to_slot_count_list(
+            quota, slot_size_lists, ratio, granularity, min_slots
         )
-
-    def _allocate_slot_counts(
-        self,
-        level: CacheLevel,
-        quota: int,
-        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-        ratio: TypedIndexList[PoolGroupIndex, float],
-        granularity: int,
-        min_slots: TypedIndexList[PoolGroupIndex, int],
-    ) -> TypedIndexList[PoolGroupIndex, int]:
-        """Allocate slots, fixing non-reusable SSM-only GPU pools at their lifecycle floor."""
-        if level != GPU_LEVEL or self._enable_block_reuse:
-            return CacheLevelStorage.ratio_to_slot_count_list(
-                quota, slot_size_lists, ratio, granularity, min_slots
-            )
-
-        fixed_pool_groups = [
-            pool_group
-            for pool_group in typed_range(self.num_pool_groups)
-            if self._is_ssm_only_pool_group(pool_group)
-        ]
-        if not fixed_pool_groups:
-            return CacheLevelStorage.ratio_to_slot_count_list(
-                quota, slot_size_lists, ratio, granularity, min_slots
-            )
-
-        fixed_pool_group_set = set(fixed_pool_groups)
-        growable_pool_groups = [
-            pool_group
-            for pool_group in typed_range(self.num_pool_groups)
-            if pool_group not in fixed_pool_group_set
-        ]
-        slot_counts = filled_list(0, self.num_pool_groups)
-        fixed_quota = 0
-        for pool_group in fixed_pool_groups:
-            slot_counts[pool_group] = min_slots[pool_group]
-            fixed_quota += sum(
-                round_up(min_slots[pool_group] * slot_size, granularity)
-                for slot_size in slot_size_lists[pool_group]
-            )
-        if fixed_quota > quota:
-            raise ValueError("Insufficient quota to satisfy fixed SSM slot constraints")
-        if not growable_pool_groups:
-            return slot_counts
-
-        growable_slot_counts = CacheLevelStorage.ratio_to_slot_count_list(
-            quota - fixed_quota,
-            cast(
-                TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-                [slot_size_lists[pool_group] for pool_group in growable_pool_groups],
-            ),
-            cast(
-                TypedIndexList[PoolGroupIndex, float],
-                [ratio[pool_group] for pool_group in growable_pool_groups],
-            ),
-            granularity,
-            cast(
-                TypedIndexList[PoolGroupIndex, int],
-                [min_slots[pool_group] for pool_group in growable_pool_groups],
-            ),
-        )
-        for sub_pool_group, pool_group in enumerate(growable_pool_groups):
-            slot_counts[pool_group] = growable_slot_counts[sub_pool_group]
+        ssm_life_cycle = self.life_cycles.ssm_life_cycle_id
+        if level == GPU_LEVEL and cap_ssm_at_floor and ssm_life_cycle is not None:
+            pool_group = self.get_pool_group_index(ssm_life_cycle)
+            if not self._pool_group_needs_headroom_for_growth(pool_group):
+                requested_grains = round(quota / granularity * ratio[pool_group])
+                floor_grains = CacheLevelStorage._grains_for_slots(
+                    min_slots[pool_group], slot_size_lists[pool_group], granularity
+                )
+                if requested_grains <= floor_grains:
+                    slot_counts[pool_group] = min_slots[pool_group]
         return slot_counts
 
     def constrain_pool_group_ratio(
@@ -1220,14 +1148,7 @@ class StorageManager:
         """
         gpu_storage = self._levels[GPU_LEVEL].storage
         granularity = gpu_storage.pool_size_granularity
-        slot_count_list = self._allocate_slot_counts(
-            GPU_LEVEL,
-            gpu_storage.total_quota,
-            gpu_storage.slot_size_lists,
-            ratio,
-            granularity,
-            self._min_slots,
-        )
+        slot_count_list = gpu_storage.compute_slot_count_list(ratio, self._min_slots)
         num_bytes = self._pool_group_slots_to_bytes(slot_count_list, granularity)
         total = sum(num_bytes)
         assert total > 0

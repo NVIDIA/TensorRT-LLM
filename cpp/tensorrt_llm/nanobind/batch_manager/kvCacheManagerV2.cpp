@@ -1617,7 +1617,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly, bool enableBlockReuse)
+                bool textOnly)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1639,7 +1639,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
-                cfg->enableBlockReuse = enableBlockReuse;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1648,8 +1647,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("swa_scratch_reuse").none() = std::nullopt,
-            nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true, nb::arg("text_only") = false,
-            nb::arg("enable_block_reuse") = true)
+            nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true, nb::arg("text_only") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1663,7 +1661,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
-        .def_rw("enable_block_reuse", &kv::KVCacheManagerConfig::enableBlockReuse)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 

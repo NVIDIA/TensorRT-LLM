@@ -197,7 +197,6 @@ else:
         commit_min_snapshot: bool = False
         enable_stats: bool = True
         text_only: bool = False
-        enable_block_reuse: bool = True
 
     KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
     del _KVCacheManagerConfigFieldSpec, _dataclasses
