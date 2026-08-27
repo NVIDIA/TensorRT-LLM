@@ -180,6 +180,7 @@ class PLEMetadata:
     ngram_eos_token_id: int
     all_rank_num_tokens: Optional[list[int]] = None
     num_contexts: int = 0
+    context_tokens: int = 0
     use_spec_decoding: bool = False
     is_cuda_graph: bool = False
 
@@ -220,6 +221,7 @@ class PLEMetadata:
             row_width = 1
             req_indices = positions
             token_offsets = torch.zeros_like(positions)
+            context_tokens = 0
         elif uniform_row_width is not None:
             if uniform_row_width <= 0:
                 raise ValueError("PLE uniform row width must be positive")
@@ -233,11 +235,13 @@ class PLEMetadata:
             lengths = torch.full((num_seq,), row_width, dtype=torch.long, device=device)
             req_indices = torch.div(positions, row_width, rounding_mode="floor")
             token_offsets = positions.remainder(row_width)
+            context_tokens = num_contexts * row_width
         else:
             lengths = seq_lens.to(device=device, dtype=torch.long)
             seq_lens_cpu = lengths.tolist()
             row_width = max(seq_lens_cpu) if seq_lens_cpu else processed_tokens
             num_seq = lengths.shape[0]
+            context_tokens = sum(seq_lens_cpu[:num_contexts])
             query_start_loc = torch.cat([lengths.new_zeros(1), torch.cumsum(lengths, dim=0)])
             req_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
             # Keep this tensor-only: ``processed_tokens`` can be symbolic under
@@ -270,6 +274,7 @@ class PLEMetadata:
             ngram_eos_token_id=eos_token_id,
             all_rank_num_tokens=all_rank_num_tokens,
             num_contexts=num_contexts,
+            context_tokens=context_tokens,
             use_spec_decoding=use_spec_decoding,
             is_cuda_graph=is_cuda_graph,
         )
@@ -1132,6 +1137,55 @@ class Qwen4ExpPLE(nn.Module):
             return x
         m = metadata
         num_seq = m.lengths.shape[0]
+
+        # In-flight batching places context requests before generation requests.
+        # Padding their joint convolution input to the longest context chunk
+        # would scale as ``num_seq * row_width * conv_channels``. A single 8K
+        # prefill mixed with hundreds of decode rows can therefore allocate tens
+        # of GiB even though only ``processed_tokens`` rows carry data. Split the
+        # two contiguous groups: context rows retain their variable-width path,
+        # while generation rows use width one. Target verification keeps the
+        # joint path below because its per-prefix state candidates span the full
+        # static verification row.
+        if 0 < m.num_contexts < num_seq and not m.use_spec_decoding:
+            context_tokens = m.context_tokens
+            if not 0 < context_tokens < x.shape[0]:
+                raise RuntimeError(
+                    "PLE mixed-batch context boundary is inconsistent with the "
+                    f"packed token count: {context_tokens} vs {x.shape[0]}"
+                )
+            context_meta = dataclasses.replace(
+                m,
+                physical_tokens=context_tokens,
+                processed_tokens=context_tokens,
+                lengths=m.lengths[: m.num_contexts],
+                req_indices=m.req_indices[:context_tokens],
+                token_offsets=m.token_offsets[:context_tokens],
+                valid_tokens=m.valid_tokens[:context_tokens],
+                state_indices=m.state_indices[: m.num_contexts],
+                padded_tokens=m.padded_tokens[: m.num_contexts],
+                context_tokens=context_tokens,
+            )
+            generation_tokens = x.shape[0] - context_tokens
+            generation_meta = dataclasses.replace(
+                m,
+                is_decode=True,
+                physical_tokens=generation_tokens,
+                processed_tokens=generation_tokens,
+                lengths=m.lengths[m.num_contexts :],
+                row_width=1,
+                req_indices=m.req_indices[context_tokens:] - m.num_contexts,
+                token_offsets=m.token_offsets[context_tokens:],
+                valid_tokens=m.valid_tokens[context_tokens:],
+                state_indices=m.state_indices[m.num_contexts :],
+                padded_tokens=m.padded_tokens[m.num_contexts :, :1],
+                num_contexts=0,
+                context_tokens=0,
+            )
+            context_output = self._short_conv(x[:context_tokens], context_meta, conv_state)
+            generation_output = self._short_conv(x[context_tokens:], generation_meta, conv_state)
+            return torch.cat((context_output, generation_output))
+
         state = conv_state.index_select(0, m.state_indices).to(dtype=x.dtype)
 
         padded_seq = x.new_zeros((num_seq, m.row_width, self.conv_channels))

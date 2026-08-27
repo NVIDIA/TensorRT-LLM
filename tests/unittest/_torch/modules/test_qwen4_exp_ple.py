@@ -25,6 +25,7 @@ checkpoint value, so the hashing multipliers, grouped-norm gate, and dilated
 causal short-convolution math are exercised exactly as in production.
 """
 
+import dataclasses
 import math
 from types import SimpleNamespace
 
@@ -504,6 +505,69 @@ def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
     torch.testing.assert_close(context_pool[slots], torch.tensor([[100], [202]]))
     assert module._pending_conv_states is None
     assert module._pending_ngram_contexts is None
+
+
+def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
+    """IFB must not pad decode rows to the longest context chunk."""
+    channels = 8
+    state_len = 9
+    module = object.__new__(Qwen4ExpPLE)
+    torch.nn.Module.__init__(module)
+    module.conv_channels = channels
+    module.short_conv_state_len = state_len
+    module.short_conv_dilation = 3
+    module.conv1d = torch.nn.Conv1d(
+        channels,
+        channels,
+        kernel_size=4,
+        groups=channels,
+        dilation=module.short_conv_dilation,
+        bias=False,
+    )
+    module._pending_conv_states = None
+
+    # One five-token context followed by two one-token generation requests.
+    lengths = torch.tensor([5, 1, 1], dtype=torch.long)
+    state_indices = torch.tensor([0, 1, 2], dtype=torch.long)
+    input_ids = torch.arange(7, dtype=torch.long)
+    metadata = PLEMetadata.build(
+        input_ids,
+        lengths,
+        state_indices,
+        is_decode=False,
+        eos_token_id=EOS_TOKEN_ID,
+        num_contexts=1,
+    )
+    assert metadata.context_tokens == 5
+    values = torch.randn(7, channels)
+    initial_state = torch.randn(3, channels, state_len)
+
+    # The original joint-width implementation remains an exact parity oracle
+    # when num_contexts is cleared, which disables the split optimization.
+    expected_state = initial_state.clone()
+    expected = module._short_conv(
+        values,
+        dataclasses.replace(metadata, num_contexts=0, context_tokens=0),
+        expected_state,
+    )
+
+    input_shapes = []
+    original_conv1d = F.conv1d
+
+    def record_conv1d(input_tensor, *args, **kwargs):
+        input_shapes.append(tuple(input_tensor.shape))
+        return original_conv1d(input_tensor, *args, **kwargs)
+
+    monkeypatch.setattr(F, "conv1d", record_conv1d)
+    actual_state = initial_state.clone()
+    actual = module._short_conv(values, metadata, actual_state)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_state, expected_state)
+    assert input_shapes == [
+        (1, channels, state_len + 5),
+        (2, channels, state_len + 1),
+    ]
 
 
 def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> None:
