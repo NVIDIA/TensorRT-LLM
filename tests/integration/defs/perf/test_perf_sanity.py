@@ -2636,12 +2636,27 @@ class PerfSanityTestConfig:
                 # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS -- already captured
                 # as the l_force_num_accepted_tokens match key -- so 'al' would
                 # be a restatement of a configured constant rather than a
-                # measurement. Revisit if an agentx lane ever runs spec decoding
-                # without forcing the accepted count.
+                # measurement. The exemption is conditioned on that forcing
+                # actually being in effect rather than merely documented, so an
+                # agentx lane that ever runs spec decoding without pinning the
+                # accepted count still hard-fails here.
+                agentx_al_exempt = False
+                if (
+                    client_idx < len(client_configs)
+                    and client_configs[client_idx].benchmark_client == AGENTX_BENCHMARK_CLIENT
+                ):
+                    server_entry = self.server_configs[server_idx]
+                    # disagg stores (ctx, gen, disagg); aggregated stores one config.
+                    candidates = (
+                        server_entry if isinstance(server_entry, tuple) else (server_entry,)
+                    )
+                    agentx_al_exempt = any(
+                        getattr(c, "force_num_accepted_tokens", 0) for c in candidates
+                    )
                 if (
                     client_idx < len(client_configs)
                     and client_configs[client_idx].spec_decoding
-                    and client_configs[client_idx].benchmark_client != AGENTX_BENCHMARK_CLIENT
+                    and not agentx_al_exempt
                     and "al" not in metrics
                 ):
                     error_msg += (

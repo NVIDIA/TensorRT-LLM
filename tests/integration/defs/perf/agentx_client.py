@@ -484,10 +484,19 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     verify_endpoint(url, args.model)
 
     cmd = build_aiperf_cmd(args, url, artifact_dir)
+    export_path = os.path.join(artifact_dir, "profile_export_aiperf.json")
+    # Drop any export left by an earlier invocation that reused this directory
+    # (a retried lane, or a local rerun pointed at the same --output-dir).
+    # Without this, a crashed aiperf would be validated against -- and would
+    # report -- the previous run's numbers, turning a failure into a green
+    # result carrying stale metrics. Removing it first makes the existence
+    # check below a statement about *this* run.
+    if os.path.exists(export_path):
+        _log(f"removing export from a previous run: {export_path}")
+        os.remove(export_path)
     _log("running: " + " ".join(cmd))
     completed = subprocess.run(cmd)
 
-    export_path = os.path.join(artifact_dir, "profile_export_aiperf.json")
     if not os.path.exists(export_path):
         # No export at all means aiperf died before writing results; its exit
         # status is the only signal left, so surface it.
