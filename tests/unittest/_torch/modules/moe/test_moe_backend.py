@@ -513,6 +513,112 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
+def _make_megamoe_cutedsl_for_ctor_test(
+    *,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+) -> MegaMoECuteDsl:
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    return MegaMoECuteDsl(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+    )
+
+
+def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test(
+        activation_type=ActivationType.SwigluBias,
+        swiglu_alpha=torch.full((8,), 1.702),
+        swiglu_beta=torch.ones(8),
+        swiglu_limit=torch.full((8,), 7.0),
+    )
+
+    assert moe.swiglu_activation_alpha == pytest.approx(1.702)
+    assert moe.swiglu_activation_beta == pytest.approx(1.0)
+    assert moe.gate_up_clamp == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize("parameter_name", ["swiglu_alpha", "swiglu_beta", "swiglu_limit"])
+def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(parameter_name: str) -> None:
+    parameters = {
+        "swiglu_alpha": torch.full((8,), 1.702),
+        "swiglu_beta": torch.ones(8),
+        "swiglu_limit": torch.full((8,), 7.0),
+    }
+    parameters[parameter_name][-1] += 1.0
+
+    with pytest.raises(
+        ValueError, match=rf"uniform .*{parameter_name}|uniform \(per-layer\) {parameter_name}"
+    ):
+        _make_megamoe_cutedsl_for_ctor_test(
+            activation_type=ActivationType.SwigluBias,
+            **parameters,
+        )
+
+
+def test_megamoe_cutedsl_standard_swiglu_keeps_original_activation_path() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+
+    assert moe.swiglu_activation_alpha is None
+    assert moe.swiglu_activation_beta is None
+    assert moe.gate_up_clamp is None
+
+
+def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Profiling scratch is sized for the largest adaptive bucket.
+    monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    buckets = moe._maxt_buckets
+    assert len(buckets) >= 2, f"expected a multi-bucket ladder, got {buckets}"
+    small_hint = buckets[0]
+    assert moe._select_launch_max_tokens(small_hint) == buckets[0]
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+    assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
+
+
+def test_megamoe_cutedsl_tactic_autotune_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Standard serving must not pay for the 36-tactic sweep by default.
+    monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    assert moe.tactic_autotune is False
+
+
+def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
+    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
+    assert len(decode) == len(prefill) == 36
+    assert {t[-1] for t in decode} == {(1, 1)}
+    assert {t[-1] for t in prefill} == {(2, 4)}
+    # The deterministic fallback stays inside the curated axes.
+    for num_tokens in (64, 4096, 16384):
+        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
+    invalid_tactic[2] = 511
+    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
+        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+
+
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,

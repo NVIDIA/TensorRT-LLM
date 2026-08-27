@@ -3389,6 +3389,24 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         }
     }
 
+    // Log the resolved mako match on every render, tagged with stage+context.
+    // transformMakoArgsToJson already echoes the bare JSON ("Test DB Mako opts:"),
+    // but unlabeled and far upstream of the render; the preDefinedMakoOpts path
+    // skips it entirely. This co-locates the match with the stage/context and the
+    // "-> N tests" summary below under one greppable renderTestDB: prefix, so a
+    // wrong-but-non-empty render (a stale/unexpected sysinfo value selecting the
+    // wrong block) is diagnosable per stage, not just the "na"/empty cases.
+    echo "renderTestDB: stage=${stageName} context=${testContext} mako match: ${makoOpts}"
+
+    if (makoOpts.contains('"na"')) {
+        // "na" is a sysinfo probe failure sentinel (see get_sysinfo.py). Blocks
+        // conditioned on the failed property silently drop out of the render, so
+        // even a non-empty list may be missing tests. Warn here, where every
+        // sysinfo-based stage passes through, not just when the list ends up empty.
+        echo "WARNING: renderTestDB: some sysinfo probes returned \"na\": ${makoOpts}. " +
+             "Test-db blocks conditioned on those properties (e.g. linux_distribution_name: ubuntu*) " +
+             "will NOT be selected."
+    }
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
     // orchestrator uploaded to Artifactory (see getCbtsResult in
@@ -3435,10 +3453,30 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    def testCount = sh(returnStdout: true, script: "wc -l < ${testList} | tr -d ' '").trim()
+    // Count non-empty lines, not newlines: trt-test-db writes the test names
+    // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
+    // for a single-test render, which would trip the empty-list guard below
+    // (and mis-report every stage's count by one). `grep -c .` is agnostic to
+    // the missing terminator. It exits 1 for no matches (a legitimately empty
+    // render -> count "0"); accept only that, so a read failure (exit 2:
+    // missing file, unreadable, etc.) still aborts the step instead of being
+    // silently masked.
+    def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
+    if (testCount == "0") {
+        // An empty render is never legitimate here: every launched stage must
+        // have tests (CBTS drops stages with an empty selection before launch).
+        // Fail now with the match query rather than letting pytest --collect-only
+        // exit 5 later with an unattributable "Test collection failed" message.
+        def hint = makoOpts.contains('"na"') ?
+            " Some sysinfo probes returned \"na\" (see the match JSON above); a broken probe" +
+            " (e.g. the python 'distro' module missing) makes conditions like" +
+            " linux_distribution_name: ubuntu* match nothing." : ""
+        error("renderTestDB: rendered EMPTY test list for stage=${stageName} " +
+              "context=${testContext} test-db=${testDBLabel}. Match query: ${makoOpts}.${hint}")
+    }
     recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount, clusterName)
 
     return testList
@@ -5196,6 +5234,9 @@ def launchTestJobs(pipeline, testFilter)
 
     parallelJobs += parallelSlurmJobs
 
+    // [M3 bringup] All SBSA Kubernetes stages disabled for feat branch.
+    SBSATestConfigs = [:]
+    /*
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
         "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
@@ -5203,9 +5244,14 @@ def launchTestJobs(pipeline, testFilter)
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
+    */ // [/M3 bringup]
+
     SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
 
+    // [M3 bringup] All SBSA Slurm stages disabled for feat branch.
+    SBSASlurmTestConfigs = [:]
+    /*
     SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
         // useClusterDurations=true: record actual test times so each cluster builds its own
@@ -5233,9 +5279,14 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
     ]
+    */ // [/M3 bringup]
+
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
+    // [M3 bringup] All SBSA Slurm stages disabled for feat branch.
+    multiNodesSBSAConfigs = [:]
+    /*
     multiNodesSBSAConfigs = [
         // Each testcase uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
@@ -5447,6 +5498,8 @@ def launchTestJobs(pipeline, testFilter)
         56,
         14
     )
+    */ // [/M3 bringup]
+
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -5516,9 +5569,61 @@ def launchTestJobs(pipeline, testFilter)
 
     // Python version and OS for sanity check
     // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
-    // [M3 bringup] Sanity check stages disabled for feat branch.
-    x86SanityCheckConfigs = [:]
-    aarch64SanityCheckConfigs = [:]
+    x86SanityCheckConfigs = [
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "B200_PCIe",
+            X86_64_TRIPLE,
+            false,
+            true,
+            DLFW_IMAGE,
+            false,
+            'manylinux_2_39_x86_64',
+        ],
+        "PY310-UB2204": [
+            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+            "A10",
+            X86_64_TRIPLE,
+            true,
+            false,
+            UBUNTU_22_04_IMAGE,
+            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            'manylinux_2_28_x86_64',
+        ],
+        "PY312-UB2404": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+            "A100X",
+            X86_64_TRIPLE,
+            true,
+            false,
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_28_x86_64',
+        ],
+    ]
+
+    aarch64SanityCheckConfigs = [
+        "PY312-UB2404": [
+            LLM_WHEEL_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            false,
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_39_aarch64',
+        ],
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            true,
+            DLFW_IMAGE,
+            false,
+            'manylinux_2_39_aarch64',
+        ],
+    ]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
     fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()

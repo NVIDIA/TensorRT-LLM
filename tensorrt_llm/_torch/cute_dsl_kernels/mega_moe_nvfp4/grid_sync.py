@@ -119,11 +119,12 @@ def software_grid_sync(counter_ptr,
          "selp.b32 %delta, $2, $3, %is_sm0;\n\t"
          "atom.release.gpu.global.add.u32 %old, [$0], %delta;\n\t"
          "SPIN:\n\t"
-         "ld.acquire.gpu.global.b32 %cur, [$0];\n\t"
+         "ld.relaxed.gpu.global.b32 %cur, [$0];\n\t"
          "xor.b32 %cur, %cur, %old;\n\t"
          "and.b32 %cur, %cur, 0x80000000;\n\t"
          "setp.eq.u32 %waiting, %cur, 0;\n\t"
          "@%waiting bra SPIN;\n\t"
+         "fence.acq_rel.gpu;\n\t"
          "DONE:\n\t"
          "}"),
         "l,r,r,r,r",

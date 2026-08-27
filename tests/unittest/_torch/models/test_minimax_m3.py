@@ -38,10 +38,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3MoE,
     MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
     _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
+    _moe_routed_output_is_global,
     _strip_language_model_prefix,
     _wrap_dict_as_config,
     get_moe_layer_ids,
@@ -51,6 +53,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
@@ -66,6 +69,85 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+class _M3CompositionGate(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
+class _M3CompositionExperts(nn.Module):
+    def __init__(self, scheduler_kind: MoESchedulerKind) -> None:
+        super().__init__()
+        self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, **kwargs: object
+    ) -> torch.Tensor:
+        del router_logits, kwargs
+        return torch.full_like(hidden_states, 3.0)
+
+
+class _M3CompositionShared(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(hidden_states, 2.0)
+
+
+class _M3CompositionAllReduce(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs = []
+        self.params = []
+
+    def forward(
+        self, value: torch.Tensor, *, all_reduce_params: object | None = None
+    ) -> torch.Tensor:
+        self.inputs.append(value.clone())
+        self.params.append(all_reduce_params)
+        return value * 4
+
+
+@pytest.mark.parametrize(
+    "scheduler_kind, expected, reduced_input",
+    [
+        (MoESchedulerKind.EXTERNAL_COMM, 20.0, 5.0),
+        (MoESchedulerKind.FUSED_COMM, 11.0, 2.0),
+    ],
+)
+def test_minimax_m3_moe_reduces_only_local_terms(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_kind: MoESchedulerKind,
+    expected: float,
+    reduced_input: float,
+) -> None:
+    """An already-global routed result must not enter M3's TP AllReduce."""
+    monkeypatch.setattr(
+        minimax_m3_module,
+        "maybe_execute_in_parallel",
+        lambda routed, shared, *_args, **_kwargs: (routed(), shared()),
+    )
+    moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
+    nn.Module.__init__(moe)
+    moe.gate = _M3CompositionGate()
+    moe.experts = _M3CompositionExperts(scheduler_kind)
+    moe.shared_experts = _M3CompositionShared()
+    moe.routed_output_is_global = _moe_routed_output_is_global(moe.experts)
+    moe.allreduce = _M3CompositionAllReduce()
+    moe.event_dict = {
+        minimax_m3_module.EventType.Main: None,
+        minimax_m3_module.EventType.MoeShared: None,
+    }
+    moe.aux_stream = None
+
+    hidden_states = torch.ones((2, 4))
+    output = moe(hidden_states, SimpleNamespace(all_rank_num_tokens=None))
+
+    torch.testing.assert_close(output, torch.full_like(hidden_states, expected))
+    assert len(moe.allreduce.inputs) == 1
+    torch.testing.assert_close(
+        moe.allreduce.inputs[0], torch.full_like(hidden_states, reduced_input)
+    )
+    assert moe.allreduce.params == [None]
 
 
 def test_minimax_m3_fused_sparse_producer_fake_shapes(monkeypatch):
@@ -88,6 +170,63 @@ def test_minimax_m3_fused_sparse_producer_fake_shapes(monkeypatch):
     assert index_q.shape == (7, 128)
     assert q.dtype == torch.float8_e4m3fn
     assert index_q.dtype == torch.float8_e4m3fn
+
+
+def test_attention_dispatch_clips_the_piecewise_token_pad():
+    """Only the live tokens reach the attention core, and the output's pad rows
+    come back zeroed rather than as the buffer supplied them."""
+    seen = {}
+
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+        seen["rows"] = [None if t is None else int(t.shape[0]) for t in (q, k, v, idx_q, idx_k)]
+        seen["out_rows"] = int(output.shape[0])
+        output.fill_(7.0)
+
+    attn_layer = SimpleNamespace(_dispatch_attention_backend=capture)
+    # Eleven speculative decode requests of 4 query tokens, padded to 64.
+    padded, live, hidden = 64, 44, 8
+    q = torch.ones((padded, hidden))
+    output = torch.full((padded, hidden), float("nan"))
+
+    minimax_m3_module._dispatch_attention_over_live_tokens(
+        attn_layer,
+        q,
+        q,
+        q,
+        None,
+        None,
+        SimpleNamespace(num_tokens=live),
+        output,
+    )
+
+    assert seen["rows"] == [live, live, live, None, None]
+    assert seen["out_rows"] == live
+    assert torch.equal(output[:live], torch.full((live, hidden), 7.0))
+    assert torch.equal(output[live:], torch.zeros(padded - live, hidden))
+
+
+def test_attention_dispatch_leaves_an_unpadded_step_alone():
+    """No pad, so nothing to clip and nothing to zero."""
+    seen = {}
+
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+        seen["out"] = output
+        del q, k, v, idx_q, idx_k, attn_metadata
+
+    output = torch.full((5, 8), float("nan"))
+    minimax_m3_module._dispatch_attention_over_live_tokens(
+        SimpleNamespace(_dispatch_attention_backend=capture),
+        torch.ones((5, 8)),
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_tokens=5),
+        output,
+    )
+
+    assert seen["out"].shape == (5, 8)
+    assert output.isnan().all()
 
 
 def _make_text_config():

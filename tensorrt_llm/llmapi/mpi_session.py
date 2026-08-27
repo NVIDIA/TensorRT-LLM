@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import abc
 import itertools
 import os
@@ -61,6 +75,7 @@ class MPINodeState:
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
     """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+
     e.g. mpirun -np 4 python script.py
     """
     if ENABLE_MULTI_DEVICE:
@@ -242,6 +257,7 @@ class MpiPoolSession(MpiSession):
                  wait_shutdown: bool = False,
                  env_overrides: Optional[Dict[str, str]] = None):
         """Args:
+
         n_workers: number of MPI workers to spawn.
         wait_shutdown: when True, ``shutdown()`` blocks until the spawned
             worker processes have actually exited. ``MPIPoolExecutor.shutdown``
