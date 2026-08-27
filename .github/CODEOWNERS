@@ -133,6 +133,8 @@
 /tensorrt_llm/usage @NVIDIA/trt-llm-runtime-devs
 /tests/torch @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/compilation @NVIDIA/trt-llm-runtime-devs
+# Matches nothing today -- PR #17968 moved these tests out -- but kept so a recreated custom_ops/ lands here instead of on the global fallback.
+/tests/unittest/_torch/custom_ops @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/distributed @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/executor @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/peft @NVIDIA/trt-llm-runtime-devs
