@@ -403,7 +403,7 @@ def create_py_executor(
         A fully initialized PyExecutor instance.
     """
     creation_metrics: dict[str, float] = {}
-    with timing_metric("total_executor_creation_seconds", creation_metrics):
+    with timing_metric("total_py_executor_creation_seconds", creation_metrics):
         py_executor = _create_py_executor(
             llm_args=llm_args,
             creation_metrics=creation_metrics,

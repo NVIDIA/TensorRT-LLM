@@ -384,7 +384,7 @@ def test_move_model_engine_metrics_moves_and_clears():
     assert draft_model_engine.metrics == {}
 
 
-def test_total_executor_creation_metric_finishes_on_error(monkeypatch):
+def test_total_py_executor_creation_metric_finishes_on_error(monkeypatch):
     captured_metrics = None
 
     @contextmanager
@@ -405,7 +405,7 @@ def test_total_executor_creation_metric_finishes_on_error(monkeypatch):
     with pytest.raises(RuntimeError, match="creation failed"):
         py_executor_creator.create_py_executor(SimpleNamespace())
 
-    assert captured_metrics == {"total_executor_creation_seconds": 1.5}
+    assert captured_metrics == {"total_py_executor_creation_seconds": 1.5}
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):

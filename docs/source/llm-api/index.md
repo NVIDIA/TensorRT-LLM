@@ -101,7 +101,7 @@ A typical result has the following structure:
     "final_kv_cache_creation_seconds": 0.057,
     "final_py_executor_creation_seconds": 4.459,
     "worker_start_seconds": 0.000,
-    "total_executor_creation_seconds": 13.373
+    "total_py_executor_creation_seconds": 13.373
   },
   "model_loader": {
     "checkpoint_preparation_seconds": 0.719,
@@ -129,7 +129,7 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 | `final_kv_cache_creation_seconds` | Construct the final KV cache retained for serving. |
 | `final_py_executor_creation_seconds` | Using the final KV cache, construct the final PyExecutor retained for serving, which includes the final model engine warmup. |
 | `worker_start_seconds` | Start the final PyExecutor worker. |
-| `total_executor_creation_seconds` | Total time for the `create_py_executor()` call, including all applicable scopes above. |
+| `total_py_executor_creation_seconds` | Total time for the `create_py_executor()` call, including all applicable scopes above. |
 
 The two model-engine properties contain times for various `PyTorchModelEngine` warmup stages.
 `initial_model_engine` measures the timings for the initial model engine creation as part of the
