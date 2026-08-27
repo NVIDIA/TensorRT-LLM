@@ -255,54 +255,27 @@ if args.replay_file_path:
         replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
     else:
         replay_start_iter, replay_stop_iter = args.replay_start_iter, args.replay_stop_iter
-        # Check the requested window against the calibration that was just loaded,
-        # before the first pre_step() reaches into it. Without this, asking for an
-        # iteration the file does not hold surfaces as
-        #
-        #     File ".../layer_wise_benchmarks/calibrator.py", line 516, in pre_step
-        #         self._cur_iter_metadata = self._replay_db[iteration]["metadata"]
-        #     KeyError: 105
-        #
-        # thousands of lines into an interleaved multi-rank log, naming neither the
-        # range that was asked for nor the range that exists. Every caller that
-        # passes these flags reads them from somewhere else -- a scheduler, an index,
-        # a copied command line -- so being out of step with the pack is the ordinary
-        # way for them to be wrong, not an exotic one.
-        #
-        # get_replay_iteration_range() also rejects a non-contiguous calibration.
-        # That is not this check's business: a caller naming a contiguous window
-        # inside a gappy pack works today and has to keep working, so a range that
-        # cannot be computed means only that there is nothing to compare against.
-        try:
-            available_range = calibrator.get_replay_iteration_range()
-        except ValueError:
-            available_range = None
-        if available_range is not None:
-            available_start, available_stop = available_range
-            if replay_start_iter < available_start or replay_stop_iter > available_stop:
-                parser.error(
-                    f"--replay-start-iter/--replay-stop-iter ask for iterations "
-                    f"[{replay_start_iter}, {replay_stop_iter}], but "
-                    f"{args.replay_file_path} holds only "
-                    f"[{available_start}, {available_stop}]. Drop both flags to "
-                    f"replay whatever the calibration contains."
-                )
+        # Check the window before pre_step() indexes into it: a missing iteration
+        # otherwise surfaces as a KeyError thousands of lines into an interleaved
+        # multi-rank log, naming neither the window asked for nor the one that exists.
+        missing = calibrator.get_missing_replay_iterations(replay_start_iter, replay_stop_iter)
+        if missing:
+            shown = ", ".join(str(i) for i in missing[:8])
+            if len(missing) > 8:
+                shown += f", ... ({len(missing):d} in total)"
+            parser.error(
+                f"--replay-start-iter/--replay-stop-iter ask for iterations "
+                f"[{replay_start_iter}, {replay_stop_iter}], but "
+                f"{args.replay_file_path} does not hold {shown}. Drop both flags "
+                f"to replay whatever the calibration contains."
+            )
     logger.info(
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
-    # The replay has to put the same number of tokens through MoE that the
-    # calibration recorded. Nothing on the GEN path notices when it does not:
-    # pre_step's size check derives both sides from the recorded metadata, so it is
-    # self-consistent and never fires, and the only check that compares the shape
-    # ACTUALLY executed against the shape recorded is the deferred one, which runs
-    # only under --replay-verify-metadata. Run without that flag and a mismatch does
-    # not raise -- it profiles the wrong routing and reports a number.
-    #
-    # Deliberately not gated on --replay-verify-metadata. That flag asks whether to
-    # re-check every iteration's metadata at the end, which is a runtime cost. This
-    # is a question about the configuration, answerable before any of it runs, and a
-    # caller who turned the expensive check off did not ask to be handed a silently
-    # wrong measurement.
+    # The replay has to put the same number of tokens through MoE that the calibration
+    # recorded, or it profiles different routing and still reports a number. Checked
+    # here rather than under --replay-verify-metadata: that flag buys a per-iteration
+    # runtime check, while this is answerable before any of it runs.
     recorded_tokens = calibrator.get_replay_token_count()
     if recorded_tokens is not None:
         mismatched = [

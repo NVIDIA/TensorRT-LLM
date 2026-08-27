@@ -710,6 +710,29 @@ class Calibrator:
         }
         return counts.pop() if len(counts) == 1 else None
 
+    def get_missing_replay_iterations(self, start_iter, stop_iter):
+        """Iterations in [start_iter, stop_iter] this rank's calibration does not hold.
+
+        Membership rather than bounds: a calibration with a hole in it satisfies a
+        first/last comparison and still raises KeyError in pre_step().
+
+        Args:
+            start_iter: First iteration of the requested window, inclusive.
+            stop_iter: Last iteration of the requested window, inclusive.
+
+        Returns:
+            list[int]: The missing iterations, ascending. Empty when all are present.
+
+        Raises:
+            ValueError: If mode is not REPLAY.
+        """
+        if self.mode != Mode.REPLAY:
+            raise ValueError(
+                f"get_missing_replay_iterations() is only valid in REPLAY mode, "
+                f"current mode is {self.mode.name}"
+            )
+        return [i for i in range(start_iter, stop_iter + 1) if i not in self._replay_db]
+
     def get_replay_iteration_range(self):
         """Get the valid iteration range for REPLAY mode.
 
