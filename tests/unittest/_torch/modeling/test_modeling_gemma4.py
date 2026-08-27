@@ -4138,7 +4138,7 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
         once per invocation and must not contain a Python-level
         ``for i in range(pixel_values.shape[0])`` loop.
 
-        Pattern matches LlavaNext / Qwen2VL / Qwen3VL / Nemotron-Nano
+        Pattern matches LlavaNext / Qwen3VL / Nemotron-Nano
         dynamic-resolution — all of which batch images in a single tower
         call. Gemma4 was the outlier before this guard."""
         import re
