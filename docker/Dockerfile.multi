@@ -41,11 +41,6 @@ SHELL ["/bin/bash", "-c"]
 
 FROM base AS devel
 
-ARG GIT_COMMIT
-ARG TRT_LLM_VER
-ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
-    TRT_LLM_VERSION=${TRT_LLM_VER}
-
 #
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
@@ -97,7 +92,12 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
 # Generate OSS attribution file for devel image
+ARG GIT_COMMIT
+ARG TRT_LLM_VER
 ARG TARGETARCH
+ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
+    TRT_LLM_VERSION=${TRT_LLM_VER}
+
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/tmp/gen_attribution.sh \
     bash /tmp/gen_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
 
