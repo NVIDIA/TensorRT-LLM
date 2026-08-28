@@ -2813,12 +2813,15 @@ class W4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
-    ):
-        assert activation_type in (
+    ) -> None:
+        if activation_type not in (
             ActivationType.Swiglu,
             ActivationType.Relu2,
             ActivationType.Silu,
-        ), f"Unsupported activation for W4A16RefGatedMLPFusedMoE: {activation_type}"
+        ):
+            raise ValueError(
+                f"Unsupported activation for W4A16RefGatedMLPFusedMoE: {activation_type}"
+            )
         self._original_quant_config = model_config.quant_config if model_config else None
         # Forward activation_type so the base builds gated (Swiglu) or non-gated
         # (squared-ReLU / SiLU) experts, as W8A16RefGatedMLPFusedMoE does.
@@ -2842,7 +2845,7 @@ class W4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
         # unpacked is (out, in); scale is (out,) -> broadcast over the input dim.
         return (unpacked.T.contiguous().float() * scale).to(self.dtype).T.contiguous()
 
-    def load_weights(self, weights_list: List[Dict]):
+    def load_weights(self, weights_list: List[Dict]) -> None:
         """Unpack and dequantize the INT4 expert weights into the fp reference."""
         assert len(weights_list) == 1
         weights = weights_list[0]
@@ -2881,7 +2884,12 @@ class W4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
 
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
-    def check_accuracy(self, output, ref_output, weight_dtype=torch.quint4x2):
+    def check_accuracy(
+        self,
+        output: torch.Tensor,
+        ref_output: torch.Tensor,
+        weight_dtype: torch.dtype = torch.quint4x2,
+    ) -> None:
         """Compare against the reference at the same thresholds as the W8A16 arm."""
         # Same helper and the same percent thresholds as the W8A16 arm; only the
         # dtype differs, which widens atol via calc_woq_tolerence's
@@ -2967,7 +2975,9 @@ class W4A16QuantizeUtil(BaseQuantizeUtil):
         return weights
 
     def create_ref_module(
-        self, routing_method, ref_cls=W4A16RefGatedMLPFusedMoE
+        self,
+        routing_method: BaseMoeRoutingMethod,
+        ref_cls: type = W4A16RefGatedMLPFusedMoE,
     ) -> torch.nn.Module:
         """
         Create a reference module for correctness testing.

@@ -1583,7 +1583,7 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
     # 2 INT4 values per int8 byte, matching mInnerDimMultiplier in FusedMoeRunner.
     PACKED_ELEMENTS_PER_BYTE = 2
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module) -> None:
         """Allocate packed INT4 expert weights and full-width per-channel scales."""
         module.sm_version = get_sm_version()
         module.sm_version = 80 if module.sm_version >= 90 else module.sm_version
@@ -1627,7 +1627,7 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
         self.setup_quant_scales(module)
 
-    def setup_quant_scales(self, module: torch.nn.Module):
+    def setup_quant_scales(self, module: torch.nn.Module) -> None:
         """Publish the 2-element per-channel scale tuple the runner expects."""
         # Reuses the per-channel 2-scale tuple; FusedMoeRunner's quant-scale
         # handling turns this into QuantParams::Int(fc1_scale, fc2_scale).
@@ -1637,7 +1637,8 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         )
 
     @staticmethod
-    def _validate_alignment(num_rows: int, name: str, module: torch.nn.Module):
+    def _validate_alignment(num_rows: int, name: str,
+                            module: torch.nn.Module) -> None:
         """Fail with a diagnostic before preprocess_weights_for_mixed_gemm's bare asserts.
 
         ``preprocess_weights_for_mixed_gemm`` asserts
@@ -1660,7 +1661,7 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+                                 dst_w3_w1_weight: torch.Tensor) -> None:
         """Load the w1 (and, when gated, w3) weights for one expert."""
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
@@ -1701,7 +1702,7 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
     def load_expert_w2_weight(self, module: torch.nn.Module,
                               w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+                              dst_w2_weight: torch.Tensor) -> None:
         """Load the w2 weight for one expert."""
         # ROW shard: the split is on w2's input dim, so sharding and the
         # last-dim packing do not interact.
@@ -1717,7 +1718,7 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         """Load per-output-channel scales, concatenating w3 only when gated."""
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],

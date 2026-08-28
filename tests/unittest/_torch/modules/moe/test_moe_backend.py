@@ -1022,7 +1022,9 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     [ActivationType.Swiglu, ActivationType.Relu2],
     ids=["gated_swiglu", "nongated_relu2"],
 )
-def test_cutlass_w4a16_weight_shapes_gated_and_nongated(activation_type):
+def test_cutlass_w4a16_weight_shapes_gated_and_nongated(
+    activation_type: ActivationType,
+) -> None:
     """W4A16 MoE must size its weights from expand_intermediate_size_per_partition.
 
     Nemotron-H uses squared-ReLU and is NON-gated, so a class that assumes
@@ -1102,7 +1104,9 @@ def test_cutlass_w4a16_weight_shapes_gated_and_nongated(activation_type):
     "intermediate_size,tp_size",
     [(1856, 2), (1856, 4), (928, 2), (2688, 4)],
 )
-def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(intermediate_size, tp_size):
+def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(
+    intermediate_size: int, tp_size: int
+) -> None:
     """A non-64-aligned row count must fail with a message that names the cause.
 
     ``preprocess_weights_for_mixed_gemm`` enforces the row-tile constraint as a
@@ -1146,7 +1150,7 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(intermediate_size, tp_siz
 
 
 @pytest.mark.parametrize("num_rows", [64, 128, 1024, 2048, 2816])
-def test_cutlass_w4a16_aligned_rows_accepted(num_rows):
+def test_cutlass_w4a16_aligned_rows_accepted(num_rows: int) -> None:
     """The aligned TP sizes the method claims to support must pass cleanly.
 
     Counterpart to the rejection test: pinning only the failure would leave the

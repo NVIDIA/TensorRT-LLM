@@ -738,19 +738,23 @@ class CutlassFusedMoE(MoEImplBase):
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     @property
-    def has_int4_woq_per_channel(self):
+    def has_int4_woq_per_channel(self) -> bool:
         """True for plain W4A16: INT4 weights with per-channel scales."""
         # Excluding per-group keeps W4A8_AWQ on WInt4AFP8FusedMoEMethod, which
         # is selected by is_int4_weight_only_per_group().
-        return self.quant_config and self.quant_config.layer_quant_mode.is_int4_weight_only(
-        ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
+        if not self.quant_config:
+            return False
+        layer_quant_mode = self.quant_config.layer_quant_mode
+        return layer_quant_mode.is_int4_weight_only(
+        ) and not layer_quant_mode.has_per_group_scaling()
 
     @property
-    def has_woq_per_channel(self):
+    def has_woq_per_channel(self) -> bool:
         """True for either per-channel weight-only dtype; drives the C++ flag."""
         # Both share the dim-swapped weight layout and the 2-element scale list
         # that the runner turns into QuantParams::Int.
-        return self.has_int8_woq_per_channel or self.has_int4_woq_per_channel
+        return bool(self.has_int8_woq_per_channel
+                    or self.has_int4_woq_per_channel)
 
     def quantize_input(
         self,
