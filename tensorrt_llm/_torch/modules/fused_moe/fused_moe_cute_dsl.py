@@ -349,11 +349,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         # eagerly under _torch.models, so that reaches all model startup rather
         # than just this backend. Reaching this line means a CuteDSL runner is
         # already being tuned, so the DSL is installed.
-        from ...custom_ops.cute_dsl_custom_ops import (
-            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-            Sm100BlockScaledContiguousGroupedGemmRunner,
-            Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 
         for runner, tactic in comb:
             if isinstance(runner, _TILE_SIZE_CHECKED_RUNNERS):
