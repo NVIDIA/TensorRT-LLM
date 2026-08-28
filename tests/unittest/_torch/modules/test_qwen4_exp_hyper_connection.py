@@ -81,6 +81,33 @@ def test_combine_and_mix_matches_unfused_reference_cpu(rows):
     torch.testing.assert_close(actual_residual[2], expected_residual[2])
 
 
+def test_fused_layout_slices_padding_only_for_large_prefill_cpu(monkeypatch):
+    monkeypatch.setenv("TRTLLM_QWEN4_EXP_HC_FUSED_MIX", "1")
+    torch.manual_seed(42)
+    module = Qwen4ExpHyperConnection(
+        hc_count=2,
+        hidden_size=4,
+        hc_lowrank=6,
+        dtype=torch.float32,
+    ).eval()
+    _initialize_test_weights(module)
+    small_input = torch.randn(2, 8)
+    large_input = torch.randn(8192, 8)
+
+    small_full = module.input_mix_weight_down_block_inject(small_input)
+    small_actual = module._packed_down_and_injection(small_input)
+    large_full = module.input_mix_weight_down_block_inject(large_input)
+    large_actual = module._packed_down_and_injection(large_input)
+
+    assert module.input_mix_weight_down_block_inject.weight.shape == (128, 8)
+    assert module.input_mix_fallback_rows == 16
+    assert module.input_mix_injection_offset == 6
+    assert small_actual.shape == (2, 128)
+    assert large_actual.shape == (8192, 16)
+    torch.testing.assert_close(small_actual, small_full)
+    torch.testing.assert_close(large_actual, large_full[:, :16])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("rows", [1, 4, 16, 128, 320])
 @torch.inference_mode()
@@ -197,7 +224,7 @@ def test_cute_fused_mix_matches_reference_and_graph(rows, monkeypatch):
         rtol=1e-2,
         atol=5e-3,
     )
-    assert module.input_mix_weight_down_block_inject.weight.shape == (400, 10240)
+    assert module.input_mix_weight_down_block_inject.weight.shape == (384, 10240)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
