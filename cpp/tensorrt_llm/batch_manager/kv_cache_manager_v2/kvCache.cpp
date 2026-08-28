@@ -309,16 +309,69 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
     // Only allocate if any slots are needed.
     bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
+    std::vector<SharedPtr<Page>> protectedGpuPages;
+    auto restoreProtectedGpuPages = FuncGuard(
+        [&storageMgr, &protectedGpuPages]()
+        {
+            for (auto iter = protectedGpuPages.rbegin(); iter != protectedGpuPages.rend(); ++iter)
+            {
+                storageMgr.scheduleForEviction(**iter);
+            }
+        });
+
     if (anyNeeded)
     {
+        MigrationRecorder const migrationRecorder
+            = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+                  CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+        DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+        { _recordDroppedPages(pages, cacheLevel); };
+
+        // Reserve the complete resume working set before allocating deferred or scratch slots. Otherwise an
+        // allocation may evict one of this cache's own resident pages, consume its slot, and leave activate()
+        // without capacity to bring that page back.
+        TypedVec<PoolGroupIndex, SlotCount> freeSlotRequirements(storageMgr.numPoolGroups(), 0);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        {
+            freeSlotRequirements[storageMgr.getPoolGroupIndex(lc)] += numSlotsNeeded[lc];
+        }
+
+        std::unordered_set<Page*> countedPages;
+        for (auto const& activePage : _activePages())
+        {
+            auto const page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
+            if (!page || page->status() == PageStatus::LOCKED || !countedPages.insert(page.get()).second)
+            {
+                continue;
+            }
+
+            if (page->cacheLevel != kHotLevel)
+            {
+                freeSlotRequirements[storageMgr.getPoolGroupIndex(activePage.lcId)] += 1;
+            }
+            else if (page->scheduledForEviction())
+            {
+                protectedGpuPages.push_back(page);
+            }
+        }
+
+        for (auto const& page : protectedGpuPages)
+        {
+            storageMgr.excludeFromEviction(*page);
+        }
+
+        try
+        {
+            storageMgr.prepareFreeSlots(kHotLevel, freeSlotRequirements, migrationRecorder, dropRecorder);
+        }
+        catch (OutOfPagesError const&)
+        {
+            return false;
+        }
+
         TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots;
         try
         {
-            MigrationRecorder const migrationRecorder
-                = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-                      CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-            DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-            { _recordDroppedPages(pages, cacheLevel); };
             tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
         }
         catch (OutOfPagesError const&)
@@ -374,6 +427,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         // a recordEventScope, matching Python behavior.
         return false;
     }
+    restoreProtectedGpuPages.cancel();
 
     // Deferred copy: for partial blocks and SSM, copy from now-locked source pages
     // to pre-allocated GPU slots, then unlock sources and replace with new pages.

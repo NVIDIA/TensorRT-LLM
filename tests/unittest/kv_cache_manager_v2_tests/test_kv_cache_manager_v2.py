@@ -2463,8 +2463,11 @@ class TestSSMSupport(unittest.TestCase):
         self,
         tokens_per_block: int = 32,
         gpu_quota: int = 32 << 20,
+        host_quota: int | None = None,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
+        ssm_buffer_size: int = 8192,
+        max_util_for_resume: float = 0.97,
         window_size: SlidingWindowSize = None,
         commit_min_snapshot: bool = True,
         enable_partial_reuse: bool = False,
@@ -2488,15 +2491,19 @@ class TestSSMSupport(unittest.TestCase):
                 SsmLayerConfig(
                     layer_id=LayerId(lid),
                     buffers=[
-                        BufferConfig(role=DataRole("ssm_state"), size=8192),
+                        BufferConfig(role=DataRole("ssm_state"), size=ssm_buffer_size),
                     ],
                 )
             )
             lid += 1
+        cache_tiers = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota is not None:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
-            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            cache_tiers=cache_tiers,
             layers=layers,
+            max_util_for_resume=max_util_for_resume,
             enable_partial_reuse=enable_partial_reuse,
             commit_min_snapshot=commit_min_snapshot,
         )
@@ -2532,6 +2539,112 @@ class TestSSMSupport(unittest.TestCase):
         resumed_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
         self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
         kv_cache.close()
+
+    @requires_cpp_backend
+    def test_resume_protects_resident_reuse_source_before_allocating(self) -> None:
+        """A deferred-state allocation must not evict its own reuse source."""
+        slot_size = 2 << 20
+        cfg = self._make_ssm_config(
+            gpu_quota=2 * slot_size,
+            host_quota=slot_size,
+            num_attn_layers=0,
+            num_ssm_layers=1,
+            ssm_buffer_size=slot_size,
+            max_util_for_resume=1.0,
+        )
+        self.manager = KVCacheManager(cfg)
+        gpu_stats = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+        host_level = CacheLevel(1)
+        host_stats = _introspection.storage_statistics(self.manager, host_level)[0]
+        self.assertEqual(gpu_stats.total, 2)
+        self.assertEqual(host_stats.total, 1)
+
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(cfg.tokens_per_block)]
+
+        seed = self.manager.create_kv_cache(custom_priority_callback=lambda _ordinal, _lc: 0)
+        self.assertTrue(seed.resume(stream))
+        seed.capacity = len(prompt)
+        seed.history_length = len(prompt)
+        seed.commit(prompt, is_end=True)
+        seed.close()
+
+        reused = self.manager.create_kv_cache(
+            input_tokens=prompt,
+            custom_priority_callback=lambda _ordinal, _lc: 0,
+        )
+        pressure = self.manager.create_kv_cache(custom_priority_callback=lambda _ordinal, _lc: 100)
+        caches = [reused, pressure]
+        try:
+            self.assertEqual(reused.num_committed_tokens, len(prompt))
+            self.assertTrue(pressure.resume(stream))
+            pressure.stop_committing()
+            pressure.suspend()
+
+            gpu_before = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+            host_before = _introspection.storage_statistics(self.manager, host_level)[0]
+            reused_pages, _ = _introspection.active_page_stats(reused)
+            self.assertEqual(gpu_before.free, 0)
+            self.assertEqual(host_before.free, 1)
+            self.assertEqual(reused_pages[GPU_LEVEL], 1)
+
+            # The reuse source has lower eviction priority than the pressure page. Without the
+            # preflight, newGpuSlots() moves that source to the only host slot and activate()
+            # cannot bring it back. Protecting the source makes the pressure page the victim.
+            self.assertTrue(reused.resume(stream))
+        finally:
+            for kv_cache in reversed(caches):
+                if kv_cache.status != _KVCache.Status.CLOSED:
+                    kv_cache.close()
+            stream_holder.synchronize()
+
+    @requires_cpp_backend
+    def test_failed_offload_keeps_gpu_recurrent_pages_evictable(self) -> None:
+        """A full host tier must not drain the GPU eviction queue."""
+        host_level = CacheLevel(1)
+        cfg = self._make_ssm_config(
+            gpu_quota=8 << 20,
+            host_quota=4 << 20,
+            num_attn_layers=0,
+            num_ssm_layers=1,
+            ssm_buffer_size=1 << 20,
+            max_util_for_resume=1.0,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        gpu_slots = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0].total
+        host_slots = _introspection.storage_statistics(self.manager, host_level)[0].total
+        caches = []
+
+        try:
+            for _ in range(gpu_slots + host_slots):
+                kv_cache = self.manager.create_kv_cache()
+                caches.append(kv_cache)
+                self.assertTrue(kv_cache.resume(stream))
+                kv_cache.stop_committing()
+                kv_cache.suspend()
+
+            gpu_before = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+            host_before = _introspection.storage_statistics(self.manager, host_level)[0]
+            self.assertEqual(gpu_before.free, 0)
+            self.assertEqual(host_before.free, 0)
+            self.assertGreater(gpu_before.evictable, 0)
+
+            blocked = self.manager.create_kv_cache()
+            caches.append(blocked)
+            self.assertFalse(blocked.resume(stream))
+            gpu_after = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+            host_after = _introspection.storage_statistics(self.manager, host_level)[0]
+
+            self.assertEqual(gpu_after.evictable, gpu_before.evictable)
+            self.assertEqual(host_after.free, host_before.free)
+            self.assertEqual(host_after.evictable, host_before.evictable)
+        finally:
+            for kv_cache in reversed(caches):
+                kv_cache.close()
+            stream_holder.synchronize()
 
     def test_no_reuse_with_ssm(self) -> None:
         """input_tokens are accepted but no prefix reuse happens without a prior snapshot."""
