@@ -1195,8 +1195,8 @@ def test_warm_ctx_from_gen(model, generation_overlap):
 
             # 1. Worker 0 generates a reply and its reuse tree now holds prompt and reply.
             print("Turn 1 on worker 0 (gen role)", flush=True)
-            requests = [(turn1, SamplingParams(max_tokens=32, ignore_eos=True),
-                         None)]
+            requests = [(turn1, SamplingParams(max_tokens=32,
+                                               ignore_eos=True), None)]
             responses = send_requests_to_worker(requests, 0, intercomm)
             assert len(responses) == 1
             generated_ids = list(responses[0][0].token_ids)
@@ -1207,8 +1207,10 @@ def test_warm_ctx_from_gen(model, generation_overlap):
             prompt_ids = intercomm.recv(source=0, tag=MPI_RESULT)
             assert len(prompt_ids) > 0
             full_ids = list(prompt_ids) + generated_ids
-            print(f"Worker 0 holds {len(prompt_ids)} prompt + "
-                  f"{len(generated_ids)} generated tokens", flush=True)
+            print(
+                f"Worker 0 holds {len(prompt_ids)} prompt + "
+                f"{len(generated_ids)} generated tokens",
+                flush=True)
 
             # 2. Read worker 0's transceiver state
             intercomm.send("GET_STATE", dest=0, tag=MPI_REQUEST)
@@ -1223,9 +1225,9 @@ def test_warm_ctx_from_gen(model, generation_overlap):
                 first_gen_tokens=[0],
                 disagg_request_id=4242,
             )
-            requests = [(full_ids,
-                         SamplingParams(max_tokens=1,
-                                        ignore_eos=True), warm_params)]
+            requests = [(full_ids, SamplingParams(max_tokens=1,
+                                                  ignore_eos=True), warm_params)
+                        ]
             responses = send_requests_to_worker(requests, 1, intercomm)
             assert len(responses) == 1
             assert len(responses[0][0].token_ids) > 0, (
@@ -1242,13 +1244,16 @@ def test_warm_ctx_from_gen(model, generation_overlap):
 
             intercomm.send("GET_LAST_CACHED_TOKENS", dest=1, tag=MPI_REQUEST)
             warmed_cached = intercomm.recv(source=1, tag=MPI_RESULT)
-            print(f"Worker 1 cached_tokens after warming: {warmed_cached} "
-                  f"(prompt alone would be <= {len(prompt_ids)})", flush=True)
+            print(
+                f"Worker 1 cached_tokens after warming: {warmed_cached} "
+                f"(prompt alone would be <= {len(prompt_ids)})",
+                flush=True)
 
             # The hit must reach past the prompt into the reply.
             assert warmed_cached > len(prompt_ids), (
                 f"cached_tokens={warmed_cached} does not exceed the "
-                f"{len(prompt_ids)}-token prompt, so the reply KV did not transfer")
+                f"{len(prompt_ids)}-token prompt, so the reply KV did not transfer"
+            )
 
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
