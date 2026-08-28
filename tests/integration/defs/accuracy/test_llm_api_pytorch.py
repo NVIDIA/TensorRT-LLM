@@ -23,6 +23,7 @@ import torch
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
+from pytest_mock import MockerFixture
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
@@ -7122,7 +7123,8 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @parametrize_with_ids("enable_branch_snapshot", [False, True])
-    def test_bf16_branch_snapshot(self, enable_branch_snapshot, mocker):
+    def test_bf16_branch_snapshot(self, enable_branch_snapshot: bool,
+                                  mocker: MockerFixture) -> None:
         """Branch-point snapshots must not change what the model generates.
 
         A branch snapshot lets a request restore recurrent state at a depth it
