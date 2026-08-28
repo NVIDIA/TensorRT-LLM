@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from collections.abc import Callable
 from typing import Optional, Tuple, Union
 
@@ -172,7 +173,15 @@ class MLP(nn.Module):
         """Whether the unquantized up projection can use the cuBLASLt GELU
         epilogue without bypassing Linear post-processing or another GEMM
         backend.
+
+        Opt-in: the epilogue applies GELU to the fp32 GEMM accumulator whereas
+        eager rounds the GEMM output to bf16 first. The per-layer difference is
+        at bf16-ULP level, but it is a different rounding trajectory and
+        compounds across residual blocks x denoising steps in diffusion
+        transformers (LTX-2, Wan), whose reference outputs predate the fusion.
         """
+        if os.environ.get("TRTLLM_MLP_FUSE_GELU_EPILOGUE", "0") != "1":
+            return False
         up_proj = self.up_proj
         return (self.activation is gelu_tanh
                 and hasattr(torch, "_addmm_activation")
