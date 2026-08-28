@@ -38,6 +38,27 @@ from torch import nn
 from .heads import confident_prefix_length
 
 
+def resolve_noise_token_id(mask_token_id: Optional[int], config, ckpt_attr: str) -> int:
+    """Resolve the DSpark noise/mask token id.
+
+    ``mask_token_id`` is either the speculative config's value (set explicitly
+    or resolved from the checkpoint during ``DSparkDecodingConfig`` validation)
+    or ``None``, in which case it falls back to the drafter checkpoint's
+    ``ckpt_attr`` attribute. Both missing is a checkpoint/config error: an
+    embedding id of ``vocab_size`` is out of range for ``embed_tokens`` and
+    would only surface later as an opaque device-side assert.
+    """
+    if mask_token_id is None:
+        mask_token_id = getattr(config, ckpt_attr, None)
+    if mask_token_id is None:
+        raise ValueError(
+            f"DSpark drafter checkpoint config has neither a resolved "
+            f"mask_token_id nor a `{ckpt_attr}` attribute; the DeepSpec "
+            f"checkpoint's config.json is expected to carry `{ckpt_attr}`."
+        )
+    return int(mask_token_id)
+
+
 def build_draft_input_ids(
     bonus_token_ids: torch.Tensor, *, block_size: int, noise_token_id: int
 ) -> torch.Tensor:

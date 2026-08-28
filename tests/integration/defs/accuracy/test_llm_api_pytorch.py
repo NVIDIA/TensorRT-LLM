@@ -5061,6 +5061,30 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    def test_dspark(self):
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+
+        dspark_model_dir = f"{llm_models_root()}/dspark_qwen3_8b_block7"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+
+        spec_config = DSparkDecodingConfig(max_draft_len=7,
+                                           speculative_model=dspark_model_dir)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp",
                              [(1, 1, 1, False)],

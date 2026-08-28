@@ -1855,6 +1855,13 @@
       "path": "speculative_config.block_size"
     },
     {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.ctx_window_size"
+    },
+    {
       "allowed_values": [
         "AUTO",
         "DFlash",

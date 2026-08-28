@@ -2955,6 +2955,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
+    ctx_window_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Ring-window length, in tokens, of the worker-owned per-layer context "
+        "K/V buffer used by the dense (Qwen3-style) DSpark drafter. Clamped to "
+        "[block_size + 2, max_position_embeddings]. Only applies to the dense "
+        "Qwen3 DSpark drafter (ignored by the DeepSeek-V4 drafter, which uses "
+        "the checkpoint's own sliding_window instead). Defaults to 2048.")
+
     # NOTE: confidence-based dynamic drafting (the draft model's confidence head
     # that truncates the proposed block) is NOT enabled in this PR. The user-facing
     # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
@@ -6012,11 +6021,23 @@ class TorchLlmArgs(BaseLlmArgs):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
                     dspark_cfg = draft_cfg.get("dspark_config", {})
+                    # DeepSpec-released dense drafter checkpoints (e.g.
+                    # Qwen3DSparkModel) use unprefixed top-level keys in their
+                    # own config.json; gate that fallback on the checkpoint's
+                    # architectures (mirroring the dispatch in
+                    # get_draft_model) so a V4-style checkpoint that happens
+                    # to carry an unrelated top-level key with the same name
+                    # (e.g. `block_size`) doesn't get silently misread.
+                    draft_arches = draft_cfg.get("architectures") or []
+                    is_dense_drafter = any("Qwen3DSpark" in arch
+                                           for arch in draft_arches)
 
                     def _dspark_get(key, top_level_key):
                         value = dspark_cfg.get(key)
                         if value is None:
                             value = draft_cfg.get(top_level_key)
+                        if value is None and is_dense_drafter:
+                            value = draft_cfg.get(key)
                         return value
 
                     # The checkpoint's ``dspark_target_layer_ids`` is
