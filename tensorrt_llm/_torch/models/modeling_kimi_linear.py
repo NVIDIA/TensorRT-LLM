@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import itertools
 import json
 import math
 import os
@@ -1597,17 +1598,47 @@ def _kimi_k3_mla_decode_backend_policy(
 
 
 def _meta_safe_cast_dtype(module, dtype):
-    """``module.to(dtype=dtype)`` that also works under ``MetaInitMode``.
+    """``module.to(dtype=dtype)`` that also works under ``MetaInitMode``,
+    leaving quantized weights and their scales untouched.
 
     ``Module.to`` dispatches ``aten._to_copy``, which MetaInitMode rejects
     (it would silently fall back to full CPU construction of the model —
     ~70 GB of host RAM per rank for Kimi K3). Under meta init the values
     are garbage anyway, so a dtype-only re-allocation via ``empty_like``
     (an allowed init op) is equivalent; off meta this matches ``.to``.
+
+    ``skip_create_weights_in_init`` defaults to ``False``, so the MLA
+    projections may already hold quantized weights (fp8/fp4) plus float32
+    scale/dequant buffers, and MLA's own ``k_b_proj_trans`` may be fp8 with
+    a float32 scale. Widening any of those to the compute dtype breaks the
+    quantized-kernel contract, so they are preserved:
+
+    - every parameter/buffer of a quantized ``Linear`` (covers nvfp4
+      ``alpha``, whose name carries no ``scale`` hint),
+    - any 1-byte float tensor (fp8 weights, incl. bare ``k_b_proj_trans``),
+    - any ``scale``/``dequant`` buffer (covers ``k_b_proj_trans_scale`` etc.
+      that live directly on the MLA module, not inside a ``Linear``).
     """
+    preserve_ids = set()
+    for submod in module.modules():
+        if (
+            isinstance(submod, TrtllmLinear)
+            and getattr(submod, "_weights_created", False)
+            and submod.has_any_quant
+        ):
+            for t in itertools.chain(
+                submod.parameters(recurse=False), submod.buffers(recurse=False)
+            ):
+                preserve_ids.add(id(t))
+    for name, t in itertools.chain(module.named_parameters(), module.named_buffers()):
+        if "scale" in name or "dequant" in name:
+            preserve_ids.add(id(t))
 
     def _cast(t):
         if not t.is_floating_point():
+            return t
+        # 1-byte floats are quantized (fp8); never widen them.
+        if t.element_size() == 1 or id(t) in preserve_ids:
             return t
         if t.is_meta:
             return torch.empty_like(t, dtype=dtype)
@@ -1689,6 +1720,12 @@ def _install_identity_rope_table(backend: TrtllmAttention) -> None:
             "backend.rotary_cos_sin is None after construction; check "
             "pos_embd_params has a valid RopeParams with dim > 0."
         )
+    # The rope cache keys on (RopeParams, interleave), so mha, mqa, and every
+    # K3 MLA layer with equal params share ONE cached cos/sin tensor. Clone
+    # before overwriting so the in-place identity write never mutates the
+    # shared cached sinusoidal table (which other consumers may read).
+    cos_sin = cos_sin.clone()
+    backend.rotary_cos_sin = cos_sin
     _write_identity_rope_values(cos_sin)
 
     orig_resize = backend._ensure_rope_table_size  # bound method
@@ -1697,6 +1734,9 @@ def _install_identity_rope_table(backend: TrtllmAttention) -> None:
         if required_max_positions <= backend.rope_params.max_positions:
             return
         orig_resize(required_max_positions)
+        # orig_resize regenerates from the shared cache again; clone the fresh
+        # table before rewriting identity so the cache stays pristine.
+        backend.rotary_cos_sin = backend.rotary_cos_sin.clone()
         _write_identity_rope_values(backend.rotary_cos_sin)
 
     backend._ensure_rope_table_size = _identity_preserving_resize
