@@ -1406,7 +1406,7 @@ def generate_element_wise_test_params() -> List:
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
-            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
+            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16, QuantAlgo.W4A16],
         ):
             if skip_reason:
                 continue
@@ -1414,8 +1414,11 @@ def generate_element_wise_test_params() -> List:
                 continue
             if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
                 continue
-            # INT8 weight-only per-channel non-gated MoE is CUTLASS-path only.
-            if quant_algo == QuantAlgo.W8A16 and backend_type != MoeBackendType.CUTLASS:
+            # Per-channel weight-only (INT8 and INT4) non-gated MoE is CUTLASS-path only.
+            if (
+                quant_algo in (QuantAlgo.W8A16, QuantAlgo.W4A16)
+                and backend_type != MoeBackendType.CUTLASS
+            ):
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (
