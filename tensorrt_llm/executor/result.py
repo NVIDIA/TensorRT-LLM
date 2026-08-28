@@ -446,7 +446,7 @@ class GenerationResultBase:
                     if output.token_ids[-len(stop_ids):] == stop_ids:
                         output.stop_reason = stop_reason
                         if not self.sampling_params.include_stop_str_in_output:
-                            output.token_ids = output.token_ids[:-len(stop_ids)]
+                            self._trim_stop_word_outputs(output, len(stop_ids))
                         break
             elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
@@ -471,6 +471,34 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+
+    @staticmethod
+    def _trim_stop_word_outputs(output: CompletionOutput,
+                                num_stop_ids: int) -> None:
+        """Drop the trailing stop-word tokens and their per-token outputs.
+
+        ``logprobs``, ``generation_logits`` and every value of
+        ``additional_generation_outputs`` are indexed along their first axis by
+        the same positions as ``token_ids``, so trimming only ``token_ids``
+        leaves them one entry per stop token too long and breaks every consumer
+        that zips them together -- e.g. the OpenAI server's
+        ``create_logprobs``, which turns the mismatch into a 400 for the whole
+        request. ``additional_context_outputs`` is prompt-aligned and is left
+        alone.
+        """
+        output.token_ids = output.token_ids[:-num_stop_ids]
+        if output.logprobs:
+            output.logprobs = output.logprobs[:-num_stop_ids]
+        if output.generation_logits is not None:
+            output.generation_logits = output.generation_logits[:-num_stop_ids]
+        if output.additional_generation_outputs:
+            # HandleAdditionalOutputs concatenates one [1, beam_width, ...]
+            # slice per generated token, so axis 0 is the token axis for every
+            # entry regardless of the output's name or beam width.
+            output.additional_generation_outputs = {
+                name: value[:-num_stop_ids]
+                for name, value in output.additional_generation_outputs.items()
+            }
 
     def _get_decoder_output_prefix_logprobs(
             self) -> TokenLogprobs | SimpleTokenLogprobs:

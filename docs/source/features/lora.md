@@ -118,6 +118,22 @@ llm = LLM(
 )
 ```
 
+#### Native FP8 adapter support
+
+The base model's quantization and the LoRA adapter's data type are independent. Dense LoRA modules can keep
+FP8 E4M3 adapter weights and execute them with native FP8 grouped GEMM kernels on the following architectures:
+
+| GPU architecture | Native FP8 adapter support |
+|---|---|
+| Hopper (SM90) | Yes |
+| Blackwell B200 (SM100) | Yes |
+| Blackwell (SM103/SM107) | No |
+| Blackwell (SM120/SM121) | No |
+
+If native FP8 LoRA kernels are unavailable for the current device or were excluded from the TensorRT-LLM build,
+the adapter weights are converted to the model compute data type. Native FP8 adapter weights are not supported
+for routed-expert MoE LoRA modules; see [Routed-Expert MoE LoRA](#routed-expert-moe-lora).
+
 ### NeMo LoRA Format
 
 ```python

@@ -20,6 +20,7 @@ Tests for the token->request map used by DSAtrtllmAttentionMetadata.
 2. on_update_kv_lens() must rebuild the map after the MTP draft loop rewrites
    seq_lens, or every draft token is misattributed to request 0
    (https://nvbugs/6513132, https://nvbugs/6513093).
+3. on_update_kv_lens() must preserve the base metadata invalidation contract.
 """
 
 from unittest.mock import Mock
@@ -64,7 +65,28 @@ def test_matches_host_repeat_interleave(seq_lens, device):
     assert result.to(torch.int32).tolist() == _host_reference(seq_lens).tolist()
 
 
-def test_on_update_kv_lens_rebuilds_stale_map():
+def test_on_update_kv_lens_invalidates_base_mla_state() -> None:
+    md = object.__new__(DSAtrtllmAttentionMetadata)
+    md.enable_flash_mla = False
+    md._mla_scheduler_buffers_valid = True
+    md._mla_ctx_cu_seqlens_valid = True
+    md._cute_dsl_mla_staging_key = object()
+    md._invalidate_pool_view_cache = Mock()
+    md._num_tokens = 0
+    md._num_generations = 0
+    md.kv_cache_manager = None
+    md.kv_lens_cuda = torch.empty(0, dtype=torch.int32)
+    md._compute_kv_lens_row_reorder = Mock()
+    md.prepare_dense_topk_indices = Mock()
+
+    md.on_update_kv_lens()
+
+    assert not md._mla_scheduler_buffers_valid
+    assert not md._mla_ctx_cu_seqlens_valid
+    assert md._cute_dsl_mla_staging_key is None
+
+
+def test_on_update_kv_lens_rebuilds_stale_map() -> None:
     """on_update_kv_lens() must replace prepare()'s stale map (fails pre-fix)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

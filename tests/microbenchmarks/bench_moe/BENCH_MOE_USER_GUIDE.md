@@ -53,7 +53,7 @@ For single-rank sanity checks:
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model mixtral_8x7b \
+  --model qwen1.5_moe \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -87,7 +87,7 @@ every MPI rank to execute the benchmark worker.
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model mixtral_8x7b \
+  --model qwen1.5_moe \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -658,16 +658,22 @@ includes full requested and observed dispatch/expert matrices.
 
 | Model | Experts | `top_k` | Hidden | Intermediate | Default quant | Default routing |
 |---|---:|---:|---:|---:|---|---|
-| `qwen1.5_moe` | 60 | 4 | 2048 | 1408 | `FP8` | `RENORMALIZE` |
 | `deepseek_v2_lite` | 64 | 6 | 2048 | 1408 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_v3` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
+| `kimi_k3` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
-| `mixtral_8x7b` | 8 | 2 | 4096 | 14336 | `FP8` | `RENORMALIZE` |
+| `qwen3_8` | 512 | 10 | 8192 | 2048 | pass `--quant` | `RENORMALIZE` |
 | `gpt_oss_120b` | 128 | 4 | 2880 | 2880 | `W4A8_MXFP4_MXFP8` | `RENORMALIZE` |
+
+† **Latent MoE.** Some models project tokens down to a smaller latent dimension
+before dispatch and back up after combine, so the routed experts never see the
+model's `hidden_size`. For those, `Hidden` is the latent dimension — that is what
+both the expert GEMMs and the all-to-all payload actually run at. The outer
+down/up projections sit outside the MoE layer and are not benchmarked.
 
 Custom shapes can be used instead of `--model`:
 

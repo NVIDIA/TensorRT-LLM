@@ -20,11 +20,9 @@ dependency on the sampler_strategy interface or other backend implementation mod
 
 import math
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Optional
 
 import torch
-
-from tensorrt_llm._utils import prefer_pinned
 
 
 @dataclass(kw_only=True)
@@ -142,42 +140,6 @@ def greedy_search_sampling_batch(
         softmax = torch.zeros_like(logits)
         softmax.scatter_(1, next_tokens.unsqueeze(-1), 1.0)
     return next_tokens, softmax
-
-
-def get_rejected_indices(
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    generator: torch.Generator,
-    draft_tokens: list[int],
-) -> torch.Tensor:
-    num_draft_tokens = draft_probs.size(0)
-    draft_tokens = draft_tokens[:num_draft_tokens]
-    token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(
-        draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
-    ).to(device=generator.device, non_blocking=True)
-    p = draft_probs[token_idx, draft_tokens_cuda]
-    q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
-    accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
-    rejected_indices = (
-        torch.rand(accept_probs.shape, generator=generator, device=accept_probs.device)
-        > accept_probs
-    ).nonzero()
-    return rejected_indices
-
-
-def sample_rejected(
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    generator: torch.Generator,
-    num_accepted: int,
-) -> int:
-    last_draft = draft_probs[num_accepted]
-    last_target = target_probs[num_accepted]
-    new = last_target - last_draft
-    new = torch.where(new > 0, new, 0.0)
-    new_token = torch.multinomial(new, num_samples=1, generator=generator).squeeze(-1)
-    return cast(int, new_token.item())
 
 
 # Rows whose temperature is at or below this threshold are treated as greedy.

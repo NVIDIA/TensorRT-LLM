@@ -1311,7 +1311,7 @@ models:
         required: true
       response_format:
         kind: openai
-        type: Literal['url', 'b64_json']
+        type: Literal['url', 'b64_json', 'path']
         default: url
         status: stable
         required: false
@@ -1449,8 +1449,8 @@ models:
         required: true
       response_format:
         kind: extension
-        type: Literal['url', 'b64_json']
-        default: url
+        type: Literal['file', 'path']
+        default: file
         status: stable
         required: false
       format:

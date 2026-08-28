@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
 import torch
 
@@ -22,6 +22,9 @@ from .params import (
     DeepSeekV4MetadataParams,
     is_compress_layer,
 )
+
+if TYPE_CHECKING:
+    from .cache_manager import DeepseekV4CacheManager
 
 
 class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
@@ -282,6 +285,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # so compute them once during initialization instead of every prepare().
         self._init_cache_buffer_data_pointers()
 
+        # Draft-sized sparse buffers for one-model MTP separate draft KV cache.
+        self._init_draft_sparse_buffers()
+
     def prepare_for_indexer_k_cache(self):
         """Prepare the shared indexer K-cache decode table for DSA kernels."""
         # INDEXER_COMPRESS uses shared page indices, so the generic DSA
@@ -338,6 +344,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             req_idx = torch.searchsorted(cu_seq_lens[1:].to(torch.int32), token_idx, right=True)
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
+
+        if self.use_fp8_ds_mla:
+            self.token_positions_cuda[: token_positions.shape[0]] = token_positions
 
         self._prepare_deepseek_v4_indices_compiled(
             token_positions,
@@ -413,31 +422,95 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
 
+    def _build_cache_buffer_data_pointers(
+        self, manager: "DeepseekV4CacheManager", compress_ratios_by_layer: list[int]
+    ) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+        """Build sparse cache pointers for a target or draft manager."""
+        sparse_mla_base_ptrs = {1: manager.swa_pool_ptr}
+        for ratio, compress_pool_ptr in manager.compress_pool_ptrs.items():
+            sparse_mla_base_ptrs[ratio] = compress_pool_ptr
+
+        swa_buffer_ptrs = {layer_idx: manager.swa_pool_ptr for layer_idx in manager.pp_layers}
+        compressed_buffer_ptrs = {
+            layer_idx: manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
+            for layer_idx in manager.pp_layers
+            if is_compress_layer(compress_ratios_by_layer[layer_idx])
+        }
+        return sparse_mla_base_ptrs, swa_buffer_ptrs, compressed_buffer_ptrs
+
     def _init_cache_buffer_data_pointers(self):
-        # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1
+        # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1.
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
         )
-        # SWA uses PER_LAYER indices; COMPRESS uses SHARED indices. The sparse
-        # MLA conversion kernel receives a representative base pointer per pool
-        # and a per-layer buffer pointer so it can account for any layer offset.
-        self.sparse_mla_base_ptrs = {
-            1: self.kv_cache_manager.swa_pool_ptr,
-        }
-        for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
-            self.sparse_mla_base_ptrs[ratio] = compress_pool_ptr
+        (
+            self.sparse_mla_base_ptrs,
+            self.swa_buffer_ptrs,
+            self.compressed_buffer_ptrs,
+        ) = self._build_cache_buffer_data_pointers(self.kv_cache_manager, extend_compress_ratios)
 
-        self.swa_buffer_ptrs = {
-            layer_idx: self.kv_cache_manager.swa_pool_ptr
-            for layer_idx in self.kv_cache_manager.pp_layers
-        }
-        self.compressed_buffer_ptrs = {
-            layer_idx: self.kv_cache_manager.get_buffers(
-                layer_idx, DeepseekV4AttentionType.COMPRESS
-            ).data_ptr()
-            for layer_idx in self.kv_cache_manager.pp_layers
-            if is_compress_layer(extend_compress_ratios[layer_idx])
-        }
+    def _init_draft_sparse_buffers(self):
+        """Initialize sparse buffers for a separate one-model MTP draft cache."""
+        self.draft_sliding_block_tables = None
+        self.draft_sparse_mla_base_ptrs = None
+        self.draft_swa_buffer_ptrs = None
+
+        draft_mgr = self.draft_kv_cache_manager
+        from .cache_manager import DeepseekV4CacheManager
+
+        if not isinstance(draft_mgr, DeepseekV4CacheManager):
+            return
+
+        # Current DSv4 MTP layers are SWA-only. Fail fast if a future model
+        # introduces a compressed or indexer MTP layer.
+        draft_ratio = self.compress_ratios[-1]
+        if draft_ratio != 1:
+            raise NotImplementedError(
+                "Separate DeepSeek-V4 draft KV cache supports only SWA-only "
+                f"(compress_ratio 1) MTP draft layers; got ratio {draft_ratio}."
+            )
+
+        draft_block_table_shape = (
+            draft_mgr.num_local_layers,
+            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            self.max_num_sequences,
+            draft_mgr.max_blocks_per_seq,
+        )
+        self.draft_sliding_block_tables = self.get_empty(
+            self.cuda_graph_buffers,
+            draft_block_table_shape,
+            cache_name="draft_sliding_block_tables",
+            dtype=torch.int32,
+            capture_graph=self.is_cuda_graph,
+        )
+        extend_compress_ratios = self.compress_ratios + [draft_ratio] * (self.max_draft_tokens - 1)
+        (
+            self.draft_sparse_mla_base_ptrs,
+            self.draft_swa_buffer_ptrs,
+            _,
+        ) = self._build_cache_buffer_data_pointers(draft_mgr, extend_compress_ratios)
+
+    _DRAFT_SPARSE_FIELDS = (
+        "sliding_block_tables",
+        "sparse_mla_base_ptrs",
+        "swa_buffer_ptrs",
+    )
+
+    def prepare_for_draft_forward(self) -> dict | None:
+        """Repoint sparse fields to the draft buffers for a draft forward."""
+        if self.draft_sliding_block_tables is None:
+            return None
+        saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}
+        for field in self._DRAFT_SPARSE_FIELDS:
+            setattr(self, field, getattr(self, f"draft_{field}"))
+        return saved_state
+
+    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+        """Restore the target sparse fields after a draft forward."""
+        if saved_state is None:
+            return
+        for field in self._DRAFT_SPARSE_FIELDS:
+            setattr(self, field, saved_state[field])
 
     def prepare(self):
         assert self.kv_cache_manager is not None
@@ -447,6 +520,22 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.request_ids,
             self.num_contexts,
         )
+
+        # Prepare the draft manager's tables before the generic prepare copies
+        # its block offsets, and populate the dedicated DSv4 draft sparse table.
+        draft_mgr = self.draft_kv_cache_manager
+        if draft_mgr is not None and hasattr(draft_mgr, "compute_sliding_block_tables"):
+            draft_mgr.compute_sliding_block_tables(
+                self.request_ids,
+                self.num_contexts,
+            )
+            if self.draft_sliding_block_tables is not None:
+                draft_mgr.copy_batch_sliding_block_tables(
+                    self.draft_sliding_block_tables,
+                    self.request_ids,
+                    self.num_contexts,
+                    self.num_seqs,
+                )
 
         TrtllmAttentionMetadata.prepare(self)
 

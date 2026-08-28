@@ -14,9 +14,9 @@ from .openai_server import RemoteMMEncoderServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])
+@pytest.fixture(scope="module", ids=["Qwen3/Qwen3-VL-2B-Instruct"])
 def model_name():
-    return "Qwen2.5-VL-3B-Instruct"
+    return "Qwen3/Qwen3-VL-2B-Instruct"
 
 
 @pytest.fixture(scope="module",
@@ -103,10 +103,11 @@ def test_multimodal_content_mm_encoder(
     # Verify the handle contains tensor information
     mm_handle = choice.mm_embedding_handle
     assert "tensor_size" in mm_handle
-    assert mm_handle["tensor_size"][
-        0] == 324  # qwen2.5-vl: 324 tokens for the same image
-    assert mm_handle["tensor_size"][
-        1] == 2048  # qwen2.5-vl: hidden_size of the vision encoder
+    tensor_size = mm_handle["tensor_size"]
+    assert len(tensor_size) == 2
+    assert tensor_size[0] > 0
+    assert tensor_size[
+        1] == 8192  # qwen3-vl: hidden_size * (1 + 3 deepstack streams)
 
     return messages, mm_handle  # used by tests/unittest/llmapi/apps/_test_openai_chat_multimodal.py
 

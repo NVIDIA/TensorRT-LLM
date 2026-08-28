@@ -185,6 +185,7 @@ class TestWarmupCleanup(unittest.TestCase):
             is_warmup_only=True,
         )
         model_engine._torch_compile_piecewise_cuda_graph = False
+        model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
 
         @contextlib.contextmanager

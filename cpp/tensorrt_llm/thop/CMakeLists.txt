@@ -117,6 +117,8 @@ add_library(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   sparseKvCacheCompactOp.cpp
+  minimaxM3Fp8IndexerOp.cpp
+  minimaxM3SelectBlocksOp.cpp
   mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
@@ -126,6 +128,7 @@ add_library(
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
+  localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp

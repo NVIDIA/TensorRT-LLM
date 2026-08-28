@@ -24,9 +24,12 @@ from tensorrt_llm._torch.peft.lora.layer import (
     _validate_fp8_lora_cuda_graph_alignment,
     add_lora_result,
 )
+from tensorrt_llm._torch.peft.lora.manager import supports_native_fp8_lora
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_NATIVE_FP8_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+_NATIVE_FP8_AVAILABLE = torch.cuda.is_available() and supports_native_fp8_lora(
+    torch.cuda.get_device_capability()
+)
 
 
 def _kernel_source(filename: str) -> str:
@@ -57,7 +60,16 @@ def _assert_fp8_gemm_matches_reference(actual, reference):
     )
 
 
-@pytest.mark.skipif(not _NATIVE_FP8_AVAILABLE, reason="Native FP8 LoRA requires SM90")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((9, 0), (10, 0)),
+    reason="Native FP8 LoRA requires SM90 or SM100",
+)
+def test_fp8_grouped_gemm_kernel_is_reported_available():
+    major, minor = torch.cuda.get_device_capability()
+    assert torch.ops.trtllm.lora_grouped_gemm_supports_fp8(major * 10 + minor)
+
+
+@pytest.mark.skipif(not _NATIVE_FP8_AVAILABLE, reason="Native FP8 LoRA requires SM90 or SM100")
 def test_fp8_eager_grouped_gemm_matches_reference():
     x, lora_in, lora_out, reference = _make_fp8_lora_problem()
     rank = lora_in.shape[0]
@@ -82,7 +94,7 @@ def test_fp8_eager_grouped_gemm_matches_reference():
     _assert_fp8_gemm_matches_reference(actual, reference)
 
 
-@pytest.mark.skipif(not _NATIVE_FP8_AVAILABLE, reason="Native FP8 LoRA requires SM90")
+@pytest.mark.skipif(not _NATIVE_FP8_AVAILABLE, reason="Native FP8 LoRA requires SM90 or SM100")
 def test_fp8_cuda_graph_grouped_gemm_matches_reference_after_replay():
     batch_size = 16
     x, lora_in, lora_out, _ = _make_fp8_lora_problem(batch_size=batch_size)
@@ -221,7 +233,9 @@ def test_fp8_cuda_graph_alignment_rejects_misaligned_hidden_dims(hidden_size, ou
 def test_fp8_cuda_graph_grouped_gemm_reuses_live_device_metadata():
     source = _kernel_source("cuda_graph_grouped_gemm.cu")
     fp8_graph_body = _function_block(
-        source, "void fp8CudaGraphGroupedGemm(", "\nvoid cudaGraphGroupedGemm("
+        source,
+        "void fp8CudaGraphGroupedGemmImpl(",
+        "\nvoid fp8CudaGraphGroupedGemm(",
     )
 
     assert "hostMaxProblemSizesPtr" not in fp8_graph_body
@@ -256,12 +270,15 @@ def test_fp8_grouped_gemm_dispatch_has_explicit_unsupported_cutlass_guard(filena
 
 
 @pytest.mark.parametrize("filename", ["groupGemm.cu", "cuda_graph_grouped_gemm.cu"])
-def test_fp8_grouped_gemm_dispatch_requires_sm90(filename):
+def test_fp8_grouped_gemm_dispatch_supports_sm90_and_sm100(filename):
     source = _kernel_source(filename)
 
     assert "getSMVersion()" in source
-    assert "smVersion == 90" in source
-    assert "requires Hopper (SM90)" in source
+    assert "smVersion == fp8GroupedGemmConfig::kSm90" in source
+    assert "smVersion == fp8GroupedGemmConfig::kSm100" in source
+    assert "requires Hopper (SM90) or B200 (SM100)" in source
+    assert "fp8GroupedGemmConfig::Sm90Config" in source
+    assert "fp8GroupedGemmConfig::Sm100Config" in source
     assert "SM120/SM121" in source
 
 

@@ -19,12 +19,35 @@
 
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include "tensorrt_llm/common/logger.h"
+
 #include <cuda.h>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+template <typename F>
+void terminateOnException(char const* context, F&& func) noexcept
+{
+    try
+    {
+        std::forward<F>(func)();
+    }
+    catch (std::exception const& error)
+    {
+        TLLM_LOG_ERROR("%s: %s", context, error.what());
+        std::terminate();
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("%s: unknown error", context);
+        std::terminate();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Exception hierarchy (mirrors _exceptions.py)
@@ -127,27 +150,6 @@ class OutOfPagesError : public std::runtime_error
 public:
     explicit OutOfPagesError(std::string const& msg = "Out of pages")
         : std::runtime_error(msg)
-    {
-    }
-};
-
-// Block creation rejected because its tokens are fully covered by an existing sibling.
-// Mirrors Python's UselessBlockError — carries the sibling block.
-// TODO: Once Python is removed and C++ becomes the primary development target,
-// replace this exception-based flow with a simple if-condition return in
-// addOrGetExistingBlock (returning the sibling block directly instead of throwing).
-// The exception pattern exists only to maintain parity with the Python code path.
-// Forward-declared; Block definition is in blockRadixTree.h.
-struct Block;
-
-class UselessBlockError : public std::runtime_error
-{
-public:
-    SharedPtr<Block> block;
-
-    explicit UselessBlockError(SharedPtr<Block> blk)
-        : std::runtime_error("Block is useless — covered by existing sibling")
-        , block(std::move(blk))
     {
     }
 };

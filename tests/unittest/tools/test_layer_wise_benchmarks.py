@@ -340,6 +340,54 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
     )
 
 
+# Kimi K3's MXFP4 routed experts and KDA kernels require SM100+.
+@skip_pre_blackwell
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_kimi_k3_gen_dep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
+    model_root = llm_models_root(check=True)
+    profile_dir = f"profiles/test_kimi_k3_gen_dep_{world_size}"
+    if world_size == 1:
+        # EP1 puts all 896 experts on one GPU, and GEN builds a second (prefill)
+        # model, so halve the slice: layer 6 is KDA and 7 is MLA, still covering
+        # both attention paths. Balanced routing needs the top-k computed outside
+        # the MoE kernel, which only happens once there is expert parallelism.
+        layer_args = ["--layer-indices=6,7", "--balance-method=NotModified"]
+    else:
+        # 0-based: three KDA layers then one full-attention (MLA) layer.
+        layer_args = ["--layer-indices=4,5,6,7"]
+    check_call(
+        [
+            "./mpi_launch.sh",
+            "./run.sh",
+            "config_gen.yaml",
+            "--model",
+            model_root / "Kimi-K3",
+            *layer_args,
+            "--tokens-per-block=64",
+            # SiTU routed experts support no other backend, and GEN also builds
+            # a prefill runner.
+            "--moe-backend=TRTLLM",
+            "--moe-backend-for-prefill=TRTLLM",
+            # 1 golden + 3 draft tokens per generation step.
+            "--batch-size=32",
+            "--seq-len-q=4",
+            "--spec-max-draft-len=3",
+        ],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+        env={
+            **os.environ,
+            "NP": f"{world_size:d}",
+            "PROFILE_DIR": profile_dir,
+        },
+    )
+    check_call(
+        ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+    )
+
+
 # The pinned DeepSeek-V3-Lite NVFP4 checkpoint requires SM100+; on older
 # architectures the benchmark crashes the test process (seen on A10, where
 # this module runs as part of the unittest/tools directory).

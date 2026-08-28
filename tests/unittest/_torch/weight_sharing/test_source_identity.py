@@ -35,6 +35,7 @@ from _source_identity_fakes import (
 
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
@@ -71,14 +72,21 @@ def test_from_model_config_requires_one_artifact_source() -> None:
         )
 
 
-def test_from_model_config_binds_transform_abi() -> None:
+@pytest.mark.parametrize(
+    "transform_abi_id",
+    [
+        LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    ],
+)
+def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
     identity = SourceIdentity.from_model_config(
         FakeModelConfig(),
         artifact_identity=make_artifact_identity(),
-        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        transform_abi_id=transform_abi_id,
     )
 
-    assert identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert identity.transform_abi_id == transform_abi_id
 
 
 @pytest.mark.parametrize("transform_abi_id", ["", 1])

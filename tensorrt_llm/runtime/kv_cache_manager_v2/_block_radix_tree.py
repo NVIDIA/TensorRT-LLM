@@ -585,7 +585,13 @@ class Block:
         # But for simplicity, we leave it for now.
         curr = start
         while (
-            (isinstance(curr, Block) and curr.get_page(lc_idx) is None)
+            (
+                isinstance(curr, Block)
+                and all(
+                    curr.get_page(life_cycle) is None
+                    for life_cycle in typed_range(curr.num_life_cycles)
+                )
+            )
             and not curr.next
             and curr._prev() is not None
         ):

@@ -71,6 +71,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         assert sparse_params is not None, (
             "sparse_params is required for DeepseekV4TrtllmAttention and cannot be None"
         )
+        kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         assert mla_params is not None, "DeepSeek-V4 attention requires MLA parameters"
         mla_params = replace(
             mla_params,
@@ -126,6 +128,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 dtype=dtype,
                 rotate_activation=False,
             )
+            if self.use_fp8_ds_mla:
+                self.compressor.enable_footer_scale_cache()
 
     def _prepare_sparse_forward_args(
         self,
@@ -211,6 +215,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.compress_ratio,
             DeepseekV4AttentionType.SWA,
             has_fp8_kv_cache,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
 
         # Select token range based on phase
@@ -287,7 +292,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 ),
             )
 
-        global_indices = deepseek_v4_local_to_global_indices(
+        result = deepseek_v4_local_to_global_indices(
             req_id=req_id,
             block_table_swa=block_table_swa,
             swa_local_indices=swa_local_indices,
@@ -302,9 +307,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compress_ratio=self.compress_ratio,
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
+            split_extra=self.use_fp8_ds_mla,
         )
 
-        return global_indices, None
+        if self.use_fp8_ds_mla:
+            return result
+        return result, None
 
     def sparse_kv_predict(
         self,

@@ -18,6 +18,7 @@
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from unittest import mock
 
 import pytest
 import torch
@@ -924,24 +925,30 @@ class CompressorWrapper:
         else:
             cache_dtype = DataType.BF16
 
-        # Create cache manager
-        cache_manager = DeepseekV4CacheManager(
-            kv_cache_config=kv_cache_config,
-            kv_cache_type=CacheTypeCpp.SELFKONLY,
-            num_layers=len(compress_ratios),
-            num_kv_heads=1,
-            head_dim=HEAD_DIM,
-            tokens_per_block=PAGE_SIZE,
-            max_seq_len=MAX_SEQ,
-            max_batch_size=MAX_BATCH,
-            max_input_len=MAX_SEQ,
-            mapping=mapping,
-            dtype=cache_dtype,
-            compressor_dtype=DataType.FLOAT,  # State caches always use FP32
-            vocab_size=self.VOCAB_SIZE,
-            max_num_tokens=MAX_SEQ * MAX_BATCH,
-            sparse_attn_config=sparse_attn_config,
-        )
+        # These tests cover the generic compressor cache formats independently
+        # of the architecture-specific attention layout. Keep that coverage on
+        # H100 without selecting the Hopper-required footer-scale cache.
+        with mock.patch(
+            "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager.get_sm_version",
+            return_value=100,
+        ):
+            cache_manager = DeepseekV4CacheManager(
+                kv_cache_config=kv_cache_config,
+                kv_cache_type=CacheTypeCpp.SELFKONLY,
+                num_layers=len(compress_ratios),
+                num_kv_heads=1,
+                head_dim=HEAD_DIM,
+                tokens_per_block=PAGE_SIZE,
+                max_seq_len=MAX_SEQ,
+                max_batch_size=MAX_BATCH,
+                max_input_len=MAX_SEQ,
+                mapping=mapping,
+                dtype=cache_dtype,
+                compressor_dtype=DataType.FLOAT,  # State caches always use FP32
+                vocab_size=self.VOCAB_SIZE,
+                max_num_tokens=MAX_SEQ * MAX_BATCH,
+                sparse_attn_config=sparse_attn_config,
+            )
 
         return cache_manager
 

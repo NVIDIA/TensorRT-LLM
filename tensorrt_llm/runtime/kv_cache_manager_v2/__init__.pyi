@@ -187,6 +187,8 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
+    # One positive, normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
+    # layer-group slot-count proportions.
     initial_pool_ratio: list[float] | None = None
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     commit_min_snapshot: bool = False
@@ -321,6 +323,7 @@ class _KVCache:
         custom_priority_callback: Callable[[int, Any], Priority],
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -474,11 +477,23 @@ class PageIndexConverter:
         scratch: ScratchDesc | None = None,
     ) -> list[int]: ...
 
+class IKvCacheColdPageCodec: ...
+
+def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
+    """Create the default lossless cold-page codec.
+
+    Passing ``cold_page_codec=None`` to ``KVCacheManager`` already selects this codec, so normal users do not need to
+    call this factory. It is primarily provided to demonstrate how a native codec factory exposes an owning
+    ``IKvCacheColdPageCodec`` object for transfer into ``KVCacheManager``. Any ``KVCacheManager`` construction attempt
+    consumes an explicitly supplied codec, including an attempt that fails.
+    """
+
 class KVCacheManager:
     def __init__(
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
+        cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
@@ -500,6 +515,7 @@ class KVCacheManager:
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> _KVCache: ...
     def probe_reuse(
         self,

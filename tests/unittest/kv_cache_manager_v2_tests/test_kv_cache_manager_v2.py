@@ -17,6 +17,7 @@ import functools
 import gc
 import hashlib
 import itertools
+import math
 import os
 import random
 import time
@@ -160,6 +161,11 @@ KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND",
 requires_python_backend = unittest.skipIf(
     KV_CACHE_MANAGER_V2_BACKEND == "cpp",
     "white-box test over pure-Python KVCacheManagerV2 internals",
+)
+
+requires_cpp_backend = unittest.skipUnless(
+    KV_CACHE_MANAGER_V2_BACKEND == "cpp",
+    "cold-page codec end-to-end test requires the C++ backend",
 )
 
 
@@ -452,6 +458,189 @@ class TestNoBatching(TestKVCacheManagerV2):
         time_taken = toc - tic
         # print(f"Time taken: {time_taken} seconds")
         return time_taken
+
+    def _run_cold_page_codec_round_trip(
+        self,
+        expected_num_pages: int,
+        expected_cold_pages: dict[LayerGroupId, tuple[int, int, int]],
+    ) -> None:
+        """Force one request through cold storage, then validate its promoted KV."""
+        requests: list[TestNoBatching.Request] = []
+        try:
+            first = self.new_request(0, None, 3 * self.cfg.tokens_per_block, 0)
+            requests.append(first)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(first.kv_cache.resume(stream))
+                self.run_request(first, self.cfg.tokens_per_block, True)
+            stream_holder.take_finish_event().synchronize()
+            self.assertEqual(
+                _introspection.active_page_stats(first.kv_cache)[0],
+                [expected_num_pages, 0],
+            )
+            first.kv_cache.suspend()
+            self.manager.get_and_reset_iteration_stats()
+
+            second = self.new_request(1, None, 3 * self.cfg.tokens_per_block, 0)
+            requests.append(second)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(second.kv_cache.resume(stream))
+                self.run_request(second, self.cfg.tokens_per_block, True)
+            stream_holder.take_finish_event().synchronize()
+
+            # Hot storage has exactly one request worth of slots, so every page of the
+            # suspended request must now use the padded cold representation.
+            self.assertEqual(
+                _introspection.active_page_stats(first.kv_cache)[0],
+                [0, expected_num_pages],
+            )
+            offload_stats = self.manager.get_and_reset_iteration_stats()
+            for life_cycle_id, (offload_pages, _, page_bytes) in expected_cold_pages.items():
+                self.assertEqual(offload_stats[life_cycle_id].iter_offload_blocks, offload_pages)
+                self.assertEqual(
+                    offload_stats[life_cycle_id].iter_offload_bytes,
+                    offload_pages * page_bytes,
+                )
+
+            second.kv_cache.close()
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(first.kv_cache.resume(stream))
+                self.run_request(first, self.cfg.tokens_per_block, True)
+            stream_holder.take_finish_event().synchronize()
+            self.assertEqual(
+                _introspection.active_page_stats(first.kv_cache)[0],
+                [expected_num_pages, 0],
+            )
+            onboard_stats = self.manager.get_and_reset_iteration_stats()
+            for life_cycle_id, (_, onboard_pages, page_bytes) in expected_cold_pages.items():
+                self.assertEqual(onboard_stats[life_cycle_id].iter_onboard_blocks, onboard_pages)
+                self.assertEqual(
+                    onboard_stats[life_cycle_id].iter_onboard_bytes,
+                    onboard_pages * page_bytes,
+                )
+        finally:
+            for request in requests:
+                if request.kv_cache.status != _KVCache.Status.CLOSED:
+                    request.kv_cache.close()
+            if hasattr(self, "manager"):
+                self.manager.clear_reusable_blocks()
+
+    @requires_cpp_backend
+    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
+        """Padding merges full attention with one of two differently-sized SWA LCs."""
+        unit = 1 << 20
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=24 * unit),
+                GpuCacheTierConfig(quota=64 * unit),
+            ],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=4 * unit)],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                    sliding_window_size=4,
+                    num_sink_tokens=0,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(2),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                    sliding_window_size=8,
+                    num_sink_tokens=0,
+                ),
+            ],
+            initial_pool_ratio=[1 / 3, 1 / 3, 1 / 3],
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
+            max_util_for_resume=1.0,
+        )
+        self.engine = FakeEngine(self.cfg)
+        codec = _introspection.create_test_padding_cold_page_codec(
+            {0: 4 * unit, 1: 4 * unit, 2: 2 * unit}
+        )
+        self.manager = KVCacheManager(self.cfg, cold_page_codec=codec)
+
+        full_lc, short_swa_lc, long_swa_lc = [
+            self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(3)
+        ]
+        hot_groups = [
+            _introspection.pool_group_index(self.manager, lc_id, 0)
+            for lc_id in (full_lc, short_swa_lc, long_swa_lc)
+        ]
+        cold_groups = [
+            _introspection.pool_group_index(self.manager, lc_id, 1)
+            for lc_id in (full_lc, short_swa_lc, long_swa_lc)
+        ]
+        self.assertNotEqual(hot_groups[0], hot_groups[1])
+        self.assertEqual(hot_groups[1], hot_groups[2])
+        self.assertEqual(cold_groups[0], cold_groups[1])
+        self.assertNotEqual(cold_groups[1], cold_groups[2])
+
+        hot_stats = _introspection.storage_statistics(self.manager, 0)
+        self.assertEqual(hot_stats[hot_groups[0]].total, 3)
+        self.assertEqual(hot_stats[hot_groups[1]].total, 6)
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=6,
+            expected_cold_pages={
+                full_lc: (3, 3, 4 * unit),
+                short_swa_lc: (3, 1, 4 * unit),
+                long_swa_lc: (3, 2, 2 * unit),
+            },
+        )
+
+    @requires_cpp_backend
+    def test_cold_codec_splits_lifecycles_from_one_hot_pool_group(self) -> None:
+        """Padding one SWA lifecycle splits a shared hot pool group in cold storage."""
+        unit = 1 << 20
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=12 * unit),
+                GpuCacheTierConfig(quota=32 * unit),
+            ],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                    sliding_window_size=8,
+                    num_sink_tokens=0,
+                ),
+            ],
+            initial_pool_ratio=[0.5, 0.5],
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
+            max_util_for_resume=1.0,
+        )
+        self.engine = FakeEngine(self.cfg)
+        codec = _introspection.create_test_padding_cold_page_codec({0: 2 * unit, 1: 4 * unit})
+        self.manager = KVCacheManager(self.cfg, cold_page_codec=codec)
+
+        full_lc, swa_lc = [
+            self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(2)
+        ]
+        hot_groups = [
+            _introspection.pool_group_index(self.manager, lc_id, 0) for lc_id in (full_lc, swa_lc)
+        ]
+        cold_groups = [
+            _introspection.pool_group_index(self.manager, lc_id, 1) for lc_id in (full_lc, swa_lc)
+        ]
+        self.assertEqual(hot_groups[0], hot_groups[1])
+        self.assertNotEqual(cold_groups[0], cold_groups[1])
+
+        hot_stats = _introspection.storage_statistics(self.manager, 0)
+        self.assertEqual(hot_stats[hot_groups[0]].total, 6)
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=5,
+            expected_cold_pages={full_lc: (3, 3, 2 * unit), swa_lc: (3, 2, 4 * unit)},
+        )
 
     def run_naive(
         self,
@@ -3204,6 +3393,28 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         manager.shutdown()
 
+    def test_initial_ratio_is_per_layer_group_when_hot_group_is_shared(self):
+        config = KVCacheManagerConfig(
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)],
+                    sliding_window_size=self.WINDOW_SIZE,
+                    num_sink_tokens=self.SINK_TOKENS,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)],
+                ),
+            ],
+            initial_pool_ratio=[0.25, 0.75],
+        )
+        manager = KVCacheManager(config)
+        self.assertEqual(_introspection.current_gpu_ratio(manager), [1.0])
+        manager.shutdown()
+
     @parameterized.expand(
         [
             ("empty", [], "initial_pool_ratio length"),
@@ -3217,6 +3428,16 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg = self._make_config(initial_pool_ratio=ratio)
 
         with self.assertRaisesRegex(ValueError, error):
+            KVCacheManager(cfg)
+
+    @parameterized.expand(
+        [("zero", 0.0), ("negative", -0.1), ("greater_than_one", 1.1), ("nan", math.nan)]
+    )
+    def test_invalid_max_util_for_resume(self, _name: str, max_util_for_resume: float):
+        cfg = self._make_config()
+        cfg.max_util_for_resume = max_util_for_resume
+
+        with self.assertRaisesRegex((ValueError, RuntimeError), "max_util_for_resume must be in"):
             KVCacheManager(cfg)
 
     def test_ratio_slot_count_rounding_matches_python(self):

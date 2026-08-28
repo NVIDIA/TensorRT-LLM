@@ -66,6 +66,93 @@ def test_checkpoint_resets_timer():
         assert hd.detected() is False
 
 
+def test_checkpoint_schedules_no_work_on_the_detector_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """checkpoint() runs on the executor thread and must stay off the detector loop.
+
+    Waking that loop is the per-iteration cost this detector is built to avoid,
+    and the executor pays it three times per iteration. Both routes into the
+    loop -- scheduling a coroutine and cancelling one -- funnel through
+    call_soon_threadsafe, so counting it catches either.
+    """
+    hd = HangDetector(timeout=30)
+    with hd:
+        woken = []
+        real_call_soon_threadsafe = hd.loop.call_soon_threadsafe
+
+        def counting_call_soon_threadsafe(*args: object, **kwargs: object) -> asyncio.Handle:
+            woken.append(args[0] if args else None)
+            return real_call_soon_threadsafe(*args, **kwargs)
+
+        monkeypatch.setattr(hd.loop, "call_soon_threadsafe", counting_call_soon_threadsafe)
+
+        for _ in range(10):
+            hd.checkpoint()
+        with hd.pause():
+            hd.checkpoint()
+        hd.checkpoint()
+        hd.disarm()
+        assert woken == []
+
+
+def test_detector_is_disarmed_until_the_first_checkpoint():
+    """start() enables detection; the first checkpoint arms the deadline.
+
+    Callers separate lifecycle start from arming, so the start-to-first-
+    checkpoint window must not be attributed to the loop as a hang.
+    """
+    fired = []
+    hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
+    with hd:
+        time.sleep(2.0)  # would fire if start() armed the deadline itself
+        assert fired == []
+        assert hd.detected() is False
+
+
+def test_watcher_survives_a_raising_callback():
+    """on_detected is the cross-rank hard kill and can fail on a broken job."""
+    fired = []
+
+    def boom():
+        fired.append(1)
+        raise RuntimeError("hard kill failed")
+
+    hd = HangDetector(timeout=1, on_detected=boom)
+    with hd:
+        hd.checkpoint()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(fired) < 1:
+            time.sleep(0.05)
+        assert len(fired) == 1
+
+        # The watcher is still live and still able to report.
+        hd.checkpoint()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(fired) < 2:
+            time.sleep(0.05)
+        assert len(fired) == 2
+
+
+def test_one_lapse_invokes_on_detected_once() -> None:
+    """A single lapse must not re-run on_detected as the watcher keeps polling.
+
+    Nothing clears the deadline once its lapse is reported, so every later poll
+    observes the same lapse. on_detected is propagate_hard_kill(), which is not
+    idempotent -- re-running it would re-propagate to peer ranks.
+    """
+    fired = []
+    hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
+    with hd:
+        hd.checkpoint()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not fired:
+            time.sleep(0.05)
+        assert len(fired) == 1
+        time.sleep(2.5)  # several further polls over the same lapse
+        assert len(fired) == 1, "the same lapse ran on_detected again"
+
+
 def test_pause_suppresses_detection():
     fired = []
     hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
@@ -102,7 +189,7 @@ def test_status_provider_errors_are_logged(monkeypatch):
     detector.register_status_provider(failing_provider)
     detector.register_status_provider(lambda: "transceiver status")
 
-    asyncio.run(detector._detect_hang())
+    asyncio.run(detector._report_hang())
 
     messages = "\n".join(message for kind, message in events if kind == "log")
     assert "provider failed" in messages

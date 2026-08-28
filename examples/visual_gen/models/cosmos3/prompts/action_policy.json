@@ -1,0 +1,5 @@
+{
+    "model_mode": "image2video",
+    "prompt": "Pick up the pear from the fruit display and place it into the plastic bag in the shopping cart.",
+    "vision_path": "https://github.com/nvidia-cosmos/cosmos-dependencies/raw/refs/heads/assets/cosmos3/inputs/vision/robot_153.jpg"
+}

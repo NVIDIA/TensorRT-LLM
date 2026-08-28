@@ -16,9 +16,9 @@
 """
 FlashInfer TRTLLM-Gen FMHA
 
-This module implements attention computation using flashinfer's trtllm-gen kernels.
-It provides a TRT-LLM attention FMHA library for trtllm-gen kernels
-(Blackwell architecture: SM100/SM103). Enable or disable it through
+This module implements attention computation using flashinfer's trtllm-gen kernels,
+with an optional CuTeDSL kernel for MLA generation. It provides a TRT-LLM attention
+FMHA library for Blackwell architecture (SM100/SM103). Enable or disable it through
 ``TLLM_FMHA_LIBS``.
 
 Architecture:
@@ -58,6 +58,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .interface import FmhaPhase, _CuteDslMlaStagingKey
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -207,6 +208,18 @@ if IS_FLASHINFER_AVAILABLE:
     _install_flashinfer_mla_decode_tuning_config_cache()
 
 
+_SUPPORTED_MLA_BACKENDS = {"cute-dsl", "trtllm-gen"}
+
+
+def _get_mla_backend(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend not in _SUPPORTED_MLA_BACKENDS:
+        raise ValueError(
+            f"flashinfer_mla_backend must be one of {_SUPPORTED_MLA_BACKENDS}, got {backend!r}."
+        )
+    return backend
+
+
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 
@@ -228,6 +241,89 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
     return bmm1_scale.narrow(0, 1, 1)
+
+
+@lru_cache(maxsize=128)
+def _get_cute_dsl_mla_workspace_size(
+    max_batch_size: int,
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    multi_processor_count: int,
+) -> int:
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import _get_split_kv_and_workspace_size
+
+    return max(
+        _get_split_kv_and_workspace_size(
+            batch_size,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            multi_processor_count,
+        )[1]
+        for batch_size in range(1, max_batch_size + 1)
+    )
+
+
+def _get_cute_dsl_mla_buffer_layout(
+    batch_size: int,
+    padded_num_pages: int,
+) -> Tuple[int, int, int]:
+    buffer_alignment_bytes = 32
+    page_table_bytes = batch_size * padded_num_pages * torch.int32.itemsize
+    sequence_lengths_offset = (
+        math.ceil(page_table_bytes / buffer_alignment_bytes) * buffer_alignment_bytes
+    )
+    kernel_workspace_offset = (
+        math.ceil(
+            (sequence_lengths_offset + batch_size * torch.int32.itemsize) / buffer_alignment_bytes
+        )
+        * buffer_alignment_bytes
+    )
+    return page_table_bytes, sequence_lengths_offset, kernel_workspace_offset
+
+
+def _prepare_cute_dsl_mla_buffers(
+    workspace: torch.Tensor,
+    block_tables: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    padded_num_pages: int,
+    skip_copy: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if block_tables.size(-1) > padded_num_pages:
+        raise RuntimeError("CuTeDSL MLA page table exceeds its pre-allocated shape.")
+    batch_size = block_tables.size(0)
+    if sequence_lengths.numel() < batch_size:
+        raise RuntimeError("CuTeDSL MLA sequence lengths are smaller than the batch size.")
+
+    page_table_bytes, sequence_lengths_offset, kernel_workspace_offset = (
+        _get_cute_dsl_mla_buffer_layout(batch_size, padded_num_pages)
+    )
+    workspace_bytes = workspace.view(torch.uint8).flatten()
+    if workspace_bytes.numel() <= kernel_workspace_offset:
+        raise RuntimeError(
+            f"CuTeDSL MLA workspace has {workspace_bytes.numel()} bytes; "
+            f"staging metadata alone needs {kernel_workspace_offset} bytes."
+        )
+    page_table_storage = (
+        workspace_bytes[:page_table_bytes].view(torch.int32).view(batch_size, padded_num_pages)
+    )
+    if not skip_copy:
+        page_table_storage.zero_()
+        page_table_storage[:, : block_tables.size(-1)].copy_(block_tables[:, 0, :])
+
+    sequence_lengths_storage = workspace_bytes[
+        sequence_lengths_offset:kernel_workspace_offset
+    ].view(torch.int32)
+    aligned_sequence_lengths = sequence_lengths_storage[:batch_size]
+    if not skip_copy:
+        aligned_sequence_lengths.copy_(sequence_lengths.flatten()[:batch_size])
+
+    kernel_workspace_bytes = (workspace_bytes.numel() - kernel_workspace_offset) // 4 * 4
+    kernel_workspace = workspace_bytes[
+        kernel_workspace_offset : kernel_workspace_offset + kernel_workspace_bytes
+    ].view(-1, 4)
+    return kernel_workspace, page_table_storage, aligned_sequence_lengths
 
 
 @lru_cache(maxsize=128)
@@ -358,7 +454,7 @@ def _get_workspace_size(
 
 class FlashInferTrtllmGenFmha(PhasedFmha):
     """
-    An attention backend using pure trtllm-gen kernels from flashinfer.
+    An attention backend using FlashInfer trtllm-gen and optional MLA CuTeDSL kernels.
     """
 
     # Default KV layout for flashinfer
@@ -411,28 +507,28 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
+    # (headDimQk, headDimV, tokens_per_block) whose trtllm-gen MLA decode kernel is
+    # slower than the thop.attention fallback, so this backend declines them.
+    SLOWER_MLA_GENERATION_KERNELS = {
+        (576, 512, 32),
+    }
 
-    def __init__(self, attn: "TrtllmAttention"):
+    def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
+        requested_mla_backend = _get_mla_backend(attn.flashinfer_mla_backend or "trtllm-gen")
+        if requested_mla_backend == "cute-dsl" and attn.is_mla_enable and attn.has_fp8_kv_cache:
+            raise ValueError(
+                "flashinfer_mla_backend='cute-dsl' does not support FP8 KV cache device scales; "
+                "use 'trtllm-gen' instead."
+            )
+        self._mla_backend = requested_mla_backend
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
-
-    def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
-        kv_cache_manager = meta.kv_cache_manager
-        if kv_cache_manager is not None:
-            get_page_index_upper_bound = getattr(
-                getattr(kv_cache_manager, "impl", None), "get_page_index_upper_bound", None
-            )
-            # KVCacheManagerV2 exposes this implementation-only API and reports an
-            # already-flattened page-index bound, unlike the legacy logical block count.
-            if get_page_index_upper_bound is not None:
-                return int(kv_cache_manager.blocks_in_primary_pool)
-        return super()._get_total_num_blocks(meta)
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -530,6 +626,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        tokens_per_block: int,
+        mla_backend: str,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -567,6 +665,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
+        # Scoped to trtllm-gen: SLOWER_MLA_GENERATION_KERNELS was measured on that
+        # kernel. Callers pass the backend that will actually run this batch, so a
+        # cute-dsl batch stays selectable while a batch a policy downgraded to
+        # trtllm-gen is still gated.
+        if (
+            mla_backend == "trtllm-gen"
+            and (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS
+        ):
+            return (
+                False,
+                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
+                f"tokens_per_block={tokens_per_block}.",
+            )
+
         return True, ""
 
     def is_supported(
@@ -576,6 +689,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
         supported, reason = self._is_supported_with_reason(
             q,
@@ -584,9 +699,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self.attn,
             metadata,
             forward_args,
+            phase=phase,
         )
         if not supported:
-            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {reason}")
+            logger.debug(f"FlashInfer trtllm-gen fmha library does not support request: {reason}")
         return supported
 
     def _is_supported_with_reason(
@@ -597,8 +713,33 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
+        if phase is None:
+            has_context_phase = fwd.attention_input_type != AttentionInputType.generation_only
+            has_generation_phase = fwd.attention_input_type != AttentionInputType.context_only
+        elif phase == FmhaPhase.CONTEXT:
+            has_context_phase = True
+            has_generation_phase = False
+        elif phase == FmhaPhase.GENERATION:
+            has_context_phase = False
+            has_generation_phase = True
+        else:
+            return False, f"invalid FMHA phase: {phase}."
+
+        if has_context_phase and q.dtype == torch.bfloat16 and 0 < meta.num_contexts <= 4:
+            # NVBug 6579626: the per-layer host overhead of the FlashInfer
+            # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
+            # Let the FMHA selector choose the fallback implementation only
+            # for that affected regime.
+            return False, (
+                "small-batch BF16 context attention uses the fallback FMHA for "
+                "performance because the FlashInfer TRTLLM-Gen context path "
+                "regresses TTFT due to per-layer host overhead."
+            )
+
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
@@ -627,8 +768,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "relative attention bias."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
             return False, "spec-dec tree/custom masks."
-        if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
-            return False, "MLA with non-generation-only attention."
+        if is_mla_enable and has_context_phase:
+            return False, "MLA context attention."
 
         if meta.kv_cache_block_offsets is None:
             return False, "non-paged KV cache; paged KV cache is required."
@@ -648,9 +789,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block is None:
             tokens_per_block = 0
 
-        attn_input_type = fwd.attention_input_type
-        has_context_phase = attn_input_type != AttentionInputType.generation_only
-        has_generation_phase = attn_input_type != AttentionInputType.context_only
         q_dtype = q.dtype
         o_dtype = output.dtype
 
@@ -731,8 +869,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                     f"Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
             if is_mla_enable:
+                # The effective backend, not the configured one: a policy may downgrade
+                # cute-dsl to trtllm-gen for this batch, and it is the kernel that
+                # actually runs that the gate is about. MLA reaches here only as
+                # generation-only (checked above), so num_gen_tokens == q.size(0),
+                # matching prepare_workspace's is_gen_only branch.
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    tokens_per_block=tokens_per_block,
+                    mla_backend=self._get_effective_mla_backend(meta, q.size(0)),
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
@@ -763,20 +908,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             device_index = torch.cuda.current_device()
         return self._get_multi_processor_count_for_device(device_index)
 
-    def get_fp8_context_fmha(
+    def _use_fp8_context_fmha(
         self,
-        q: torch.Tensor,
         output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
+        attention_input_type: AttentionInputType,
     ) -> bool:
         kv_cache_quant_mode = QuantMode(self.attn.quant_mode)
         return (
             output.dtype == torch.float8_e4m3fn
             or output.dtype == torch.uint8
             or kv_cache_quant_mode.has_fp4_kv_cache()
-            or (kv_cache_quant_mode.has_fp8_kv_cache() and not is_gen_only)
+            or (
+                kv_cache_quant_mode.has_fp8_kv_cache()
+                and attention_input_type != AttentionInputType.generation_only
+            )
         )
 
     def prepare_workspace(
@@ -824,7 +969,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         output = forward_args.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires output.")
-        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
+        fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
         workspace_max_tokens = max(num_tokens, metadata.max_context_length)
         workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
@@ -840,12 +985,39 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fp8_context_fmha=fp8_context_fmha,
         )
 
+        effective_mla_backend = self._get_effective_mla_backend(metadata, num_gen_tokens)
+        if is_gen_only and attn.is_mla_enable and effective_mla_backend == "cute-dsl":
+            if metadata.kv_cache_manager is None:
+                raise RuntimeError("CuTeDSL MLA requires a paged KV cache manager.")
+            max_batch_size = metadata.max_num_sequences or metadata.max_num_requests
+            max_num_pages = metadata.kv_cache_manager.max_blocks_per_seq
+            tokens_per_block = metadata.tokens_per_block or 64
+            pages_per_superblock = 128 // tokens_per_block
+            padded_num_pages = (
+                math.ceil(max_num_pages / pages_per_superblock) * pages_per_superblock
+            )
+            _, _, buffer_metadata_size = _get_cute_dsl_mla_buffer_layout(
+                max_batch_size, padded_num_pages
+            )
+            assert self._multi_processor_count is not None
+            cute_dsl_workspace_size = _get_cute_dsl_mla_workspace_size(
+                max_batch_size,
+                max(1, attn.predicted_tokens_per_seq),
+                attn.num_heads,
+                int(attn.kv_lora_rank or 0),
+                self._multi_processor_count,
+            )
+            required_workspace_size = max(
+                required_workspace_size, buffer_metadata_size + cute_dsl_workspace_size
+            )
+            required_workspace_size = math.ceil(required_workspace_size / 4) * 4
+
         current_workspace_size = workspace.numel() * workspace.element_size()
         if current_workspace_size < required_workspace_size:
             if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Attention CUDA graph workspace is smaller than the "
-                    "required size for trtllm-gen."
+                    f"required size for {effective_mla_backend}."
                 )
             required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
             workspace.resize_((required_workspace_numel,))
@@ -855,6 +1027,26 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if counter_buffer is None:
             raise RuntimeError("The trtllm-gen multi-CTA KV counter buffer is not initialized.")
         return counter_buffer
+
+    def _get_effective_mla_backend(
+        self, meta: "TrtllmAttentionMetadata", num_gen_tokens: int
+    ) -> str:
+        """Resolve the MLA decode backend for the current scheduler batch.
+
+        ``attn.mla_backend_policy`` is a neutral per-batch override hook.
+        A model whose backend choice depends on the batch composition (e.g.
+        Kimi K3's MLA module) installs a policy on the attention instance it
+        owns; the policy receives the statically configured backend, the batch
+        metadata, and the batch's generation-token count, and returns the
+        backend to use for this batch. Without a policy (the default for every
+        model) this returns ``self._mla_backend`` unchanged, so every call
+        site behaves exactly like the plain ``self._mla_backend`` checks it
+        replaced.
+        """
+        policy = self.attn.mla_backend_policy
+        if policy is None:
+            return self._mla_backend
+        return policy(self._mla_backend, meta, num_gen_tokens)
 
     @staticmethod
     def _compute_window_left(
@@ -899,6 +1091,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
+        output = fwd.output
+        fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         (
             q_processed,
             kv_pool,
@@ -948,7 +1142,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale_static,  # bmm1_scale
             1.0,  # bmm2_scale
             attention_chunk_size,  # attention_chunk_size
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             meta.use_paged_context_fmha,  # paged_context_fmha
             attn.is_mla_enable,  # is_mla_enable
             self._multi_processor_count,  # multi_processor_count
@@ -962,7 +1156,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or params.fp8_context_fmha:
+        if has_fp4_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
@@ -970,9 +1164,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(params.num_tokens, attn.num_heads, attn.head_dim)
             )
         ctx_bmm1_scale = bmm1_scale_static
-        if params.fp8_context_fmha and bmm1_scale is not None:
+        if fp8_context_fmha and bmm1_scale is not None:
             ctx_bmm1_scale = bmm1_scale.narrow(0, 0, 1)
-        ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        ctx_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
         causal = (
             False
             if params.is_cross
@@ -1038,7 +1232,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             rope_params.max_positions,  # rotary_embedding_max_positions
             attn.position_embedding_type,  # position_embedding_type
             bmm1_scale_static,  # bmm1_scale
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             meta.use_paged_context_fmha,  # paged_context_fmha
             attn.is_mla_enable,  # is_mla_enable
             attention_chunk_size,  # attention_chunk_size
@@ -1055,6 +1249,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
+        output = fwd.output
+        fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.num_requests * meta.beam_width
         (
             q_processed,
@@ -1105,7 +1301,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.position_embedding_type,  # position_embedding_type
             bmm1_scale_static,  # bmm1_scale
             1.0,  # bmm2_scale
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             attn.predicted_tokens_per_seq,  # predicted_tokens_per_seq
             attention_chunk_size,  # attention_chunk_size
             self._multi_processor_count,  # multi_processor_count
@@ -1122,7 +1318,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or params.fp8_context_fmha:
+        if has_fp4_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
@@ -1130,9 +1326,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(params.num_tokens, attn.num_heads, attn.head_dim)
             )
         gen_bmm1_scale = (
-            bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
-        gen_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
@@ -1170,6 +1366,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
+        # ``params.num_tokens`` is the generation-token count here: phased.py
+        # dispatches MLA generation with the generation slice only.
+        effective_mla_backend = self._get_effective_mla_backend(meta, params.num_tokens)
         if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
             raise NotImplementedError(
                 "Sliding-window attention is not supported by MLA decode path."
@@ -1239,7 +1438,52 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             )
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
-        workspace_buffer = params.workspace.view(-1, 4)
+        if effective_mla_backend == "cute-dsl":
+            pages_per_superblock = 128 // params.tokens_per_block
+            padded_num_pages = (
+                math.ceil(block_tables.size(-1) / pages_per_superblock) * pages_per_superblock
+            )
+            # Every MLA layer of one forward step shares this metadata, its
+            # workspace, and (for a single paged pool) identical block tables
+            # and sequence lengths — so the staged copies are byte-identical
+            # across layers. Stage once per step: the first generation-only
+            # call copies, subsequent layers with a matching key skip the 3
+            # copy kernels. ``prepare()`` / ``update_for_spec_dec`` reset
+            # the key each step so eager forwards always re-stage; under CUDA
+            # graphs the first layer's captured copies replay once per step.
+            # The capture flag is part of the key: CUDA-graph capture is
+            # preceded by warmup forwards on the same metadata without an
+            # intervening prepare(), and the capture pass MUST re-record the
+            # staging copies (a skip would freeze stale page tables into the
+            # graph).
+            staging_key = _CuteDslMlaStagingKey(
+                is_capturing=torch.cuda.is_current_stream_capturing(),
+                workspace_ptr=params.workspace.data_ptr(),
+                block_tables_ptr=block_tables.data_ptr(),
+                block_tables_shape=tuple(block_tables.shape),
+                sequence_lengths_ptr=params.sequence_lengths.data_ptr(),
+                sequence_lengths_offset=params.seq_offset,
+                batch_beam=batch_beam,
+                padded_num_pages=padded_num_pages,
+            )
+            skip_staging_copy = (
+                meta.num_contexts == 0
+                and getattr(meta, "_cute_dsl_mla_staging_key", None) == staging_key
+            )
+            workspace_buffer, block_tables, sequence_lengths = _prepare_cute_dsl_mla_buffers(
+                params.workspace,
+                block_tables,
+                params.sequence_lengths,
+                padded_num_pages,
+                skip_copy=skip_staging_copy,
+            )
+            if meta.num_contexts == 0:
+                meta._cute_dsl_mla_staging_key = staging_key
+            uses_shared_paged_kv_idx = True
+        else:
+            sequence_lengths = params.sequence_lengths
+            workspace_buffer = params.workspace.view(-1, 4)
+            uses_shared_paged_kv_idx = self.USE_SHARED_PAGED_KV_IDX
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
@@ -1249,7 +1493,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_lora_rank,  # kv_lora_rank
             qk_rope_head_dim,  # qk_rope_head_dim
             block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
+            sequence_lengths,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
             params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
@@ -1258,8 +1502,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.attention_sinks,  # sinks
             None,  # skip_softmax_threshold_scale_factor
             self._enable_pdl,  # enable_pdl
-            "trtllm-gen",  # backend
-            True,  # is_var_seq
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            backend=effective_mla_backend,
+            is_var_seq=True,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cute_dsl_impl="monolithic",
+            # flashinfer rejects the counter buffer unless the trtllm-gen
+            # runner is selected; the cute-dsl MLA path must pass None.
+            multi_ctas_kv_counter_buffer=(
+                self._get_multi_ctas_kv_counter_buffer()
+                if effective_mla_backend != "cute-dsl"
+                else None
+            ),
         )

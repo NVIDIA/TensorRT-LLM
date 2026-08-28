@@ -46,6 +46,8 @@ class SparseRuntimeParams:
     sparse_kv_indices: Optional[torch.Tensor] = None
     sparse_kv_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices: Optional[torch.Tensor] = None
+    # Per-query offsets, or backend-specific secondary sparse indices
+    # (DeepSeek-V4 fp8_ds_mla compressed-pool indices).
     sparse_attn_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices_block_size: int = 0
     sparse_attn_kv_lens: Optional[torch.Tensor] = None

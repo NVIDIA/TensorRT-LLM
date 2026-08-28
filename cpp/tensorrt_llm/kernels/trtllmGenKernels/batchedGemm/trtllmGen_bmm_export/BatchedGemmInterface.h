@@ -958,14 +958,9 @@ public:
         auto options = getOptionsFromConfigAndData(config, data);
 
         // Check options without modifications.
-        //
-        // NOTE(TRT-LLM local fix over producer output a2ad0544-dirty): the generator
-        // inserted the `worldSize` parameter into checkAndUpdateBatchedGemmOptions
-        // without updating this call, so the literal `false` bound positionally to
-        // `worldSize` (=0) and `updateOptions` silently took its default `true`.
-        // Pass both arguments explicitly. Report upstream before the next re-export.
         return checkAndUpdateBatchedGemmOptions(options, config.mSm,
-            /* worldSize */ 1, /* updateOptions */ false);
+            /* worldSize */ 1,
+            /* updateOptions */ false);
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////////

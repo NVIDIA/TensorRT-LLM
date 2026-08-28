@@ -22,7 +22,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
                                                is_in_breakable_cuda_graph)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -1052,16 +1052,16 @@ class Attention(nn.Module):
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
 
-        qkv = self.qkv_proj(hidden_states)
-
         if bool(lora_params):
-            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
-                                              self.layer_idx)
-            qkv = add_lora_result(qkv, qkv_lora)
-
-            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
-                                           self.layer_idx)
-            qkv = add_lora_result(qkv, qkv_lora)
+            qkv = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            qkv = self.qkv_proj(hidden_states)
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).

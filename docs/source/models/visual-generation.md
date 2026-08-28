@@ -47,6 +47,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
+| `zai-org/GLM-Image` | Text-to-Image |
 
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
@@ -67,6 +68,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -105,11 +107,16 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/images/generations` | POST | Synchronous image generation |
 | `/v1/images/edits` | POST | Image editing |
 | `/v1/videos` | POST | Asynchronous video generation |
-| `/v1/videos/generations` | POST | Synchronous video generation |
+| `/v1/videos/sync` | POST | Synchronous video generation |
+| `/v1/videos/generations` | POST | Deprecated alias of `/v1/videos/sync` (kept for back-compat) |
 | `/v1/videos/{id}` | GET | Video status / metadata |
 | `/v1/videos/{id}/content` | GET | Download generated video |
 | `/v1/videos/{id}` | DELETE | Delete generated video |
 | `/v1/videos` | GET | List all videos |
+
+The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
+
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
 ## Optimizations
 
@@ -131,6 +138,34 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+### Runtime LoRA
+
+VisualGen can preload a local LoRA adapter at startup and fuse its deltas into transformer weights before warmup, CUDA graph capture, and cache acceleration setup. Configure this through `VisualGenArgs.runtime_lora_config` in Python or YAML:
+
+```yaml
+runtime_lora_config:
+  path: /path/to/adapter-or-safetensors
+  target_components:
+    - transformer
+```
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import RuntimeLoRAConfig
+
+args = VisualGenArgs(
+    model="/path/to/model",
+    runtime_lora_config=RuntimeLoRAConfig(
+        path="/path/to/adapter-or-safetensors",
+        target_components=["transformer"],
+    ),
+)
+```
+
+The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
+
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
 
 ### Quantized Attention
 

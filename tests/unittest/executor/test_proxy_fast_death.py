@@ -56,6 +56,8 @@ def _bare_proxy():
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
     proxy._multi_frontend_ipc_dir = None
+    # Borrowed-session default; ownership-sensitive tests override it.
+    proxy._owns_mpi_session = False
     return proxy
 
 
@@ -739,3 +741,238 @@ def test_pool_session_shutdown_never_blocks_after_release():
     session.shutdown()  # owner asks for the default blocking shutdown
 
     pool.shutdown.assert_called_once_with(wait=False)
+
+
+# --- Ordered teardown on initialization failure (_fail_initialization) ---
+# A rank that dies during init leaves its peers wedged in the init collective
+# still holding their weights, so the init wait loop must abort the owned
+# world strictly BEFORE marking the engine dead: release_exit_joins() (via
+# _mark_engine_dead) marks the pool dead, which forces shutdown_abort()'s
+# blocking shutdown() non-blocking and defangs its MPI_Abort escalation.
+
+
+def _proxy_awaiting_worker_init(
+    owns_session: bool, future_exception=None, ready_status=None, future_cancelled=False
+):
+    """Proxy parked in _start_executor_workers' init-status wait loop.
+
+    Seeds only what that path touches: a status queue, one worker future,
+    the process monitor, and the session. The spawn itself is stubbed --
+    the contract under test is what the wait loop does on each
+    initialization-failure path. By default the future is already finished
+    successfully (a silent non-leader death) and the status queue never
+    reports ready; ``future_exception`` makes the worker die raising
+    instead, ``future_cancelled`` makes the future cancelled, and
+    ``ready_status`` makes the status queue deliver that tuple (a pending
+    future) to exercise the non-ready path.
+    """
+    proxy = _bare_proxy()
+    proxy._error_queue = _queue.Queue()
+    proxy._fatal_error = None
+    proxy._owns_mpi_session = owns_session
+    proxy.worker_cls = object
+    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
+    # time is live: keep it out of pre_shutdown(), whose attributes (the
+    # worker-process monitor teardown, the request queue) this fixture does
+    # not seed.
+    proxy.doing_shutdown = True
+
+    worker_future = _Future()
+    if ready_status is None:
+        if future_cancelled:
+            assert worker_future.cancel()
+        elif future_exception is not None:
+            worker_future.set_exception(future_exception)
+        else:
+            worker_future.set_result(None)
+
+    proxy.mpi_session = _Mock()
+    proxy.mpi_session.submit.return_value = [worker_future]
+    proxy._worker_process_monitor = _Mock()
+    proxy._worker_process_monitor.find_dead_worker.return_value = None
+
+    status_queue = _Mock()
+    if ready_status is None:
+        status_queue.poll.return_value = False  # worker never signals ready
+    else:
+        status_queue.poll.return_value = True
+        status_queue.get.return_value = ready_status
+    proxy.worker_init_status_queue = status_queue
+    return proxy
+
+
+def test_worker_death_during_init_aborts_the_wedged_world():
+    """A rank dying during init must not leave its peers wedged.
+
+    A non-leader rank that fails setup returns without notifying anyone, so
+    the survivors stay blocked in the init collective still holding their
+    share of the weights. Raising alone leaks them until job end and makes
+    the next blocking shutdown() hang instead of reporting the failure.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    # The world is recorded dead and forcibly torn down, not merely abandoned.
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    # Exit joins are released, so a later join cannot block on the dead pool.
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+    # Pending work fails fast rather than waiting on a gone producer.
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_worker_death_during_init_does_not_abort_borrowed_session():
+    """An externally owned session is marked dead but never torn down.
+
+    Its owner (the LLM API, or the test session-reuse pool) tears it down;
+    aborting it here would kill a session this proxy did not create.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=False)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    # The non-destructive part still has to happen for the borrowed session.
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_worker_death_during_init_aborts_before_marking_dead():
+    """The abort must precede the engine-dead bookkeeping.
+
+    shutdown_abort() escalates to MPI_Abort only when its own blocking
+    shutdown() overruns the grace period, but release_exit_joins() (reached
+    via _mark_engine_dead) marks the pool dead, which forces that shutdown()
+    non-blocking. Marking first would therefore silently defang the abort and
+    leave wedged ranks holding their weights.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    # Mock records child calls in order, so read the ordering off the session.
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+def test_worker_death_during_init_marks_dead_even_if_abort_raises():
+    """A failing abort must not skip the engine-dead bookkeeping.
+
+    If shutdown_abort() itself raises, _mark_engine_dead() (pending-result
+    broadcast + exit-join release) must still run, and the original
+    initialization error must be the one raised, not the teardown failure.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    proxy.mpi_session.shutdown_abort.side_effect = RuntimeError("abort blew up")
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_worker_exception_death_during_init_aborts_before_marking_dead():
+    """A rank dying RAISING during init must keep the abort-before-mark order.
+
+    add_done_callback() runs its callback synchronously when the future has
+    already completed, so registering the fast-death callback before the init
+    loop would let _handle_worker_death -> _mark_engine_dead ->
+    release_exit_joins() mark the pool dead ahead of the loop's abort,
+    defanging the MPI_Abort escalation. Registration is therefore deferred
+    until the world reported ready; this pins the ordering for the
+    exceptional-future death mode the silent-death test cannot see.
+    """
+    boom = RuntimeError("rank raised during init")
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_exception=boom)
+
+    with pytest.raises(RuntimeError, match="died during initialization") as excinfo:
+        proxy._start_executor_workers({})
+
+    # The worker's own exception is preserved as the cause.
+    assert excinfo.value.__cause__ is boom
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+def test_worker_exception_death_during_init_does_not_abort_borrowed_session():
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=False, future_exception=RuntimeError("rank raised during init")
+    )
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_cancelled_worker_future_during_init_is_treated_as_death():
+    """A cancelled worker future must fail init through the ordered teardown.
+
+    done() is True for a cancelled future and exception() then raises
+    CancelledError, so returning it from detection would escape the init
+    wait loop through a side entrance without the abort-before-mark
+    teardown; skipping the future instead would leave detection blind while
+    the ready wait loop spins forever. A cancelled worker_main future means
+    that rank can never come up, so it is a death like any other
+    (mirroring _check_mpi_futures on the runtime path).
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_cancelled=True)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+def test_non_ready_status_during_init_aborts_then_marks_dead():
+    """The non-ready status path must run the same ordered teardown.
+
+    Before the shared _fail_initialization helper it aborted but never marked
+    the engine dead, so pending-result and exit-join cleanup was inconsistent
+    with the worker-death path.
+    """
+    err = ValueError("worker init failed")
+    proxy = _proxy_awaiting_worker_init(owns_session=True, ready_status=(err, "trace"))
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="returned error") as excinfo:
+        proxy._start_executor_workers({})
+
+    assert excinfo.value.__cause__ is err
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+    # Pending work fails fast on this path too.
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_non_ready_status_during_init_does_not_abort_borrowed_session():
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=False, ready_status=(ValueError("worker init failed"), "trace")
+    )
+
+    with pytest.raises(RuntimeError, match="returned error"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()

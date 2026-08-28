@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketVanillaAttentionMetadata,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, RocketSparseAttentionConfig
@@ -747,6 +748,23 @@ def test_rocketkv_kt_cache_sized_by_kt_dtype_not_kv_dtype():
         assert kv_cache_manager.get_cache_bytes_per_token() == main_bytes + kt_pool_bytes // tokens
     finally:
         kv_cache_manager.shutdown()
+
+
+def test_rocket_add_dummy_requests_forwards_capture_sampling_params(mocker):
+    """RocketKVCacheManager overrides add_dummy_requests with an explicit
+    signature that must stay in sync with KVCacheManager.add_dummy_requests's
+    capture_sampling_params kwarg, or CUDA graph warmup breaks with a
+    TypeError for sparse-attention models.
+    """
+    mgr = object.__new__(RocketKVCacheManager)
+    base_add_dummy_requests = mocker.patch.object(
+        KVCacheManager, "add_dummy_requests", return_value=[]
+    )
+    sampling_params = SamplingParams(temperature=0.9, top_p=0.95)
+
+    mgr.add_dummy_requests([123], capture_sampling_params=sampling_params)
+
+    assert base_add_dummy_requests.call_args.kwargs["capture_sampling_params"] is sampling_params
 
 
 if __name__ == "__main__":

@@ -151,6 +151,17 @@ BATCH_SPECS = {
 LONG_PROMPT_BATCHES = {"large_mixed_deepseek_v4"}
 KV_CACHE_DTYPES = ["auto", "fp8"]
 SPARSE_ATTN_ALGOS = ["dsa", "deepseek_v4"]
+if get_sm_version() == 90:
+    DSV4_KV_CACHE_DTYPES = ["fp8_ds_mla"]
+else:
+    DSV4_KV_CACHE_DTYPES = KV_CACHE_DTYPES
+
+
+def _kv_cache_dtypes_for_algo(sparse_attn_algo: str) -> list[str]:
+    if sparse_attn_algo == "deepseek_v4":
+        return DSV4_KV_CACHE_DTYPES
+    return KV_CACHE_DTYPES
+
 
 UNIFIED_TEST_PARAMS = [
     pytest.param(batch_name,
@@ -158,14 +169,15 @@ UNIFIED_TEST_PARAMS = [
                  sparse_attn_algo,
                  id=f"{sparse_attn_algo}-{kv_cache_dtype}-{batch_name}")
     for batch_name in BATCH_SPECS if batch_name not in LONG_PROMPT_BATCHES
-    for kv_cache_dtype in KV_CACHE_DTYPES
     for sparse_attn_algo in SPARSE_ATTN_ALGOS
+    for kv_cache_dtype in _kv_cache_dtypes_for_algo(sparse_attn_algo)
 ]
 UNIFIED_TEST_PARAMS.append(
-    pytest.param("large_mixed_deepseek_v4",
-                 "auto",
-                 "deepseek_v4",
-                 id="deepseek_v4-auto-large_mixed_deepseek_v4"))
+    pytest.param(
+        "large_mixed_deepseek_v4",
+        DSV4_KV_CACHE_DTYPES[0],
+        "deepseek_v4",
+        id=f"deepseek_v4-{DSV4_KV_CACHE_DTYPES[0]}-large_mixed_deepseek_v4"))
 
 
 def apply_rotary_emb(x: torch.Tensor,
@@ -1652,11 +1664,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     print(
         f"\n{'=' * 80}\nTesting: {batch_name}, sparse_attn_algo: {sparse_attn_algo}, "
         f"kv_cache_dtype: {kv_cache_dtype}\n{'=' * 80}")
-    if sparse_attn_algo == "deepseek_v4" and get_sm_version() < 100:
-        pytest.skip(
-            "DeepSeek-V4 sparse MLA unittest is not supported on pre-Blackwell architectures"
-        )
-    if kv_cache_dtype == "fp8" and get_sm_version() < 100:
+    if (sparse_attn_algo != "deepseek_v4" and kv_cache_dtype == "fp8"
+            and get_sm_version() < 100):
         pytest.skip(
             "FP8 kv cache is not supported on pre-Blackwell architectures")
 
@@ -1846,14 +1855,14 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
 
     if kv_cache_dtype == "auto":
         cache_dtype = dtype
-    elif kv_cache_dtype == "fp8":
+    elif kv_cache_dtype in ("fp8", "fp8_ds_mla"):
         cache_dtype = torch.float8_e4m3fn
     else:
         cache_dtype = dtype
 
     # Configure quantization for FP8 KV cache (per-tensor FP8, no blockwise scales)
     quant_config = QuantConfig()
-    if kv_cache_dtype == "fp8":
+    if kv_cache_dtype in ("fp8", "fp8_ds_mla"):
         quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
     model_config = ModelConfig(
@@ -1862,6 +1871,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         pretrained_config=SimpleNamespace(rms_norm_eps=1e-6, ),
         quant_config=quant_config,
     )
+    model_config.extra_attrs["kv_cache_dtype"] = kv_cache_dtype
 
     # Setup positional embedding params
     pos_embd_params = PositionalEmbeddingParams(
@@ -1972,7 +1982,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             "max_num_tokens": max_tokens,
         }
     kv_cache_manager = kv_cache_manager_cls(
-        KvCacheConfig(max_tokens=max_tokens,
+        KvCacheConfig(dtype=kv_cache_dtype,
+                      max_tokens=max_tokens,
                       enable_block_reuse=False,
                       event_buffer_max_size=0),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -2401,7 +2412,7 @@ if __name__ == "__main__":
                                     sparse_attn_algo="dsa")
 
     test_forward_sparse_mla_unified(batch_name="large_mixed_deepseek_v4",
-                                    kv_cache_dtype="auto",
+                                    kv_cache_dtype=DSV4_KV_CACHE_DTYPES[0],
                                     sparse_attn_algo="deepseek_v4")
 
     print("All tests passed!")

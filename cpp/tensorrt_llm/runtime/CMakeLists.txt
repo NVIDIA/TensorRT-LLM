@@ -20,6 +20,7 @@ set(SRCS
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
+    locality_domain/locality_domain_utils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
     decodingLayerWorkspace.cpp

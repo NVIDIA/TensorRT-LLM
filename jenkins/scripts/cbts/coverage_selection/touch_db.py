@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Read-only accessor for the merged CBTS touch DB (`cbts_touchmap.sqlite`).
+"""Read-only accessor for a compact merged CBTS touch DB (`cbts_touchmap.sqlite`).
 
 Implements the TOUCH_DB_CONTRACT.md queries. Two real-data details:
   - the `test` column is `<stage>/<nodeid>` (stage-prefixed);
@@ -48,6 +48,14 @@ _SERVING_PATH_MARKERS: tuple[str, ...] = ("disaggregated/",)
 # Stage-name markers whose GPU worker is uninstrumented, so capture is partial.
 _UNTRUSTED_STAGE_MARKERS: tuple[str, ...] = ("-Ray-",)
 _MIN_FUNCS = 30
+_SCHEMA_VERSION = "3"
+_STORAGE_SCHEMA = "compact-v1"
+
+_QUALIFIED_TEST_SQL = (
+    "CASE WHEN case_stage.test='' THEN '' "
+    "WHEN stage.name='' THEN case_stage.test "
+    "ELSE stage.name || '/' || case_stage.test END"
+)
 
 
 def canon(path: str) -> str:
@@ -99,13 +107,50 @@ class TouchDB:
 
     @classmethod
     def open(cls, sqlite_path: Path | str) -> "TouchDB":
-        """Open the DB read-only (`mode=ro`) and verify the `touch` schema."""
-        uri = f"file:{Path(sqlite_path).resolve()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(touch)")}
-        if not {"test", "file", "qualname"} <= cols:
+        """Open the DB read-only (`mode=ro`) and verify the compact schema."""
+        path = Path(sqlite_path).resolve()
+        uri = f"file:{path}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error as exc:
+            raise ValueError(f"{path}: unable to open compact touch database: {exc}") from exc
+
+        try:
+            touch_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch)")}
+            row_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch_rows)")}
+            test_meta_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_case_meta)")}
+            metadata = dict(conn.execute("SELECT key, value FROM meta"))
+        except sqlite3.Error as exc:
             conn.close()
-            raise ValueError(f"unexpected touch schema, columns={sorted(cols)}")
+            raise ValueError(f"{path}: unable to read compact touch database: {exc}") from exc
+        if (
+            not {"case_stage_id", "symbol_id"} <= touch_cols
+            or not {
+                "test",
+                "file",
+                "qualname",
+                "stage",
+            }
+            <= row_cols
+            or not {
+                "test",
+                "stage",
+                "outcome",
+                "expected_workers",
+                "saved_procs",
+            }
+            <= test_meta_cols
+            or metadata.get("schema_version") != _SCHEMA_VERSION
+            or metadata.get("storage_schema") != _STORAGE_SCHEMA
+        ):
+            conn.close()
+            raise ValueError(
+                "unexpected compact touch schema, "
+                f"touch_columns={sorted(touch_cols)}, row_columns={sorted(row_cols)}, "
+                f"test_meta_columns={sorted(test_meta_cols)}, "
+                f"schema_version={metadata.get('schema_version')}, "
+                f"storage_schema={metadata.get('storage_schema')}"
+            )
         return cls(conn)
 
     def close(self) -> None:
@@ -140,7 +185,14 @@ class TouchDB:
         return {
             row[0]
             for row in self._conn.execute(
-                "SELECT DISTINCT test FROM touch WHERE file=? AND test!=''", (file,)
+                f"SELECT DISTINCT {_QUALIFIED_TEST_SQL} "
+                "FROM file "
+                "JOIN symbol ON symbol.file_id=file.id "
+                "JOIN touch ON touch.symbol_id=symbol.id "
+                "JOIN case_stage ON case_stage.id=touch.case_stage_id "
+                "JOIN stage ON stage.id=case_stage.stage_id "
+                "WHERE file.path=? AND case_stage.test!=''",
+                (file,),
             )
         }
 
@@ -149,7 +201,13 @@ class TouchDB:
         return {
             row[0]
             for row in self._conn.execute(
-                "SELECT DISTINCT test FROM touch WHERE file=? AND qualname=? AND test!=''",
+                f"SELECT DISTINCT {_QUALIFIED_TEST_SQL} "
+                "FROM file "
+                "JOIN symbol ON symbol.file_id=file.id "
+                "JOIN touch ON touch.symbol_id=symbol.id "
+                "JOIN case_stage ON case_stage.id=touch.case_stage_id "
+                "JOIN stage ON stage.id=case_stage.stage_id "
+                "WHERE file.path=? AND symbol.qualname=? AND case_stage.test!=''",
                 (file, qualname),
             )
         }
@@ -157,7 +215,13 @@ class TouchDB:
     def file_has_touch_rows(self, file: str) -> bool:
         """True iff any instrumented test entered a function in `file`."""
         row = self._conn.execute(
-            "SELECT 1 FROM touch WHERE file=? AND test!='' LIMIT 1", (file,)
+            "SELECT 1 "
+            "FROM file "
+            "JOIN symbol ON symbol.file_id=file.id "
+            "JOIN touch ON touch.symbol_id=symbol.id "
+            "JOIN case_stage ON case_stage.id=touch.case_stage_id "
+            "WHERE file.path=? AND case_stage.test!='' LIMIT 1",
+            (file,),
         ).fetchone()
         return row is not None
 
@@ -166,7 +230,13 @@ class TouchDB:
     def known_tests(self) -> set[str]:
         """Every stage-prefixed test with coverage data."""
         return {
-            row[0] for row in self._conn.execute("SELECT DISTINCT test FROM touch WHERE test!=''")
+            row[0]
+            for row in self._conn.execute(
+                f"SELECT DISTINCT {_QUALIFIED_TEST_SQL} "
+                "FROM touch JOIN case_stage ON case_stage.id=touch.case_stage_id "
+                "JOIN stage ON stage.id=case_stage.stage_id "
+                "WHERE case_stage.test!=''"
+            )
         }
 
     def per_test_footprint(self) -> dict[str, int]:
@@ -174,7 +244,10 @@ class TouchDB:
         return {
             row[0]: row[1]
             for row in self._conn.execute(
-                "SELECT test, COUNT(*) FROM touch WHERE test!='' GROUP BY test"
+                f"SELECT {_QUALIFIED_TEST_SQL}, COUNT(*) "
+                "FROM touch JOIN case_stage ON case_stage.id=touch.case_stage_id "
+                "JOIN stage ON stage.id=case_stage.stage_id "
+                "WHERE case_stage.test!='' GROUP BY case_stage.id"
             )
         }
 
@@ -204,20 +277,32 @@ class TouchDB:
 
     def files_touched_by(self, test: str) -> list[tuple[str, str]]:
         """`(file, qualname)` rows for a stage-prefixed `test`."""
+        stage, nodeid = split_stage(test)
+        predicate = "case_stage.test=?"
+        parameters: tuple[str, ...] = (nodeid,)
+        if stage:
+            predicate += " AND stage.name=?"
+            parameters += (stage,)
         return [
             (row[0], row[1])
-            for row in self._conn.execute("SELECT file, qualname FROM touch WHERE test=?", (test,))
+            for row in self._conn.execute(
+                "SELECT file.path, symbol.qualname "
+                "FROM case_stage "
+                "JOIN stage ON stage.id=case_stage.stage_id "
+                "JOIN touch ON touch.case_stage_id=case_stage.id "
+                "JOIN symbol ON symbol.id=touch.symbol_id "
+                "JOIN file ON file.id=symbol.file_id "
+                f"WHERE {predicate}",
+                parameters,
+            )
         ]
 
     def incomplete_capture_tests(self) -> set[str]:
-        """Tests `test_meta` reports as not passed or short of the spawned process count."""
-        try:
-            rows = self._conn.execute(
-                "SELECT test FROM test_meta WHERE test != '' AND "
-                "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
-            )
-        except sqlite3.OperationalError:
-            return set()
+        """Tests whose compact completeness view reports a failed or missing capture."""
+        rows = self._conn.execute(
+            "SELECT test FROM test_case_meta WHERE test != '' AND "
+            "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
+        )
         # Tests that recorded nothing are not selection candidates.
         return {row[0] for row in rows} & self.known_tests()
 
@@ -237,7 +322,13 @@ class TouchDB:
             drove_execution |= {
                 row[0]
                 for row in self._conn.execute(
-                    "SELECT DISTINCT test FROM touch WHERE file=? AND qualname LIKE ? AND test!=''",
+                    f"SELECT DISTINCT {_QUALIFIED_TEST_SQL} "
+                    "FROM file "
+                    "JOIN symbol ON symbol.file_id=file.id "
+                    "JOIN touch ON touch.symbol_id=symbol.id "
+                    "JOIN case_stage ON case_stage.id=touch.case_stage_id "
+                    "JOIN stage ON stage.id=case_stage.stage_id "
+                    "WHERE file.path=? AND symbol.qualname LIKE ? AND case_stage.test!=''",
                     (file, f"%{qual_substr}%"),
                 )
             }
@@ -251,7 +342,11 @@ class TouchDB:
         tiny = {
             row[0]
             for row in self._conn.execute(
-                "SELECT test FROM touch WHERE test!='' GROUP BY test HAVING COUNT(*) < ?",
+                f"SELECT {_QUALIFIED_TEST_SQL} "
+                "FROM touch JOIN case_stage ON case_stage.id=touch.case_stage_id "
+                "JOIN stage ON stage.id=case_stage.stage_id "
+                "WHERE case_stage.test!='' "
+                "GROUP BY case_stage.id HAVING COUNT(*) < ?",
                 (min_funcs,),
             )
         }

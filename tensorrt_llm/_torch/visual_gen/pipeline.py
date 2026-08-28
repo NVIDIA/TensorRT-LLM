@@ -58,6 +58,15 @@ class ExtraParamSchema(StrictBaseModel):
         "values. Must be a module-level function (specs are pickled to the "
         "coordinator in the READY handshake).",
     )
+    requires_tensor_output: bool = Field(
+        default=False,
+        description="Setting this parameter makes the request produce a result "
+        "the media encoders cannot represent (a non-image/video modality), so "
+        "the response must be a tensor payload. Serve resolves 'auto' to a "
+        "tensor format and rejects an explicit encoder format. Declared here "
+        "rather than hard-coded in the routes so the serving layer needs no "
+        "per-model knowledge.",
+    )
 
 
 if TYPE_CHECKING:
@@ -91,6 +100,7 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+        self._runtime_lora_applications: List[Any] = []
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
@@ -408,6 +418,96 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+
+    def _setup_runtime_lora(self) -> None:
+        runtime_lora = getattr(self.pipeline_config, "runtime_lora", None)
+        if runtime_lora is None or self._runtime_lora_applications:
+            return
+
+        from .runtime_lora import (
+            _commit_runtime_lora_plan,
+            _log_runtime_lora_application,
+            _prepare_runtime_lora,
+        )
+
+        transformer_component_names = list(self.transformer_components)
+        transformer_components = set(transformer_component_names)
+        if not runtime_lora.target_components and len(transformer_component_names) > 1:
+            raise ValueError(
+                "runtime_lora_config.target_components must be set when a pipeline "
+                f"has multiple transformer components: {transformer_component_names}. "
+                "A single runtime_lora_config.path cannot be safely applied by default "
+                "to every component."
+            )
+        component_names = runtime_lora.target_components or transformer_component_names
+        if len(component_names) != len(set(component_names)):
+            raise ValueError(
+                f"runtime_lora_config.target_components contains duplicates: {component_names}"
+            )
+        total_applied = 0
+        plans = []
+        require_each_component_match = runtime_lora.strict and bool(runtime_lora.target_components)
+        for component_name in component_names:
+            if component_name not in transformer_components:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        "runtime_lora_config target component "
+                        f"'{component_name}' is not in transformer_components "
+                        f"{sorted(transformer_components)}"
+                    )
+                logger.warning(
+                    f"Runtime LoRA skipping non-transformer component '{component_name}'"
+                )
+                continue
+            component = getattr(self, component_name, None)
+            if component is None:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested missing component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping missing component '{component_name}'")
+                continue
+            if not isinstance(component, nn.Module):
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested non-module component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping non-module component '{component_name}'")
+                continue
+
+            component_prefixes = [f"{component_name}.", f"model.{component_name}."]
+            plan = _prepare_runtime_lora(
+                component,
+                runtime_lora,
+                default_strip_prefixes=component_prefixes,
+                raise_on_no_matches=False,
+            )
+            application = plan.application
+            if require_each_component_match and not application.applied_modules:
+                raise ValueError(
+                    f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                    f"selected component '{component_name}'."
+                )
+            plans.append((component_name, plan))
+            total_applied += len(application.applied_modules)
+
+        if total_applied == 0 and runtime_lora.strict:
+            raise ValueError(
+                f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                f"components {component_names}."
+            )
+
+        applications = []
+        for component_name, plan in plans:
+            application = _commit_runtime_lora_plan(plan)
+            applications.append(application)
+            _log_runtime_lora_application(application)
+            if application.applied_modules:
+                logger.info(
+                    f"Runtime LoRA fused into {component_name}: {list(application.applied_modules)}"
+                )
+
+        self._runtime_lora_applications = applications
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
         """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
@@ -1095,8 +1195,11 @@ class BasePipeline(nn.Module):
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
-            post_step_fn: Optional callable applied after each scheduler step,
-                         invoked as ``post_step_fn(latents) -> latents``.
+            post_step_fn: Optional callable applied after each scheduler step.
+                         It is invoked as ``post_step_fn(latents,
+                         extra_stream_latents) -> (latents, extra_stream_latents)``,
+                         where ``extra_stream_latents`` is the dict of parallel streams
+                         from ``extra_streams`` (e.g. ``{"action": ...}``).
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
@@ -1206,7 +1309,7 @@ class BasePipeline(nn.Module):
             )
 
             if post_step_fn is not None:
-                latents = post_step_fn(latents)
+                latents, extra_stream_latents = post_step_fn(latents, extra_stream_latents)
 
             # Logging
             if self.rank == 0:

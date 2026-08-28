@@ -1,0 +1,69 @@
+# Example brief for the perf-analyze workflow. Copy this file to
+# `task.yaml`, fill in your paths and knobs, then run:
+#
+#     perf-analyze \
+#         --task path/to/your/task.yaml \
+#         --workspace workspace/perf-analyze/<model-name>
+#
+# Required: the two source paths below. The workflow refuses to start if
+# either is missing or does not point at an existing path.
+
+checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>
+trtllm_repo_path: /path/to/TensorRT-LLM
+# extra_llm_api_options: /path/to/extra_llm_api_options.yaml
+
+# Optional: the benchmark operating point(s) driven by
+# benchmark_serving.py.
+benchmark:
+  dataset_name: random       # random | sharegpt | hf | sonnet | burstgpt
+  random_input_len: 1024     # ISL
+  random_output_len: 128     # OSL
+  num_prompts: 200
+  concurrency: 64
+  # concurrency: [8, 32, 128]  # list => Pareto-curve mode: one benchmark run
+  #                            # per point (over one server launch), profiling
+  #                            # at the largest point, and the report gains a
+  #                            # measured Pareto curve (x = tok/s/user =
+  #                            # 1000/mean_tpot_ms, y = tok/s/gpu =
+  #                            # output_throughput/num_gpus)
+  # num_prompts: [32, 128, 512]  # curve mode only: per-point num_prompts,
+  #                            # paired index-by-index with the concurrency
+  #                            # list (each entry >= its point). Keeps
+  #                            # low-concurrency points cheap; a scalar
+  #                            # means the same count at every point.
+  # request_rate: inf        # requests/sec; "inf" sends all at once
+  # dataset_path: /path/to/ShareGPT.json   # for sharegpt / hf datasets
+
+# Optional: which profilers the Analyzer runs, and the steady-state
+# iteration window that gates them (TLLM_PROFILE_START_STOP for
+# nsys/torch; ncu arms on the same window via --profile-from-start off).
+# ncu is the bounded per-kernel deep dive on the top nsys kernels,
+# interpreted with the perf-nsight-compute-analysis skill.
+profile:
+  methods: [nsys, torch, ncu]
+  nsys_iter_range: "100-150"
+
+# Optional: include this section only when the server + benchmark must run
+# through Slurm (otherwise everything runs locally on the current node).
+# When present, both fields are required.
+# slurm-environment:
+#   slurm_partition: <partition>
+#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+
+# Optional: the analytical SOL-projection stage (benchmarker ->
+# projector -> analyzer -> reporter) runs **by default**, so this section
+# only has to be written to turn it off or to hand the skill a hint. The
+# projector follows the internal-perf-sol-analysis skill
+# (trtllm-agent-toolkit) for the speed-of-light ceiling. Every field is
+# optional: `enabled` gates the stage (default true) and `gpu` is the
+# part-name hint for the skill's peaks calculator when the automatic
+# mapping would guess wrong.
+# The skill is internal, so open-source builds of the toolkit strip it.
+# Without it the stage still completes: the projector falls back to the
+# perf-analysis skill, grounds the peaks from named sources instead of
+# the calculator, writes no peaks file, and the analyzer skips the
+# measured-vs-SOL correlation. Set `enabled: false` to skip the stage's
+# wall-clock outright in an environment that has no toolkit.
+# sol:
+#   enabled: false   # skip the projector entirely
+#   gpu: H100

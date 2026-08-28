@@ -60,14 +60,17 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     get_non_empty_aux_indices,
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+    MambaPolicy,
+    mamba_receiver_payload_bytes,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -105,7 +108,6 @@ class RecvReqInfo:
     # None means "end-of-range suffix" — sender derives it from len(blocks).
     dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
-    mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
 
@@ -121,7 +123,6 @@ class RecvReqInfo:
                 "unique_rid": self.unique_rid,
                 "dst_start_token": self.dst_start_token,
                 "aux_slot": self.aux_slot,
-                "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
             }
@@ -847,68 +848,72 @@ class Sender(SenderBase):
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
             if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
+
+            lg_info = extractor.page_table.layer_groups[self_lg]
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            tpb = extractor.page_table.tokens_per_block
-            token_range = task._slice.token_range
-            lg_info = extractor.page_table.layer_groups[self_lg]
-            window_size = getattr(lg_info, "sliding_window_size", None)
-
-            peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
-            dst_block_ids = Sender._trim_receiver_window_head(
-                src_block_ids,
-                dst_block_ids,
-                peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
-                beam_width=task._beam_width,
-            )
-
-            # Block lists are the suffix of [..., slice_end); cached prefix
-            # is implicit in their size. token_start = (total_blocks - n) * tpb.
-            slice_end = token_range.end if token_range is not None else 0
-            total_blocks = (slice_end + tpb - 1) // tpb
-            src_beam0_blocks = Sender._beam0_block_count(
-                src_block_ids, total_blocks, task._beam_width
-            )
-            dst_beam0_blocks = Sender._beam0_block_count(
-                dst_block_ids, total_blocks, task._beam_width
-            )
-            assert src_beam0_blocks <= total_blocks, (
-                f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
-                f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-            )
-            assert dst_beam0_blocks <= total_blocks, (
-                f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
-                f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-            )
-            src_start = (total_blocks - src_beam0_blocks) * tpb
-            dst_start = (total_blocks - dst_beam0_blocks) * tpb
-            if req_info.dst_start_token is not None:
-                dst_start = max(dst_start, req_info.dst_start_token)
-            if window_size is not None:
-                # SWA stale_end uses the request prompt_len (not slice_end —
-                # they differ for non-final slices). prompt_len must be plumbed
-                # via the session; falling back to slice_end is wrong on
-                # non-final slices.
-                assert task._prompt_len is not None, (
-                    "SWA layer requires session.prompt_len; "
-                    "set TxSession(prompt_len=request.prompt_len)."
+            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
+            if lg_info.kind == CacheKind.STATE:
+                if src_block_ids.size == 0 or dst_block_ids.size == 0:
+                    continue
+                if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
+                    continue
+                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
+                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
+            else:
+                tpb = extractor.page_table.tokens_per_block
+                token_range = task._slice.token_range
+                if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
+                    # Helix: the receiver owns global blocks [cp_rank::cp_size]
+                    # (same protocol as partition_context_for_helix). The strided
+                    # subset has exactly the receiver's block count, so the
+                    # suffix alignment below degenerates to identity; block
+                    # reuse is rejected under helix.
+                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
+                window_size = getattr(lg_info, "sliding_window_size", None)
+                peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
+                dst_block_ids = Sender._trim_receiver_window_head(
+                    src_block_ids,
+                    dst_block_ids,
+                    peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
+                    beam_width=task._beam_width,
                 )
-                stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                src_start = max(stale_end * tpb, src_start)
-                dst_start = max(stale_end * tpb, dst_start)
-            src_block_ids, dst_block_ids = Sender._align_kv_blocks(
-                src_block_ids,
-                dst_block_ids,
-                src_token_start=src_start,
-                dst_token_start=dst_start,
-                tokens_per_block=tpb,
-            )
+                slice_end = token_range.end if token_range is not None else 0
+                total_blocks = (slice_end + tpb - 1) // tpb
+                src_beam0 = Sender._beam0_block_count(src_block_ids, total_blocks, task._beam_width)
+                dst_beam0 = Sender._beam0_block_count(dst_block_ids, total_blocks, task._beam_width)
+                assert src_beam0 <= total_blocks, (
+                    f"src beam-0 block list ({src_beam0}) exceeds total slice "
+                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                )
+                assert dst_beam0 <= total_blocks, (
+                    f"dst beam-0 block list ({dst_beam0}) exceeds total slice "
+                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                )
+                src_start = (total_blocks - src_beam0) * tpb
+                dst_start = (total_blocks - dst_beam0) * tpb
+                if req_info.dst_start_token is not None:
+                    dst_start = max(dst_start, req_info.dst_start_token)
+                if window_size is not None:
+                    assert task._prompt_len is not None, (
+                        "SWA layer requires session.prompt_len; "
+                        "set TxSession(prompt_len=request.prompt_len)."
+                    )
+                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
+                    src_start = max(stale_end * tpb, src_start)
+                    dst_start = max(stale_end * tpb, dst_start)
+                src_block_ids, dst_block_ids = Sender._align_kv_blocks(
+                    src_block_ids,
+                    dst_block_ids,
+                    src_token_start=src_start,
+                    dst_token_start=dst_start,
+                    tokens_per_block=tpb,
+                )
+                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
+                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
 
-            src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
-            dst_region = peer_extractor.extract(
-                dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
-            )
+            # Map and collect fragments (same for all layer types)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
             region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
@@ -930,20 +935,6 @@ class Sender(SenderBase):
             src_frags = np.array([], dtype=np.int64)
             dst_frags = np.array([], dtype=np.int64)
             kv_sizes = np.array([], dtype=np.int64)
-
-        # handle mamba fragments
-        m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
-            self_page_table=extractor.page_table,
-            peer_page_table=peer_extractor.page_table,
-            src_slot=task._slice.mamba_state_index,
-            dst_slot=req_info.mamba_state_index,
-            self_ri=self._registrar.self_rank_info,
-            peer_ri=peer_ri,
-        )
-        if m_src:
-            src_frags = np.concatenate([src_frags, np.array(m_src, dtype=np.int64)])
-            dst_frags = np.concatenate([dst_frags, np.array(m_dst, dtype=np.int64)])
-            kv_sizes = np.concatenate([kv_sizes, np.array(m_sizes, dtype=np.int64)])
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1677,7 +1668,6 @@ class Receiver(ReceiverBase):
             unique_rid=task._unique_rid,
             dst_start_token=None,
             aux_slot=task._aux_slot,
-            mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
         )
 
@@ -1689,8 +1679,8 @@ class Receiver(ReceiverBase):
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
-            count in expected_transfers, so the live writers overflow their slots;
+          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
+            expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -1718,6 +1708,18 @@ class Receiver(ReceiverBase):
                         if pool_view.mapper_kind == MapperKind.REPLICATED:
                             return False
         return True
+
+    def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
+        """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
+        pt = self._registrar.self_extractor.page_table
+        if pt is None:
+            return None
+        for lg_idx, lg in enumerate(pt.layer_groups):
+            if lg.kind == CacheKind.STATE:
+                block_ids = req_info.block_ids_per_layer_groups[lg_idx]
+                if block_ids.size > 0:
+                    return int(block_ids[0])
+        return None
 
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
@@ -1779,28 +1781,31 @@ class Receiver(ReceiverBase):
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
+        # Helix writers contribute unequal shares (one KV owner, one state
+        # sender, the rest empty), so the fan-in equal split would overflow
+        # into neighboring reservations; use the per-fragment path.
+        cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None
+            and not cp_involved
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
                 self._registrar.self_extractor.page_table,
             )
         )
-        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks (the sender
-        # appends its MambaPolicy fragments in _build_kv_write_meta), so the bounce region must be
-        # sized for those bytes too or the write would overrun into the neighboring slot.
+        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
+        # so the bounce region must be sized for those bytes too.
         extra_bytes = 0
-        if receiver_req.mamba_state_index is not None:
+        mamba_dst_slot = self._get_mamba_slot(receiver_req)
+        if mamba_dst_slot is not None:
             if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the sender's recurrent-state payload
+                allow_bounce = False  # cannot size the recurrent-state payload
             else:
-                extra_bytes = MambaPolicy.payload_bytes(
+                extra_bytes = mamba_receiver_payload_bytes(
                     sender_page_table=peer_infos.page_table,
                     receiver_page_table=self._registrar.self_extractor.page_table,
-                    dst_slot=receiver_req.mamba_state_index,
-                    sender_ri=peer_infos,
-                    receiver_ri=self._registrar.self_rank_info,
+                    dst_slot=mamba_dst_slot,
                 )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes

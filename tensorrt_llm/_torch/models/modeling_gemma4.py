@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import copy
 import dataclasses
 import math
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
@@ -59,7 +60,11 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
+from .modeling_speculative import (
+    _SPECULATIVE_POSITION_HEADROOM,
+    SpecDecOneEngineForCausalLM,
+    _slice_spec_position_ids,
+)
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 if TYPE_CHECKING:
@@ -76,6 +81,17 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+def _gemma4_rope_max_positions(model_config: ModelConfig) -> int:
+    """Size RoPE for transient speculative positions beyond max_seq_len."""
+    max_positions = model_config.pretrained_config.max_position_embeddings
+    spec_config = model_config.spec_config
+    if spec_config is not None:
+        # Overlap can have one pending verification width, while the current target and shared,
+        # Q-only assistant consume the next one.
+        max_positions += 2 * spec_config.tokens_per_gen_step
+    return max_positions
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +242,7 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
-        rope_params.max_positions = config.max_position_embeddings
+        rope_params.max_positions = _gemma4_rope_max_positions(model_config)
         if is_sliding:
             # Sliding: default RoPE, theta=10K, full rotation
             rope_config = (
@@ -1323,11 +1339,10 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """Build context mask with causal + bidirectional for MM tokens.
 
         Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) are True for
-          all rows. SWA window enforcement is delegated to the kernel's
-          window_left clip. Bidirectional MM across the prefix/extend
-          boundary is NOT supported here; callers must ensure chunk
-          boundaries do not split a multimodal block.
+        - The first `prefix_len` columns (cached/paged history) apply the
+          sliding window using absolute token positions. Bidirectional MM
+          across the prefix/extend boundary is NOT supported here; callers
+          must ensure chunk boundaries do not split a multimodal block.
         - The last `extend_len` columns follow the original causal +
           (optional) sliding window + MM-bidirectional logic.
         """
@@ -1344,9 +1359,19 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
 
         if prefix_len > 0:
-            prefix_block = torch.ones(
-                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-            )
+            if (
+                effective_sliding_window is not None
+                and effective_sliding_window < prefix_len + extend_len
+            ):
+                query_pos = prefix_len + pos
+                prefix_pos = torch.arange(prefix_len, device=device)
+                prefix_block = (
+                    prefix_pos.unsqueeze(0) > query_pos.unsqueeze(1) - effective_sliding_window
+                )
+            else:
+                prefix_block = torch.ones(
+                    extend_len, prefix_len, dtype=causal_mask.dtype, device=device
+                )
             causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
 
         return causal_mask
@@ -1597,9 +1622,16 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
 
     def __init__(self, model_config: ModelConfig):
         assistant_config = model_config.pretrained_config
+        assistant_text_config = copy.deepcopy(assistant_config.text_config)
+        # The assistant is deliberately built without `spec_config` to avoid recursive speculative
+        # initialization. Carry only its fixed physical position headroom through the internal model
+        # attributes instead.
+        assistant_text_config.max_position_embeddings += model_config.extra_attrs.get(
+            _SPECULATIVE_POSITION_HEADROOM, 0
+        )
         text_model_config = dataclasses.replace(
             model_config,
-            pretrained_config=assistant_config.text_config,
+            pretrained_config=assistant_text_config,
             spec_config=None,
         )
         super().__init__(

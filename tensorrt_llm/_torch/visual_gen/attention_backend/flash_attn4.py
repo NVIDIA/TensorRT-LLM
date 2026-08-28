@@ -74,7 +74,8 @@ class FlashAttn4Attention(AttentionBackend):
         seqused_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
-        output, lse = _flash_attn_fwd(
+        # FA4's private forward API may append diagnostics that this backend does not consume.
+        output, lse, *_ = _flash_attn_fwd(
             q,
             k,
             v,

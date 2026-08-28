@@ -247,9 +247,9 @@ class TestWanTextToVideo:
         ],
     )
     def test_t2v_sync(self, server, format_, expected_content_type):
-        """Synchronous text-to-video via POST /v1/videos/generations."""
+        """Synchronous text-to-video via POST /v1/videos/sync."""
         resp = requests.post(
-            server.url_for("v1", "videos", "generations"),
+            server.url_for("v1", "videos", "sync"),
             json={
                 "prompt": "A cute cat playing piano",
                 "size": "480x320",
@@ -367,10 +367,10 @@ class TestWanImageToVideo:
         ],
     )
     def test_ti2v_sync(self, server, format_, expected_content_type):
-        """Synchronous image-to-video via multipart POST /v1/videos/generations."""
+        """Synchronous image-to-video via multipart POST /v1/videos/sync."""
         with open(_REF_IMAGE_PATH, "rb") as f:
             resp = requests.post(
-                server.url_for("v1", "videos", "generations"),
+                server.url_for("v1", "videos", "sync"),
                 data={
                     "prompt": "The cat starts playing piano, keys moving",
                     "size": "480x320",

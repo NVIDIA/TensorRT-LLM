@@ -103,6 +103,9 @@ setting `use_kv_cache_manager_v2: true` explicitly raises an error. This
 applies to every model that selects its manager through
 `use_kv_cache_manager_v2`, not just GPT-OSS.
 
+For the native V2 cold-storage representation and codec extension contract, see
+[KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the
@@ -139,6 +142,8 @@ This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
+`pool_ratio` contains one positive, normalized cache-tier quota weight per
+layer group in layer-group ID order.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
