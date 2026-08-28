@@ -32,6 +32,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
 
     cute = ModuleType("cutlass.cute")
     cute.core = SimpleNamespace()
+    cute.ThrCopy = object()
     cute.ThrMma = object()
     cute.make_rmem_tensor = object()
     cutlass = ModuleType("cutlass")
@@ -43,6 +44,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
     msa_package_available.cache_clear()
     try:
         assert msa_package_available()
+        assert cute.core.ThrCopy is cute.ThrCopy
         assert cute.core.ThrMma is cute.ThrMma
         assert cute.make_fragment is cute.make_rmem_tensor
     finally:

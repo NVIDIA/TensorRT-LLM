@@ -20,7 +20,8 @@ import functools
 
 import torch
 
-from .._utils import ceil_div
+from flashinfer.utils import ceil_div
+
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 

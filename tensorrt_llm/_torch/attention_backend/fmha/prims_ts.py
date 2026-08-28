@@ -33,6 +33,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -229,9 +230,17 @@ class PrimsTSFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
         supported, reason = self._is_supported_with_reason(
-            q, k, v, self.attn, metadata, forward_args
+            q,
+            k,
+            v,
+            self.attn,
+            metadata,
+            forward_args,
+            phase=phase,
         )
         if not supported:
             logger.debug(f"PrimTS FMHA does not support request: {reason}")
@@ -245,8 +254,14 @@ class PrimsTSFmha(PhasedFmha):
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> tuple[bool, str]:
-        """Return a conservative, side-effect-free request support decision."""
+        """Return a conservative, side-effect-free whole-request support decision."""
+        # PrimTS prepares workspace for every active request phase before
+        # dispatch. Accept the phased dispatcher keyword, but do not narrow
+        # support until that preparation is phase-aware too.
+        del phase
         if q.device.type != "cuda":
             return False, "CUDA tensors are required."
         if not q.is_contiguous():

@@ -24,6 +24,7 @@ from packaging.version import Version
 
 import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
 from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
 from tensorrt_llm._torch.attention_backend.fmha.registry import get_enabled_fmha_lib_classes
@@ -127,6 +128,7 @@ def _support_result(
     num_kv_cache_pools: int = 1,
     use_kv_cache_v2: bool = False,
     enable_swa_scratch_reuse: bool = False,
+    phase: FmhaPhase | None = None,
 ) -> tuple[bool, str]:
     attn = _Attention(
         head_dim=head_dim,
@@ -203,7 +205,15 @@ def _support_result(
     fmha._get_kv_page_offset = Mock(return_value=1)
     k = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     v = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
-    return fmha._is_supported_with_reason(q, k, v, attn, metadata, forward_args)
+    return fmha._is_supported_with_reason(
+        q,
+        k,
+        v,
+        attn,
+        metadata,
+        forward_args,
+        phase=phase,
+    )
 
 
 @pytest.mark.parametrize(
@@ -241,6 +251,48 @@ def test_supported_matrix(case: dict) -> None:
     supported, reason = _support_result(**case)
 
     assert supported, reason
+
+
+@pytest.mark.parametrize("phase", [FmhaPhase.CONTEXT, FmhaPhase.GENERATION])
+def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase) -> None:
+    supported, reason = _support_result(
+        attention_input_type=AttentionInputType.mixed,
+        head_dim=64,
+        phase=phase,
+    )
+
+    assert not supported
+    assert "context head dimension" in reason
+
+
+def test_is_supported_accepts_and_forwards_phase_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attn = _Attention()
+    fmha = PrimsTSFmha(attn)
+    support_check = Mock(return_value=(True, ""))
+    monkeypatch.setattr(fmha, "_is_supported_with_reason", support_check)
+    q = Mock(spec=torch.Tensor)
+    metadata = SimpleNamespace()
+    forward_args = AttentionForwardArgs()
+
+    assert fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.GENERATION,
+    )
+    support_check.assert_called_once_with(
+        q,
+        None,
+        None,
+        attn,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.GENERATION,
+    )
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,8 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import torch
 
-from ._api import flashinfer_api
+from flashinfer.api_logging import flashinfer_api
+
 from ._tensor_aliasing import (
     _validate_out_does_not_overlap_inputs,
     _validate_tensor_does_not_overlap_inputs,
