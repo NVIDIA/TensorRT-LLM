@@ -102,10 +102,8 @@ class _TransferNotSubmittedError(RuntimeError):
 
 class _AgentOperationGate:
     def __init__(self, drain_timeout_s: Optional[float] = None) -> None:
-        if drain_timeout_s is None:
+        if drain_timeout_s is None or drain_timeout_s <= 0:
             drain_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
-        if drain_timeout_s < 0:
-            raise ValueError("agent-operation drain timeout must be non-negative")
         self._drain_timeout_s = drain_timeout_s
         self._condition = threading.Condition()
         self._active_transfers = 0

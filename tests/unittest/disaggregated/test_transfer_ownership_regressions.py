@@ -941,7 +941,8 @@ def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
 
 
 @pytest.mark.cpu_only
-def test_cancel_request_retains_session_when_close_refuses() -> None:
+@pytest.mark.parametrize("direction", ("send", "recv"))
+def test_cancel_request_retains_session_when_close_refuses(direction: str) -> None:
     rid = 83
     request = SimpleNamespace(
         request_id=rid,
@@ -954,15 +955,22 @@ def test_cancel_request_retains_session_when_close_refuses() -> None:
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._wait_reqs = {}
-    transceiver._send_sessions = {}
-    transceiver._send_reqs = {}
-    transceiver._recv_sessions = {rid: session}
-    transceiver._recv_reqs = {rid: request}
+    transceiver._send_sessions = {rid: session} if direction == "send" else {}
+    transceiver._send_reqs = {rid: request} if direction == "send" else {}
+    transceiver._recv_sessions = {rid: session} if direction == "recv" else {}
+    transceiver._recv_reqs = {rid: request} if direction == "recv" else {}
 
     assert transceiver.cancel_request(request) is False
-    assert transceiver._recv_sessions[rid] is session
-    assert transceiver._recv_reqs[rid] is request
+    sessions = transceiver._send_sessions if direction == "send" else transceiver._recv_sessions
+    requests = transceiver._send_reqs if direction == "send" else transceiver._recv_reqs
+    assert sessions[rid] is session
+    assert requests[rid] is request
     session.close.assert_called_once_with()
+
+    session.close.return_value = True
+    assert transceiver.cancel_request(request) is True
+    assert sessions == {}
+    assert requests == {}
 
 
 @pytest.mark.cpu_only
@@ -996,6 +1004,71 @@ def test_failed_session_is_not_reported_retired_when_close_refuses() -> None:
     assert request.state is not initial_state
     assert sessions == {}
     assert requests == {}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("status", "is_completed", "has_failed", "wait_result", "mark_complete"),
+    (
+        (SessionStatus.CANCELLED, False, True, WaitResult.FAILED, False),
+        (SessionStatus.FULLY_TRANSFERRED, True, False, WaitResult.COMPLETED, True),
+    ),
+)
+def test_send_terminal_session_is_retained_when_close_refuses(
+    status: SessionStatus,
+    is_completed: bool,
+    has_failed: bool,
+    wait_result: WaitResult,
+    mark_complete: bool,
+) -> None:
+    rid = 96
+    initial_state = object()
+    request = SimpleNamespace(state=initial_state)
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        resources_drained=Mock(return_value=True),
+        status=status,
+        is_completed=Mock(return_value=is_completed),
+        has_failed=Mock(return_value=has_failed),
+        has_transferring_tasks=Mock(return_value=False),
+        wait_complete=Mock(return_value=wait_result),
+        close=Mock(return_value=False),
+        disagg_request_id=rid,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {rid: session}
+    transceiver._send_reqs = {rid: request}
+    transceiver._ctx_consensus = Mock(side_effect=lambda rids: rids)
+    transceiver._ctx_consensus_outcome = Mock(
+        side_effect=lambda _rids, cancelled, failed, completed: (
+            cancelled,
+            failed,
+            completed,
+        )
+    )
+    transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
+
+    with pytest.raises(RuntimeError, match="session close refused"):
+        transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
+
+    assert request.state is initial_state
+    assert transceiver._send_sessions == {rid: session}
+    assert transceiver._send_reqs == {rid: request}
+
+    session.close.return_value = True
+    completed, failed = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
+
+    assert failed == []
+    assert completed == ([rid] if mark_complete else [])
+    if mark_complete:
+        assert request.state is not initial_state
+    else:
+        assert request.state is initial_state
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
 
 
 @pytest.mark.cpu_only
@@ -1166,6 +1239,20 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     transceiver._transfer_worker.shutdown.assert_called_once_with()
 
 
+@pytest.mark.cpu_only
+def test_context_manager_preserves_primary_exception_when_shutdown_refuses() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver.shutdown = Mock(side_effect=RuntimeError("resources remain active"))
+
+    with pytest.raises(ValueError, match="primary failure"):
+        with transceiver:
+            raise ValueError("primary failure")
+
+    transceiver.shutdown.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="resources remain active"):
+        transceiver.__exit__(None, None, None)
+
+
 def _make_owned_sender(
     operation_drain_timeout_s: float | None = None,
 ) -> transfer_mod.Sender:
@@ -1245,7 +1332,7 @@ def test_sender_retires_only_after_done_and_retains_ambiguous_operation() -> Non
 
 @pytest.mark.cpu_only
 def test_sender_gate_timeout_retires_only_unsubmitted_operation() -> None:
-    sender = _make_owned_sender(operation_drain_timeout_s=0.0)
+    sender = _make_owned_sender(operation_drain_timeout_s=0.01)
     sender._agent = Mock()
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=95))
     request = Mock()
@@ -1265,7 +1352,11 @@ def test_sender_gate_timeout_retires_only_unsubmitted_operation() -> None:
 
 @pytest.mark.cpu_only
 def test_agent_gate_timeouts_retain_active_transfer() -> None:
-    metadata_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.0)
+    for timeout_s in (0.0, -1.0):
+        gate = transfer_mod._AgentOperationGate(drain_timeout_s=timeout_s)
+        assert gate._drain_timeout_s == transfer_mod._FALLBACK_TX_OVERALL_TIMEOUT_S
+
+    metadata_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.01)
     release_metadata = metadata_gate.acquire_transfer()
 
     with pytest.raises(RuntimeError, match="quarantined"):
@@ -1279,7 +1370,7 @@ def test_agent_gate_timeouts_retain_active_transfer() -> None:
     with pytest.raises(RuntimeError, match="quarantined"):
         metadata_gate.acquire_transfer()
 
-    close_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.0)
+    close_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.01)
     release_close = close_gate.acquire_transfer()
 
     with pytest.raises(RuntimeError, match="refuses teardown"):
