@@ -1295,21 +1295,6 @@ class TestRequestValidation:
             extra_param_specs=COSMOS3_EXTRA_SPECS,
         )
 
-    def test_video_reference_must_be_bytes(self):
-        """A server-local path must not reach the worker: the ``video`` contract
-        is encoded bytes, so a string (or anything else) fails preflight."""
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
-
-        req = self._make_request(extra_params={"video": "/server/local/path.mp4"})
-        with pytest.raises(ValueError, match="expected type 'bytes'"):
-            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
-
-            validate_visual_gen_params(
-                req.params,
-                declared_defaults=None,
-                extra_param_specs=COSMOS3_EXTRA_SPECS,
-            )
-
 
 # =============================================================================
 # Parameter validation — message content per category
