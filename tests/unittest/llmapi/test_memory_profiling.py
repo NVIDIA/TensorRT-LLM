@@ -97,7 +97,7 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
 
     Both components must use the same stream for proper synchronization.
     """
-    MODEL = "Qwen3.5-4B"
+    MODEL = "Qwen3/Qwen3-0.6B"
     MODEL_PATH = get_model_path(MODEL)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,

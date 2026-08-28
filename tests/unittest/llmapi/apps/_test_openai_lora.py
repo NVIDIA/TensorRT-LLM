@@ -1,7 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import tempfile
 from dataclasses import asdict
-from typing import List, Optional
+from pathlib import Path
+from typing import Generator
 
 import openai
 import pytest
@@ -9,23 +25,22 @@ import yaml
 
 from tensorrt_llm.executor.request import LoRARequest
 
+from ..lora_test_utils import qwen3_lora_adapter
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module", ids=["llama-models/llama-7b-hf"])
+@pytest.fixture(scope="module", ids=["Qwen3/Qwen3-0.6B"])
 def model_name() -> str:
-    return "llama-models/llama-7b-hf"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
-def lora_adapter_names() -> List[Optional[str]]:
-    return [
-        None, "llama-models/luotuo-lora-7b-0.1",
-        "llama-models/Japanese-Alpaca-LoRA-7b-v0"
-    ]
+def lora_adapter_path() -> Generator[Path, None, None]:
+    with qwen3_lora_adapter() as adapter_path:
+        yield adapter_path
 
 
 @pytest.fixture(scope="module")
@@ -71,43 +86,41 @@ def client(server: RemoteOpenAIServer) -> openai.OpenAI:
 
 
 def test_lora(client: openai.OpenAI, model_name: str,
-              lora_adapter_names: List[str]):
-    prompts = [
-        "美国的首都在哪里? \n答案:",
-        "美国的首都在哪里? \n答案:",
-        "美国的首都在哪里? \n答案:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-    ]
-    references = [
-        "沃尔玛\n\n## 新闻\n\n* ",
-        "美国的首都是华盛顿。\n\n美国的",
-        "纽约\n\n### カンファレンスの",
-        "Washington, D.C.\nWashington, D.C. is the capital of the United",
-        "华盛顿。\n\n英国の首都是什",
-        "ワシントン\nQ1. アメリカ合衆国",
-    ]
+              lora_adapter_path: Path) -> None:
+    prompt = "The capital of France is"
 
-    for prompt, reference, lora_adapter_name in zip(prompts, references,
-                                                    lora_adapter_names * 2):
-        extra_body = {}
-        if lora_adapter_name is not None:
-            lora_req = LoRARequest(lora_adapter_name,
-                                   lora_adapter_names.index(lora_adapter_name),
-                                   get_model_path(lora_adapter_name))
-            extra_body["lora_request"] = asdict(lora_req)
-
+    def complete(
+        extra_body: dict[str, object] | None = None
+    ) -> tuple[str, tuple[str, ...], tuple[float | None, ...]]:
         response = client.completions.create(
             model=model_name,
             prompt=prompt,
             max_tokens=20,
             temperature=0.0,
-            extra_body=extra_body,
+            logprobs=1,
+            extra_body=extra_body or {},
         )
-        output = response.choices[0].text
-        print(f"response: {output}")
-        print(f"reference: {reference}")
-        assert output == reference, (
-            f"Unexpected output for LoRA adapter {lora_adapter_name!r}: "
-            f"prompt={prompt!r}, response={output!r}, reference={reference!r}")
+        choice = response.choices[0]
+        assert choice.logprobs is not None
+        assert choice.logprobs.tokens is not None
+        assert choice.logprobs.token_logprobs is not None
+        return (
+            choice.text,
+            tuple(choice.logprobs.tokens),
+            tuple(choice.logprobs.token_logprobs),
+        )
+
+    base_output = complete()
+    lora_request = LoRARequest(lora_name=lora_adapter_path.name,
+                               lora_int_id=1,
+                               lora_path=str(lora_adapter_path))
+    extra_body = {"lora_request": asdict(lora_request)}
+    first_lora_output = complete(extra_body)
+    reused_lora_output = complete(extra_body)
+
+    assert base_output[0]
+    assert first_lora_output[0]
+    output_changed = first_lora_output[:2] != base_output[:2]
+    logprobs_changed = first_lora_output[2] != base_output[2]
+    assert output_changed or logprobs_changed
+    assert reused_lora_output == first_lora_output

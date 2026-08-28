@@ -1,12 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import tarfile
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, OrderedDict, Tuple, Type, Union
+from typing import Generator, List, Optional, OrderedDict, Tuple, Type, Union
 
 import pytest
 import torch
+from safetensors.torch import save_file
+from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 from utils.util import duplicate_list_to_length, flatten_list, similar
 
@@ -21,6 +39,52 @@ from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 
 from .test_utils import DelayedAssert
+
+QWEN3_MODEL_DIR = Path(llm_models_root()) / "Qwen3" / "Qwen3-0.6B"
+
+
+def create_qwen3_lora_adapter(adapter_dir: Path, rank: int = 8) -> Path:
+    """Create a deterministic Qwen3 attention LoRA adapter for server tests."""
+    config = AutoConfig.from_pretrained(QWEN3_MODEL_DIR)
+    head_dim = getattr(config, "head_dim",
+                       config.hidden_size // config.num_attention_heads)
+    projection_output_sizes = {
+        "q_proj": config.num_attention_heads * head_dim,
+        "k_proj": config.num_key_value_heads * head_dim,
+        "v_proj": config.num_key_value_heads * head_dim,
+    }
+    generator = torch.Generator().manual_seed(42)
+    weights = {}
+    for module_name, output_size in projection_output_sizes.items():
+        prefix = f"base_model.model.model.layers.0.self_attn.{module_name}"
+        weights[f"{prefix}.lora_A.weight"] = torch.randn(
+            rank, config.hidden_size, generator=generator) * 0.1
+        weights[f"{prefix}.lora_B.weight"] = torch.randn(
+            output_size, rank, generator=generator) * 0.1
+
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    save_file(weights, adapter_dir / "adapter_model.safetensors")
+    adapter_config = {
+        "base_model_name_or_path": str(QWEN3_MODEL_DIR),
+        "bias": "none",
+        "inference_mode": True,
+        "lora_alpha": rank,
+        "lora_dropout": 0.0,
+        "peft_type": "LORA",
+        "r": rank,
+        "target_modules": list(projection_output_sizes),
+        "task_type": "CAUSAL_LM",
+    }
+    with open(adapter_dir / "adapter_config.json", "w",
+              encoding="utf-8") as config_file:
+        json.dump(adapter_config, config_file)
+    return adapter_dir
+
+
+@contextmanager
+def qwen3_lora_adapter() -> Generator[Path, None, None]:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        yield create_qwen3_lora_adapter(Path(temp_dir) / "qwen3-lora")
 
 
 def check_llama_7b_multi_unique_lora_adapters_from_request(
