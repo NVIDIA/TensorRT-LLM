@@ -745,11 +745,11 @@ def should_skip_cutlass(
     # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
     #
     # W4A16 (W4A16WoqPerChannelFusedMoEMethod) shares W8A16's constraint exactly,
-    # and it is no worse: rows_per_tile = 128*8//BITS_PER_ELT_A is
-    # activation-driven, so it is 64 for both INT4 and INT8 weights
-    # (tensorrt_llm/quantization/functional.py:1020). INT4's other row
-    # constraints are weaker divisors of 64 -- B_ROWS_PER_MMA = 32 (:985) and
-    # elts_in_int32 = 8 (:1021) -- so 64 binds in both cases. The listed quants
+    # and it is no worse: rows_per_tile = 128*8//BITS_PER_ELT_A in
+    # preprocess_weights_for_mixed_gemm is activation-driven, so it is 64 for
+    # both INT4 and INT8 weights. INT4's other row constraints there are weaker
+    # divisors of 64 (B_ROWS_PER_MMA = 32, elts_in_int32 = 8), so 64 binds in
+    # both cases. The listed quants
     # use the stricter 128 here rather than 64 because these multi-GPU configs
     # also feed NVFP4-style paths; W4A16 is grouped with W8A16 for the same
     # reason it shares the loader shape.

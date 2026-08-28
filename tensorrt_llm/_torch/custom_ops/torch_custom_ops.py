@@ -439,7 +439,7 @@ def _(input: torch.Tensor,
         # Sub-byte weights are packed along that trailing hidden dim, so the stored
         # extent is hidden_size / elements_per_byte and must be scaled back up to
         # recover the logical hidden size. This mirrors the real op, which applies
-        # mInnerDimMultiplier at moeOp.cpp:379; without it the fake kernel reports
+        # mInnerDimMultiplier; without it the fake kernel reports
         # half the hidden size for INT4 and shape inference silently disagrees with
         # the kernel under torch.compile.
         inner_dim_multiplier = 2 if fc2_expert_weights.dtype == torch.quint4x2 else 1

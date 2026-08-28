@@ -1027,15 +1027,14 @@ def test_cutlass_w4a16_weight_shapes_gated_and_nongated(activation_type):
 
     Nemotron-H uses squared-ReLU and is NON-gated, so a class that assumes
     gating (a literal ``* 2``) allocates twice the fc1 rows it should and the
-    loader then writes past the logical extent.  ``INT8WoqPerChannelFusedMoEMethod``
-    hardcodes ``intermediate_size_per_partition * 2`` (quantization.py:1313-1315),
-    so this generality is new code in the W4A16 class rather than something
-    inherited by cloning.
+    loader then writes past the logical extent.  This pins the W4A16 class to
+    the same ``expand_intermediate_size_per_partition`` sizing that
+    ``INT8WoqPerChannelFusedMoEMethod`` uses.
 
     Also pins the INT4 packing axis: two INT4 values share one int8 byte along
     the trailing (output) dim, matching the dense W4A16 convention
-    ``(in_features, out_features // 2)`` (linear.py:2173-2176) and the runner's
-    ``mInnerDimMultiplier = 2`` (moeOp.cpp:201-204).
+    ``(in_features, out_features // 2)`` in ``WeightOnlyQuantLinearMethod`` and
+    the runner's ``mInnerDimMultiplier = 2``.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required to construct a Cutlass MoE backend")
@@ -1047,8 +1046,8 @@ def test_cutlass_w4a16_weight_shapes_gated_and_nongated(activation_type):
         pytest.skip(f"CutlassFusedMoE W4A16 requires SM >= 80, got SM{sm_version}")
 
     num_experts, top_k = 4, 2
-    # 64-aligned so preprocess_weights_for_mixed_gemm's row-tile constraint
-    # (functional.py:1020-1024) is satisfied and is not what this test measures.
+    # 64-aligned so preprocess_weights_for_mixed_gemm's row-tile constraint is
+    # satisfied and is not what this test measures.
     hidden_size, intermediate_size = 128, 256
     dtype = torch.bfloat16
 
@@ -1107,18 +1106,16 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(intermediate_size, tp_siz
     """A non-64-aligned row count must fail with a message that names the cause.
 
     ``preprocess_weights_for_mixed_gemm`` enforces the row-tile constraint as a
-    BARE assert -- ``assert (num_rows % rows_per_tile == 0)``
-    (tensorrt_llm/quantization/functional.py:1024) -- inside a helper several
-    frames below the loader.  Left alone it surfaces as a bare ``AssertionError``
-    with no tensor name, no dimension and no tp_size, which is exactly the
-    unhelpful failure M6 asks to replace.
+    BARE assert -- ``assert num_rows % rows_per_tile == 0`` -- inside a helper
+    several frames below the loader.  Left alone it surfaces as a bare
+    ``AssertionError`` with no tensor name, no dimension and no tp_size.
 
-    The shapes chosen here are the ones the brief calls out as breaking W8A16
-    today: intermediate_size 1856 at TP 2/4 and 2688 at TP 4.  W4A16 inherits
-    the same restriction and is no worse, because ``rows_per_tile =
+    The shapes chosen here are the ones that break W8A16 today:
+    intermediate_size 1856 at TP 2/4 and 2688 at TP 4.  W4A16 inherits the same
+    restriction and is no worse, because ``rows_per_tile =
     128*8//BITS_PER_ELT_A`` is activation-driven and therefore 64 for both INT4
-    and INT8 (functional.py:1020); INT4's other row constraints are weaker
-    divisors of 64 (B_ROWS_PER_MMA = 32 at :985, elts_in_int32 = 8 at :1021).
+    and INT8; INT4's other row constraints there are weaker divisors of 64
+    (B_ROWS_PER_MMA = 32, elts_in_int32 = 8).
     """
     from tensorrt_llm._torch.modules.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
 
@@ -1152,10 +1149,8 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(intermediate_size, tp_siz
 def test_cutlass_w4a16_aligned_rows_accepted(num_rows):
     """The aligned TP sizes the method claims to support must pass cleanly.
 
-    Counterpart to the rejection test: M6's check is two-sided ("tests pass at
-    the TP sizes your choice claims to support, and fail cleanly ... at the ones
-    it does not"), so pinning only the failure would leave the validator free to
-    reject everything.
+    Counterpart to the rejection test: pinning only the failure would leave the
+    validator free to reject every shape, so the accepted side is pinned too.
     """
     from tensorrt_llm._torch.modules.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
 

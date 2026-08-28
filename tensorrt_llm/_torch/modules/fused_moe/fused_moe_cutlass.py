@@ -141,7 +141,8 @@ class CutlassFusedMoE(MoEImplBase):
         },
         # W4A16 (plain INT4 weight-only, per-channel scales): SM >= 80.
         # Uses the legacy mixed-dtype weight-only path, which SM120/121 reach
-        # via the SM80 interleaved layout (functional.py:962-963), so the same
+        # via the SM80 interleaved layout, because
+        # preprocess_weights_for_mixed_gemm remaps sm >= 120 to 80, so the same
         # code covers SM80 through SM121.
         QuantAlgo.W4A16: {
             "sm_constraint": ("min", 80),
@@ -738,17 +739,17 @@ class CutlassFusedMoE(MoEImplBase):
 
     @property
     def has_int4_woq_per_channel(self):
-        # Plain W4A16: INT4 weights with per-channel (not per-group) scales.
+        """True for plain W4A16: INT4 weights with per-channel scales."""
         # Excluding per-group keeps W4A8_AWQ on WInt4AFP8FusedMoEMethod, which
-        # is selected by is_int4_weight_only_per_group() (mode.py:138).
+        # is selected by is_int4_weight_only_per_group().
         return self.quant_config and self.quant_config.layer_quant_mode.is_int4_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     @property
     def has_woq_per_channel(self):
-        # Both per-channel weight-only dtypes share the dim-swapped weight
-        # layout and the 2-element scale list that moeOp.cpp:1137 turns into
-        # QuantParams::Int, so the C++ flag is driven by either.
+        """True for either per-channel weight-only dtype; drives the C++ flag."""
+        # Both share the dim-swapped weight layout and the 2-element scale list
+        # that the runner turns into QuantParams::Int.
         return self.has_int8_woq_per_channel or self.has_int4_woq_per_channel
 
     def quantize_input(
@@ -1018,11 +1019,11 @@ class CutlassFusedMoE(MoEImplBase):
                 weight_dtype = torch.quint4x2
             elif self.has_int4_woq_per_channel:
                 # Packed INT4 is stored in an int8 parameter. Without this view
-                # the op sees Char, isInt8Quant() matches (moeOp.cpp:1201) and
-                # CutlassMoeFCRunner<T, uint8_t> is built (moeOp.cpp:107) -- a
-                # silent fallback that runs at the wrong element width and
-                # leaves mInnerDimMultiplier at 1. quint4x2 makes
-                # isInt4Quant() (moeOp.cpp:1206) select the uint4b_t runner.
+                # the op sees Char, isInt8Quant() matches and
+                # create_weight_quant_runner builds CutlassMoeFCRunner<T,
+                # uint8_t> -- a silent fallback that runs at the wrong element
+                # width and leaves mInnerDimMultiplier at 1. quint4x2 makes
+                # isInt4Quant() select the uint4b_t runner instead.
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8

@@ -2753,16 +2753,16 @@ class W8A16QuantizeUtil(BaseQuantizeUtil):
 #   * preprocess_weights_for_mixed_gemm's subbyte_transpose builds
 #     cat([low, high]) with low = (t << 4) >> 4 and high = t >> 4, i.e. the LOW
 #     nibble is the lower-indexed logical element
-#     (tensorrt_llm/quantization/functional.py:1004-1012).
+#     (tensorrt_llm/quantization/functional.py).
 #   * unpack_int4_packed_tensor_to_int8 writes elt_0 = (packed << 4) >> 4 to the
 #     even index and elt_1 = packed >> 4 to the odd index
-#     (cpp/tensorrt_llm/thop/weightOnlyQuantOp.cpp:308-312).
+#     (cpp/tensorrt_llm/thop/weightOnlyQuantOp.cpp).
 # Both agree: even logical index -> low nibble, odd -> high nibble.
 #
 # Packing runs along dim 0 (the OUTPUT channel dim) because that is the axis the
 # MoE loader needs. A packed tensor cannot be transposed to move its packing
 # axis, and torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix
-# packs along the LAST axis (weightOnlyQuantOp.cpp:330), so it cannot be reused
+# packs along the LAST axis, so it cannot be reused
 # here; the arithmetic is reproduced explicitly instead.
 
 
@@ -2783,7 +2783,7 @@ def pack_int4_along_dim0(unpacked: torch.Tensor) -> torch.Tensor:
 def unpack_int4_along_dim0(packed: torch.Tensor) -> torch.Tensor:
     """Inverse of :func:`pack_int4_along_dim0`, sign-extending each nibble."""
     as_u8 = packed.view(torch.uint8)
-    # Double shift sign-extends the 4-bit value, as in weightOnlyQuantOp.cpp:308.
+    # Double shift sign-extends the 4-bit value, as unpack_int4_packed_tensor_to_int8 does.
     low = (as_u8 << 4).view(torch.int8) >> 4
     high = as_u8.view(torch.int8) >> 4
     stacked = torch.stack([low, high], dim=1)
@@ -2843,6 +2843,7 @@ class W4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
         return (unpacked.T.contiguous().float() * scale).to(self.dtype).T.contiguous()
 
     def load_weights(self, weights_list: List[Dict]):
+        """Unpack and dequantize the INT4 expert weights into the fp reference."""
         assert len(weights_list) == 1
         weights = weights_list[0]
 
@@ -2881,9 +2882,10 @@ class W4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def check_accuracy(self, output, ref_output, weight_dtype=torch.quint4x2):
+        """Compare against the reference at the same thresholds as the W8A16 arm."""
         # Same helper and the same percent thresholds as the W8A16 arm; only the
-        # dtype differs, which widens atol via bits_in_type = 4
-        # (tests/unittest/_torch/helpers.py:97-99). Deliberately NOT loosened
+        # dtype differs, which widens atol via calc_woq_tolerence's
+        # bits_in_type = 4. Deliberately NOT loosened
         # beyond that: per-channel INT4 accuracy is the gate that decides whether
         # this feature ships, so a relaxed threshold would hide the signal.
         atol = calc_woq_tolerence(ref_output, weight_dtype)
