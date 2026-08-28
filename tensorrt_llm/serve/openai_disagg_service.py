@@ -15,10 +15,11 @@
 import asyncio
 import base64
 import json
-import numpy as np
 import os
 import traceback
 from typing import Callable, Optional
+
+import numpy as np
 
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
@@ -118,7 +119,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     @staticmethod
     def _align_to_blocks(token_ids: list, block_size: int) -> list:
         """Drop the ragged tail so every requested block is a whole one.
-        
+
         Small example:
         # With block_size 4 and 10 ids, the last 2 ids form no whole block:
         #     in  [A B C D E F G H I J]   ->  out [A B C D E F G H]
@@ -154,7 +155,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             line = line.strip()
             if not line.startswith("data:"):
                 continue
-            payload = line[len("data:"):].strip()
+            payload = line[len("data:") :].strip()
             if not payload or payload == "[DONE]":
                 continue
             try:
@@ -180,11 +181,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             return list(prompt)
         return []
 
-    async def _warm_ctx(self, ctx_server: Optional[str], gen_server: Optional[str],
-                        gen_req: UCompletionRequest, disagg_request_id: Optional[int],
-                        gen_token_ids: list) -> None:
-        """Request context worker to pull the finished turn's KV from the generation worker.
-        """
+    async def _warm_ctx(
+        self,
+        ctx_server: Optional[str],
+        gen_server: Optional[str],
+        gen_req: UCompletionRequest,
+        disagg_request_id: Optional[int],
+        gen_token_ids: list,
+    ) -> None:
+        """Pull the finished turn's KV from the generation worker."""
         try:
             if not ctx_server or not gen_server or not gen_token_ids:
                 return
@@ -197,7 +202,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             if block_size is None:
                 return
             full_token_ids = self._align_to_blocks(
-                prompt_token_ids + list(gen_token_ids), block_size)
+                prompt_token_ids + list(gen_token_ids), block_size
+            )
             if not full_token_ids:
                 return
 
@@ -219,19 +225,25 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ),
             )
             await self._ctx_client.send_request(warm_req, server=ctx_server)
-            logger.info(f"Warmed ctx {ctx_server} from gen {gen_server}: "
-                         f"{len(full_token_ids)} of "
-                         f"{len(prompt_token_ids)}+{len(gen_token_ids)} tokens "
-                         f"(block={block_size})")
+            logger.info(
+                f"Warmed ctx {ctx_server} from gen {gen_server}: "
+                f"{len(full_token_ids)} of "
+                f"{len(prompt_token_ids)}+{len(gen_token_ids)} tokens "
+                f"(block={block_size})"
+            )
         except Exception:
             self._gen_client.forget_data_transceiver_state(gen_server)
             logger.error(f"Failed to warm ctx: {traceback.format_exc()}")
 
-    async def _warming_stream(self, gen_response: UCompletionResponseOrGenerator, ctx_server: Optional[str],
-                              gen_server: Optional[str], gen_req: UCompletionRequest,
-                              disagg_request_id: Optional[int]):
-        """Relay a streaming response, then request the context worker to warm once it drains.
-        """
+    async def _warming_stream(
+        self,
+        gen_response: UCompletionResponseOrGenerator,
+        ctx_server: Optional[str],
+        gen_server: Optional[str],
+        gen_req: UCompletionRequest,
+        disagg_request_id: Optional[int],
+    ):
+        """Relay a streaming response, then warm the context worker once it drains."""
         seen = []
         try:
             async for chunk in gen_response:
@@ -239,10 +251,17 @@ class OpenAIDisaggregatedService(OpenAIService):
                 yield chunk
         finally:
             body = b"".join(c for c in seen if isinstance(c, bytes)).decode(
-                "utf-8", errors="ignore")
+                "utf-8", errors="ignore"
+            )
             asyncio.create_task(
-                self._warm_ctx(ctx_server, gen_server, gen_req, disagg_request_id,
-                               self._gen_token_ids_of_sse(body)))
+                self._warm_ctx(
+                    ctx_server,
+                    gen_server,
+                    gen_req,
+                    disagg_request_id,
+                    self._gen_token_ids_of_sse(body),
+                )
+            )
 
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -319,8 +338,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                     gen_response, ctx_server, gen_server, gen_req, disagg_request_id
                 )
             asyncio.create_task(
-                self._warm_ctx(ctx_server, gen_server, gen_req, disagg_request_id,
-                               self._gen_token_ids_of(gen_response)))
+                self._warm_ctx(
+                    ctx_server,
+                    gen_server,
+                    gen_req,
+                    disagg_request_id,
+                    self._gen_token_ids_of(gen_response),
+                )
+            )
             return gen_response
         else:
             if gen_server:

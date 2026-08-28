@@ -143,9 +143,8 @@ class ChatPostprocArgs(PostprocArgs):
             chat_template_kwargs=request.chat_template_kwargs,
             ctx_usage=None if request.disaggregated_params is None else
             request.disaggregated_params.ctx_usage,
-            return_gen_token_ids=False
-            if request.disaggregated_params is None else
-            request.disaggregated_params.return_gen_token_ids,
+            return_gen_token_ids=False if request.disaggregated_params is None
+            else request.disaggregated_params.return_gen_token_ids,
         )
 
 

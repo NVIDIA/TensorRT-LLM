@@ -490,7 +490,8 @@ class Router(ABC):
         pass
 
     def keeps_conversation_affinity(self) -> bool:
-        """True when this router sends the turns of one conversation to one server. 
+        """True when one conversation's turns all go to one server.
+
         e.g. kv_cache_aware or conversation router.
         """
         return False
@@ -1343,8 +1344,10 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return self._server_content_load.get(server, 0)
 
     def _get_server_load(self, server: str) -> int:
-        """Use content weight so ``_select_least_loaded`` balances by
-        estimated tokens rather than request count.
+        """Use content weight when balancing load.
+
+        ``_select_least_loaded`` then balances by estimated tokens rather than
+        request count.
         """
         return self._get_content_load(server)
 

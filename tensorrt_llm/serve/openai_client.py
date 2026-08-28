@@ -121,8 +121,7 @@ class OpenAIClient(ABC):
     async def shutdown(self) -> None: ...
 
     async def get_data_transceiver_state(self, server: str) -> Optional[str]:
-        """Return the base64 DataTransceiverState of ``server``.
-        """
+        """Return the base64 DataTransceiverState of ``server``."""
 
     def forget_data_transceiver_state(self, server: str) -> None:
         """Drop any memoized state for ``server`` so the next read fetches it again."""

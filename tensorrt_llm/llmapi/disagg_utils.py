@@ -154,7 +154,7 @@ class DisaggServerConfig():
     gen_tokids_ctxbytes: bool = False
     # After a turn finishes, ask the context worker to pull that conversation's KV from the
     # generation worker that produced it. The next turn then reuses the reply tokens instead
-    # of prefilling them again. Needs a kv_cache_aware or conversation router that keeps 
+    # of prefilling them again. Needs a kv_cache_aware or conversation router that keeps
     # conversation affinity and block reuse on both sides.
     warm_ctx_from_gen: bool = False
     # Number of uvicorn disagg-server worker processes to fork on the public port.

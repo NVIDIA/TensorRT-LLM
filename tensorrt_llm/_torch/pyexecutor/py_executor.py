@@ -7390,7 +7390,8 @@ class PyExecutor:
     @staticmethod
     def _is_transfer_only_request(request: LlmRequest) -> bool:
         params = getattr(request, "py_disaggregated_params", None)
-        return bool(params is not None and getattr(params, "transfer_only", False))
+        return bool(params is not None
+                    and getattr(params, "transfer_only", False))
 
     def _finish_transfer_only_requests(self, requests):
         for request in requests:
@@ -7408,8 +7409,6 @@ class PyExecutor:
                 transfer_only_requests.append(req)
             else:
                 cache_trans_complete_requests.append(req)
-        if len(transfer_only_requests) > 0:
-            self._finish_transfer_only_requests(transfer_only_requests)
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests_last_chunk = cache_trans_complete_requests
@@ -7438,6 +7437,11 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                if self._is_transfer_only_request(req):
+                    req.context_current_position = req.prompt_len
+                    if self.kv_cache_transceiver is not None:
+                        self.kv_cache_transceiver.commit_blocks_for_reuse(req)
+                    continue
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 if self.kv_cache_transceiver is not None:
@@ -7465,6 +7469,9 @@ class PyExecutor:
                     req.add_new_token(first_gen_tokens[beam], beam)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+        if len(transfer_only_requests) > 0:
+            self._finish_transfer_only_requests(transfer_only_requests)
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
