@@ -4333,12 +4333,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default="auto",
         description=
         "The runtime implementation. 'auto' (default) adopts the model's "
-        "preferred runtime when the effective backend supports it, and falls "
-        "back to the C++ transceiver otherwise. 'CPP' selects the C++ "
-        "transceiver, 'PYTHON' the Python transceiver. None is equivalent to "
-        "'CPP'. The model preference is only consulted on the PyTorch "
-        "backend's standard model-loading path; other paths (e.g. AutoDeploy) "
-        "fall back to the C++ transceiver under 'auto'.")
+        "preferred runtime when it declares one; otherwise it selects the "
+        "Python transceiver, falling back to the C++ transceiver only when "
+        "this config itself rules it out (non-NIXL backend or a null "
+        "kv_transfer_timeout_ms) — any other incompatibility fails at "
+        "transceiver creation. The fallback is decided independently on "
+        "each server and is only logged, not surfaced, so keep context and "
+        "generation server configurations consistent. 'CPP' selects the C++ "
+        "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
+        "to 'CPP'. 'auto' is only resolved on the PyTorch backend's "
+        "standard model-loading path; other paths (e.g. AutoDeploy) fall "
+        "back to the C++ transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -5556,7 +5561,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
+        "no-op otherwise. "
         "Defaults to False.",
         status="prototype")
 
@@ -5721,6 +5727,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
+        if (self.disable_mm_encoder
+                and self.multimodal_config.encoder_cache_max_bytes != 0):
+            logger.info(
+                "Setting multimodal_config.encoder_cache_max_bytes to 0 "
+                "because disable_mm_encoder=True.")
+            # The cache defaults to enabled, so disabling the encoder must override it to also
+            # disable an unused cache. Although `multimodal_config` is unlikely to be used
+            # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
+            self.multimodal_config = self.multimodal_config.model_copy(
+                update={"encoder_cache_max_bytes": 0})
         return self
 
     @model_validator(mode="after")

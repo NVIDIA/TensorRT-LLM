@@ -184,6 +184,111 @@ def test_optimized_prefill_matches_fla_reference() -> None:
 
 
 @torch.no_grad()
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [None, [100, 257, 63]],
+    ids=["padded_eqlen", "varlen"],
+)
+def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
+    sequence_lengths: list[int] | None,
+) -> None:
+    """In-kernel beta sigmoid matches the legacy host launch."""
+    from fla.modules.l2norm import l2norm_fwd
+    from fla.ops.common.gate import fused_beta_sigmoid
+
+    torch.manual_seed(10)
+    batch_size = 1
+    if sequence_lengths is None:
+        sequence_length = 300
+        num_sequences = batch_size
+        cu_seqlens = None
+    else:
+        sequence_length = sum(sequence_lengths)
+        num_sequences = len(sequence_lengths)
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+            dtype=torch.long,
+            device="cuda",
+        )
+    A_log = torch.randn(NUM_HEADS, dtype=torch.float32, device="cuda") * 0.1
+    dt_bias = torch.randn(NUM_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda") * 0.1
+
+    for seed in (11, 12):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+
+        def randn(
+            *shape: int, dtype: torch.dtype = torch.bfloat16, scale: float = 0.05
+        ) -> torch.Tensor:
+            return (
+                torch.randn(*shape, generator=generator, dtype=torch.float32, device="cuda") * scale
+            ).to(dtype)
+
+        q = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
+        k = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
+        v = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
+        g = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
+        if seed == 11:
+            beta = randn(batch_size, sequence_length, NUM_HEADS, dtype=torch.float32)
+        else:
+            # Exercise the L2 epsilon path and saturated sigmoid tails.
+            q[:, ::17].zero_()
+            k[:, ::19].zero_()
+            beta = torch.linspace(
+                -20.0,
+                20.0,
+                batch_size * sequence_length * NUM_HEADS,
+                dtype=torch.float32,
+                device="cuda",
+            ).reshape(batch_size, sequence_length, NUM_HEADS)
+        initial_state = randn(
+            num_sequences, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, scale=0.01
+        )
+        state_indices = torch.arange(num_sequences, dtype=torch.int32, device="cuda")
+
+        common = dict(
+            v=v,
+            g=g,
+            scale=HEAD_DIM**-0.5,
+            state_indices=state_indices,
+            safe_gate=True,
+            lower_bound=-5.0,
+            use_gate_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+        )
+
+        q_unfused, _ = l2norm_fwd(q)
+        k_unfused, _ = l2norm_fwd(k)
+        beta_unfused = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
+        state_unfused = initial_state.clone()
+        output_unfused = torch.ops.trtllm.kda_prefill(
+            q=q_unfused,
+            k=k_unfused,
+            beta=beta_unfused,
+            state_pool=state_unfused,
+            use_beta_sigmoid_in_kernel=False,
+            **common,
+        )
+        # The op reuses shape-keyed output buffers; retain the first result
+        # before the fused call overwrites it.
+        output_unfused = output_unfused.clone()
+
+        state_fused = initial_state.clone()
+        output_fused = torch.ops.trtllm.kda_prefill(
+            q=q_unfused,
+            k=k_unfused,
+            beta=beta,
+            state_pool=state_fused,
+            use_beta_sigmoid_in_kernel=True,
+            **common,
+        )
+
+        _assert_close(output_fused, output_unfused)
+        _assert_close(state_fused, state_unfused)
+
+
+@torch.no_grad()
 def test_kda_mixer_empty_prefill():
     """The production mixer handles an empty token payload without raising."""
     optimized, _ = _make_attention_pair()
