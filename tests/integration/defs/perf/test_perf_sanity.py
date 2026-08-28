@@ -1400,6 +1400,10 @@ class DisaggConfig:
         hardware: dict,
         server_env_var: str,
         internal_request_auth_key: str | None = None,
+        router_config: dict | None = None,
+        ctx_router_config: dict | None = None,
+        gen_router_config: dict | None = None,
+        server_config_extra: dict | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1411,6 +1415,10 @@ class DisaggConfig:
         self.hardware = hardware
         self.server_env_var = server_env_var
         self.internal_request_auth_key = internal_request_auth_key
+        self.router_config = router_config
+        self.ctx_router_config = ctx_router_config
+        self.gen_router_config = gen_router_config
+        self.server_config_extra = server_config_extra
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1559,6 +1567,12 @@ class DisaggTestCmds(NamedTuple):
     # disagg, only rank-0 pytest goes through this path; multi-rank workers
     # receive env via SLURM env propagation set up by submit.py.
     server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
+    # Disagg-server-level keys, named as in bench-trtllm-disagg. A generic
+    # router applies to both roles; a role-specific one overrides it.
+    router_config: Optional[dict] = None
+    ctx_router_config: Optional[dict] = None
+    gen_router_config: Optional[dict] = None
+    server_config_extra: Optional[dict] = None
 
     def _hostnames_dir(self, server_idx: int) -> str:
         """Directory the disagg tasks exchange bound addresses through.
@@ -1637,6 +1651,43 @@ class DisaggTestCmds(NamedTuple):
                 "urls": gen_hostnames,
             },
         }
+        # Router selection, mirroring bench-trtllm-disagg's submit.py: a generic
+        # router applies to both roles and a role-specific one overrides it for
+        # that role, e.g. ctx_router_config={"type": "conversation"} puts a
+        # conversation router only on the context servers. Deep-copied because
+        # trtllm-serve pops keys out of this dict while parsing it.
+        if self.router_config:
+            server_config["context_servers"]["router"] = copy.deepcopy(self.router_config)
+            server_config["generation_servers"]["router"] = copy.deepcopy(self.router_config)
+        if self.ctx_router_config:
+            server_config["context_servers"]["router"] = copy.deepcopy(self.ctx_router_config)
+        if self.gen_router_config:
+            server_config["generation_servers"]["router"] = copy.deepcopy(self.gen_router_config)
+
+        if self.server_config_extra:
+            # Merged last, as bench-trtllm-disagg does, so it wins over
+            # everything above. The reserved keys are the exception: the harness
+            # owns them, not the config file. port must stay 0 so the server
+            # binds a kernel-assigned port and reports it via --report_addr, and
+            # the url lists are discovered from the hostname files above.
+            # Overriding either surfaces as a hang or a benchmark against the
+            # wrong endpoint, a long way from the cause, so reject it here.
+            reserved = {
+                "port",
+                "hostname",
+                "internal_request_auth_key",
+                "context_servers",
+                "generation_servers",
+            }
+            clobbered = sorted(reserved & set(self.server_config_extra))
+            if clobbered:
+                raise RuntimeError(
+                    f"server_config_extra may not override harness-owned keys {clobbered}: "
+                    "the port is kernel-assigned and reported back via --report_addr, and "
+                    "the server urls are discovered at runtime."
+                )
+            server_config.update(copy.deepcopy(self.server_config_extra))
+
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
@@ -2332,6 +2383,12 @@ class PerfSanityTestConfig:
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
         internal_request_auth_key = self._resolve_internal_request_auth_key(config)
+        # Optional disagg-server-level keys, same names as bench-trtllm-disagg's
+        # sweep config so a recipe can be carried over unchanged.
+        router_config = config.get("router_config", None)
+        ctx_router_config = config.get("ctx_router_config", None)
+        gen_router_config = config.get("gen_router_config", None)
+        server_config_extra = config.get("server_config_extra", None)
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -2404,6 +2461,10 @@ class PerfSanityTestConfig:
                 hardware=hardware,
                 server_env_var=server_env_var,
                 internal_request_auth_key=internal_request_auth_key,
+                router_config=router_config,
+                ctx_router_config=ctx_router_config,
+                gen_router_config=gen_router_config,
+                server_config_extra=server_config_extra,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -2604,6 +2665,10 @@ class PerfSanityTestConfig:
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
             internal_request_auth_key=disagg_config.internal_request_auth_key,
+            router_config=disagg_config.router_config,
+            ctx_router_config=disagg_config.ctx_router_config,
+            gen_router_config=disagg_config.gen_router_config,
+            server_config_extra=disagg_config.server_config_extra,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )
