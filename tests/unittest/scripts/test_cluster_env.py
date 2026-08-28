@@ -87,7 +87,8 @@ def test_gpu_type_from_supported_gpus(
         ),
         (
             "oci-aga-cs-001",
-            "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
+            "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp "
+            "UCX_TCP_AF_PRIO=inet UCX_NET_DEVICES=eth0",
         ),
         (
             "aws-cmh",
@@ -103,7 +104,10 @@ def test_get_ucx_tls_cmd_selects_cluster_rule(
 ) -> None:
     command = cluster_env_module.get_ucx_tls_cmd(cluster_name, "B200")
 
-    assert command == f"{cluster_env_module.BASE_UCX_UNSET} && {expected_export} &&"
+    assert command == (
+        f"{cluster_env_module.BASE_UCX_UNSET} && {expected_export} && "
+        f"{cluster_env_module.PRESERVE_UCX_ENV} &&"
+    )
 
 
 @pytest.mark.parametrize("cluster_name", ("", "unknown-cluster"))
@@ -112,4 +116,6 @@ def test_get_ucx_tls_cmd_uses_base_unset_for_unknown_cluster(
 ) -> None:
     command = cluster_env_module.get_ucx_tls_cmd(cluster_name, "GB300")
 
-    assert command == f"{cluster_env_module.BASE_UCX_UNSET} &&"
+    assert command == (
+        f"{cluster_env_module.BASE_UCX_UNSET} && {cluster_env_module.PRESERVE_UCX_ENV} &&"
+    )

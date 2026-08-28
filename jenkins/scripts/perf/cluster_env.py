@@ -25,7 +25,12 @@ from fnmatch import fnmatch
 # Applied on every cluster before any cluster-specific export: clear settings
 # that may leak in from the outer environment and break UCX transport
 # auto-selection.
-BASE_UCX_UNSET = "unset UCX_CUDA_IPC_ENABLE_MNNVL UCX_TLS UCX_NET_DEVICES"
+BASE_UCX_UNSET = (
+    "unset UCX_CUDA_IPC_ENABLE_MNNVL UCX_TLS UCX_NET_DEVICES "
+    "UCX_TCP_AF_PRIO UCX_IB_GID_INDEX UCX_IB_TRAFFIC_CLASS UCX_IB_SL "
+    "UCX_IB_MLX5_DEVX"
+)
+PRESERVE_UCX_ENV = "export TRTLLM_PRESERVE_UCX_ENV=1"
 
 # (cluster_pattern, gpu_pattern, extra_export) — evaluated in order, first
 # match wins; the matched export is appended after BASE_UCX_UNSET (empty
@@ -45,11 +50,12 @@ UCX_ENV_RULES = [
         " UCX_IB_GID_INDEX=auto UCX_IB_TRAFFIC_CLASS=52 UCX_IB_SL=0",
     ),
     # oci-aga: use TCP over IPv4 alongside the local CUDA/shared-memory
-    # transports.
+    # transports, and keep TCP off the RDMA VF interfaces that have no usable
+    # container-visible IP address.
     (
         "oci-aga*",
         "*",
-        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
+        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet UCX_NET_DEVICES=eth0",
     ),
     # oci-hsg: UCX picks wrong RDMA devices; pin the usable mlx5 ports and
     # keep eth0 as the TCP fallback device.
@@ -156,5 +162,22 @@ def get_ucx_tls_cmd(cluster_name, gpu_type):
             extra = cmd
             break
     if extra:
-        return f"{BASE_UCX_UNSET} && {extra} &&"
-    return f"{BASE_UCX_UNSET} &&"
+        return f"{BASE_UCX_UNSET} && {extra} && {PRESERVE_UCX_ENV} &&"
+    return f"{BASE_UCX_UNSET} && {PRESERVE_UCX_ENV} &&"
+
+
+def get_ucx_env_cmd(
+    runtime_mode: str,
+    hardware_config: dict[str, int],
+    cluster_name: str,
+    gpu_type: str,
+) -> str:
+    """Return cluster-specific UCX setup for launches that can initialize UCX.
+
+    Disaggregated launches can initialize UCX even in single-rank roles through
+    the cache transceiver. Aggregated launches initialize it through MPI only
+    when the model spans multiple ranks.
+    """
+    if runtime_mode == "aggregated" and hardware_config.get("gpus_per_server", 1) <= 1:
+        return ""
+    return get_ucx_tls_cmd(cluster_name, gpu_type)

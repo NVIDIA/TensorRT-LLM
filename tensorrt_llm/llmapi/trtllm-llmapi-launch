@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -Eeo pipefail
 
 task_with_command=("$@")
@@ -68,6 +82,28 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         I_MPI_ HYDRA_ KMP_ MPICH_ MV2_ CRAY_
     )
 
+    # Perf launchers normalize cluster-specific UCX behavior before entering
+    # this script. Preserve only that explicit allowlist across the MPI cleanup;
+    # all other UCX runtime state remains blacklisted from the child process.
+    ucx_env_passthrough=()
+    if [[ "${TRTLLM_PRESERVE_UCX_ENV:-0}" == "1" ]]; then
+        ucx_env_allowlist=(
+            UCX_CUDA_IPC_ENABLE_MNNVL
+            UCX_TLS
+            UCX_NET_DEVICES
+            UCX_TCP_AF_PRIO
+            UCX_IB_GID_INDEX
+            UCX_IB_TRAFFIC_CLASS
+            UCX_IB_SL
+            UCX_IB_MLX5_DEVX
+        )
+        for var in "${ucx_env_allowlist[@]}"; do
+            if [[ -v "$var" ]]; then
+                ucx_env_passthrough+=("$var=${!var}")
+            fi
+        done
+    fi
+
     (
         # Remove MPI-related variables only in the subshell context
         for var in $(compgen -e); do
@@ -77,6 +113,10 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
                     break
                 fi
             done
+        done
+
+        for assignment in "${ucx_env_passthrough[@]}"; do
+            export "$assignment"
         done
 
         # Turn off "exit on error" so the following lines always run
