@@ -105,9 +105,6 @@ _FMHA_SELECTION_SEQ_LEN_Q_GRID: Tuple[int, ...] = (1, 2, 4, 8, 32, 64, 128)
 
 
 class _FmhaSelectionCacheKey(NamedTuple):
-    attention_input_type: AttentionInputType
-    has_context: bool
-    has_generation: bool
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
@@ -126,8 +123,9 @@ def _normalize_fmha_selection_grid_value(value: int, grid: Tuple[int,
 
 
 def _is_fmha_selection_cache_enabled() -> bool:
-    # CuTe DSL MLA intentionally relaxes its performance gate while tuning.
-    # Do not let those temporary selections read or populate the serving cache.
+    # Selection policy may differ while tuning (currently for CuTe DSL MLA).
+    # Keep all temporary selections out of the serving cache so future FMHAs
+    # inherit the same cache boundary.
     from tensorrt_llm._torch.autotuner import AutoTuner
 
     autotuner = AutoTuner._instance
@@ -1859,27 +1857,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         FMHA selection inputs not represented here must remain invariants for
         the cache lifetime. Rebuilding the FMHA library list starts a new one.
+
+        The batch fields describe the complete source scheduler batch, even
+        when ``q`` contains only one compacted phase. A zero generation Q
+        length distinguishes a context-only subcall from a generation-active
+        subcall with the same source batch composition. Ordinary attention
+        instances use mixed inputs, while MLA instances use those compacted
+        phase calls, so these values encode the per-instance input regimes.
         """
         attention_input_type = forward_args.attention_input_type
-        has_context = metadata.num_contexts > 0
-        has_generation = metadata.num_generations > 0
         output_dtype = (forward_args.output.dtype
                         if forward_args.output is not None else None)
         output_sf_dtype = (forward_args.output_sf.dtype
                            if forward_args.output_sf is not None else None)
 
-        context_batch_size = 0
-        if (attention_input_type != AttentionInputType.generation_only
-                and has_context):
-            context_batch_size = _normalize_fmha_selection_grid_value(
-                metadata.num_contexts, _FMHA_SELECTION_BATCH_SIZE_GRID)
-
-        generation_batch_size = 0
+        context_batch_size = _normalize_fmha_selection_grid_value(
+            metadata.num_contexts, _FMHA_SELECTION_BATCH_SIZE_GRID)
+        generation_batch_size = _normalize_fmha_selection_grid_value(
+            metadata.num_generations, _FMHA_SELECTION_BATCH_SIZE_GRID)
         generation_seq_len_q = 0
         if (attention_input_type != AttentionInputType.context_only
-                and has_generation):
-            generation_batch_size = _normalize_fmha_selection_grid_value(
-                metadata.num_generations, _FMHA_SELECTION_BATCH_SIZE_GRID)
+                and metadata.num_generations > 0):
             num_generation_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
                 num_generation_tokens -= metadata.num_ctx_tokens
@@ -1889,9 +1887,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
 
         return _FmhaSelectionCacheKey(
-            attention_input_type=attention_input_type,
-            has_context=has_context,
-            has_generation=has_generation,
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
@@ -1907,7 +1902,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Optional[Fmha]:
-        if (self.is_mla_enable and not _is_fmha_selection_cache_enabled()):
+        if not _is_fmha_selection_cache_enabled():
             return self._select_fmha_uncached(q, k, v, metadata, forward_args)
 
         cache_key = self._make_fmha_selection_cache_key(q, metadata,

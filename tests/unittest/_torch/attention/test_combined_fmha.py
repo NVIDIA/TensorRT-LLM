@@ -506,6 +506,9 @@ def test_context_fmha_selection_cache_uses_only_batch_grid() -> None:
 
 def test_fmha_selection_cache_key_tracks_phase_composition() -> None:
     backend = _make_selection_backend()
+    removed_fields = {"attention_input_type", "has_context", "has_generation"}
+    assert removed_fields.isdisjoint(trtllm_backend._FmhaSelectionCacheKey._fields)
+
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     pure_generation = backend._make_fmha_selection_cache_key(
         torch.empty((2, 4)),
@@ -519,9 +522,55 @@ def test_fmha_selection_cache_key_tracks_phase_composition() -> None:
     )
 
     assert pure_generation != mixed_generation
-    assert not pure_generation.has_context
-    assert mixed_generation.has_context
-    assert mixed_generation.context_batch_size == 0
+    assert pure_generation.context_batch_size == 0
+    assert mixed_generation.context_batch_size == 3
+    assert pure_generation.generation_batch_size == mixed_generation.generation_batch_size
+    assert pure_generation.generation_seq_len_q == mixed_generation.generation_seq_len_q
+
+
+def test_fmha_selection_cache_key_distinguishes_compacted_phases() -> None:
+    backend = _make_selection_backend()
+    backend.is_mla_enable = True
+    metadata = _make_selection_metadata(num_contexts=3, num_generations=2, num_ctx_tokens=6)
+    context = backend._make_fmha_selection_cache_key(
+        torch.empty((6, 4)),
+        metadata,
+        AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+    )
+    generation = backend._make_fmha_selection_cache_key(
+        torch.empty((2, 4)),
+        metadata,
+        AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
+    )
+
+    assert context != generation
+    assert context.context_batch_size == generation.context_batch_size
+    assert context.generation_batch_size == generation.generation_batch_size
+    assert context.generation_seq_len_q == 0
+    assert generation.generation_seq_len_q == 1
+
+
+def test_fmha_selection_cache_key_tracks_mixed_generation_q_length() -> None:
+    backend = _make_selection_backend()
+    metadata = _make_selection_metadata(
+        num_contexts=1,
+        num_generations=1,
+        num_ctx_tokens=32,
+    )
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
+
+    single_token = backend._make_fmha_selection_cache_key(
+        torch.empty((33, 4)), metadata, forward_args
+    )
+    four_tokens = backend._make_fmha_selection_cache_key(
+        torch.empty((36, 4)), metadata, forward_args
+    )
+
+    assert single_token.context_batch_size == four_tokens.context_batch_size
+    assert single_token.generation_batch_size == four_tokens.generation_batch_size
+    assert single_token.generation_seq_len_q == 1
+    assert four_tokens.generation_seq_len_q == 4
+    assert single_token != four_tokens
 
 
 def test_fmha_selection_cache_tracks_lora_output_representation() -> None:
@@ -626,33 +675,50 @@ def test_fmha_selection_cache_keeps_combined_selections_immutable() -> None:
 
 
 def test_fmha_selection_cache_is_bypassed_while_autotuning() -> None:
-    events: list[tuple] = []
-    backend = _make_selection_backend()
-    backend.is_mla_enable = True
-    fmha = _TestFmha(backend, "fmha", events)
-    backend.fmha_libs = [fmha]
-    metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    q = torch.empty((1, 4))
+    cases = (
+        (False, AttentionInputType.mixed, 1, 1, 1, 2),
+        (True, AttentionInputType.context_only, 1, 0, 1, 1),
+        (True, AttentionInputType.generation_only, 0, 1, 0, 1),
+    )
+    for (
+        is_mla_enable,
+        attention_input_type,
+        num_contexts,
+        num_generations,
+        num_ctx_tokens,
+        num_q_tokens,
+    ) in cases:
+        events: list[tuple] = []
+        backend = _make_selection_backend()
+        backend.is_mla_enable = is_mla_enable
+        fmha = _TestFmha(backend, "fmha", events)
+        backend.fmha_libs = [fmha]
+        metadata = _make_selection_metadata(
+            num_contexts=num_contexts,
+            num_generations=num_generations,
+            num_ctx_tokens=num_ctx_tokens,
+        )
+        forward_args = AttentionForwardArgs(attention_input_type=attention_input_type)
+        q = torch.empty((num_q_tokens, 4))
 
-    with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=False):
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
-    assert not backend._fmha_selection_cache
-    with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
-    with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=False):
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
-    with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
+        with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=False):
+            assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
+            assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
+        assert not backend._fmha_selection_cache
+        with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
+            assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
+            assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
+        with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=False):
+            assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
+        with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
+            assert backend._select_fmha(q, None, None, metadata, forward_args) is fmha
 
-    assert events == [
-        ("support", "fmha", None),
-        ("support", "fmha", None),
-        ("support", "fmha", None),
-        ("support", "fmha", None),
-    ]
+        assert events == [
+            ("support", "fmha", None),
+            ("support", "fmha", None),
+            ("support", "fmha", None),
+            ("support", "fmha", None),
+        ]
 
 
 def test_fmha_selection_cache_does_not_cache_failed_selection() -> None:
