@@ -505,6 +505,22 @@ def preparation(pipeline, testFilter, globalVars)
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
+        stage("Upload Build Info") {
+            try {
+                def branch = globalVars[BUILD_BRANCH]
+                def buildInfo = "commit=${env.gitlabCommit}\n" +
+                    "branch=${branch}\n" +
+                    "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                    "jenkins_url=${env.BUILD_URL}"
+                writeFile file: 'build_info.txt', text: buildInfo
+                trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+                pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo "Upload Build Info failed: ${e.toString()}"
+            }
+        }
         stage("Merge Test Waive List") {
             if (testFilter[INFRA_DRY_RUN]) {
                 echo "Skipping Merge Test Waive List for the infrastructure dry run."
@@ -661,6 +677,15 @@ def getGitlabMRChangedFile(pipeline, function, filePath="") {
                 rawDataList.each { rawData ->
                     result += [rawData.get("old_path"), rawData.get("new_path")]
                 }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("old_path"), rawData.get("new_path")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("diff") }
+                }
             }
             if (!rawDataList) { break }
         }
@@ -707,6 +732,15 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 }
                 rawDataList.each { rawData ->
                     result += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+                }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("filename"), rawData.get("previous_filename")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") }
                 }
             }
             if (!rawDataList) { break }
@@ -907,11 +941,18 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             returnStdout: true,
         ).trim()
         def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+        def filesNeedingDiff = changedFiles.findAll { filePath ->
+            _cbtsMatchesAnyPattern(filePath, needsDiffFor)
+        }
         def diffs = [:]
-        for (f in changedFiles) {
-            if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
+        if (filesNeedingDiff) {
+            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+            def fileChanges = githubPrApiUrl != null
+                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
-                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f) ?: ""
+                [(filePath): fileChanges[filePath] ?: ""]
             }
         }
 
@@ -996,7 +1037,7 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        // artifact.py resolves, downloads and unpacks; paths come back
+        // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
@@ -2055,6 +2096,28 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
+                // BOLT profile generation (producer): refreshes the branch-keyed
+                // `latest` bundle the BOLT consumers pull, on this pipeline's
+                // cadence. Post-merge only -- it profiles the SBSA build just
+                // built under three multi-hour GPU workloads, so it must never
+                // land on a pre-merge /bot run. Best-effort: the producer depends
+                // on external SLURM health and bundles are drift-tolerant, so a
+                // failure just leaves `latest` where it was; it must not fail
+                // post-merge nor block the tests behind it.
+                if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    stage("[BOLT-Profile-Gen] Remote Run") {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            def additionalParameters = [
+                                "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                                'targetArch': "aarch64-linux-gnu",
+                                'branch': globalVars[BUILD_BRANCH],
+                                'promote': "true",
+                            ]
+                            launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
+                        }
+                    }
+                }
+
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 def singleGpuInfraIncomplete = false
@@ -2211,6 +2274,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'wait_success_seconds': "",
                             ]
                         }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
+                        }
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2278,6 +2344,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
+                        }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
                         }
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2406,20 +2475,6 @@ pipeline {
         }
         always {
             script {
-                stage("Upload Build Info") {
-                    try {
-                        def branch = globalVars[BUILD_BRANCH]
-                        def buildInfo = "commit=${env.gitlabCommit}\n" +
-                            "branch=${branch}\n" +
-                            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
-                            "jenkins_url=${env.BUILD_URL}"
-                        writeFile file: 'build_info.txt', text: buildInfo
-                        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-                        echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
-                    } catch (Exception e) {
-                        echo "Upload Build Info failed: ${e.toString()}"
-                    }
-                }
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter, globalVars)
                 }
