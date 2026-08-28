@@ -4,9 +4,10 @@
 from tensorrt_llm.llmapi.llm_args import TorchCompileConfig
 
 
-def test_compile_generation_defaults_to_enabled():
-    assert TorchCompileConfig().compile_generation
+def test_compile_only_context_and_mixed_graphs_defaults_to_disabled():
+    assert not TorchCompileConfig().compile_only_context_and_mixed_graphs
 
 
-def test_compile_generation_can_be_disabled():
-    assert not TorchCompileConfig(compile_generation=False).compile_generation
+def test_compile_only_context_and_mixed_graphs_can_be_enabled():
+    config = TorchCompileConfig(compile_only_context_and_mixed_graphs=True)
+    assert config.compile_only_context_and_mixed_graphs
