@@ -59,6 +59,9 @@ if TYPE_CHECKING:
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
+# Python's errno module omits Linux's EBADHANDLE value.
+_LINUX_EBADHANDLE = 521
+
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
@@ -83,7 +86,7 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
         # (the post-EEXIST is_dir() recheck sees a stale attribute cache).
         # An un-creatable lock dir is broken infra, not contention.
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
-                             errno.ESTALE, errno.EEXIST)
+                             errno.ESTALE, errno.EEXIST, _LINUX_EBADHANDLE)
     return False
 
 
@@ -156,7 +159,7 @@ def hf_remote_code_lock(timeout: int = 10) -> Iterator[None]:
     try:
         is_filler = _try_take_lock(lock)
     except (PermissionError, OSError) as e:
-        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        # Broken lock infra (permissions or NFS errors): retry on a tempdir lock.
         if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
