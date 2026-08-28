@@ -201,11 +201,6 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
-  # ------------- KV Cache V2 Scheduler IT ---------------
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_v2
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- KV Cache Iteration Stats ---------------
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse

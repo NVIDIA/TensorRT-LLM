@@ -894,14 +894,7 @@ def llm_lora_model_root(request):
         model_list = [request.param]
 
     for item in model_list:
-        if item == "Japanese-Alpaca-LoRA-7b-v0":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models",
-                             "Japanese-Alpaca-LoRA-7b-v0"))
-        elif item == "luotuo-lora-7b-0.1":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models", "luotuo-lora-7b-0.1"))
-        elif item == "peft-lora-starcoder2-15b-unity-copilot":
+        if item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
                     models_root,

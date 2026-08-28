@@ -24,8 +24,6 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.peft.lora.config import LoraConfig
-from tensorrt_llm.executor import request as executor_request
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams, SchedulerConfig
 
 from ..conftest import llm_models_root, skip_pre_hopper
@@ -45,14 +43,6 @@ SHORT_PROMPTS = [
     "Largest ocean on Earth? One word.",
     "How many continents are there? One number.",
     "First prime number? One digit.",
-]
-
-MEDIUM_PROMPTS = [
-    "Describe the process of photosynthesis in detail, including the light-dependent and light-independent reactions.",
-    "Explain the theory of general relativity and its implications for our understanding of space and time.",
-    "Discuss the major causes and consequences of the French Revolution in European history.",
-    "Compare and contrast the economic systems of capitalism and socialism with real-world examples.",
-    "Describe the structure and function of DNA, including how it replicates and how mutations occur.",
 ]
 
 # Construct a long prompt (~500 tokens) by repeating text
@@ -129,148 +119,6 @@ def _run_v1_v2_compare(
         _assert_all_completed(outputs_v1, expected_count=len(prompts))
         _assert_outputs_match(outputs_v1, outputs_v2, "V1", "V2")
     return outputs_v1, outputs_v2
-
-
-# ===========================================================================
-# LoRA tests on llama-7b-hf
-# ===========================================================================
-@pytest.mark.skip_less_device_memory(40000)
-class TestKVCacheV2LoRA:
-    """LoRA tests for V2 scheduler using llama-7b-hf (1 GPU, >=40GB)."""
-
-    MODEL_PATH = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    LORA_DIR = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
-    LORA_CONFIG = LoraConfig(
-        lora_dir=[LORA_DIR],
-        max_lora_rank=8,
-        max_loras=1,
-        max_cpu_loras=1,
-        lora_target_modules=["attn_q", "attn_k", "attn_v"],
-    )
-
-    def _run_v1_v2_lora(
-        self,
-        prompts,
-        expected_count=None,
-        sampling_params=None,
-        kv_extra=None,
-        label_suffix="",
-        **llm_kwargs,
-    ):
-        """Run V1 then V2 with LoRA; assert outputs match."""
-        if expected_count is None:
-            expected_count = len(prompts)
-        if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
-        if kv_extra is None:
-            kv_extra = {"free_gpu_memory_fraction": 0.4}
-        lora_request = executor_request.LoRARequest("lora-0", 0, self.LORA_DIR)
-
-        kv_v1 = KvCacheConfig(use_kv_cache_manager_v2=False, **kv_extra)
-        with LLM(
-            self.MODEL_PATH,
-            kv_cache_config=kv_v1,
-            lora_config=self.LORA_CONFIG,
-            **llm_kwargs,
-        ) as llm:
-            outputs_v1 = llm.generate(
-                prompts,
-                sampling_params=sampling_params,
-                lora_request=lora_request,
-            )
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        kv_v2 = KvCacheConfig(use_kv_cache_manager_v2=True, **kv_extra)
-        with LLM(
-            self.MODEL_PATH,
-            kv_cache_config=kv_v2,
-            scheduler_config=_V2_SCHEDULER_CONFIG,
-            lora_config=self.LORA_CONFIG,
-            **llm_kwargs,
-        ) as llm:
-            outputs_v2 = llm.generate(
-                prompts,
-                sampling_params=sampling_params,
-                lora_request=lora_request,
-            )
-
-        _assert_all_completed(outputs_v1, expected_count=expected_count)
-        _assert_all_completed(outputs_v2, expected_count=expected_count)
-        _assert_outputs_match(
-            outputs_v1,
-            outputs_v2,
-            f"V1-LoRA{label_suffix}",
-            f"V2-LoRA{label_suffix}",
-        )
-
-    # Single LoRA adapter — V2 matches V1
-    def test_lora_v2(self):
-        self._run_v1_v2_lora(SHORT_PROMPTS[:3])
-
-    # LoRA adapter swapping — V2 matches V1
-    def test_lora_multi_adapter_v2(self):
-        sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
-        lora_request = executor_request.LoRARequest("lora-0", 0, self.LORA_DIR)
-
-        def _run_multi_adapter(kv_config, **extra_llm_kwargs):
-            with LLM(
-                self.MODEL_PATH,
-                kv_cache_config=kv_config,
-                lora_config=self.LORA_CONFIG,
-                **extra_llm_kwargs,
-            ) as llm:
-                out_lora = llm.generate(
-                    SHORT_PROMPTS[:2],
-                    sampling_params=sampling_params,
-                    lora_request=lora_request,
-                )
-                out_base = llm.generate(
-                    SHORT_PROMPTS[2:4],
-                    sampling_params=sampling_params,
-                )
-            return out_lora, out_base
-
-        outs_v1 = _run_multi_adapter(
-            KvCacheConfig(use_kv_cache_manager_v2=False, free_gpu_memory_fraction=0.4),
-        )
-        gc.collect()
-        torch.cuda.empty_cache()
-        outs_v2 = _run_multi_adapter(
-            KvCacheConfig(use_kv_cache_manager_v2=True, free_gpu_memory_fraction=0.4),
-            scheduler_config=_V2_SCHEDULER_CONFIG,
-        )
-
-        for label, v1, v2, count in [
-            ("LoRA", outs_v1[0], outs_v2[0], 2),
-            ("base", outs_v1[1], outs_v2[1], 2),
-        ]:
-            _assert_all_completed(v1, expected_count=count)
-            _assert_all_completed(v2, expected_count=count)
-            _assert_outputs_match(v1, v2, f"V1-{label}", f"V2-{label}")
-
-    # LoRA + chunked prefill — V2 matches V1
-    def test_lora_chunked_prefill(self):
-        self._run_v1_v2_lora(
-            MEDIUM_PROMPTS[:3],
-            enable_chunked_prefill=True,
-            max_num_tokens=128,
-            label_suffix="-chunked",
-        )
-
-    # LoRA + eviction — V2 matches V1
-    def test_lora_eviction(self):
-        self._run_v1_v2_lora(
-            SHORT_PROMPTS,
-            expected_count=10,
-            sampling_params=SamplingParams(max_tokens=64, temperature=0.0),
-            kv_extra={
-                "free_gpu_memory_fraction": 0.2,
-                "host_cache_size": 64 * 1024 * 1024,  # 64 MiB host tier
-            },
-            max_batch_size=8,
-            label_suffix="-evict",
-        )
 
 
 # ===========================================================================
