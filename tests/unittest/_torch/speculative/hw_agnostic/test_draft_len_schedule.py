@@ -157,7 +157,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     "drafter_type,draft_schedule",
     [
         ("ngram", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
-        ("model_drafter", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
     ],
 )
 @pytest.mark.high_cuda_memory

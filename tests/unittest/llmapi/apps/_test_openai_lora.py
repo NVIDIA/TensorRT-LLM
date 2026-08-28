@@ -1,21 +1,7 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import os
 import tempfile
 from dataclasses import asdict
+from typing import List, Optional
 
 import openai
 import pytest
@@ -23,36 +9,33 @@ import yaml
 
 from tensorrt_llm.executor.request import LoRARequest
 
-from ..lora_test_utils import qwen3_5_lora_adapter
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-_LORA_ADAPTER_NAME = "qwen3.5-test-lora"
 
-
-@pytest.fixture(scope="module", ids=["Qwen3.5-4B"])
+@pytest.fixture(scope="module", ids=["llama-models/llama-7b-hf"])
 def model_name() -> str:
-    return "Qwen3.5-4B"
+    return "llama-models/llama-7b-hf"
 
 
 @pytest.fixture(scope="module")
-def lora_adapter_path():
-    with qwen3_5_lora_adapter() as adapter_path:
-        yield adapter_path
+def lora_adapter_names() -> List[Optional[str]]:
+    return [
+        None, "llama-models/luotuo-lora-7b-0.1",
+        "llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    ]
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(lora_adapter_path: str):
+def temp_extra_llm_api_options_file():
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
         extra_llm_api_options_dict = {
-            "max_batch_size": 8,
             "lora_config": {
-                "lora_dir": [lora_adapter_path],
-                "lora_target_modules": ["attn_dense"],
+                "lora_target_modules": ['attn_q', 'attn_k', 'attn_v'],
                 "max_lora_rank": 8,
                 "max_loras": 4,
                 "max_cpu_loras": 4,
@@ -87,71 +70,44 @@ def client(server: RemoteOpenAIServer) -> openai.OpenAI:
     return server.get_client()
 
 
-@pytest.mark.parametrize(
-    "prompt,use_lora",
-    [
-        pytest.param(
-            "The capital of France is",
-            False,
-            id="capital-prompt-base",
-        ),
-        pytest.param(
-            "The capital of France is",
-            True,
-            id="capital-prompt-lora-first-load",
-        ),
-        pytest.param(
-            "The capital of France is",
-            True,
-            id="capital-prompt-lora-reuse",
-        ),
-        pytest.param(
-            "Two plus two equals",
-            False,
-            id="arithmetic-prompt-base",
-        ),
-        pytest.param(
-            "Two plus two equals",
-            True,
-            id="arithmetic-prompt-lora-first-load",
-        ),
-        pytest.param(
-            "Two plus two equals",
-            True,
-            id="arithmetic-prompt-lora-reuse",
-        ),
-    ],
-)
-def test_lora(client: openai.OpenAI, model_name: str, lora_adapter_path: str,
-              prompt: str, use_lora: bool):
-    base_response = None
-    if use_lora:
-        base_response = client.completions.create(
+def test_lora(client: openai.OpenAI, model_name: str,
+              lora_adapter_names: List[str]):
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+        "美国的首都在哪里? \n答案:",
+        "美国的首都在哪里? \n答案:",
+        "アメリカ合衆国の首都はどこですか? \n答え:",
+        "アメリカ合衆国の首都はどこですか? \n答え:",
+        "アメリカ合衆国の首都はどこですか? \n答え:",
+    ]
+    references = [
+        "沃尔玛\n\n## 新闻\n\n* ",
+        "美国的首都是华盛顿。\n\n美国的",
+        "纽约\n\n### カンファレンスの",
+        "Washington, D.C.\nWashington, D.C. is the capital of the United",
+        "华盛顿。\n\n英国の首都是什",
+        "ワシントン\nQ1. アメリカ合衆国",
+    ]
+
+    for prompt, reference, lora_adapter_name in zip(prompts, references,
+                                                    lora_adapter_names * 2):
+        extra_body = {}
+        if lora_adapter_name is not None:
+            lora_req = LoRARequest(lora_adapter_name,
+                                   lora_adapter_names.index(lora_adapter_name),
+                                   get_model_path(lora_adapter_name))
+            extra_body["lora_request"] = asdict(lora_req)
+
+        response = client.completions.create(
             model=model_name,
             prompt=prompt,
             max_tokens=20,
             temperature=0.0,
-            logprobs=1,
+            extra_body=extra_body,
         )
-    extra_body = {}
-    if use_lora:
-        lora_req = LoRARequest(_LORA_ADAPTER_NAME, 1, lora_adapter_path)
-        extra_body["lora_request"] = asdict(lora_req)
-
-    response = client.completions.create(
-        model=model_name,
-        prompt=prompt,
-        max_tokens=20,
-        temperature=0.0,
-        logprobs=1,
-        extra_body=extra_body,
-    )
-    assert response.choices
-    assert response.usage.completion_tokens > 0
-    if use_lora:
-        assert base_response is not None
-        lora_choice = response.choices[0]
-        base_choice = base_response.choices[0]
-        assert (lora_choice.text != base_choice.text
-                or lora_choice.logprobs.token_logprobs
-                != base_choice.logprobs.token_logprobs)
+        output = response.choices[0].text
+        print(f"response: {output}")
+        print(f"reference: {reference}")
+        assert output == reference, (
+            f"Unexpected output for LoRA adapter {lora_adapter_name!r}: "
+            f"prompt={prompt!r}, response={output!r}, reference={reference!r}")

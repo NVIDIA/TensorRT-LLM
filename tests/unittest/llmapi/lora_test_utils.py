@@ -1,31 +1,14 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import json
-import os
 import tarfile
 import tempfile
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Type, Union
+from typing import List, Optional, OrderedDict, Tuple, Type, Union
 
 import pytest
 import torch
-from safetensors.torch import save_file
 from utils.llm_data import llm_models_root
+from utils.util import duplicate_list_to_length, flatten_list, similar
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
@@ -39,171 +22,113 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 
 from .test_utils import DelayedAssert
 
-QWEN3_5_MODEL_DIR = str(llm_models_root() / "Qwen3.5-4B")
-_QWEN3_5_LORA_RANK = 8
 
-
-def create_qwen3_5_lora_adapter(output_dir: str,
-                                model_dir: str = QWEN3_5_MODEL_DIR) -> str:
-    """Create a deterministic adapter for Qwen3.5 full-attention layers."""
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(model_dir, "config.json")) as config_file:
-        config = json.load(config_file)
-
-    text_config = config.get("text_config", config)
-    hidden_size = text_config["hidden_size"]
-    head_dim = text_config["head_dim"]
-    num_attention_heads = text_config["num_attention_heads"]
-    num_hidden_layers = text_config["num_hidden_layers"]
-    layer_types = text_config.get("layer_types")
-    if layer_types is None:
-        full_attention_interval = text_config["full_attention_interval"]
-        layer_types = [
-            "full_attention" if layer_idx %
-            full_attention_interval == full_attention_interval -
-            1 else "linear_attention" for layer_idx in range(num_hidden_layers)
-        ]
-    if len(layer_types) != num_hidden_layers:
-        raise ValueError("Qwen3.5 layer_types must match num_hidden_layers")
-    full_attention_layers = [
-        layer_idx for layer_idx, layer_type in enumerate(layer_types)
-        if layer_type == "full_attention"
-    ]
-    if not full_attention_layers:
-        raise ValueError(
-            "Qwen3.5 LoRA test adapter requires full-attention layers")
-
-    adapter_config = {
-        "base_model_name_or_path": model_dir,
-        "bias": "none",
-        "lora_alpha": 16,
-        "peft_type": "LORA",
-        "r": _QWEN3_5_LORA_RANK,
-        "target_modules": ["o_proj"],
-        "task_type": "CAUSAL_LM",
-    }
-    with open(os.path.join(output_dir, "adapter_config.json"),
-              "w") as config_file:
-        json.dump(adapter_config, config_file)
-
-    projection_size = num_attention_heads * head_dim
-    weights = {}
-    generator = torch.Generator().manual_seed(42)
-    for layer_idx in full_attention_layers:
-        key = f"base_model.model.model.layers.{layer_idx}.self_attn.o_proj"
-        weights[f"{key}.lora_A.weight"] = (torch.randn(_QWEN3_5_LORA_RANK,
-                                                       projection_size,
-                                                       dtype=torch.bfloat16,
-                                                       generator=generator) *
-                                           0.01)
-        weights[f"{key}.lora_B.weight"] = (torch.randn(hidden_size,
-                                                       _QWEN3_5_LORA_RANK,
-                                                       dtype=torch.bfloat16,
-                                                       generator=generator) *
-                                           0.01)
-
-    save_file(weights, os.path.join(output_dir, "adapter_model.safetensors"))
-    return output_dir
-
-
-@contextmanager
-def qwen3_5_lora_adapter() -> Iterator[str]:
-    """Yield a temporary Qwen3.5 adapter directory."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        yield create_qwen3_5_lora_adapter(os.path.join(temp_dir, "lora"))
-
-
-def assert_lora_changes_output(lora_outputs, base_outputs) -> None:
-    """Assert that applying LoRA changes generated tokens or their logprobs."""
-    for output_idx, (lora_output, base_output) in enumerate(
-            zip(lora_outputs, base_outputs, strict=True)):
-        lora_completion = lora_output.outputs[0]
-        base_completion = base_output.outputs[0]
-        if lora_completion.token_ids != base_completion.token_ids:
-            continue
-        logprobs_differ = False
-        for lora_step, base_step in zip(lora_completion.logprobs,
-                                        base_completion.logprobs,
-                                        strict=True):
-            common_token_ids = lora_step.keys() & base_step.keys()
-            if any(
-                    abs(lora_step[token_id].logprob -
-                        base_step[token_id].logprob) > 1e-6
-                    for token_id in common_token_ids):
-                logprobs_differ = True
-                break
-        if not logprobs_differ:
-            raise AssertionError(
-                f"LoRA output {output_idx} matches base model tokens and log probabilities"
-            )
-
-
-def check_qwen3_5_multi_unique_lora_adapters_from_request(
+def check_llama_7b_multi_unique_lora_adapters_from_request(
         lora_adapter_count_per_call: List[int], repeat_calls: int,
         repeats_per_call: int, llm_class: Type[BaseLLM], **llm_kwargs):
-    """Exercise unique adapter IDs, cache eviction, reload, and request reuse."""
+    """Calls llm.generate s.t. for each C in lora_adapter_count_per_call, llm.generate is called with C requests
+    repeated 'repeats_per_call' times, where each request is configured with a unique LoRA adapter ID.
+    This entire process is done in a loop 'repeats_per_call' times with the same requests.
+    Asserts the output of each llm.generate call is similar to the expected.
+    """  # noqa: D205
     total_lora_adapters = sum(lora_adapter_count_per_call)
-    with qwen3_5_lora_adapter() as lora_dir:
-        lora_requests = [
-            LoRARequest(f"qwen35-{index}", index, lora_dir)
-            for index in range(total_lora_adapters)
-        ]
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    hf_lora_dirs = [
+        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
+        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    ]
+    # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
+    prompt_to_references = OrderedDict({
+        "美国的首都在哪里? \n答案:": [
+            "美国的首都是华盛顿。\n\n美国的",
+            "纽约\n\n### カンファレンスの",
+        ],
+        "アメリカ合衆国の首都はどこですか? \n答え:": [
+            "华盛顿。\n\n英国の首都是什",
+            "ワシントン\nQ1. アメリカ合衆国",
+        ],
+    })
 
-        llm = llm_class(QWEN3_5_MODEL_DIR, **llm_kwargs)
-        try:
-            for _ in range(repeat_calls):
-                first = 0
-                for adapter_count in lora_adapter_count_per_call:
-                    prompts = (["The capital of France is"] * adapter_count *
-                               repeats_per_call)
-                    sampling_params = SamplingParams(max_tokens=20,
-                                                     temperature=0.0,
-                                                     logprobs=0)
-                    outputs = llm.generate(
-                        prompts,
-                        sampling_params,
-                        lora_request=lora_requests[first:first + adapter_count]
-                        * repeats_per_call,
-                    )
-                    assert len(outputs) == adapter_count * repeats_per_call
-                    assert all(output.outputs[0].token_ids
-                               for output in outputs)
-                    base_outputs = llm.generate(prompts, sampling_params)
-                    assert_lora_changes_output(outputs, base_outputs)
-                    first += adapter_count
-        finally:
-            llm.shutdown()
+    prompts_to_generate = duplicate_list_to_length(
+        flatten_list([[prompt] * len(hf_lora_dirs)
+                      for prompt in prompt_to_references.keys()]),
+        total_lora_adapters)
+    references = duplicate_list_to_length(
+        flatten_list(list(prompt_to_references.values())), total_lora_adapters)
+    lora_requests = [
+        LoRARequest(str(i), i, hf_lora_dirs[i % len(hf_lora_dirs)])
+        for i in range(total_lora_adapters)
+    ]
+    llm = llm_class(hf_model_dir, **llm_kwargs)
+
+    # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
+    try:
+        for _ in range(repeat_calls):
+            last_idx = 0
+            for adapter_count in lora_adapter_count_per_call:
+                sampling_params = SamplingParams(max_tokens=20)
+                outputs = llm.generate(
+                    prompts_to_generate[last_idx:last_idx + adapter_count] *
+                    repeats_per_call,
+                    sampling_params,
+                    lora_request=lora_requests[last_idx:last_idx +
+                                               adapter_count] *
+                    repeats_per_call)
+                for output, ref in zip(
+                        outputs, references[last_idx:last_idx + adapter_count] *
+                        repeats_per_call):
+                    assert similar(output.outputs[0].text, ref)
+                last_idx += adapter_count
+    finally:
+        llm.shutdown()
 
 
-def check_qwen3_5_multi_lora_from_request_test_harness(llm_class: Type[BaseLLM],
-                                                       **llm_kwargs) -> None:
-    """Generate base and multi-ID LoRA requests in one batch."""
-    with qwen3_5_lora_adapter() as lora_dir:
-        lora_requests = [
-            LoRARequest(f"qwen35-{index}", index, lora_dir)
-            for index in range(2)
-        ]
-        request_pattern = [
-            None,
-            lora_requests[0],
-            lora_requests[1],
-            None,
-            lora_requests[0],
-            lora_requests[1],
-        ]
+def check_llama_7b_multi_lora_from_request_test_harness(
+        llm_class: Type[BaseLLM], **llm_kwargs) -> None:
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
+    hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+        "美国的首都在哪里? \n答案:",
+        "美国的首都在哪里? \n答案:",
+        "アメリカ合衆国の首都はどこですか? \n答え:",
+        "アメリカ合衆国の首都はどこですか? \n答え:",
+        "アメリカ合衆国の首都はどこですか? \n答え:",
+    ]
+    references = [
+        "沃尔玛\n\n## 新闻\n\n* ",
+        "美国的首都是华盛顿。\n\n美国的",
+        "纽约\n\n### カンファレンスの",
+        "Washington, D.C.\nWashington, D.C. is the capital of the United",
+        "华盛顿。\n\n英国の首都是什",
+        "ワシントン\nQ1. アメリカ合衆国",
+    ]
+    key_words = [
+        "沃尔玛",
+        "华盛顿",
+        "纽约",
+        "Washington",
+        "华盛顿",
+        "ワシントン",
+    ]
+    lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
+    lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
+    sampling_params = SamplingParams(max_tokens=20)
 
-        with llm_class(QWEN3_5_MODEL_DIR, **llm_kwargs) as llm:
-            outputs = llm.generate(
-                ["The capital of France is"] * len(request_pattern),
-                SamplingParams(max_tokens=20, temperature=0.0, logprobs=0),
-                lora_request=request_pattern,
-            )
-
-        assert len(outputs) == len(request_pattern)
-        assert all(output.outputs[0].token_ids for output in outputs)
-        assert_lora_changes_output(
-            [outputs[1], outputs[2], outputs[4], outputs[5]],
-            [outputs[0], outputs[0], outputs[3], outputs[3]])
+    llm = llm_class(hf_model_dir, **llm_kwargs)
+    try:
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=[
+                                   None, lora_req1, lora_req2, None, lora_req1,
+                                   lora_req2
+                               ])
+    finally:
+        llm.shutdown()
+    for output, ref, key_word in zip(outputs, references, key_words):
+        assert similar(output.outputs[0].text,
+                       ref) or key_word in output.outputs[0].text
 
 
 def create_mock_nemo_lora_checkpoint(

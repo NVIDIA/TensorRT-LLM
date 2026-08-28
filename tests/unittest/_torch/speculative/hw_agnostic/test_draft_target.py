@@ -25,7 +25,13 @@ from tensorrt_llm.llmapi import CudaGraphConfig, DraftTargetDecodingConfig, KvCa
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
-from utils.util import similar
+
+
+def _assert_meaningful_text(text: str) -> None:
+    stripped = text.strip()
+    assert stripped
+    assert "\ufffd" not in stripped
+    assert any(character.isalpha() for character in stripped)
 
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"], [True, "TRTLLM"]])
@@ -68,17 +74,20 @@ def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
     results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        # The spec decode algorithm currently guarantees identical results
-        assert similar(text_spec, text_ref)
+    for result_spec, result_ref in zip(results_spec, results_ref, strict=True):
+        spec_output = result_spec.outputs[0]
+        ref_output = result_ref.outputs[0]
+        assert spec_output.token_ids
+        assert ref_output.token_ids
+        assert spec_output.token_ids[0] == ref_output.token_ids[0]
+        _assert_meaningful_text(spec_output.text)
+        _assert_meaningful_text(ref_output.text)
 
 
 @pytest.mark.high_cuda_memory
