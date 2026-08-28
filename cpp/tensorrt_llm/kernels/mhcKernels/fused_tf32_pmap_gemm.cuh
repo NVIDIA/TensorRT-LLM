@@ -165,6 +165,18 @@ __device__ __forceinline__ float2 fma_f32x2_vv(float2 a, float2 b, float2 c)
 #endif
 }
 
+// The read-only cache is not coherent with stores issued earlier by the same
+// kernel, so Phase 4's store-to-load path cannot use __ldg.
+__device__ __forceinline__ uint4 ld_global_volatile_u128(uint4 const* addr)
+{
+    uint4 val;
+    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                 : "l"(addr)
+                 : "memory");
+    return val;
+}
+
 __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
     asm volatile(
@@ -1184,8 +1196,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             }
         }
 
-        // Drain any in-flight residual_out TMA stores before exit.
-        cute::tma_store_wait<0>();
+        // tma_store_wait is the `.read` form and retires only the SMEM reads,
+        // so the global writes could still be in flight at the Phase-3 fence.
+        asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
 
         // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
@@ -1245,6 +1258,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             {
                 /* spin */
             }
+            // Acquire the Phase-2 writes published before each increment.
+            __threadfence();
         }
         __syncthreads();
     }
@@ -1396,6 +1411,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // When WARPS_PER_TOK>1, warp_in_team 0..WARPS_PER_TOK-1 together cover
         // HIDDEN in strides of WARPS_PER_TOK * 32 * 8.  When WARPS_PER_TOK==1,
         // each warp sweeps HIDDEN alone (same as the original single-warp case).
+
+        // First read of these addresses, ordered by the acquire fence above, so
+        // __ldg stays for residual read throughput. The layer_input reload below
+        // is the same-thread store-to-load case and cannot.
         __nv_bfloat16 const* rbase = residual_cur_ptr + static_cast<long long>(tok) * HC_MULT * HIDDEN;
         __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * HIDDEN;
 
@@ -1495,7 +1514,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             // Reduce: intra-warp __shfl_xor; cross-warp via SMEM + per-team
             //   named PTX barrier when WARPS_PER_TOK > 1 (KS ≥ 16 instances).
             //   Inactive teams `continue`'d above and never reach this barrier.
-            // Pass 2: re-LDG layer_input_out from L2, multiply by
+            // Pass 2: volatile-reload layer_input_out, multiply by
             //   rsqrt * norm_weight, STG normalized bf16 back to the same
             //   address. Avoids the FMA recompute that doubling pass 1 would
             //   require (Path D Phase 4 is already FMA-heavy).
@@ -1607,13 +1626,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 
             float const rsqrt_val = rsqrtf(sum_sq_local / static_cast<float>(HIDDEN) + norm_eps);
 
-            // Pass 2: re-LDG the un-normalized layer_input we just wrote
-            // (L2-hot), LDG norm_weight, normalize, STG back. No FMA recompute.
+            // Pass 2: reload the un-normalized layer_input this thread wrote,
+            // LDG norm_weight, normalize, STG back. No FMA recompute. Each
+            // thread reloads only its own stores, so no CTA fence is needed --
+            // just a load that bypasses the read-only cache.
             __nv_bfloat16 const* nbase = norm_weight;
 #pragma unroll
             for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
             {
-                uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                uint4 li_raw = ld_global_volatile_u128(reinterpret_cast<uint4 const*>(&obase[h]));
                 uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                 __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
                 __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
@@ -1636,7 +1657,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 if (my_chunk < TAIL_CHUNKS)
                 {
                     const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
-                    uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                    uint4 li_raw = ld_global_volatile_u128(reinterpret_cast<uint4 const*>(&obase[h]));
                     uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                     __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
                     __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
