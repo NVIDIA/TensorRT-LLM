@@ -3762,16 +3762,28 @@ class GvrTopkRegKernel:
             above = s_res[RES_ABOVE]
             m = s_res[RES_M]
             Bv = s_res[RES_B]
+            tot = s_res[RES_TOT]
             need = k - above
             whole = cutlass.Int32(0)
             if need >= m:
                 whole = cutlass.Int32(1)
 
             # ---- ESCAPE: 32-step key-space bisection
+            # Count-crossing enforcement: when the hint-derived bracket's low
+            # edge sits above the true k-th value, the classify arms count
+            # fewer than k entries (q < 0 is never histogrammed) and the
+            # crossing scan pins its bin-0 fallback as a fake crossing — the
+            # whole-bin emit would then stop at the histogram total and leave
+            # out_row[tot:k) unwritten. Exactness must come from the
+            # count-crossing invariant, never from the bracket estimate: when
+            # the histogram never reaches k (tot < k), take the escape — it
+            # ranks the FULL row in key space, independent of the bracket.
             esc = cutlass.Int32(0)
             if whole == cutlass.Int32(0):
                 if m > cmp_:
                     esc = cutlass.Int32(1)
+            if tot < k:
+                esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
                     s_cnt[0] = cutlass.Int32(0)
@@ -3785,6 +3797,15 @@ class GvrTopkRegKernel:
                     s_e12[0] = cutlass.Int32(0)
                     s_e12[1] = cutlass.Int32(0)
                 cute.arch.barrier()  # escape init
+                # Vector-lane bound: the register batch holds real data only
+                # below 4*n4 — lanes in [4*n4, n) are the -inf FILL of the
+                # last partial float4 (the real values there live in tval).
+                # Bounding by n would count/emit each tail element twice
+                # (once as a fill key, once via tval): benign while the tie
+                # threshold is finite (a fill key loses every compare), but
+                # it emits duplicate indices when the tie class is the -inf
+                # key itself (in-window -inf entries are admissible).
+                nvec = n4 << cutlass.Int32(2)
                 klo = cutlass.Uint32(0)
                 bit = cutlass.Int32(31)
                 while bit >= cutlass.Int32(0):
@@ -3794,7 +3815,7 @@ class GvrTopkRegKernel:
                         ix = (
                             (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                         ) + cutlass.Int32(s % 4)
-                        if ix < n:
+                        if ix < nvec:
                             if fkey(_val(frags, s)) >= kt:
                                 cnt = cnt + cutlass.Int32(1)
                     if tid < ntail:
@@ -3818,7 +3839,7 @@ class GvrTopkRegKernel:
                     ix = (
                         (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                     ) + cutlass.Int32(s % 4)
-                    if ix < n:
+                    if ix < nvec:
                         if cutlass.Int64(fkey(_val(frags, s))) > ethr:
                             abv = abv + cutlass.Int32(1)
                 if tid < ntail:
@@ -3839,7 +3860,7 @@ class GvrTopkRegKernel:
                         (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                     ) + cutlass.Int32(s % 4)
                     u64 = cutlass.Int64(-1)
-                    if ixv < n:
+                    if ixv < nvec:
                         u64 = cutlass.Int64(fkey(_val(frags, s)))
                     q1e = cutlass.Int32(0)
                     q2e = cutlass.Int32(0)
