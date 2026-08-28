@@ -1796,7 +1796,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // Unlike the single-GPU-infra-incomplete policy below, post-merge
                 // skips too: with no artifact there is no signal to be had.
                 if (buildInfraIncomplete) {
-                    stage("[Test-x86_64] Skipped - build infra-incomplete") {
+                    stage("[Test-x86_64] Blocked - build infra-incomplete") {
                         echo "x86_64 build was infra-incomplete (UNSTABLE); skipping x86_64 test sub-jobs (no artifact to test). Build stays UNSTABLE."
                     }
                     return
