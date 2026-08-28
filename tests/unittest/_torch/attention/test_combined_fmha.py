@@ -25,8 +25,14 @@ from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    CustomAttentionMask,
+    PredefinedAttentionMask,
+)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization.mode import QuantMode
 
 
@@ -407,11 +413,13 @@ def _make_selection_metadata(
     num_contexts: int,
     num_generations: int,
     num_ctx_tokens: int = 0,
+    use_spec_decoding: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
         num_ctx_tokens=num_ctx_tokens,
+        use_spec_decoding=use_spec_decoding,
     )
 
 
@@ -571,6 +579,104 @@ def test_fmha_selection_cache_key_tracks_mixed_generation_q_length() -> None:
     assert single_token.generation_seq_len_q == 1
     assert four_tokens.generation_seq_len_q == 4
     assert single_token != four_tokens
+
+
+def test_fmha_selection_cache_key_tracks_attention_mask_type() -> None:
+    backend = _make_selection_backend()
+    metadata = _make_selection_metadata(num_contexts=1, num_generations=0)
+    q = torch.empty((4, 4))
+    keys = []
+
+    for attention_mask, expected_mask_type in (
+        (PredefinedAttentionMask.CAUSAL, AttentionMaskType.causal),
+        (PredefinedAttentionMask.FULL, AttentionMaskType.padding),
+        (CustomAttentionMask.CUSTOM, AttentionMaskType.custom_mask),
+    ):
+        key = backend._make_fmha_selection_cache_key(
+            q,
+            metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                attention_mask=attention_mask,
+            ),
+        )
+        assert key.attention_mask_type == expected_mask_type
+        keys.append(key)
+
+    assert len(set(keys)) == 3
+
+
+def test_fmha_selection_cache_tracks_attention_mask_data() -> None:
+    for mask_data_first in (True, False):
+        events: list[tuple] = []
+        backend = _make_selection_backend()
+        implicit_mask_only = _TestFmha(
+            backend,
+            "implicit-mask-only",
+            events,
+            support_predicate=lambda forward_args: forward_args.attention_mask_data is None,
+        )
+        fallback = _TestFmha(backend, "fallback", events)
+        backend.fmha_libs = [implicit_mask_only, fallback]
+        metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
+        q = torch.empty((1, 4))
+        implicit_mask_args = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.generation_only,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+        )
+        mask_data_args = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.generation_only,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            attention_mask_data=torch.empty((1, 1)),
+        )
+        mask_data_key = backend._make_fmha_selection_cache_key(q, metadata, mask_data_args)
+        assert mask_data_key.attention_mask_type == AttentionMaskType.custom_mask
+        request_order = (
+            (mask_data_args, implicit_mask_args)
+            if mask_data_first
+            else (implicit_mask_args, mask_data_args)
+        )
+
+        with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
+            for forward_args in request_order:
+                fresh = backend._select_fmha_uncached(q, None, None, metadata, forward_args)
+                cached = backend._select_fmha(q, None, None, metadata, forward_args)
+
+                assert cached is fresh
+
+        assert (
+            backend._select_fmha(q, None, None, metadata, implicit_mask_args) is implicit_mask_only
+        )
+        assert backend._select_fmha(q, None, None, metadata, mask_data_args) is fallback
+        assert len(backend._fmha_selection_cache) == 2
+
+
+def test_fmha_selection_cache_key_tracks_use_spec_decoding() -> None:
+    backend = _make_selection_backend()
+    q = torch.empty((4, 4))
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    regular = backend._make_fmha_selection_cache_key(
+        q,
+        _make_selection_metadata(
+            num_contexts=0,
+            num_generations=1,
+            use_spec_decoding=False,
+        ),
+        forward_args,
+    )
+    speculative = backend._make_fmha_selection_cache_key(
+        q,
+        _make_selection_metadata(
+            num_contexts=0,
+            num_generations=1,
+            use_spec_decoding=True,
+        ),
+        forward_args,
+    )
+
+    assert not regular.use_spec_decoding
+    assert speculative.use_spec_decoding
+    assert regular != speculative
 
 
 def test_fmha_selection_cache_tracks_lora_output_representation() -> None:

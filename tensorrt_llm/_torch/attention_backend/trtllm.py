@@ -45,9 +45,9 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        CustomAttentionMask, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -108,6 +108,8 @@ class _FmhaSelectionCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
+    attention_mask_type: AttentionMaskType
+    use_spec_decoding: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: Optional[torch.dtype]
@@ -1870,6 +1872,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                         if forward_args.output is not None else None)
         output_sf_dtype = (forward_args.output_sf.dtype
                            if forward_args.output_sf is not None else None)
+        # Explicit mask data has the same FMHA selection constraints as a
+        # custom mask enum, even when the accompanying enum remains causal.
+        attention_mask_type = (AttentionMaskType.custom_mask if (
+            forward_args.attention_mask == CustomAttentionMask.CUSTOM
+            or forward_args.attention_mask_data is not None) else
+                               AttentionMaskType(forward_args.mask_type))
 
         context_batch_size = _normalize_fmha_selection_grid_value(
             metadata.num_contexts, _FMHA_SELECTION_BATCH_SIZE_GRID)
@@ -1890,6 +1898,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
+            attention_mask_type=attention_mask_type,
+            use_spec_decoding=metadata.use_spec_decoding,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )
