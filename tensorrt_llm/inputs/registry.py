@@ -43,6 +43,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
+from .prefix_token_cache import get_prefix_token_cache, prefix_cache_enabled
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -194,6 +195,30 @@ class DefaultInputProcessor(InputProcessor):
             "<|call|>",
             "<|reserved_200013|>",
         }
+        # Multi-turn prompts grow by a small delta each turn, so re-tokenizing
+        # the whole prompt every turn dominates context-server wall time
+        # (measured: 47.4% of it, 43.7 ms/request at ~38k tokens). When the
+        # prefix cache is enabled and the request is a plain long text prompt,
+        # reuse the tokenization of the longest cached prefix and tokenize only
+        # the tail. Requires a fast tokenizer for offset mappings, and is
+        # skipped whenever the arguments would change tokenization
+        # (add_special_tokens, truncation, or a separate query).
+        prompt = inputs.get("prompt")
+        cache = get_prefix_token_cache() if prefix_cache_enabled() else None
+        use_cache = (cache is not None and isinstance(prompt, str)
+                     and len(prompt) >= cache.min_chars
+                     and "query" not in inputs
+                     and getattr(self.tokenizer, "is_fast", False)
+                     and not sampling_params.add_special_tokens
+                     and sampling_params.truncate_prompt_tokens is None)
+        if use_cache:
+            with nvtx_range_debug("tokenize prompt (prefix cache)"):
+                try:
+                    return cache.encode(self.tokenizer, prompt), None
+                except Exception:
+                    # never fail a request over a cache problem
+                    use_cache = False
+
         with nvtx_range_debug("tokenize prompt"):
             try:
                 token_ids = self.tokenizer.encode(
