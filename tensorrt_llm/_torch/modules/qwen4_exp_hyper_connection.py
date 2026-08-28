@@ -56,6 +56,7 @@ _HC_DIRECT_SKINNY_GEMM_ENV = "TRTLLM_QWEN4_EXP_HC_DIRECT_SKINNY_GEMM"
 _HC_FUSED_MIX_ENV = "TRTLLM_QWEN4_EXP_HC_FUSED_MIX"
 _HC_FUSED_MIX_MAX_ROWS = 16
 _HC_FUSED_LOWRANK_ALIGNMENT = 128
+_HC_FUSED_LAYOUT_SLICE_MIN_ROWS = 8192
 
 
 def _fused_mix_requested() -> bool:
@@ -206,12 +207,13 @@ class Qwen4ExpHyperConnection(nn.Module):
             self.input_mix_lowrank_padding = (
                 (-hc_lowrank) % _HC_FUSED_LOWRANK_ALIGNMENT if self.fused_mix_requested else 0
             )
-            self.input_mix_injection_offset = hc_lowrank + self.input_mix_lowrank_padding
-            self.input_mix_padding = (
-                (-(self.input_mix_injection_offset + hc_count)) % 16 if use_combine else 0
-            )
+            self.input_mix_injection_offset = hc_lowrank
+            logical_rows = hc_lowrank + (hc_count if use_combine else 0)
+            self.input_mix_fallback_rows = (logical_rows + 15) // 16 * 16
+            fused_rows = hc_lowrank + self.input_mix_lowrank_padding
+            packed_rows = max(self.input_mix_fallback_rows, fused_rows)
+            self.input_mix_padding = packed_rows - logical_rows
             if use_combine:
-                packed_rows = self.input_mix_injection_offset + hc_count + self.input_mix_padding
                 self.input_mix_weight_down_block_inject = Linear(
                     hc_dim,
                     packed_rows,
@@ -300,39 +302,42 @@ class Qwen4ExpHyperConnection(nn.Module):
         projection = self.input_mix_weight_down_block_inject
         rows = normed.numel() // normed.shape[-1]
         weight = projection.weight
+        runtime_weight = weight[: self.input_mix_fallback_rows]
         direct_eligible = (
             os.environ.get(_HC_DIRECT_SKINNY_GEMM_ENV, "0") == "1"
             and not torch.is_grad_enabled()
             and rows == 1
             and normed.is_cuda
-            and weight.is_cuda
+            and runtime_weight.is_cuda
             and normed.dtype == torch.bfloat16
-            and weight.dtype == torch.bfloat16
+            and runtime_weight.dtype == torch.bfloat16
             and normed.is_contiguous()
-            and weight.is_contiguous()
+            and runtime_weight.is_contiguous()
             and normed.shape[-1] % (128 * 8) == 0
-            and weight.shape[0] % 2 == 0
+            and runtime_weight.shape[0] % 2 == 0
         )
         if not direct_eligible:
-            return projection(normed)
+            if runtime_weight.shape == weight.shape or rows < _HC_FUSED_LAYOUT_SLICE_MIN_ROWS:
+                return projection(normed)
+            return F.linear(normed, runtime_weight)
 
         from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import DirectTactic, run_direct_dense
         from ..flashinfer_utils import get_env_enable_pdl
 
         input_2d = normed.view(1, normed.shape[-1])
         output = torch.empty(
-            (1, weight.shape[0]),
+            (1, runtime_weight.shape[0]),
             dtype=torch.bfloat16,
             device=normed.device,
         )
         run_direct_dense(
             input_2d,
-            weight.t(),
+            runtime_weight.t(),
             output,
             get_env_enable_pdl(),
             DirectTactic(block_size=128, outputs_per_block=2, rows_per_block=1),
         )
-        return output.view(*normed.shape[:-1], weight.shape[0])
+        return output.view(*normed.shape[:-1], runtime_weight.shape[0])
 
     @staticmethod
     def _fused_cuda_eligible(*tensors: torch.Tensor) -> bool:
@@ -388,6 +393,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         packed_projection = self.input_mix_weight_down_block_inject
         packed_weight = packed_projection.weight
         up_weight = self.input_mix_weight_up.weight
+        padded_lowrank = self.hc_lowrank + self.input_mix_lowrank_padding
         if not (
             self.fused_mix_requested
             and not torch.is_grad_enabled()
@@ -402,7 +408,8 @@ class Qwen4ExpHyperConnection(nn.Module):
             and packed_weight.is_contiguous()
             and up_weight.is_contiguous()
             and self.hc_count == 4
-            and self.input_mix_injection_offset % _HC_FUSED_LOWRANK_ALIGNMENT == 0
+            and self.hc_lowrank % 64 == 0
+            and padded_lowrank % _HC_FUSED_LOWRANK_ALIGNMENT == 0
             and is_sm_100f()
         ):
             return None
@@ -415,7 +422,7 @@ class Qwen4ExpHyperConnection(nn.Module):
                 up_weight,
                 self.hc_count,
                 self.hidden_size,
-                self.input_mix_injection_offset,
+                padded_lowrank,
             )
             self._input_mix_weight_up_permuted_padded = permuted_up
 
@@ -454,11 +461,11 @@ class Qwen4ExpHyperConnection(nn.Module):
             dtype=normed.dtype,
             device=normed.device,
         )
-        gate_input = packed[:, : self.input_mix_injection_offset]
+        gate_input = packed[:, :padded_lowrank]
         gate_tactic = default_tactic(
             rows,
             self.hc_count * self.hidden_size,
-            self.input_mix_injection_offset,
+            padded_lowrank,
         )
         run_splitk_dense_gate(
             gate_input,

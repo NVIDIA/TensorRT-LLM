@@ -355,14 +355,9 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                     f"Qwen4-Exp Hyper-Connection {prefix} has an injection "
                     "projection but no input-mix down projection"
                 )
-            lowrank_padding = (
-                (-down.shape[0]) % 128 if os.environ.get(_HC_FUSED_MIX_ENV, "0") == "1" else 0
-            )
-            components = [down]
-            if lowrank_padding:
-                components.append(down.new_zeros((lowrank_padding, down.shape[1])))
-            components.append(inject)
-            padding = (-(down.shape[0] + lowrank_padding + inject.shape[0])) % 16
+            alignment = 128 if os.environ.get(_HC_FUSED_MIX_ENV, "0") == "1" else 16
+            components = [down, inject]
+            padding = (-(down.shape[0] + inject.shape[0])) % alignment
             if padding:
                 components.append(down.new_zeros((padding, down.shape[1])))
             new_weights[f"{prefix}.input_mix_weight_down_block_inject.weight"] = torch.cat(

@@ -584,7 +584,7 @@ def test_mapper_packs_hc_down_and_injection_with_alignment() -> None:
     )
 
 
-def test_mapper_packs_fused_hc_lowrank_padding_before_injection(monkeypatch) -> None:
+def test_mapper_packs_fused_hc_padding_after_injection(monkeypatch) -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
     )
@@ -618,11 +618,10 @@ def test_mapper_packs_fused_hc_lowrank_padding_before_injection(monkeypatch) -> 
 
     packed_name = "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"
     packed = mapped[packed_name]
-    assert packed.shape == (144, 4)
+    assert packed.shape == (128, 4)
     torch.testing.assert_close(packed[:6], down)
-    torch.testing.assert_close(packed[6:128], torch.zeros(122, 4))
-    torch.testing.assert_close(packed[128:130], inject)
-    torch.testing.assert_close(packed[130:], torch.zeros(14, 4))
+    torch.testing.assert_close(packed[6:8], inject)
+    torch.testing.assert_close(packed[8:], torch.zeros(120, 4))
 
 
 def test_mtp_checkpoint_names_map_to_recurrent_runtime_layer() -> None:
