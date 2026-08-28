@@ -487,9 +487,10 @@ def _timed_checkpoint_weight_session(
     checkpoint_dir: str,
     metrics: dict[str, float],
     checkpoint_preparation_metric_name: str,
+    checkpoint_finalization_metric_name: str,
     **kwargs: Any,
 ) -> Iterator[dict[str, Any]]:
-    """Time synchronous session setup and teardown around materialization."""
+    """Time session setup and finalization around materialization."""
     session = _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir,
                                               **kwargs)
     with timing_metric(checkpoint_preparation_metric_name, metrics):
@@ -497,12 +498,12 @@ def _timed_checkpoint_weight_session(
     try:
         yield weights
     except BaseException:
-        with timing_metric(checkpoint_preparation_metric_name, metrics):
+        with timing_metric(checkpoint_finalization_metric_name, metrics):
             suppress = session.__exit__(*sys.exc_info())
         if not suppress:
             raise
     else:
-        with timing_metric(checkpoint_preparation_metric_name, metrics):
+        with timing_metric(checkpoint_finalization_metric_name, metrics):
             session.__exit__(None, None, None)
 
 
@@ -519,9 +520,12 @@ class ModelLoaderMetricNames(Enum):
     TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
     CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
     WEIGHT_POPULATION_SECONDS = "weight_population_seconds"
+    CHECKPOINT_FINALIZATION_SECONDS = "checkpoint_finalization_seconds"
     DRAFT_CHECKPOINT_PREPARATION_SECONDS = (
         "draft_checkpoint_preparation_seconds")
     DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
+    DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
+        "draft_checkpoint_finalization_seconds")
     POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
 
 
@@ -1805,6 +1809,7 @@ class ModelLoader:
         with _timed_checkpoint_weight_session(
                 checkpoint_loader, checkpoint_dir, self._metrics,
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
+                ModelLoaderMetricNames.CHECKPOINT_FINALIZATION_SECONDS.value,
                 **load_weights_kwargs) as weights:
             weights_preloaded = checkpoint_loader.is_weights_preloaded()
             self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
@@ -1827,6 +1832,8 @@ class ModelLoader:
                 self.spec_config.speculative_model,
                 self._metrics,
                 ModelLoaderMetricNames.DRAFT_CHECKPOINT_PREPARATION_SECONDS.
+                value,
+                ModelLoaderMetricNames.DRAFT_CHECKPOINT_FINALIZATION_SECONDS.
                 value,
                 mapping=self.mapping) as weights:
             if model.draft_config is not None:

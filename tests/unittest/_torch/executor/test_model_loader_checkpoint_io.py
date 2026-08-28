@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _construct_checkpoint_loader,
     _open_checkpoint_weight_session,
+    _timed_checkpoint_weight_session,
 )
 from tensorrt_llm.mapping import Mapping
 
@@ -280,6 +281,46 @@ def test_legacy_weight_session_defers_load_until_enter() -> None:
     checkpoint_loader.load_weights.assert_called_once_with("/checkpoint", mapping=mapping)
 
 
+def test_checkpoint_session_times_preparation_and_finalization_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    metrics = {}
+    checkpoint_loader = _SessionCheckpointLoader(events)
+
+    @contextmanager
+    def record_timing(metric_name: str, metric_values: dict[str, float]) -> Iterator[None]:
+        events.append(f"{metric_name}_start")
+        try:
+            yield
+        finally:
+            metric_values[metric_name] = 1.0
+            events.append(f"{metric_name}_end")
+
+    monkeypatch.setattr(model_loader_module, "timing_metric", record_timing)
+
+    with _timed_checkpoint_weight_session(
+        checkpoint_loader,
+        "/checkpoint",
+        metrics,
+        "preparation",
+        "finalization",
+        mapping=object(),
+    ):
+        events.append("materialize")
+
+    assert events == [
+        "preparation_start",
+        "session_enter",
+        "preparation_end",
+        "materialize",
+        "finalization_start",
+        "session_exit",
+        "finalization_end",
+    ]
+    assert metrics == {"preparation": 1.0, "finalization": 1.0}
+
+
 def test_model_loader_session_spans_mapper_and_materialization() -> None:
     events = []
     model = MagicMock()
@@ -306,6 +347,7 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     ]
     assert "checkpoint_preparation_seconds" in loader.metrics
     assert "weight_population_seconds" in loader.metrics
+    assert "checkpoint_finalization_seconds" in loader.metrics
 
 
 def test_draft_session_spans_mapper_and_materialization(
@@ -340,6 +382,7 @@ def test_draft_session_spans_mapper_and_materialization(
     ]
     assert "draft_checkpoint_preparation_seconds" in loader.metrics
     assert "draft_weight_population_seconds" in loader.metrics
+    assert "draft_checkpoint_finalization_seconds" in loader.metrics
 
 
 def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None:
@@ -362,3 +405,4 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None
     assert events == ["session_enter", "materialize", "session_exit"]
     assert "draft_checkpoint_preparation_seconds" in loader.metrics
     assert "draft_weight_population_seconds" in loader.metrics
+    assert "draft_checkpoint_finalization_seconds" in loader.metrics

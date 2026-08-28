@@ -238,6 +238,41 @@ def test_mpi_disabled_distributed_fallback_preserves_native_prefetch(
     reader_start.assert_not_called()
 
 
+def test_collective_native_fallback_failure_escapes_without_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_communicator = mock.Mock()
+    active_communicator.Get_size.return_value = 2
+    active_communicator.allgather.side_effect = lambda value: [value, value]
+    node_communicator = mock.Mock()
+    node_communicator.Get_size.return_value = 2
+
+    loader = _rank_striped_loader()
+    native_load = mock.Mock(side_effect=OSError("rank-local prefetch failure"))
+    close_node_communicator = mock.Mock()
+    monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(weight_loader_module, "close_node_communicator", close_node_communicator)
+
+    with pytest.raises(OSError, match="rank-local prefetch failure"):
+        loader._fallback_to_native(
+            "/unused",
+            Mapping(world_size=2),
+            False,
+            "runtime fallback",
+            active_communicator,
+            node_communicator,
+            allow_native_prefetch=True,
+        )
+
+    native_load.assert_called_once()
+    assert native_load.call_args.kwargs["_local_communicator"] is node_communicator
+    assert native_load.call_args.kwargs["_allow_prefetch"] is True
+    # The only active consensus happens before native loading, while every rank
+    # is still known to be in the same fallback phase.
+    active_communicator.allgather.assert_called_once_with(None)
+    close_node_communicator.assert_not_called()
+
+
 @pytest.mark.parametrize("requested_policy", ["auto", "rank_striped_read_ahead"])
 @pytest.mark.parametrize("partial,available", [(True, 1 << 40), (False, 0)])
 def test_ineligible_request_uses_exact_native_fallback(
@@ -443,7 +478,7 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     success = success_loader.last_checkpoint_io_status.effective
     communicator.Barrier()
 
-    fallback_failure_loader = _rank_striped_loader(partial_model_loading=True)
+    fallback_failure_loader = _rank_striped_loader()
     if rank == world_size - 1:
         original_native_load = fallback_failure_loader._load_weights_native
 
@@ -454,7 +489,9 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         fallback_failure_loader._load_weights_native = fail_after_native_load
     fallback_failure_error = None
     try:
-        fallback_failure_loader.load_weights(checkpoint_dir, mapping=mapping)
+        fallback_failure_loader.load_weights(
+            checkpoint_dir, mapping=Mapping(world_size=1, rank=0, tp_size=1)
+        )
     except BaseException as error:
         fallback_failure_error = str(error)
     communicator.Barrier()

@@ -628,18 +628,30 @@ class HfWeightLoader(BaseWeightLoader):
         if allow_native_prefetch is None:
             allow_native_prefetch = not (mapping.world_size > 1
                                          and fallback_communicator is None)
-        load_error = None
-        try:
-            weights = self._load_weights_native(
+
+        def load_native() -> dict[str, Any]:
+            return self._load_weights_native(
                 checkpoint_dir,
                 mapping,
                 use_consolidated,
                 _local_communicator=fallback_communicator,
                 _allow_prefetch=allow_native_prefetch,
                 **kwargs)
-        except BaseException as error:
-            load_error = error
-            weights = None
+
+        load_error = None
+        native_load_may_use_node_collectives = (
+            allow_native_prefetch and fallback_communicator is not None
+            and fallback_communicator.Get_size() > 1)
+        if native_load_may_use_node_collectives:
+            # A rank-local failure can strand peers in native node collectives.
+            # Let it escape instead of switching to cleanup or active consensus.
+            weights = load_native()
+        else:
+            try:
+                weights = load_native()
+            except BaseException as error:
+                load_error = error
+                weights = None
         close_error = None
         try:
             close_node_communicator(node_communicator)
