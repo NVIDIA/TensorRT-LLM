@@ -146,6 +146,44 @@ def test_malformed_extra_body(raw_value: str) -> None:
         benchmark._parse_extra_body(raw_value)
 
 
+def test_load_and_prepare_action_trajectory(tmp_path: Path) -> None:
+    action_json = tmp_path / "action.json"
+    action_json.write_text(json.dumps([[0.0, 1.0], [2.0, 3.0]]), encoding="utf-8")
+
+    trajectory = benchmark._load_action_trajectory(str(action_json))
+    extra_body = benchmark._prepare_action_extra_body(
+        extra_body={"extra_params": {"action_mode": "forward_dynamics"}},
+        action_trajectory=trajectory,
+    )
+
+    assert extra_body == {
+        "extra_params": {
+            "action_mode": "forward_dynamics",
+            "action": [[0.0, 1.0], [2.0, 3.0]],
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], [[1.0], [2.0, 3.0]], [[True]], [["not numeric"]]],
+)
+def test_load_action_trajectory_rejects_invalid_shape(tmp_path: Path, payload: Any) -> None:
+    action_json = tmp_path / "invalid-action.json"
+    action_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        benchmark._load_action_trajectory(str(action_json))
+
+
+def test_prepare_action_trajectory_rejects_duplicate_value() -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        benchmark._prepare_action_extra_body(
+            extra_body={"extra_params": {"action": [[1.0]]}},
+            action_trajectory=[[2.0]],
+        )
+
+
 def test_prepare_transfer_derives_edge_from_input_reference(tmp_path: Path) -> None:
     input_reference = tmp_path / "source.mp4"
     input_reference.write_bytes(b"source video")
@@ -624,6 +662,85 @@ def test_shell_argument_construction_with_spaces_and_json(tmp_path: Path) -> Non
     }
 
 
+def test_shell_action_policy_uses_tensor_response_and_domain_defaults(tmp_path: Path) -> None:
+    input_reference = tmp_path / "robot observation.jpg"
+    input_reference.write_bytes(b"image bytes")
+
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="policy",
+        INPUT_REFERENCE=str(input_reference),
+        EXTRA_PARAMS='{"domain_name":"bridge_orig_lerobot"}',
+        SAVE_MEDIA="true",
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["mode"] == "policy"
+    assert metadata["input_reference"] == "robot observation.jpg"
+    assert metadata["action_json"] is None
+    assert metadata["request_body"] == {
+        "extra_params": {
+            "domain_name": "bridge_orig_lerobot",
+            "action_mode": "policy",
+        }
+    }
+    assert "--media-dir" in result.stdout
+
+
+def test_shell_action_forward_dynamics_passes_trajectory_path(tmp_path: Path) -> None:
+    input_reference = tmp_path / "autonomous vehicle.jpg"
+    input_reference.write_bytes(b"image bytes")
+    action_json = tmp_path / "steering trajectory.json"
+    action_json.write_text(json.dumps([[0.0] * 9, [0.1] * 9]), encoding="utf-8")
+
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="forward_dynamics",
+        INPUT_REFERENCE=str(input_reference),
+        ACTION_JSON=str(action_json),
+        EXTRA_PARAMS='{"domain_name":"av"}',
+        OUTPUT_FORMAT="pt",
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["mode"] == "forward_dynamics"
+    assert metadata["action_json"] == "steering trajectory.json"
+    assert "--action-json" in result.stdout
+    assert "steering\\ trajectory.json" in result.stdout
+    assert metadata["request_body"] == {
+        "format": "pt",
+        "extra_params": {
+            "domain_name": "av",
+            "action_mode": "forward_dynamics",
+        },
+    }
+
+
+def test_shell_action_inverse_dynamics_uses_video_reference(tmp_path: Path) -> None:
+    input_reference = tmp_path / "robot observation.mp4"
+    input_reference.write_bytes(b"video bytes")
+
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="inverse_dynamics",
+        INPUT_REFERENCE=str(input_reference),
+        EXTRA_PARAMS='{"domain_name":"bridge_orig_lerobot"}',
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["mode"] == "inverse_dynamics"
+    assert metadata["request_body"]["extra_params"] == {
+        "domain_name": "bridge_orig_lerobot",
+        "action_mode": "inverse_dynamics",
+    }
+
+
 def test_shell_transfer_derives_edge_from_input_video(tmp_path: Path) -> None:
     input_reference = tmp_path / "source video.mp4"
     input_reference.write_bytes(b"source video")
@@ -902,6 +1019,40 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         ({"MODE": "i2v"}, "requires INPUT_REFERENCE"),
         ({"MODE": "v2v"}, "requires INPUT_REFERENCE"),
         ({"MODE": "ti2av"}, "requires INPUT_REFERENCE"),
+        ({"MODE": "policy"}, "requires INPUT_REFERENCE"),
+        ({"MODE": "inverse_dynamics"}, "requires INPUT_REFERENCE"),
+        (
+            {
+                "MODE": "forward_dynamics",
+                "INPUT_REFERENCE": __file__,
+                "EXTRA_PARAMS": '{"domain_name":"av"}',
+            },
+            "requires ACTION_JSON",
+        ),
+        (
+            {
+                "MODE": "policy",
+                "INPUT_REFERENCE": __file__,
+            },
+            "requires EXTRA_PARAMS.domain_name or EXTRA_PARAMS.domain_id",
+        ),
+        (
+            {
+                "MODE": "policy",
+                "INPUT_REFERENCE": __file__,
+                "EXTRA_PARAMS": '{"domain_name":"bridge_orig_lerobot"}',
+                "OUTPUT_FORMAT": "mp4",
+            },
+            "OUTPUT_FORMAT='mp4' is not valid for MODE=policy",
+        ),
+        (
+            {
+                "MODE": "policy",
+                "MODEL": "nvidia/Cosmos3-Edge",
+                "INPUT_REFERENCE": __file__,
+            },
+            "action weights are not supported",
+        ),
         ({"MODE": "transfer"}, "requires a non-empty TRANSFER_CONTROLS"),
         (
             {"MODE": "transfer", "TRANSFER_CONTROLS": '{"seg": true}'},

@@ -16,6 +16,7 @@ SERVER_LOG_PATH=${SERVER_LOG_PATH-}
 SERVER_PROCESS_PID=${SERVER_PROCESS_PID-}
 BACKEND=${BACKEND-}
 INPUT_REFERENCE=${INPUT_REFERENCE-}
+ACTION_JSON=${ACTION_JSON-}
 TRANSFER_CONTROLS=${TRANSFER_CONTROLS-}
 EXTRA_PARAMS=${EXTRA_PARAMS-"{}"}
 HOST=${HOST:-127.0.0.1}
@@ -147,13 +148,13 @@ case "$MODE" in
     t2i)
         EXPECTED_BACKEND=openai-images
         ;;
-    t2v|i2v|v2v|transfer|t2av|ti2av)
+    t2v|i2v|v2v|transfer|t2av|ti2av|policy|forward_dynamics|inverse_dynamics)
         EXPECTED_BACKEND=openai-videos
         ;;
     *)
         fail \
-            "MODE must be one of t2i, t2v, i2v, v2v, transfer, t2av, or " \
-            "ti2av; got '${MODE}'"
+            "MODE must be one of t2i, t2v, i2v, v2v, transfer, t2av, ti2av, " \
+            "policy, forward_dynamics, or inverse_dynamics; got '${MODE}'"
         ;;
 esac
 
@@ -165,13 +166,26 @@ BACKEND=$EXPECTED_BACKEND
 if [ -n "$INPUT_REFERENCE" ] && [ ! -f "$INPUT_REFERENCE" ]; then
     fail "INPUT_REFERENCE file does not exist: ${INPUT_REFERENCE}"
 fi
+if [ -n "$ACTION_JSON" ] && [ ! -f "$ACTION_JSON" ]; then
+    fail "ACTION_JSON file does not exist: ${ACTION_JSON}"
+fi
 TRANSFER_CONTROLS_METADATA={}
 
 case "$MODE" in
-    i2v|v2v|ti2av)
+    i2v|v2v|ti2av|policy|forward_dynamics|inverse_dynamics)
         if [ -z "$INPUT_REFERENCE" ]; then
             fail "MODE=${MODE} requires INPUT_REFERENCE pointing to an image or video file"
         fi
+        if [ "$MODE" = "forward_dynamics" ] && [ -z "$ACTION_JSON" ]; then
+            fail "MODE=forward_dynamics requires ACTION_JSON containing a [T, D] trajectory"
+        fi
+        case "$MODE:$MODEL" in
+            policy:*Cosmos3-Edge*|policy:*cosmos3-edge*|\
+            forward_dynamics:*Cosmos3-Edge*|forward_dynamics:*cosmos3-edge*|\
+            inverse_dynamics:*Cosmos3-Edge*|inverse_dynamics:*cosmos3-edge*)
+                fail "Cosmos3-Edge action weights are not supported; use Cosmos3-Nano or Cosmos3-Super"
+                ;;
+        esac
         ;;
     transfer)
         if [ -z "$TRANSFER_CONTROLS" ]; then
@@ -237,13 +251,16 @@ print(json.dumps(metadata, separators=(",", ":")))
         if [ -n "$INPUT_REFERENCE" ]; then
             fail \
                 "MODE=${MODE} does not accept INPUT_REFERENCE; use i2v, v2v, " \
-                "transfer, or ti2av"
+                "transfer, ti2av, policy, forward_dynamics, or inverse_dynamics"
         fi
         ;;
 esac
 
 if [ "$MODE" != "transfer" ] && [ -n "$TRANSFER_CONTROLS" ]; then
     fail "TRANSFER_CONTROLS requires MODE=transfer"
+fi
+if [ "$MODE" != "forward_dynamics" ] && [ -n "$ACTION_JSON" ]; then
+    fail "ACTION_JSON requires MODE=forward_dynamics"
 fi
 
 case "$MODE" in
@@ -285,7 +302,13 @@ else:
 if mode in {"t2av", "ti2av"}:
     required["enable_audio"] = True
     body["format"] = "mp4"
-
+if mode in {"policy", "forward_dynamics", "inverse_dynamics"}:
+    required["action_mode"] = mode
+    allowed_formats = {"auto", "safetensors", "pt"}
+    if not any(extra_params.get(key) is not None for key in ("domain_name", "domain_id")):
+        raise SystemExit(
+            f"ERROR: MODE={mode} requires EXTRA_PARAMS.domain_name or EXTRA_PARAMS.domain_id"
+        )
 if output_format:
     if output_format not in allowed_formats:
         raise SystemExit(
@@ -398,6 +421,9 @@ fi
 if [ -n "$INPUT_REFERENCE" ]; then
     BENCHMARK_CMD+=(--input-reference "$INPUT_REFERENCE")
 fi
+if [ -n "$ACTION_JSON" ]; then
+    BENCHMARK_CMD+=(--action-json "$ACTION_JSON")
+fi
 if [ -n "$TRANSFER_CONTROLS" ]; then
     BENCHMARK_CMD+=(--transfer-controls "$TRANSFER_CONTROLS")
 fi
@@ -414,6 +440,10 @@ INPUT_REFERENCE_BASENAME=
 if [ -n "$INPUT_REFERENCE" ]; then
     INPUT_REFERENCE_BASENAME=$(basename "$INPUT_REFERENCE")
 fi
+ACTION_JSON_BASENAME=
+if [ -n "$ACTION_JSON" ]; then
+    ACTION_JSON_BASENAME=$(basename "$ACTION_JSON")
+fi
 CONFIG_METADATA=$SERVER_CONFIG
 if [ -z "$CONFIG_METADATA" ]; then
     CONFIG_METADATA=checkpoint-defaults
@@ -423,6 +453,7 @@ BENCHMARK_CMD+=(
     "mode=${MODE}"
     "server_config=${CONFIG_METADATA}"
     "input_reference=${INPUT_REFERENCE_BASENAME}"
+    "action_json=${ACTION_JSON_BASENAME}"
 )
 
 mkdir -p "$RESULT_DIR"
@@ -441,6 +472,7 @@ from pathlib import Path
     request_rate,
     max_concurrency,
     input_reference,
+    action_json,
     transfer_controls,
     request_body,
     save_media,
@@ -455,6 +487,7 @@ metadata = {
     "request_rate": request_rate,
     "max_concurrency": int(max_concurrency),
     "input_reference": input_reference or None,
+    "action_json": action_json or None,
     "transfer_controls": json.loads(transfer_controls),
     "extra_params": request_body.get("extra_params", {}),
     "request_body": request_body,
@@ -470,6 +503,7 @@ Path(output_path).write_text(json.dumps(metadata, indent=2) + "\n", encoding="ut
     "$REQUEST_RATE" \
     "$MAX_CONCURRENCY" \
     "$INPUT_REFERENCE_BASENAME" \
+    "$ACTION_JSON_BASENAME" \
     "$TRANSFER_CONTROLS_METADATA" \
     "$EXTRA_BODY" \
     "$SAVE_MEDIA"
@@ -484,6 +518,7 @@ echo "GPUs:                ${NUM_GPUS_VALUE}"
 echo "Request rate:        ${REQUEST_RATE}"
 echo "Max concurrency:     ${MAX_CONCURRENCY}"
 echo "Input reference:     ${INPUT_REFERENCE_BASENAME:-none}"
+echo "Action trajectory:   ${ACTION_JSON_BASENAME:-none}"
 echo "Transfer controls:   ${TRANSFER_CONTROLS_METADATA}"
 echo "Client media:        ${CLIENT_MEDIA_DIR:-disabled}"
 echo "Server metrics log:  ${SERVER_LOG_PATH:-disabled}"

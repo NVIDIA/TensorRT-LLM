@@ -732,6 +732,52 @@ def _validate_input_reference(path_value: Optional[str]) -> Optional[str]:
     return str(path.resolve())
 
 
+def _load_action_trajectory(path_value: Optional[str]) -> Optional[list[list[float]]]:
+    """Load and validate a client-local ``[T, D]`` action trajectory."""
+    if path_value is None:
+        return None
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        raise ValueError(f"Action trajectory file does not exist: {path_value}")
+    try:
+        action = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in --action-json: {exc}") from exc
+    if (
+        not isinstance(action, list)
+        or not action
+        or not all(isinstance(step, list) and step for step in action)
+    ):
+        raise ValueError("--action-json must contain a non-empty [T, D] list")
+    widths = {len(step) for step in action}
+    if len(widths) != 1:
+        raise ValueError("--action-json rows must all have the same width D")
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for step in action
+        for value in step
+    ):
+        raise ValueError("--action-json trajectory values must be numeric")
+    return action
+
+
+def _prepare_action_extra_body(
+    *,
+    extra_body: Optional[dict[str, Any]],
+    action_trajectory: Optional[list[list[float]]],
+) -> Optional[dict[str, Any]]:
+    """Add a forward-dynamics action without carrying it in the CLI argv."""
+    if action_trajectory is None:
+        return extra_body
+    body = dict(extra_body or {})
+    extra_params = dict(body.get("extra_params") or {})
+    if "action" in extra_params:
+        raise ValueError("--action-json conflicts with --extra-body.extra_params.action")
+    extra_params["action"] = action_trajectory
+    body["extra_params"] = extra_params
+    return body
+
+
 def _parse_transfer_controls(raw_value: Optional[str]) -> Optional[dict[str, Optional[str]]]:
     """Parse a hint-to-control mapping without loading control media into the CLI argv."""
     if raw_value is None or raw_value == "":
@@ -903,6 +949,11 @@ def main(args: argparse.Namespace):
 
     extra_body = _parse_extra_body(args.extra_body)
     input_reference = _validate_input_reference(args.input_reference)
+    action_trajectory = _load_action_trajectory(args.action_json)
+    extra_body = _prepare_action_extra_body(
+        extra_body=extra_body,
+        action_trajectory=action_trajectory,
+    )
     transfer_controls = _parse_transfer_controls(args.transfer_controls)
     extra_body = _prepare_transfer_extra_body(
         extra_body=extra_body,
@@ -963,6 +1014,8 @@ def main(args: argparse.Namespace):
                 hint: "input_reference" if path is None else Path(path).name
                 for hint, path in transfer_controls.items()
             }
+        if args.action_json is not None:
+            result_json["action_json"] = Path(args.action_json).name
 
         if args.metadata:
             for item in args.metadata:
@@ -1117,6 +1170,15 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Image or video conditioning file for multipart video requests.",
+    )
+    gen_group.add_argument(
+        "--action-json",
+        type=str,
+        default=None,
+        help=(
+            "Client-local JSON file containing a [T, D] trajectory for Cosmos3 "
+            "forward_dynamics. The file contents are loaded after argument parsing."
+        ),
     )
     gen_group.add_argument(
         "--transfer-controls",
