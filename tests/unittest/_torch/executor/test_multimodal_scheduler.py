@@ -323,10 +323,10 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
     assert output.context_requests == [request]
 
 
-def test_qwen_output_budget_uses_post_merge_embedding_capacity():
-    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+def test_qwen3_output_budget_uses_post_merge_embedding_capacity():
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
 
-    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor = object.__new__(Qwen3VLInputProcessorBase)
     processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
     engine = object.__new__(PyTorchModelEngine)
     engine.max_num_tokens = 8192

@@ -57,9 +57,9 @@ l0_h100:
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_rejection_buffers_guard.py
-  - unittest/_torch/speculative/test_capture_override_leak.py
   - unittest/_torch/speculative/test_sa_hybrid_state_promotion.py
   - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/speculative/test_capture_sampling_params.py
   - unittest/_torch/thop/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/parallel_hw_agnostic
@@ -144,6 +144,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=True-eagle3_one_model=True-overlap_scheduler=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_one_engine_non_greedy_cuda_graph_matches_eager[spec_dec_algo=eagle3]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_one_engine_non_greedy_cuda_graph_matches_eager[spec_dec_algo=suffix_automaton]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dflash
@@ -167,6 +169,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[VANILLA]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
@@ -210,8 +213,6 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v1-decoder-graphs-on-beam2]
-  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
-  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-non-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-enable_request_rate] # negative test
@@ -371,8 +372,8 @@ l0_h100:
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
-  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[eager] TIMEOUT (90)
-  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (90)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (300)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (300)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]

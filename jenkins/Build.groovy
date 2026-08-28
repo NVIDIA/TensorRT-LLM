@@ -16,7 +16,10 @@
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
+import java.lang.InterruptedException
 import groovy.transform.Field
+import trtllm.FailureClassifier
+import trtllm.exceptions.InfraFailure
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -39,6 +42,22 @@ AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+
+// Infra-scoped fail-fast master switch (mirrors L0_Test.groovy). When true, a
+// build branch whose failure classifies as a positive K8s infra abort (via
+// FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its sibling
+// build branches keep running instead of being SIGTERMed by failFast -- and a
+// build job that saw only infra aborts (no genuine build failure) resolves to
+// UNSTABLE (infra-incomplete) instead of FAILURE, so the parent layer
+// (L0_MergeRequest.launchJob) can skip this arch's test consumers without
+// cancelling the healthy sibling architecture. When false, every failure
+// rethrows and the original bare-boolean fail-fast is fully restored. Build
+// stages run only on K8s builders, so K8s is the only infra scope deferred here.
+//
+// Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
+// env var on the job. Env values are strings ("false" is truthy in Groovy), so
+// the override goes through toBoolean() rather than the bare elvis.
+ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INFRA_SCOPED_FAILFAST.toBoolean() : true
 
 // Literals for easier access.
 @Field
@@ -568,6 +587,66 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
 }
 
+// Infra-scoped fail-fast (build-branch layer). Runs `jobs` under `parallel` so
+// a build branch whose failure is a positive K8s infra abort
+// (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its
+// siblings keep running instead of being SIGTERMed by failFast. A genuine
+// build failure (compile error, unclassified exception) is rethrown unchanged,
+// so failFast stays fully active for real failures; an interrupt (e.g. a
+// sibling's own fail-fast SIGTERM) is also rethrown and never swallowed. After
+// the join, a build job that saw ONLY infra aborts and no real failure
+// resolves to UNSTABLE (artifact missing for infra reasons, not a failure) so
+// the parent layer (L0_MergeRequest.launchJob) can skip this arch's test
+// consumers while sparing the healthy sibling architecture; a mixed job
+// already threw on its real failure and is FAILURE.
+//
+// Minimal copy of runBranchesWithInfraDefer in L0_Test.groovy: that definition
+// lives in the L0_Test pipeline script's own scope (not the shared lib), so it
+// is not visible here. Scope: classify() is scope-filtered, so this passes
+// K8S -- build pods only run on K8s builders today. Threading a SLURM scope
+// through is a follow-up, mirroring the L0_Test.groovy note. Gated on
+// ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior exactly (plain
+// failFast + parallel, no wrapping, no UNSTABLE).
+//
+// TODO(TRTLLMINF-324): de-duplicate this with the identical copy in
+// jenkins/L0_Test.groovy; see the ticket for the planned shared home.
+def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
+    if (!ENABLE_INFRA_SCOPED_FAILFAST) {
+        jobs.failFast = failFast
+        parallel jobs
+        return
+    }
+    // CPS serializes parallel-branch continuations onto a single VM thread, so a
+    // plain list append from the catch blocks below is safe -- there is no
+    // JVM-level concurrency to guard against here.
+    def deferred = []
+    def wrapped = jobs.collectEntries { stageName, body ->
+        [(stageName), {
+            try {
+                body()
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)) {
+                    deferred.add([stage: stageName])
+                    echo "[INFRA-DEFER] ${stageName}: K8s infra abort recorded; " +
+                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    return
+                }
+                throw e
+            }
+        }]
+    }
+    wrapped.failFast = failFast
+    parallel wrapped
+    if (deferred) {
+        echo "[INFRA-DEFER] ${deferred.size()} build stage(s) infra-incomplete " +
+             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
+             "(artifact missing for infra reasons, no genuine build failure)."
+        currentBuild.result = 'UNSTABLE'
+    }
+}
+
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
@@ -632,7 +711,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             buildOrCache(pipeline, key, reuseArtifactPath, values[1], values[0], k8s_cpu, values[2])
         }
     }]}
-    parallelJobs.failFast = enableFailFast
 
     if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
         def key = "Build With Build Type Debug"
@@ -652,7 +730,10 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     }
 
     stage("Build") {
-        pipeline.parallel parallelJobs
+        // failFast is threaded through runBranchesWithInfraDefer (it sets the
+        // map key itself) so the flag-off path stays identical to the old
+        // `parallelJobs.failFast = enableFailFast; parallel parallelJobs`.
+        runBranchesWithInfraDefer(parallelJobs, enableFailFast)
     } // Build stage
 }
 
