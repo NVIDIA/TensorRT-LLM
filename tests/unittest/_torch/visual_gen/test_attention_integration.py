@@ -18,9 +18,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import (
-    _cudnn_import_error as _cudnn_backend_import_error,
-)
+from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
@@ -46,7 +44,6 @@ from tensorrt_llm.visual_gen.args import (
 
 _flash_attn4_available = _fa4_fwd is not None
 _cute_dsl_available = _cute_dsl_import_error is None
-_cudnn_available = _cudnn_backend_import_error is None
 
 # ============================================================================
 # Original naive implementations for comparison
@@ -170,18 +167,28 @@ def create_model_config(
     return config
 
 
-def _require_attention_backend(attn_backend: str) -> None:
+def _require_attention_backend(
+    attn_backend: str,
+    quant_attention_config: "QuantAttentionConfig | None" = None,
+) -> None:
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 attention test")
     if attn_backend == "CUTEDSL" and not _cute_dsl_available:
         pytest.fail("CuTe DSL backend is required for CUTEDSL attention test")
-    if attn_backend == "CUDNN" and not _cudnn_available:
-        pytest.fail("cuDNN Python frontend is required for CUDNN attention test")
-    if attn_backend in ("CUTEDSL", "CUDNN"):
+    if attn_backend == "CUDNN":
+        recipe = CuDNNAttention.resolve_recipe(quant_attention_config)
+        try:
+            if not torch.cuda.is_available():
+                raise ImportError("CUDA not available")
+            CuDNNAttention.check_hardware_compatibility(torch.device("cuda"), recipe)
+            CuDNNAttention.check_library_feature(recipe)
+        except ImportError as e:
+            pytest.skip(f"cuDNN detected hardware/library incompatibility: {e}")
+    if attn_backend == "CUTEDSL":
         compute_capability = torch.cuda.get_device_capability()
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
         if gpu_arch not in ("sm_100a", "sm_103a"):
-            pytest.skip(f"{attn_backend} attention test requires a supported Blackwell-class GPU")
+            pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
 
 
 def _make_cross_attention_with_mapping(
@@ -364,7 +371,7 @@ def test_self_attention_equivalence(
     head_dim: int, attn_backend: str, quant_attention_config: "QuantAttentionConfig | None"
 ):
     """Test that integrated self-attention produces same output as naive."""
-    _require_attention_backend(attn_backend)
+    _require_attention_backend(attn_backend, quant_attention_config)
 
     print("\n" + "=" * 60)
     print("Testing Self-Attention Equivalence")
@@ -564,7 +571,7 @@ def test_cross_attention_equivalence(
     head_dim: int, attn_backend: str, quant_attention_config: "QuantAttentionConfig | None"
 ):
     """Test that integrated cross-attention produces same output as naive."""
-    _require_attention_backend(attn_backend)
+    _require_attention_backend(attn_backend, quant_attention_config)
 
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
@@ -667,7 +674,7 @@ def test_fast_cross_attention_wan_shapes(
     quant_attention_config: "QuantAttentionConfig | None",
 ):
     """Test fast cross-attention correctness at Wan-realistic shapes."""
-    _require_attention_backend(attn_backend)
+    _require_attention_backend(attn_backend, quant_attention_config)
 
     hidden_size = num_heads * head_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

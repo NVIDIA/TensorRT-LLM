@@ -30,6 +30,7 @@ Layout: HND ``[B, H, S, D]``.
 """
 
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Optional, Tuple
 
@@ -209,13 +210,14 @@ class CuDNNAttention(AttentionBackend):
     through cuDNN's fused ``sdpa`` / ``sdpa_fp8`` / ``sdpa_mxfp8`` nodes. The recipe
     comes from ``quant_attention_config``; ``None`` means unquantized.
 
-    The cuDNN handle and the compiled-graph cache are process-wide and shared by
-    every instance.
+    The compiled-graph cache is process-wide and shared by every instance.
+    cuDNN handles and cached graphs are isolated by CUDA device.
     """
 
     _cudnn_lib_version = None
-    _cudnn_handle: ClassVar[Optional[Any]] = None
+    _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
+    _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -233,18 +235,13 @@ class CuDNNAttention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype or torch.bfloat16
         self.quant_attention_config = quant_attention_config
-        self.recipe = self._resolve_recipe(quant_attention_config)
+        self.recipe = self.resolve_recipe(quant_attention_config)
+        self.check_library_feature(self.recipe)
         self.scale = 1.0 / math.sqrt(head_dim)
         self._preferred_layout = AttentionTensorLayout.HND
 
-        # Check if the cuDNN library supports the requested functionality.
-        if self._get_lib_version() <= 90100:
-            raise ImportError("cuDNN attention backend requires cuDNN library v9.1.0 or later.")
-        if self.recipe == "mxfp8" and self._get_lib_version() <= 92100:
-            raise ImportError("cuDNN MXFP8 attention requires cuDNN library v9.21.0 or later.")
-
     @staticmethod
-    def _resolve_recipe(quant_attention_config: Optional[QuantAttentionConfig]) -> str:
+    def resolve_recipe(quant_attention_config: Optional[QuantAttentionConfig]) -> str:
         """Map the validated public recipe onto a cuDNN SDPA node."""
         if quant_attention_config is None:
             return "no_quant"
@@ -281,15 +278,36 @@ class CuDNNAttention(AttentionBackend):
         return cls._cudnn_lib_version
 
     @classmethod
-    def _get_handle(cls) -> Any:
-        if cls._cudnn_handle is None:
-            cls._cudnn_handle = cudnn.create_handle()
-        return cls._cudnn_handle
+    def _get_handle(cls, device: torch.device) -> Any:
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        with cls._cache_lock:
+            handle = cls._cudnn_handles.get(device_index)
+            if handle is None:
+                with torch.cuda.device(device_index):
+                    handle = cudnn.create_handle()
+                cls._cudnn_handles[device_index] = handle
+            return handle
+
+    @classmethod
+    def check_hardware_compatibility(cls, device: torch.device, recipe: str = "no_quant") -> None:
+        compute_capability = torch.cuda.get_device_capability(device)
+        gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
+        if gpu_arch not in ("sm_100a", "sm_103a") and recipe != "no_quant":
+            raise ImportError("cuDNN quantized attention requires NVIDIA Blackwell-class GPU.")
+
+    @classmethod
+    def check_library_feature(cls, recipe: str = "no_quant") -> None:
+        # Check if the cuDNN library supports the requested functionality.
+        if cls._get_lib_version() < 90100:
+            raise ImportError("cuDNN attention backend requires cuDNN library v9.1.0 or later.")
+        if cls._get_lib_version() < 92100 and recipe == "mxfp8":
+            raise ImportError("cuDNN MXFP8 attention requires cuDNN library v9.21.0 or later.")
 
     @classmethod
     def clear_graph_cache(cls) -> None:
         """Drop every compiled cuDNN graph (used by tests)."""
-        cls._graph_cache.clear()
+        with cls._cache_lock:
+            cls._graph_cache.clear()
 
     @staticmethod
     def _build_graph(
@@ -438,16 +456,24 @@ class CuDNNAttention(AttentionBackend):
         sm_scale: float,
         out_dtype: torch.dtype,
         with_lse: bool,
+        device: torch.device,
     ) -> _CuDNNGraphBundle:
-        key = (recipe, shape, is_causal, sm_scale, out_dtype, with_lse)
-        bundle = cls._graph_cache.get(key)
-        if bundle is None:
-            logger.debug(
-                f"[CuDNNAttention] building graph: recipe={recipe} {shape} causal={is_causal}"
-            )
-            bundle = cls._build_graph(recipe, shape, is_causal, sm_scale, out_dtype, with_lse)
-            cls._graph_cache[key] = bundle
-        return bundle
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        key = (device_index, recipe, shape, is_causal, sm_scale, out_dtype, with_lse)
+        with cls._cache_lock:
+            bundle = cls._graph_cache.get(key)
+            if bundle is None:
+                cls.check_hardware_compatibility(device, recipe)
+                logger.debug(
+                    f"[CuDNNAttention] building graph on cuda:{device_index}: "
+                    f"recipe={recipe} {shape} causal={is_causal}"
+                )
+                with torch.cuda.device(device_index):
+                    bundle = cls._build_graph(
+                        recipe, shape, is_causal, sm_scale, out_dtype, with_lse
+                    )
+                cls._graph_cache[key] = bundle
+            return bundle
 
     @classmethod
     @torch.compiler.disable
@@ -457,10 +483,11 @@ class CuDNNAttention(AttentionBackend):
         tensor_map: Dict[Any, torch.Tensor],
         device: torch.device,
     ) -> None:
-        handle = cls._get_handle()
-        cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
-        workspace = torch.empty(bundle.workspace_size, dtype=torch.uint8, device=device)
-        bundle.graph.execute(tensor_map, workspace, handle=handle)
+        with torch.cuda.device(device):
+            handle = cls._get_handle(device)
+            cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
+            workspace = torch.empty(bundle.workspace_size, dtype=torch.uint8, device=device)
+            bundle.graph.execute(tensor_map, workspace, handle=handle)
 
     # ------------------------------------------------------------------
     # Forward
@@ -478,6 +505,16 @@ class CuDNNAttention(AttentionBackend):
             raise ValueError(f"Batch size mismatch: q={q.shape[0]} vs k={k.shape[0]}.")
         if q.shape[3] != k.shape[3]:
             raise ValueError(f"Q/K head_dim mismatch: {q.shape[3]} vs {k.shape[3]}.")
+        if q.shape[3] != self.head_dim:
+            raise ValueError(
+                f"cuDNN backend was configured with head_dim={self.head_dim}, "
+                f"but received head_dim={q.shape[3]}."
+            )
+        if q.shape[1] != self.num_heads:
+            raise ValueError(
+                f"cuDNN backend was configured with num_heads={self.num_heads}, "
+                f"but received num_heads={q.shape[1]}."
+            )
         if q.shape[1] % k.shape[1] != 0:
             raise ValueError(
                 f"num_heads={q.shape[1]} must be a multiple of num_kv_heads={k.shape[1]} for GQA."
@@ -487,6 +524,10 @@ class CuDNNAttention(AttentionBackend):
             raise ValueError(
                 f"cuDNN quantized SDPA supports head_dim <= 128; got qk={q.shape[3]}, "
                 f"v={v.shape[3]}. Drop quant_attention_config to run unquantized."
+            )
+        if self.recipe == "mxfp8" and q.shape[3] % 32 != 0:
+            raise ValueError(
+                f"cuDNN MXFP8 requires head_dim to be a multiple of 32; got {q.shape[3]}."
             )
 
     def _run(
@@ -502,8 +543,7 @@ class CuDNNAttention(AttentionBackend):
         _, h_kv, s_kv, d_v = v.shape
         device = q.device
         out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        if q.dtype != out_dtype:
-            q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
         buffers: Dict[str, torch.Tensor] = {}
         if self.recipe == "no_quant":
@@ -553,6 +593,7 @@ class CuDNNAttention(AttentionBackend):
             sm_scale=self.scale,
             out_dtype=out_dtype,
             with_lse=with_lse,
+            device=device,
         )
 
         output = torch.empty(b, h_q, s_q, d_v, dtype=out_dtype, device=device)

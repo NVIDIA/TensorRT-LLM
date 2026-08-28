@@ -51,7 +51,6 @@ MIN_COSINE = {"no_quant": 0.9999, "fp8": 0.995, "mxfp8": 0.995}
 def _require_cudnn(recipe: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("cuDNN attention backend requires CUDA.")
-    pytest.importorskip("cudnn", reason="cuDNN Python frontend is not installed.")
     if recipe != "no_quant" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("cuDNN FP8/MXFP8 SDPA requires a Blackwell-class GPU (sm100+).")
 
