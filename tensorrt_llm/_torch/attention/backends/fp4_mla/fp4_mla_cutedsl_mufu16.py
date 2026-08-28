@@ -18,6 +18,19 @@ import cutlass as ctm
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import torch
+from ctm.Operations import ptx
+from ctm.Operations.ptx import (
+    AtomicOpKind,
+    CvtaSpace,
+    MBarrierArriveScope,
+    MBarrierArriveSem,
+    MBarrierSpace,
+    MemScopeKind,
+    SharedSpace,
+    cvta_to,
+    mbarrier_arrive,
+)
+from ctm.Operations.ptx import cp_async as _cp_async
 from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
@@ -25,12 +38,11 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
-nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode.RN)
+nvvm_add_packed_f32x2 = partial(ptx.add_packed_f32x2, rnd="rn")
+nvvm_mul_packed_f32x2 = partial(ptx.mul_packed_f32x2, rnd="rn")
+nvvm_fma_packed_f32x2 = partial(ptx.fma_packed_f32x2, rnd="rn")
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 CUDA_GRID_Z_MAX = 65535
-INT32_MAX = (1 << 31) - 1
 _CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
 _PYIR_STDOUT_LINES = frozenset(
     {
@@ -47,7 +59,7 @@ def _as_shared_cta(address, *, loc=None, ip=None):
     address_ir = address.ir_value() if hasattr(address, "ir_value") else address
     address_space = llvm.PointerType(address_ir.type).address_space
     if address_space == ctm.AddressSpace.dsmem:
-        return prims.cvta_to(address, prims.CvtaSpace.SHARED, loc=loc, ip=ip)
+        return cvta_to(address, CvtaSpace.SHARED, loc=loc, ip=ip)
     return address
 
 
@@ -58,10 +70,12 @@ def _mapa_shared_cluster(address, rank, *, loc=None, ip=None):
 
 @ctm.dsl_user_op
 def _mbarrier_arrive_release_cta_shared_cluster(mbar, count=1, *, loc=None, ip=None) -> None:
-    prims.mbarrier_arrive(
+    mbarrier_arrive(
         mbar,
-        count=count,
-        scope=prims.MemScope.CTA,
+        count,
+        sem=MBarrierArriveSem.RELEASE,
+        scope=MBarrierArriveScope.CTA,
+        space=MBarrierSpace.SHARED_CLUSTER,
         loc=loc,
         ip=ip,
     )
@@ -293,14 +307,9 @@ LOG2_E = 1.4426950408889634
 # normalization below cancels this factor without changing the attention math.
 FP4_MLA_E4M3_MAX_FINITE = 448.0
 FP4_MLA_P_GLOBAL_SCALE = FP4_MLA_E4M3_MAX_FINITE * 6.0
-SMEM_P4_PAGE_PLAN_PROFILE_KV = 160 * 1024
-SMEM_P4_RUNTIME_PROFILE_PAGE_ALIGNMENT = 4
-SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT = SMEM_P4_RUNTIME_PROFILE_PAGE_ALIGNMENT * TRTLLM_PAGE_SIZE
-# Keep the device-side ceil division ``valid_k + KV_TILE - 1`` in Int32 range.
-SMEM_P4_RUNTIME_MAX_KV = (
-    (INT32_MAX - (KV_TILE - 1)) // SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
-) * SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
-SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_PAGE_PLAN_PROFILE_KV // TRTLLM_PAGE_SIZE
+SMEM_P4_RUNTIME_MAX_KV = 160 * 1024
+SMEM_P4_RUNTIME_MAX_PAGES = SMEM_P4_RUNTIME_MAX_KV // TRTLLM_PAGE_SIZE
+SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_RUNTIME_MAX_PAGES
 SMEM_P4_PAGE_ID_PLAN_BYTES = SMEM_P4_PAGE_ID_PLAN_INTS * ctm.Int32.bytes
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 2
 SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float32.bytes
@@ -501,40 +510,13 @@ SMEM_P4_QK_COMPLETION_MBARS = SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
 _EXPLICIT_TORCH_STREAM: torch.cuda.Stream | None = None
 
 
-@contextlib.contextmanager
-def _launch_stream():
-    """Yield the CUDA driver stream these kernels should launch on.
-
-    cuda2ctl capture cannot reliably query the default null stream, so SMART
-    wrappers can ask for an explicit one through DKG_MLA_EXPLICIT_STREAM. The
-    substitution must be bracketed rather than assigned: the caller's stream
-    already carries the RoPE, Q quantization and KV-cache writes these kernels
-    read, and it is also the stream their consumers read the output from.
-    Entering waits on the caller's work, leaving publishes ours back to it, and
-    ``torch.cuda.stream`` restores the thread's current stream on the way out.
-    A bare ``set_stream`` does none of the three.
-
-    Switching the current stream is illegal while a CUDA graph is capturing, so
-    the knob is ignored under capture and the caller's stream is used as-is.
-    """
-    entry_stream = torch.cuda.current_stream()
-    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") != "1" or torch.cuda.is_current_stream_capturing():
-        yield cuda.CUstream(entry_stream.cuda_stream)
-        return
-
+def _current_cu_stream() -> cuda.CUstream:
     global _EXPLICIT_TORCH_STREAM
-    if _EXPLICIT_TORCH_STREAM is None:
-        _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
-    start_event = torch.cuda.Event()
-    done_event = torch.cuda.Event()
-    start_event.record(entry_stream)
-    with torch.cuda.stream(_EXPLICIT_TORCH_STREAM):
-        _EXPLICIT_TORCH_STREAM.wait_event(start_event)
-        try:
-            yield cuda.CUstream(_EXPLICIT_TORCH_STREAM.cuda_stream)
-        finally:
-            done_event.record(_EXPLICIT_TORCH_STREAM)
-    entry_stream.wait_event(done_event)
+    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") == "1":
+        if _EXPLICIT_TORCH_STREAM is None:
+            _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
+        torch.cuda.set_stream(_EXPLICIT_TORCH_STREAM)
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
 @dataclass(frozen=True)
@@ -995,26 +977,6 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _select_runtime_kv_profile(max_kv_len: int) -> int:
-    if type(max_kv_len) is not int:
-        raise TypeError(f"max_kv_len must be an int, got {type(max_kv_len).__name__}")
-    if max_kv_len <= 0:
-        raise ValueError(f"max_kv_len must be positive, got {max_kv_len}")
-    if max_kv_len > SMEM_P4_RUNTIME_MAX_KV:
-        raise ValueError(
-            "max_kv_len exceeds the Int32-safe runtime-KV limit: "
-            f"{max_kv_len} > {SMEM_P4_RUNTIME_MAX_KV}"
-        )
-    if max_kv_len <= SMEM_P4_PAGE_PLAN_PROFILE_KV:
-        return SMEM_P4_PAGE_PLAN_PROFILE_KV
-    # Eager execution can report a different batch maximum on every step.
-    # Shifted power-of-two buckets bound the number of compiled variants and
-    # retain the established 1 Mi-token plus four-page-reserve profile.
-    profile_payload = max_kv_len - SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
-    profile_kv = (1 << (profile_payload - 1).bit_length()) + (SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT)
-    return min(profile_kv, SMEM_P4_RUNTIME_MAX_KV)
-
-
 def _validate_output_dtype(output_dtype: torch.dtype) -> None:
     if output_dtype not in {torch.float16, torch.bfloat16}:
         raise TypeError(f"output dtype must be torch.float16 or torch.bfloat16, got {output_dtype}")
@@ -1091,7 +1053,6 @@ def fused_fp4_mla_decode_ctm(
     page_size: ctm.Constexpr = KV_TILE,
     use_mixed_imlp: ctm.Constexpr = False,
     query_len_per_seq: ctm.Constexpr = 1,
-    use_smem_page_plan: ctm.Constexpr = True,
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
 ) -> None:
@@ -1114,7 +1075,9 @@ def fused_fp4_mla_decode_ctm(
     )
     page_table_tensor = cute.make_tensor(
         cute.recast_ptr(page_table_ptr, dtype=cutlass.Int32),
-        cute.make_layout(((k // page_size) * (batch_size // query_len_per_seq),), stride=(1,)),
+        cute.make_layout(
+            (SMEM_P4_RUNTIME_MAX_PAGES * (batch_size // query_len_per_seq),), stride=(1,)
+        ),
     )
     page_indptr_tensor = cute.make_tensor(
         cute.recast_ptr(page_indptr_ptr, dtype=cutlass.Int32),
@@ -1415,7 +1378,6 @@ def fused_fp4_mla_decode_ctm(
         pv_output_scale,
         page_size,
         query_len_per_seq,
-        use_smem_page_plan,
         use_mixed_imlp,
         use_consecutive_page_pair,
         use_ksf_gather4,
@@ -1532,31 +1494,6 @@ def _load_staged_page_native_tile_pair(sPageIdPlan, kv_tile_idx: ctm.Int32) -> t
 
 
 @cute.jit
-def _load_global_page_native_tile_pair(
-    mPageTable_pl: cute.Tensor,
-    kv_tile_idx: ctm.Int32,
-    page_begin: ctm.Int32,
-    page_count: ctm.Int32,
-) -> tuple:
-    tile_page_idx = ctm.Int32(kv_tile_idx * SMEM_P4_PAGES_PER_KV_TILE)
-    # Keep these as two scalar loads: a CSR row may start at an odd Int32, and
-    # the second logical page must clamp to the first for a one-page tail.
-    physical_page0 = _lookup_physical_page(
-        mPageTable_pl, tile_page_idx, ctm.Int32(0), page_begin, page_count
-    )
-    physical_page1 = _lookup_physical_page(
-        mPageTable_pl,
-        tile_page_idx + ctm.Int32(1),
-        ctm.Int32(0),
-        page_begin,
-        page_count,
-    )
-    physical_page0 = cute.arch.make_warp_uniform(physical_page0)
-    physical_page1 = cute.arch.make_warp_uniform(physical_page1)
-    return (physical_page0, physical_page1)
-
-
-@cute.jit
 def _tma_gather4_cluster(
     smem_dst,
     tma_desc,
@@ -1574,7 +1511,7 @@ def _tma_gather4_cluster(
     leader_barrier = _as_shared_cta(_mapa_shared_cluster(barrier, ctm.Int32(0)))
     barrier_ptr = leader_barrier.data_ptr()
     multicast_mask_u16 = ctm.Uint16(multicast_mask)
-    cute_inline_ptx(
+    _cp_async._predicated_inline_ptx(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
         ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
         " [{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], "
@@ -2095,7 +2032,6 @@ def _load_v_tile_stage(
     v_tma_phase: ctm.Int32,
     stage: ctm.Int32 = 0,
     manage_mbarrier: ctm.Constexpr = True,
-    use_smem_page_plan: ctm.Constexpr = True,
     use_consecutive_page_pair: ctm.Constexpr = False,
 ) -> None:
     del tidx
@@ -2109,15 +2045,15 @@ def _load_v_tile_stage(
         if should_wait_v_tma:
             if prims.elect_sync():
                 prims.mbarrier_arrive_expect_tx(v_tma_mbar, v_tma_bytes)
-    del bidz, tile_physical_page0, tile_physical_page1
-    if cutlass.const_expr(use_smem_page_plan):
-        resolved_physical_page0, resolved_physical_page1 = _load_staged_page_native_tile_pair(
-            sPageIdPlan, kv_tile_idx
-        )
-    else:
-        resolved_physical_page0, resolved_physical_page1 = _load_global_page_native_tile_pair(
-            mPageTable_pl, kv_tile_idx, page_begin, page_count
-        )
+    # Resolve the page pair at the point of use so V-ring wrap cannot reuse a
+    # stale loop-carried ID.  The plan was populated once before the producer
+    # warps start, so reloading it here avoids a second CSR/global lookup and
+    # its serial uniform-address chain on every tile.
+    del mPageTable_pl, bidz, page_begin, page_count
+    del tile_physical_page0, tile_physical_page1
+    resolved_physical_page0, resolved_physical_page1 = _load_staged_page_native_tile_pair(
+        sPageIdPlan, kv_tile_idx
+    )
     if cutlass.const_expr(use_consecutive_page_pair):
         resolved_physical_page1 = resolved_physical_page0 + ctm.Int32(1)
     if prims.elect_sync():
@@ -2358,11 +2294,7 @@ def _softmax_exp2_pair_packed_f16x2(
         (score0, score1), (softmax_scale_log2, softmax_scale_log2), (p_bias, p_bias)
     )
     shifted_h2 = _pack_f32_pair_to_f16x2(shifted[0], shifted[1])
-    return cute_inline_ptx(
-        "ex2.approx.f16x2 {$w0}, {$r0};",
-        write_only_types=[ctm.Int32],
-        read_only_args=[shifted_h2],
-    )
+    return ptx.ex2_f16x2(shifted_h2)
 
 
 @cute.jit
@@ -3659,41 +3591,28 @@ def _smem_p4_p4_materialize_group_col(
 
 @cute.jit
 def _float_to_ordered_u32_for_atomic_max(value: ctm.Float32) -> ctm.Uint32:
-    bits = prims.mov_b32(value, target_type=ctm.Int32)
+    bits = ptx.mov_b32(value, target_type=ctm.Int32)
     sign_mask = bits >> ctm.Int32(31) | ctm.Int32(2147483648)
     encoded = bits ^ sign_mask
-    return prims.mov_b32(encoded, target_type=ctm.Uint32)
+    return ptx.mov_b32(encoded, target_type=ctm.Uint32)
 
 
 @cute.jit
 def _ordered_u32_to_float_after_atomic_max(value: ctm.Uint32) -> ctm.Float32:
-    encoded = prims.mov_b32(value, target_type=ctm.Int32)
+    encoded = ptx.mov_b32(value, target_type=ctm.Int32)
     sign_mask = ~(encoded >> ctm.Int32(31)) | ctm.Int32(2147483648)
     bits = encoded ^ sign_mask
-    return prims.mov_b32(bits, target_type=ctm.Float32)
+    return ptx.mov_b32(bits, target_type=ctm.Float32)
 
 
 @cute.jit
 def _smem_atomic_max_ordered_u32(pointer, value: ctm.Uint32) -> None:
-    prims.atomicrmw(
-        prims.AtomicOp.MAX,
+    ptx.atom(
+        AtomicOpKind.MAX,
         pointer,
         value,
-        syncscope=prims.MemScope.CTA,
-        space=prims.SharedSpace.shared_cta,
-    )
-
-
-@cute.jit
-def _tcgen05_ld_red_32x32b_x16_max_f32(tmem) -> tuple:
-    tmem_addr = tmem.toint(ctm.Int32)
-    return cute_inline_ptx(
-        "tcgen05.ld.red.sync.aligned.32x32b.x16.max.f32 "
-        "{{$w0}, {$w1}, {$w2}, {$w3}, {$w4}, {$w5}, {$w6}, {$w7}, "
-        "{$w8}, {$w9}, {$w10}, {$w11}, {$w12}, {$w13}, {$w14}, {$w15}}, "
-        "{$w16}, [{$r0}];",
-        write_only_types=[ctm.Int32] * 17,
-        read_only_args=[tmem_addr],
+        syncscope=MemScopeKind.CTA,
+        space=SharedSpace.shared_cta,
     )
 
 
@@ -3779,7 +3698,13 @@ def _load_p4_n256_score_half_from_tmem(
             pending_score_groups.append(group_scores)
             pending_group_stats.append(None)
         else:
-            regs = _tcgen05_ld_red_32x32b_x16_max_f32(tmem)
+            regs = ptx.tcgen05_ld_red(
+                ptx.Tcgen05LdStShape.SHAPE_32X32B,
+                tmem,
+                num=SF_VEC_SIZE,
+                red_op="max",
+                type_="f32",
+            )
             pending_score_groups.append(regs)
             pending_group_stats.append(regs[SF_VEC_SIZE])
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
@@ -5507,13 +5432,14 @@ def _runtime_t336_producer_tile(
         )
     if has_previous_tile:
         common_source_ready_pred = prims.elect_sync() & ~warp_rebase
-        if common_source_ready_pred:
-            prims.mbarrier_arrive(
-                leader_pair_p_source_ready_dsmem_mbar,
-                count=1,
-                scope=prims.MemScope.CLUSTER,
-                relaxed=True,
-            )
+        mbarrier_arrive(
+            leader_pair_p_source_ready_dsmem_mbar,
+            1,
+            sem=MBarrierArriveSem.RELAXED,
+            scope=MBarrierArriveScope.CLUSTER,
+            space=MBarrierSpace.SHARED_CLUSTER,
+            pred=common_source_ready_pred,
+        )
         if warp_rebase:
             pv_done_li_idx = stream_li_idx - ctm.Int32(1)
             pv_done_slot = pv_done_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
@@ -5765,13 +5691,14 @@ def _runtime_t336_producer_tile_v23(
     warp_rebase = cute.arch.vote_any_sync(lane_rebase)
     if has_previous_tile:
         common_source_ready_pred = prims.elect_sync() & ~warp_rebase
-        if common_source_ready_pred:
-            prims.mbarrier_arrive(
-                leader_pair_p_source_ready_dsmem_mbar,
-                count=1,
-                scope=prims.MemScope.CLUSTER,
-                relaxed=True,
-            )
+        mbarrier_arrive(
+            leader_pair_p_source_ready_dsmem_mbar,
+            1,
+            sem=MBarrierArriveSem.RELAXED,
+            scope=MBarrierArriveScope.CLUSTER,
+            space=MBarrierSpace.SHARED_CLUSTER,
+            pred=common_source_ready_pred,
+        )
         if warp_rebase:
             pv_done_li_idx = stream_li_idx - ctm.Int32(1)
             pv_done_slot = pv_done_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
@@ -5935,7 +5862,6 @@ def _run_mla_decode_body(
     pv_output_scale: ctm.Float32,
     page_size: ctm.Constexpr,
     query_len_per_seq: ctm.Constexpr,
-    use_smem_page_plan: ctm.Constexpr,
     use_mixed_imlp: ctm.Constexpr = False,
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
@@ -6231,10 +6157,9 @@ def _run_mla_decode_body(
         _stage_smem_p4_runtime_scale_pair(
             mQGlobalScale, mKvGlobalScale, sRuntimeScalePair, softmax_scale_log2
         )
-    if cutlass.const_expr(use_smem_page_plan):
-        _stage_smem_p4_page_id_plan(
-            mPageTable_pl, mPageIndptr_s, sPageIdPlan, tidx, page_batch, planned_page_count
-        )
+    _stage_smem_p4_page_id_plan(
+        mPageTable_pl, mPageIndptr_s, sPageIdPlan, tidx, page_batch, planned_page_count
+    )
     cute.arch.cluster_arrive()
     cute.arch.cluster_wait()
     runtime_scale_pair = sRuntimeScalePair.data_ptr().load(count=2, alignment=8)
@@ -6284,14 +6209,7 @@ def _run_mla_decode_body(
             qk0_handle = qk_smem_producer.acquire_and_advance()
             qk0_tma_mbar = ctm.Array(qk0_handle.barrier, shape=1)
             if is_leader_cta:
-                if cutlass.const_expr(use_smem_page_plan):
-                    qk0_page0, qk0_page1 = _load_staged_page_native_tile_pair(
-                        sPageIdPlan, ctm.Int32(0)
-                    )
-                else:
-                    qk0_page0, qk0_page1 = _load_global_page_native_tile_pair(
-                        mPageTable_pl, ctm.Int32(0), csr_page_begin, csr_page_count
-                    )
+                qk0_page0, qk0_page1 = _load_staged_page_native_tile_pair(sPageIdPlan, ctm.Int32(0))
                 _load_runtime_t336_qk_tile(
                     mPageTable_pl,
                     tma_k_page_ptr,
@@ -6325,14 +6243,9 @@ def _run_mla_decode_body(
                 )
                 qk_prefix_tma_mbar = ctm.Array(qk_prefix_handle.barrier, shape=1)
                 if is_leader_cta:
-                    if cutlass.const_expr(use_smem_page_plan):
-                        qk_prefix_page0, qk_prefix_page1 = _load_staged_page_native_tile_pair(
-                            sPageIdPlan, qk_prefix_li_idx
-                        )
-                    else:
-                        qk_prefix_page0, qk_prefix_page1 = _load_global_page_native_tile_pair(
-                            mPageTable_pl, qk_prefix_li_idx, csr_page_begin, csr_page_count
-                        )
+                    qk_prefix_page0, qk_prefix_page1 = _load_staged_page_native_tile_pair(
+                        sPageIdPlan, qk_prefix_li_idx
+                    )
                     _load_runtime_t336_qk_tile(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6369,14 +6282,9 @@ def _run_mla_decode_body(
                 )
                 qk_tma_mbar = ctm.Array(qk_handle.barrier, shape=1)
                 if is_leader_cta:
-                    if cutlass.const_expr(use_smem_page_plan):
-                        qk_steady_page0, qk_steady_page1 = _load_staged_page_native_tile_pair(
-                            sPageIdPlan, kv_tile_idx
-                        )
-                    else:
-                        qk_steady_page0, qk_steady_page1 = _load_global_page_native_tile_pair(
-                            mPageTable_pl, kv_tile_idx, csr_page_begin, csr_page_count
-                        )
+                    qk_steady_page0, qk_steady_page1 = _load_staged_page_native_tile_pair(
+                        sPageIdPlan, kv_tile_idx
+                    )
                     _load_runtime_t336_qk_tile(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6408,14 +6316,9 @@ def _run_mla_decode_body(
                 )
                 qk15_tma_mbar = ctm.Array(qk15_handle.barrier, shape=1)
                 if is_leader_cta:
-                    if cutlass.const_expr(use_smem_page_plan):
-                        qk15_page0, qk15_page1 = _load_staged_page_native_tile_pair(
-                            sPageIdPlan, ctm.Int32(15)
-                        )
-                    else:
-                        qk15_page0, qk15_page1 = _load_global_page_native_tile_pair(
-                            mPageTable_pl, ctm.Int32(15), csr_page_begin, csr_page_count
-                        )
+                    qk15_page0, qk15_page1 = _load_staged_page_native_tile_pair(
+                        sPageIdPlan, ctm.Int32(15)
+                    )
                     _load_runtime_t336_qk_tile(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6445,12 +6348,9 @@ def _run_mla_decode_body(
             cute.arch.cp_async_bulk_wait_group(0, read=True)
             q_smem_producer.tail()
         if warp_idx == TMA_V_WARP_ID:
-            v_physical_page0 = ctm.Int32(0)
-            v_physical_page1 = ctm.Int32(0)
-            if cutlass.const_expr(use_smem_page_plan):
-                v_physical_page0, v_physical_page1 = _load_staged_page_native_tile_pair(
-                    sPageIdPlan, ctm.Int32(0)
-                )
+            v_physical_page0, v_physical_page1 = _load_staged_page_native_tile_pair(
+                sPageIdPlan, ctm.Int32(0)
+            )
             for kv_tile_idx in cutlass.range(0, kv_tiles, 1, unroll=1):
                 v_handle = v_smem_producer.acquire_and_advance()
                 v_tma_mbar = ctm.Array(v_handle.barrier, shape=1)
@@ -6479,27 +6379,20 @@ def _run_mla_decode_body(
                     v_tma_phase=v_stage,
                     stage=v_stage,
                     manage_mbarrier=False,
-                    use_smem_page_plan=use_smem_page_plan,
                     use_consecutive_page_pair=use_consecutive_page_pair,
                 )
-                if cutlass.const_expr(use_smem_page_plan):
-                    if kv_tile_idx + ctm.Int32(1) < kv_tiles:
-                        v_physical_page0, v_physical_page1 = _load_staged_page_native_tile_pair(
-                            sPageIdPlan, kv_tile_idx + ctm.Int32(1)
-                        )
+                if kv_tile_idx + ctm.Int32(1) < kv_tiles:
+                    v_physical_page0, v_physical_page1 = _load_staged_page_native_tile_pair(
+                        sPageIdPlan, kv_tile_idx + ctm.Int32(1)
+                    )
             v_smem_producer.tail()
         if warp_idx == ROWMETA_WARP_ID:
             if is_leader_cta:
                 qk_prefix_end = min(kv_tiles, ctm.Int32(3))
                 for qk_prefix_li_idx in cutlass.range(1, qk_prefix_end, 1, unroll=1):
-                    if cutlass.const_expr(use_smem_page_plan):
-                        rowmeta_page0, rowmeta_page1 = _load_staged_page_native_tile_pair(
-                            sPageIdPlan, qk_prefix_li_idx
-                        )
-                    else:
-                        rowmeta_page0, rowmeta_page1 = _load_global_page_native_tile_pair(
-                            mPageTable_pl, qk_prefix_li_idx, csr_page_begin, csr_page_count
-                        )
+                    rowmeta_page0, rowmeta_page1 = _load_staged_page_native_tile_pair(
+                        sPageIdPlan, qk_prefix_li_idx
+                    )
                     _issue_runtime_t336_qk_prefix_rank1(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6980,7 +6873,6 @@ def kernel(
     pv_output_scale: ctm.Float32,
     page_size: ctm.Constexpr,
     query_len_per_seq: ctm.Constexpr,
-    use_smem_page_plan: ctm.Constexpr,
     use_mixed_imlp: ctm.Constexpr,
     use_consecutive_page_pair: ctm.Constexpr,
     use_ksf_gather4: ctm.Constexpr,
@@ -7016,7 +6908,6 @@ def kernel(
         pv_output_scale,
         page_size,
         query_len_per_seq,
-        use_smem_page_plan,
         use_mixed_imlp,
         use_consecutive_page_pair,
         use_ksf_gather4,
@@ -7270,25 +7161,13 @@ def _compile_fused(
     vsf_page_stride_bytes: int = 0,
     use_consecutive_page_pair: bool = False,
 ) -> Callable:
-    if type(kv) is not int:
-        raise TypeError(f"runtime-KV compile K must be an int, got {type(kv).__name__}")
-    is_page_plan_profile = kv == SMEM_P4_PAGE_PLAN_PROFILE_KV
-    is_bucketed_runtime_profile = (
-        SMEM_P4_PAGE_PLAN_PROFILE_KV < kv <= SMEM_P4_RUNTIME_MAX_KV
-        and _select_runtime_kv_profile(kv) == kv
-    )
-    if not (is_page_plan_profile or is_bucketed_runtime_profile):
-        raise ValueError(
-            "runtime-KV compile requires the fixed page-plan profile "
-            f"{SMEM_P4_PAGE_PLAN_PROFILE_KV} or a larger geometric profile "
-            f"up to {SMEM_P4_RUNTIME_MAX_KV}, got {kv}"
-        )
+    if kv != SMEM_P4_RUNTIME_MAX_KV:
+        raise ValueError(f"runtime-KV compile requires fixed K={SMEM_P4_RUNTIME_MAX_KV}, got {kv}")
     use_ksf_gather4 = (
         not use_consecutive_page_pair and ksf_page_stride_bytes == page_size * TRTLLM_K_SF_GROUPS
     )
     cache_key = (
         n,
-        kv,
         page_size,
         use_mixed_imlp,
         output_dtype,
@@ -7337,7 +7216,6 @@ def _compile_fused(
         page_size=page_size,
         use_mixed_imlp=use_mixed_imlp,
         query_len_per_seq=query_len_per_seq,
-        use_smem_page_plan=kv == SMEM_P4_PAGE_PLAN_PROFILE_KV,
         use_consecutive_page_pair=use_consecutive_page_pair,
         use_ksf_gather4=use_ksf_gather4,
         options="--opt-level 2 --ptxas-options '--uumn'",
@@ -7385,7 +7263,12 @@ def run_trtllm_fp4_mla_decode_page_native(
         raise ValueError(
             f"page-native decode requires page_size={TRTLLM_PAGE_SIZE}, got {page_size}"
         )
-    physical_k = _select_runtime_kv_profile(max_kv_len)
+    if max_kv_len <= 0:
+        raise ValueError(f"max_kv_len must be positive, got {max_kv_len}")
+    if max_kv_len > SMEM_P4_RUNTIME_MAX_KV:
+        raise ValueError(
+            f"max_kv_len exceeds the fixed runtime-KV profile: {max_kv_len} > {SMEM_P4_RUNTIME_MAX_KV}"
+        )
     for name, value in (
         ("assume_valid_k_prefix_tiles", assume_valid_k_prefix_tiles),
         (
@@ -7411,6 +7294,7 @@ def run_trtllm_fp4_mla_decode_page_native(
     del assume_valid_k_prefix_tiles, partition_runtime_valid_k
     required_consecutive_tiles = _ceil_div(max_kv_len, KV_TILE)
     use_consecutive_page_pair = assume_consecutive_page_prefix_tiles >= required_consecutive_tiles
+    physical_k = SMEM_P4_RUNTIME_MAX_KV
     if q_internal.dtype != torch.uint8 or q_internal.dim() != 3:
         raise TypeError(
             "q_internal must be a uint8 [M, Q640/2, L] tensor, "
@@ -7470,15 +7354,10 @@ def run_trtllm_fp4_mla_decode_page_native(
             "src_page_ids must be a 1D int32 physical-page list, "
             f"got dtype={src_page_ids.dtype} shape={tuple(src_page_ids.shape)}"
         )
-    src_page_id_count = src_page_ids.numel()
-    if src_page_id_count == 0 or src_page_ids.stride(0) != 1:
+    if src_page_ids.numel() == 0 or src_page_ids.stride(0) != 1:
         raise ValueError(
             "src_page_ids must be non-empty and contiguous, "
-            f"got numel={src_page_id_count} stride={src_page_ids.stride()}"
-        )
-    if src_page_id_count > INT32_MAX:
-        raise ValueError(
-            f"src_page_ids exceeds the Int32 element limit: {src_page_id_count} > {INT32_MAX}"
+            f"got numel={src_page_ids.numel()} stride={src_page_ids.stride()}"
         )
     if (
         paged_kv_indptr_decode.dtype != torch.int32
@@ -7516,14 +7395,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         )
     num_cache_pages = cache_layout.num_pages
     page_table_capacity = num_sequences * (physical_k // page_size)
-    if page_table_capacity > INT32_MAX:
+    if src_page_ids.numel() > page_table_capacity:
         raise ValueError(
-            "bucketed CSR capacity exceeds the Int32 layout limit: "
-            f"{page_table_capacity} > {INT32_MAX}"
-        )
-    if src_page_id_count > page_table_capacity:
-        raise ValueError(
-            f"src_page_ids exceeds the bucketed CSR capacity, got {src_page_id_count} > {page_table_capacity}"
+            f"src_page_ids exceeds the bucketed CSR capacity, got {src_page_ids.numel()} > {page_table_capacity}"
         )
     expected_v_rows = num_cache_pages * (TRTLLM_V_HEAD_DIM // v_pack_block) * v_pack_block
     if (
@@ -7546,11 +7420,12 @@ def run_trtllm_fp4_mla_decode_page_native(
     if not isinstance(v_page_offset, int):
         raise TypeError(f"v_page_offset must be an int, got {type(v_page_offset).__name__}")
     num_v_cache_pages = v_packed.shape[0] // v_rows_per_page
-    if v_page_offset < 0 or v_page_offset > INT32_MAX:
-        raise ValueError(f"v_page_offset must be in [0, {INT32_MAX}], got {v_page_offset}")
-    if num_v_cache_pages > INT32_MAX:
+    int32_max = torch.iinfo(torch.int32).max
+    if v_page_offset < 0 or v_page_offset > int32_max:
+        raise ValueError(f"v_page_offset must be in [0, {int32_max}], got {v_page_offset}")
+    if num_v_cache_pages > int32_max:
         raise ValueError(
-            f"v_packed exceeds the Int32 physical-page limit: {num_v_cache_pages} > {INT32_MAX}"
+            f"v_packed exceeds the Int32 physical-page limit: {num_v_cache_pages} > {int32_max}"
         )
     if v_page_offset + num_cache_pages > num_v_cache_pages:
         raise ValueError(
@@ -7618,165 +7493,164 @@ def run_trtllm_fp4_mla_decode_page_native(
         raise TypeError("q_global_scale must be a scalar FP32 CUDA tensor")
     if kv_global_scale.dtype != torch.float32 or kv_global_scale.numel() != 1:
         raise TypeError("kv_global_scale must be a scalar FP32 CUDA tensor")
-    with _launch_stream() as stream:
-        device_index = torch.cuda.current_device()
-        context_result, current_context = cuda.cuCtxGetCurrent()
-        if context_result != cuda.CUresult.CUDA_SUCCESS:
+    stream = _current_cu_stream()
+    device_index = torch.cuda.current_device()
+    context_result, current_context = cuda.cuCtxGetCurrent()
+    if context_result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            f"Failed to query the current CUDA context for FP4 MLA launch: {context_result}."
+        )
+    q_data_ptr = q_internal.data_ptr()
+    k_data_ptr = kv_cache.data_ptr()
+    q_sf_data_ptr = q_sf_internal.data_ptr()
+    k_sf_data_ptr = sf_cache.data_ptr()
+    b_data_ptr = v_packed.data_ptr()
+    scratch_ptr = output.data_ptr()
+    sfb_data_ptr = v_sf.data_ptr()
+    page_table_data_ptr = src_page_ids.data_ptr()
+    valid_k_data_ptr = valid_k.data_ptr()
+    c_data_ptr = output.data_ptr()
+    page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
+    q_global_scale_data_ptr = q_global_scale.data_ptr()
+    kv_global_scale_data_ptr = kv_global_scale.data_ptr()
+    kv_page_stride_bytes = cache_layout.stride_page
+    ksf_page_stride_bytes = int(sf_cache.stride(0))
+    vsf_page_stride_bytes = int(v_sf.stride(0))
+    softmax_scale_log2 = sm_scale * LOG2_E
+    fused = _compile_fused(
+        q_data_ptr,
+        k_data_ptr,
+        q_sf_data_ptr,
+        k_sf_data_ptr,
+        b_data_ptr,
+        scratch_ptr,
+        sfb_data_ptr,
+        page_table_data_ptr,
+        valid_k_data_ptr,
+        c_data_ptr,
+        scratch_ptr,
+        scratch_ptr,
+        scratch_ptr,
+        page_indptr_data_ptr,
+        q_global_scale_data_ptr,
+        kv_global_scale_data_ptr,
+        physical_m,
+        TRTLLM_V_HEAD_DIM,
+        physical_k,
+        l_batch,
+        page_size,
+        use_mixed_imlp=enable_mxi_imlp,
+        output_dtype=output.dtype,
+        stream=stream,
+        num_cache_pages=num_cache_pages,
+        query_len_per_seq=query_len_per_seq,
+        kv_page_stride_bytes=kv_page_stride_bytes,
+        ksf_page_stride_bytes=ksf_page_stride_bytes,
+        vsf_page_stride_bytes=vsf_page_stride_bytes,
+        use_consecutive_page_pair=use_consecutive_page_pair,
+    )
+    supports_prepared = _class_defines_callables(
+        fused, "to", "generate_execution_args", "run_compiled_program"
+    )
+    prepared_key = (
+        fused,
+        device_index,
+        int(current_context),
+        int(stream),
+        q_data_ptr,
+        k_data_ptr,
+        q_sf_data_ptr,
+        k_sf_data_ptr,
+        b_data_ptr,
+        sfb_data_ptr,
+        page_table_data_ptr,
+        valid_k_data_ptr,
+        c_data_ptr,
+        page_indptr_data_ptr,
+        q_global_scale_data_ptr,
+        kv_global_scale_data_ptr,
+        physical_m,
+        l_batch,
+        q_batch_capacity,
+        num_cache_pages,
+        num_v_cache_pages,
+        v_page_offset,
+        kv_page_stride_bytes,
+        ksf_page_stride_bytes,
+        vsf_page_stride_bytes,
+        softmax_scale_log2,
+        output.dtype,
+        enable_mxi_imlp,
+        use_consecutive_page_pair,
+    )
+    if supports_prepared:
+        prepared = _get_prepared_fused_call(prepared_key)
+        if prepared is not None:
+            prepared.run()
+            return
+    ptrs = _make_fused_ptrs(
+        q_data_ptr,
+        k_data_ptr,
+        q_sf_data_ptr,
+        k_sf_data_ptr,
+        b_data_ptr,
+        scratch_ptr,
+        sfb_data_ptr,
+        page_table_data_ptr,
+        valid_k_data_ptr,
+        c_data_ptr,
+        scratch_ptr,
+        scratch_ptr,
+        scratch_ptr,
+        page_indptr_data_ptr,
+        q_global_scale_data_ptr,
+        kv_global_scale_data_ptr,
+        output.dtype,
+    )
+    runtime_args = (
+        *ptrs,
+        (TRTLLM_V_HEAD_DIM, physical_k),
+        ctm.Int32(physical_m),
+        ctm.Int32(l_batch),
+        ctm.Int32(q_batch_capacity),
+        ctm.Int32(num_cache_pages),
+        ctm.Int32(num_v_cache_pages),
+        ctm.Int32(v_page_offset),
+        ctm.Int64(kv_page_stride_bytes),
+        ctm.Int64(ksf_page_stride_bytes),
+        ctm.Int64(vsf_page_stride_bytes),
+        ctm.Float32(softmax_scale_log2),
+        ctm.Float32(1.0),
+        stream,
+    )
+    if not supports_prepared:
+        fused(*runtime_args)
+        return
+    executor_key = (fused, device_index, int(current_context))
+    executor = _get_fused_executor(executor_key)
+    if executor is None:
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"Failed to query the current CUDA context for FP4 MLA launch: {context_result}."
+                "FP4 MLA CUDA Graph capture requires an eager warmup for the compiled kernel, device, and CUDA context."
             )
-        q_data_ptr = q_internal.data_ptr()
-        k_data_ptr = kv_cache.data_ptr()
-        q_sf_data_ptr = q_sf_internal.data_ptr()
-        k_sf_data_ptr = sf_cache.data_ptr()
-        b_data_ptr = v_packed.data_ptr()
-        scratch_ptr = output.data_ptr()
-        sfb_data_ptr = v_sf.data_ptr()
-        page_table_data_ptr = src_page_ids.data_ptr()
-        valid_k_data_ptr = valid_k.data_ptr()
-        c_data_ptr = output.data_ptr()
-        page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
-        q_global_scale_data_ptr = q_global_scale.data_ptr()
-        kv_global_scale_data_ptr = kv_global_scale.data_ptr()
-        kv_page_stride_bytes = cache_layout.stride_page
-        ksf_page_stride_bytes = int(sf_cache.stride(0))
-        vsf_page_stride_bytes = int(v_sf.stride(0))
-        softmax_scale_log2 = sm_scale * LOG2_E
-        fused = _compile_fused(
-            q_data_ptr,
-            k_data_ptr,
-            q_sf_data_ptr,
-            k_sf_data_ptr,
-            b_data_ptr,
-            scratch_ptr,
-            sfb_data_ptr,
-            page_table_data_ptr,
-            valid_k_data_ptr,
-            c_data_ptr,
-            scratch_ptr,
-            scratch_ptr,
-            scratch_ptr,
-            page_indptr_data_ptr,
-            q_global_scale_data_ptr,
-            kv_global_scale_data_ptr,
-            physical_m,
-            TRTLLM_V_HEAD_DIM,
-            physical_k,
-            l_batch,
-            page_size,
-            use_mixed_imlp=enable_mxi_imlp,
-            output_dtype=output.dtype,
-            stream=stream,
-            num_cache_pages=num_cache_pages,
-            query_len_per_seq=query_len_per_seq,
-            kv_page_stride_bytes=kv_page_stride_bytes,
-            ksf_page_stride_bytes=ksf_page_stride_bytes,
-            vsf_page_stride_bytes=vsf_page_stride_bytes,
-            use_consecutive_page_pair=use_consecutive_page_pair,
-        )
-        supports_prepared = _class_defines_callables(
-            fused, "to", "generate_execution_args", "run_compiled_program"
-        )
-        prepared_key = (
-            fused,
-            device_index,
-            int(current_context),
-            int(stream),
-            q_data_ptr,
-            k_data_ptr,
-            q_sf_data_ptr,
-            k_sf_data_ptr,
-            b_data_ptr,
-            sfb_data_ptr,
-            page_table_data_ptr,
-            valid_k_data_ptr,
-            c_data_ptr,
-            page_indptr_data_ptr,
-            q_global_scale_data_ptr,
-            kv_global_scale_data_ptr,
-            physical_m,
-            l_batch,
-            q_batch_capacity,
-            num_cache_pages,
-            num_v_cache_pages,
-            v_page_offset,
-            kv_page_stride_bytes,
-            ksf_page_stride_bytes,
-            vsf_page_stride_bytes,
-            softmax_scale_log2,
-            output.dtype,
-            enable_mxi_imlp,
-            use_consecutive_page_pair,
-        )
-        if supports_prepared:
-            prepared = _get_prepared_fused_call(prepared_key)
-            if prepared is not None:
-                prepared.run()
-                return
-        ptrs = _make_fused_ptrs(
-            q_data_ptr,
-            k_data_ptr,
-            q_sf_data_ptr,
-            k_sf_data_ptr,
-            b_data_ptr,
-            scratch_ptr,
-            sfb_data_ptr,
-            page_table_data_ptr,
-            valid_k_data_ptr,
-            c_data_ptr,
-            scratch_ptr,
-            scratch_ptr,
-            scratch_ptr,
-            page_indptr_data_ptr,
-            q_global_scale_data_ptr,
-            kv_global_scale_data_ptr,
-            output.dtype,
-        )
-        runtime_args = (
-            *ptrs,
-            (TRTLLM_V_HEAD_DIM, physical_k),
-            ctm.Int32(physical_m),
-            ctm.Int32(l_batch),
-            ctm.Int32(q_batch_capacity),
-            ctm.Int32(num_cache_pages),
-            ctm.Int32(num_v_cache_pages),
-            ctm.Int32(v_page_offset),
-            ctm.Int64(kv_page_stride_bytes),
-            ctm.Int64(ksf_page_stride_bytes),
-            ctm.Int64(vsf_page_stride_bytes),
-            ctm.Float32(softmax_scale_log2),
-            ctm.Float32(1.0),
-            stream,
-        )
-        if not supports_prepared:
+        candidate = fused.to(device_index)
+        if not _class_defines_callables(
+            candidate, "generate_execution_args", "run_compiled_program"
+        ):
             fused(*runtime_args)
             return
-        executor_key = (fused, device_index, int(current_context))
-        executor = _get_fused_executor(executor_key)
-        if executor is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "FP4 MLA CUDA Graph capture requires an eager warmup for the "
-                    "compiled kernel, device, and CUDA context."
-                )
-            candidate = fused.to(device_index)
-            if not _class_defines_callables(
-                candidate, "generate_execution_args", "run_compiled_program"
-            ):
-                fused(*runtime_args)
-                return
-            executor = _cache_fused_executor(executor_key, candidate)
-        execution_args, adapted_args = executor.generate_execution_args(*runtime_args)
-        prepared = _cache_prepared_fused_call(
-            prepared_key,
-            _PreparedFusedCall(
-                executor=executor,
-                runtime_args=runtime_args,
-                execution_args=execution_args,
-                adapted_args=adapted_args,
-            ),
-        )
-        prepared.run()
+        executor = _cache_fused_executor(executor_key, candidate)
+    execution_args, adapted_args = executor.generate_execution_args(*runtime_args)
+    prepared = _cache_prepared_fused_call(
+        prepared_key,
+        _PreparedFusedCall(
+            executor=executor,
+            runtime_args=runtime_args,
+            execution_args=execution_args,
+            adapted_args=adapted_args,
+        ),
+    )
+    prepared.run()
 
 
 def run_trtllm_fp4_mla_decode_page_native_from_raw(

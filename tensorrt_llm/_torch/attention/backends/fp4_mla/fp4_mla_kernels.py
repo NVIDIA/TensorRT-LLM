@@ -286,96 +286,6 @@ def _fp4_mla_swizzled_sf_offset(
 # FP4 conversion and cache kernels
 
 
-@triton.jit(
-    do_not_specialize=[
-        "num_page_ids",
-        "num_pages",
-        "num_layers",
-        "local_layer",
-    ],
-    do_not_specialize_on_alignment=[
-        "num_page_ids",
-        "num_pages",
-        "num_layers",
-        "local_layer",
-    ],
-)
-def _fp4_mla_rebuild_v_scale_from_k_scale_kernel(
-    k_sf_ptr,
-    v_sf_ptr,
-    page_ids_ptr,
-    page_valid_tokens_ptr,
-    num_page_ids,
-    num_pages,
-    num_layers,
-    local_layer,
-    page_size,
-    k_sf_s0,
-    v_sf_s0,
-    v_sf_s1,
-    V_HEAD_D: tl.constexpr,
-    HP_BLOCK: tl.constexpr,
-    SF_PER_TOKEN: tl.constexpr,
-    SF_PER_PAGE: tl.constexpr,
-    BLOCK_TOKEN_GROUPS: tl.constexpr,
-):
-    """Rebuild dim-major MLA V scales from transferred token-major K scales.
-
-    Context quantization uses one shared scale for every 16x16 compressed-V
-    tile.  That byte is repeated across the tile's 16 K rows and 16 V rows,
-    so the process-local V layout can be reconstructed exactly from the first
-    valid K row of every token tile.
-    """
-    page_work_idx = tl.program_id(0)
-    dim_block = tl.program_id(1)
-    if page_work_idx >= num_page_ids:
-        return
-    if (local_layer < 0) | (local_layer >= num_layers):
-        return
-
-    physical_page = tl.load(page_ids_ptr + page_work_idx).to(tl.int64)
-    if (physical_page < 0) | (physical_page >= num_pages):
-        return
-
-    valid_tokens = tl.load(page_valid_tokens_ptr + page_work_idx).to(tl.int32)
-    valid_tokens = tl.maximum(0, tl.minimum(valid_tokens, page_size))
-    token_groups = tl.arange(0, BLOCK_TOKEN_GROUPS)
-    token_group_valid = (token_groups * HP_BLOCK < valid_tokens) & (
-        token_groups * HP_BLOCK < page_size
-    )
-
-    # Scale tensors are passed as uint8 views so this is a bit-exact copy of
-    # the FP8 E4M3 encoding, including signed zero if it is ever produced.
-    k_rows = token_groups * HP_BLOCK
-    k_sf_offsets = _fp4_mla_swizzled_sf_offset(
-        k_rows,
-        dim_block,
-        SF_PER_TOKEN,
-    )
-    scale_bits = tl.load(
-        k_sf_ptr + physical_page * k_sf_s0 + k_sf_offsets,
-        mask=token_group_valid,
-        other=0,
-    )
-
-    dims = dim_block * HP_BLOCK + tl.arange(0, HP_BLOCK)
-    dim_valid = dims < V_HEAD_D
-    safe_dims = tl.where(dim_valid, dims, 0)
-    v_sf_offsets = _fp4_mla_swizzled_sf_offset(
-        safe_dims[:, None],
-        token_groups[None, :],
-        SF_PER_PAGE,
-    )
-    v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
-        v_sf_s0, tl.int64
-    ) + physical_page * tl.cast(v_sf_s1, tl.int64)
-    tl.store(
-        v_sf_ptr + v_sf_base + v_sf_offsets.to(tl.int64),
-        scale_bits[None, :],
-        mask=dim_valid[:, None] & (token_groups[None, :] * HP_BLOCK < page_size),
-    )
-
-
 @triton.jit
 def _fp4_e2m1_to_f32(nibble):
     magnitude = nibble & 0x7
@@ -402,130 +312,6 @@ def _fp4_e2m1_to_f32(nibble):
     )
     sign = (nibble & 0x8) != 0
     return tl.where(sign, -value, value)
-
-
-@triton.jit
-def _fp4_mla_chunked_cache_gather_kernel(
-    compressed_kv_ptr,
-    k_pe_ptr,
-    kv_cache_ptr,
-    sf_cache_ptr,
-    page_ids_ptr,
-    cu_chunked_seq_len_ptr,
-    chunked_global_offset_ptr,
-    global_scale_ptr,
-    max_chunk_len,
-    page_table_stride,
-    num_pages,
-    page_size,
-    kv_s0,
-    kv_s2,
-    kv_s4,
-    sf_s0,
-    compressed_kv_s0,
-    k_pe_s0,
-    KV_LORA_RANK: tl.constexpr,
-    QK_ROPE_HEAD_DIM: tl.constexpr,
-    FP4_BLOCK: tl.constexpr,
-    SF_PER_TOKEN: tl.constexpr,
-    TOKEN_BLOCK: tl.constexpr,
-):
-    """Gather one logical MLA prefix chunk from the canonical FP4 K view."""
-    token_block = tl.program_id(0)
-    batch_idx = tl.program_id(1)
-    dim_block = tl.program_id(2)
-
-    local_tokens = token_block * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
-    chunk_start = tl.load(cu_chunked_seq_len_ptr + batch_idx).to(tl.int64)
-    chunk_end = tl.load(cu_chunked_seq_len_ptr + batch_idx + 1).to(tl.int64)
-    chunk_len = chunk_end - chunk_start
-    valid_tokens = (local_tokens < chunk_len) & (local_tokens < max_chunk_len)
-
-    logical_positions = tl.load(chunked_global_offset_ptr + batch_idx).to(
-        tl.int64
-    ) + local_tokens.to(tl.int64)
-    logical_page = logical_positions // page_size
-    page_position = logical_positions - logical_page * page_size
-    page_table_offsets = batch_idx * page_table_stride + logical_page
-    valid_tokens = valid_tokens & (logical_page >= 0) & (logical_page < page_table_stride)
-    physical_pages = tl.load(page_ids_ptr + page_table_offsets, mask=valid_tokens, other=0).to(
-        tl.int64
-    )
-    valid_tokens = valid_tokens & (physical_pages >= 0) & (physical_pages < num_pages)
-
-    dims = dim_block * FP4_BLOCK + tl.arange(0, FP4_BLOCK)
-    head_dim = KV_LORA_RANK + QK_ROPE_HEAD_DIM
-    valid_dims = dims < head_dim
-    packed_cols = dims // 2
-    packed = tl.load(
-        kv_cache_ptr
-        + physical_pages[:, None] * kv_s0
-        + page_position[:, None] * kv_s2
-        + packed_cols[None, :] * kv_s4,
-        mask=valid_tokens[:, None] & valid_dims[None, :],
-        other=0,
-    ).to(tl.uint8)
-    nibbles = tl.where((dims[None, :] & 1) == 0, packed & 0x0F, packed >> 4)
-
-    sf_offsets = _fp4_mla_swizzled_sf_offset(
-        page_position,
-        dim_block,
-        SF_PER_TOKEN,
-    )
-    scale = tl.load(
-        sf_cache_ptr + physical_pages * sf_s0 + sf_offsets,
-        mask=valid_tokens,
-        other=0.0,
-    ).to(tl.float32)
-    global_scale = tl.load(global_scale_ptr).to(tl.float32)
-    values = _fp4_e2m1_to_f32(nibbles) * scale[:, None] / global_scale
-
-    if dim_block * FP4_BLOCK >= KV_LORA_RANK:
-        residual_group = dim_block - KV_LORA_RANK // FP4_BLOCK
-        residual_packed_cols = (
-            head_dim // 2 + residual_group * (FP4_BLOCK // 2) + dims % FP4_BLOCK // 2
-        )
-        residual_packed = tl.load(
-            kv_cache_ptr
-            + physical_pages[:, None] * kv_s0
-            + page_position[:, None] * kv_s2
-            + residual_packed_cols[None, :] * kv_s4,
-            mask=valid_tokens[:, None] & valid_dims[None, :],
-            other=0,
-        ).to(tl.uint8)
-        residual_nibbles = tl.where(
-            (dims[None, :] & 1) == 0,
-            residual_packed & 0x0F,
-            residual_packed >> 4,
-        )
-        residual_sf_col = head_dim // FP4_BLOCK + residual_group
-        residual_sf_offsets = _fp4_mla_swizzled_sf_offset(
-            page_position,
-            residual_sf_col,
-            SF_PER_TOKEN,
-        )
-        residual_scale = tl.load(
-            sf_cache_ptr + physical_pages * sf_s0 + residual_sf_offsets,
-            mask=valid_tokens,
-            other=0.0,
-        ).to(tl.float32)
-        values += _fp4_e2m1_to_f32(residual_nibbles) * residual_scale[:, None] / global_scale
-
-    output_tokens = chunk_start + local_tokens
-    if dim_block * FP4_BLOCK < KV_LORA_RANK:
-        output_dims = dims
-        tl.store(
-            compressed_kv_ptr + output_tokens[:, None] * compressed_kv_s0 + output_dims[None, :],
-            values,
-            mask=valid_tokens[:, None] & (output_dims[None, :] < KV_LORA_RANK),
-        )
-    else:
-        output_dims = dims - KV_LORA_RANK
-        tl.store(
-            k_pe_ptr + output_tokens[:, None] * k_pe_s0 + output_dims[None, :],
-            values,
-            mask=valid_tokens[:, None] & (output_dims[None, :] < QK_ROPE_HEAD_DIM),
-        )
 
 
 @triton.jit
@@ -618,7 +404,6 @@ def _fp4_mla_context_cache_update_kernel(
     v_sf_ptr,
     v_packed_ptr,
     latent_cache_ptr,
-    q_context_ptr,
     global_scale_ptr,
     rotary_cos_sin_ptr,
     hp_pool_ptr,
@@ -645,9 +430,6 @@ def _fp4_mla_context_cache_update_kernel(
     sf_s0,
     lc_s0,
     lc_s1,
-    q_s0,
-    q_s1,
-    q_s2,
     vsf_s0,
     vsf_s1,
     v_packed_s0,
@@ -665,17 +447,12 @@ def _fp4_mla_context_cache_update_kernel(
     STORE_K_RESIDUAL: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     APPLY_K_ROPE: tl.constexpr,
-    APPLY_Q_ROPE: tl.constexpr,
-    NUM_DIM_BLOCKS: tl.constexpr,
-    NUM_Q_HEADS: tl.constexpr,
-    Q_NOPE_DIM: tl.constexpr,
-    BLOCK_Q_HEADS: tl.constexpr,
     POOL_HEAD_D: tl.constexpr,
     STORE_HP_TAIL: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
-    work_idx = tl.program_id(1)
+    dim_block = tl.program_id(1)
     if (local_layer < 0) | (local_layer >= num_layers):
         return
     if token_idx >= num_tokens:
@@ -689,47 +466,6 @@ def _fp4_mla_context_cache_update_kernel(
     position = tl.load(positions_ptr + metadata_token_idx).to(tl.int64)
     if (batch_idx < 0) | (batch_idx + 1 >= indptr_len) | (position < 0):
         return
-
-    if APPLY_Q_ROPE and work_idx >= NUM_DIM_BLOCKS:
-        q_head_block = work_idx - NUM_DIM_BLOCKS
-        q_heads = q_head_block * BLOCK_Q_HEADS + tl.arange(0, BLOCK_Q_HEADS)
-        q_head_mask = q_heads < NUM_Q_HEADS
-        pair_offsets = tl.arange(0, ROPE_DIM // 2)
-        rotary_offsets = position * (ROPE_DIM * 2) + pair_offsets * 2
-        cos = tl.load(rotary_cos_sin_ptr + rotary_offsets).to(tl.float32)
-        sin = tl.load(rotary_cos_sin_ptr + rotary_offsets + 1).to(tl.float32)
-        q_base = token_idx * q_s0 + q_heads[:, None].to(tl.int64) * q_s1 + Q_NOPE_DIM * q_s2
-        q_even_offsets = q_base + (pair_offsets[None, :] * 2).to(tl.int64) * q_s2
-        q_odd_offsets = q_even_offsets + q_s2
-        q_even = tl.load(
-            q_context_ptr + q_even_offsets,
-            mask=q_head_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        q_odd = tl.load(
-            q_context_ptr + q_odd_offsets,
-            mask=q_head_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        q_roped_even, q_roped_odd = _fp4_mla_rope_fp32(
-            q_even,
-            q_odd,
-            cos[None, :],
-            sin[None, :],
-        )
-        tl.store(
-            q_context_ptr + q_even_offsets,
-            q_roped_even.to(tl.bfloat16),
-            mask=q_head_mask[:, None],
-        )
-        tl.store(
-            q_context_ptr + q_odd_offsets,
-            q_roped_odd.to(tl.bfloat16),
-            mask=q_head_mask[:, None],
-        )
-        return
-
-    dim_block = work_idx
     if position % HP_BLOCK != 0:
         return
 
@@ -815,24 +551,6 @@ def _fp4_mla_context_cache_update_kernel(
             roped_even, roped_odd = _fp4_mla_rope_fp32(even_values, odd_values, cos, sin)
             roped_even = roped_even.to(tl.bfloat16).to(tl.float32)
             roped_odd = roped_odd.to(tl.bfloat16).to(tl.float32)
-            if APPLY_Q_ROPE:
-                # Only chunked prefill consumes the rotated current K from
-                # latent_cache. Normal context overlaps this cache update with
-                # FP8 attention on another stream, so its input must stay read-only.
-                tl.store(
-                    latent_cache_ptr
-                    + safe_token_candidates[:, None] * lc_s0
-                    + safe_even_d[None, :] * lc_s1,
-                    roped_even,
-                    mask=rotary_mask,
-                )
-                tl.store(
-                    latent_cache_ptr
-                    + safe_token_candidates[:, None] * lc_s0
-                    + safe_odd_d[None, :] * lc_s1,
-                    roped_odd,
-                    mask=rotary_mask,
-                )
             even_values = tl.where(rotary_mask, roped_even, even_values)
             odd_values = tl.where(rotary_mask, roped_odd, odd_values)
 

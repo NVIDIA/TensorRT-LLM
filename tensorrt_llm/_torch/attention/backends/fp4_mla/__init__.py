@@ -18,14 +18,11 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
-from tensorrt_llm.bindings import DataType
+from tensorrt_llm._utils import get_sm_version
 
 from .fp4_mla_kernels import (
-    _fp4_mla_chunked_cache_gather_kernel,
     _fp4_mla_context_cache_update_kernel,
     _fp4_mla_generation_fused_qk_rope_cache_update_kernel,
-    _fp4_mla_rebuild_v_scale_from_k_scale_kernel,
 )
 
 HP_BLOCK_SIZE: int = 16
@@ -49,8 +46,6 @@ FP4_MLA_Q_LOGICAL_DIM: int = FP4_MLA_Q_PREFIX_DIM + 2 * FP4_MLA_Q_RESIDUAL_DIM
 FP4_MLA_Q_PACKED_DIM: int = FP4_MLA_Q_LOGICAL_DIM // 2
 FP4_MLA_Q_SF_GROUPS: int = FP4_MLA_Q_LOGICAL_DIM // FP4_BLOCK_SIZE
 FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
-# Retained for compatibility; mufu16 is now the only non-fused CuTeDSL variant.
-FP4_MLA_CUTEDSL_MUFU16_ENV = "TRTLLM_FP4_MLA_CUTEDSL_MUFU16"
 FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
 _FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
 _FP4_MLA_K_RESIDUAL_BACKENDS = ("triton", _FP4_MLA_CUTEDSL_BACKEND)
@@ -463,7 +458,7 @@ def populate_fp4_mla_generation_lengths(
 def _fp4_mla_page_table_spec(kv_cache_manager: Any) -> Any:
     get_spec = getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)
     if not callable(get_spec):
-        raise RuntimeError("FP4 MLA requires V2 cache-layout page metadata.")
+        raise RuntimeError("FP4 MLA requires Fp4MlaKVCacheManagerV2 page metadata.")
     spec = get_spec()
     for field_name in (
         "cache_pool_id",
@@ -573,7 +568,7 @@ def configure_fp4_mla_device_page_table(
 ) -> bool:
     """Configure the fixed-stride, device-materialized page table.
 
-    Eager context and generation batches receive the full block-offset
+    Context, generation, and fresh mixed batches receive the full block-offset
     table on the GPU. The materialization kernel decodes V2 page indices and
     refreshes rows from the final device KV lengths before cache update.
     """
@@ -600,7 +595,18 @@ def configure_fp4_mla_device_page_table(
     tensors = (block_offsets, page_ids, paged_kv_indptr, paged_kv_indptr_decode)
     is_cuda_graph = bool(getattr(metadata, "is_cuda_graph", False))
     generation_only = num_contexts == 0
-    eager_context = not is_cuda_graph and num_contexts > 0
+    fresh_mixed = (
+        not is_cuda_graph
+        and num_contexts > 0
+        and num_generation_sequences > 0
+        and int(getattr(metadata, "num_ctx_cached_tokens", 0) or 0) == 0
+    )
+    fresh_context_only = (
+        not is_cuda_graph
+        and num_contexts > 0
+        and num_generation_sequences == 0
+        and int(getattr(metadata, "num_ctx_cached_tokens", 0) or 0) == 0
+    )
     has_valid_generation = num_generation_sequences == 0 or (
         num_generation_tokens >= num_generation_sequences
         and num_generation_tokens % num_generation_sequences == 0
@@ -608,7 +614,7 @@ def configure_fp4_mla_device_page_table(
     # NVFP4 exposes one data pool plus its paired block-scale pool. The
     # materializer reads encoded data offsets from pool 0.
     supported = (
-        (generation_only or eager_context)
+        (generation_only or fresh_mixed or fresh_context_only)
         and kv_cache_manager is not None
         and has_valid_generation
         and int(getattr(metadata, "beam_width", 1)) == 1
@@ -646,7 +652,7 @@ def configure_fp4_mla_device_page_table(
         and kv_lens.ndim == 1
         and kv_lens.numel() >= num_sequences
     )
-    if eager_context and num_generation_sequences > 0 and not host_kv_lens_available:
+    if fresh_mixed and not host_kv_lens_available:
         return False
     if not is_cuda_graph and host_kv_lens_available:
         generation_tokens_per_sequence = (
@@ -1147,247 +1153,6 @@ def get_fp4_mla_v_scale_pool_view(
     return torch.as_strided(pool, size=shape, stride=strides)
 
 
-def _rebuild_fp4_mla_v_scales_from_k_scales(
-    sf_cache: torch.Tensor,
-    v_scale_pool: torch.Tensor,
-    page_ids: torch.Tensor,
-    page_valid_tokens: torch.Tensor,
-    *,
-    local_layer: int,
-    v_head_dim: int,
-    page_size: int,
-) -> None:
-    """Bit-exactly rebuild imported MLA V scales from transferred K scales."""
-    if page_ids.numel() == 0:
-        return
-    if page_size != FP4_MLA_TOKENS_PER_BLOCK:
-        raise ValueError(
-            "FP4 MLA imported V-scale rebuild requires "
-            f"tokens_per_block={FP4_MLA_TOKENS_PER_BLOCK}, got {page_size}."
-        )
-    for name, tensor in (
-        ("sf_cache", sf_cache),
-        ("v_scale_pool", v_scale_pool),
-        ("page_ids", page_ids),
-        ("page_valid_tokens", page_valid_tokens),
-    ):
-        if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
-            raise ValueError(f"{name} must be a CUDA tensor.")
-    if page_ids.dtype != torch.int32 or page_valid_tokens.dtype != torch.int32:
-        raise TypeError("FP4 MLA imported page IDs and valid-token counts must use int32.")
-    if page_ids.ndim != 1 or page_valid_tokens.ndim != 1:
-        raise ValueError("FP4 MLA imported page metadata must be one-dimensional.")
-    if page_ids.numel() != page_valid_tokens.numel():
-        raise ValueError("FP4 MLA imported page IDs and valid-token counts must have equal length.")
-    if not page_ids.is_contiguous() or not page_valid_tokens.is_contiguous():
-        raise ValueError("FP4 MLA imported page metadata must be contiguous.")
-    if not (sf_cache.device == v_scale_pool.device == page_ids.device == page_valid_tokens.device):
-        raise ValueError("FP4 MLA imported cache tensors must be on the same device.")
-
-    k_sf_bytes = sf_cache.view(torch.uint8)
-    v_sf_bytes = v_scale_pool.view(torch.uint8)
-    if k_sf_bytes.ndim < 2 or v_sf_bytes.ndim < 3:
-        raise ValueError(
-            "FP4 MLA imported scale pools require per-page K storage and "
-            "per-layer/per-page V storage."
-        )
-    num_layers = int(v_sf_bytes.shape[0])
-    num_pages = int(v_sf_bytes.shape[1])
-    if not 0 <= local_layer < num_layers:
-        raise IndexError(
-            f"local_layer={local_layer} is outside the V-scale pool with {num_layers} layers."
-        )
-    if int(k_sf_bytes.shape[0]) != num_pages:
-        raise ValueError(
-            "FP4 MLA K/V scale pools disagree on their physical page count: "
-            f"{int(k_sf_bytes.shape[0])} != {num_pages}."
-        )
-    sf_per_token = int(k_sf_bytes.shape[-1])
-    required_sf_per_token = _ceil_div(v_head_dim, FP4_BLOCK_SIZE)
-    if sf_per_token < required_sf_per_token:
-        raise ValueError(
-            "FP4 MLA K-scale storage is too narrow for the compressed V head: "
-            f"{sf_per_token} < {required_sf_per_token}."
-        )
-    required_v_page_elems = get_fp4_mla_v_scale_pool_size(v_head_dim, page_size)
-    if int(v_sf_bytes.shape[-1]) < required_v_page_elems:
-        raise ValueError(
-            "FP4 MLA V-scale page storage is too small for import rebuild: "
-            f"{int(v_sf_bytes.shape[-1])} < {required_v_page_elems}."
-        )
-
-    token_groups = page_size // HP_BLOCK_SIZE
-    _fp4_mla_rebuild_v_scale_from_k_scale_kernel[
-        (page_ids.numel(), triton.cdiv(v_head_dim, FP4_BLOCK_SIZE))
-    ](
-        k_sf_bytes,
-        v_sf_bytes,
-        page_ids,
-        page_valid_tokens,
-        page_ids.numel(),
-        num_pages,
-        num_layers,
-        local_layer,
-        page_size,
-        k_sf_bytes.stride(0),
-        v_sf_bytes.stride(0),
-        v_sf_bytes.stride(1),
-        V_HEAD_D=v_head_dim,
-        HP_BLOCK=HP_BLOCK_SIZE,
-        SF_PER_TOKEN=sf_per_token,
-        SF_PER_PAGE=token_groups,
-        BLOCK_TOKEN_GROUPS=triton.next_power_of_2(token_groups),
-        num_warps=4,
-    )
-
-
-def _stage_fp4_mla_import_page_metadata(
-    prompt_block_ids: list[int],
-    *,
-    prompt_len: int,
-    page_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stage imported page metadata without synchronizing the CUDA stream."""
-    if device.type != "cuda":
-        raise ValueError("FP4 MLA disaggregated import requires a CUDA device.")
-    num_prompt_pages = len(prompt_block_ids)
-    pin_memory = prefer_pinned()
-    page_ids_host = torch.tensor(
-        prompt_block_ids,
-        dtype=torch.int32,
-        device="cpu",
-        pin_memory=pin_memory,
-    )
-    page_valid_tokens_host = torch.full(
-        (num_prompt_pages,),
-        page_size,
-        dtype=torch.int32,
-        device="cpu",
-        pin_memory=pin_memory,
-    )
-    page_valid_tokens_host[-1] = prompt_len - (num_prompt_pages - 1) * page_size
-    # Constructing a CUDA tensor directly from a Python list synchronizes the
-    # current stream. During overlap scheduling that stream already waits for
-    # the previous forward, exposing the import rebuild as an inter-step gap.
-    # Explicit non-blocking copies keep the CPU free to enqueue every rebuild
-    # and the next forward while preserving their existing stream order.
-    page_ids = torch.empty_like(page_ids_host, device=device)
-    page_valid_tokens = torch.empty_like(page_valid_tokens_host, device=device)
-    page_ids.copy_(page_ids_host, non_blocking=True)
-    page_valid_tokens.copy_(page_valid_tokens_host, non_blocking=True)
-    return page_ids, page_valid_tokens
-
-
-def rebuild_fp4_mla_disagg_imported_cache(
-    kv_cache_manager: Any,
-    request_id: int,
-    prompt_len: int,
-) -> bool:
-    """Rebuild GEN-local FP4 MLA sidecars after a disaggregated KV import.
-
-    The disaggregated payload carries the native V2 K, K-scale, and BF16 HP
-    roles. V scales and CuTeDSL's V-packed layout are deterministic
-    process-local views, so rebuilding them here avoids transfer bandwidth and
-    guarantees they are ready before a first decode step that may execute
-    through a pre-captured CUDA graph.
-    """
-    if (
-        kv_cache_manager is None
-        or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4
-        or getattr(kv_cache_manager, "kv_factor", None) != 1
-        or getattr(kv_cache_manager, "mla_v_scale_head_dim", None) is None
-        or not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
-    ):
-        return False
-    if not isinstance(prompt_len, int) or prompt_len <= 0:
-        raise ValueError(
-            f"FP4 MLA disaggregated import needs a positive prompt_len, got {prompt_len}."
-        )
-
-    page_size = int(kv_cache_manager.tokens_per_block)
-    if page_size != FP4_MLA_TOKENS_PER_BLOCK:
-        raise ValueError(
-            "FP4 MLA disaggregated import requires "
-            f"tokens_per_block={FP4_MLA_TOKENS_PER_BLOCK}, got {page_size}."
-        )
-    pp_layers = list(getattr(kv_cache_manager, "pp_layers", ()))
-    num_local_layers = int(getattr(kv_cache_manager, "num_local_layers", len(pp_layers)))
-    if len(pp_layers) != num_local_layers:
-        raise RuntimeError(
-            "FP4 MLA disaggregated import cannot map local to global layers: "
-            f"{len(pp_layers)} PP layers for {num_local_layers} local layers."
-        )
-    fp4_local_layers = list(
-        getattr(kv_cache_manager, "_fp4_mla_compact_to_local", range(num_local_layers))
-    )
-    if not fp4_local_layers:
-        raise RuntimeError("FP4 MLA disaggregated import found no local MLA layers.")
-    if any(local_layer < 0 or local_layer >= num_local_layers for local_layer in fp4_local_layers):
-        raise RuntimeError(
-            "FP4 MLA disaggregated import has invalid compact-to-local layer mapping: "
-            f"{fp4_local_layers}."
-        )
-
-    num_prompt_pages = _ceil_div(prompt_len, page_size)
-    first_attention_layer = pp_layers[fp4_local_layers[0]]
-    block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(
-        [int(request_id)], layer_idx=first_attention_layer
-    )
-    if len(block_ids_per_seq) != 1 or len(block_ids_per_seq[0]) < num_prompt_pages:
-        available = len(block_ids_per_seq[0]) if block_ids_per_seq else 0
-        raise RuntimeError(
-            "FP4 MLA disaggregated import is missing prompt pages for request "
-            f"{request_id}: need {num_prompt_pages}, have {available}."
-        )
-    prompt_block_ids = [int(block_id) for block_id in block_ids_per_seq[0][:num_prompt_pages]]
-
-    v_scale_pool = kv_cache_manager.get_mla_v_scale_pool()
-    if not isinstance(v_scale_pool, torch.Tensor):
-        raise RuntimeError("FP4 MLA disaggregated import requires the manager V-scale pool.")
-    page_ids, page_valid_tokens = _stage_fp4_mla_import_page_metadata(
-        prompt_block_ids,
-        prompt_len=prompt_len,
-        page_size=page_size,
-        device=v_scale_pool.device,
-    )
-
-    v_scale_head_dim = int(kv_cache_manager.mla_v_scale_head_dim)
-    cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
-    for compact_layer, local_layer in enumerate(fp4_local_layers):
-        layer_idx = pp_layers[local_layer]
-        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
-        _rebuild_fp4_mla_v_scales_from_k_scales(
-            sf_cache,
-            v_scale_pool,
-            page_ids,
-            page_valid_tokens,
-            local_layer=compact_layer,
-            v_head_dim=v_scale_head_dim,
-            page_size=page_size,
-        )
-        if cutedsl_backend and not _fp4_mla_cutedsl_fused_v_transpose_enabled():
-            v_head_dim = getattr(kv_cache_manager, "mla_v_head_dim", None)
-            if v_head_dim is None:
-                raise RuntimeError(
-                    "CuTeDSL FP4 MLA disaggregated import requires a persistent V head dimension."
-                )
-            v_packed = kv_cache_manager.get_mla_v_packed_pool(compact_layer)
-            if not isinstance(v_packed, torch.Tensor):
-                raise RuntimeError(
-                    "CuTeDSL FP4 MLA disaggregated import requires the persistent V-packed pool."
-                )
-            _repack_cutedsl_v_packed_cache(
-                v_packed,
-                kv_cache,
-                page_ids,
-                v_head_dim=int(v_head_dim),
-                page_size=page_size,
-                block_v=FP4_MLA_SCALE_ROW_GROUP,
-            )
-    return True
-
-
 # Python launch helpers
 
 
@@ -1491,8 +1256,6 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     v_sf: torch.Tensor,
     global_scale: torch.Tensor,
     rotary_cos_sin: Optional[torch.Tensor],
-    q_context: Optional[torch.Tensor],
-    q_nope_head_dim: Optional[int],
     *,
     token_offset: int,
     local_layer: int,
@@ -1523,34 +1286,6 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         else 0
     )
     rotary_cos_sin_ptr = rotary_cos_sin if rotary_cos_sin is not None else latent_cache
-
-    apply_q_rope = q_context is not None
-    block_q_heads = 16
-    if apply_q_rope:
-        if rotary_cos_sin is None or q_nope_head_dim is None:
-            raise ValueError("FP4 MLA fused context Q-RoPE requires a rotary table and Q layout.")
-        q_head_dim = q_nope_head_dim + rope_dim
-        if (
-            q_context.dtype != torch.bfloat16
-            or q_context.device != latent_cache.device
-            or q_context.ndim != 2
-            or q_context.shape[0] != num_tokens
-            or q_context.shape[1] <= 0
-            or q_nope_head_dim <= 0
-            or q_context.shape[1] % q_head_dim != 0
-            or not q_context.is_contiguous()
-        ):
-            raise ValueError(
-                "FP4 MLA fused context Q-RoPE requires a contiguous same-device BF16 "
-                f"tensor shaped [tokens, heads * ({q_nope_head_dim} + {rope_dim})]."
-            )
-        num_q_heads = q_context.shape[1] // q_head_dim
-        q_context_view = q_context.view(num_tokens, num_q_heads, q_head_dim)
-        q_head_blocks = triton.cdiv(num_q_heads, block_q_heads)
-    else:
-        num_q_heads = 0
-        q_context_view = latent_cache
-        q_head_blocks = 0
 
     hp_pool = getattr(metadata, "high_precision_kv_pool", None)
     if not isinstance(hp_pool, torch.Tensor):
@@ -1587,7 +1322,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     _fp4_mla_context_cache_update_kernel[
         (
             num_tokens,
-            num_dim_blocks + q_head_blocks,
+            num_dim_blocks,
         )
     ](
         kv_cache,
@@ -1595,7 +1330,6 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         v_sf,
         v_packed_output,
         latent_cache,
-        q_context_view,
         global_scale,
         rotary_cos_sin_ptr,
         hp_pool,
@@ -1622,9 +1356,6 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         sf_cache.stride(0),
         latent_cache.stride(0),
         latent_cache.stride(1),
-        q_context_view.stride(0),
-        q_context_view.stride(1) if apply_q_rope else 0,
-        q_context_view.stride(2) if apply_q_rope else 0,
         v_sf.stride(0),
         v_sf.stride(1),
         v_packed_s0,
@@ -1642,11 +1373,6 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         STORE_K_RESIDUAL=(_fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS),
         ROPE_DIM=rope_dim,
         APPLY_K_ROPE=apply_k_rope,
-        APPLY_Q_ROPE=apply_q_rope,
-        NUM_DIM_BLOCKS=num_dim_blocks,
-        NUM_Q_HEADS=num_q_heads,
-        Q_NOPE_DIM=q_nope_head_dim if q_nope_head_dim is not None else 0,
-        BLOCK_Q_HEADS=block_q_heads,
         POOL_HEAD_D=pool_head_dim,
         STORE_HP_TAIL=store_hp_tail,
         WRITE_V_PACKED=write_v_packed,
@@ -2060,7 +1786,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 v_sf,
                 v_packed_output,
                 latent_cache,
-                latent_cache,
                 global_scale,
                 rotary_table,
                 pool,
@@ -2087,9 +1812,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 sf_cache.stride(0),
                 latent_cache.stride(0),
                 latent_cache.stride(1),
-                latent_cache.stride(0),
-                0,
-                0,
                 v_sf.stride(0),
                 v_sf.stride(1),
                 v_packed_s0,
@@ -2107,11 +1829,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 STORE_K_RESIDUAL=store_k_residual,
                 ROPE_DIM=rope_dim,
                 APPLY_K_ROPE=True,
-                APPLY_Q_ROPE=False,
-                NUM_DIM_BLOCKS=num_dim_blocks,
-                NUM_Q_HEADS=0,
-                Q_NOPE_DIM=0,
-                BLOCK_Q_HEADS=16,
                 POOL_HEAD_D=hp_head_dim,
                 STORE_HP_TAIL=True,
                 WRITE_V_PACKED=write_v_packed,
@@ -2159,140 +1876,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
 # Public cache update and decode entry points
 
 
-def load_fp4_mla_chunked_kv_cache(
-    metadata: Any,
-    layer_idx: int,
-    *,
-    num_ctx_cached_tokens: int,
-    cu_chunked_seq_len: torch.Tensor,
-    chunked_global_offset: torch.Tensor,
-    chunked_max_seq_len: int,
-    out_dtype: torch.dtype,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather one cached-prefix partition from dense FP4 MLA V2 storage."""
-    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError(f"FP4 MLA chunk gather does not support output dtype {out_dtype}.")
-    if num_ctx_cached_tokens < 0:
-        raise ValueError("FP4 MLA chunk gather token count must be non-negative.")
-    if chunked_max_seq_len < 0:
-        raise ValueError("FP4 MLA chunk gather max sequence length must be non-negative.")
-    if num_ctx_cached_tokens > 0 and chunked_max_seq_len == 0:
-        raise ValueError("A non-empty FP4 MLA chunk gather requires a positive max length.")
-    if (
-        kv_lora_rank <= 0
-        or kv_lora_rank % FP4_BLOCK_SIZE != 0
-        or qk_rope_head_dim != FP4_MLA_K_RESIDUAL_DIM
-    ):
-        raise ValueError(
-            "FP4 MLA chunk gather requires a positive kv_lora_rank and "
-            f"qk_rope_head_dim={FP4_MLA_K_RESIDUAL_DIM}, got "
-            f"{kv_lora_rank} and {qk_rope_head_dim}."
-        )
-
-    num_contexts = int(metadata.num_contexts)
-    if num_ctx_cached_tokens > 0 and num_contexts <= 0:
-        raise ValueError("A non-empty FP4 MLA chunk gather requires context requests.")
-    tensors = (cu_chunked_seq_len, chunked_global_offset)
-    if any(not isinstance(tensor, torch.Tensor) or not tensor.is_cuda for tensor in tensors):
-        raise ValueError("FP4 MLA chunk gather metadata must use CUDA tensors.")
-    if (
-        cu_chunked_seq_len.dtype != torch.int64
-        or cu_chunked_seq_len.ndim != 1
-        or cu_chunked_seq_len.numel() < num_contexts + 1
-        or not cu_chunked_seq_len.is_contiguous()
-    ):
-        raise ValueError(
-            "FP4 MLA chunk gather requires a contiguous int64 cumulative-length tensor."
-        )
-    if (
-        chunked_global_offset.dtype != torch.int64
-        or chunked_global_offset.ndim != 1
-        or chunked_global_offset.numel() < num_contexts
-        or not chunked_global_offset.is_contiguous()
-    ):
-        raise ValueError("FP4 MLA chunk gather requires contiguous int64 global offsets.")
-    if cu_chunked_seq_len.device != chunked_global_offset.device:
-        raise ValueError("FP4 MLA chunk gather metadata tensors must share one device.")
-
-    compressed_kv = torch.empty(
-        (num_ctx_cached_tokens, kv_lora_rank),
-        dtype=out_dtype,
-        device=cu_chunked_seq_len.device,
-    )
-    k_pe = torch.empty(
-        (num_ctx_cached_tokens, qk_rope_head_dim),
-        dtype=out_dtype,
-        device=cu_chunked_seq_len.device,
-    )
-    if num_ctx_cached_tokens == 0:
-        return compressed_kv, k_pe
-
-    if not bool(getattr(metadata, "_fp4_mla_device_page_table", False)):
-        raise RuntimeError("FP4 MLA chunk gather requires fixed-stride device page metadata.")
-    _materialize_fp4_mla_device_page_table_for_forward(metadata)
-    page_table_stride = int(metadata.fp4_mla_page_table_stride)
-    page_ids = metadata._paged_kv_indices
-    if (
-        page_table_stride <= 0
-        or not isinstance(page_ids, torch.Tensor)
-        or page_ids.dtype != torch.int32
-        or not page_ids.is_cuda
-        or page_ids.device != cu_chunked_seq_len.device
-        or page_ids.numel() < num_contexts * page_table_stride
-    ):
-        raise RuntimeError("FP4 MLA chunk gather received invalid device page metadata.")
-
-    kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
-    head_dim = kv_lora_rank + qk_rope_head_dim
-    storage_head_dim = _validate_fp4_mla_kv_storage_shape(
-        kv_cache,
-        sf_cache,
-        head_dim=head_dim,
-        backend=_fp4_mla_attention_backend(),
-    )
-    if storage_head_dim != head_dim + FP4_MLA_K_RESIDUAL_DIM:
-        raise RuntimeError(
-            "FP4 MLA chunk gather requires K residual storage for BF16 reconstruction."
-        )
-    sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    global_scale = _get_fp4_mla_global_scale(metadata, kv_cache.device)
-    token_block = 16
-    grid = (
-        triton.cdiv(chunked_max_seq_len, token_block),
-        num_contexts,
-        triton.cdiv(head_dim, FP4_BLOCK_SIZE),
-    )
-    _fp4_mla_chunked_cache_gather_kernel[grid](
-        compressed_kv,
-        k_pe,
-        kv_cache,
-        sf_cache,
-        page_ids,
-        cu_chunked_seq_len,
-        chunked_global_offset,
-        global_scale,
-        chunked_max_seq_len,
-        page_table_stride,
-        kv_cache.shape[0],
-        metadata.page_size,
-        kv_cache.stride(0),
-        kv_cache.stride(2),
-        kv_cache.stride(4),
-        sf_cache.stride(0),
-        compressed_kv.stride(0),
-        k_pe.stride(0),
-        KV_LORA_RANK=kv_lora_rank,
-        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-        FP4_BLOCK=FP4_BLOCK_SIZE,
-        SF_PER_TOKEN=storage_head_dim // FP4_BLOCK_SIZE,
-        TOKEN_BLOCK=token_block,
-        num_warps=4,
-    )
-    return compressed_kv, k_pe
-
-
 def scatter_fp4_mla_kv_cache(
     metadata: Any,
     latent_cache: torch.Tensor,
@@ -2306,8 +1889,6 @@ def scatter_fp4_mla_kv_cache(
     q_pe: Optional[torch.Tensor] = None,
     q_rope_out: Optional[torch.Tensor] = None,
     q_quant_input: Optional[torch.Tensor] = None,
-    q_context: Optional[torch.Tensor] = None,
-    q_nope_head_dim: Optional[int] = None,
 ) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
@@ -2327,10 +1908,8 @@ def scatter_fp4_mla_kv_cache(
     layouts. Tail K-only dimensions use K's per-token 1D scales. For
     exclusively owned CuTeDSL pages, context scatter also writes the
     persistent packed-V sidecar.
-    Context scatter can rotate Q in place and rotate the K tail directly from
-    the unassembled latent tensor. When context Q is supplied for chunked
-    prefill, it also writes rotated K back for current-chunk attention.
-    Generation scatter rewrites each touched 16-token tile by reading
+    Context scatter can rotate the K tail directly from the unassembled latent
+    tensor. Generation scatter rewrites each touched 16-token tile by reading
     old tokens from the HP pool and new tokens from ``latent_cache``. The
     static-scale generation
     specialization can also rotate Q and new K tails while updating the HP pool.
@@ -2345,11 +1924,6 @@ def scatter_fp4_mla_kv_cache(
         metadata._fp4_mla_q_batch_capacity = None
     if latent_cache.numel() == 0:
         raise ValueError("FP4 MLA cache scatter requires at least one latent token.")
-    if q_context is not None and not latent_cache.is_contiguous():
-        raise ValueError(
-            "FP4 MLA fused context Q/K RoPE requires contiguous latent_cache "
-            "storage for in-place current-K update."
-        )
 
     latent_cache = latent_cache.reshape(latent_cache.shape[0], -1).contiguous()
     num_tokens = latent_cache.shape[0]
@@ -2417,12 +1991,8 @@ def scatter_fp4_mla_kv_cache(
     if phase == "context":
         if any(arg is not None for arg in (q_pe, q_rope_out, q_quant_input)):
             raise ValueError("FP4 MLA context cache update does not accept generation Q tensors.")
-        if (q_context is None) != (q_nope_head_dim is None):
-            raise ValueError("FP4 MLA context Q and q_nope_head_dim must be provided together.")
         hp_pool_updated = False
     else:
-        if q_context is not None or q_nope_head_dim is not None:
-            raise ValueError("FP4 MLA generation cache update does not accept context Q tensors.")
         if not all(arg is not None for arg in generation_inputs):
             raise ValueError(
                 "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
@@ -2523,8 +2093,6 @@ def scatter_fp4_mla_kv_cache(
             v_sf,
             global_scale,
             rotary_cos_sin,
-            q_context,
-            q_nope_head_dim,
             token_offset=token_offset,
             local_layer=local_layer,
             v_head_dim=v_head_dim,
