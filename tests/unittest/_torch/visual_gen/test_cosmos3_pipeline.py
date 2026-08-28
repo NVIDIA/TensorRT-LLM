@@ -1012,6 +1012,7 @@ class TestCosmos3V2V:
         the system prompt, so the same frame would tokenize differently
         depending on whether it was passed as an image or a one-frame clip."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
             device=torch.device("cpu"), num_embodiment_domains=32
         )
@@ -1069,6 +1070,7 @@ class TestCosmos3V2V:
         instance outlives the request. An action request that followed a V2V one
         would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
             device=torch.device("cpu"), num_embodiment_domains=32
         )
