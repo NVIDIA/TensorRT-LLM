@@ -164,6 +164,7 @@ class CutlassFusedMoE(MoEImplBase):
 
     _GPTOSS_SUPPORTED_ALGOS: frozenset[Optional[QuantAlgo]] = frozenset({
         None,
+        QuantAlgo.MXFP8,
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
@@ -171,7 +172,10 @@ class CutlassFusedMoE(MoEImplBase):
     })
     """Algorithms whose weight methods can serve gpt-oss / MiniMax SwiGLU.
 
-    Unquantized and the MXFP4 family can load a 1-D gpt-oss expert bias.
+    Unquantized and the MXFP4 family can load a 1-D gpt-oss expert bias. MXFP8
+    belongs to that group for the same reason: ``MXFP8CutlassFusedMoEMethod``
+    overrides neither weight nor bias loading, so bias goes through the generic
+    ``FusedMoEMethodBase`` path.
     NVFP4 is included for MiniMax-style SwigluBias without expert bias.
     ``can_implement`` still rejects NVFP4 when ``p.bias is True`` because the
     NVFP4 weight pad only accepts 2-D tensors.

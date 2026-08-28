@@ -1687,8 +1687,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
-    # This test validates the C++ transceiver's timing-metric semantics. Force
-    # DEFAULT to UCX so Llama's Python preference falls back to C++.
+    # This test validates the C++ transceiver's timing-metric semantics: the
+    # config pins transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env = llm_venv._new_env | {
         "TRTLLM_USE_NIXL_KVCACHE": "0",
         "TRTLLM_USE_UCX_KVCACHE": "1",
@@ -1731,8 +1731,8 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
     env = llm_venv._new_env.copy()
-    # This test validates the C++ transceiver's CSV format. Selecting UCX for
-    # the DEFAULT backend also resolves the automatic runtime to C++.
+    # This test validates the C++ transceiver's CSV format: the config pins
+    # transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
