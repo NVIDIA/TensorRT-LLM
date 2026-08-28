@@ -1301,7 +1301,7 @@ def test_nvfp4_mixed_step_splits_triton_suffix_from_csr_prefix(monkeypatch):
     prefix to the CSR kernel, narrowed to the context rows."""
     # Rows 0-1 are context, holding the first 4 tokens; rows 2-3 generate one
     # token each.
-    span = SimpleNamespace(token_first=4, row_first=2, row_last=4, query_len=1)
+    span = SimpleNamespace(token_first=4, token_last=6, row_first=2, row_last=4, query_len=1)
     call, calls, ctx = _nvfp4_dispatch_fixture(
         monkeypatch, num_tokens=6, batch=4, decode_query_len=1, span=span, num_contexts=2
     )
