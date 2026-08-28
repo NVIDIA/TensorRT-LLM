@@ -15,8 +15,23 @@
 
 """Low-level helper intrinsics for FMHA context TS resources."""
 
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
+
+
+@cute.jit
+def variable_window_cta_min_start(
+    cta_starts: cute.Tensor,
+    *,
+    batch_coord: Int32,
+    seq_coord: Int32,
+    q_stride: int | Int32,
+    tile_size_q: cutlass.Constexpr[int],
+) -> Int32:
+    """Load the plan-time minimum variable-window start for one Q CTA."""
+    num_seq_tiles = cute.ceil_div(q_stride, tile_size_q)
+    return Int32(cta_starts[batch_coord * num_seq_tiles + seq_coord])
 
 
 def bottom_right_window_left_bound(

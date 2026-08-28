@@ -426,11 +426,11 @@ class SmemPageOffsetsResource(MlaResource):
                 f"got {type(base).__name__}"
             )
         return _StructuredWaitPipelineAsync(
-            base.sync_object_full,
-            base.sync_object_empty,
-            base.num_stages,
-            base.producer_mask,
-            base.consumer_mask,
+            sync_object_full=base.sync_object_full,
+            sync_object_empty=base.sync_object_empty,
+            num_stages=base.num_stages,
+            producer_mask=base.producer_mask,
+            consumer_mask=base.consumer_mask,
         )
 
     def get_smem_requirements(self):
@@ -521,9 +521,12 @@ class SmemPageOffsetsResource(MlaResource):
                 cfg, stage_info, inst_id, is_v, section=section
             )
             tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
-            last_valid_page = (
-                seq_len_kv + Int32(cfg.num_tokens_per_page - 1)
-            ) // Int32(cfg.num_tokens_per_page) - Int32(1)
+            last_valid_page = cute.math.max(
+                (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
+                // Int32(cfg.num_tokens_per_page)
+                - Int32(1),
+                Int32(0),
+            )
             logical_page_idx = cute.math.min(
                 tile_idx * pages_per_tile + lane_idx,
                 last_valid_page,
@@ -847,9 +850,13 @@ class SmemKvResource(MlaResource):
             pages_per_tile = cfg.pages_per_kv_tile
             first_page_elems = inner_width * cfg.num_tokens_per_page
             first_tile_elems = inner_width * cfg.tile_size_kv
-            last_valid_page = (
-                seq_len_kv + Int32(cfg.num_tokens_per_page - 1)
-            ) // Int32(cfg.num_tokens_per_page) - Int32(1)
+            active_tile_elems = active_width * cfg.tile_size_kv
+            last_valid_page = cute.math.max(
+                (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
+                // Int32(cfg.num_tokens_per_page)
+                - Int32(1),
+                Int32(0),
+            )
             # Keep the small set of independent page TMA issues straight-line.
             for page_frag in cutlass.range(pages_per_tile, unroll_full=True):
                 if cutlass.const_expr(self.page_offsets_kv is not None):
@@ -890,7 +897,7 @@ class SmemKvResource(MlaResource):
                         # so the expected transaction byte count is satisfied.
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             stage_base.data_ptr(
-                                Int32(first_tile_elems) + smem_page_offset
+                                Int32(active_tile_elems) + smem_page_offset
                             ),
                             tma_desc,
                             (dim_offset, Int32(0), page_id),

@@ -88,6 +88,7 @@ from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
     freeze_smem_descriptor,
+    variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
 
@@ -104,6 +105,53 @@ SoftmaxRowSumContribution: TypeAlias = SoftmaxChunks | SoftmaxScalar
 # Stored at module level (not on self) to avoid adding a non-dynamic-expression
 # field to the dataclass, which breaks the framework's scf.if handling.
 _tmem_sp_sdata: dict[int, list] = {}
+
+
+@cute.jit
+def _bmsk_clamp(start: Int32, width: Int32) -> Int32:
+    """Create a contiguous 32-bit mask with clamped bounds."""
+    return cute.arch.inline_ptx(
+        "bmsk.clamp.b32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Int32],
+        read_only_args=[start, width],
+    )
+
+
+@cute.jit
+def _mask_score_quad(
+    valid_bits: Int32,
+    score0: Float32,
+    score1: Float32,
+    score2: Float32,
+    score3: Float32,
+) -> tuple[Float32, Float32, Float32, Float32]:
+    """Expand four bitmap bits with setp and replace invalid scores."""
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .pred valid<4>;
+            .reg .b32 bit;
+            mov.b32 {$w0}, {$r1};
+            mov.b32 {$w1}, {$r2};
+            mov.b32 {$w2}, {$r3};
+            mov.b32 {$w3}, {$r4};
+            and.b32 bit, {$r0}, 0x1;
+            setp.ne.u32 valid0, bit, 0;
+            and.b32 bit, {$r0}, 0x2;
+            setp.ne.u32 valid1, bit, 0;
+            and.b32 bit, {$r0}, 0x4;
+            setp.ne.u32 valid2, bit, 0;
+            and.b32 bit, {$r0}, 0x8;
+            setp.ne.u32 valid3, bit, 0;
+            @!valid0 mov.b32 {$w0}, 0xff800000;
+            @!valid1 mov.b32 {$w1}, 0xff800000;
+            @!valid2 mov.b32 {$w2}, 0xff800000;
+            @!valid3 mov.b32 {$w3}, 0xff800000;
+        }
+        """,
+        write_only_types=[Float32, Float32, Float32, Float32],
+        read_only_args=[valid_bits, score0, score1, score2, score3],
+    )
 
 
 @cute.jit
@@ -251,6 +299,8 @@ class FmhaConfig:
 
     # Causal masking: when True, mask out positions where k_idx > q_idx
     is_causal: bool = False
+    # Explicit packed-Q inclusive [start, end] bounds replace static masks.
+    has_variable_window: bool = False
     # Causal balancing uses head_batch_seq logical tile order and reverses Q
     # sequence tiles.
     balance_causal_workload: bool = False
@@ -733,6 +783,9 @@ class GmemQKVResource(MemoryResource):
     tma_v_desc: cutlass.Pointer | None = field(init=False, default=None)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
+    variable_window_token_starts: cute.Tensor | None = field(init=False, default=None)
+    variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
+    variable_window_q_stride: int | Int32 = field(init=False, default=0)
     q_offset_default: int | Int32 = field(init=False, default=0)
     seqlens_kv: cute.Pointer | None = field(init=False, default=None)
     max_seq_len_kv: Optional[Int32 | int] = field(init=False, default=None)
@@ -761,6 +814,9 @@ class GmemQKVResource(MemoryResource):
         cfg: FmhaConfig,
         seqlens_kv: cute.Pointer | None = None,
         max_seq_len_kv: Int32 | int | None = None,
+        variable_window_token_starts: cute.Tensor | None = None,
+        variable_window_cta_starts: cute.Tensor | None = None,
+        variable_window_q_stride: int | Int32 = 0,
         **kwargs: Any,
     ) -> None:
         """Bind Q/K/V descriptors, optional varlen metadata, and FMHA config."""
@@ -773,6 +829,9 @@ class GmemQKVResource(MemoryResource):
         self.q_offset_default = q_offset
         self.seqlens_kv = seqlens_kv
         self.max_seq_len_kv = max_seq_len_kv
+        self.variable_window_token_starts = variable_window_token_starts
+        self.variable_window_cta_starts = variable_window_cta_starts
+        self.variable_window_q_stride = variable_window_q_stride
         self.cfg = cfg
         self.seq_coord = TaskLocalVariable(
             dtype=Int32,
@@ -914,6 +973,15 @@ class GmemQKVResource(MemoryResource):
                     )
                     // self.cfg.seq_tile_n,
                 )
+        if cutlass.const_expr(self.cfg.has_variable_window):
+            min_window_start = variable_window_cta_min_start(
+                self.variable_window_cta_starts,
+                batch_coord=batch_coord,
+                seq_coord=seq_coord,
+                q_stride=self.variable_window_q_stride,
+                tile_size_q=self.cfg.cta_tiler[0],
+            )
+            kv_tile_start = min_window_start // self.cfg.kv_tile_n
         return (
             seq_coord,
             head_coord,
@@ -1867,6 +1935,10 @@ class TmemSPResource(MemoryResource):
     q_offset_default: int | Int32 = field(init=False, default=0)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
+    variable_window_token_starts: cute.Tensor | None = field(init=False, default=None)
+    variable_window_token_ends: cute.Tensor | None = field(init=False, default=None)
+    variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
+    variable_window_q_stride: int | Int32 = field(init=False, default=0)
     scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed TMEM pointers/addresses (set by auxiliary work). Avoids
@@ -1884,6 +1956,12 @@ class TmemSPResource(MemoryResource):
     p_chunk: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     q_offset: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     seqlen_k: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    variable_window_start: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    variable_window_end: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
 
     def __init__(
         self,
@@ -1895,6 +1973,10 @@ class TmemSPResource(MemoryResource):
         q_offset: int | Int32 = 0,
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
+        variable_window_token_starts: cute.Tensor | None = None,
+        variable_window_token_ends: cute.Tensor | None = None,
+        variable_window_cta_starts: cute.Tensor | None = None,
+        variable_window_q_stride: int | Int32 = 0,
         scale_softmax_log2: cute.Tensor | None = None,
         **kwargs: Any,
     ) -> None:
@@ -1908,6 +1990,10 @@ class TmemSPResource(MemoryResource):
         self.q_offset_default = q_offset
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
+        self.variable_window_token_starts = variable_window_token_starts
+        self.variable_window_token_ends = variable_window_token_ends
+        self.variable_window_cta_starts = variable_window_cta_starts
+        self.variable_window_q_stride = variable_window_q_stride
         self.scale_softmax_log2 = scale_softmax_log2
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
@@ -1954,6 +2040,16 @@ class TmemSPResource(MemoryResource):
             default=Int32(0),
             docs="Request-local K/V sequence length for packed dense masking.",
         )
+        self.variable_window_start = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(0),
+            docs="Inclusive first K position for this Q row.",
+        )
+        self.variable_window_end = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(0),
+            docs="Inclusive last K position for this Q row.",
+        )
         self.scale_softmax_log2_value = TaskLocalVariable(
             dtype=Float32,
             # Placeholder before load_scale_softmax_log2 reads the runtime tensor.
@@ -1985,6 +2081,11 @@ class TmemSPResource(MemoryResource):
     def uses_varlen_q_offset_cache(self) -> bool:
         """Return whether masks need a per-work-tile varlen Q/K offset."""
         return self.cfg.has_varlen and self.cfg.has_q_offset
+
+    @property
+    def uses_variable_window(self) -> bool:
+        """Return whether softmax consumes explicit packed-Q row bounds."""
+        return self.cfg.has_variable_window
 
     @property
     def uses_fixed_dense_k_tail_mask(self) -> bool:
@@ -2321,6 +2422,43 @@ class TmemSPResource(MemoryResource):
         cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
         return Int32(self.cum_seqlen_k[batch_coord + Int32(1)]) - cuseqlen_k
 
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(variable_window_start, variable_window_end),
+    )
+    @cute.jit
+    def cache_variable_window_bounds(
+        self, stage_info: StageInfo
+    ) -> tuple[Int32, Int32]:
+        """Load this lane's bounds relative to the CTA's first K/V tile."""
+        seq_coord, _, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        warp_id_in_sg = cute.arch.warp_idx() % 4
+        row_in_tile = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+        local_q = (
+            seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
+            + self.q_half * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
+            + row_in_tile
+        )
+        local_q = cute.math.min(
+            local_q,
+            self.variable_window_q_stride - Int32(1),
+        )
+        packed_q = batch_coord * self.variable_window_q_stride + local_q
+        min_window_start = variable_window_cta_min_start(
+            self.variable_window_cta_starts,
+            batch_coord=batch_coord,
+            seq_coord=seq_coord,
+            q_stride=self.variable_window_q_stride,
+            tile_size_q=self.cfg.cta_tiler[0],
+        )
+        kv_base = (min_window_start // self.cfg.kv_tile_n) * self.cfg.kv_tile_n
+        return (
+            Int32(self.variable_window_token_starts[packed_q]) - kv_base,
+            Int32(self.variable_window_token_ends[packed_q]) - kv_base,
+        )
+
     @cute.jit
     def _load_s_chunks(self, stage_info: StageInfo) -> SoftmaxChunks:
         """Load ALL S chunks from TMEM into register vectors."""
@@ -2425,7 +2563,7 @@ class TmemSPResource(MemoryResource):
         )
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata[id(self)]
+        s_data = _tmem_sp_sdata.pop(id(self))
         if cutlass.const_expr(self.enable_early_tile_sum):
             # Keep four independent scalar dependency chains while expressing
             # them as two packed float2 values.  The explicit packed primitive
@@ -2551,7 +2689,7 @@ class TmemSPResource(MemoryResource):
         words_per_chunk = 2 * store_group_words
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata[id(self)]
+        s_data = _tmem_sp_sdata.pop(id(self))
         local_sum_chains = cutlass.Array(
             Float32,
             4,
@@ -2712,7 +2850,7 @@ class TmemSPResource(MemoryResource):
         num_values = self.cfg.qk_mma_tiler[1]
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata[id(self)]
+        s_data = _tmem_sp_sdata.pop(id(self))
 
         fma_values: tuple[Any, ...] = ()
         for flat_idx in cutlass.range_constexpr(0, 8, 2):
@@ -2905,6 +3043,59 @@ class TmemSPResource(MemoryResource):
                 s_data[chunk_idx] = cutlass.vector.where(
                     mask, s_data[chunk_idx], neg_inf
                 )
+        return self._reduce_row_max(s_data, row_max)
+
+    @consumer_work(returns=(old_row_max, row_max))
+    @cute.jit
+    def variable_window_row_max(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max: SoftmaxScalar,
+        window_start: Int32,
+        window_end: Int32,
+    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
+        """Mask S using inclusive per-row VariableWindow bounds."""
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        s_data = self._load_s_chunks(stage_info)
+        kv_tile_base = stage_info.loop_offset * self.cfg.kv_tile_n
+        tile_n = self.cfg.qk_mma_tiler[1]
+        left_oob = cute.math.min(
+            cute.math.max(window_start - kv_tile_base, Int32(0)),
+            Int32(tile_n),
+        )
+        right_valid = cute.math.min(
+            cute.math.max(window_end + Int32(1) - kv_tile_base, Int32(0)),
+            Int32(tile_n),
+        )
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            chunk_base = Int32(chunk_idx * tmem_x)
+            chunk_left = cute.math.min(
+                cute.math.max(left_oob - chunk_base, Int32(0)),
+                Int32(tmem_x),
+            )
+            chunk_right = cute.math.min(
+                cute.math.max(right_valid - chunk_base, Int32(0)),
+                Int32(tmem_x),
+            )
+            valid_bits = _bmsk_clamp(chunk_left, chunk_right - chunk_left)
+            chunk = s_data[chunk_idx]
+            masked_scores = []
+            for quad_idx in cutlass.range_constexpr(tmem_x // 4):
+                quad_base = quad_idx * 4
+                masked_scores.extend(
+                    _mask_score_quad(
+                        valid_bits >> Int32(quad_base),
+                        chunk[quad_base],
+                        chunk[quad_base + 1],
+                        chunk[quad_base + 2],
+                        chunk[quad_base + 3],
+                    )
+                )
+            s_data[chunk_idx] = cutlass.Vector.from_elements(
+                tuple(masked_scores), self.cfg.qk_acc_dtype
+            )
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -3266,8 +3457,8 @@ class TmemSPResource(MemoryResource):
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
         scaled_sum = row_sum * acc_scale
         if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
-            # Match TRT-LLM-gen's four independent float2 accumulation chains
-            # for D256. A single 64-pair chain serializes every FADD behind the
+            # Use four independent float2 accumulation chains for D256. A
+            # single 64-pair chain serializes every FADD behind the
             # preceding result and leaves no row-sum ILP after P publication.
             local_sum_0 = (scaled_sum, scaled_sum)
             local_sum_1 = (Float32(0.0), Float32(0.0))

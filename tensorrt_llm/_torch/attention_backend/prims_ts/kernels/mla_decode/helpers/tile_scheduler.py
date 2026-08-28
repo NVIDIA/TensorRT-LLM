@@ -210,7 +210,7 @@ class MLAStaticTileScheduler:
             self.num_blocks = cute.size(self.persistent_blk_layout, loc=loc, ip=ip)
             self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
         else:
-            self.is_valid = is_valid
+            self.is_valid = cutlass.Boolean(is_valid)
         self.loc = loc
         self.ip = ip
 
@@ -276,25 +276,35 @@ class MLAStaticTileScheduler:
         if self.params.is_persistent:
             self.current_work_linear_idx += advance_count * self.num_persistent_sm
         else:
-            self.is_valid = False
+            self.is_valid = cutlass.Boolean(False)
 
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.params)
         values.extend(cutlass.extract_mlir_values(self.current_work_linear_idx))
         values.extend(cutlass.extract_mlir_values(self.blk_coord))
         values.extend(cutlass.extract_mlir_values(self.grid_shape))
+        if not self.params.is_persistent:
+            values.extend(cutlass.extract_mlir_values(self.is_valid))
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 13
+        expected_values = 13 if self.params.is_persistent else 14
+        assert len(values) == expected_values
         new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
         new_current_work_linear_idx = cutlass.new_from_mlir_values(
             self.current_work_linear_idx, [values[6]]
         )
         new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[7:10])
-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[10:])
+        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[10:13])
+        new_is_valid = True
+        if not self.params.is_persistent:
+            new_is_valid = cutlass.new_from_mlir_values(self.is_valid, [values[13]])
         return MLAStaticTileScheduler(
-            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
+            new_params,
+            new_current_work_linear_idx,
+            new_blk_coord,
+            new_grid_shape,
+            is_valid=new_is_valid,
         )
 
 

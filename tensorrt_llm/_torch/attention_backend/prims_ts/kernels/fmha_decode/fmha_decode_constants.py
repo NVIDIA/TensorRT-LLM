@@ -29,6 +29,31 @@ TOTAL_SMEM_BUDGET_KIB = 218
 MAX_KV_STAGE_SMEM_KIB = 144
 BYTES_PER_KIB = 1024
 
+# The supported BF16 M64N256 profile uses a 64-KiB shared K/V stage. Three
+# stages occupy 192 KiB; its 16-KiB Q stage and small metadata/barrier
+# allocations fit in the remaining SM100 budget. Persistent direct-output tail
+# correction rotates a compact 35,840-byte exchange payload over one drained
+# 64-KiB stage in this ring; split-KV keeps its fixed full exchange allocation.
+# Keep this exact-profile override separate from the conservative,
+# topology-independent MAX_KV_STAGE_SMEM_KIB inference above.
+KV_TILE_256_SHARED_FIFO_STAGES = 3
+
+# The four semantic K64 atoms are stored in the physical K slots consumed by
+# the two interleaved QK instructions in this order.
+KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
+
+# Keep the old maximum as the exponent reference while a new maximum is at
+# most eight log2 units larger. This avoids an output-correction round without
+# letting an intermediate probability exceed 2**8; the softmax identity is
+# unchanged apart from normal finite-precision rounding.
+KV_TILE_256_RESCALE_THRESHOLD_LOG2 = 8.0
+
+# A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
+# the resulting register hand-off has a fixed cost. Paired B200 measurements
+# show that it is amortized once a Q64/KV256 CTA processes at least 32 tiles
+# (8K dense KV tokens); shorter loops are as fast or faster without it.
+KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES = 32
+
 # TMA-swizzled Q rows are padded to 128 B before computing how many KV stages
 # fit in the remaining SMEM budget.
 Q_ROW_ALIGNMENT_BYTES = 128
@@ -55,13 +80,17 @@ MAX_CLUSTER_DIM_X = 16
 # overhead does not dominate tiny per-split K ranges.
 MIN_LOOP_ITERS_PER_SPLIT = 2
 
-# Auto launch selection uses the default decode KV tile size; explicit profile
-# validation owns non-default tile sizes.
+# The maximum number of warp groups per CTA.
+MAX_WARP_GROUPS = 4
+
+# Default used only when the launch helper has no resolved decode config.
+# Config-aware FMHA and block-sparse callers pass their selected KV tile.
 AUTO_LAUNCH_TILE_SIZE_KV = 128
 
 # Split-KV is worthwhile below one static SM wave only when each CTA still owns
-# enough K/V tiles to amortize GMEM reduction.
-SPLIT_KV_MIN_TILES_PER_CTA = 16
+# enough K/V work to amortize GMEM reduction. The B200-qualified
+# crossover is 2,048 tokens: 16 KV128 tiles or 8 KV256 tiles.
+SPLIT_KV_MIN_TOKENS_PER_CTA = 2_048
 
 # Two interleaved K/V instances form the decode cadence: instance 0 is the
 # first K/P/V stream in each loop iteration and instance 1 is the second. These
