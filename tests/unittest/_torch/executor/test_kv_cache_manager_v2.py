@@ -94,6 +94,9 @@ def _make_cache_config_for_test(
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
+    # Mirrors __init__: without helix the ledger block equals the physical
+    # page (the helper re-enacts construction for partial instances).
+    cache_manager._ledger_tokens_per_block = 128
 
     return cache_manager._build_base_config(
         kv_cache_config,
@@ -421,6 +424,7 @@ class _ContextRequest:
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
     is_dummy_request: bool = False
+    return_perf_metrics: bool = False
     context_current_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None

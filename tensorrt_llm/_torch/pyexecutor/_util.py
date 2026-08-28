@@ -37,7 +37,8 @@ from tensorrt_llm.llmapi.llm_args import (
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
-from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
+from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
+                                                   supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -87,6 +88,16 @@ GB = 1 << 30
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _get_initial_lora_data_type(
+    configured_lora_data_type: Optional[torch.dtype],
+) -> Optional[torch.dtype]:
+    if configured_lora_data_type != torch.float8_e4m3fn:
+        return None
+    if supports_native_fp8_lora(torch.cuda.get_device_capability()):
+        return configured_lora_data_type
+    return None
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
@@ -641,16 +652,12 @@ class KvCacheCreator:
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+            sparse_attn_config = model_config.sparse_attention_config
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
-            sparse_attn_config = model_config.sparse_attention_config
-            if (sparse_attn_config is not None
-                    and sparse_attn_config.algorithm == "dsa"
-                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
-                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some
@@ -1035,6 +1042,14 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for context parallelism, disable it."
             )
+            if (self._is_kv_cache_manager_v2
+                    and self._mapping.cp_config.get('cp_type') == CpType.HELIX):
+                # Promote like the encoder-decoder case so build_managers
+                # runs configure_kv_cache_capacity(), which sets the quota
+                # KVCacheManagerV2 requires at construction (V1 stays local).
+                # HELIX only: configure_kv_cache_capacity has no sizing path
+                # for other CP types and would hit its assertion.
+                self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             estimating_kv_cache = False
@@ -1077,6 +1092,41 @@ class KvCacheCreator:
                 self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
 
+    def _configure_helix_kv_cache_capacity(self) -> None:
+        """Set the helix KV quota without profiling (not CP-aware).
+
+        Explicit quotas pass through; otherwise fraction sizing sets
+        ``max_gpu_total_bytes`` (a rank-local byte cap the manager consumes
+        as-is). Setting ``max_tokens`` here would overshoot the fraction:
+        the manager inflates that knob by 1 / max_util_for_resume.
+        """
+        if (self._kv_cache_config.max_tokens is not None
+                and self._kv_cache_config.max_tokens <= 0):
+            raise ValueError(
+                "Helix CP: kv_cache_config.max_tokens must be positive when "
+                f"set, got {self._kv_cache_config.max_tokens}.")
+        if (self._kv_cache_config.max_gpu_total_bytes or 0) > 0 or \
+                (self._kv_cache_config.max_tokens or 0) > 0:
+            logger.info("Helix CP: skipping KV cache capacity profiling; using "
+                        "the explicitly configured quota.")
+            return
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
+        free_mem, _total = torch.cuda.mem_get_info()
+        budget_bytes = int(free_mem * fraction)
+        if budget_bytes <= 0:
+            raise ValueError(
+                "Helix CP: fraction-based KV sizing found no usable free "
+                "memory; set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes.")
+        logger.warning(
+            "Helix CP: capacity profiling is unsupported; sizing the KV "
+            f"cache as fraction {fraction} of free memory -> "
+            f"max_gpu_total_bytes={budget_bytes} (rank-local byte cap; the "
+            "manager min-syncs across ranks and converts to global tokens). "
+            "Set kv_cache_config.max_tokens or max_gpu_total_bytes to "
+            "override.")
+        self._kv_cache_config.max_gpu_total_bytes = budget_bytes
+
     def configure_kv_cache_capacity(self,
                                     py_executor: PyExecutor = None) -> None:
         """Perform KV cache capacity estimation.
@@ -1087,6 +1137,16 @@ class KvCacheCreator:
         mapping = self._mapping
 
         # TODO: support CP by generating dummy requests for it.
+        if mapping.cp_config.get('cp_type') == CpType.HELIX:
+            if not self._is_kv_cache_manager_v2:
+                # The helix sizing below emits V2 ledger (global) quotas;
+                # V1 reads max_tokens as rank-local. Reject explicitly.
+                raise NotImplementedError(
+                    "TRTLLM_SKIP_KV_CACHE_ESTIMATION with helix CP requires "
+                    "the V2 KV cache manager "
+                    "(kv_cache_config.use_kv_cache_manager_v2=True).")
+            self._configure_helix_kv_cache_capacity()
+            return
         assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
@@ -2362,6 +2422,7 @@ def _create_kv_cache_manager(
             head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2504,6 +2565,7 @@ def _create_kv_cache_manager(
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2611,6 +2673,7 @@ def _create_kv_cache_manager(
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2858,10 +2921,8 @@ def create_py_executor_instance(
         initial_lora_data_type = None
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
-            configured_lora_data_type = load_torch_lora(lora_config)
-            if (configured_lora_data_type == torch.float8_e4m3fn
-                    and torch.cuda.get_device_capability() == (9, 0)):
-                initial_lora_data_type = configured_lora_data_type
+            initial_lora_data_type = _get_initial_lora_data_type(
+                load_torch_lora(lora_config))
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -3295,9 +3356,6 @@ def instantiate_sampler(
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
-    if mapping.cp_config.get('cp_type') == CpType.STAR:
-        assert llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)

@@ -18,6 +18,7 @@ import torch
 
 from ....functional import PositionEmbeddingType
 from ....logger import logger
+from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
 from ...attention_backend import AttentionMetadata, TrtllmAttention, TrtllmAttentionMetadata
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -231,6 +232,7 @@ class KimiK3MLAAttention(MLA):
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
         model_config: ModelConfig,
+        mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
@@ -253,6 +255,7 @@ class KimiK3MLAAttention(MLA):
             dtype=dtype,
             dense_bias=False,
             config=model_config,
+            mapping_with_cp=mapping_with_cp,
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
@@ -266,14 +269,15 @@ class KimiK3MLAAttention(MLA):
         self.use_output_gate = use_output_gate
 
         if use_output_gate:
-            # Follow q_b_proj's effective MLA mapping: replicated under
-            # attention-DP and column-sharded by head otherwise.
+            # The gate must match o_proj's input sharding (under helix the
+            # post-all-to-all 1/cp head chunk); outside helix this equals
+            # q_b_proj's head sharding, replicated under attention-DP.
             self.g_proj = Linear(
                 hidden_size,
                 num_heads * v_head_dim,
                 bias=False,
                 dtype=dtype,
-                mapping=self.q_b_proj.mapping,
+                mapping=self.o_proj.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,

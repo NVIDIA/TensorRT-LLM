@@ -190,6 +190,32 @@ def f32_order_key(float_val):
     return s ^ ((s >> cutlass.Int32(31)) | cutlass.Int32(-2147483648))
 
 
+def f32_order_key_signed(float_val):
+    """Signed-monotonic Int32 key (fp32 order == signed Int32 order), so the
+    Phase-3 repair can bisect with provable collapse in <= 32 steps."""
+    return f32_order_key(float_val) ^ cutlass.Int32(-2147483648)
+
+
+def order_key_signed_to_f32(m):
+    """Branchless inverse of :func:`f32_order_key_signed` (non-NaN keys)."""
+    k = m ^ cutlass.Int32(-2147483648)
+    top = k >> cutlass.Int32(31)  # -1 if top bit set, else 0
+    mask = cutlass.Int32(-2147483648) | (~top & cutlass.Int32(2147483647))
+    s = k ^ mask
+    return cutlass.Float32(llvm.bitcast(cutlass.Float32.mlir_type, s.ir_value()))
+
+
+def order_key_mid_f32(v_lo, v_hi):
+    """Ordered-key midpoint; returns (mid_float, is_adjacent) where adjacency
+    means no float strictly between v_lo and v_hi exists."""
+    m_lo = f32_order_key_signed(v_lo)
+    m_hi = f32_order_key_signed(v_hi)
+    m_mid = (m_lo & m_hi) + ((m_lo ^ m_hi) >> cutlass.Int32(1))
+    return order_key_signed_to_f32(m_mid), m_mid == m_lo
+
+
+
+
 def _fmin_f32_inline(a, b):
     """Single PTX ``min.f32`` → one SASS FMNMX.
 
@@ -2997,6 +3023,20 @@ class GvrTopKKernel:
         # always aggregates across the cluster, so every CTA sees the same
         # cluster-wide cand_count; cs=1 makes the aggregation a no-op.
         if s_iscalars[1] != cutlass.Int32(1):
+            # Any dense re-count invalidates the block-skip active list. The
+            # list is built from the loosest kept rung of the probe that set
+            # the flag, so it is a superset only at or above that rung, and
+            # the repair below anchors and bisects underneath it; separately,
+            # the compact stream-write replays the list walk against the
+            # smem_ptcnt of its matching compact pass, which a dense re-count
+            # overwrites. Cleared once here rather than per re-count: done==1
+            # rows never reach this block, so the hot path keeps its compact
+            # write.
+            if cutlass.const_expr(self.enable_block_skip):
+                if tidx == cutlass.Int32(0):
+                    s_active_cnt[1] = cutlass.Int32(0)
+                cute.arch.barrier()
+
             # Re-count with current threshold (may already have stale cand_count)
             cur_thr = s_thr[0]
             self.block_count_ge(
@@ -3014,46 +3054,56 @@ class GvrTopKKernel:
                 smem_input=smem_input,
                 do_cluster_sync=do_cluster_sync,
             )
+            # Two-sided repair: the old retry only guarded overflow, so an
+            # undershooting threshold shipped a -1-padded, silently wrong
+            # top-K. Anchor the untested bracket end at a float extreme, then
+            # bisect on the signed order-key image (provable collapse).
             if tidx == 0:
-                if s_iscalars[0] > cutlass.Int32(kCC):
-                    s_thr[1] = s_thr[0]  # val_lo = threshold
+                c0 = s_iscalars[0]
+                if c0 > cutlass.Int32(kCC):
+                    s_thr[1] = s_thr[0]
+                    s_thr[2] = cutlass.Float32(self.FLT_MAX)
+                elif c0 < cutlass.Int32(kK):
+                    s_thr[2] = s_thr[0]
+                    s_thr[1] = cutlass.Float32(self.NEG_FLT_MAX)
             cute.arch.barrier()
 
-            # 10-iter retry-shrink. Runtime while with `cand_count > kCC` in the
-            # loop condition.
             rs = cutlass.Int32(0)
-            while rs < cutlass.Int32(10) and s_iscalars[0] > cutlass.Int32(kCC):
-                if tidx == 0:
-                    lo = s_thr[1]
-                    hi = s_thr[2]
-                    mid = (lo + hi) * cutlass.Float32(0.5)
-                    if mid == lo:
-                        mid = hi
-                    s_thr[0] = mid
-                cute.arch.barrier()
-                new_thr = s_thr[0]
-                self.block_count_ge(
-                    input_row,
-                    slice_start,
-                    slice_end,
-                    new_thr,
-                    smem_ptcnt,
-                    smem_wcnt,
-                    s_iscalars,
-                    s_cluster_partial,
-                    tidx,
-                    warp_id,
-                    lane,
-                    smem_input=smem_input,
-                    do_cluster_sync=do_cluster_sync,
-                )
-                if tidx == 0:
-                    c_rs = s_iscalars[0]
-                    if c_rs > cutlass.Int32(kCC):
-                        s_thr[1] = s_thr[0]
-                    elif c_rs < cutlass.Int32(kK):
-                        s_thr[2] = s_thr[0]
-                cute.arch.barrier()
+            collapsed = cutlass.Int32(0)
+            while (
+                rs < cutlass.Int32(48)
+                and (s_iscalars[0] > cutlass.Int32(kCC) or s_iscalars[0] < cutlass.Int32(kK))
+                and collapsed == cutlass.Int32(0)
+            ):
+                mid_f, adj = order_key_mid_f32(s_thr[1], s_thr[2])
+                if adj:
+                    collapsed = cutlass.Int32(1)
+                if collapsed == cutlass.Int32(0):
+                    if tidx == 0:
+                        s_thr[0] = mid_f
+                    cute.arch.barrier()
+                    self.block_count_ge(
+                        input_row,
+                        slice_start,
+                        slice_end,
+                        s_thr[0],
+                        smem_ptcnt,
+                        smem_wcnt,
+                        s_iscalars,
+                        s_cluster_partial,
+                        tidx,
+                        warp_id,
+                        lane,
+                        smem_input=smem_input,
+                        do_cluster_sync=do_cluster_sync,
+                    )
+                    if tidx == 0:
+                        c_rs = s_iscalars[0]
+                        if c_rs > cutlass.Int32(kCC):
+                            s_thr[1] = s_thr[0]
+                        elif c_rs < cutlass.Int32(kK):
+                            s_thr[2] = s_thr[0]
+                    cute.arch.barrier()
                 rs = rs + cutlass.Int32(1)
 
         # ---- Warp prefix sum over smem_ptcnt ----
@@ -7651,29 +7701,18 @@ class GvrTopKKernel:
                                 )
                                 cute.arch.barrier()
                             elif s_iscalars[1] != cutlass.Int32(1):
-                                # fail-soft (non-plateau): land on the
-                                # measured undershoot side (count <= kC =>
-                                # no overflow; -1 pad stays the documented
-                                # non-convergence encoding).
-                                self.block_count_ge(
-                                    input_row,
-                                    slice_start,
-                                    slice_end,
-                                    s_thr[2],
-                                    smem_ptcnt,
-                                    smem_wcnt,
-                                    s_iscalars,
-                                    s_cluster_partial,
-                                    tidx,
-                                    warp_id,
-                                    lane,
-                                    do_cluster_sync=do_cluster_sync,
-                                    smem_input=smem_input,
-                                )
-                                cute.arch.barrier()
+                                # Non-converged terminal on the leader path.
+                                # This used to recount at the undershoot side
+                                # and stamp done = 1, shipping a -1-padded row
+                                # as a documented "non-convergence encoding" -
+                                # which also hid the row from Phase 3, since
+                                # done == 1 never enters the repair. Stamp
+                                # done = 2 and let Phase 3's two-sided
+                                # bisection own it; the recount is dropped
+                                # because that bisection measures anyway.
                                 if tidx == cutlass.Int32(0):
                                     s_thr[0] = s_thr[2]
-                                    s_iscalars[1] = cutlass.Int32(1)
+                                    s_iscalars[1] = cutlass.Int32(2)
                                 cute.arch.barrier()
                         else:
                             self.phase2_secant_search(

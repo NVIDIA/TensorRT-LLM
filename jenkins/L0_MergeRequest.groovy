@@ -152,9 +152,24 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def DISABLE_CBTS = "disable_cbts"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+// Version-controlled Tier 2 rollout policy. Keep this in the infra-owned Groovy
+// boundary so changing who receives coverage-based narrowing requires infra review.
+@Field
+def CBTS_COVERAGE_PILOT_USERS = [
+    "crazydemo",
+    "QiJune",
+    "sunnyqgg",
+    "Barry-Delaney",
+    "xxi-nv",
+    "leslie-fang25",
+    "rosong11",
+    "tongyuantongyu",
+] as Set
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
@@ -178,6 +193,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
+    (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -213,6 +229,7 @@ if (runMode == "nightly_release") {
 // GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
     !GEN_POST_MERGE_BUILDS_ONLY &&
+    !testFilter[INFRA_DRY_RUN] &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -351,18 +368,41 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
+    if (params.program_version_name) {
+        env.NSPECT_RELEASE_VERSION = params.program_version_name
+    } else {
+        def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+        def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+        if (!versionMatcher.find()) {
+            error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+        }
+        def nspectReleaseVersionSuffix = "dev"
+        if (runMode == "nightly_release") {
+            nspectReleaseVersionSuffix = "nightly"
+        } else if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            nspectReleaseVersionSuffix = "postmerge"
+        }
+        env.NSPECT_RELEASE_VERSION = "${versionMatcher.group(1)}_${nspectReleaseVersionSuffix}"
+    }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+    if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
     }
-    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-    testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
-    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-    // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-    // Coverage runs only on the official post-merge pipeline.
-    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (testFilter[INFRA_DRY_RUN]) {
+        pipeline.echo("Changed-file analysis is skipped for the infrastructure dry run.")
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = false
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = ""
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = []
+        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
+    } else {
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
     getContainerURIs().each { k, v ->
@@ -463,7 +503,11 @@ def preparation(pipeline, testFilter, globalVars)
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
         stage("Merge Test Waive List") {
-            mergeWaiveList(pipeline, globalVars)
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Merge Test Waive List for the infrastructure dry run."
+            } else {
+                mergeWaiveList(pipeline, globalVars)
+            }
         }
     })
 }
@@ -717,7 +761,8 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file list to empty list.")
@@ -753,7 +798,8 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     // Note: This function intentionally propagates exceptions to the caller.
     // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file diff to empty string.")
@@ -931,12 +977,15 @@ def _cbtsCoverageAudit(pipeline)
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
+        def prAuthor = ""
         def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
-            pilotEligible = sh(
+            prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
-            ).trim() == "true"
+            ).trim()
+            pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
+            pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
             if (pilotEligible) {
                 readyJson = sh(
                     script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
@@ -1643,7 +1692,8 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
         ]
     }
 
-    if (env.testPhase2StageName) {
+    // Preserve an explicit empty phase override from the dry-run helper.
+    if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
         parameters += [
             'testPhase2StageName': env.testPhase2StageName,
         ]
@@ -1688,12 +1738,28 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     return buildStatus
 }
 
+def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, imageParameters)
+{
+    String testFilterJson = writeJSON returnText: true, json: testFilter
+    def additionalParameters = [
+        'testFilter': testFilterJson,
+        // Keep all synthetic GPU-count stages in this helper.
+        'testPhase2StageName': '',
+    ] + imageParameters
+    stage("[Test-${arch}-Single-GPU] Remote Run") {
+        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
+    }
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release-Check": {
             script {
-                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Release-Check for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
                     return
                 }
@@ -1779,6 +1845,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
                 if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
                     echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
                     return
                 }
 
@@ -1933,6 +2008,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
+                    return
+                }
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -2083,13 +2166,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 runMode == "nightly_release" ||
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
+                            'program_version_name': env.NSPECT_RELEASE_VERSION,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2158,9 +2241,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
+                            additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
                         }
@@ -2239,7 +2322,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    parallelJobs.failFast = enableFailFast
+    // Preserve both architecture tracks during dry acceptance.
+    def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
+    parallelJobs.failFast = effectiveFailFast
     pipeline.parallel parallelJobs
 }
 
@@ -2263,24 +2348,26 @@ pipeline {
     post {
         unsuccessful {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "failed", GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }
         success {
             script {
-                if (enableUpdateGitlabStatus) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
-                } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
-                    trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                if (!testFilter[INFRA_DRY_RUN]) {
+                    if (enableUpdateGitlabStatus) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
+                        trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    }
                 }
             }
         }
         aborted {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'canceled', GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
@@ -2333,7 +2420,11 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this, globalVars)
+                                if (testFilter[INFRA_DRY_RUN]) {
+                                    echo "Skipping Release-Check for the infrastructure dry run."
+                                } else {
+                                    launchReleaseCheck(this, globalVars)
+                                }
                             }
                         }
                     } else {

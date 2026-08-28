@@ -173,7 +173,7 @@ void KvCacheManager::clearReusableBlocks()
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly)
+    std::optional<bool> textOnly, bool enableRequestStats)
 {
     if (!priorityCb)
     {
@@ -195,7 +195,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly);
+        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(

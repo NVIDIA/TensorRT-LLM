@@ -342,7 +342,6 @@ class PreprocessedInputs:
     """
 
     prompt_token_ids: List[int]
-    query_token_ids: Optional[List[int]] = None
     multimodal_params: Optional[MultimodalParams] = None
     encoder_input_token_ids: Optional[List[int]] = None
 
@@ -806,7 +805,6 @@ class BaseLLM:
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
-            query_token_ids = inputs.query_token_ids
             multimodal_params = inputs.multimodal_params
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
@@ -819,7 +817,7 @@ class BaseLLM:
                 prompt_token_ids = self._get_decoder_prompt_token_ids(
                     sampling_params)
         else:
-            (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+            (prompt_token_ids, prompt, multimodal_params,
              encoder_input_token_ids) = self._preprocess(
                  inputs,
                  sampling_params,
@@ -829,17 +827,14 @@ class BaseLLM:
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
-        self._check_arguments(
-            len(prompt_token_ids),
-            len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params,
-            is_gen_only=is_gen_only)
+        self._check_arguments(len(prompt_token_ids),
+                              sampling_params,
+                              is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
         result = self._executor.generate_async(
             prompt_token_ids,
-            query_token_ids=query_token_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
@@ -872,15 +867,15 @@ class BaseLLM:
         inputs: Optional[PromptInputs],
         sampling_params: SamplingParams,
         disaggregated_params: Optional[DisaggregatedParams] = None,
-    ) -> Tuple[List[int], Optional[str], Optional[List[int]],
-               Optional[MultimodalParams], Optional[List[int]]]:
+    ) -> Tuple[List[int], Optional[str], Optional[MultimodalParams],
+               Optional[List[int]]]:
         """Preprocess raw prompts into token IDs and multimodal params.
 
         This is the CPU-heavy portion of generate_async (tokenization,
         multimodal processing, hash computation).
 
         Returns:
-            `(prompt_token_ids, prompt, query_token_ids, multimodal_params, encoder_input_token_ids)`
+            `(prompt_token_ids, prompt, multimodal_params, encoder_input_token_ids)`
         """
         if isinstance(inputs, dict):
             inputs = self._copy_prompt_inputs(inputs)
@@ -921,7 +916,6 @@ class BaseLLM:
         is_gen_only = (disaggregated_params is not None and
                        disaggregated_params.request_type == "generation_only")
 
-        query_token_ids = None
         multimodal_params = None
         prompt = None
 
@@ -952,7 +946,6 @@ class BaseLLM:
                     "DisaggPrefillMultimodalInputs")
             prompt_token_ids = disagg_mm_inputs.prompt_token_ids
             prompt = inputs.get("prompt", None)
-            query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
                 raise ValueError(
                     "Generation-only mode should not need multimodal parameters"
@@ -1002,7 +995,6 @@ class BaseLLM:
               and inputs.get("multi_modal_data") is None
               and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
-            query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
@@ -1057,7 +1049,6 @@ class BaseLLM:
             prompt = inputs.get(
                 "prompt")  # This is the text prompt, if present.
             if extra_processed_inputs is not None:
-                query_token_ids = extra_processed_inputs.get('query_token_ids')
                 # Create unified MultimodalParams.
                 multimodal_params = MultimodalParams(
                     multimodal_input=extra_processed_inputs.get(
@@ -1117,7 +1108,7 @@ class BaseLLM:
                 prompt_token_ids = self._get_decoder_prompt_token_ids(
                     sampling_params)
 
-        return (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+        return (prompt_token_ids, prompt, multimodal_params,
                 normalized_encoder_input_token_ids)
 
     @set_api_status("prototype")
@@ -1140,7 +1131,7 @@ class BaseLLM:
                 passed directly to :meth:`generate_async` as `inputs`.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
-        (prompt_token_ids, _prompt, query_token_ids, multimodal_params,
+        (prompt_token_ids, _prompt, multimodal_params,
          encoder_input_token_ids) = self._preprocess(
              inputs,
              sampling_params,
@@ -1149,7 +1140,6 @@ class BaseLLM:
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,
-            query_token_ids=query_token_ids,
             multimodal_params=multimodal_params,
             encoder_input_token_ids=encoder_input_token_ids,
         )
@@ -1568,18 +1558,17 @@ class BaseLLM:
         )
         _append_logits_processor(sampling_params, processor)
 
-    def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams,
+    def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            # Check prompt length and query length against max_num_tokens to filter illegal requests.
+            # Check prompt length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
                 max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
                     raise RequestError(
-                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                        f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
             return
 
@@ -1593,10 +1582,10 @@ class BaseLLM:
         # TODO: Remove this check and left the request verification to cpp runtime
 
         if (not self.args.enable_chunked_prefill) and (
-                prompt_len / self.args.parallel_config.cp_size + query_len +
+                prompt_len / self.args.parallel_config.cp_size +
             (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
+                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({max_seq_len})")
 
         if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:

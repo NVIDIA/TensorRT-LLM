@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
+import inspect
+import textwrap
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import TypeAlias
@@ -249,3 +252,117 @@ def test_flashinfer_mla_backend_policy_hook_is_consulted() -> None:
 
     assert fmha._get_effective_mla_backend(meta, 4) == "trtllm-gen"
     assert calls == [("cute-dsl", meta, 4)]
+
+
+# The six tests below guard the MLA generation perf gate that #15300 removed as
+# refactoring collateral, costing ~3% output token throughput on DeepSeek-V3-family
+# and Kimi-K2 MLA decode at the default tokens_per_block. They deliberately call the
+# checker instead of asserting on SLOWER_MLA_GENERATION_KERNELS itself: a test that
+# pins the literal set would be deleted along with the constant by the next
+# mechanical refactor, whereas these turn a dropped parameter into a TypeError and a
+# dropped constant into an AttributeError.
+
+
+def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
+    # DeepSeek-V3 / Kimi-K2 shape at the default tokens_per_block=32: the trtllm-gen
+    # MLA decode kernel is slower here than the thop.attention fallback, so this
+    # backend must decline and let selection fall through.
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        tokens_per_block=32,
+        mla_backend="trtllm-gen",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert not supported
+    assert "slower" in reason
+    assert "headDimQk=576" in reason
+    assert "headDimV=512" in reason
+    assert "tokens_per_block=32" in reason
+
+
+@pytest.mark.parametrize("tokens_per_block", [16, 64])
+def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -> None:
+    # The gate must stay narrow: the same head dims at other page sizes are still
+    # served by this backend. Real configs run tokens_per_block=64.
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        tokens_per_block=tokens_per_block,
+        mla_backend="trtllm-gen",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert supported, reason
+    assert reason == ""
+
+
+def test_mla_generation_gate_is_scoped_to_the_trtllm_gen_backend() -> None:
+    # The gated kernel is the trtllm-gen one; the cute-dsl MLA decode path shares
+    # this class and these head dims, and must stay selectable.
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        tokens_per_block=32,
+        mla_backend="cute-dsl",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert supported, reason
+    assert reason == ""
+
+
+def test_mla_generation_gate_declines_a_policy_downgrade_to_trtllm_gen() -> None:
+    # A cute-dsl config whose per-batch policy downgrades to trtllm-gen (K3 does so
+    # for mixed batches and for speculative verification) still runs the gated
+    # kernel, so the gate must fire on the *effective* backend. Reading the static
+    # self._mla_backend here would let the slower kernel through.
+    fmha = _make_fmha("cute-dsl", mla_backend_policy=lambda *_: "trtllm-gen")
+    meta = SimpleNamespace(num_contexts=1, num_generations=3)
+    effective = fmha._get_effective_mla_backend(meta, 3)
+    assert effective == "trtllm-gen"
+
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        tokens_per_block=32,
+        mla_backend=effective,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert not supported
+    assert "slower" in reason
+
+
+def test_mla_generation_gate_reads_the_effective_mla_backend() -> None:
+    # The composition above is only load-bearing if the production call site feeds
+    # the gate the effective backend. Assert that structurally: reverting to the
+    # static self._mla_backend is a one-word change, and no behavioural test here
+    # would catch it because driving _is_supported_with_reason needs a full
+    # metadata/forward-args stub.
+    source = textwrap.dedent(inspect.getsource(FlashInferTrtllmGenFmha._is_supported_with_reason))
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_check_mla_generation_support"
+    ]
+    assert len(calls) == 1, "expected exactly one MLA generation gate call site"
+    kwargs = {kw.arg: kw.value for kw in calls[0].keywords}
+    passed = kwargs.get("mla_backend")
+    assert passed is not None, "gate call site lost its mla_backend argument"
+    assert (
+        isinstance(passed, ast.Call)
+        and getattr(passed.func, "attr", None) == "_get_effective_mla_backend"
+    ), f"gate must receive the effective backend, got {ast.dump(passed)}"
+
+
+def test_mla_generation_allows_other_supported_head_dims() -> None:
+    # (320, 256) is unaffected at every page size.
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=320,
+        tokens_per_block=32,
+        mla_backend="trtllm-gen",
+        kv_lora_rank=256,
+        qk_rope_head_dim=64,
+    )
+    assert supported, reason
+    assert reason == ""
