@@ -996,6 +996,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         _ensure_pool_view_cached() recomputes them for the new batch.
         """
         self._pool_cache_valid = False
+        # The grouped remap batches (leader-written, follower-read) are only
+        # valid within one forward. Drop them at the step boundary so a follower
+        # can never read a previous step's batch, and so the tensors are not
+        # retained across idle steps. Python-only -> safe under graph replay
+        # (replay does not re-run this).
+        self._group_remap_batched.clear()
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by

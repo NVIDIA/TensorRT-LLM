@@ -214,9 +214,18 @@ class DSATrtllmAttention(TrtllmAttention):
             )
             metadata._group_remap_batched[leader] = batched
         else:
-            # Shared layer: read the leader's precomputed batch.
+            # Shared layer: read the leader's precomputed batch. The batch is
+            # cleared at every step boundary, so a present entry is from this
+            # forward; still require it to match this layer's group slot and
+            # top-k shape, and otherwise fall back to the per-layer path. This
+            # makes any leader/follower ordering or shape mismatch a safe
+            # per-layer fallback rather than a stale/out-of-bounds read.
             batched = metadata._group_remap_batched.get(leader, None)
-            if batched is None:
+            if (
+                batched is None
+                or slot >= batched.shape[0]
+                or batched.shape[1:] != topk_indices.shape
+            ):
                 return None
 
         return batched[slot]

@@ -611,6 +611,7 @@ def _make_group_remap_metadata(
         shared_topk_indices=torch.empty(0, dtype=torch.int32, device=device),
         block_table=None,
         in_mtp_draft_loop=False,
+        _pool_cache_valid=True,
         _group_remap_struct=None,
         _group_remap_struct_kv_id=0,
         _group_remap_batched={},
@@ -624,6 +625,11 @@ def _make_group_remap_metadata(
     )
     metadata._ensure_group_remap_struct = MethodType(
         DSAtrtllmAttentionMetadata._ensure_group_remap_struct, metadata
+    )
+    # Bind the real per-step cache invalidation so tests exercise the actual
+    # clear of _group_remap_batched at forward boundaries.
+    metadata._invalidate_pool_view_cache = MethodType(
+        DSAtrtllmAttentionMetadata._invalidate_pool_view_cache, metadata
     )
     return metadata, block_table, req_idx
 
@@ -835,6 +841,124 @@ def test_group_remap_matches_per_layer_cuda_graph():
             assert torch.equal(batched[struct["slot_of"][local_idx]], baseline), (
                 f"layer {local_idx} diverged on graph replay (seed={seed})"
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_batched_cleared_per_step():
+    """The leader-written batch must not survive a forward boundary: after the
+    per-step cache invalidation, a follower reached before its leader falls back
+    to the per-layer path instead of consuming a previous step's stale batch."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size = 8, 4, 128, 64
+    mask = [True, False]  # leader 0, follower 1
+    params = {0: (2, 0), 1: (2, 1)}
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+
+    def per_layer(idx, topk):
+        out, _ = transform_local_topk_and_prepare_pool_view(topk, md, idx, is_generation=True)
+        return out
+
+    # Forward 1: leader then follower.
+    md._invalidate_pool_view_cache()  # step boundary
+    topk1 = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=1)
+    leader._grouped_remap_topk_to_global(topk1, md, 0, True)
+    assert 0 in md._group_remap_batched
+    f1 = follower._grouped_remap_topk_to_global(topk1, md, 1, True)
+    assert torch.equal(f1, per_layer(1, topk1))
+
+    # Forward 2: the step boundary must have dropped forward 1's batch, so a
+    # follower reached before its leader falls back (None) rather than returning
+    # forward 1's now-stale indices (same shape, so only the clear catches it).
+    md._invalidate_pool_view_cache()
+    assert md._group_remap_batched == {}
+    topk2 = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=2)
+    assert follower._grouped_remap_topk_to_global(topk2, md, 1, True) is None
+    # Once the leader runs in forward 2, the follower gets forward-2 data.
+    leader._grouped_remap_topk_to_global(topk2, md, 0, True)
+    assert torch.equal(
+        follower._grouped_remap_topk_to_global(topk2, md, 1, True), per_layer(1, topk2)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_follower_shape_guard():
+    """A follower whose top-k shape does not match the cached batch falls back to
+    the per-layer path instead of returning a mismatched/out-of-range slice."""
+    device = torch.device("cuda")
+    num_requests, block_size = 4, 64
+    mask = [True, False]
+    params = {0: (2, 0), 1: (2, 1)}
+    md, _, _ = _make_group_remap_metadata(mask, params, 8, num_requests, 256, block_size, device)
+    md._invalidate_pool_view_cache()
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+
+    # Leader caches a batch for a width-256 top-k.
+    topk_wide = _make_group_remap_topk(8, 256, block_size, device, seed=1)
+    leader._grouped_remap_topk_to_global(topk_wide, md, 0, True)
+    assert 0 in md._group_remap_batched
+
+    # A follower arriving with a different-width top-k must not read the stale
+    # batch -> falls back (None).
+    topk_narrow = _make_group_remap_topk(8, 128, block_size, device, seed=2)
+    assert follower._grouped_remap_topk_to_global(topk_narrow, md, 1, True) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_remap_orchestration_cuda_graph():
+    """Capture the real leader-store / follower-read orchestration
+    (`_grouped_remap_topk_to_global`, not just the transform helper) into a
+    graph, replay with changed contents, and stay bit-exact vs the per-layer
+    path for every member."""
+    device = torch.device("cuda")
+    num_tokens, num_requests, num_topk, block_size = 8, 4, 256, 64
+    mask = [True, False, False]
+    params = {0: (2, 0), 1: (2, 1), 2: (2, 2)}
+    md, _, _ = _make_group_remap_metadata(
+        mask, params, num_tokens, num_requests, num_topk, block_size, device
+    )
+    backends = [
+        _make_group_remap_backend(indexer=(object() if mask[i] else None), local_idx=i)
+        for i in range(len(mask))
+    ]
+
+    # The group struct is intentionally not built during capture, so build it
+    # eagerly first; a static top-k buffer feeds the captured kernels.
+    md._ensure_group_remap_struct()
+    topk = _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=1)
+
+    def run_all():
+        return [
+            backends[i]._grouped_remap_topk_to_global(topk, md, i, True) for i in range(len(mask))
+        ]
+
+    # Warmup on a side stream.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run_all()
+    torch.cuda.current_stream().wait_stream(s)
+
+    md._group_remap_batched.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = run_all()
+    # Every member took the grouped path (leader computed, followers read a slice).
+    assert all(o is not None for o in outs)
+
+    for seed in (2, 3):
+        topk.copy_(_make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        for i in range(len(mask)):
+            baseline, _ = transform_local_topk_and_prepare_pool_view(
+                topk, md, i, is_generation=True
+            )
+            assert torch.equal(outs[i], baseline), f"layer {i} diverged on replay (seed={seed})"
 
 
 def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
