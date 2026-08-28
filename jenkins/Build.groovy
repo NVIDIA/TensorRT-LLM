@@ -519,7 +519,7 @@ def runLLMBuild(
         sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
     }
     withCredentials([string(credentialsId: 'svc_tensorrt_llm_oss_gitlab_token_secret', variable: 'GITLAB_TOKEN')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./3rdparty_sources --token ${GITLAB_TOKEN}"
+        sh "cd ${LLM_ROOT} && python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./ --token ${GITLAB_TOKEN}"
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
