@@ -7742,9 +7742,12 @@ class PyExecutor:
                     # Forward is done for this request — release the
                     # IndexMapper slot so new requests can reuse it.
                     # KV blocks stay allocated for the upcoming transfer.
-                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
-                        self.kv_cache_manager.release_index_slot(
-                            req.py_request_id)
+                    # getattr: executors built by unit tests skip __init__
+                    # and so never get the draft binding.
+                    for mgr in (self.kv_cache_manager,
+                                getattr(self, 'draft_kv_cache_manager', None)):
+                        if hasattr(mgr, 'release_index_slot'):
+                            mgr.release_index_slot(req.py_request_id)
                     # Order matters: start_transfer commits the request's blocks to the reuse
                     # tree and pins them, and must run before respond_and_send_async sends the
                     # final KV slice and (for the Python transceiver) transitions the request toward completion.
