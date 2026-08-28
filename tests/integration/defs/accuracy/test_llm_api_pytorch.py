@@ -1619,6 +1619,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     acceptance_length,
                 )
 
+    @skip_no_rubin
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_nvfp4_mla_gsm8k(self):
+        kv_cache_config = KvCacheConfig(dtype="nvfp4",
+                                        free_gpu_memory_fraction=0.75)
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                attn_backend="TRTLLM",
+                kv_cache_config=kv_cache_config,
+                max_num_tokens=8192,
+                max_batch_size=1350,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_bfloat16_flashinfer(self, enable_chunked_prefill):
