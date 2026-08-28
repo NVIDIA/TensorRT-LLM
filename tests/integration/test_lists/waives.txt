@@ -75,6 +75,7 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_
 accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8_mmmu_encoder_cuda_graph] SKIP (https://nvbugs/6581049)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5838199)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] SKIP (https://nvbugs/5838199)
+cpp/test_unit_tests.py::test_unit_tests[batch_manager-80] SKIP (https://nvbugs/6674826)
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/6611817)
 disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6105768)
 disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6428069)
