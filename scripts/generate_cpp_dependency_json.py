@@ -1,11 +1,12 @@
-"""Generate a JSON manifest of third-party source URLs used in the CMake build.
+"""Generate an SPDX SBOM of third-party source URLs used in the CMake build.
 
 This script produces a record of third-party dependencies exactly as consumed
 during the build. Each dependency is mirrored to the GitLab OSS components group
 (https://gitlab.com/nvidia/tensorrt-llm/oss-components), and the resulting
-third-party-sources.json is copied into the container image so that source
-references are distributed alongside build artifacts, satisfying open-source
-license obligations in a traceable and auditable way.
+third-party-sources.json (an SPDX 2.3 JSON document) is copied into the
+container image so that source references are distributed alongside build
+artifacts, satisfying open-source license obligations in a traceable and
+auditable way, and so the document can be ingested directly by Black Duck.
 """
 
 import argparse
@@ -13,9 +14,12 @@ import json
 import logging
 import os
 import pathlib
+import re
 import time
 import urllib.parse
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +30,8 @@ GITLAB_API_BASE = "https://gitlab.com/api/v4"
 REPO_URL_OVERWRITE = {"deep_ep_download": "https://github.com/deepseek-ai/DeepEP"}
 
 _FETCH_CONTENT_JSON = pathlib.Path(__file__).parent.parent / "3rdparty" / "fetch_content.json"
+
+_NOASSERTION = "NOASSERTION"
 
 
 def _load_fetch_content_index() -> dict[str, dict]:
@@ -133,6 +139,95 @@ def wait_for_mirror(project_id: int, poll_interval: int = 10, timeout: int = 300
         time.sleep(poll_interval)
 
 
+def _github_purl(upstream_url: str, tag: str) -> str | None:
+    """Return a GitHub purl (for Black Duck component matching) or None if not applicable."""
+    if not upstream_url or "github.com" not in upstream_url:
+        return None
+    path = upstream_url.split("github.com/", 1)[-1].rstrip("/").removesuffix(".git")
+    parts = path.split("/")
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    return f"pkg:github/{owner}/{repo}@{tag}" if tag else f"pkg:github/{owner}/{repo}"
+
+
+def _spdx_package(name: str, tag: str, upstream_url: str, mirror_url: str) -> dict:
+    spdx_id = "SPDXRef-Package-" + re.sub(r"[^a-zA-Z0-9.-]", "-", name)
+    download_location = f"git+{mirror_url}@{tag}" if tag else (mirror_url or _NOASSERTION)
+    package = {
+        "SPDXID": spdx_id,
+        "name": name,
+        "versionInfo": tag or _NOASSERTION,
+        "downloadLocation": download_location,
+        "filesAnalyzed": False,
+        "licenseConcluded": _NOASSERTION,
+        "licenseDeclared": _NOASSERTION,
+        "copyrightText": _NOASSERTION,
+    }
+    purl = _github_purl(upstream_url, tag)
+    if purl:
+        package["externalRefs"] = [
+            {
+                "referenceCategory": "PACKAGE-MANAGER",
+                "referenceType": "purl",
+                "referenceLocator": purl,
+            }
+        ]
+    return package
+
+
+def build_spdx_document(third_party_packages: list[dict]) -> dict:
+    """Build an SPDX 2.3 JSON document describing the resolved third-party packages."""
+    root_spdx_id = "SPDXRef-Package-tensorrt-llm-cpp-deps"
+    packages = [
+        {
+            "SPDXID": root_spdx_id,
+            "name": "tensorrt-llm-cpp-third-party-dependencies",
+            "versionInfo": _NOASSERTION,
+            "downloadLocation": _NOASSERTION,
+            "filesAnalyzed": False,
+            "licenseConcluded": _NOASSERTION,
+            "licenseDeclared": _NOASSERTION,
+            "copyrightText": _NOASSERTION,
+        }
+    ]
+    relationships = [
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relationshipType": "DESCRIBES",
+            "relatedSpdxElement": root_spdx_id,
+        }
+    ]
+    for pkg in third_party_packages:
+        spdx_package = _spdx_package(
+            pkg["name"], pkg["tag"], pkg["upstream_url"], pkg["mirror_url"]
+        )
+        packages.append(spdx_package)
+        relationships.append(
+            {
+                "spdxElementId": root_spdx_id,
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": spdx_package["SPDXID"],
+            }
+        )
+
+    return {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": "tensorrt-llm-cpp-third-party-sources",
+        "documentNamespace": (
+            f"https://github.com/NVIDIA/TensorRT-LLM/spdxdocs/tensorrt-llm-cpp-deps-{uuid.uuid4()}"
+        ),
+        "creationInfo": {
+            "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "creators": ["Tool: generate_cpp_dependency_json.py"],
+        },
+        "packages": packages,
+        "relationships": relationships,
+    }
+
+
 def main():
     global TOKEN
     parser = argparse.ArgumentParser(description=__doc__)
@@ -162,9 +257,7 @@ def main():
         raise ValueError(f"No source directories found in {args.deps_dir}")
 
     namespace_id: int | None = None
-    fetch_content = json.loads(_FETCH_CONTENT_JSON.read_text())
-    dep_source_index = {dep["name"]: dep for dep in fetch_content.get("dependencies", [])}
-    third_party_source_list = []
+    third_party_packages = []
 
     for src_dir in src_dirs:
         package_name = src_dir.name.removesuffix("-src")
@@ -193,11 +286,13 @@ def main():
         tag = source_info["tag"]
         if tag and commit_exists_in_project(project_id, tag):
             logger.info("%s -> ref %r confirmed in oss-components, updating url", package_name, tag)
-            if package_name not in dep_source_index:
-                logger.warning("%s -> not found in fetch_content.json, skipping", package_name)
-                continue
-            third_party_source_list.append(
-                {**dep_source_index[package_name], "git_repository": oss_url}
+            third_party_packages.append(
+                {
+                    "name": package_name,
+                    "tag": tag,
+                    "upstream_url": source_info["url"],
+                    "mirror_url": oss_url,
+                }
             )
         else:
             logger.warning(
@@ -206,12 +301,14 @@ def main():
                 tag,
             )
 
+    spdx_document = build_spdx_document(third_party_packages)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = args.output_dir / "third-party-sources.json"
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(third_party_source_list, f, indent=2)
+        json.dump(spdx_document, f, indent=2)
         f.write("\n")
-    logger.info("Wrote oss fetch_content to %s", output_path)
+    logger.info("Wrote SPDX SBOM to %s", output_path)
 
 
 if __name__ == "__main__":
