@@ -650,7 +650,6 @@ class TRTLLMWorker(Worker):
         except RequestError as error:
             if self._is_max_num_tokens_request_error(error):
                 return self._finish_task_by_length(task)
-            print('TRTLLM worker get exception: ' + str(error))
             return TaskStatus.WORKER_EXECEPTION
 
         self.fill_task_with_result(task, result)
@@ -671,7 +670,6 @@ class TRTLLMWorker(Worker):
                 task.end_flag = True
                 if self._is_max_num_tokens_request_error(error):
                     return self._finish_task_by_length(task)
-                print('TRTLLM worker get exception: ' + str(error))
                 return TaskStatus.WORKER_EXECEPTION
 
         if task.cancel_flag:
@@ -688,7 +686,6 @@ class TRTLLMWorker(Worker):
             task.end_flag = True
             if self._is_max_num_tokens_request_error(error):
                 return self._finish_task_by_length(task)
-            print('TRTLLM worker get exception: ' + str(error))
             return TaskStatus.WORKER_EXECEPTION
 
         self.fill_task_with_result(task, task.request_handle)

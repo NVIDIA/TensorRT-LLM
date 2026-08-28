@@ -16,7 +16,7 @@
 import asyncio
 import os
 import sys
-from typing import Any, Generator
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
@@ -81,74 +81,18 @@ def create_trtoai_worker(model_name, async_client):
     )
 
 
-class _AwaitableResult:
-
-    def __init__(self, result: object) -> None:
-        self.result = result
-
-    def __await__(self) -> Generator[Any, None, object]:
-
-        async def _result() -> object:
-            return self.result
-
-        return _result().__await__()
-
-
-class _Completion:
-
-    text = "ok"
-    token_ids = [1]
-    finish_reason = "stop"
-    logprobs = None
-
-
-class _GenerationResult:
-
-    outputs = [_Completion()]
-    context_logits = None
-
-
-class _SuccessfulLLM:
-
-    def generate_async(self, *args: object,
-                       **kwargs: object) -> _AwaitableResult:
-        return _AwaitableResult(_GenerationResult())
-
-
-class _FailingLLM:
-
-    def __init__(self, error: RequestError) -> None:
-        self.error = error
-
-    def generate_async(self, *args: object,
-                       **kwargs: object) -> _AwaitableResult:
-        raise self.error
-
-
-class _StreamingFailingResult:
-
-    def __init__(self, error: RequestError) -> None:
-        self._done = False
-        self.error = error
-        self.outputs = [_Completion()]
-        self.context_logits = None
-
-    async def _aresult_step(self) -> None:
-        raise self.error
-
-
-class _StreamingFailingLLM:
-
-    def __init__(self, error: RequestError) -> None:
-        self.error = error
-
-    def generate_async(self, *args: object,
-                       **kwargs: object) -> _StreamingFailingResult:
-        return _StreamingFailingResult(self.error)
+def _generation_result() -> MagicMock:
+    completion = MagicMock(text="ok",
+                           token_ids=[1],
+                           finish_reason="stop",
+                           logprobs=None)
+    return MagicMock(outputs=[completion], context_logits=None)
 
 
 def test_trtllm_worker_copies_finish_reason_from_result() -> None:
-    worker = TRTLLMWorker(_SuccessfulLLM(), tokenizer=None)
+    llm = MagicMock()
+    llm.generate_async = AsyncMock(return_value=_generation_result())
+    worker = TRTLLMWorker(llm, tokenizer=None)
     task = GenerationTask.create_from_prompt("hello")
 
     status = asyncio.run(worker.run_task(task))
@@ -163,7 +107,9 @@ def test_trtllm_worker_returns_length_for_max_num_tokens_error() -> None:
     error = RequestError(
         "The sum of prompt length (4), query length (1) should not exceed "
         "max_num_tokens (4)")
-    worker = TRTLLMWorker(_FailingLLM(error), tokenizer=None)
+    llm = MagicMock()
+    llm.generate_async = AsyncMock(side_effect=error)
+    worker = TRTLLMWorker(llm, tokenizer=None)
     task = GenerationTask.create_from_prompt("hello")
 
     status = asyncio.run(worker.run_task(task))
@@ -175,8 +121,9 @@ def test_trtllm_worker_returns_length_for_max_num_tokens_error() -> None:
 
 
 def test_trtllm_worker_preserves_unrelated_request_errors() -> None:
-    worker = TRTLLMWorker(_FailingLLM(RequestError("bad request")),
-                          tokenizer=None)
+    llm = MagicMock()
+    llm.generate_async = AsyncMock(side_effect=RequestError("bad request"))
+    worker = TRTLLMWorker(llm, tokenizer=None)
     task = GenerationTask.create_from_prompt("hello")
 
     status = asyncio.run(worker.run_task(task))
@@ -189,7 +136,12 @@ def test_trtllm_worker_returns_length_for_streaming_step_error() -> None:
     error = RequestError(
         "The sum of prompt length (4), query length (1) should not exceed "
         "max_num_tokens (4)")
-    worker = TRTLLMWorker(_StreamingFailingLLM(error), tokenizer=None)
+    request_handle = _generation_result()
+    request_handle._done = False
+    request_handle._aresult_step = AsyncMock(side_effect=error)
+    llm = MagicMock()
+    llm.generate_async.return_value = request_handle
+    worker = TRTLLMWorker(llm, tokenizer=None)
     task = StreamGenerationTask.create_from_generation_task(
         GenerationTask.create_from_prompt("hello"), streaming_step=1)
 
@@ -206,7 +158,9 @@ def test_trtllm_worker_returns_length_for_streaming_start_error() -> None:
     error = RequestError(
         "The sum of prompt length (4), query length (1) should not exceed "
         "max_num_tokens (4)")
-    worker = TRTLLMWorker(_FailingLLM(error), tokenizer=None)
+    llm = MagicMock()
+    llm.generate_async.side_effect = error
+    worker = TRTLLMWorker(llm, tokenizer=None)
     task = StreamGenerationTask.create_from_generation_task(
         GenerationTask.create_from_prompt("hello"), streaming_step=1)
 
