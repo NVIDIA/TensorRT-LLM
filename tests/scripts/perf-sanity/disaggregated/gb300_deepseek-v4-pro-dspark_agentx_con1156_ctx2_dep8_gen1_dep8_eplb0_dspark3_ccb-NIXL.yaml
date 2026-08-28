@@ -43,6 +43,13 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
+ctx_router_config:
+  type: conversation
+server_config_extra:
+  gen_strip_message_history: true
+  gen_tokids_ctxbytes: true
+  server_keep_alive_timeout: 3600
+  num_workers: 4
 worker_config:
   gen:
     print_iter_log: true
