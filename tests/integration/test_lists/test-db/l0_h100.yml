@@ -91,6 +91,7 @@ l0_h100:
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
   - unittest/disaggregated/test_transceiver_bounded_polling.py
+  - unittest/disaggregated/test_rx_peer_drain.py
   - unittest/disaggregated/test_pool_matching.py
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_minimax_m3_kv_transfer.py

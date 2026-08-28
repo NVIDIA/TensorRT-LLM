@@ -39,6 +39,15 @@ from tensorrt_llm.bindings import LlmRequestState
 @dataclass
 class _FakeRequest:
     state: Optional[LlmRequestState] = None
+    kv_cache_transfer_time_ms: float = 0.0
+    kv_cache_size: int = 0
+    py_kv_cache_xfer_bytes: int = 0
+
+    def set_kv_cache_transfer_end(self, _t) -> None:
+        pass
+
+    def set_kv_cache_size(self, size: int) -> None:
+        self.kv_cache_size = size
 
 
 class _FakeTransferWorker:
@@ -58,14 +67,19 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        has_transferring_tasks: bool = False,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self._has_transferring_tasks = has_transferring_tasks
         self.blocking_calls: list[bool] = []
         self.closed = False
+        self.cancelled = False
+        self.transfer_end_time = None
+        self.kv_cache_size_bytes = 0
         self.aux_slot: Optional[int] = 0
 
     @property
@@ -86,6 +100,12 @@ class _FakeSession:
     def has_failed(self) -> bool:
         return self._has_failed
 
+    def has_transferring_tasks(self) -> bool:
+        return self._has_transferring_tasks
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
     def close(self) -> None:
         self.closed = True
         self.aux_slot = None
@@ -99,6 +119,7 @@ class _FakeTask:
         on_wait: Optional[Callable[[Optional[float]], None]] = None,
     ) -> None:
         self.status = status
+        self.pending_peers: set[int] = set()
         self._wait_results = list(wait_result) if isinstance(wait_result, list) else [wait_result]
         self._on_wait = on_wait
         self.wait_calls: list[Optional[float]] = []
@@ -140,7 +161,7 @@ def _make_transceiver(
     transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
-    transceiver._ctx_consensus_outcome = lambda _to_process, cancelled, failed, completed: (
+    transceiver._ctx_consensus_outcome = lambda _to_process, cancelled, failed, completed, _busy: (
         cancelled,
         failed,
         completed,
@@ -359,27 +380,45 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
-    # The cancelled/failed/completed id lists are exchanged with ONE allgather
-    # (packed as a list-of-lists) instead of three; verify a single call and that
-    # union (cancelled/failed) + intersection (completed) semantics are preserved.
+    # Every outcome list is exchanged with ONE allgather (packed as a
+    # list-of-lists); verify a single call and that union (cancelled/failed/busy)
+    # plus intersection (completed) semantics are preserved.
     transceiver = object.__new__(KvCacheTransceiverV2)
     calls: list = []
 
     def fake_allgather(payload):
         calls.append(payload)
-        # rank0 = this rank's [cancelled, failed, completed]; rank1 = a peer rank.
-        return [payload, [[], [99], [7, 8]]]
+        # rank0 = this rank's [cancelled, failed, completed, busy]; rank1 = a peer.
+        return [payload, [[], [99], [7, 8], []]]
 
     to_process = [1, 2, 7, 8, 99]
-    new_cancelled, new_failed, new_completed = transceiver._consensus_outcome(
-        to_process, [1], [2], [7], fake_allgather, True
+    new_cancelled, new_failed, new_completed, new_busy = transceiver._consensus_outcome(
+        to_process, [1], [2], [7, 8], [8], fake_allgather, True
     )
 
-    assert len(calls) == 1  # batched: a single allgather, not three
-    assert calls[0] == [[1], [2], [7]]
+    assert len(calls) == 1  # batched: a single allgather, not four
+    assert calls[0] == [[1], [2], [7, 8], [8]]
     assert new_cancelled == [1]  # union of cancelled across ranks
     assert new_failed == [2, 99]  # union of failed across ranks
-    assert new_completed == [7]  # intersection only (8 is completed on the peer only)
+    assert new_completed == [7]  # 8 is complete everywhere but still busy locally
+    assert new_busy == [8]
+
+
+def test_consensus_outcome_defers_a_terminal_rid_that_is_busy_on_a_peer() -> None:
+    # A rank that has already drained must not close a session that another
+    # rank is still writing into.
+    transceiver = object.__new__(KvCacheTransceiverV2)
+
+    def fake_allgather(payload):
+        # rank1 reports rid 5 as still busy.
+        return [payload, [[5], [], [], [5]]]
+
+    cancelled, failed, completed, busy = transceiver._consensus_outcome(
+        [5], [5], [], [], [], fake_allgather, True
+    )
+
+    assert cancelled == []
+    assert busy == [5]
 
 
 def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
@@ -387,10 +426,10 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
     transceiver._dist = SimpleNamespace(
-        tp_allgather=lambda payload: [payload, [[], [], []]],
+        tp_allgather=lambda payload: [payload, [[], [], [], []]],
     )
 
-    cancelled, failed, completed = transceiver._ctx_consensus_outcome([21], [], [], [21])
+    cancelled, failed, completed = transceiver._ctx_consensus_outcome([21], [], [], [21], [])
 
     assert cancelled == []
     assert failed == []
@@ -403,10 +442,10 @@ def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver._ctx_need_pp_sync = True
     transceiver._dist = SimpleNamespace(
         tp_allgather=Mock(side_effect=AssertionError("TP allgather must be skipped")),
-        pp_allgather=lambda payload: [payload, [[], [], []]],
+        pp_allgather=lambda payload: [payload, [[], [], [], []]],
     )
 
-    cancelled, failed, completed = transceiver._ctx_consensus_outcome([22], [], [], [22])
+    cancelled, failed, completed = transceiver._ctx_consensus_outcome([22], [], [], [22], [])
 
     assert cancelled == []
     assert failed == []
@@ -1002,3 +1041,111 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
     transceiver.prepare_context_requests([])
     transceiver._ctx_consensus.assert_not_called()
+
+
+def test_failed_session_is_cancelled_before_it_is_closed() -> None:
+    # close() never notifies the peers. A drain deadline can expire before a
+    # backlogged sender has even started writing, so the failed path has to
+    # cancel first or that sender writes into pages we already released.
+    session = _FakeSession(31, WaitResult.FAILED, has_failed=True)
+    req = _FakeRequest()
+    transceiver = object.__new__(KvCacheTransceiverV2)
+
+    transceiver._close_failed_sessions({31: session}, {31: req}, [31])
+
+    assert session.cancelled is True
+    assert session.closed is True
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+def test_recv_request_is_registered_before_dispatch_can_raise() -> None:
+    # dispatch can raise after earlier peers were contacted, leaving a session
+    # the predicate calls busy. If the request were only registered after
+    # receive(), _close_failed_sessions would KeyError on it once the drain
+    # deadline expired, taking the executor loop down with it.
+    rid = 77
+    req = SimpleNamespace(
+        request_id=rid,
+        py_disaggregated_params=None,
+        state=None,
+        py_kv_cache_xfer_bytes=0,
+        set_kv_cache_transfer_start=lambda _t: None,
+    )
+
+    class _RaisingSession(_FakeSession):
+        def receive(self, _slice) -> None:
+            raise RuntimeError("dispatch failed on peer 3 of 4")
+
+    session = _RaisingSession(rid, WaitResult.FAILED)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = False
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=lambda _r: session)
+    transceiver._create_kv_slice = lambda _r: object()
+    transceiver._slice_num_bytes = lambda _s: 0
+    transceiver._kv_size_rank_factor = 1
+
+    with pytest.raises(RuntimeError):
+        KvCacheTransceiverV2.request_and_receive_async(transceiver, req)
+
+    # Both maps must agree, so the drain path can clean up without KeyError.
+    assert rid in transceiver._recv_sessions
+    assert rid in transceiver._recv_reqs
+    transceiver._close_failed_sessions(transceiver._recv_sessions, transceiver._recv_reqs, [rid])
+    assert transceiver._recv_sessions == {} and transceiver._recv_reqs == {}
+
+
+def _make_gen_postprocess_transceiver(rids, failing_rid, *, need_sync=False, peer_failed=()):
+    """check_gen_transfer_status with every rid already agreed COMPLETED."""
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = need_sync
+    transceiver._dist = SimpleNamespace(rank=0)
+    transceiver._recv_sessions = {r: _FakeSession(r, WaitResult.COMPLETED) for r in rids}
+    transceiver._recv_reqs = {r: _FakeRequest() for r in rids}
+    transceiver._gen_consensus = lambda ids: list(ids)
+    transceiver._build_to_process = lambda *_a, **_k: list(rids)
+    transceiver._busy_rids = lambda *_a, **_k: []
+    transceiver._gen_consensus_outcome = lambda _tp, c, f, d, _b: (c, f, list(rids))
+    transceiver._close_failed_sessions = Mock()
+    transceiver._need_aux_transfer = lambda _r: False
+    transceiver._sync_transfer_timing = lambda _r: None
+
+    def _assert_history(req):
+        if transceiver._recv_reqs_snapshot.get(id(req)) == failing_rid:
+            raise RuntimeError("history not declared")
+
+    transceiver._recv_reqs_snapshot = {id(r): rid for rid, r in transceiver._recv_reqs.items()}
+    transceiver._assert_disagg_history_declared = _assert_history
+    transceiver._gen_allgather = lambda payload: [payload, list(peer_failed)]
+    return transceiver
+
+
+def test_gen_postprocess_failure_does_not_strand_later_requests() -> None:
+    # A raise on the first rid used to escape the loop, leaving the rest at
+    # IN_PROGRESS with their sessions still registered, and dropping this rank
+    # out of the next collective.
+    transceiver = _make_gen_postprocess_transceiver([41, 42], failing_rid=41)
+
+    completed, failed, _ = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [42]
+    assert failed == [41]
+    # Both were closed and removed; the failed one must not be cleaned up twice.
+    assert transceiver._recv_sessions == {} and transceiver._recv_reqs == {}
+    transceiver._close_failed_sessions.assert_called_once()
+    assert transceiver._close_failed_sessions.call_args[0][2] == []
+
+
+def test_gen_postprocess_failure_on_a_peer_rank_is_not_completed_locally() -> None:
+    # Local postprocess succeeded for 51, but a peer rank failed it. Publishing
+    # TRANS_COMPLETE here while the peer publishes an error diverges req.state.
+    transceiver = _make_gen_postprocess_transceiver(
+        [51], failing_rid=None, need_sync=True, peer_failed=[51]
+    )
+
+    completed, failed, _ = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == [51]
