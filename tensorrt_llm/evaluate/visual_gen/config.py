@@ -40,7 +40,7 @@ def load_prompt_records(
     if num_samples is not None and num_samples < 1:
         raise click.BadParameter("--num-samples must be >= 1", param_hint="--num-samples")
 
-    if path.suffix == ".json":
+    if path.suffix.lower() == ".json":
         try:
             parsed = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
