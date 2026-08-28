@@ -3206,6 +3206,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         *,
         cache_salt: Optional[str] = None,
         is_dummy: bool = False,
+        enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
@@ -3214,6 +3215,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             input_tokens,
             cache_salt=cache_salt,
             is_dummy=is_dummy,
+            enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
         )
         if (self.mapping.rank == 0 and kv_cache is not None

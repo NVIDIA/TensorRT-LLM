@@ -2606,8 +2606,10 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
         },
     )
     monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
-    log_info = MagicMock()
-    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+    log_debug = MagicMock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.debug", log_debug
+    )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
@@ -2632,9 +2634,9 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     assert mgr._recurrent_evicted_blocks_total == 5
     assert mgr._recurrent_onboarded_blocks_total == 5
     assert mgr._recurrent_dropped_blocks_total == 3
-    assert log_info.call_count == expected_log_count
+    assert log_debug.call_count == expected_log_count
     if rank == 0:
-        log_info.assert_called_once_with(
+        log_debug.assert_called_once_with(
             "[MambaHybridCacheManagerV2] recurrent cache status "
             "rank=0 pool_group_ids=[6, 7] "
             "evicted_recurrent_blocks=5 evicted_recurrent_bytes=500 "
