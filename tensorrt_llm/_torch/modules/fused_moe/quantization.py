@@ -1677,8 +1677,10 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
             # Non-gated activations (e.g. Nemotron-H squared-ReLU) have no w3.
             w31_weight_shard = w1_weight_shard
 
-        assert module.dtype in [torch.float16, torch.bfloat16], \
-            f"activation dtype should be float16 or bfloat16, got {module.dtype}"
+        if module.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "activation dtype should be float16 or bfloat16, got "
+                f"{module.dtype}")
 
         # shape[-1] is the pre-transpose column count == num_rows the
         # preprocessor sees after .T (it reads shape[1] of the 3-D view).
