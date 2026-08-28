@@ -456,6 +456,16 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     the RequestData.priorities field is populated with the correct
     per-block priorities based on the token ranges.
     """
+    # TEMPORARY: deterministic fail-once-then-pass hook to validate the
+    # periodic-upload/rerun-merge Jenkins pipeline fix. Fails the very first
+    # time this test runs (creating the marker), passes on every later
+    # invocation (rerun2 in the same pod, or any subsequent build). Revert
+    # before merging.
+    _rerun_demo_marker = "/tmp/.trtllm_rerun_merge_demo_marker"
+    if not os.path.exists(_rerun_demo_marker):
+        open(_rerun_demo_marker, "w").close()
+        assert False, "intentional first failure to exercise the rerun path (remove this block before merging)"
+
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
     NUM_TOKENS = 4
