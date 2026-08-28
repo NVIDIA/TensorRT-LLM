@@ -830,6 +830,23 @@ def _mock_cross_attention(backend, *, num_attention_heads=2, head_dim=2) -> Cosm
 
 
 class TestCosmos3MultiControlAttention:
+    def test_ulysses_rank_segments_preserve_global_ranges(self):
+        # Post-A2A KV is rank-packed as [text_0, gen_0, text_1, gen_1].
+        packed = torch.arange(10.0).reshape(1, 10, 1, 1)
+        segments = Cosmos3CrossAttention._ulysses_rank_segments(
+            packed,
+            batch_idx=0,
+            global_start=2,
+            global_end=5,
+            local_sequence_length=3,
+            rank_stride=5,
+            rank_offset=2,
+            world_size=2,
+        )
+        torch.testing.assert_close(
+            torch.cat(segments, dim=1).flatten(), torch.tensor([4.0, 7.0, 8.0])
+        )
+
     def _run_two_controls(self):
         backend = _RecordingMultiControlBackend()
         attention = _mock_cross_attention(backend)
