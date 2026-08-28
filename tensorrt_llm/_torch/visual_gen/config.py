@@ -38,7 +38,6 @@ from tensorrt_llm.visual_gen.args import (
     CudaGraphConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
-    StepPrecisionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
@@ -120,7 +119,6 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
-    step_precision: StepPrecisionConfig = PydanticField(default_factory=StepPrecisionConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -186,7 +184,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
-    step_precision: StepPrecisionConfig = PydanticField(default_factory=StepPrecisionConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -251,7 +248,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             compilation=_model_config_value(self.compilation),
             torch_compile=_model_config_value(self.torch_compile),
             cuda_graph=_model_config_value(self.cuda_graph),
-            step_precision=_model_config_value(self.step_precision),
             attention=_model_config_value(self.attention),
             attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
@@ -476,7 +472,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         compilation_cfg = args.compilation_config if args else CompilationConfig()
         torch_compile_cfg = args.torch_compile_config if args else TorchCompileConfig()
         cuda_graph_cfg = args.cuda_graph_config if args else CudaGraphConfig()
-        step_precision_cfg = args.step_precision_config if args else StepPrecisionConfig()
         attention_cfg = args.attention_config if args else AttentionConfig()
         parallel_cfg = args.parallel_config if args else ParallelConfig()
         cache_cfg = args.cache_config if args else None
@@ -636,7 +631,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             compilation=compilation_cfg,
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
-            step_precision=step_precision_cfg,
             attention=attention_cfg,
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,

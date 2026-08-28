@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Component tests for step precision: <component> x <StepPrecisionConfig>.
+"""Component tests for step precision: <component> x <checkpoint policy>.
 
 Level-1 policy tests live in test_cosmos3_step_precision.py and use stubs.
 These build the real quantized components the feature acts on -- a split
-GatedMLP and a shared-quant Attention -- drive them through the config, and
+GatedMLP -- drive it through the checkpoint's declared policy, and
 compare feature-on against feature-off in the same job. There is no stored
 reference: the comparisons are either exact arithmetic or an A/B against the
 same module's other path.
@@ -25,10 +25,10 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
     install_step_precision,
+    parse_diffusion_step_policy,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import StepPrecisionConfig
 
 HIDDEN, INTERMEDIATE, TOKENS = 512, 1024, 128
 # Chosen so the whole chain stays inside FP8's representable range. The
@@ -69,29 +69,46 @@ def _linears(mlp):
     return [getattr(mlp, n) for n in names] + [mlp.down_proj]
 
 
-def _install(mlp, config: StepPrecisionConfig):
-    """Install exactly as the transformer does, straight from the config object."""
-    if not config.enable:
+def _policy(first=3, last=3):
+    """The block the checkpoint publishes under quantization_config.runtime."""
+    return {
+        "runtime": {
+            "diffusion_step_policy": {
+                "schema_version": 1,
+                "type": "first_last_n",
+                "index_space": "denoising_loop_iteration",
+                "scope": ["transformer"],
+                "default_mode": "native",
+                "first_steps": {"count": first, "mode": "a16"},
+                "last_steps": {"count": last, "mode": "a16"},
+                "overlap": "a16",
+                "reasoner": "a16",
+            }
+        }
+    }
+
+
+def _install(mlp, quantization_config):
+    """Install exactly as the transformer does: parse the checkpoint, then wrap."""
+    policy = parse_diffusion_step_policy(quantization_config)
+    if policy is None:
         return None
     controller = StepPrecisionController(
-        first_steps=config.first_steps, last_steps=config.last_steps
+        first_steps=policy.first_steps, last_steps=policy.last_steps
     )
     assert install_step_precision([mlp], controller) == len(_linears(mlp))
     return controller
 
 
 @requires_cuda
-def test_config_defaults_are_on_with_three_step_windows():
-    """The shipped default: enabled, three steps at each end."""
-    config = StepPrecisionConfig()
-    assert config.enable is True
-    assert (config.first_steps, config.last_steps) == (3, 3)
+def test_checkpoint_without_a_policy_installs_nothing():
+    """Absence is the signal, not a default to fill in.
 
-
-@requires_cuda
-def test_disabled_config_installs_nothing():
+    The image and distilled 4-step FP8 builds ship no policy and must run
+    fully quantized rather than inherit another checkpoint's windows.
+    """
     mlp = _make_mlp()
-    assert _install(mlp, StepPrecisionConfig(enable=False)) is None
+    assert _install(mlp, {}) is None
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
     # Without a wrapper nothing publishes high_precision, so the shared-input
     # optimization stays engaged on every step.
@@ -107,7 +124,7 @@ def test_shared_quantization_stands_down_only_on_edge_steps():
     activations and is not actually running in higher precision.
     """
     mlp = _make_mlp()
-    controller = _install(mlp, StepPrecisionConfig())
+    controller = _install(mlp, _policy())
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
     controller.set_step(0, NUM_STEPS)
@@ -128,7 +145,7 @@ def test_edge_step_linear_matches_exact_dequantized_reference():
     weight_scale -- nothing is read that the checkpoint did not already supply.
     """
     mlp = _make_mlp()
-    controller = _install(mlp, StepPrecisionConfig())
+    controller = _install(mlp, _policy())
     controller.set_step(0, NUM_STEPS)
 
     linear = mlp.gate_proj
@@ -146,7 +163,7 @@ def test_edge_and_middle_steps_produce_different_output():
     failure mode a flag-only test cannot see.
     """
     mlp = _make_mlp()
-    controller = _install(mlp, StepPrecisionConfig())
+    controller = _install(mlp, _policy())
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
     controller.set_step(NUM_STEPS // 2, NUM_STEPS)
@@ -173,7 +190,7 @@ def test_edge_step_is_closer_to_the_unquantized_reference():
     quantization anywhere, which is what a 16-bit step approximates.
     """
     mlp = _make_mlp()
-    controller = _install(mlp, StepPrecisionConfig())
+    controller = _install(mlp, _policy())
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
     def dequant(linear):
@@ -197,9 +214,9 @@ def test_edge_step_is_closer_to_the_unquantized_reference():
 
 @requires_cuda
 def test_zero_windows_keep_every_step_quantized():
-    """An operator can turn the behaviour off without turning the feature off."""
+    """A policy may declare empty windows; every step then runs quantized."""
     mlp = _make_mlp()
-    controller = _install(mlp, StepPrecisionConfig(first_steps=0, last_steps=0))
+    controller = _install(mlp, _policy(first=0, last=0))
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
     for step in (0, NUM_STEPS // 2, NUM_STEPS - 1):
         controller.set_step(step, NUM_STEPS)

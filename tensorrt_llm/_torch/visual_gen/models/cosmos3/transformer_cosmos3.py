@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
     install_step_precision,
+    parse_diffusion_step_policy,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -1759,34 +1760,55 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self._maybe_install_step_precision()
 
     def _maybe_install_step_precision(self) -> None:
-        """Wrap the static-FP8 linears for per-denoising-step activation precision.
+        """Honor the checkpoint's ``diffusion_step_policy``, if it declares one.
 
         Runs last: the wrapper only ever needs to dispatch ``apply``, and the
-        projections must already be finalized. Only static FP8 qualifies --
-        under dynamic quantization the scale is derived per call, so there is
-        no calibration mismatch for the outer steps to avoid.
+        projections must already be finalized. The policy is the checkpoint's
+        to state -- it ships only with the builds whose calibration needs it --
+        so there is no default to apply when it is absent, and no knob here to
+        turn it on for a checkpoint that did not ask.
+
+        Only static FP8 qualifies: under dynamic quantization the scale is
+        derived per call, so there is no calibration mismatch to avoid.
         """
-        config = getattr(self.model_config, "step_precision", None)
-        if config is None or not config.enable:
+        policy = parse_diffusion_step_policy(
+            getattr(self.model_config.pretrained_config, "quantization_config", None)
+        )
+        if policy is None:
             return
         if not uses_static_fp8(self.model_config):
+            logger.warning(
+                "Checkpoint declares a diffusion_step_policy but this run is not static "
+                "per-tensor FP8, so the policy does not apply and is ignored."
+            )
             return
 
         self.step_precision_controller = StepPrecisionController(
-            first_steps=config.first_steps,
-            last_steps=config.last_steps,
+            first_steps=policy.first_steps,
+            last_steps=policy.last_steps,
         )
-        wrapped = install_step_precision(
-            [self.language_model.layers, self.gen_layers],
-            self.step_precision_controller,
-        )
+        # The generation tower follows the step windows. The reasoner's
+        # precision is stated outright: it runs once per request, on whichever
+        # transformer call builds its KV cache, so deriving it from a step index
+        # would match the policy only by coincidence.
+        wrapped = install_step_precision([self.gen_layers], self.step_precision_controller)
+        if policy.reasoner_high_precision:
+            wrapped += install_step_precision(
+                [self.language_model.layers], self.step_precision_controller, always_high=True
+            )
         if wrapped == 0:
             logger.warning(
-                "Cosmos3 step precision is enabled and the checkpoint is static FP8, "
-                "but no FP8 linears were found to wrap; every step will run fully "
-                "quantized."
+                "Checkpoint declares a diffusion_step_policy, but no static-FP8 linears "
+                "were found to wrap; every step will run fully quantized."
             )
             self.step_precision_controller = None
+            return
+        logger.info(
+            f"Cosmos3 diffusion_step_policy: {wrapped} FP8 linears wrapped; first "
+            f"{policy.first_steps} and last {policy.last_steps} denoising steps run with "
+            f"BF16 activations, reasoner "
+            f"{'always BF16' if policy.reasoner_high_precision else 'native'}."
+        )
 
     def set_denoising_step(self, step_index: int, num_steps: int) -> None:
         """Select this step's activation precision, before any transformer call.

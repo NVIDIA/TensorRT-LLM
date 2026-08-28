@@ -478,49 +478,6 @@ class CudaGraphConfig(StrictBaseModel):
     enable: bool = Field(False, status="prototype")
 
 
-class StepPrecisionConfig(StrictBaseModel):
-    """Run the outer denoising steps of a static-FP8 model with BF16 activations.
-
-    A statically quantized (ModelOpt-calibrated) checkpoint carries one
-    activation scale per projection, calibrated as a max over the whole
-    sampling trajectory. The first and last denoising steps are the ones that
-    scale fits worst, so those steps can instead run the resident FP8 weights
-    through a 16-bit GEMM -- the weight is dequantized with its own
-    ``weight_scale`` and ``input_scale`` goes unused. The middle steps keep the
-    checkpoint's fully quantized path.
-
-    Nothing extra is read from the checkpoint: this uses the same weights and
-    scales already loaded. ``first_steps``/``last_steps`` are a runtime policy,
-    not a calibrated quantity -- the checkpoint records no per-step
-    information at all.
-
-    Honored today only by Cosmos3 under static per-tensor FP8; every other
-    model and quantization mode ignores it.
-    """
-
-    enable: bool = Field(
-        True,
-        status="prototype",
-        description=(
-            "Run the first/last denoising steps with BF16 activations. On by "
-            "default for static-FP8 Cosmos3; set false to run every step fully "
-            "quantized."
-        ),
-    )
-    first_steps: int = Field(
-        3,
-        ge=0,
-        status="prototype",
-        description="Number of leading denoising steps to run with BF16 activations.",
-    )
-    last_steps: int = Field(
-        3,
-        ge=0,
-        status="prototype",
-        description="Number of trailing denoising steps to run with BF16 activations.",
-    )
-
-
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -665,10 +622,6 @@ class VisualGenArgs(StrictBaseModel):
     )
     cuda_graph_config: CudaGraphConfig = Field(
         default_factory=CudaGraphConfig,
-        status="prototype",
-    )
-    step_precision_config: StepPrecisionConfig = Field(
-        default_factory=StepPrecisionConfig,
         status="prototype",
     )
     attention_config: AttentionConfig = Field(
