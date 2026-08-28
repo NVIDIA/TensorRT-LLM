@@ -130,9 +130,6 @@ class TestCaptureReplayStaticTensors:
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=use_mrope, max_num_tokens=128)
         key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
         num_tokens = runner._get_num_tokens_for_key(key)
-
-        # Identity, not equality, is what replay() checks against the
-        # metadata captured for this key.
         attn_metadata = object()
 
         def forward_fn(inputs):
@@ -164,9 +161,6 @@ class TestCaptureReplayStaticTensors:
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=True, max_num_tokens=128)
         key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
         num_tokens = runner._get_num_tokens_for_key(key)
-
-        # Identity, not equality, is what replay() checks against the
-        # metadata captured for this key.
         attn_metadata = object()
 
         def forward_fn(inputs):
@@ -186,6 +180,83 @@ class TestCaptureReplayStaticTensors:
                 ),
             )
 
+    def test_replay_mrope_delta_read_seq_slots_omission_after_capture(self):
+        """A replay that omits mrope_delta_read_seq_slots must fill the
+        static buffer with the reserved dummy seq slot (a permanently-zero
+        delta, per model_engine.py's mrope_dummy_seq_slot fast path) rather
+        than leaving it at whatever (here: uninitialized) value it held.
+        """
+        batch_size = 1
+        runner = create_mock_cuda_graph_runner(batch_size, use_mrope=True)
+        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = object()
+        dummy_seq_slot = runner.config.max_num_tokens * runner.config.mapping.pp_size
+
+        def forward_fn(inputs):
+            return inputs["input_ids"].clone()
+
+        runner.capture(
+            key,
+            forward_fn,
+            self._make_inputs(attn_metadata, num_tokens, batch_size, value=1, use_mrope=True),
+        )
+
+        # use_mrope=True keeps position_ids 3D, matching what a real caller
+        # always sends for an MRoPE-capable model; only
+        # mrope_delta_read_seq_slots is conditionally omitted, so we delete
+        # just that key rather than passing use_mrope=False.
+        replay_inputs = self._make_inputs(
+            attn_metadata, num_tokens, batch_size, value=2, use_mrope=True
+        )
+        del replay_inputs["mrope_delta_read_seq_slots"]
+
+        runner.replay(key, replay_inputs)
+
+        static_buf = runner.shared_static_tensors["mrope_delta_read_seq_slots"]
+        assert static_buf[:batch_size].tolist() == [dummy_seq_slot] * batch_size
+
+    def test_replay_mrope_delta_read_seq_slots_omission_after_prior_replay(self):
+        """A replay that omits mrope_delta_read_seq_slots after a prior
+        replay carried real slot values must overwrite the static buffer
+        with the dummy seq slot, not leave the previous request's stale
+        values in place.
+        """
+        batch_size = 1
+        runner = create_mock_cuda_graph_runner(batch_size, use_mrope=True)
+        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = object()
+        dummy_seq_slot = runner.config.max_num_tokens * runner.config.mapping.pp_size
+
+        def forward_fn(inputs):
+            return inputs["input_ids"].clone()
+
+        runner.capture(
+            key,
+            forward_fn,
+            self._make_inputs(attn_metadata, num_tokens, batch_size, value=1, use_mrope=True),
+        )
+
+        runner.replay(
+            key,
+            self._make_inputs(attn_metadata, num_tokens, batch_size, value=2, use_mrope=True),
+        )
+        static_buf = runner.shared_static_tensors["mrope_delta_read_seq_slots"]
+        assert static_buf[:batch_size].tolist() == [2] * batch_size
+
+        # See the omission-after-capture test above for why use_mrope=True is
+        # kept here (3D position_ids) while only the delta-slots key is
+        # deleted.
+        replay_inputs = self._make_inputs(
+            attn_metadata, num_tokens, batch_size, value=3, use_mrope=True
+        )
+        del replay_inputs["mrope_delta_read_seq_slots"]
+
+        runner.replay(key, replay_inputs)
+
+        assert static_buf[:batch_size].tolist() == [dummy_seq_slot] * batch_size
+
     def test_replay_output_reflects_latest_inputs(self):
         """Replaying twice with different inputs must produce outputs that
         reflect each call's own inputs. A dropped copy_ makes them identical.
@@ -194,9 +265,6 @@ class TestCaptureReplayStaticTensors:
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=False)
         key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
         num_tokens = runner._get_num_tokens_for_key(key)
-
-        # Identity, not equality, is what replay() checks against the
-        # metadata captured for this key.
         attn_metadata = object()
 
         def forward_fn(inputs):
