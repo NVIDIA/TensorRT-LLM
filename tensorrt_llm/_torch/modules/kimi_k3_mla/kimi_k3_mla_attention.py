@@ -18,6 +18,7 @@ import torch
 
 from ....functional import PositionEmbeddingType
 from ....logger import logger
+from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
 from ...attention_backend import AttentionMetadata, TrtllmAttention, TrtllmAttentionMetadata
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -76,19 +77,21 @@ def _kimi_k3_mla_decode_backend_policy(
     CuTe-DSL reuses one staged page table across MLA layers for a
     generation-only, one-token-per-request batch. Other mixed batches repeat
     the staging copies in every MLA layer and regress time to first token, so
-    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception:
-    TRTLLM-Gen may select a 64-head Q tile, which does not divide 96 and
-    produces an invalid configuration after K3's head padding was removed.
-
-    The CuTe-DSL kernel itself accepts multi-token queries, but K3's decode
-    tuning covers only the one-token-per-request regime, so generation-only
-    speculative verification also falls back.
+    they fall back to TRTLLM-Gen. The H=96 path is the correctness exception
+    and applies to EVERY fallback candidate: TRTLLM-Gen may select a 64-head
+    Q tile, which does not divide 96 (invalid after K3's head padding was
+    removed), and its decode gate rejects 64 < num_heads_q < 128 outright —
+    falling back would fail engine initialization. H=96 per rank is K3's
+    attention-DP shape, so this keeps attention-DP + speculative
+    verification (a generation-only multi-token batch) on CuTe-DSL, which
+    accepts multi-token queries; K3's decode tuning preference for
+    TRTLLM-Gen only applies where TRTLLM-Gen is valid at all.
     """
     is_single_token_generation = num_gen_tokens == metadata.num_generations
-    requires_cute_dsl_for_mixed_batch = metadata.num_contexts > 0 and num_heads == 96
+    requires_cute_dsl = num_heads == 96
     if (
         requested_backend == "cute-dsl"
-        and not requires_cute_dsl_for_mixed_batch
+        and not requires_cute_dsl
         and (metadata.num_contexts > 0 or not is_single_token_generation)
     ):
         return "trtllm-gen"
@@ -231,6 +234,7 @@ class KimiK3MLAAttention(MLA):
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
         model_config: ModelConfig,
+        mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
@@ -253,6 +257,7 @@ class KimiK3MLAAttention(MLA):
             dtype=dtype,
             dense_bias=False,
             config=model_config,
+            mapping_with_cp=mapping_with_cp,
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
@@ -266,14 +271,15 @@ class KimiK3MLAAttention(MLA):
         self.use_output_gate = use_output_gate
 
         if use_output_gate:
-            # Follow q_b_proj's effective MLA mapping: replicated under
-            # attention-DP and column-sharded by head otherwise.
+            # The gate must match o_proj's input sharding (under helix the
+            # post-all-to-all 1/cp head chunk); outside helix this equals
+            # q_b_proj's head sharding, replicated under attention-DP.
             self.g_proj = Linear(
                 hidden_size,
                 num_heads * v_head_dim,
                 bias=False,
                 dtype=dtype,
-                mapping=self.q_b_proj.mapping,
+                mapping=self.o_proj.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,

@@ -11,9 +11,7 @@ This guide covers the TRT-LLM PyTorch attention stack:
 
 Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
-Attention (MLA), dense backends, and sparse backends. It does not cover
-`tensorrt_llm/_torch/attention_backend/star_flashinfer.py`, which is planned
-for deprecation.
+Attention (MLA), dense backends, and sparse backends.
 
 ## Glossary
 
@@ -314,6 +312,9 @@ use `TLLM_FMHA_LIBS=fallback` or
 to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
+For mixed non-MLA batches, the dispatcher checks each active phase independently
+with `is_supported(..., phase=...)`; a phased library accepts only phases backed
+by its corresponding `run_*()` entry point.
 
 The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
 explicitly selects the MLA generation kernel inside
@@ -336,15 +337,20 @@ cache (override with `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen`; other values are
 rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
 per-batch policy that falls back to `trtllm-gen` for mixed
 context/generation batches and multi-token generation (speculative
-verification), keeping `cute-dsl` for plain one-token-per-request decode. A
-mixed H=96 batch remains on `cute-dsl`: TRTLLM-Gen may select a 64-head Q tile,
-which does not divide 96 after K3's head padding removal.
+verification), keeping `cute-dsl` for plain one-token-per-request decode.
+Any H=96 batch (K3's attention-DP shape) remains on `cute-dsl` regardless of
+batch composition: TRTLLM-Gen may select a 64-head Q tile, which does not
+divide 96 after K3's head padding removal, and its decode gate rejects
+`64 < num_heads_q < 128` — so falling back there would fail engine
+initialization (this covers attention-DP speculative verification).
 
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
-- `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
-  requests and dispatches them to phase-specific hooks.
+- `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
+  context/generation and MHA/MLA entry points.
+- `fmha/combined.py` composes different context and generation implementations
+  for non-MLA mixed batches.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
@@ -353,9 +359,9 @@ The FMHA package is split by role:
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
-Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
-entry points. Use `Fmha` directly for libraries that already own the full
-request shape.
+Use `PhasedFmha` for libraries that implement one or more phase-specific entry
+points. Use `Fmha` directly for libraries that already own the full request
+shape.
 
 #### 3.2.3 MLA cached-context semantics
 

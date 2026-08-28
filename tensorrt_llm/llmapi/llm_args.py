@@ -1630,10 +1630,6 @@ class CpConfig(StrictBaseModel):
         description=
         "FIFO version for alltoall communication. Used in HELIX parallelism. Defaults to 2."
     )
-    cp_anchor_size: Optional[int] = Field(
-        default=None, description="Anchor size for STAR attention.")
-    block_size: Optional[int] = Field(
-        default=None, description="Block size for STAR attention.")
 
     @field_validator("cp_type", mode="before")
     @classmethod
@@ -1877,8 +1873,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "any of these penalties is rejected at admission rather than silently decoded "
         "without them.")
 
-    # If set, drafting is allowed to use chain drafter.
-    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
@@ -4339,12 +4333,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default="auto",
         description=
         "The runtime implementation. 'auto' (default) adopts the model's "
-        "preferred runtime when the effective backend supports it, and falls "
-        "back to the C++ transceiver otherwise. 'CPP' selects the C++ "
-        "transceiver, 'PYTHON' the Python transceiver. None is equivalent to "
-        "'CPP'. The model preference is only consulted on the PyTorch "
-        "backend's standard model-loading path; other paths (e.g. AutoDeploy) "
-        "fall back to the C++ transceiver under 'auto'.")
+        "preferred runtime when it declares one; otherwise it selects the "
+        "Python transceiver, falling back to the C++ transceiver only when "
+        "this config itself rules it out (non-NIXL backend or a null "
+        "kv_transfer_timeout_ms) — any other incompatibility fails at "
+        "transceiver creation. The fallback is decided independently on "
+        "each server and is only logged, not surfaced, so keep context and "
+        "generation server configurations consistent. 'CPP' selects the C++ "
+        "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
+        "to 'CPP'. 'auto' is only resolved on the PyTorch backend's "
+        "standard model-loading path; other paths (e.g. AutoDeploy) fall "
+        "back to the C++ transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -4990,6 +4989,13 @@ class BaseLlmArgs(StrictBaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+
+        if self.lora_config is not None and self.backend == 'pytorch':
+            if self.lora_config.cuda_graph_specialize_lora and self.enable_attention_dp:
+                raise ValueError(
+                    "LoRA CUDA graph specialization cannot be used when attention DP is enabled."
+                )
+
         return self
 
     @model_validator(mode="after")
@@ -5347,8 +5353,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="beta",
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
-        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER",
-                                             "FLASHINFER_STAR_ATTENTION"))
+        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
 
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
@@ -5556,7 +5561,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
+        "no-op otherwise. "
         "Defaults to False.",
         status="prototype")
 
@@ -5721,6 +5727,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
+        if (self.disable_mm_encoder
+                and self.multimodal_config.encoder_cache_max_bytes != 0):
+            logger.info(
+                "Setting multimodal_config.encoder_cache_max_bytes to 0 "
+                "because disable_mm_encoder=True.")
+            # The cache defaults to enabled, so disabling the encoder must override it to also
+            # disable an unused cache. Although `multimodal_config` is unlikely to be used
+            # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
+            self.multimodal_config = self.multimodal_config.model_copy(
+                update={"encoder_cache_max_bytes": 0})
         return self
 
     @model_validator(mode="after")
