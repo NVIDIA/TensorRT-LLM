@@ -4741,6 +4741,83 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                                          acceptance_length)
 
 
+# 3600s to match the test-db TIMEOUT (60) budget; measured 25m30s.
+@pytest.mark.timeout(3600)
+# TP8 leaves ~182 GiB of weights per GPU before any KV cache, past what a
+# 184 GiB B200/GB200 part holds. Scheduled on 2x4 GB300
+# (l0_gb300_multi_nodes_node2_gpu8).
+@pytest.mark.skip_less_device_memory(250000)
+@skip_pre_blackwell
+class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
+    """Kimi K3 driven by a standalone DSpark drafter.
+
+    Split from TestKimiK3 because both the drafter and the target precision
+    are checkpoint axes here: the RadixArk artifact below is a qwen3-shaped
+    DSparkDraftModel while Inferact ships a K3DSparkModel, and the target is
+    the NVFP4 requant rather than TestKimiK3's MXFP4 weights.
+    """
+
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    # The NVFP4 requant, not the MXFP4 weights TestKimiK3 runs: it is the
+    # Blackwell deployment precision and nothing else covers it end to end.
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3-NVFP4"
+    DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_tep8(self):
+        """GSM8K plus an acceptance-length gate on the TEP8 DSpark recipe.
+
+        TEP, not TestKimiK3's DEP16 recipe: with attention DP off the drafter gets
+        its own KV cache pool, which is the path this covers. Accuracy alone
+        cannot detect a broken drafter -- speculative decoding is lossless, so
+        a drafter producing garbage scores the same and only runs slower --
+        hence the acceptance-length assertion.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.20,
+                                        tokens_per_block=64)
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model=self.DSPARK_MODEL_PATH,
+            attention_backend="TRTLLM")
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                enable_attention_dp=False,
+                max_batch_size=8,
+                max_num_tokens=4096,
+                max_seq_len=8192,
+                trust_remote_code=True,
+                # The drafter runs between target steps, and its hidden-state
+                # capture needs a whole-sequence prefill.
+                disable_overlap_scheduler=True,
+                enable_chunked_prefill=False,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+                # Not the TRTLLM backend TestKimiK3 uses: trtllm-gen ships
+                # SiTu cubins only for W4A8_MXFP4_MXFP8, so K3's NVFP4 routed
+                # experts leave MEGAMOE_CUTEDSL and CUTLASS as the choices.
+                moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL",
+                                     max_num_tokens=33024,
+                                     use_low_precision_moe_combine=True),
+                kv_cache_config=kv_cache_config,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+                speculative_config=spec_config,
+        ) as llm:
+            # Unlike TestKimiK3's MXFP4 weights, the requant ships
+            # hf_quant_config.json, so the matcher sees MIXED_PRECISION --
+            # only the experts are 4-bit.
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            acceptance_length = _compute_acceptance_length(llm)
+            print(f"[AL] TestKimiK3DSpark::test_gsm8k_tep8 "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length("TestKimiK3DSpark::test_gsm8k_tep8",
+                                     acceptance_length)
+
+
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 

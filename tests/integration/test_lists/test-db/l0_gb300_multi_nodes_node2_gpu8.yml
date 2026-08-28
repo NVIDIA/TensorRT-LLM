@@ -14,3 +14,6 @@ l0_gb300_multi_nodes_node2_gpu8:
       backend: pytorch
   tests:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm TIMEOUT (60)
+  # Kimi K3 GSM8K accuracy plus an acceptance-length gate on the TEP8 DSpark
+  # recipe. Measured 25m45s on 2x4 GB300.
+  - accuracy/test_llm_api_pytorch.py::TestKimiK3DSpark::test_gsm8k_tep8 TIMEOUT (60)
