@@ -202,6 +202,55 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
             raise subprocess.CalledProcessError(return_code, command)
 
 
+@pytest.mark.cpu_only
+def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    python_stub = stub_bin / "python3"
+    python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-c\" ]; then\n"
+                           "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+                           "fi\n")
+    python_stub.chmod(0o755)
+    openssl_stub = stub_bin / "openssl"
+    openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
+    openssl_stub.chmod(0o755)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ.copy()
+    for name in (
+            "SLURM_NTASKS",
+            "SLURM_PROCID",
+            "OMPI_COMM_WORLD_SIZE",
+            "OMPI_COMM_WORLD_RANK",
+            "PMI_SIZE",
+            "PMI_ID",
+            "FLASHINFER_WORKSPACE_BASE",
+            "FLASHINFER_CUBIN_DIR",
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+    ):
+        env.pop(name, None)
+    env["PMI_RANK"] = "0"
+    env["HOME"] = str(home)
+    env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
+
+    launcher = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+                "trtllm-llmapi-launch")
+    result = subprocess.run(  # nosec B603
+        ["bash", str(launcher), "/usr/bin/env"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER=1" in result.stdout
+
+
 # ---- wait_shutdown: shutdown blocks until worker processes actually exit ----
 
 

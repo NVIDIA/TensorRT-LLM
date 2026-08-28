@@ -88,7 +88,11 @@ PY
 }
 
 function configure_flashinfer_workspace {
-    if [ -n "$FLASHINFER_WORKSPACE_BASE" ] || [ "$tllm_mpi_size" -le 1 ] || \
+    # PMI_RANK or PMI_ID still proves that this process is launcher-managed
+    # when PMI_SIZE is unavailable. Isolate even rank 0 in that case so rank-0
+    # processes from concurrent jobs cannot share FlashInfer's default workspace.
+    if [ -n "$FLASHINFER_WORKSPACE_BASE" ] || \
+        { [ "$tllm_mpi_size" -le 1 ] && [ -z "$PMI_RANK" ] && [ -z "$PMI_ID" ]; } || \
         [ "${TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS:-1}" = "0" ]; then
         return
     fi
