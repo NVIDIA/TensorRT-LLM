@@ -1897,6 +1897,66 @@ def test_deepseek_streaming_preserves_withheld_text(
                                          sample_tools).normal_text == expected
 
 
+@pytest.mark.parametrize("parser_cls", [DeepSeekV32Parser, DeepSeekV4Parser])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # Generation stops on a bare `<`, which is a prefix of every DSML
+        # delimiter, so the increment path is still withholding when the
+        # stream ends.
+        ["The condition is a <"],
+        # Several characters into a delimiter rather than one.
+        ["cost is 3", "<｜D"],
+        # The withheld run spans more than the last delta.
+        ["Here is the analysis. ", "The threshold is <"],
+    ],
+)
+def test_deepseek_streaming_emits_withheld_text_when_the_stream_ends(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """A stream that stops mid-ambiguity must still deliver what was held.
+
+    Withholding is released by the next chunk, so a stream that ends instead --
+    max_tokens, a stop string, an abort -- has nothing to release it. Without a
+    `finish` that flushes, the tail is dropped silently: the request succeeds
+    and the end of the answer is simply missing.
+    """
+    parser = parser_cls()
+
+    streamed = "".join(
+        parser.parse_streaming_increment(delta, sample_tools).normal_text
+        for delta in deltas)
+    streamed += parser.finish(sample_tools).normal_text
+
+    assert streamed == "".join(deltas)
+
+
+@pytest.mark.parametrize("parser_cls", [DeepSeekV32Parser, DeepSeekV4Parser])
+def test_deepseek_finish_leaves_a_truncated_tool_call_alone(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """Flushing must not turn half a tool call into visible text.
+
+    Content before a tool-call section is already streamed by the increment
+    path, so a buffer holding a section holds markup rather than content.
+    Emitting it would trade a dropped tail for DSML leaking into the answer.
+    """
+    parser = parser_cls()
+
+    # Built from the parser's own tokens: V3.2 opens a section with
+    # `function_calls` and V4 with `tool_calls`, so a hard-coded one is not a
+    # section start for the other parser and the buffer would be flushed as
+    # ordinary text.
+    truncated = f'Let me read it. {parser.bot_token}<｜DSML｜invoke name="Re'
+    streamed = parser.parse_streaming_increment(truncated,
+                                                sample_tools).normal_text
+    finished = parser.finish(sample_tools)
+
+    assert streamed == "Let me read it. "
+    assert finished.normal_text == ""
+    assert finished.calls == []
+
+
 @pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
