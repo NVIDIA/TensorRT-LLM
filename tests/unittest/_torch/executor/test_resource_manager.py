@@ -22,8 +22,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
-    _get_minimum_blocks_per_window,
-    _merge_kv_cache_pool_pointers,
+    _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LayerType
