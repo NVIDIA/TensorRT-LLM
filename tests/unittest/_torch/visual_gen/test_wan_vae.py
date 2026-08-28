@@ -118,7 +118,7 @@ def test_implicit_fp4_checkpoint_falls_back_on_unsupported_device(monkeypatch):
     monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
 
     with patch.object(vae_loader.logger, "warning") as warning:
-        enabled = vae_loader._nvfp4_enabled_for_device(
+        enabled = vae_loader._resolve_nvfp4_device_support(
             torch.device("cuda"),
             {"decoder.conv1"},
             explicit_request=False,
@@ -133,7 +133,7 @@ def test_explicit_fp4_request_rejects_unsupported_device(monkeypatch):
     monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
 
     with pytest.raises(ValueError, match="SM100, SM103, and SM120"):
-        vae_loader._nvfp4_enabled_for_device(
+        vae_loader._resolve_nvfp4_device_support(
             torch.device("cuda"),
             {"decoder.conv1"},
             explicit_request=True,

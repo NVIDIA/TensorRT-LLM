@@ -18,19 +18,19 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.visual_gen.models.wan import fp4_conv_autotuner
-from tensorrt_llm._torch.visual_gen.models.wan.fp4_conv_autotuner import (
-    FP4_CONV_FALLBACK_TACTIC,
-    FP4_CONV_FIXED_TACTIC,
-    FP4_CONV_TACTICS,
-    FP4ConvTunableRunner,
-    _clear_fp4_conv_failed_tactics,
-)
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     NVFP4WanCausalConv3d,
     WanCausalConv3d,
     _fp4_compile_cache,
     _supports_nvfp4_device,
+)
+from tensorrt_llm._torch.visual_gen.modules.vae import nvfp4_conv_autotuner
+from tensorrt_llm._torch.visual_gen.modules.vae.nvfp4_conv_autotuner import (
+    FP4_CONV_FALLBACK_TACTIC,
+    FP4_CONV_FIXED_TACTIC,
+    FP4_CONV_TACTICS,
+    FP4ConvTunableRunner,
+    _clear_fp4_conv_failed_tactics,
 )
 
 
@@ -90,7 +90,7 @@ def test_fp4_conv_tactic_definitions_version_persistent_key(monkeypatch):
     original_key = runner.unique_id()
 
     monkeypatch.setattr(
-        fp4_conv_autotuner,
+        nvfp4_conv_autotuner,
         "FP4_CONV_TACTICS",
         tuple(reversed(FP4_CONV_TACTICS)),
     )
@@ -207,7 +207,7 @@ def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
             conv(activation, residual=residual)
 
         selected_tactics = []
-        original_run_tuned = fp4_conv_autotuner.run_tuned_fp4_conv
+        original_run_tuned = nvfp4_conv_autotuner.run_tuned_fp4_conv
 
         def record_selected_tactic(**kwargs):
             output, tactic = original_run_tuned(**kwargs)
@@ -215,7 +215,7 @@ def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
             return output, tactic
 
         monkeypatch.setattr(
-            fp4_conv_autotuner,
+            nvfp4_conv_autotuner,
             "run_tuned_fp4_conv",
             record_selected_tactic,
         )
