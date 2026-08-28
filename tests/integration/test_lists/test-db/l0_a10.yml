@@ -14,6 +14,8 @@ l0_a10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/modeling/test_kimi_linear_helix_mappings.py::test_setup_helix_mappings_precondition_validation
+  - unittest/_torch/modeling/test_kimi_linear_helix_mappings.py::test_setup_helix_mappings_dual_mapping_swap_restore
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_penalties.py
   - unittest/_torch/test_tensor_lru_cache.py
