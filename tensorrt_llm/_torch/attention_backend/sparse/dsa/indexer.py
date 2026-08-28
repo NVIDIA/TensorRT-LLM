@@ -267,7 +267,7 @@ def transform_local_topk_and_prepare_pool_view_grouped(
     is_generation: bool = False,
 ) -> torch.Tensor:
     """Grouped (cross-layer fan-out) variant of the local-topk → global-index
-    remap (``TRTLLM_DSA_GROUP_REMAP``).
+    remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
 
     Computes the global-index output for a whole full+shared indexer group in a
     single launch. All members of a group share the same top-k selection,

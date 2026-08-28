@@ -127,7 +127,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
-        # Cross-layer fan-out of the DSA index remap (TRTLLM_DSA_GROUP_REMAP).
+        # Cross-layer fan-out of the DSA index remap (TRTLLM_DISABLE_DSA_GROUP_REMAP).
         # `_group_remap_struct` is the (static) full+shared indexer
         # group layout; `_group_remap_batched` holds the current forward's
         # per-group batched remap output (leader writes, shared members read).
@@ -1029,7 +1029,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def _ensure_group_remap_struct(self):
         """Build (once) the static full+shared indexer group layout used by the
-        cross-layer fan-out remap (``TRTLLM_DSA_GROUP_REMAP``).
+        cross-layer fan-out remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
 
         Groups are runs of consecutive local layers starting at a full-indexer
         layer (``indexer_k_cache_local_layer_mask[L] == True``, i.e.

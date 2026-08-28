@@ -30,13 +30,15 @@ from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
-# Cross-layer fan-out of the DSA index remap (convert_req_index_to_global). When
-# enabled, each full+shared indexer group's per-layer remap launches collapse
-# into a single grouped launch per group (grid.z = group_size), with shared
-# layers consuming a precomputed slice. OFF (default) preserves the exact
-# per-layer behavior. Applies only to the generation forward (MLA path); context
-# and MTP draft passes keep the per-layer path.
-_GROUP_REMAP = os.environ.get("TRTLLM_DSA_GROUP_REMAP", "0") == "1"
+# Cross-layer fan-out of the DSA index remap (convert_req_index_to_global). Each
+# full+shared indexer group's per-layer remap launches collapse into a single
+# grouped launch per group (grid.z = group_size), with shared layers consuming a
+# precomputed slice; grouped output is bit-identical to the per-layer path.
+# Enabled by default; set TRTLLM_DISABLE_DSA_GROUP_REMAP=1 to force the per-layer
+# path. Applies only to the generation forward (MLA path); context and MTP draft
+# passes keep the per-layer path. Auto-inert on models without shared indexer
+# layers (every group is a singleton -> per-layer fallback).
+_GROUP_REMAP = os.environ.get("TRTLLM_DISABLE_DSA_GROUP_REMAP", "0") != "1"
 
 
 class DSATrtllmAttention(TrtllmAttention):

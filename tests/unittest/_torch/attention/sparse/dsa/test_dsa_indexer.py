@@ -570,7 +570,7 @@ def test_transform_local_topk_uses_v2_page_mapping():
 
 
 # ===================================================================
-# Cross-layer group-remap fan-out (TRTLLM_DSA_GROUP_REMAP)
+# Cross-layer group-remap fan-out (TRTLLM_DISABLE_DSA_GROUP_REMAP)
 # ===================================================================
 #
 # These tests validate the Python orchestration on top of the
