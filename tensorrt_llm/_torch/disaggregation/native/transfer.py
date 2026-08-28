@@ -96,18 +96,49 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
+class _TransferNotSubmittedError(RuntimeError):
+    """The sender rejected an operation before the backend could access memory."""
+
+
 class _AgentOperationGate:
-    def __init__(self):
+    def __init__(self, drain_timeout_s: Optional[float] = None) -> None:
+        if drain_timeout_s is None:
+            drain_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+        if drain_timeout_s < 0:
+            raise ValueError("agent-operation drain timeout must be non-negative")
+        self._drain_timeout_s = drain_timeout_s
         self._condition = threading.Condition()
         self._active_transfers = 0
         self._metadata_pending = False
         self._closing = False
+        self._poisoned: Optional[Exception] = None
+
+    def _poison_locked(self, error: Exception) -> None:
+        if self._poisoned is None:
+            self._poisoned = error
+        self._condition.notify_all()
+
+    def poison(self, error: Exception) -> None:
+        with self._condition:
+            self._poison_locked(error)
+
+    def _raise_if_unavailable_locked(self) -> None:
+        if self._poisoned is not None:
+            raise RuntimeError("NIXL agent operation gate is quarantined") from self._poisoned
+        if self._closing:
+            raise RuntimeError("NIXL agent is closing")
 
     def acquire_transfer(self) -> Callable[[], None]:
         with self._condition:
-            self._condition.wait_for(lambda: self._closing or not self._metadata_pending)
-            if self._closing:
-                raise RuntimeError("NIXL agent is closing")
+            admitted = self._condition.wait_for(
+                lambda: self._closing or self._poisoned is not None or not self._metadata_pending,
+                timeout=self._drain_timeout_s,
+            )
+            if not admitted:
+                self._poison_locked(
+                    RuntimeError("NIXL transfer admission timed out behind metadata mutation")
+                )
+            self._raise_if_unavailable_locked()
             self._active_transfers += 1
         return self._release_transfer
 
@@ -119,12 +150,29 @@ class _AgentOperationGate:
     @contextmanager
     def metadata(self) -> Iterator[None]:
         with self._condition:
-            if self._closing:
-                raise RuntimeError("NIXL agent is closing")
+            self._raise_if_unavailable_locked()
             if self._metadata_pending:
                 raise RuntimeError("concurrent NIXL metadata mutation")
             self._metadata_pending = True
-            self._condition.wait_for(lambda: self._active_transfers == 0)
+            try:
+                drained = self._condition.wait_for(
+                    lambda: self._closing
+                    or self._poisoned is not None
+                    or self._active_transfers == 0,
+                    timeout=self._drain_timeout_s,
+                )
+                if not drained:
+                    self._poison_locked(
+                        RuntimeError(
+                            "NIXL metadata mutation timed out while transfer ownership "
+                            "remained active"
+                        )
+                    )
+                self._raise_if_unavailable_locked()
+            except Exception:
+                self._metadata_pending = False
+                self._condition.notify_all()
+                raise
         try:
             yield
         finally:
@@ -136,9 +184,21 @@ class _AgentOperationGate:
         with self._condition:
             self._closing = True
             self._condition.notify_all()
-            self._condition.wait_for(
-                lambda: not self._metadata_pending and self._active_transfers == 0
+            drained = self._condition.wait_for(
+                lambda: self._poisoned is not None
+                or (not self._metadata_pending and self._active_transfers == 0),
+                timeout=self._drain_timeout_s,
             )
+            if not drained:
+                self._poison_locked(
+                    RuntimeError(
+                        "NIXL agent shutdown timed out while transfer ownership remained active"
+                    )
+                )
+            if self._poisoned is not None or self._metadata_pending or self._active_transfers > 0:
+                raise RuntimeError(
+                    "NIXL agent refuses teardown while transfer ownership is active"
+                ) from self._poisoned
 
 
 @dataclass
@@ -555,6 +615,7 @@ class Sender(SenderBase):
         agent: BaseTransferAgent,
         bounce=None,
         enforce_physical_ownership: bool = False,
+        operation_drain_timeout_s: Optional[float] = None,
     ):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -576,7 +637,7 @@ class Sender(SenderBase):
         # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
-        self._agent_operation_gate = _AgentOperationGate()
+        self._agent_operation_gate = _AgentOperationGate(operation_drain_timeout_s)
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = threading.Lock()
         self._num_threads = KV_TRANSFER_NUM_THREADS
@@ -750,8 +811,21 @@ class Sender(SenderBase):
             return completed, detail
         with self._ownership_poison_lock:
             if self._ownership_poisoned is not None:
-                raise RuntimeError("NIXL sender is quarantined") from self._ownership_poisoned
-        release_agent = self._agent_operation_gate.acquire_transfer()
+                error = self._ownership_poisoned
+                task.finish_physical_operation(peer_rank)
+                raise _TransferNotSubmittedError(
+                    "NIXL sender rejected transfer before backend submission"
+                ) from error
+        try:
+            release_agent = self._agent_operation_gate.acquire_transfer()
+        except Exception as error:
+            with self._ownership_poison_lock:
+                if self._ownership_poisoned is None:
+                    self._ownership_poisoned = error
+            task.finish_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "NIXL sender rejected transfer before backend submission"
+            ) from error
         try:
             task.retain_physical_request(peer_rank, request, release_agent)
         except Exception:
@@ -762,15 +836,16 @@ class Sender(SenderBase):
             task.attach_physical_status(peer_rank, status)
             if not status.wait():
                 detail = getattr(status, "last_status_str", lambda: "<no detail>")()
+                error = RuntimeError(f"NIXL transfer outcome is ambiguous: {detail}")
                 with self._ownership_poison_lock:
-                    self._ownership_poisoned = RuntimeError(
-                        f"NIXL transfer outcome is ambiguous: {detail}"
-                    )
+                    self._ownership_poisoned = error
+                self._agent_operation_gate.poison(error)
                 return False, detail
             return True, None
         except Exception as error:
             with self._ownership_poison_lock:
                 self._ownership_poisoned = error
+            self._agent_operation_gate.poison(error)
             raise
 
     def _process_task_queue(self, thread_idx: int):
@@ -979,6 +1054,11 @@ class Sender(SenderBase):
                     task.fail(error)
                     if owned:
                         raise error
+            except _TransferNotSubmittedError as error:
+                # Backend admission failed, so local resources are safe to retire.
+                transfer_finished = True
+                agent_result = AgentResult.FAILED
+                task.fail(error)
             finally:
                 if send_slot_id is not None and (not owned or transfer_finished):
                     self._bounce.release_send(send_slot_id)
@@ -1061,15 +1141,21 @@ class Sender(SenderBase):
                 raise
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            transfer_finished, _ = self._submit_transfer(aux_task, write_meta.peer_rank, request)
-            if transfer_finished:
-                del request
-                aux_task.finish_physical_operation(write_meta.peer_rank)
-            if not transfer_finished:
+            try:
+                transfer_finished, _ = self._submit_transfer(
+                    aux_task, write_meta.peer_rank, request
+                )
+                if transfer_finished:
+                    del request
+                    aux_task.finish_physical_operation(write_meta.peer_rank)
+                if not transfer_finished:
+                    agent_result = AgentResult.FAILED
+                    session.set_exception("aux transfer agent request failed")
+                    if owned:
+                        raise RuntimeError("aux transfer outcome is ambiguous; retaining source")
+            except _TransferNotSubmittedError as error:
                 agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
-                if owned:
-                    raise RuntimeError("aux transfer outcome is ambiguous; retaining source")
+                aux_task.fail(error)
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
         elif owned:
@@ -1462,6 +1548,8 @@ class Sender(SenderBase):
         self._messenger.start_listener(handle_message)
 
     def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
+        if self._shutdown_requested:
+            return
         torch.cuda.set_device(self._device_id)
         CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
@@ -3386,6 +3474,7 @@ class TransferWorker:
                 self._agent,
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
+                operation_drain_timeout_s=self._config.tx_overall_timeout_s,
             )
             self._receiver = Receiver(
                 self._peer_registrar,

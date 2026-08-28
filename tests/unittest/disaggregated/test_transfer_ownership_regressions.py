@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Regressions for receive-side KV transfer ownership boundaries."""
+"""Regressions for Python KV transfer ownership boundaries."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
+import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
@@ -37,6 +38,9 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 
@@ -1160,3 +1164,211 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     assert transceiver._send_sessions == {}
     send_session.close.assert_called_once_with()
     transceiver._transfer_worker.shutdown.assert_called_once_with()
+
+
+def _make_owned_sender(
+    operation_drain_timeout_s: float | None = None,
+) -> transfer_mod.Sender:
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = True
+    sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._shutdown = sender._shutdown_requested = False
+    sender._agent_operation_gate = transfer_mod._AgentOperationGate(operation_drain_timeout_s)
+    sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
+    sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
+    sender._instance_rank = 0
+    return sender
+
+
+@pytest.mark.cpu_only
+def test_sender_ignores_remote_agent_registration_after_shutdown_request(
+    monkeypatch,
+) -> None:
+    sender = _make_owned_sender()
+    sender._shutdown_requested = True
+    sender._device_id, sender._registrar, sender._agent = 0, Mock(), Mock()
+    set_device, cuda_set_device, cuassert, decode = Mock(), Mock(), Mock(), Mock()
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", cuda_set_device)
+    monkeypatch.setattr(transfer_mod, "CUASSERT", cuassert)
+    monkeypatch.setattr(transfer_mod.RankInfo, "from_bytes", decode)
+
+    sender._register_peer_rank(b"", [b"", b"rank"])
+
+    set_device.assert_not_called()
+    cuda_set_device.assert_not_called()
+    cuassert.assert_not_called()
+    decode.assert_not_called()
+    sender._registrar.register.assert_not_called()
+    sender._agent.load_remote_agent.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_sender_retires_only_after_done_and_retains_ambiguous_operation() -> None:
+    sender = _make_owned_sender()
+    done_status = SimpleNamespace(wait=lambda: True)
+    sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: done_status)
+    done = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
+    done_request = Mock()
+
+    assert done.begin_physical_operation(7)
+    assert sender._submit_transfer(done, 7, done_request) == (True, None)
+    assert not done.resources_drained
+    assert done._physical_ops[7][:2] == [done_request, done_status]
+    done.finish_physical_operation(7)
+    assert done.resources_drained
+
+    ambiguous_status = SimpleNamespace(
+        wait=lambda: False,
+        last_status_str=lambda: "still active",
+    )
+    sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: ambiguous_status)
+    ambiguous = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=93))
+    ambiguous_request = Mock()
+
+    assert ambiguous.begin_physical_operation(7)
+    assert sender._submit_transfer(ambiguous, 7, ambiguous_request) == (
+        False,
+        "still active",
+    )
+    assert sender._ownership_poisoned is not None
+    assert not ambiguous.resources_drained
+    assert ambiguous._physical_ops[7][:2] == [ambiguous_request, ambiguous_status]
+    assert sender._agent_operation_gate._active_transfers == 1
+    with pytest.raises(RuntimeError, match="quarantined"):
+        with sender._agent_operation_gate.metadata():
+            pass
+    with pytest.raises(RuntimeError, match="refuses teardown"):
+        sender._agent_operation_gate.close()
+    assert sender._agent_operation_gate._active_transfers == 1
+
+
+@pytest.mark.cpu_only
+def test_sender_gate_timeout_retires_only_unsubmitted_operation() -> None:
+    sender = _make_owned_sender(operation_drain_timeout_s=0.0)
+    sender._agent = Mock()
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=95))
+    request = Mock()
+
+    assert task.begin_physical_operation(7)
+    with sender._agent_operation_gate.metadata():
+        with pytest.raises(
+            transfer_mod._TransferNotSubmittedError,
+            match="before backend submission",
+        ):
+            sender._submit_transfer(task, 7, request)
+
+    sender._agent.submit_transfer_requests.assert_not_called()
+    assert sender._ownership_poisoned is not None
+    assert task.resources_drained
+
+
+@pytest.mark.cpu_only
+def test_agent_gate_timeouts_retain_active_transfer() -> None:
+    metadata_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.0)
+    release_metadata = metadata_gate.acquire_transfer()
+
+    with pytest.raises(RuntimeError, match="quarantined"):
+        with metadata_gate.metadata():
+            pass
+
+    assert not metadata_gate._metadata_pending
+    assert metadata_gate._active_transfers == 1
+    release_metadata()
+    assert metadata_gate._active_transfers == 0
+    with pytest.raises(RuntimeError, match="quarantined"):
+        metadata_gate.acquire_transfer()
+
+    close_gate = transfer_mod._AgentOperationGate(drain_timeout_s=0.0)
+    release_close = close_gate.acquire_transfer()
+
+    with pytest.raises(RuntimeError, match="refuses teardown"):
+        close_gate.close()
+
+    assert close_gate._active_transfers == 1
+    release_close()
+    with pytest.raises(RuntimeError, match="quarantined"):
+        close_gate.acquire_transfer()
+
+
+@pytest.mark.cpu_only
+def test_gen_first_aux_owner_uses_anonymous_no_retry_writer_count() -> None:
+    receiver = _ReceiverProbe()
+    session = RxSession(
+        request_id=94,
+        params=DisaggregatedParams(
+            disagg_request_id=94,
+            schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+        ),
+        receiver=receiver,
+    )
+    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    assert task is not None
+    task.expected_transfers = 2
+    published_writers: set[int] = set()
+
+    def publish() -> None:
+        published_writers.update({0, 1, 2, 3})
+
+    assert session.try_begin_transfer(
+        task.slice_id,
+        set(),
+        writer_cohort=None,
+        publish=publish,
+        published_writers=published_writers,
+    )
+    aux_owner = session._aux_physical_owner
+    assert aux_owner is not None
+    assert aux_owner._writer_cohort is None
+    assert not aux_owner.resources_drained
+
+    session.process_aux_agent_result(2, AgentResult.FAILED)
+    assert not aux_owner.resources_drained
+    session.process_aux_agent_result(3, AgentResult.SUCCESS)
+    assert aux_owner.resources_drained
+
+
+@pytest.mark.cpu_only
+def test_fp4_mla_bridge_uses_production_cache_layout(monkeypatch) -> None:
+    mapping = SimpleNamespace(enable_attention_dp=True, pp_size=1, cp_size=1)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_disagg = True
+    manager.dtype = DataType.NVFP4
+    manager.kv_cache_type = CacheTypeCpp.SELFKONLY
+    config = SimpleNamespace(
+        backend="NIXL",
+        transceiver_runtime="PYTHON",
+        kv_transfer_timeout_ms=60_000,
+        kv_cache_bounce_size_mb=0,
+    )
+    profile = (mapping, manager, config)
+
+    monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
+    assert not transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    assert transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+
+    for attribute, value in (
+        ("is_disagg", False),
+        ("dtype", DataType.BF16),
+        ("kv_cache_type", CacheTypeCpp.SELF),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(manager, attribute, value)
+            assert not transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+
+    assert not transceiver_mod._validate_fp4_mla_bridge_profile(
+        mapping,
+        SimpleNamespace(
+            is_disagg=True,
+            dtype=DataType.NVFP4,
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+        ),
+        config,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(mapping, "enable_attention_dp", False)
+        with pytest.raises(ValueError, match="no-retry ADP"):
+            transceiver_mod._validate_fp4_mla_bridge_profile(*profile)

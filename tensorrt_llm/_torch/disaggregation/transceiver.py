@@ -56,9 +56,9 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -83,14 +83,17 @@ def _validate_fp4_mla_bridge_profile(
     kv_cache_manager: KVCacheManager,
     cache_transceiver_config: CacheTransceiverConfig,
 ) -> bool:
-    if not (
-        getattr(kv_cache_manager, "is_disagg", False)
-        and callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
-    ):
+    """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
+    fp4_mla_layout = (
+        isinstance(kv_cache_manager, KVCacheManagerV2)
+        and kv_cache_manager.is_disagg
+        and kv_cache_manager.dtype == DataType.NVFP4
+        and kv_cache_manager.kv_cache_type == CacheTypeCpp.SELFKONLY
+    )
+    if not fp4_mla_layout or os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") != "1":
         return False
     supported = (
-        os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
-        and cache_transceiver_config.backend == "NIXL"
+        cache_transceiver_config.backend == "NIXL"
         and cache_transceiver_config.transceiver_runtime == "PYTHON"
         and cache_transceiver_config.kv_transfer_timeout_ms is not None
         and cache_transceiver_config.kv_transfer_timeout_ms > 0
@@ -103,8 +106,9 @@ def _validate_fp4_mla_bridge_profile(
     )
     if not supported:
         raise ValueError(
-            "FP4 MLA lifecycle bridge requires a finite timeout, no-retry ADP, "
-            "PP1/CP1, async non-layerwise Python/NIXL transfer, and bounce disabled"
+            "FP4 MLA lifecycle bridge requires a disaggregated NVFP4 SELFKONLY "
+            "KVCacheManagerV2, a finite timeout, no-retry ADP, PP1/CP1, "
+            "async non-layerwise Python/NIXL transfer, and bounce disabled"
         )
     return True
 
