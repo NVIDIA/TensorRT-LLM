@@ -295,7 +295,7 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
         release_sibling.wait()
         session.process_kv_agent_result(
             peer_rank=1,
-            sender_slice_id=0,
+            receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
         )
@@ -308,7 +308,7 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
         # and may still write to the same receive-side KV allocation.
         session.process_kv_agent_result(
             peer_rank=0,
-            sender_slice_id=0,
+            receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.FAILED,
         )
@@ -540,7 +540,7 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
     session.process_kv_agent_result(
         peer_rank=0,
-        sender_slice_id=0,
+        receiver_slice_id=0,
         is_last_slice=False,
         status=AgentResult.SUCCESS,
     )
@@ -609,7 +609,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     assert receiver._request_sender_data.call_count == 4
     session.process_kv_agent_result(
         peer_rank=2,
-        sender_slice_id=0,
+        receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.FAILED,
     )
@@ -618,7 +618,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
 
     session.process_kv_agent_result(
         peer_rank=3,
-        sender_slice_id=0,
+        receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
     )
@@ -660,12 +660,13 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
         self_extractor=SimpleNamespace(page_table=None),
-        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0),
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0", 1: "tcp://sender-1"},
             page_table=None,
+            cp_size=1,
             dp_size=1,
         )
     )
@@ -677,7 +678,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         if writer_settles_before_failure:
             session.process_kv_agent_result(
                 peer_rank=0,
-                sender_slice_id=0,
+                receiver_slice_id=0,
                 is_last_slice=True,
                 status=AgentResult.SUCCESS,
                 dst_ptrs=np.array([0x2000], dtype=np.int64),
@@ -710,7 +711,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         # remains owned until that writer reports terminal physical evidence.
         session.process_kv_agent_result(
             peer_rank=0,
-            sender_slice_id=0,
+            receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
             dst_ptrs=np.array([0x2000], dtype=np.int64),
@@ -741,7 +742,7 @@ def test_aborted_publication_cannot_complete_during_failure_unwind() -> None:
                 original_abort(writers)
                 self._session.process_kv_agent_result(
                     peer_rank=0,
-                    sender_slice_id=0,
+                    receiver_slice_id=0,
                     is_last_slice=True,
                     status=AgentResult.SUCCESS,
                 )
@@ -780,7 +781,7 @@ def test_out_of_cohort_writer_cannot_authorize_reuse() -> None:
     with pytest.raises(RuntimeError, match="outside the sealed cohort"):
         session.process_kv_agent_result(
             peer_rank=2,
-            sender_slice_id=0,
+            receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
         )
@@ -825,6 +826,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
         self_extractor=SimpleNamespace(page_table=None),
+        self_rank_info=SimpleNamespace(cp_size=1),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
@@ -875,7 +877,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     def finish_writer() -> None:
         session.process_kv_agent_result(
             peer_rank=0,
-            sender_slice_id=0,
+            receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.FAILED,
         )
