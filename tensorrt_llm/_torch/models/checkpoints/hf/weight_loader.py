@@ -103,6 +103,17 @@ class HfWeightLoader(BaseWeightLoader):
     Loads weights from SafeTensors/bin/pth files.
     """
 
+    # Compatibility defaults for subclasses written before this class gained
+    # checkpoint I/O state. Their constructors may not call super().__init__().
+    _checkpoint_io_policy = _NATIVE_IO_POLICY
+    _requested_checkpoint_io_policy = _NATIVE_IO_POLICY
+    _selection_fallback_reason: str | None = None
+    _partial_model_loading = False
+    _last_checkpoint_io_status = _CheckpointIOStatus(
+        requested=_NATIVE_IO_POLICY,
+        selected=_NATIVE_IO_POLICY,
+    )
+
     def __init__(self,
                  checkpoint_io_policy: str = _NATIVE_IO_POLICY,
                  *,
@@ -471,6 +482,9 @@ class HfWeightLoader(BaseWeightLoader):
                 mapping,
                 use_consolidated,
                 "distributed rank-striped read-ahead requires an active MPI communicator",
+                # Ray workers intentionally disable MPI. Preserve the native
+                # path's per-process read-ahead in that supported mode.
+                allow_native_prefetch=mpi_disabled(),
                 **kwargs,
             )
             yield weights
@@ -507,6 +521,8 @@ class HfWeightLoader(BaseWeightLoader):
                     "model materialization failed: "
                     f"{type(body_error).__name__}: {body_error}")
                 self._log_checkpoint_io_status()
+                # Preserve the specific local error (for example, CUDA OOM) instead
+                # of finish()'s rank-coordinated wrapper.
                 logger.error(
                     "Rank-striped model materialization failed; preserving "
                     "the original exception. Coordinated session result: "
@@ -580,10 +596,13 @@ class HfWeightLoader(BaseWeightLoader):
         status = self._last_checkpoint_io_status
         status.activated = False
         status.fallback_reason = reason
-        if status.requested != _NATIVE_IO_POLICY:
-            logger.warning("Checkpoint I/O policy is falling back before model "
-                           f"materialization: requested={status.requested}, "
-                           f"selected={status.selected}, reason={reason}.")
+        message = ("Checkpoint I/O policy is falling back before model "
+                   f"materialization: requested={status.requested}, "
+                   f"selected={status.selected}, reason={reason}.")
+        if status.requested == _RANK_STRIPED_IO_POLICY:
+            logger.warning(message)
+        else:
+            logger.info(message)
         try:
             self._close_unactivated_session(
                 session,

@@ -110,6 +110,28 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    ("model_kwargs", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({
+            "unrelated_override": 1
+        }, False),
+        ({
+            "num_hidden_layers": 1
+        }, True),
+    ],
+)
+def test_is_partial_model_loading(model_kwargs: dict[str, Any] | None,
+                                  expected: bool) -> None:
+    args = TorchLlmArgs(model=llama_model_path, model_kwargs=model_kwargs)
+
+    assert args.is_partial_model_loading is expected
+    assert "is_partial_model_loading" not in args.model_dump()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "kwargs",
     [
         {
@@ -134,14 +156,16 @@ def test_rank_striped_checkpoint_io_accepts_best_effort_config(
 
 
 @pytest.mark.cpu_only
-def test_rank_striped_checkpoint_io_warns_and_falls_back_for_autodeploy(
+def test_rank_striped_checkpoint_io_warns_and_preserves_request_for_autodeploy(
 ) -> None:
     with patch.object(llm_args_mod.logger, "warning") as warning:
         args = AutoDeployLlmArgs(
             model=llama_model_path,
             checkpoint_io_policy="rank_striped_read_ahead",
         )
-    assert args.checkpoint_io_policy == "native"
+    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
+    serialized_args = args.model_dump()
+    assert serialized_args["checkpoint_io_policy"] == "rank_striped_read_ahead"
     assert any("selected=native" in call.args[0]
                for call in warning.call_args_list)
 

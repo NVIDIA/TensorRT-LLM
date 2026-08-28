@@ -5634,6 +5634,12 @@ class TorchLlmArgs(BaseLlmArgs):
             },
         )
 
+    @property
+    def is_partial_model_loading(self) -> bool:
+        """Whether model overrides request loading only part of the model."""
+        return (self.model_kwargs is not None
+                and "num_hidden_layers" in self.model_kwargs)
+
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
         description="ModelExpress (MX) P2P checkpoint loading config.",
@@ -6277,14 +6283,13 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
-    def resolve_non_pytorch_checkpoint_io_policy(self) -> 'TorchLlmArgs':
-        # AutoDeploy does not construct a checkpoint loader, so its explicit
-        # best-effort request is resolved here. PyTorch requests are resolved
-        # at loader construction, where the actual format and registered
-        # loader implementations are known.
+    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader. Preserve the
+        # requested policy for telemetry while reporting its native selection.
+        # PyTorch requests are resolved at loader construction, where the actual
+        # format and registered loader implementations are known.
         if (self.checkpoint_io_policy == "rank_striped_read_ahead"
                 and self.backend != "pytorch"):
-            self.checkpoint_io_policy = "native"
             logger.warning(
                 "Checkpoint I/O policy resolved before loading: "
                 "requested=rank_striped_read_ahead, selected=native, "

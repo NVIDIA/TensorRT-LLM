@@ -106,9 +106,10 @@ checkpoint bytes reach host memory:
 - `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
   Node-local ranks issue disjoint background `pread` requests into the Linux
   page cache while the existing mapping, transformation, and H2D path runs.
-  Once every rank finishes materialization, unfinished advisory reads are
-  cancelled. Shutdown can still wait for at most one in-flight 8 MiB
-  synchronous read per worker; degraded storage can therefore delay the join.
+  After every rank finishes materialization, speculative read-ahead work that
+  is still queued or active can no longer improve first-token latency and is
+  stopped. A worker already blocked in a synchronous `pread` must finish its
+  current 8 MiB read before shutdown, so degraded storage can delay the join.
 
 ```yaml
 checkpoint_format: HF
@@ -129,11 +130,11 @@ rank-striped communicator or reader setup. An explicit incompatible
 Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
 loading, raw-weight caching, layer overrides, insufficient host-memory
 headroom, and `.bin`/`.pth` select native materialization before readers start
-or the model is mutated. These runtime fallbacks emit a warning because the
-rank-striped policy had already been selected from configuration. With a valid
-node communicator, fallback preserves native prefetch collectives on that load
-group; if communicator setup failed or its size did not match the model-load
-mapping, native loading safely skips prefetch.
+or the model is mutated. These pre-activation runtime fallbacks log at info
+level for `auto` and warn for an explicit `rank_striped_read_ahead` request.
+With a valid node communicator, fallback preserves native prefetch collectives
+on that load group; if communicator setup failed or its size did not match the
+model-load mapping, native loading safely skips prefetch.
 Memory admission reserves cgroup-aware startup headroom. Reader setup failures
 also clean up and fall back before mapping; mapping, transformation, or H2D
 failure after activation never retries a partially mutated model. A later

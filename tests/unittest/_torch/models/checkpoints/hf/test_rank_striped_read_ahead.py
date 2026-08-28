@@ -54,6 +54,35 @@ def _rank_striped_loader(*, partial_model_loading: bool = False) -> HfWeightLoad
     )
 
 
+def test_subclass_without_super_init_uses_native_compatibility_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _LegacyLoader(HfWeightLoader):
+        def __init__(self) -> None:
+            self.custom_state = True
+
+    loader = _LegacyLoader()
+    initial_status = loader.last_checkpoint_io_status
+    assert loader.checkpoint_io_policy == "native"
+    assert initial_status.requested == "native"
+    assert initial_status.selected == "native"
+    assert initial_status.effective == "none"
+    assert loader._partial_model_loading is False
+
+    native_weights = {"native": object()}
+    native_load = mock.Mock(return_value=native_weights)
+    reader_start = mock.Mock(side_effect=AssertionError("must not start"))
+    monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
+
+    weights = loader.load_weights("/unused", mapping=Mapping())
+
+    assert weights is native_weights
+    native_load.assert_called_once()
+    assert loader.last_checkpoint_io_status.effective == "native"
+    reader_start.assert_not_called()
+
+
 def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 4)
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_LOAD_GROUP", 3)
@@ -173,17 +202,66 @@ def test_communicator_failure_does_not_fall_back_locally(monkeypatch):
     native_load.assert_not_called()
 
 
+@pytest.mark.parametrize("enable_multi_device", [True, False])
+def test_mpi_disabled_distributed_fallback_preserves_native_prefetch(
+    monkeypatch: pytest.MonkeyPatch, enable_multi_device: bool
+) -> None:
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", enable_multi_device)
+    monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(
+        weight_loader_module,
+        "mpi_comm",
+        mock.Mock(side_effect=AssertionError("must not communicate")),
+    )
+
+    loader = HfWeightLoader(
+        checkpoint_io_policy="rank_striped_read_ahead",
+        requested_checkpoint_io_policy="auto",
+    )
+    native_weights = {"native": object()}
+    native_load = mock.Mock(return_value=native_weights)
+    reader_start = mock.Mock(side_effect=AssertionError("must not start"))
+    monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
+
+    with loader.open_weight_session("/unused", mapping=Mapping(world_size=2)) as weights:
+        assert weights is native_weights
+
+    native_load.assert_called_once()
+    assert native_load.call_args.kwargs["_allow_prefetch"] is True
+    assert native_load.call_args.kwargs["_local_communicator"] is None
+    status = loader.last_checkpoint_io_status
+    assert status.requested == "auto"
+    assert status.selected == "native"
+    assert status.effective == "native"
+    assert "active MPI communicator" in status.fallback_reason
+    reader_start.assert_not_called()
+
+
+@pytest.mark.parametrize("requested_policy", ["auto", "rank_striped_read_ahead"])
 @pytest.mark.parametrize("partial,available", [(True, 1 << 40), (False, 0)])
-def test_ineligible_request_uses_exact_native_fallback(tmp_path, monkeypatch, partial, available):
+def test_ineligible_request_uses_exact_native_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_policy: str,
+    partial: bool,
+    available: int,
+) -> None:
     checkpoint_dir, _ = _write_checkpoint(tmp_path)
-    loader = _rank_striped_loader(partial_model_loading=partial)
+    loader = HfWeightLoader(
+        checkpoint_io_policy="rank_striped_read_ahead",
+        requested_checkpoint_io_policy=requested_policy,
+        partial_model_loading=partial,
+    )
     native_weights = {"native": object()}
     native_load = mock.Mock(return_value=native_weights)
     reader_start = mock.Mock(side_effect=AssertionError("must not start"))
     warning = mock.Mock()
+    info = mock.Mock()
     monkeypatch.setattr(loader, "_load_weights_native", native_load)
     monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
     monkeypatch.setattr(weight_loader_module.logger, "warning", warning)
+    monkeypatch.setattr(weight_loader_module.logger, "info", info)
     monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: available)
 
     with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as weights:
@@ -196,7 +274,15 @@ def test_ineligible_request_uses_exact_native_fallback(tmp_path, monkeypatch, pa
     assert status.effective == "native"
     assert status.fallback_reason
     reader_start.assert_not_called()
-    warning.assert_called_once()
+    if requested_policy == "rank_striped_read_ahead":
+        warning.assert_called_once()
+        assert "falling back before model materialization" in warning.call_args.args[0]
+    else:
+        warning.assert_not_called()
+        assert any(
+            "falling back before model materialization" in call.args[0]
+            for call in info.call_args_list
+        )
 
 
 def test_disabled_weight_cache_does_not_force_fallback(tmp_path, monkeypatch):

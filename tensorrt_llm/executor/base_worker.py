@@ -196,6 +196,7 @@ class BaseWorker(GenerationExecutor):
             if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
+                partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
@@ -204,9 +205,7 @@ class BaseWorker(GenerationExecutor):
                     mx_model_name=self.llm_args.model,
                     checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
                     load_format=self.llm_args.load_format,
-                    partial_model_loading=(
-                        self.llm_args.model_kwargs is not None
-                        and "num_hidden_layers" in self.llm_args.model_kwargs),
+                    partial_model_loading=partial_model_loading,
                 )
 
             self.max_seq_len = self.llm_args.max_seq_len

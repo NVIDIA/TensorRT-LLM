@@ -12,9 +12,13 @@ from typing import Sequence
 
 import psutil
 
+# Work-assignment granularity across ranks; one extent stays with one issuer.
 _CHUNK_SIZE = 256 * 1024 * 1024
+# I/O and cancellation granularity within an extent; one pread reads this much.
 _READ_SIZE = 8 * 1024 * 1024
+# Maximum reader concurrency contributed by one node-local rank.
 _WORKERS_PER_RANK = 16
+# Maximum aggregate reader concurrency across the node-local load group.
 _WORKERS_PER_LOAD_GROUP = 64
 _HOST_MEMORY_HEADROOM_BYTES = 16 * 1024 * 1024 * 1024
 _HOST_MEMORY_HEADROOM_FRACTION = 0.1
