@@ -342,6 +342,10 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        if dtype == DataType.NVFP4 and kv_cache_type == CacheTypeCpp.SELFKONLY:
+            raise ValueError(
+                "NVFP4 SELFKONLY cache storage requires "
+                "Fp4MlaKVCacheManagerV2; KVCacheManager V1 is not supported.")
         # Consumed by the disaggregation page-table builder to expose the DSA
         # indexer K cache pool as a REPLICATED pool view.
         self.enable_indexer_k_cache = enable_indexer_k_cache
@@ -1538,6 +1542,12 @@ class KVCacheManager(BaseResourceManager):
         # get head dim
         mla = hasattr(config,
                       "kv_lora_rank") and config.kv_lora_rank is not None
+        quant_config = model_config.quant_config
+        if (mla and quant_config is not None
+                and quant_config.quant_mode.has_fp4_kv_cache()):
+            raise ValueError(
+                "FP4 MLA cache sizing requires Fp4MlaKVCacheManagerV2; "
+                "KVCacheManager V1 is not supported.")
         if mla:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
@@ -1554,7 +1564,6 @@ class KVCacheManager(BaseResourceManager):
         # K and V
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
-        quant_config = model_config.quant_config
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
             mem_per_token *= 1
@@ -1860,17 +1869,24 @@ class KVCacheManager(BaseResourceManager):
         result = self.impl.get_primary_pool_data(layer_offset)
 
         pool = self.get_pool_for_layer(layer_offset)
+        layer_dtype = pool.dtype if pool else self.dtype
         layer_head_dim = pool.head_dim if pool else self.head_dim
 
         assert kv_layout in ["NHD",
                              "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        element_per_container = 1
+        if layer_dtype == DataType.NVFP4:
+            element_per_container = 2
+        effective_head_dim = layer_head_dim // element_per_container
+
         if kv_layout == "NHD":
             return result.reshape(
                 result.shape[0],
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
-                layer_head_dim,
+                effective_head_dim,
             )
         else:
             return result.reshape(
@@ -1878,7 +1894,7 @@ class KVCacheManager(BaseResourceManager):
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
-                layer_head_dim,
+                effective_head_dim,
             )
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:

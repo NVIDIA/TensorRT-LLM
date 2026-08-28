@@ -3419,6 +3419,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
+    TLLM_CHECK_WITH_INFO(dtype != tensorrt_llm::DataType::kFP4 || cacheType != CacheType::kSELFKONLY,
+        "NVFP4 SELFKONLY cache storage requires Fp4MlaKVCacheManagerV2; KVCacheManager V1 is not supported.");
+
     // When num_layers < len(maxAttentionWindowVec), not all window sizes in the
     // repeating pattern are used. Update mMaxAttentionWindow to the actual
     // maximum window size that has been allocated in the block manager.

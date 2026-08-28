@@ -7700,6 +7700,14 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        if not self._disable_overlap_scheduler:
+            # Do not refill reusable host staging while the previous
+            # iteration's asynchronous H2D copies still consume it.  This
+            # event precedes the model forward, so its synchronization retains
+            # GPU forward overlap while protecting every forward entry,
+            # including speculative/draft paths.
+            self.wait_for_input_copy()
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
