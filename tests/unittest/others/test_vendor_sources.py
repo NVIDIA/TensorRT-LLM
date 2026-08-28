@@ -1005,6 +1005,34 @@ new file mode 100644
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
 
 
+def test_patch_application_ignores_enclosing_git_worktree(tmp_path: Path) -> None:
+    enclosing = tmp_path / "enclosing"
+    enclosing.mkdir()
+    _run(["git", "init", "--initial-branch=main", enclosing], cwd=tmp_path)
+    case_root = enclosing / "case"
+    case_root.mkdir()
+    upstream, commit = _make_upstream(case_root, {"kernel.py": "VALUE = 'upstream'\n"})
+    consumer, lock = _make_consumer(case_root)
+    destination = consumer / _DESTINATION
+    _write_files(destination, {"kernel.py": "VALUE = 'downstream'\n"})
+    _create_vendor(consumer, lock, upstream, commit, mode="patched")
+
+    temporary_root = consumer / "tmp"
+    temporary_root.mkdir()
+    assert _git(temporary_root, "rev-parse", "--show-toplevel") == str(enclosing)
+
+    _vendor(
+        consumer,
+        lock,
+        "check",
+        _VENDOR_NAME,
+        "--repo",
+        upstream,
+        env_overrides={"TMPDIR": str(temporary_root)},
+    )
+    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 'downstream'\n"
+
+
 def test_exact_adoption_rejects_unrepresented_differences(tmp_path: Path) -> None:
     upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1044,7 +1072,7 @@ def test_exact_adoption_rejects_unrepresented_differences(tmp_path: Path) -> Non
 def test_create_rolls_back_destination_and_patch_when_lock_save_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
     exact_root = tmp_path / "exact-case"
@@ -1108,7 +1136,7 @@ def test_create_rolls_back_destination_and_patch_when_lock_save_fails(
 
     assert exact_result == 1
     assert patched_result == 1
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert "error:" in captured.err.lower()
     assert "injected lock-save failure" in captured.err
     assert not exact_lock.exists()
@@ -1598,7 +1626,7 @@ def test_export_and_pin_retain_then_drop_compatibility_patch(tmp_path: Path) -> 
 def test_pin_restores_absorbed_patch_when_lock_save_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1638,7 +1666,7 @@ def test_pin_restores_absorbed_patch_when_lock_save_fails(
         )
 
     assert result == 1
-    assert "injected pin lock-save failure" in capsys.readouterr().err
+    assert "injected pin lock-save failure" in capfd.readouterr().err
     assert lock.read_bytes() == lock_content
     assert patch_path.read_bytes() == patch_content
     assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
@@ -1664,7 +1692,7 @@ def test_pin_restores_absorbed_patch_when_lock_save_fails(
 def test_pin_directory_sync_failure_retains_absorbed_patch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1704,7 +1732,7 @@ def test_pin_directory_sync_failure_retains_absorbed_patch(
         )
 
     assert result == 1
-    assert "injected lock-directory sync failure" in capsys.readouterr().err
+    assert "injected lock-directory sync failure" in capfd.readouterr().err
     assert patch_path.read_bytes() == patch_content
     updated_vendor = _vendor_data(lock)
     assert updated_vendor["commit"] == absorbed_commit
@@ -1715,7 +1743,7 @@ def test_pin_directory_sync_failure_retains_absorbed_patch(
 def test_pin_patch_cleanup_failure_succeeds_with_orphan_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1768,7 +1796,7 @@ def test_pin_patch_cleanup_failure_succeeds_with_orphan_warning(
             ]
         )
 
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert result == 0
     assert "offline enforcement restored" in captured.out
     assert "warning:" in captured.err.lower()

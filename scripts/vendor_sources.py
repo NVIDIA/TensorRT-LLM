@@ -49,6 +49,7 @@ _GIT_LOCAL_ENVIRONMENT_VARIABLES = {
     "GIT_ATTR_GLOBAL",
     "GIT_ATTR_SOURCE",
     "GIT_ATTR_SYSTEM",
+    "GIT_CEILING_DIRECTORIES",
     "GIT_COMMON_DIR",
     "GIT_CONFIG",
     "GIT_CONFIG_COUNT",
@@ -720,7 +721,7 @@ def _atomic_file_replacement(path: Path, content: bytes) -> Iterator[None]:
         raise
 
 
-def _git_environment(*, isolated: bool) -> dict[str, str]:
+def _git_environment(*, isolated: bool, repository_ceiling: Path | None = None) -> dict[str, str]:
     environment = os.environ.copy()
     for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES:
         environment.pop(variable, None)
@@ -741,6 +742,8 @@ def _git_environment(*, isolated: bool) -> dict[str, str]:
     if isolated:
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    if repository_ceiling is not None:
+        environment["GIT_CEILING_DIRECTORIES"] = str(repository_ceiling.resolve())
     environment.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20")
     return environment
 
@@ -752,6 +755,7 @@ def _run_git(
     capture_bytes: bool = False,
     isolated: bool = False,
     input_bytes: bytes | None = None,
+    repository_ceiling: Path | None = None,
 ) -> bytes | str:
     if input_bytes is not None and not capture_bytes:
         raise ValueError("Git commands with byte input must capture byte output.")
@@ -760,7 +764,10 @@ def _run_git(
         result = subprocess.run(
             command,
             cwd=cwd,
-            env=_git_environment(isolated=isolated),
+            env=_git_environment(
+                isolated=isolated,
+                repository_ceiling=repository_ceiling,
+            ),
             check=True,
             capture_output=True,
             input=input_bytes,
@@ -1037,12 +1044,19 @@ def _apply_patch(
         directory = Path(temporary_directory)
         _write_tree(directory, baseline)
         try:
+            # Stop before Git can inspect a parent that belongs to an enclosing worktree.
             _run_git(
                 ["apply", "--check", "--binary", patch_path],
                 cwd=directory,
                 isolated=True,
+                repository_ceiling=directory.parent,
             )
-            _run_git(["apply", "--binary", patch_path], cwd=directory, isolated=True)
+            _run_git(
+                ["apply", "--binary", patch_path],
+                cwd=directory,
+                isolated=True,
+                repository_ceiling=directory.parent,
+            )
         except VendorError as error:
             raise VendorError(f"Failed to apply vendor patch {patch_path}: {error}") from error
         return _read_all_directory_files(directory, patterns)
