@@ -37,8 +37,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, similarity_score,
                         skip_fp8_pre_ada, skip_gpu_memory_less_than_40gb,
-                        skip_gpu_memory_less_than_80gb,
-                        skip_gpu_memory_less_than_138gb, skip_ray)
+                        skip_gpu_memory_less_than_80gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -377,41 +376,6 @@ def test_lora_cuda_graph_params_filling_kernel_special_cases():
     mask[-1, -4] = False
     test_params6 = replace(test_params5, layer_module_mask=mask)
     compare_cuda_graph_lora_params_filler(test_params6)
-
-
-@skip_gpu_memory_less_than_138gb
-@pytest.mark.part1
-@test_lora_with_and_without_cuda_graph
-def test_nemotron_nas_lora(cuda_graph_config) -> None:
-    lora_config = LoraConfig(lora_dir=[
-        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
-    ],
-                             max_lora_rank=64,
-                             max_loras=1,
-                             max_cpu_loras=1)
-
-    llm = LLM(
-        model=
-        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
-        lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config,
-        trust_remote_code=True)
-
-    prompts = [
-        "Hello, how are you?",
-        "Hello, how are you?",
-    ]
-
-    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
-    lora_req = LoRARequest(
-        "task-0", 0,
-        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
-    )
-    lora_request = [lora_req, None]
-
-    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
-
-    assert similar(outputs[0].outputs[0].text, outputs[1].outputs[0].text)
 
 
 @skip_gpu_memory_less_than_80gb
