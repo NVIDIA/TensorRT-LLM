@@ -3106,6 +3106,54 @@ class GvrTopKKernel:
                     cute.arch.barrier()
                 rs = rs + cutlass.Int32(1)
 
+            # Undershoot at collapse: val_lo admits >= kK by construction.
+            if s_iscalars[0] < cutlass.Int32(kK):
+                if tidx == 0:
+                    s_thr[0] = s_thr[1]
+                cute.arch.barrier()
+                self.block_count_ge(
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    s_thr[0],
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_iscalars,
+                    s_cluster_partial,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_input=smem_input,
+                    do_cluster_sync=do_cluster_sync,
+                )
+            cute.arch.barrier()
+
+            # Collapsed tie plateau (> kCC at an adjacent bracket): hand the
+            # row to the existing done=3 machinery; Phase 4 fills from the
+            # tie class in [val_lo, val_hi).
+            mid_chk, adj_chk = order_key_mid_f32(s_thr[1], s_thr[2])
+            if s_iscalars[0] > cutlass.Int32(kCC) and adj_chk:
+                if tidx == 0:
+                    s_thr[0] = s_thr[2]
+                    s_iscalars[1] = cutlass.Int32(3)  # plateau terminal
+                cute.arch.barrier()
+                self.block_count_ge(
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    s_thr[0],
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_iscalars,
+                    s_cluster_partial,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_input=smem_input,
+                    do_cluster_sync=do_cluster_sync,
+                )
+                cute.arch.barrier()
+
         # ---- Warp prefix sum over smem_ptcnt ----
         # my_total_qual = per-thread count cached by last block_count_ge.
         my_total_qual = smem_ptcnt[tidx]
