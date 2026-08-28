@@ -13,6 +13,21 @@ methods:
       has_zero_point:
         annotation: bool
         default: false
+      kimi_k3_fp8_weight_read:
+        annotation: Optional[bool]
+        default: null
+      kimi_k3_fp8_weight_read_gate_up:
+        annotation: Optional[bool]
+        default: null
+      kimi_k3_fp8_weight_read_kda:
+        annotation: Optional[bool]
+        default: null
+      kimi_k3_fp8_weight_read_mla:
+        annotation: Optional[bool]
+        default: null
+      kimi_k3_kda_glue_fp8:
+        annotation: Optional[bool]
+        default: null
       kv_cache_quant_algo:
         annotation: Optional[tensorrt_llm.quantization.mode.QuantAlgo]
         default: null

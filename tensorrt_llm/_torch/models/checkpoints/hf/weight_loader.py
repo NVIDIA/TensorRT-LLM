@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
-import json
 import multiprocessing
 import os
 import threading
@@ -56,9 +55,6 @@ _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
 _SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
 _SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
-# Model families whose checkpoints are too large to materialize in host RAM;
-# their models stream rank-local slices out of the lazy mmapped handles.
-_LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear")
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -360,27 +356,6 @@ class HfWeightLoader(BaseWeightLoader):
             self._cache_loaded_weights(cache_key, weights)
         return weights
 
-    @staticmethod
-    def _requires_lazy_safetensors(checkpoint_dir: str) -> bool:
-        """Whether this checkpoint must stay mmapped instead of being read
-        into host RAM.
-
-        The listed model families ship checkpoints too large to materialize
-        in host RAM (Kimi K3 is about 1.5 TB), and their models stream
-        rank-local slices (expert-parallel expert ranges) out of the lazy
-        handles during `load_weights`.
-        """
-        config_path = os.path.join(checkpoint_dir, "config.json")
-        if not os.path.isfile(config_path):
-            return False
-        # Do not swallow read/parse failures: every rank must take the same
-        # branch here (the eager path enqueues collectives), so a rank-local
-        # transient error routing one rank differently would deadlock the job.
-        # Propagating fails fast on all ranks instead.
-        with open(config_path) as f:
-            model_type = json.load(f).get("model_type")
-        return model_type in _LAZY_SAFETENSORS_MODEL_TYPES
-
     def _load_lazy_safetensors(
             self,
             checkpoint_dir: str,
@@ -390,7 +365,7 @@ class HfWeightLoader(BaseWeightLoader):
         Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
         indexing) materializes only the requested bytes from the mmapped
         file. This lets a model's ``load_weights`` stream a huge checkpoint
-        and read only its rank-local shard (e.g. Kimi K3 expert-parallel
+        and read only its rank-local shard (e.g. expert-parallel routed
         expert slices) without ever holding the full checkpoint in RAM.
         """
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
@@ -421,7 +396,7 @@ class HfWeightLoader(BaseWeightLoader):
         # transient source weights when ModelLoader.load() returns.
         lazy_weights = _LazySafetensorsWeights(weights, handles)
         # A lazy slice does not carry the file it came from, and a model that
-        # wants to re-open shards itself (Kimi K3 streams rank-local experts
+        # wants to re-open shards itself (e.g. streaming rank-local experts
         # per shard file, precisely to avoid holding this mapping open) has no
         # other reliable source: transformers no longer sets
         # ``PretrainedConfig._name_or_path``.
@@ -432,8 +407,12 @@ class HfWeightLoader(BaseWeightLoader):
                      checkpoint_dir: str,
                      mapping: Mapping,
                      use_consolidated: bool = False,
+                     load_lazily: bool = False,
                      **kwargs) -> dict[str, Any]:
-        """Load synchronously without activating session-scoped read-ahead."""
+        """Load synchronously without activating session-scoped read-ahead.
+
+        See :meth:`_load_weights_native` for what ``load_lazily`` selects.
+        """
         self._reset_checkpoint_io_status()
         if self._checkpoint_io_policy != _NATIVE_IO_POLICY:
             status = self._last_checkpoint_io_status
@@ -446,8 +425,11 @@ class HfWeightLoader(BaseWeightLoader):
                 f"load: requested={status.requested}, "
                 f"selected={status.selected}, reason={status.fallback_reason}.")
             logger.info(message)
-        weights = self._load_weights_native(checkpoint_dir, mapping,
-                                            use_consolidated, **kwargs)
+        weights = self._load_weights_native(checkpoint_dir,
+                                            mapping,
+                                            use_consolidated,
+                                            load_lazily=load_lazily,
+                                            **kwargs)
         self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
         self._log_checkpoint_io_status()
         return weights
@@ -457,12 +439,21 @@ class HfWeightLoader(BaseWeightLoader):
                             checkpoint_dir: str,
                             mapping: Mapping,
                             use_consolidated: bool = False,
+                            load_lazily: bool = False,
                             **kwargs) -> Iterator[dict[str, Any]]:
-        """Keep opt-in read-ahead alive through model materialization."""
+        """Keep opt-in read-ahead alive through model materialization.
+
+        See :meth:`_load_weights_native` for what ``load_lazily`` selects. A
+        lazy load never reads whole shards up front, so it is not eligible for
+        read-ahead; the flag is forwarded so every path below agrees on it.
+        """
         self._reset_checkpoint_io_status()
         if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
-            weights = self._load_weights_native(checkpoint_dir, mapping,
-                                                use_consolidated, **kwargs)
+            weights = self._load_weights_native(checkpoint_dir,
+                                                mapping,
+                                                use_consolidated,
+                                                load_lazily=load_lazily,
+                                                **kwargs)
             self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
             self._log_checkpoint_io_status()
             yield weights
@@ -492,6 +483,7 @@ class HfWeightLoader(BaseWeightLoader):
                 str(coordinated_mapping_error),
                 active_communicator=active_communicator,
                 allow_native_prefetch=False,
+                load_lazily=load_lazily,
                 **kwargs,
             )
             yield weights
@@ -506,6 +498,7 @@ class HfWeightLoader(BaseWeightLoader):
                 # Ray workers intentionally disable MPI. Preserve the native
                 # path's per-process read-ahead in that supported mode.
                 allow_native_prefetch=mpi_disabled(),
+                load_lazily=load_lazily,
                 **kwargs,
             )
             yield weights
@@ -516,6 +509,7 @@ class HfWeightLoader(BaseWeightLoader):
             mapping,
             use_consolidated,
             active_communicator,
+            load_lazily=load_lazily,
             **kwargs,
         )
         if session is None:
@@ -583,9 +577,10 @@ class HfWeightLoader(BaseWeightLoader):
     def build_checkpoint_catalog(
             self,
             checkpoint_dir: str,
-            use_consolidated: bool = False) -> CheckpointCatalog | None:
+            use_consolidated: bool = False,
+            load_lazily: bool = False) -> CheckpointCatalog | None:
         """Inspect the selected eager SafeTensors files without reading payloads."""
-        if self._requires_lazy_safetensors(checkpoint_dir):
+        if load_lazily:
             return None
         if (self._partial_model_loading
                 or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
@@ -629,6 +624,7 @@ class HfWeightLoader(BaseWeightLoader):
                             session=None,
                             *,
                             allow_native_prefetch: bool | None = None,
+                            load_lazily: bool = False,
                             **kwargs) -> dict[str, Any]:
         status = self._last_checkpoint_io_status
         status.activated = False
@@ -671,6 +667,7 @@ class HfWeightLoader(BaseWeightLoader):
                 checkpoint_dir,
                 mapping,
                 use_consolidated,
+                load_lazily=load_lazily,
                 _local_communicator=fallback_communicator,
                 _allow_prefetch=allow_native_prefetch,
                 **kwargs)
@@ -722,6 +719,7 @@ class HfWeightLoader(BaseWeightLoader):
         mapping: Mapping,
         use_consolidated: bool,
         active_communicator,
+        load_lazily: bool = False,
         **kwargs,
     ) -> tuple[dict[str, Any], RankStripedReadAheadSession | None]:
         """Load weights via rank-striped read-ahead, or fall back to native."""
@@ -742,10 +740,13 @@ class HfWeightLoader(BaseWeightLoader):
                 None, node_communicator, active_communicator,
                 "rank-striped node communicator cleanup")
             self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
-            return self._fallback_to_native(checkpoint_dir, mapping,
+            return self._fallback_to_native(checkpoint_dir,
+                                            mapping,
                                             use_consolidated,
                                             str(coordinated_split_error),
-                                            active_communicator, **kwargs), None
+                                            active_communicator,
+                                            load_lazily=load_lazily,
+                                            **kwargs), None
 
         weight_files = []
         stats = []
@@ -753,10 +754,9 @@ class HfWeightLoader(BaseWeightLoader):
         eligibility_reason = None
         preflight_error = None
         try:
-            if self._requires_lazy_safetensors(checkpoint_dir):
+            if load_lazily:
                 eligibility_reason = (
-                    "the checkpoint requires model-specific lazy SafeTensors loading"
-                )
+                    "the checkpoint is loaded as lazy SafeTensors slices")
             weight_files = self._selected_safetensors_files(
                 checkpoint_dir, use_consolidated)
             stats = [(path, os.stat(path)) for path in weight_files]
@@ -776,11 +776,14 @@ class HfWeightLoader(BaseWeightLoader):
             active_communicator, "rank-striped preflight", preflight_error)
         if coordinated_preflight_error is not None:
             self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
-            return self._fallback_to_native(checkpoint_dir, mapping,
+            return self._fallback_to_native(checkpoint_dir,
+                                            mapping,
                                             use_consolidated,
                                             str(coordinated_preflight_error),
                                             active_communicator,
-                                            node_communicator, **kwargs), None
+                                            node_communicator,
+                                            load_lazily=load_lazily,
+                                            **kwargs), None
 
         local_rank = 0
         local_size = 1
@@ -810,10 +813,13 @@ class HfWeightLoader(BaseWeightLoader):
                 None, node_communicator, active_communicator,
                 "rank-striped node preflight cleanup")
             self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
-            return self._fallback_to_native(checkpoint_dir, mapping,
+            return self._fallback_to_native(checkpoint_dir,
+                                            mapping,
                                             use_consolidated,
                                             str(coordinated_node_error),
-                                            active_communicator, **kwargs), None
+                                            active_communicator,
+                                            load_lazily=load_lazily,
+                                            **kwargs), None
 
         file_sizes = [(path, stat.st_size) for path, stat in stats]
         checkpoint_bytes = sum(size for _, size in file_sizes)
@@ -845,11 +851,14 @@ class HfWeightLoader(BaseWeightLoader):
         if fallback_reasons:
             rank, reason = fallback_reasons[0]
             self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
-            return self._fallback_to_native(checkpoint_dir, mapping,
+            return self._fallback_to_native(checkpoint_dir,
+                                            mapping,
                                             use_consolidated,
                                             f"rank {rank}: {reason}",
                                             active_communicator,
-                                            node_communicator, **kwargs), None
+                                            node_communicator,
+                                            load_lazily=load_lazily,
+                                            **kwargs), None
 
         self._last_checkpoint_io_status.selected = _RANK_STRIPED_IO_POLICY
         session = None
@@ -865,11 +874,14 @@ class HfWeightLoader(BaseWeightLoader):
                                                    "rank-striped reader setup",
                                                    setup_error)
         if coordinated_setup_error is not None:
-            return self._fallback_to_native(checkpoint_dir, mapping,
+            return self._fallback_to_native(checkpoint_dir,
+                                            mapping,
                                             use_consolidated,
                                             str(coordinated_setup_error),
                                             active_communicator,
-                                            node_communicator, session,
+                                            node_communicator,
+                                            session,
+                                            load_lazily=load_lazily,
                                             **kwargs), None
         assert session is not None
 
@@ -912,11 +924,27 @@ class HfWeightLoader(BaseWeightLoader):
                              mapping: Mapping,
                              use_consolidated: bool = False,
                              *,
+                             load_lazily: bool = False,
                              _local_communicator=None,
                              _allow_prefetch: bool = True,
                              **kwargs) -> dict[str, Any]:
-        """Load weights with the native (no read-ahead) I/O policy."""
-        if self._requires_lazy_safetensors(checkpoint_dir):
+        """Load weights with the native (no read-ahead) I/O policy.
+
+        When ``load_lazily`` is set (selected via ``LoadFormat.LAZY_SAFETENSORS``
+        on the ``load_format`` surface, or a model's declared default), the
+        safetensors shards are opened lazily so only the rank-local slices each
+        model reads are materialized -- never the whole checkpoint in CPU
+        memory. This is required for checkpoints too large to fit in host RAM.
+
+        Otherwise the checkpoint is loaded eagerly: safetensors shards may be
+        prefetched in parallel to warm up the OS file cache if the CPU memory is
+        large enough, before their tensors are loaded via mmap. When
+        `_WEIGHT_CACHE_ENV` is on, eager loads can also use a CPU weight cache to
+        accelerate repeated loading under the same process.
+
+        Returns a `ConsumableWeightsDict` mapping checkpoint tensor names to tensors.
+        """
+        if load_lazily:
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
