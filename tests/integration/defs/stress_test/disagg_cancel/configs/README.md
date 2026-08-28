@@ -5,7 +5,6 @@ Per-marathon YAML files consumed by ``test_disagg_cancel_stress.py``.
 | File | Model | KV cache | Transceiver |
 |------|-------|----------|-------------|
 | `marathon_cpp_v1_deepseek.yaml` | `DeepSeek-V3-Lite/bf16` (MLA) | V1 | C++ |
-| `marathon_python_v2_qwen.yaml` | `Qwen2.5-7B-Instruct` (GQA) | V2 | Python |
 
 Only configurations listed in `_MARATHON_CONFIGS` in
 `test_disagg_cancel_stress.py` are actually parametrized; the other

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.models.modeling_dspark import (
     dspark_sparse_attn,
     get_dspark_topk_idxs_batched,
 )
@@ -172,7 +172,7 @@ def test_cute_dsl_dspark_attention_compiles_once_across_batch_sizes():
 
 
 def test_dspark_attention_forward_batched_fused_matches_fallback(monkeypatch):
-    import tensorrt_llm._torch.models.dspark.attention as dspark_attention
+    import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
 
     torch.manual_seed(17)
     device = torch.device("cuda")
