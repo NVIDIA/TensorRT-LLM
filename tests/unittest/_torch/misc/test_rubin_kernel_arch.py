@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Every Rubin CuTe-DSL kernel must name an arch the TMEM allocator accepts.
 
 ``self.arch`` on these kernels is consumed by
