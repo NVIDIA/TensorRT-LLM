@@ -260,6 +260,59 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
 
+    def test_warmup_stage_metrics_are_recorded(self):
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        _run_warmup_tracked(model_engine, resource_manager)
+
+        expected_metrics = {
+            "attention_warmup_seconds",
+            "general_warmup_seconds",
+            "autotuner_warmup_seconds",
+            "mamba_hybrid_warmup_seconds",
+            "cuda_graph_warmup_seconds",
+            "cuda_graph_capture_seconds",
+            "dg_paged_mqa_warmup_seconds",
+            "cute_dsl_radix_topk_warmup_seconds",
+            "memory_pool_prepopulation_seconds",
+            "kv_cache_cleanup_seconds",
+            "total_warmup_seconds",
+        }
+        self.assertEqual(expected_metrics, model_engine.metrics.keys())
+        self.assertTrue(all(value >= 0 for value in model_engine.metrics.values()))
+
+    def test_total_warmup_metric_includes_kv_cache_cleanup(self):
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        metric_events = []
+
+        @contextlib.contextmanager
+        def record_metric_scope(metric_name, _metrics):
+            metric_events.append(("enter", metric_name))
+            try:
+                yield
+            finally:
+                metric_events.append(("exit", metric_name))
+
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.timing_metric",
+            side_effect=record_metric_scope,
+        ):
+            _run_warmup_tracked(model_engine, resource_manager)
+
+        total_and_cleanup_events = [
+            event
+            for event in metric_events
+            if event[1] in {"total_warmup_seconds", "kv_cache_cleanup_seconds"}
+        ]
+        self.assertEqual(
+            total_and_cleanup_events,
+            [
+                ("enter", "total_warmup_seconds"),
+                ("enter", "kv_cache_cleanup_seconds"),
+                ("exit", "kv_cache_cleanup_seconds"),
+                ("exit", "total_warmup_seconds"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

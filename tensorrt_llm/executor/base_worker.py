@@ -974,6 +974,19 @@ class BaseWorker(GenerationExecutor):
             return {}
 
         startup_metrics = {}
+        executor_metrics = dict(getattr(self.engine, "metrics", {}))
+        for model_engine_stage in (
+                "initial_model_engine",
+                "final_model_engine",
+                "initial_draft_model_engine",
+                "final_draft_model_engine",
+        ):
+            model_engine_metrics = executor_metrics.pop(model_engine_stage,
+                                                        None)
+            if model_engine_metrics is not None:
+                startup_metrics[model_engine_stage] = dict(model_engine_metrics)
+        startup_metrics["py_executor"] = executor_metrics
+
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:
