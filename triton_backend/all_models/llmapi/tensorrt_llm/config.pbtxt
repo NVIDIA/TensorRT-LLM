@@ -51,6 +51,13 @@ input [
     data_type: TYPE_STRING
     dims: [ -1 ]
   },
+  ## Optional multimodal input: URL, local path or data URI, one per image.
+  {
+    name: "image_url"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+    optional: true
+  },
   {
     name: "streaming"
     data_type: TYPE_BOOL

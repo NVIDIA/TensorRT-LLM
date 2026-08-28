@@ -251,6 +251,8 @@ class TritonPythonModel:
             self._response_thread = threading.Thread(target=self._response_loop)
             self._response_thread.start()
 
+            self._multimodal_context = None
+
             self.req_id_to_request_data = {}
             self.triton_user_id_to_req_ids = {}
             self.lock = threading.Lock()
@@ -582,6 +584,16 @@ class TritonPythonModel:
                 if triton_user_id is not None and triton_user_id != "" and triton_user_id in self.triton_user_id_to_req_ids:
                     del self.triton_user_id_to_req_ids[triton_user_id]
 
+    def _get_multimodal_context(self):
+        """Return (tokenizer, checkpoint dir, HF model_type), resolved once."""
+        if self._multimodal_context is None:
+            hf_model_dir = str(self._llm_engine._hf_model_dir)
+            with open(os.path.join(hf_model_dir, "config.json")) as f:
+                model_type = json.load(f)["model_type"]
+            self._multimodal_context = (self._llm_engine.tokenizer,
+                                        hf_model_dir, model_type)
+        return self._multimodal_context
+
     def _convert_request(self, request):
         """Helper function to convert the request into a prompt for LLM.generate_async
 
@@ -593,6 +605,7 @@ class TritonPythonModel:
 
         Notes:
             - The current implementation only supports text_input being a 1D tensor(a single prompt).
+            - With `image_url`, prompt becomes a multimodal PromptInputs dict.
         """
         text_input = get_input_tensor_by_name(request, 'text_input')
         if text_input is None:
@@ -607,6 +620,27 @@ class TritonPythonModel:
 
         if isinstance(prompt, bytes):
             prompt = prompt.decode("utf-8")
+
+        # The loader applies the chat template and inserts the per-architecture
+        # image placeholders, so callers send a plain question.
+        image_url = get_input_tensor_by_name(request, 'image_url')
+        if image_url is not None and image_url.size > 0:
+            # Imported here, not at module scope (see note above).
+            from tensorrt_llm.inputs import default_multimodal_input_loader
+
+            media = [
+                url.decode("utf-8") if isinstance(url, bytes) else str(url)
+                for url in image_url.reshape(-1)
+            ]
+            tokenizer, hf_model_dir, model_type = self._get_multimodal_context()
+            prompt = default_multimodal_input_loader(tokenizer=tokenizer,
+                                                     model_dir=hf_model_dir,
+                                                     model_type=model_type,
+                                                     modality="image",
+                                                     prompts=[prompt],
+                                                     media=media,
+                                                     image_data_format="pt",
+                                                     device="cpu")[0]
 
         sampling_params = get_sampling_params_from_request(request)
         output_config = get_output_config_from_request(request)
