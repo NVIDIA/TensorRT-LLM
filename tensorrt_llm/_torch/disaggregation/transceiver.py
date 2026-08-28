@@ -328,8 +328,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __enter__(self):
         return self
 
-    def __exit__(self, _exc_type, _exc_val, _exc_tb):
-        self.shutdown()
+    def __exit__(self, exc_type, _exc_val, _exc_tb):
+        try:
+            self.shutdown()
+        except RuntimeError as error:
+            if exc_type is None:
+                raise
+            logger.error(f"KvCacheTransceiverV2 shutdown refused during exception unwind: {error}")
 
     def _get_mamba_slot_for_request(self, req: LlmRequest) -> Optional[int]:
         """Get the mamba state slot index for a request, or None."""
@@ -1277,6 +1282,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if rid in self._send_sessions:
             self._send_sessions[rid].cancel()
             if self._send_sessions[rid].has_transferring_tasks():
+                has_transferring = True
+            elif self._send_sessions[rid].close() is False:
                 has_transferring = True
             else:
                 self._retire_send_session(rid, req)
