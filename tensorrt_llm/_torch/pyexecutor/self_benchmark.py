@@ -50,6 +50,30 @@ class BenchmarkCase:
 
 
 @dataclass(frozen=True)
+class _CudaGraphState:
+    """Snapshot of the decode CUDA graphs this rank can actually replay.
+
+    `capture_sizes` is OBSERVED: it comes from `CUDAGraphRunner.graphs`, which
+    is only written on the real capture pass, whereas `graph_metadata` also
+    carries warmup-only keys. `supported_sizes` / `max_supported_size` are the
+    CONFIGURED rounding inputs that `_get_padded_batch` consults; they differ
+    from `capture_sizes` exactly when warmup skipped a per-shape capture, which
+    is a divergence worth surfacing in the artifact rather than hiding.
+    """
+
+    enabled: bool = False
+    padding_enabled: bool = False
+    capture_sizes: tuple[int, ...] = ()
+    supported_sizes: tuple[int, ...] = ()
+    max_supported_size: int = 0
+    # Dynamic draft-length schedules map each captured batch size to exactly one
+    # draft length, so the reachable batch sizes are partitioned by draft length
+    # rather than shared. The sweep cannot know which partition a step lands in,
+    # so graph awareness degrades off rather than guessing.
+    dynamic_draft_len: bool = False
+
+
+@dataclass(frozen=True)
 class BenchmarkCasePlan:
     case_id: int
     planner_backend: str
@@ -63,6 +87,12 @@ class BenchmarkCasePlan:
     token_components: dict[str, int]
     kv_snapshot: dict
     planner_origin_rank: int = 0
+    # Predicted CUDA graph width this case executes at, or None when it is
+    # expected to run eager. `cuda_graph_padding` is the number of dummy
+    # generation requests `CUDAGraphRunner._get_padded_batch` would append; it
+    # is 0 for every graph-snapped batch size by construction.
+    cuda_graph_batch_size: Optional[int] = None
+    cuda_graph_padding: int = 0
 
 
 @dataclass(frozen=True)
@@ -196,6 +226,11 @@ class SelfBenchmark:
             None if self.config is None else self._rank_output_path(self.config.output_path)
         )
         self._identity = self._build_identity()
+        # Read once, before `_build_cases()`. That method runs twice (here and
+        # again after TP consensus) and must see the same graph state both
+        # times; reading it outside the `try` also keeps it available for
+        # `local_planner_record()` on a rank whose planning failed.
+        self._cuda_graph = self._cuda_graph_state()
         if not self._done:
             logger.info("Self-benchmark enabled: %s", self.config)
             initialization_stage = "output_invalidation"
@@ -243,6 +278,7 @@ class SelfBenchmark:
                 "grid_config": grid_config,
                 "signature": [],
                 "axes": [],
+                "cuda_graph": self._cuda_graph_record(),
             }
 
         axes = []
@@ -271,6 +307,7 @@ class SelfBenchmark:
             "grid_config": grid_config,
             "signature": signature,
             "axes": axes,
+            "cuda_graph": self._cuda_graph_record(),
         }
 
     def apply_planner_consensus(self, records: list[dict]) -> None:
@@ -343,6 +380,13 @@ class SelfBenchmark:
         reference_axes = records[0]["axes"]
         if any(len(record["axes"]) != len(reference_axes) for record in records[1:]):
             raise ValueError("planner axis count differs across TP ranks")
+
+        # Reduce to the graphs every rank can replay before any axis is built.
+        # Replicated by construction, so ranks cannot derive different axes --
+        # this deliberately does not gate consensus on equality, because a
+        # per-shape capture skip on one rank is benign and today completes
+        # normally.
+        self._cuda_graph = self._merge_cuda_graph_records(records)
 
         global_plans = {}
         origin_ranks = {}
@@ -1008,6 +1052,7 @@ class SelfBenchmark:
                 "output_path": self._output_path,
                 "config": self.config.model_dump(),
                 "limits": self._limits(),
+                "cuda_graph": self._cuda_graph_record(),
                 "coverage": coverage,
                 "cases": [asdict(case) for case in self._cases],
                 "case_plans": [
@@ -1198,9 +1243,11 @@ class SelfBenchmark:
                         f"prefill(isl={isl},kv_read_tokens={kv_read_tokens})", measured_plan
                     )
                     self._record_planner_reduction("prefill", isl, kv_read_tokens, 0, measured_plan)
-                    batch_values = self._sample_values(
+                    batch_values = self._batch_values_for(
+                        "prefill",
                         measured_plan.proposed_capacity,
                         self.config.prefill_batch_granularity,
+                        isl=isl,
                     )
                     for batch_size in batch_values:
                         cache_salt_id = self._cache_salt_id(next_case_id)
@@ -1240,8 +1287,8 @@ class SelfBenchmark:
                 )
                 self._require_positive_capacity(f"decode(context_length={context_length})", plan)
                 self._record_planner_reduction("decode", 0, 0, context_length, plan)
-                batch_values = self._sample_values(
-                    plan.proposed_capacity, self.config.decode_batch_granularity
+                batch_values = self._batch_values_for(
+                    "decode", plan.proposed_capacity, self.config.decode_batch_granularity
                 )
                 for batch_size in batch_values:
                     case = BenchmarkCase(
@@ -1288,6 +1335,9 @@ class SelfBenchmark:
         planner_origin_rank: int,
     ) -> None:
         cases.append(case)
+        graph_width = self._cuda_graph_plan_for_case(case)
+        graph_batch_size = graph_width or None
+        graph_padding = max(0, graph_width - case.batch_size) if graph_width else 0
         self._case_plans[case.case_id] = BenchmarkCasePlan(
             case_id=case.case_id,
             planner_backend=axis_plan.planner_backend,
@@ -1301,7 +1351,27 @@ class SelfBenchmark:
             token_components=dict(axis_plan.token_components),
             kv_snapshot=dict(axis_plan.kv_snapshot),
             planner_origin_rank=planner_origin_rank,
+            cuda_graph_batch_size=graph_batch_size,
+            cuda_graph_padding=graph_padding,
         )
+
+    def _cuda_graph_plan_for_case(self, case: BenchmarkCase) -> int:
+        """Predicted graph width for a case, or 0 when it is expected to run eager.
+
+        Only decode-shaped batches can graph: `ScheduledRequests.can_run_cuda_graph`
+        requires zero context requests, so a real prefill batch never does. The
+        isl=1 prefill slice is the exception -- it is promoted into a
+        decode-shaped batch before the graph lookup.
+        """
+        if case.case_type == "decode":
+            return self._cuda_graph_padded_size(case.batch_size)
+        if (
+            case.case_type in ("prefill", "prefill_seed")
+            and case.isl == 1
+            and self._promotes_single_token_prefill()
+        ):
+            return self._cuda_graph_padded_size(case.batch_size)
+        return 0
 
     def _plan_prefill_axis(
         self,
@@ -1659,8 +1729,12 @@ class SelfBenchmark:
             if case_type == "decode"
             else self.config.prefill_batch_granularity
         )
-        requested_batch_sizes = self._sample_values(plan.requested_capacity, granularity)
-        proposed_batch_sizes = self._sample_values(plan.proposed_capacity, granularity)
+        requested_batch_sizes = self._batch_values_for(
+            case_type, plan.requested_capacity, granularity, isl=isl
+        )
+        proposed_batch_sizes = self._batch_values_for(
+            case_type, plan.proposed_capacity, granularity, isl=isl
+        )
         omitted_batch_sizes = [
             batch_size
             for batch_size in requested_batch_sizes
@@ -2033,6 +2107,218 @@ class SelfBenchmark:
         inflight_stats["numQueuedCtxTokens"] = 0
         inflight_stats["numQueuedGenRequests"] = 0
         inflight_stats["numQueuedGenKvTokens"] = 0
+
+    def _cuda_graph_state(self) -> _CudaGraphState:
+        """Snapshot the decode graph shapes this rank can replay.
+
+        Never raises: any introspection failure degrades to the disabled state,
+        which reduces to today's linear sampling. A rank that cannot introspect
+        therefore produces a smaller merged capture set rather than a
+        rank-local exception, keeping the sweep collective-symmetric.
+        """
+        try:
+            model_engine = getattr(self._executor, "model_engine", None)
+            runner = getattr(model_engine, "cuda_graph_runner", None)
+            if runner is None or not getattr(runner, "enabled", False):
+                return _CudaGraphState()
+            # A dynamic draft-length schedule partitions the captured batch
+            # sizes by draft length instead of sharing them, so no single
+            # batch-size axis is reachable for every step. Degrade off
+            # explicitly: an empty intersection would silently look the same as
+            # "no graphs" while padding is force-enabled for this config.
+            if getattr(runner, "dynamic_draft_len_mapping", None):
+                return _CudaGraphState(dynamic_draft_len=True)
+            graphs = getattr(runner, "graphs", None) or {}
+            # KeyType is a NamedTuple; index 0 is batch_size, 1 is draft_len,
+            # 2 is is_first_draft. Exclude draft-model graphs, then require a
+            # batch size to be present for every draft length in play so a
+            # snapped point has a graph whichever draft length the step uses.
+            sizes_by_draft_len: dict[int, set[int]] = {}
+            for key in graphs:
+                if len(key) < 3 or key[2]:
+                    continue
+                sizes_by_draft_len.setdefault(int(key[1]), set()).add(int(key[0]))
+            if not sizes_by_draft_len:
+                return _CudaGraphState()
+            capture_sizes = set.intersection(*sizes_by_draft_len.values())
+            supported = getattr(runner, "supported_batch_sizes", None) or ()
+            return _CudaGraphState(
+                enabled=bool(capture_sizes),
+                padding_enabled=bool(getattr(runner, "padding_enabled", False)),
+                capture_sizes=tuple(sorted(capture_sizes)),
+                supported_sizes=tuple(sorted(int(size) for size in supported)),
+                max_supported_size=int(getattr(runner, "max_supported_batch_size", 0) or 0),
+            )
+        except Exception as exc:  # noqa: BLE001 - degradation is the contract
+            logger.warning("Self-benchmark could not read CUDA graph state: %s", exc)
+            return _CudaGraphState()
+
+    def _cuda_graph_record(self) -> dict:
+        """JSON-safe view of the snapshot, shared by consensus and the artifact.
+
+        Lists rather than tuples so the allgathered record and the artifact key
+        have byte-identical shape.
+        """
+        state = self._cuda_graph
+        return {
+            "enabled": state.enabled,
+            "padding_enabled": state.padding_enabled,
+            "capture_sizes": list(state.capture_sizes),
+            "supported_sizes": list(state.supported_sizes),
+            "max_supported_size": state.max_supported_size,
+            "dynamic_draft_len": state.dynamic_draft_len,
+        }
+
+    @staticmethod
+    def _merge_cuda_graph_records(records: list[dict]) -> _CudaGraphState:
+        """Reduce per-rank graph snapshots to the set every rank can replay.
+
+        Same min-merge shape as the capacity reduction: intersect the captured
+        sizes and AND the flags. The result is replicated by construction, so
+        ranks cannot derive different axes, and a rank whose warmup skipped a
+        per-shape capture narrows the sweep instead of aborting it.
+        """
+        graph_records = [record.get("cuda_graph") or {} for record in records]
+        if not graph_records or not all(record.get("enabled") for record in graph_records):
+            return _CudaGraphState(
+                dynamic_draft_len=any(
+                    bool(record.get("dynamic_draft_len")) for record in graph_records
+                )
+            )
+        capture_sizes = set.intersection(
+            *(set(int(size) for size in record.get("capture_sizes", ())) for record in graph_records)
+        )
+        supported_sizes = set.intersection(
+            *(
+                set(int(size) for size in record.get("supported_sizes", ()))
+                for record in graph_records
+            )
+        )
+        return _CudaGraphState(
+            enabled=bool(capture_sizes),
+            padding_enabled=all(bool(record.get("padding_enabled")) for record in graph_records),
+            capture_sizes=tuple(sorted(capture_sizes)),
+            supported_sizes=tuple(sorted(supported_sizes)),
+            max_supported_size=min(
+                int(record.get("max_supported_size", 0) or 0) for record in graph_records
+            ),
+        )
+
+    def _cuda_graph_padded_size(self, batch_size: int) -> int:
+        """Width a decode batch of `batch_size` would execute at, 0 for eager.
+
+        Mirrors `CUDAGraphRunner._get_padded_batch` for the shapes this sweep
+        builds. Rounds within the OBSERVED captured sizes, not the configured
+        `supported_sizes`: a shape can stay in `supported_batch_sizes` while its
+        capture was skipped for KV space, in which case the runtime pads the
+        batch and then misses the graph, running eager WITH the dummies still
+        appended. Reporting a graph width there would be exactly the confident
+        mislabelling this change exists to remove.
+        """
+        state = self._cuda_graph
+        if not state.enabled or batch_size <= 0:
+            return 0
+        if batch_size in state.capture_sizes:
+            return batch_size
+        if not state.padding_enabled:
+            return 0
+        if state.max_supported_size and batch_size > state.max_supported_size:
+            return 0
+        return next((size for size in state.capture_sizes if size >= batch_size), 0)
+
+    def _snap_to_cuda_graph(self, value: int, feasible: tuple[int, ...]) -> Optional[int]:
+        """Largest captured size at or below `value`, or None when there is none."""
+        candidate = None
+        for size in feasible:
+            if size <= value:
+                candidate = size
+            else:
+                break
+        return candidate
+
+    def _graph_batch_values(self, capacity: int, granularity: int) -> list[int]:
+        """Batch axis snapped onto CUDA graph boundaries.
+
+        Keeps the existing budget: the ideal targets are still
+        `_sample_values(capacity, granularity)`, and each is snapped DOWN to the
+        nearest captured size. Deliberately value-space, not index-space --
+        TRT-LLM's default capture list is dense at the bottom
+        (`range(1, 32) + [32, 64, 128]`), so index-uniform downsampling would
+        spend almost every point below batch 32 and leave the upper axis, where
+        throughput saturates, unsampled.
+
+        Snapping down only, so no point can pad and every point is a real
+        graph. Falls back to the unmodified targets when no graph is reachable,
+        which keeps the graph-disabled path bit-identical to before.
+        """
+        targets = self._sample_values(capacity, granularity)
+        state = self._cuda_graph
+        if not state.enabled:
+            return targets
+        # `granularity <= 1` keeps `_sample_values`' contract of "just the top of
+        # the axis". Snapping a lone point down to a graph bucket would drop the
+        # axis ceiling entirely, which is the opposite of what a single sample
+        # is asked for, and it is the shape eight existing tests rely on.
+        if granularity <= 1:
+            return targets
+        feasible = tuple(size for size in state.capture_sizes if size <= max(1, int(capacity)))
+        if not feasible:
+            return targets
+        snapped = {
+            snapped_value
+            for snapped_value in (self._snap_to_cuda_graph(target, feasible) for target in targets)
+            if snapped_value is not None
+        }
+        if not snapped:
+            return targets
+        # Anchor the eager tail. When the axis capacity sits above the largest
+        # captured size, everything between them runs eager in production too,
+        # and snapping alone would leave that whole region unsampled -- the
+        # planner would then extrapolate past its data. Only added when the
+        # budget has room, so the point count never grows.
+        if len(snapped) < granularity and capacity not in snapped:
+            if self._cuda_graph_padded_size(capacity) == 0:
+                snapped.add(max(1, int(capacity)))
+        return sorted(snapped)
+
+    def _promotes_single_token_prefill(self) -> bool:
+        """Whether an isl=1 prefill row is executed as a decode-shaped graph batch.
+
+        `_make_single_token_context_graph_batch` gates on
+        `cuda_graph_runner.enabled`, not on `prefill_cuda_graph_backend`, so
+        this fires under the default config where prefill graphs are disabled.
+        Conservative on speculative decoding and beam search: treating those as
+        non-promoting only costs the old linear sampling on that one slice.
+        """
+        if not self._cuda_graph.enabled:
+            return False
+        model_engine = getattr(self._executor, "model_engine", None)
+        if model_engine is None:
+            return False
+        if getattr(model_engine, "spec_config", None) is not None:
+            return False
+        if int(getattr(self._executor, "max_beam_width", 1) or 1) > 1:
+            return False
+        return not bool(getattr(model_engine, "is_encoder_decoder", False))
+
+    def _batch_values_for(
+        self,
+        case_type: str,
+        capacity: int,
+        granularity: int,
+        isl: int = 0,
+    ) -> list[int]:
+        """Single entry point for every batch axis.
+
+        `_build_cases` and `_record_planner_reduction` both route through here,
+        so the `axis_reduced` diagnostic can never disagree with the cases that
+        were actually built.
+        """
+        if case_type == "decode":
+            return self._graph_batch_values(capacity, granularity)
+        if isl == 1 and self._promotes_single_token_prefill():
+            return self._graph_batch_values(capacity, granularity)
+        return self._sample_values(capacity, granularity)
 
     @staticmethod
     def _sample_values(max_value: int, granularity: int) -> list[int]:

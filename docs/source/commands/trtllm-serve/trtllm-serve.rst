@@ -358,6 +358,14 @@ Startup self-benchmarking is also configured as a nested option. For example:
 
 Run the server with this configuration using ``trtllm-serve MODEL --config config.yaml``.
 
+The ``*_granularity`` options are upper bounds rather than exact counts. When CUDA
+graphs are enabled, batch-size sample points are snapped onto the captured graph
+batch sizes so that each measurement corresponds to a graph the engine actually
+replays, which can yield fewer points than requested. The emitted JSON records the
+observed graph state under the top-level ``cuda_graph`` key, and each entry of
+``case_plans`` carries ``cuda_graph_batch_size`` (``null`` when the case is expected
+to run eager) and ``cuda_graph_padding``.
+
 Syntax
 ------
 

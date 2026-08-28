@@ -289,6 +289,34 @@ class _FakeScheduledBatch:
         return self.context_requests + self.generation_requests + self._other
 
 
+def _make_cuda_graph_runner(
+    capture_sizes,
+    padding_enabled,
+    supported_sizes,
+    dynamic_draft_len,
+):
+    """Opt-in stand-in for CUDAGraphRunner.
+
+    Returns None by default so every pre-existing test keeps seeing an engine
+    with no runner, i.e. the graph-disabled path that samples exactly as before.
+    `graphs` is keyed by (batch_size, draft_len, is_first_draft) to match the
+    positional read in SelfBenchmark._cuda_graph_state.
+    """
+    if capture_sizes is None and not dynamic_draft_len:
+        return None
+    sizes = sorted(capture_sizes or ())
+    return types.SimpleNamespace(
+        enabled=True,
+        padding_enabled=padding_enabled,
+        graphs={(size, 0, False): object() for size in sizes},
+        supported_batch_sizes=sorted(
+            supported_sizes if supported_sizes is not None else sizes
+        ),
+        max_supported_batch_size=max(sizes) if sizes else 0,
+        dynamic_draft_len_mapping={1: 4} if dynamic_draft_len else None,
+    )
+
+
 def _make_executor(
     config: SelfBenchmarkConfig,
     tokens_per_block=32,
@@ -300,6 +328,11 @@ def _make_executor(
     max_total_draft_tokens=0,
     target_kv_capacity=128,
     draft_kv_capacity=None,
+    cuda_graph_capture_sizes=None,
+    cuda_graph_padding_enabled=False,
+    cuda_graph_supported_sizes=None,
+    cuda_graph_dynamic_draft_len=False,
+    spec_config=None,
 ) -> types.SimpleNamespace:
     kv_cache_manager = _FakeKvCacheManager(
         tokens_per_block=tokens_per_block,
@@ -328,7 +361,16 @@ def _make_executor(
         max_total_draft_tokens=max_total_draft_tokens,
         max_beam_width=max_beam_width,
         model_engine=types.SimpleNamespace(
-            max_draft_loop_tokens=max_total_draft_tokens, use_mrope=False
+            max_draft_loop_tokens=max_total_draft_tokens,
+            use_mrope=False,
+            spec_config=spec_config,
+            is_encoder_decoder=False,
+            cuda_graph_runner=_make_cuda_graph_runner(
+                cuda_graph_capture_sizes,
+                cuda_graph_padding_enabled,
+                cuda_graph_supported_sizes,
+                cuda_graph_dynamic_draft_len,
+            ),
         ),
         resource_manager=_FakeResourceManager(kv_cache_manager, draft_kv_cache_manager),
         scheduler=scheduler,
@@ -2628,3 +2670,276 @@ def test_skipped_case_is_diagnostic_not_result(tmp_path):
     # Skipped cases also carry the Dynamo-facing `point`/`skipped_reason` keys.
     assert data["skipped_cases"][0]["point"]["point_type"] == "prefill"
     assert data["skipped_cases"][0]["skipped_reason"] == "scheduled_batch_shape_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph aware batch sampling.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CAPTURE_SIZES = list(range(1, 32)) + [32, 64, 128]
+
+
+def _decode_batch_sizes(benchmark):
+    return sorted({case.batch_size for case in benchmark._cases if case.case_type == "decode"})
+
+
+def test_decode_batch_axis_snaps_to_cuda_graph_capture_sizes():
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=6, warmup_iterations=0
+    )
+    executor = _make_executor(
+        config,
+        max_batch_size=128,
+        max_num_tokens=256,
+        target_kv_capacity=1 << 20,
+        cuda_graph_capture_sizes=_DEFAULT_CAPTURE_SIZES,
+    )
+    benchmark = SelfBenchmark(executor)
+    batch_sizes = _decode_batch_sizes(benchmark)
+
+    assert batch_sizes, "decode axis produced no cases"
+    # Every measured batch is a real captured graph, so nothing is mislabelled.
+    assert all(size in _DEFAULT_CAPTURE_SIZES for size in batch_sizes)
+    # Budget is a cap: the axis never grows relative to the linear sweep.
+    assert len(batch_sizes) <= config.decode_batch_granularity
+
+
+def test_decode_batch_axis_keeps_spread_across_dense_capture_list():
+    """The default capture list is dense below 32; the axis must not collapse there.
+
+    Index-uniform downsampling of the candidate list would spend almost every
+    point under batch 32 and leave the upper axis unsampled. Snapping the linear
+    targets down in value space preserves the spread.
+    """
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=6, warmup_iterations=0
+    )
+    executor = _make_executor(
+        config,
+        max_batch_size=128,
+        max_num_tokens=256,
+        target_kv_capacity=1 << 20,
+        cuda_graph_capture_sizes=_DEFAULT_CAPTURE_SIZES,
+    )
+    batch_sizes = _decode_batch_sizes(SelfBenchmark(executor))
+
+    assert max(batch_sizes) == 128
+    assert 64 in batch_sizes, "the last bucket before the eager cliff must be sampled"
+    assert sum(1 for size in batch_sizes if size > 32) >= 2
+
+
+def test_decode_batch_axis_is_unchanged_when_cuda_graphs_are_disabled():
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=6, warmup_iterations=0
+    )
+    kwargs = dict(max_batch_size=128, max_num_tokens=256, target_kv_capacity=1 << 20)
+    disabled = _decode_batch_sizes(SelfBenchmark(_make_executor(config, **kwargs)))
+    capacity = max(disabled)
+
+    assert disabled == SelfBenchmark._sample_values(capacity, 6)
+
+
+def test_decode_batch_axis_anchors_the_eager_tail_above_the_largest_graph():
+    """Batches above the largest capture run eager in production too.
+
+    Snapping alone would drop that whole region, leaving the planner to
+    extrapolate past its data.
+    """
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=6, warmup_iterations=0
+    )
+    executor = _make_executor(
+        config,
+        max_batch_size=256,
+        max_num_tokens=512,
+        target_kv_capacity=1 << 20,
+        cuda_graph_capture_sizes=_DEFAULT_CAPTURE_SIZES,
+    )
+    batch_sizes = _decode_batch_sizes(SelfBenchmark(executor))
+
+    assert max(batch_sizes) == 256, "axis ceiling must still be measured"
+    assert 128 in batch_sizes, "largest captured graph must still be measured"
+    assert len(batch_sizes) <= config.decode_batch_granularity
+
+
+def test_single_sample_axis_keeps_the_capacity_ceiling():
+    """granularity=1 keeps _sample_values' contract: just the top of the axis."""
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=1, warmup_iterations=0
+    )
+    executor = _make_executor(
+        config,
+        max_batch_size=100,
+        max_num_tokens=256,
+        target_kv_capacity=1 << 20,
+        cuda_graph_capture_sizes=_DEFAULT_CAPTURE_SIZES,
+    )
+    batch_sizes = _decode_batch_sizes(SelfBenchmark(executor))
+
+    assert len(batch_sizes) == 1
+    assert batch_sizes[0] == 100
+
+
+def test_case_plans_record_predicted_graph_width_without_padding():
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=6, warmup_iterations=0
+    )
+    executor = _make_executor(
+        config,
+        max_batch_size=128,
+        max_num_tokens=256,
+        target_kv_capacity=1 << 20,
+        cuda_graph_capture_sizes=_DEFAULT_CAPTURE_SIZES,
+    )
+    benchmark = SelfBenchmark(executor)
+    plans = [
+        benchmark._case_plans[case.case_id]
+        for case in benchmark._cases
+        if case.case_type == "decode"
+    ]
+
+    assert plans
+    for plan in plans:
+        # Snapped points sit exactly on a capture, so nothing pads.
+        assert plan.cuda_graph_padding == 0
+        if plan.proposed_batch_size in _DEFAULT_CAPTURE_SIZES:
+            assert plan.cuda_graph_batch_size == plan.proposed_batch_size
+        else:
+            assert plan.cuda_graph_batch_size is None
+
+
+def test_padded_size_ignores_supported_sizes_without_a_capture():
+    """A shape can stay in supported_batch_sizes while its capture was skipped.
+
+    Rounding within the configured list would report a graph width for a batch
+    that actually runs eager with the padding dummies still appended.
+    """
+    config = SelfBenchmarkConfig(mode="decode", warmup_iterations=0)
+    executor = _make_executor(
+        config,
+        cuda_graph_capture_sizes=[1, 2, 4],
+        cuda_graph_supported_sizes=[1, 2, 4, 8],
+        cuda_graph_padding_enabled=True,
+    )
+    benchmark = SelfBenchmark(executor)
+
+    assert benchmark._cuda_graph_padded_size(4) == 4
+    assert benchmark._cuda_graph_padded_size(8) == 0
+    assert benchmark._cuda_graph_padded_size(3) == 4
+
+
+def test_dynamic_draft_length_disables_graph_awareness():
+    """Draft-length schedules partition captures by draft length.
+
+    No single batch-size axis is reachable for every step, so the sweep must
+    degrade to linear sampling rather than emit metadata it cannot honour.
+    """
+    config = SelfBenchmarkConfig(
+        mode="decode", decode_context_granularity=1, decode_batch_granularity=6, warmup_iterations=0
+    )
+    executor = _make_executor(
+        config,
+        max_batch_size=128,
+        max_num_tokens=256,
+        target_kv_capacity=1 << 20,
+        cuda_graph_dynamic_draft_len=True,
+    )
+    benchmark = SelfBenchmark(executor)
+    batch_sizes = _decode_batch_sizes(benchmark)
+
+    assert benchmark._cuda_graph.dynamic_draft_len is True
+    assert benchmark._cuda_graph.enabled is False
+    assert batch_sizes == SelfBenchmark._sample_values(max(batch_sizes), 6)
+
+
+def test_draft_model_graphs_are_excluded_from_the_capture_set():
+    config = SelfBenchmarkConfig(mode="decode", warmup_iterations=0)
+    executor = _make_executor(config, cuda_graph_capture_sizes=[1, 2, 4])
+    executor.model_engine.cuda_graph_runner.graphs[(8, 0, True)] = object()
+    benchmark = SelfBenchmark(executor)
+
+    assert benchmark._cuda_graph.capture_sizes == (1, 2, 4)
+
+
+def test_capture_sizes_intersect_across_ranks():
+    """A rank whose warmup skipped a capture narrows the sweep, never aborts it."""
+    config = SelfBenchmarkConfig(mode="decode", warmup_iterations=0)
+    merged = SelfBenchmark._merge_cuda_graph_records(
+        [
+            {
+                "cuda_graph": {
+                    "enabled": True,
+                    "padding_enabled": True,
+                    "capture_sizes": [1, 2, 4, 8],
+                    "supported_sizes": [1, 2, 4, 8],
+                    "max_supported_size": 8,
+                    "dynamic_draft_len": False,
+                }
+            },
+            {
+                "cuda_graph": {
+                    "enabled": True,
+                    "padding_enabled": False,
+                    "capture_sizes": [1, 2, 8],
+                    "supported_sizes": [1, 2, 4, 8],
+                    "max_supported_size": 8,
+                    "dynamic_draft_len": False,
+                }
+            },
+        ]
+    )
+
+    assert merged.enabled is True
+    assert merged.capture_sizes == (1, 2, 8)
+    # Padding is only predictable when every rank pads.
+    assert merged.padding_enabled is False
+
+
+def test_one_rank_without_graphs_degrades_the_merge():
+    merged = SelfBenchmark._merge_cuda_graph_records(
+        [
+            {
+                "cuda_graph": {
+                    "enabled": True,
+                    "capture_sizes": [1, 2, 4],
+                    "supported_sizes": [1, 2, 4],
+                    "max_supported_size": 4,
+                    "padding_enabled": False,
+                    "dynamic_draft_len": False,
+                }
+            },
+            {"cuda_graph": {"enabled": False, "capture_sizes": [], "dynamic_draft_len": False}},
+        ]
+    )
+
+    assert merged.enabled is False
+    assert merged.capture_sizes == ()
+
+
+def test_planner_record_and_artifact_carry_the_graph_snapshot():
+    config = SelfBenchmarkConfig(mode="decode", warmup_iterations=0)
+    executor = _make_executor(config, cuda_graph_capture_sizes=[1, 2, 4])
+    benchmark = SelfBenchmark(executor)
+    record = benchmark.local_planner_record(rank=0)
+
+    assert record["cuda_graph"]["enabled"] is True
+    assert record["cuda_graph"]["capture_sizes"] == [1, 2, 4]
+    # Lists, not tuples, so the allgathered record and the artifact key match.
+    assert isinstance(record["cuda_graph"]["capture_sizes"], list)
+
+
+def test_graph_state_degrades_when_introspection_raises():
+    config = SelfBenchmarkConfig(mode="decode", warmup_iterations=0)
+    executor = _make_executor(config)
+
+    class _ExplodingRunner:
+        enabled = True
+
+        @property
+        def graphs(self):
+            raise RuntimeError("boom")
+
+    executor.model_engine.cuda_graph_runner = _ExplodingRunner()
+    benchmark = SelfBenchmark(executor)
+
+    assert benchmark._cuda_graph.enabled is False

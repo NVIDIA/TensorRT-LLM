@@ -3112,7 +3112,9 @@ class SelfBenchmarkConfig(StrictBaseModel):
     prefill_batch_granularity: PositiveInt = Field(
         default=6,
         description=
-        "Number of batch size sample points for each prefill input sequence length.",
+        "Maximum number of batch size sample points for each prefill input sequence "
+        "length. Fewer points may be emitted when they are snapped onto CUDA graph "
+        "capture sizes.",
         status="prototype")
 
     prefill_kv_read_granularity: PositiveInt = Field(
@@ -3131,7 +3133,9 @@ class SelfBenchmarkConfig(StrictBaseModel):
     decode_batch_granularity: PositiveInt = Field(
         default=6,
         description=
-        "Number of batch size sample points for each decode context length.",
+        "Maximum number of batch size sample points for each decode context length. "
+        "Sample points are snapped onto CUDA graph capture sizes when CUDA graphs are "
+        "enabled, so fewer points may be emitted.",
         status="prototype")
 
     warmup_iterations: NonNegativeInt = Field(
