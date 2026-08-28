@@ -1,0 +1,1149 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>KVCacheManagerV2 Cold-Page Codec Design &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/kv-cache-cold-page-codec';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Telemetry" href="telemetry.html" />
+    <link rel="prev" title="Introduction to KV Cache Transmission" href="kv-transfer.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc25" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KVCacheManagerV2 Cold-Page Codec Design</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<section id="kvcachemanagerv2-cold-page-codec-design">
+<h1>KVCacheManagerV2 Cold-Page Codec Design<a class="headerlink" href="#kvcachemanagerv2-cold-page-codec-design" title="Link to this heading">#</a></h1>
+<section id="summary">
+<h2>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h2>
+<p>KVCM2 supports an internal cold-page representation for pages evicted from the hot tier. A hot page may span
+multiple GPU-facing pools, while a cold page is stored as one fixed-size opaque blob. An <code class="docutils literal notranslate"><span class="pre">IKvCacheColdPageCodec</span></code>
+transforms between these representations.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Hot representation                         Cold representation
+multiple kernel-facing pools  &lt;--------&gt;   one opaque blob per page
+                                 codec
+</pre></div>
+</div>
+<p>Compression is optional. The default codec concatenates all hot-pool data into the cold blob without reducing its
+size. Compression codecs may produce smaller cold pages. Both cases use the same KVCM allocation, migration, and
+event-management paths.</p>
+<p>This design reduces the number of files and I/O operations used by disk storage. Instead of issuing one operation per
+hot pool per page, KVCM can issue one operation per encoded cold page. Further coalescing of adjacent pages remains a
+possible optimization.</p>
+</section>
+<section id="codec-api">
+<h2>Codec API<a class="headerlink" href="#codec-api" title="Link to this heading">#</a></h2>
+<p>The C++ interface is named <code class="docutils literal notranslate"><span class="pre">IKvCacheColdPageCodec</span></code> because it defines a representation transform, not necessarily a
+compression algorithm.</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">enum</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">PageIndexLocation</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="kt">int</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">kBadLocation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">kHost</span><span class="p">,</span>
+<span class="w">    </span><span class="n">kDevice</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">alignas</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span><span class="w"> </span><span class="n">PageIndexPair</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="kt">int32_t</span><span class="w"> </span><span class="n">dst</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int32_t</span><span class="w"> </span><span class="n">src</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">static_assert</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">PageIndexPair</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+<span class="k">static_assert</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">is_trivially_copyable_v</span><span class="o">&lt;</span><span class="n">PageIndexPair</span><span class="o">&gt;</span><span class="p">);</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">IKvCacheColdPageCodec</span>
+<span class="p">{</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">    </span><span class="n">IKvCacheColdPageCodec</span><span class="p">();</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="o">~</span><span class="n">IKvCacheColdPageCodec</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="nf">configure</span><span class="p">(</span>
+<span class="w">        </span><span class="n">PoolGroupDesc</span><span class="w"> </span><span class="k">const</span><span class="o">*</span><span class="w"> </span><span class="n">gpuDescs</span><span class="p">,</span><span class="w"> </span><span class="n">PoolGroupIndex</span><span class="w"> </span><span class="n">numGpuDescs</span><span class="p">)</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Zero indicates failure.</span>
+<span class="w">    </span><span class="p">[[</span><span class="na">nodiscard</span><span class="p">]]</span><span class="w"> </span><span class="k">virtual</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">queryColdPageBytes</span><span class="p">(</span><span class="n">LayerGroupId</span><span class="w"> </span><span class="n">layerGroupId</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// The default implementation returns layerGroupId.</span>
+<span class="w">    </span><span class="p">[[</span><span class="na">nodiscard</span><span class="p">]]</span><span class="w"> </span><span class="k">virtual</span><span class="w"> </span><span class="n">LayerGroupId</span><span class="w"> </span><span class="n">getBatchingLayerGroupId</span><span class="p">(</span>
+<span class="w">        </span><span class="n">LayerGroupId</span><span class="w"> </span><span class="n">layerGroupId</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Applies to both encode and decode.</span>
+<span class="w">    </span><span class="p">[[</span><span class="na">nodiscard</span><span class="p">]]</span><span class="w"> </span><span class="k">virtual</span><span class="w"> </span><span class="n">PageIndexLocation</span><span class="w"> </span><span class="n">queryPageIndexLocation</span><span class="p">(</span>
+<span class="w">        </span><span class="n">LayerGroupId</span><span class="w"> </span><span class="n">layerGroupId</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="nf">encode</span><span class="p">(</span><span class="n">LayerGroupId</span><span class="w"> </span><span class="n">layerGroupId</span><span class="p">,</span><span class="w"> </span><span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">dstBasePtr</span><span class="p">,</span>
+<span class="w">        </span><span class="n">PageIndexPair</span><span class="w"> </span><span class="k">const</span><span class="o">*</span><span class="w"> </span><span class="n">pageIndices</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">numBasePages</span><span class="p">,</span>
+<span class="w">        </span><span class="n">cudaStream_t</span><span class="w"> </span><span class="n">stream</span><span class="p">)</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="nf">decode</span><span class="p">(</span><span class="n">LayerGroupId</span><span class="w"> </span><span class="n">layerGroupId</span><span class="p">,</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="k">const</span><span class="o">*</span><span class="w"> </span><span class="n">srcBasePtr</span><span class="p">,</span>
+<span class="w">        </span><span class="n">PageIndexPair</span><span class="w"> </span><span class="k">const</span><span class="o">*</span><span class="w"> </span><span class="n">pageIndices</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">numBasePages</span><span class="p">,</span>
+<span class="w">        </span><span class="n">cudaStream_t</span><span class="w"> </span><span class="n">stream</span><span class="p">)</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">};</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">LayerGroupId</span></code> is an alias of <code class="docutils literal notranslate"><span class="pre">LifeCycleId</span></code>. It is passed to the size query and both transforms because lifecycles that
+share a hot pool group may use different cold formats and cold-page sizes.</p>
+<p><code class="docutils literal notranslate"><span class="pre">configure()</span></code> supplies every hot GPU pool layout and base address in one call. The descriptors form a contiguous
+array ordered by <code class="docutils literal notranslate"><span class="pre">PoolGroupIndex</span></code>, and every descriptor contains that same index. KVCM calls it exactly once; returning
+<code class="docutils literal notranslate"><span class="pre">false</span></code> rejects the complete configuration.</p>
+<p>The methods have these contracts:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">queryColdPageBytes()</span></code> returns a fixed cold-page payload size for a lifecycle. Variable-sized output is not supported.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">getBatchingLayerGroupId(lifecycle)</span></code> returns the smallest lifecycle ID in the same codec-equivalence class. Equal
+IDs promise identical encode/decode behavior, including algorithm, parameters, cold-page size, and encoded
+representation. Membership in the same configured GPU pool group is a necessary additional precondition.</p></li>
+<li><p>The default <code class="docutils literal notranslate"><span class="pre">getBatchingLayerGroupId()</span></code> returns its argument, disabling cross-lifecycle batching.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">getBatchingLayerGroupId()</span></code> returns a negative ID on failure or for an unknown lifecycle.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">queryPageIndexLocation()</span></code> explicitly selects the pointer location used by both <code class="docutils literal notranslate"><span class="pre">encode()</span></code> and <code class="docutils literal notranslate"><span class="pre">decode()</span></code>.
+Lifecycles with the same batching ID must return the same location. Compressing codecs normally select <code class="docutils literal notranslate"><span class="pre">kDevice</span></code>; a
+codec that consumes indices synchronously to construct batched DMA descriptors, page-wise <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code> calls,
+or kernel parameters may select <code class="docutils literal notranslate"><span class="pre">kHost</span></code>. It returns <code class="docutils literal notranslate"><span class="pre">kBadLocation</span></code> on failure or for an unknown lifecycle;
+<code class="docutils literal notranslate"><span class="pre">kBadLocation</span></code> is never a valid index-array location.</p></li>
+<li><p>KVCM may concatenate index pairs from any subset of lifecycles with the same batching ID and call <code class="docutils literal notranslate"><span class="pre">encode()</span></code> or
+<code class="docutils literal notranslate"><span class="pre">decode()</span></code> once using that representative ID. KVCM does not promise that every member of the class is present.</p></li>
+<li><p>Encode and decode enqueue work on the supplied CUDA stream and do not synchronize it.</p></li>
+<li><p>A <code class="docutils literal notranslate"><span class="pre">bool</span></code> result reports synchronous validation or submission success, not asynchronous CUDA-work completion.</p></li>
+<li><p>For <code class="docutils literal notranslate"><span class="pre">kHost</span></code>, index pointers remain valid only until the codec call returns and asynchronous work must not retain or
+dereference them.</p></li>
+<li><p>For <code class="docutils literal notranslate"><span class="pre">kDevice</span></code>, index pointers remain valid until all codec work enqueued on the supplied stream completes. The
+codec must use them only on that stream and must not retain them beyond that work.</p></li>
+<li><p>Each <code class="docutils literal notranslate"><span class="pre">PageIndexPair</span></code> contains the destination and source index for one logical copy. The array-of-structures layout is
+shared by host and device codecs. A GPU work item can fetch both indices with one aligned 64-bit load, while a host
+codec can iterate the same array to issue page-wise copies.</p></li>
+<li><p>GPU-accessible data base pointers may be used by work enqueued on the supplied stream, but must not be retained beyond
+that work.</p></li>
+</ul>
+</section>
+<section id="storage-layout-and-grouping">
+<h2>Storage Layout and Grouping<a class="headerlink" href="#storage-layout-and-grouping" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">LifeCycleId</span></code> is the stable semantic key. Pool groups are physical allocation equivalence classes and are specific to
+a storage representation.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>LifeCycleId ----&gt; hotPoolGroup(lifecycle):  multi-pool hot layout
+            +---&gt; coldPoolGroup(lifecycle): one-pool cold layout
+</pre></div>
+</div>
+<p>The lifecycle-to-pool-group mappings for hot and cold storage are independent. For example, two lifecycles may share a
+GPU pool group because their unencoded layouts are identical but map to different cold pool groups because they encode
+to different sizes.</p>
+<p>Each non-hot pool group contains exactly one physical pool. Lifecycles with compatible fixed cold-page strides may
+share a cold pool group. Their encoded contents may differ because the lifecycle passed to <code class="docutils literal notranslate"><span class="pre">decode()</span></code> selects the
+correct interpretation.</p>
+<p>All cold tiers use the same logical encoded representation and lifecycle-to-cold-pool-group mapping. This permits raw
+blob copies between host and disk without decoding and re-encoding. Physical tiers may still apply their own allocation
+granularity or padding around the logical payload.</p>
+<p>KVCM must therefore maintain level-specific mappings, conceptually:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">TypedVec</span><span class="o">&lt;</span><span class="n">CacheLevel</span><span class="p">,</span><span class="w"> </span><span class="n">TypedVec</span><span class="o">&lt;</span><span class="n">LifeCycleId</span><span class="p">,</span><span class="w"> </span><span class="n">PoolGroupIndex</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">lifeCycleToPoolGroup</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>Memory partitioning is layer-group-based rather than hot-pool-group-based. KVCM first derives one positive, normalized
+hot-tier byte-quota weight per public layer group, whether the source is <code class="docutils literal notranslate"><span class="pre">initial_pool_ratio</span></code>, a typical batch, or
+constraints. <code class="docutils literal notranslate"><span class="pre">LayerGroupId</span></code> currently maps one-to-one to the internal <code class="docutils literal notranslate"><span class="pre">LifeCycleId</span></code>, so the implementation stores and
+computes these weights by lifecycle. Hot initialization sums the lifecycle byte weights that map to each hot pool
+group. Cold initialization first converts each hot byte weight to its implied slot-count weight, then converts that
+weight to cold bytes using the lifecycle’s cold-page size and sums it into the cold pool group. This preserves
+layer-group slot-count proportions when hot and cold representations use different page sizes or pool-group mappings.
+Runtime sampling remains level-specific and byte-based. The low-level <code class="docutils literal notranslate"><span class="pre">initial_pool_ratio</span></code> and the higher-level
+<code class="docutils literal notranslate"><span class="pre">KvCacheConfig.pool_ratio</span></code> therefore contain exactly one hot-tier byte ratio per layer group in layer-group ID order,
+not one per hot pool group.
+Hot-level constraints remain feasibility floors and may clamp the resulting hot allocation; they are not projected into
+cold storage. Cold pool groups use only the structural minimum needed by their allocators.</p>
+<p>Migration resolves source and destination groups independently from the page lifecycle and cache level. Pool group
+indices must not be compared across representations as though they identify the same physical layout.</p>
+<p>At construction, KVCM validates that every batching representative is configured, is no greater than each member,
+maps to itself, belongs to the same configured GPU and cold pool groups as every member, and has the same cold-page
+size and page-index location. For a hot/cold conversion, the migration key includes the physical source and destination
+pool groups plus the batching representative. KVCM then concatenates the already ordered index pairs and makes one
+codec call. Hot/hot and cold/cold copies do not use the codec batching ID.</p>
+<p>Existing public pool-layout and GPU base-address queries continue to describe only the hot representation. APIs that
+take an explicit cache level, such as <code class="docutils literal notranslate"><span class="pre">getAndResetIterationPeakBlockStats(level)</span></code>, return pool-group data in that
+level’s grouping order; hot and cold results may therefore have different lengths and unrelated group indices.</p>
+</section>
+<section id="memory-contract">
+<h2>Memory Contract<a class="headerlink" href="#memory-contract" title="Link to this heading">#</a></h2>
+<p>KVCM owns all hot, cold, and staging allocations. Cold storage is not exposed to codec users, and only GPU storage is
+otherwise exposed through the existing KVCM API.</p>
+<p>KVCM guarantees that every hot or cold data base pointer passed to the codec is GPU-accessible. The current UVM
+assumption that mapped pinned-host memory has the same host and GPU address remains unchanged. No public memory
+descriptor is required.</p>
+<p>KVCM first builds a packed <code class="docutils literal notranslate"><span class="pre">thread_local</span> <span class="pre">std::vector&lt;PageIndexPair&gt;</span></code> before acquiring scarce staging resources. For
+host indices, KVCM passes this vector directly and the codec consumes it before returning. For device indices, KVCM
+acquires device staging and submits one H2D <code class="docutils literal notranslate"><span class="pre">cuMemcpyBatchAsync</span></code> entry with
+<code class="docutils literal notranslate"><span class="pre">CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL</span></code>. CUDA must finish every access to the pageable host vector before the API
+returns, while the H2D transfer remains asynchronous on the codec stream. KVCM may therefore reuse the host vector
+immediately and does not need a pinned-host index ring. The upload also sets
+<code class="docutils literal notranslate"><span class="pre">CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE</span></code> to prefer copy engines when the platform honors the hint.
+Before CUDA 12.8, where <code class="docutils literal notranslate"><span class="pre">cuMemcpyBatchAsync</span></code> is unavailable, KVCM instead uploads the pageable-host indices with a
+version-gated segmented kernel whose parameters are consumed during launch.</p>
+<p>The hot-side storage used by the codec must be GPU-accessible, either GPU memory or pinned mapped host memory. Disk
+addresses are never passed to the codec. When no host tier exists, KVCM uses temporary pinned-host staging buffers for
+GPU-to-disk and disk-to-GPU migrations.</p>
+<p>KVCM keeps every GPU-accessible data allocation alive until the work enqueued on the codec stream has completed.</p>
+<p>The generalized staging facility is independent of <code class="docutils literal notranslate"><span class="pre">CopyEngine</span></code>. When any cold tier is neither GPU nor host memory,
+<code class="docutils literal notranslate"><span class="pre">StorageManager</span></code> uniquely owns a pinned page ring. After querying and validating the cold-page size of every lifecycle,
+it sizes that ring to <code class="docutils literal notranslate"><span class="pre">max(64</span> <span class="pre">MiB,</span> <span class="pre">3</span> <span class="pre">*</span> <span class="pre">maxColdPageBytes)</span></code>, with checked multiplication. GPU/host-only cold storage does
+not allocate a page ring. <code class="docutils literal notranslate"><span class="pre">CopyEngine</span></code> is constructed with a nullable, non-owning pointer and requires the ring only for
+two-hop transfers. It is destroyed before the ring during teardown. Final ring destruction synchronizes all
+retired-range events before freeing the backing allocation. <code class="docutils literal notranslate"><span class="pre">StagingBuffer</span></code> also remains a non-owning lease and must not
+outlive its <code class="docutils literal notranslate"><span class="pre">StorageManager</span></code>.</p>
+<p>Staging managers are intentionally not internally thread-safe. Each belongs to one KVCM instance, whose APIs currently
+serialize access. If KVCM later supports concurrent public calls, synchronization belongs at the KVCM boundary through
+one mutex per instance rather than inside each staging manager.</p>
+<p>If any lifecycle requests device indices, its <code class="docutils literal notranslate"><span class="pre">StorageManager</span></code> owns one device index ring, allocated lazily after codec
+configuration. The default host-index codec allocates no index staging. CUDA handles any internal host staging required
+by <code class="docutils literal notranslate"><span class="pre">CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL</span></code>; KVCM does not retain a pinned index ring. Per-<code class="docutils literal notranslate"><span class="pre">StorageManager</span></code> device rings
+prevent codec traffic in one KVCM instance from consuming another instance’s index capacity.</p>
+<p>Each manager stores its backing allocation as <code class="docutils literal notranslate"><span class="pre">std::variant&lt;HostMem,</span> <span class="pre">CudaUniqPtr&gt;</span></code> and derives its memory kind and
+base address from the active owner, so host and device ownership cannot diverge. Each manager keeps a byte-accurate
+next-fit cursor and a spatially ordered list partition of its backing buffer. A live
+range represents the current lease; a retired range retains the completion event of the previous temporal owner of
+those bytes. Allocation scans contiguous retired runs from the cursor to the physical end while skipping live ranges,
+then makes at most one additional pass from the beginning. The cursor changes only after a successful allocation. If no
+run satisfies the minimum request, allocation fails rather than waiting for a live lease that cannot retire on the same
+thread. There is no manager-wide fixed allocation granularity.</p>
+<p>Each request specifies a positive size granularity and a power-of-two address alignment. The returned size is a
+multiple of the size granularity: the minimum bound is rounded up and the maximum available bound is rounded down.
+Size granularity need not be a power of two, but it must be a multiple of the address alignment, so that every
+granularity-sized slice inside a lease starts at an aligned address. Disk staging uses the cold-page size, while index
+staging uses <code class="docutils literal notranslate"><span class="pre">sizeof(PageIndexPair)</span></code>; each chooses its own alignment subject to that divisibility rule. An allocation
+carves only its payload bytes into a new live range.
+Skipped alignment padding and end-of-ring slack remain retired with their inherited events. If padding crosses multiple
+previous ranges, it remains split at those boundaries so every padding fragment keeps the event protecting its bytes.
+A stream acquisition waits on all source events without invalidating them, allowing other fragments and streams to wait
+on the same events later. A synchronous acquisition synchronizes the source events; their shared state may then be
+closed because future consumers no longer require a wait.</p>
+<p>The device ring retains enough capacity to overlap H2D index copies and codec execution. If a batch exceeds the 64 KiB
+<code class="docutils literal notranslate"><span class="pre">kMaxIndexBatchBytes</span></code> scheduling cap, KVCM splits it into codec chunks; codecs already cannot require a complete
+equivalence class in one call.</p>
+<p><code class="docutils literal notranslate"><span class="pre">StagingBuffer</span></code> has one current owner represented by <code class="docutils literal notranslate"><span class="pre">std::optional&lt;CUstream&gt;</span></code>. <code class="docutils literal notranslate"><span class="pre">nullopt</span></code> means synchronous CPU
+ownership with no outstanding asynchronous access. Acquiring with <code class="docutils literal notranslate"><span class="pre">nullopt</span></code> host-synchronizes the slice’s previous
+completion events before returning; acquiring with a stream inserts waits on that stream. <code class="docutils literal notranslate"><span class="pre">stream()</span></code> returns the
+optional owner and <code class="docutils literal notranslate"><span class="pre">setStream()</span></code> transfers ownership as follows:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Old owner</p></th>
+<th class="head"><p>New owner</p></th>
+<th class="head"><p>Transition</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nullopt</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nullopt</span></code></p></td>
+<td><p>No action</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nullopt</span></code></p></td>
+<td><p>stream</p></td>
+<td><p>No action; preceding CPU access is already complete</p></td>
+</tr>
+<tr class="row-even"><td><p>stream A</p></td>
+<td><p>stream A</p></td>
+<td><p>No action</p></td>
+</tr>
+<tr class="row-odd"><td><p>stream A</p></td>
+<td><p>stream B</p></td>
+<td><p>Record an event on A and make B wait</p></td>
+</tr>
+<tr class="row-even"><td><p>stream</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nullopt</span></code></p></td>
+<td><p>Host-synchronize the old stream</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>On destruction, a stream-owned slice records its reusable event on that stream; a synchronously owned slice becomes
+immediately reusable. Callers must finish CPU access before a <code class="docutils literal notranslate"><span class="pre">nullopt</span></code>-to-stream transition and must call
+<code class="docutils literal notranslate"><span class="pre">setStream(stream)</span></code> before submitting asynchronous work that accesses a synchronously acquired slice.</p>
+<p>For a device-index codec, KVCM acquires a device slice on the codec stream and submits the pageable host array with
+<code class="docutils literal notranslate"><span class="pre">CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL</span></code>. The call returns only after CUDA has consumed the host source, so KVCM can
+immediately reuse it. The device lease remains alive through the codec call and records its event after the H2D copy
+and all codec work enqueued on the stream.</p>
+</section>
+<section id="migration-paths">
+<h2>Migration Paths<a class="headerlink" href="#migration-paths" title="Link to this heading">#</a></h2>
+<p>The expected paths are:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Hot -&gt; Host: encode into the host cold-page slot
+Host -&gt; Hot: decode from the host cold-page slot
+
+Hot -&gt; Disk: encode into temporary pinned staging, then write the blob
+Disk -&gt; Hot: read the blob into temporary pinned staging, then decode
+
+Host -&gt; Disk: raw encoded-blob copy
+Disk -&gt; Host: raw encoded-blob copy
+
+Hot -&gt; Hot: existing per-pool copy, including defragmentation
+Cold -&gt; Cold: raw one-pool copy
+</pre></div>
+</div>
+<p>The default concatenating codec reports <code class="docutils literal notranslate"><span class="pre">kHost</span></code> and consumes the <code class="docutils literal notranslate"><span class="pre">PageIndexPair</span></code> array synchronously. It builds one
+<code class="docutils literal notranslate"><span class="pre">cuMemcpyBatchAsync</span></code> descriptor for each page and hot pool, then submits the complete descriptor array once per codec
+call. Each descriptor copies the full pool contribution for that page. There is no codec-level 2 MiB work size,
+transfer chunking policy, or 16-byte alignment requirement; DMA scheduling and partitioning belong to CUDA.
+Before CUDA 12.8, the version-gated fallback submits the same descriptors as individual stream-ordered
+<code class="docutils literal notranslate"><span class="pre">cuMemcpyAsync</span></code> calls.</p>
+<p>The batch uses stream-ordered source access and sets <code class="docutils literal notranslate"><span class="pre">CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE</span></code> to prefer
+copy engines when the platform honors the hint. Non-empty calls require a non-legacy
+CUDA stream, as required by <code class="docutils literal notranslate"><span class="pre">cuMemcpyBatchAsync</span></code>. Host memory may be registered as adjacent 2 GiB regions by
+<code class="docutils literal notranslate"><span class="pre">HostMem</span></code>; a descriptor crossing such a registration boundary is split only to satisfy that allocation constraint.
+This boundary handling is unrelated to page-size or DMA work-unit tuning.</p>
+<p>The concrete codec, its configuration logic, and its factory live entirely in <code class="docutils literal notranslate"><span class="pre">coldPageCodec.cpp</span></code>. The class remains
+translation-unit-private and needs neither a pImpl nor a CUDA implementation file. Custom codecs remain free to choose
+host or device indices and their own implementation, subject to the corresponding pointer-lifetime contract.</p>
+<section id="migration-transaction">
+<h3>Migration Transaction<a class="headerlink" href="#migration-transaction" title="Link to this heading">#</a></h3>
+<p>Migration preserves the existing event and ownership transaction around every representation-specific transfer:</p>
+<ol class="arabic simple">
+<li><p>Allocate all destination slots before submitting work.</p></li>
+<li><p>Wait for source-page and destination-slot ready events on the migration stream.</p></li>
+<li><p>Submit the transfer and record one finish event.</p></li>
+<li><p>Attach that event to the source pages and destination slots, then notify migration observers.</p></li>
+<li><p>Transfer slot ownership and release the source slots only after successful submission.</p></li>
+</ol>
+<p>A synchronous submission failure releases newly allocated destination slots and leaves source pages retryable. The
+source and destination allocations remain alive until the recorded work completes.</p>
+</section>
+</section>
+<section id="construction-and-ownership">
+<h2>Construction and Ownership<a class="headerlink" href="#construction-and-ownership" title="Link to this heading">#</a></h2>
+<p>When <code class="docutils literal notranslate"><span class="pre">cold_page_codec</span></code> is omitted or set to <code class="docutils literal notranslate"><span class="pre">None</span></code>, KVCM creates the default lossless concatenating codec
+internally. Codec configuration, validation, and ownership transfer also occur for a GPU-only manager, even though no
+migration invokes the codec; this detects invalid explicit codecs consistently and preserves one construction contract.</p>
+<p>Normal Python users therefore select the default with:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">manager</span> <span class="o">=</span> <span class="n">KVCacheManager</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Concrete codec classes remain implementation details. Python-defined codec subclasses are not supported, and the
+pure-Python KVCM2 backend does not support the codec feature.</p>
+<p>KVCM accepts <code class="docutils literal notranslate"><span class="pre">std::unique_ptr&lt;IKvCacheColdPageCodec&gt;</span></code> by value and transfers it directly to <code class="docutils literal notranslate"><span class="pre">StorageManager</span></code>, the
+component that executes migrations. Supplying a codec is consumptive as soon as KVCM construction is invoked, whether
+construction succeeds or fails. In Python, the relinquished codec wrapper must not be used again.</p>
+<p><code class="docutils literal notranslate"><span class="pre">create_default_kv_cache_cold_page_codec()</span></code> is not needed to select the default. It remains exposed primarily as a
+reference for authors binding native compression codecs and as an end-to-end demonstration of the ownership-transfer
+contract:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">codec</span> <span class="o">=</span> <span class="n">create_default_kv_cache_cold_page_codec</span><span class="p">()</span>
+<span class="n">manager</span> <span class="o">=</span> <span class="n">KVCacheManager</span><span class="p">(</span>
+    <span class="n">config</span><span class="p">,</span>
+    <span class="n">cold_page_codec</span><span class="o">=</span><span class="n">codec</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Construction does not attempt to restore codec ownership on failure. Configuration may already have mutated the codec
+before a later validation or allocation fails, so restoring only the pointer would not provide a useful rollback
+guarantee. <code class="docutils literal notranslate"><span class="pre">StorageManager</span></code> owns the codec throughout configuration and destroys it automatically if construction
+throws.</p>
+</section>
+<section id="initialization-sequence">
+<h2>Initialization Sequence<a class="headerlink" href="#initialization-sequence" title="Link to this heading">#</a></h2>
+<p>The intended initialization order is:</p>
+<ol class="arabic simple">
+<li><p>Consume the supplied codec at the KVCM call boundary, validate the KVCM configuration, and construct the hot
+storage layout. <code class="docutils literal notranslate"><span class="pre">StorageManager</span></code> creates the default codec when none was supplied.</p></li>
+<li><p>Allocate hot storage so GPU base addresses are available.</p></li>
+<li><p>Configure the codec with the hot pool-group descriptions.</p></li>
+<li><p>Query the fixed cold-page size, batching representative, and page-index location for every lifecycle.</p></li>
+<li><p>Validate all batching equivalence classes, then build the cold lifecycle-to-pool-group mapping from encoded sizes
+and physical stride requirements.</p></li>
+<li><p>Allocate every configured cold tier using its one-pool layout.</p></li>
+<li><p>Retain the configured codec in <code class="docutils literal notranslate"><span class="pre">StorageManager</span></code> for all migrations.</p></li>
+</ol>
+</section>
+<section id="required-kvcm-refactoring">
+<h2>Required KVCM Refactoring<a class="headerlink" href="#required-kvcm-refactoring" title="Link to this heading">#</a></h2>
+<p>Existing assumptions that pool count, pool sizes, and pool-group indices are uniform across cache levels must be
+removed.
+In particular:</p>
+<ul class="simple">
+<li><p>Slot allocation must aggregate lifecycle demand using the mapping for the requested cache level.</p></li>
+<li><p>Migration must derive source and destination pool groups separately and batch hot/cold conversions by the codec’s
+validated batching representative.</p></li>
+<li><p>Eviction controllers must use the lifecycle grouping of their cache level.</p></li>
+<li><p>Pool ratios must be derived per layer group and projected through each cache level’s internal lifecycle mapping.</p></li>
+<li><p>Constraint-derived minimum slots apply only to the hot level, where batches execute; cold levels use structural
+allocator minima.</p></li>
+<li><p>Statistics keyed by pool group must not assume that groups at different levels have matching indices or counts.</p></li>
+<li><p>Hot/cold migration must use encode/decode, while cold/cold migration remains an opaque blob copy.</p></li>
+</ul>
+</section>
+<section id="initial-non-goals">
+<h2>Initial Non-Goals<a class="headerlink" href="#initial-non-goals" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Python implementations or subclasses of <code class="docutils literal notranslate"><span class="pre">IKvCacheColdPageCodec</span></code>.</p></li>
+<li><p>Support in the pure-Python KVCM2 backend.</p></li>
+<li><p>Variable-length encoded pages or per-page size metadata.</p></li>
+<li><p>Direct codec access to disk addresses or disk I/O.</p></li>
+<li><p>Changing the existing UVM and mapped-pinned-address assumptions.</p></li>
+</ul>
+</section>
+<section id="validation">
+<h2>Validation<a class="headerlink" href="#validation" title="Link to this heading">#</a></h2>
+<p>The implementation should cover at least:</p>
+<ul class="simple">
+<li><p>Byte-exact round trips through the default concatenating codec.</p></li>
+<li><p>Codec-specific correctness for compressed or lossy implementations.</p></li>
+<li><p>Lifecycles sharing a hot pool group but mapping to different cold pool groups.</p></li>
+<li><p>Lifecycles from different hot groups sharing a compatible cold pool group.</p></li>
+<li><p>GPU-host, GPU-disk staging, host-disk, resize, eviction, and defragmentation paths.</p></li>
+<li><p>Correct CUDA event ordering and staging-buffer lifetime.</p></li>
+<li><p>Every optional-stream ownership transition, including synchronous acquisition before CPU overwrite.</p></li>
+<li><p>Lazy device index-ring allocation, reuse, capacity pressure, and chunking for a device-index codec.</p></li>
+<li><p>Default-codec DMA descriptor construction cost and <code class="docutils literal notranslate"><span class="pre">cuMemcpyBatchAsync</span></code> throughput for non-contiguous pages.</p></li>
+<li><p>Device-codec AoS index-load behavior and the cost of ephemeral-source H2D submission.</p></li>
+<li><p>Layer-group pool-ratio projection across different hot and cold pool-group mappings.</p></li>
+<li><p>Hot-only constraint floors and structural cold-tier minima.</p></li>
+<li><p>Consumptive Python ownership transfer on both successful and failed construction attempts.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="kv-transfer.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Introduction to KV Cache Transmission</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="telemetry.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Telemetry</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#codec-api">Codec API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#storage-layout-and-grouping">Storage Layout and Grouping</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#memory-contract">Memory Contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#migration-paths">Migration Paths</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#migration-transaction">Migration Transaction</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#construction-and-ownership">Construction and Ownership</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#initialization-sequence">Initialization Sequence</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#required-kvcm-refactoring">Required KVCM Refactoring</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#initial-non-goals">Initial Non-Goals</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#validation">Validation</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on August 27, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

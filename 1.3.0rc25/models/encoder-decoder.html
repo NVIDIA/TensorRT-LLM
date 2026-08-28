@@ -1,0 +1,1438 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Use encoder-decoder models with the PyTorch backend &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'models/encoder-decoder';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc25" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Use encoder-decoder models with the PyTorch backend</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<section id="use-encoder-decoder-models-with-the-pytorch-backend">
+<h1>Use encoder-decoder models with the PyTorch backend<a class="headerlink" href="#use-encoder-decoder-models-with-the-pytorch-backend" title="Link to this heading">#</a></h1>
+<p>TensorRT LLM can run supported Hugging Face encoder-decoder checkpoints directly
+with the PyTorch backend. You do not need to convert the checkpoint or build a
+TensorRT engine. The LLM API treats the supplied prompt as the encoder input and
+automatically starts the decoder with the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> or <code class="docutils literal notranslate"><span class="pre">bos_token_id</span></code>.</p>
+<p>This guide covers text-to-text generation and speech-to-text transcription with
+the following Hugging Face architectures:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Hugging Face architecture</p></th>
+<th class="head"><p>Model families and examples</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">T5ForConditionalGeneration</span></code></p></td>
+<td><p>T5, Flan-T5, and ByT5, for example <code class="docutils literal notranslate"><span class="pre">google/flan-t5-small</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">BartForConditionalGeneration</span></code></p></td>
+<td><p>BART checkpoints</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MBartForConditionalGeneration</span></code></p></td>
+<td><p>mBART checkpoints</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WhisperForConditionalGeneration</span></code></p></td>
+<td><p>Whisper automatic speech recognition (ASR), for example <code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>mBART architecture loading is available. When a BART or mBART checkpoint
+defines <code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, the PyTorch backend seeds that token in the
+decoder prefix. Source- and target-language selection remains
+checkpoint-specific, so validate the configured language tokens before
+deployment. Refer to <a class="reference internal" href="#understand-bart-and-mbart-decoder-tokens"><span class="xref myst">Understand BART and mBART decoder tokens</span></a>
+for BOS, EOS, and output-limit behavior.</p>
+<p>Whisper consumes audio rather than a text prompt. The sections up to
+<a class="reference internal" href="#transcribe-audio-with-whisper"><span class="xref myst">Transcribe audio with Whisper</span></a> describe the
+text-to-text models; the runtime configuration, KV cache manager, beam search,
+CUDA graph, and parallelism guidance in this guide applies to all architectures.</p>
+<section id="feature-support">
+<h2>Feature support<a class="headerlink" href="#feature-support" title="Link to this heading">#</a></h2>
+<p>The following table describes the supported and recommended configurations.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>Support</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>KV cache manager V1</p></td>
+<td><p>Yes; recommended</p></td>
+<td><p>This is the default. It supports greedy decoding, beam search, batching, the overlap scheduler, decoder CUDA graphs, and tensor parallelism.</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV cache manager V2</p></td>
+<td><p>Yes</p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2=True</span></code>. It currently requires <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>, so use greedy or sampling with a single sequence rather than beam search.</p></td>
+</tr>
+<tr class="row-even"><td><p>Greedy decoding</p></td>
+<td><p>Yes</p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">temperature=0.0</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Beam search</p></td>
+<td><p>Yes with V1</p></td>
+<td><p>Configure <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code> when constructing <code class="docutils literal notranslate"><span class="pre">LLM</span></code>, then set <code class="docutils literal notranslate"><span class="pre">use_beam_search=True</span></code> in <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention backend</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>Use this backend for encoder-decoder models. It is required when <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Decoder CUDA graphs</p></td>
+<td><p>Yes, except in FP32</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code> captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. FP32 encoder-decoder models decline capture at engine init and log a warning instead of failing.</p></td>
+</tr>
+<tr class="row-even"><td><p>Encoder CUDA graphs</p></td>
+<td><p>Yes</p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config=EncodeCudaGraphConfig(...)</span></code> and <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>. Usually set <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> lower than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend is required.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Overlap scheduler</p></td>
+<td><p>Yes</p></td>
+<td><p>Enabled by default. V1 supports greedy decoding and beam search; V2 remains limited to <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p>Tensor parallelism</p></td>
+<td><p>Yes</p></td>
+<td><p>Use <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> with <code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;TRTLLM&quot;</span></code>. Attention head counts must be divisible by the TP size.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Pipeline parallelism</p></td>
+<td><p>No</p></td>
+<td><p>Keep <code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size=1</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p>Context parallelism</p></td>
+<td><p>No</p></td>
+<td><p>Keep <code class="docutils literal notranslate"><span class="pre">context_parallel_size=1</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Attention data parallelism</p></td>
+<td><p>No</p></td>
+<td><p>Keep <code class="docutils literal notranslate"><span class="pre">enable_attention_dp=False</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p>Chunked prefill</p></td>
+<td><p>Not supported for the encoder phase</p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">enable_chunked_prefill=False</span></code>. The complete encoder input must fit in the iteration token budget.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Piecewise CUDA graph</p></td>
+<td><p>No</p></td>
+<td><p>Do not set <code class="docutils literal notranslate"><span class="pre">torch_compile_config.enable_piecewise_cuda_graph=True</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>BF16 is the recommended model dtype. Validate accuracy with your checkpoint and
+task before deploying a different precision or quantization configuration.</p>
+</section>
+<section id="choose-the-attention-backend">
+<h2>Choose the attention backend<a class="headerlink" href="#choose-the-attention-backend" title="Link to this heading">#</a></h2>
+<p>Use <code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;TRTLLM&quot;</span></code> for encoder-decoder models. T5 self-attention needs
+this backend to apply relative attention bias, and tensor parallel
+encoder-decoder execution explicitly requires it.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend can internally select optimized kernels when the hardware
+and request are eligible. For example, compatible operations on Blackwell can
+use FlashInfer TRTLLM-Gen kernels. This internal selection is different from
+setting <code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;FLASHINFER&quot;</span></code>. Cases such as T5 relative attention bias or
+beam-expanded self-attention can fall back to another kernel within the
+<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend; no customer-side backend change is needed.</p>
+</section>
+<section id="run-basic-generation">
+<h2>Run basic generation<a class="headerlink" href="#run-basic-generation" title="Link to this heading">#</a></h2>
+<p>Install TensorRT LLM using the <a class="reference internal" href="../installation/installation-guide.html"><span class="std std-doc">installation guide</span></a>
+and make sure the checkpoint is accessible either from the Hugging Face Hub or
+from a local directory.</p>
+<p>The following example uses KV cache manager V1, greedy decoding, and the overlap
+scheduler:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">SchedulerConfig</span>
+
+
+<span class="n">model</span> <span class="o">=</span> <span class="s2">"google/flan-t5-small"</span>
+
+<span class="k">with</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="n">max_input_len</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+    <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+    <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+        <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+        <span class="n">use_kv_cache_manager_v2</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">scheduler_config</span><span class="o">=</span><span class="n">SchedulerConfig</span><span class="p">(</span><span class="n">use_python_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">llm</span><span class="p">:</span>
+    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
+        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+        <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+        <span class="s2">"translate English to German: The house is wonderful."</span><span class="p">,</span>
+        <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span>
+        <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Use the task format expected by the checkpoint. For example, T5 translation
+checkpoints commonly expect a task prefix such as <code class="docutils literal notranslate"><span class="pre">translate</span> <span class="pre">English</span> <span class="pre">to</span> <span class="pre">German:</span></code>, while a summarization checkpoint expects the source document.</p>
+<p>The LLM API performs these encoder-decoder-specific steps automatically:</p>
+<ol class="arabic simple">
+<li><p>Tokenizes the supplied string as the encoder input.</p></li>
+<li><p>Runs the encoder once and retains its output for cross-attention.</p></li>
+<li><p>Initializes the decoder from the checkpoint’s decoder start token.</p></li>
+<li><p>Generates decoder tokens and returns the detokenized decoder output.</p></li>
+</ol>
+<p>Do not prepend a decoder start token to the source prompt. If you pass token IDs
+instead of text, pass only the encoder-side token IDs:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoTokenizer</span>
+
+
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+<span class="n">source_text</span> <span class="o">=</span> <span class="s2">"translate English to German: The house is wonderful."</span>
+<span class="n">source_token_ids</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">source_text</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">source_token_ids</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">)</span>
+</pre></div>
+</div>
+<section id="configure-an-mbart-tokenizer">
+<h3>Configure an mBART tokenizer<a class="headerlink" href="#configure-an-mbart-tokenizer" title="Link to this heading">#</a></h3>
+<p>mBART tokenization depends on the source language. Create the Hugging Face
+tokenizer with <code class="docutils literal notranslate"><span class="pre">src_lang</span></code> and pass that tokenizer to <code class="docutils literal notranslate"><span class="pre">LLM</span></code> so string prompts
+receive the correct source-language token:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoTokenizer</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">SamplingParams</span>
+
+
+<span class="n">model</span> <span class="o">=</span> <span class="s2">"/path/to/mbart-large-50-many-to-one-mmt"</span>
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">src_lang</span><span class="o">=</span><span class="s2">"ro_RO"</span><span class="p">)</span>
+
+<span class="k">with</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="s2">"bfloat16"</span><span class="p">,</span>
+    <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">),</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">llm</span><span class="p">:</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+        <span class="s2">"Şeful ONU spune că nu există o soluţie militară în Siria."</span><span class="p">,</span>
+        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">),</span>
+        <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For this many-to-one checkpoint, <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code> selects English with
+the <code class="docutils literal notranslate"><span class="pre">en_XX</span></code> forced BOS token. For other mBART checkpoints, confirm that
+<code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code>, <code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, <code class="docutils literal notranslate"><span class="pre">eos_token_id</span></code>, and the
+tokenizer language settings select the source and target languages you intend
+to serve.</p>
+</section>
+<section id="understand-bart-and-mbart-decoder-tokens">
+<h3>Understand BART and mBART decoder tokens<a class="headerlink" href="#understand-bart-and-mbart-decoder-tokens" title="Link to this heading">#</a></h3>
+<p>When a BART or mBART checkpoint defines <code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, the PyTorch
+backend initializes the decoder with the following internal prefix:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>[decoder_start_token_id, forced_bos_token_id]
+</pre></div>
+</div>
+<p>For example, BART-large-CNN uses <code class="docutils literal notranslate"><span class="pre">[2,</span> <span class="pre">0]</span></code>. Customers provide only the encoder
+input; do not prepend either decoder token. By default, the returned token IDs
+exclude <code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> but include <code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, so the
+BART-large-CNN output begins with token ID 0.</p>
+<p>The forced BOS token counts against <code class="docutils literal notranslate"><span class="pre">SamplingParams.max_tokens</span></code>. Consequently,
+a request using this prefix requires <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> to be at least 2. The runtime
+uses the remaining token budget for model-selected tokens. This behavior is the
+same for greedy decoding and beam search and does not require a customer logits
+processor.</p>
+<p>EOS is a stopping token rather than a forced final token. The runtime uses
+<code class="docutils literal notranslate"><span class="pre">SamplingParams.end_id</span></code>, which defaults to the tokenizer’s <code class="docutils literal notranslate"><span class="pre">eos_token_id</span></code>. If
+the model generates EOS before the output limit, the returned token IDs include
+EOS and <code class="docutils literal notranslate"><span class="pre">finish_reason</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;stop&quot;</span></code>. Set <code class="docutils literal notranslate"><span class="pre">ignore_eos=True</span></code> to continue decoding
+past EOS.</p>
+<p>The runtime does not inject <code class="docutils literal notranslate"><span class="pre">forced_eos_token_id</span></code> when a sequence reaches
+<code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>. It preserves the model-selected final token and reports
+<code class="docutils literal notranslate"><span class="pre">finish_reason=&quot;length&quot;</span></code>.</p>
+</section>
+</section>
+<section id="transcribe-audio-with-whisper">
+<h2>Transcribe audio with Whisper<a class="headerlink" href="#transcribe-audio-with-whisper" title="Link to this heading">#</a></h2>
+<p>Whisper is an audio encoder-decoder model for speech transcription and
+translation. It differs from the text-to-text models in this guide in two ways:
+the encoder consumes audio instead of a text prompt, and the text prompt, when
+supplied, sets the decoder task prefix rather than the encoder input.</p>
+<p>Pass one audio clip per request through <code class="docutils literal notranslate"><span class="pre">multi_modal_data[&quot;audio&quot;]</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">SchedulerConfig</span>
+
+
+<span class="n">model</span> <span class="o">=</span> <span class="s2">"openai/whisper-large-v3"</span>
+<span class="n">wave</span><span class="p">,</span> <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="s2">"utterance.wav"</span><span class="p">)</span>
+
+<span class="k">with</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="c1"># Cross-KV pool capacity. The default (1024) is smaller than the 1500</span>
+    <span class="c1"># encoder positions that every Whisper request produces.</span>
+    <span class="n">max_input_len</span><span class="o">=</span><span class="mi">1500</span><span class="p">,</span>
+    <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">3000</span><span class="p">,</span>
+    <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+        <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">scheduler_config</span><span class="o">=</span><span class="n">SchedulerConfig</span><span class="p">(</span><span class="n">use_python_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">llm</span><span class="p">:</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+        <span class="p">{</span><span class="s2">"prompt"</span><span class="p">:</span> <span class="s2">""</span><span class="p">,</span> <span class="s2">"multi_modal_data"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">[(</span><span class="n">wave</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)]}},</span>
+        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">96</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">),</span>
+        <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Set <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> to at least 1500. Every Whisper request produces 1500 encoder
+positions regardless of clip length, and the cross-KV pool is sized from <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code>.</p>
+<p>The audio item accepts a file path or URL, an <code class="docutils literal notranslate"><span class="pre">(array,</span> <span class="pre">sample_rate)</span></code> tuple, or a
+<code class="docutils literal notranslate"><span class="pre">{&quot;array&quot;:</span> <span class="pre">...,</span> <span class="pre">&quot;sampling_rate&quot;:</span> <span class="pre">...}</span></code> mapping. Supply exactly one clip per
+request, at the checkpoint’s sampling rate, which is 16 kHz for the published
+Whisper checkpoints. Clips shorter than the 30-second window are zero-padded;
+longer clips and other sampling rates are rejected rather than silently
+truncated or resampled. Long-form chunked transcription is not part of this
+path.</p>
+<section id="select-the-language-and-task">
+<h3>Select the language and task<a class="headerlink" href="#select-the-language-and-task" title="Link to this heading">#</a></h3>
+<p>An empty text prompt selects the checkpoint default, which is English
+transcription (<code class="docutils literal notranslate"><span class="pre">&lt;|startoftranscript|&gt;[&lt;|en|&gt;][&lt;|transcribe|&gt;]&lt;|notimestamps|&gt;</span></code>).
+A non-empty text prompt replaces that decoder prefix verbatim and is how you
+override the language or switch to translation. It must begin with
+<code class="docutils literal notranslate"><span class="pre">&lt;|startoftranscript|&gt;</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">prompt</span> <span class="o">=</span> <span class="s2">"&lt;|startoftranscript|&gt;&lt;|de|&gt;&lt;|transcribe|&gt;&lt;|notimestamps|&gt;"</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+    <span class="p">{</span><span class="s2">"prompt"</span><span class="p">:</span> <span class="n">prompt</span><span class="p">,</span> <span class="s2">"multi_modal_data"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">[(</span><span class="n">wave</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)]}},</span>
+    <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">96</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The prefix counts against the decoder position table, so <code class="docutils literal notranslate"><span class="pre">SamplingParams.max_tokens</span></code>
+is capped to the space remaining in it. A request asking for more logs a warning
+and proceeds with the capped budget. Pre-tokenized <code class="docutils literal notranslate"><span class="pre">prompt_token_ids</span></code> are not
+consumed on this path.</p>
+</section>
+</section>
+<section id="run-a-batch">
+<h2>Run a batch<a class="headerlink" href="#run-a-batch" title="Link to this heading">#</a></h2>
+<p>Pass a list of strings to batch inputs. The strings can have different tokenized
+lengths:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sources</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="s2">"translate English to German: The house is wonderful."</span><span class="p">,</span>
+    <span class="s2">"translate English to German: The book is on the table."</span><span class="p">,</span>
+<span class="p">]</span>
+
+<span class="n">results</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">sources</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">source</span><span class="p">,</span> <span class="n">result</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">sources</span><span class="p">,</span> <span class="n">results</span><span class="p">):</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"source=</span><span class="si">{</span><span class="n">source</span><span class="si">!r}</span><span class="s2"> output=</span><span class="si">{</span><span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> must cover the encoder tokens admitted in an iteration as well
+as decoder work. Increase it for larger batches or longer source sequences.</p>
+</section>
+<section id="choose-kv-cache-manager-v1-or-v2">
+<h2>Choose KV cache manager V1 or V2<a class="headerlink" href="#choose-kv-cache-manager-v1-or-v2" title="Link to this heading">#</a></h2>
+<p>Encoder-decoder execution uses two KV cache pools:</p>
+<ul class="simple">
+<li><p>The self-attention pool stores decoder-side KV states.</p></li>
+<li><p>The cross-attention pool stores encoder-derived K/V states used by every
+decoder layer.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> is required for every encoder-decoder model. It divides
+the configured KV cache memory budget between the two pools. A value of <code class="docutils literal notranslate"><span class="pre">0.5</span></code>
+is a reasonable starting point:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span>
+    <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+    <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="n">use_kv_cache_manager_v2</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Increase <code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> when long encoder inputs exhaust the cross
+pool. Decrease it when long decoder outputs or wide beams exhaust the
+self-attention pool. The two fractions are related as follows:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>cross-attention pool = total KV cache budget * cross_kv_cache_fraction
+self-attention pool  = total KV cache budget * (1 - cross_kv_cache_fraction)
+</pre></div>
+</div>
+<p>V1 is the default and should be the first choice for production deployments.
+To evaluate V2, change only the manager selection and keep beam width equal to
+one:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span>
+    <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+    <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="n">use_kv_cache_manager_v2</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">max_beam_width</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">kv_cache_config</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>KV cache manager V2 is a prototype feature and rejects configurations with a
+maximum beam width greater than one.</p>
+</section>
+<section id="use-beam-search">
+<h2>Use beam search<a class="headerlink" href="#use-beam-search" title="Link to this heading">#</a></h2>
+<p>Beam search requires KV cache manager V1. The maximum beam width is a runtime
+capacity setting and must be specified when constructing <code class="docutils literal notranslate"><span class="pre">LLM</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">beam_width</span> <span class="o">=</span> <span class="mi">4</span>
+
+<span class="k">with</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"/path/to/bart-large-cnn"</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="s2">"bfloat16"</span><span class="p">,</span>
+    <span class="n">max_beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+    <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+        <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+        <span class="n">use_kv_cache_manager_v2</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">llm</span><span class="p">:</span>
+    <span class="n">beam_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
+        <span class="n">best_of</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+        <span class="n">n</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+        <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+        <span class="n">use_beam_search</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+        <span class="s2">"The engineering team released a faster inference service on Monday. "</span>
+        <span class="s2">"The update improves batching, lowers latency, and adds detailed "</span>
+        <span class="s2">"monitoring for operators."</span><span class="p">,</span>
+        <span class="n">sampling_params</span><span class="o">=</span><span class="n">beam_params</span><span class="p">,</span>
+        <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">hypothesis</span> <span class="ow">in</span> <span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">hypothesis</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">best_of</span></code> sets the beam width and must not exceed <code class="docutils literal notranslate"><span class="pre">LLM.max_beam_width</span></code>. <code class="docutils literal notranslate"><span class="pre">n</span></code>
+sets the number of returned hypotheses and must not exceed <code class="docutils literal notranslate"><span class="pre">best_of</span></code>. Set <code class="docutils literal notranslate"><span class="pre">n=1</span></code>
+to return only the best hypothesis.</p>
+<p>Beam search expands decoder-side cache and compute requirements. Include this
+expansion when sizing the self-attention KV pool and CUDA graph batch sizes.</p>
+</section>
+<section id="enable-encoder-and-decoder-cuda-graphs">
+<h2>Enable encoder and decoder CUDA graphs<a class="headerlink" href="#enable-encoder-and-decoder-cuda-graphs" title="Link to this heading">#</a></h2>
+<p>Configure the decoder and encoder graph grids separately:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphConfig</span><span class="p">,</span> <span class="n">EncodeCudaGraphConfig</span>
+
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">encoder_max_batch_size</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+    <span class="n">encoder_max_num_tokens</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+    <span class="n">cuda_graph_config</span><span class="o">=</span><span class="n">CudaGraphConfig</span><span class="p">(</span>
+        <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">enable_padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">encoder_cuda_graph_config</span><span class="o">=</span><span class="n">EncodeCudaGraphConfig</span><span class="p">(</span>
+        <span class="n">batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+        <span class="n">num_tokens</span><span class="o">=</span><span class="p">[</span><span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">2048</span><span class="p">],</span>
+        <span class="n">seq_lens</span><span class="o">=</span><span class="p">[</span><span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">],</span>
+        <span class="n">enable_padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">enable_encoder_decoder_mixed_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+        <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> controls decoder and mixed decoder graphs.
+<code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code> controls encoder-forward graph buckets for batch
+size, total packed tokens, and maximum sequence length. The
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> value is the hard encoder capacity and admission
+limit. With beam search, decoder graph batch sizes must cover the active
+decoder sequences after beam expansion.</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> controls the total decoder concurrency, while
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> controls encoder microbatch admission. For better
+performance, tune <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code>, and the
+encoder CUDA graph buckets together for the production workload. Start with
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> smaller than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, such as 2 versus 8,
+then adjust the limits and capture buckets based on benchmark results.</p>
+<p><code class="docutils literal notranslate"><span class="pre">enable_encoder_decoder_mixed_cuda_graph</span></code> is primarily a performance option. It
+reduces CPU launch overhead for decoder iterations that mix newly admitted
+context requests with ongoing generation requests. The option defaults to
+<code class="docutils literal notranslate"><span class="pre">True</span></code>, but becomes effective only when the encoder and decoder graph
+configurations produce usable capture shapes. Set it to <code class="docutils literal notranslate"><span class="pre">False</span></code> to disable
+mixed graphs while retaining the separate encoder and decoder CUDA graphs.</p>
+<p>Passing <code class="docutils literal notranslate"><span class="pre">EncodeCudaGraphConfig</span></code> through <code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> remains unsupported
+for encoder-decoder models; pass it through <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code>
+instead. Piecewise CUDA graphs through <code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code> are also
+unsupported for this model type.</p>
+</section>
+<section id="control-the-overlap-scheduler">
+<h2>Control the overlap scheduler<a class="headerlink" href="#control-the-overlap-scheduler" title="Link to this heading">#</a></h2>
+<p>The PyTorch backend enables the overlap scheduler by default. The examples set
+<code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler=False</span></code> explicitly to make that choice visible:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Overlap is not restricted to KV cache manager V1. Both V1 and V2 enter the same
+overlap executor loop, and that loop contains V2-specific resource handling.
+V2 remains limited to <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>. Set
+<code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler=True</span></code> when debugging.</p>
+</section>
+<section id="use-tensor-parallelism">
+<h2>Use tensor parallelism<a class="headerlink" href="#use-tensor-parallelism" title="Link to this heading">#</a></h2>
+<p>Set <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code> to the number of GPUs over which to shard the model:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">with</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+    <span class="n">pipeline_parallel_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+    <span class="n">context_parallel_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+    <span class="n">enable_attention_dp</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+        <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+        <span class="n">use_kv_cache_manager_v2</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">llm</span><span class="p">:</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">source_text</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For single-node execution through the LLM API, do not add an <code class="docutils literal notranslate"><span class="pre">mpirun</span></code> prefix.
+TensorRT LLM starts the worker processes. The selected TP size must divide the
+encoder and decoder attention head counts. Cross-attention KV head duplication
+is not supported, so its KV head count must also be divisible by the TP size.</p>
+<p>Tensor parallelism currently requires <code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;TRTLLM&quot;</span></code>. Pipeline
+parallelism, context parallelism, and attention DP are rejected for
+encoder-decoder models.</p>
+</section>
+<section id="serve-an-encoder-decoder-model">
+<h2>Serve an encoder-decoder model<a class="headerlink" href="#serve-an-encoder-decoder-model" title="Link to this heading">#</a></h2>
+<p>The following configuration starts a greedy Flan-T5 service with the PyTorch
+backend. Save it as <code class="docutils literal notranslate"><span class="pre">enc-dec-config.yaml</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attn_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bfloat16</span>
+<span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="nt">enable_chunked_prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="nt">encoder_max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="nt">encoder_max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
+<span class="nt">max_beam_width</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="nt">max_input_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
+<span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">encoder_cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">batch_sizes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">num_tokens</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">256</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">512</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1024</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">seq_lens</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">256</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">512</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">enable_encoder_decoder_mixed_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.8</span>
+<span class="w">  </span><span class="nt">cross_kv_cache_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.5</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="nt">scheduler_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">use_python_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>Start the server:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>google/flan-t5-small<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--config<span class="w"> </span>enc-dec-config.yaml
+</pre></div>
+</div>
+<p>Send the source text through the completions endpoint:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/completions<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">'{</span>
+<span class="s1">      "model": "google/flan-t5-small",</span>
+<span class="s1">      "prompt": "translate English to German: The house is wonderful.",</span>
+<span class="s1">      "max_tokens": 64,</span>
+<span class="s1">      "temperature": 0.0</span>
+<span class="s1">    }'</span>
+</pre></div>
+</div>
+<p>To serve beam search, use KV cache manager V1, restart the server with
+<code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code> set to the desired maximum, and add the following request
+fields:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"use_beam_search"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"best_of"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>For tensor parallel serving, add <code class="docutils literal notranslate"><span class="pre">--tp_size</span> <span class="pre">&lt;N&gt;</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and keep the
+attention backend set to <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>.</p>
+</section>
+<section id="size-the-runtime">
+<h2>Size the runtime<a class="headerlink" href="#size-the-runtime" title="Link to this heading">#</a></h2>
+<p>Use these guidelines as a starting point:</p>
+<ul class="simple">
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> to at least the maximum tokenized encoder input length.</p></li>
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> to at least the larger of the maximum encoder input length
+and maximum decoded sequence length. The current encoder-decoder runtime uses
+this value while sizing both phases.</p></li>
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> high enough for the active decoder tokens.</p></li>
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code> high enough for all encoder tokens in one
+encoder microbatch. This is especially important for mixed-length batches.</p></li>
+<li><p>Increase <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> for more concurrent requests. Start with a smaller
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>, such as 2 when <code class="docutils literal notranslate"><span class="pre">max_batch_size=8</span></code>, to bound encoder
+memory and admission cost without reducing decoder concurrency. Beam width
+multiplies the number of active decoder sequences but not the number of
+source requests.</p></li>
+<li><p>Tune <code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction</span></code> first, then tune
+<code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> based on whether the cross-attention or
+self-attention pool is exhausted.</p></li>
+</ul>
+</section>
+<section id="performance">
+<h2>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h2>
+<p>Configure encoder, decoder, and mixed decoder CUDA graphs for the expected
+serving workload. With representative capture buckets, the PyTorch backend can
+outperform the legacy TensorRT encoder-decoder path while avoiding the engine
+build and checkpoint conversion steps.</p>
+<p>For example, a BF16 FLAN-T5 Large serving benchmark on one H100 80 GB GPU used
+encoder CUDA graphs, padded decoder CUDA graphs, and mixed encoder-decoder CUDA
+graphs. Compared with the legacy TensorRT path, the PyTorch backend delivered
+65.8%, 12.6%, and 11.8% higher request throughput at concurrencies 8, 32, and
+64, respectively. P99 latency was 51.6%, 31.0%, and 33.5% lower.</p>
+<p>Follow <a class="reference internal" href="#enable-encoder-and-decoder-cuda-graphs"><span class="xref myst">Enable encoder and decoder CUDA graphs</span></a>
+and choose capture buckets that cover the batch sizes, packed encoder token
+counts, and sequence lengths expected in production. Capture grids that omit
+common runtime shapes fall back to eager execution and can lose these
+performance benefits.</p>
+<p>Performance depends on the model, request distribution, decoding settings, and
+GPU configuration. Benchmark with a representative workload before deployment.</p>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
+<section id="cross-kv-cache-fraction-is-required">
+<h3><code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> is required<a class="headerlink" href="#cross-kv-cache-fraction-is-required" title="Link to this heading">#</a></h3>
+<p>Every encoder-decoder runtime needs a cross-attention KV pool. Add
+<code class="docutils literal notranslate"><span class="pre">KvCacheConfig(cross_kv_cache_fraction=...)</span></code>; <code class="docutils literal notranslate"><span class="pre">0.5</span></code> is a reasonable initial
+value. Do not set this field for a decoder-only model.</p>
+</section>
+<section id="decoder-start-token-id-is-required">
+<h3><code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> is required<a class="headerlink" href="#decoder-start-token-id-is-required" title="Link to this heading">#</a></h3>
+<p>The checkpoint must define <code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> or <code class="docutils literal notranslate"><span class="pre">bos_token_id</span></code> in its
+Hugging Face model or generation configuration. Use a checkpoint with a complete
+<code class="docutils literal notranslate"><span class="pre">config.json</span></code> and, when applicable, <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>.</p>
+</section>
+<section id="kv-cache-manager-v2-fails-with-beam-search">
+<h3>KV cache manager V2 fails with beam search<a class="headerlink" href="#kv-cache-manager-v2-fails-with-beam-search" title="Link to this heading">#</a></h3>
+<p>V2 currently requires <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>. Select V1 by setting
+<code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2=False</span></code> before enabling beam search.</p>
+</section>
+<section id="tensor-parallel-initialization-is-rejected">
+<h3>Tensor parallel initialization is rejected<a class="headerlink" href="#tensor-parallel-initialization-is-rejected" title="Link to this heading">#</a></h3>
+<p>Check all of the following:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code> is <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>.</p></li>
+<li><p>Encoder, decoder, and cross-attention head counts are divisible by the TP
+size.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size=1</span></code> and <code class="docutils literal notranslate"><span class="pre">context_parallel_size=1</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_attention_dp=False</span></code>.</p></li>
+</ul>
+</section>
+<section id="encoder-cuda-graphs-fall-back-to-eager-execution">
+<h3>Encoder CUDA graphs fall back to eager execution<a class="headerlink" href="#encoder-cuda-graphs-fall-back-to-eager-execution" title="Link to this heading">#</a></h3>
+<p>Check that <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code> and <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> are set,
+that the encoder graph buckets cover the request shape, and that
+<code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;TRTLLM&quot;</span></code>. Unsupported shapes and attention backends fall back to
+eager encoder execution.</p>
+</section>
+<section id="output-quality-differs-from-the-hugging-face-example">
+<h3>Output quality differs from the Hugging Face example<a class="headerlink" href="#output-quality-differs-from-the-hugging-face-example" title="Link to this heading">#</a></h3>
+<p>Confirm that the source uses the task prefix and language settings expected by
+the checkpoint. Also compare the same model dtype, beam width, length penalty,
+EOS stopping behavior, and forced BOS configuration. Small numerical
+differences can change lower-ranked beam hypotheses when scores are close.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-support">Feature support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#choose-the-attention-backend">Choose the attention backend</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-basic-generation">Run basic generation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configure-an-mbart-tokenizer">Configure an mBART tokenizer</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#understand-bart-and-mbart-decoder-tokens">Understand BART and mBART decoder tokens</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#transcribe-audio-with-whisper">Transcribe audio with Whisper</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#select-the-language-and-task">Select the language and task</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-a-batch">Run a batch</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#choose-kv-cache-manager-v1-or-v2">Choose KV cache manager V1 or V2</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-beam-search">Use beam search</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-encoder-and-decoder-cuda-graphs">Enable encoder and decoder CUDA graphs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#control-the-overlap-scheduler">Control the overlap scheduler</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-tensor-parallelism">Use tensor parallelism</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serve-an-encoder-decoder-model">Serve an encoder-decoder model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#size-the-runtime">Size the runtime</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-kv-cache-fraction-is-required"><code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> is required</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#decoder-start-token-id-is-required"><code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> is required</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-manager-v2-fails-with-beam-search">KV cache manager V2 fails with beam search</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-initialization-is-rejected">Tensor parallel initialization is rejected</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#encoder-cuda-graphs-fall-back-to-eager-execution">Encoder CUDA graphs fall back to eager execution</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#output-quality-differs-from-the-hugging-face-example">Output quality differs from the Hugging Face example</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on August 27, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
