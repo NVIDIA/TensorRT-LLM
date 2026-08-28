@@ -6,6 +6,7 @@ Flow:
 2. Create pipeline via AutoPipeline.from_config() with MetaInit
 3. Load weights with on-the-fly quantization if dynamic_weight_quant=True
 4. Call pipeline.post_load_weights()
+5. Apply runtime LoRA adapters after all post-load hooks finish
 
 Dynamic Quantization:
 - If quant_config specifies FP8/NVFP4 and dynamic_weight_quant=True:
@@ -179,6 +180,7 @@ class PipelineLoader:
         4. Load transformer weights via pipeline.load_transformer_weights()
         5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
+        7. Apply runtime LoRA adapters after all post-load hooks finish
 
         Args:
             checkpoint_dir: Local path or HF Hub model ID (uses ``args.model`` if not provided)
@@ -295,6 +297,7 @@ class PipelineLoader:
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+        pipeline._setup_runtime_lora()
 
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128

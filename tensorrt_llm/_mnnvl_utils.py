@@ -56,9 +56,9 @@ class MnnvlMemory:
 
     # Shared across all subclasses (global/device state).
     initialized: bool = False
-    allocation_granularity: int = 0
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
+    force_fabric_handle: bool = False
 
     # Per-class state attributes. These will be auto-initialized for each subclass
     # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
@@ -69,6 +69,8 @@ class MnnvlMemory:
         "comm": None,  # MPI communicator.
         "allocated_map": dict,  # callable for fresh dict.
         "address_refcnt": dict,  # callable for fresh dict.
+        # Derived from get_allocation_prop(), whose handle type differs per class.
+        "allocation_granularity": 0,
     }
 
     # Initialize per-class state for the base class.
@@ -78,6 +80,7 @@ class MnnvlMemory:
     comm = None
     allocated_map = {}
     address_refcnt = {}
+    allocation_granularity: int = 0
 
     def __init_subclass__(cls, **kwargs):
         """Auto-initialize per-class attributes for each subclass to avoid sharing state with parent."""
@@ -103,6 +106,13 @@ class MnnvlMemory:
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
+
+    @property
+    def local_mem_handle(self) -> int:
+        """Return the local rank's CUmemGenericAllocationHandle."""
+        _, _, mem_handles, _, _, _ = type(self).allocated_map[self.ptr]
+        comm_rank = type(self).comm.Get_rank()
+        return int(mem_handles[comm_rank])
 
     @staticmethod
     def initialize():
@@ -133,8 +143,8 @@ class MnnvlMemory:
         cls.comm = comm
         return comm
 
-    @staticmethod
-    def get_allocation_prop(dev_id: int):
+    @classmethod
+    def get_allocation_prop(cls, dev_id: int):
         location = cuda.CUmemLocation()
         location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         location.id = dev_id
@@ -145,7 +155,7 @@ class MnnvlMemory:
         # May need to find a better way to handle this.
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
-        if is_on_aarch64:
+        if cls.force_fabric_handle or is_on_aarch64:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -156,19 +166,19 @@ class MnnvlMemory:
         allocation_prop.location = location
         return allocation_prop
 
-    @staticmethod
-    def get_allocation_granularity(dev_id: int):
-        if MnnvlMemory.allocation_granularity != 0:
-            return MnnvlMemory.allocation_granularity
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+    @classmethod
+    def get_allocation_granularity(cls, dev_id: int):
+        if cls.allocation_granularity != 0:
+            return cls.allocation_granularity
+        allocation_prop = cls.get_allocation_prop(dev_id)
         option = cuda.CUmemAllocationGranularity_flags(
             cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
         )
         granularity = _check_cu_result(
             cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
         )
-        MnnvlMemory.allocation_granularity = granularity
-        return MnnvlMemory.allocation_granularity
+        cls.allocation_granularity = granularity
+        return cls.allocation_granularity
 
     @classmethod
     def new_mnnvl_memory_address(cls, mapping: Mapping, size: int):
@@ -203,7 +213,7 @@ class MnnvlMemory:
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
-        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
+        granularity = cls.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
         previous_address_state = (
@@ -217,7 +227,7 @@ class MnnvlMemory:
 
         assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
 
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+        allocation_prop = cls.get_allocation_prop(dev_id)
         allocated_mem_handle = _check_cu_result(
             cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
         )
@@ -487,6 +497,12 @@ class MnnvlMemory:
             return False
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
+
+
+class CftMnnvlMemory(MnnvlMemory):
+    """MNNVL memory with FABRIC handles so CFT logical endpoints can bind it."""
+
+    force_fabric_handle: bool = True
 
 
 class HelixCpMnnvlMemory(MnnvlMemory):

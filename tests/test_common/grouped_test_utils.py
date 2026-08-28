@@ -61,14 +61,14 @@ def submit_sync_per_worker(mpi_session, fn, timeout: float = 60.0) -> list:
 def reset_worker_torch_compile_state() -> None:
     """Reset per-worker torch.compile / Dynamo state (runs inside each worker).
 
-    Dynamo's recompile counter is process-global and per-code-object. When
-    worker processes are reused across LLMs (shared ``MpiPoolSession``), each
-    ``torch_compile`` case recompiles the same ``model.forward`` code object
-    under new guards; the count accumulates and eventually trips
-    ``recompile_limit`` (16), which is a HARD failure under ``fullgraph=True``
-    (``FailOnRecompileLimitHit``) and aborts the whole MPI job. Resetting
-    between cases makes each LLM start from a clean compile cache, like a fresh
-    process. Run on every worker via ``submit_sync_per_worker``.
+    Known torch.compile test items use private sessions because other
+    process-global state, including the Userbuffers Manager, cannot be reset
+    safely between Engines. Dynamo's process-global, per-code-object recompile
+    counter can still accumulate for compile activity outside those items,
+    trip ``recompile_limit``, and hard-fail under ``fullgraph=True`` with
+    ``FailOnRecompileLimitHit``, aborting the MPI job. Keep this reset as a
+    defensive health-probe action and run it on every worker via
+    ``submit_sync_per_worker``.
     """
     import torch
 

@@ -68,8 +68,12 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
     )
 
 
-def _spec_config(mode):
-    return SimpleNamespace(spec_dec_mode=mode)
+def _spec_config(mode, *, embedded=True):
+    # Only the embedded DSpark draft shares the target's EPLB layer namespace:
+    # its stages are target decoder blocks registered into the target's
+    # balancer. A standalone DSpark drafter is an independent checkpoint and is
+    # treated like the other external drafters.
+    return SimpleNamespace(spec_dec_mode=mode, draft_is_embedded_in_target=embedded)
 
 
 @pytest.fixture
@@ -120,6 +124,17 @@ def test_non_dspark_external_drafters_do_not_inherit_load_balancer(mode):
     # silently generalized by a future refactor.
     kwargs = external_drafter_config_kwargs(
         _model_config(_lb_config(DSPARK_LAYERS)), _spec_config(mode)
+    )
+    assert "moe_load_balancer" not in kwargs
+
+
+def test_standalone_dspark_drafter_does_not_inherit_load_balancer():
+    # The flavour, not the mode, decides: a standalone DSpark drafter is its own
+    # checkpoint, so forwarding the target's EPLB config would key its experts
+    # against a layer namespace that is not the drafter's.
+    kwargs = external_drafter_config_kwargs(
+        _model_config(_lb_config(DSPARK_LAYERS)),
+        _spec_config(SpeculativeDecodingMode.DSPARK, embedded=False),
     )
     assert "moe_load_balancer" not in kwargs
 
@@ -208,3 +223,47 @@ def test_layer_base_not_checked_without_eplb():
         validate_dspark_eplb_layer_base(
             _model_config(None), _model_config(None, num_hidden_layers=3)
         )
+
+
+# ---------------------------------------------------------------------------
+# Deployment-form probe. Every DSpark dispatch -- draft model, worker, spec
+# metadata, draft-KV decision -- reads this one flag, so a misread does not
+# degrade gracefully: it routes a standalone drafter into the V4 worker.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "index_name,weight_map,model_type,expected",
+    [
+        # A parsed index is authoritative in BOTH directions. Falling through
+        # to model_type on a standalone V4-shaped drafter would classify it as
+        # embedded, and that only surfaces inside count_dspark_stages.
+        ("model.safetensors.index.json", {"mtp.0.layers.0.weight": "a"}, "deepseek_v4", True),
+        (
+            "model.safetensors.index.json",
+            {"layers.0.self_attn.q_proj.weight": "a"},
+            "deepseek_v4",
+            False,
+        ),
+        # The bin index is probed too; only the safetensors one used to be.
+        ("pytorch_model.bin.index.json", {"mtp.1.mlp.weight": "a"}, "qwen3", True),
+        # No index at all -> the model_type fallback.
+        (None, None, "deepseek_v4", True),
+        (None, None, "qwen3", False),
+    ],
+    ids=["mtp_index", "standalone_index", "bin_index", "no_index_v4", "no_index_qwen3"],
+)
+def test_draft_form_probe_reads_the_checkpoint(
+    tmp_path, index_name, weight_map, model_type, expected
+):
+    import json
+
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    if index_name is not None:
+        (tmp_path / index_name).write_text(json.dumps({"weight_map": weight_map}))
+
+    cfg = DSparkDecodingConfig(max_draft_len=7, speculative_model=str(tmp_path))
+
+    assert cfg.draft_is_embedded_in_target is expected
