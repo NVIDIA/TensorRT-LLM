@@ -296,16 +296,16 @@ def issue_dynamic_block_scaled_mma_tile(
                 }
             else:
                 nvvm_args = {
-                    "kind":
+                    "mma_kind":
                     _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
                     "cta_group":
                     _nvvm_raw.CTAGroupKind.CTA_2 if mma_tiler_mnk[0] == 256 else
                     _nvvm_raw.CTAGroupKind.CTA_1,
-                    "matrix_d":
+                    "d":
                     operand_d_ptr,
-                    "matrix_a":
+                    "a":
                     operand_a,
-                    "matrix_b":
+                    "b":
                     operand_b,
                     "idesc":
                     idesc.ir_value(),
@@ -315,7 +315,7 @@ def issue_dynamic_block_scaled_mma_tile(
                     operand_sfa_ptr,
                     "scale_b":
                     operand_sfb_ptr,
-                    "block_scale":
-                    _nvvm_raw.Tcgen05MMABlockScale.BLOCK16,
+                    "scale_vec_size":
+                    _nvvm_raw.Tcgen05MMAScaleVecSize.BLOCK16,
                 }
             nvvm.tcgen05_mma_block_scale(**nvvm_args)

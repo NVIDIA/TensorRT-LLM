@@ -299,6 +299,11 @@ class VisualGen:
         pipeline's defaults.  All declared ``extra_params`` keys are
         included with their defaults (``None`` for params without one).
 
+        Fields carrying a pipeline default are reported as unset, so a
+        round trip through this object does not read as caller intent
+        and request-dependent defaults stay resolvable; assigning any of
+        them marks it as yours.
+
         Use this to inspect what the model will use, then modify and
         pass to ``generate()``::
 

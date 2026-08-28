@@ -66,6 +66,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    GATE_SIGMOID: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
@@ -88,7 +89,10 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=cols < N).to(tl.float32)
-        x *= z * tl.sigmoid(z)
+        gate = tl.sigmoid(z)
+        if not GATE_SIGMOID:
+            gate *= z
+        x *= gate
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
         tl.store(Mean + row, mean)
@@ -108,7 +112,10 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
-        y *= z * tl.sigmoid(z)
+        gate = tl.sigmoid(z)
+        if not GATE_SIGMOID:
+            gate *= z
+        y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
         # input dtype, then static quantization reloads and multiplies by the
@@ -146,10 +153,11 @@ def _rms_norm_gated_fwd_multirow_kernel(
     N: tl.constexpr,  # row length; power of two, whole row per program
     ROWS: tl.constexpr,  # rows per program
     HEADS_PER_TOK: tl.constexpr,
+    GATE_SIGMOID: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
 ):
-    """rmsnorm(x) * silu(z), several short rows per program.
+    """Gated rmsnorm(x), several short rows per program.
 
     Z is addressed token-major: row r reads z at
     (r // HEADS_PER_TOK) * stride_z_tok + (r % HEADS_PER_TOK) * N. With
@@ -175,7 +183,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
     z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
              cols[None, :])
     z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
-    y *= z * tl.sigmoid(z)
+    gate = tl.sigmoid(z)
+    if not GATE_SIGMOID:
+        gate *= z
+    y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
         # input dtype, then static quantization reloads and multiplies by the
@@ -199,8 +210,9 @@ def rms_norm_gated_token_major(
     weight: torch.Tensor,
     eps: float,
     fp8_scale: torch.Tensor | None = None,
+    gate_activation: str = "silu",
 ) -> torch.Tensor:
-    """rmsnorm(x) * silu(z) with z read in place from a 3D token-major view.
+    """Gated rmsnorm(x) with z read from a 3D token-major view.
 
     x: [num_tokens * heads, N] with contiguous rows. z: [num_tokens, heads, N]
     whose (heads, N) block is contiguous per token and whose token stride is
@@ -210,8 +222,14 @@ def rms_norm_gated_token_major(
 
     When fp8_scale (a scalar fp32 tensor holding the downstream static input
     scale) is given, the output is quantized to float8_e4m3fn in the same
-    kernel.
+    kernel. ``gate_activation`` is ``"silu"`` for GDN's ``z * sigmoid(z)``
+    gate or ``"sigmoid"`` for KDA's ``sigmoid(z)`` gate.
     """
+    if gate_activation not in ("silu", "sigmoid"):
+        raise ValueError(
+            f"gate_activation must be 'silu' or 'sigmoid', got {gate_activation!r}"
+        )
+    gate_sigmoid = gate_activation == "sigmoid"
     M, N = x.shape
     num_tokens, heads, n_z = z.shape
     assert n_z == N and num_tokens * heads == M, (
@@ -229,6 +247,7 @@ def rms_norm_gated_token_major(
             norm_before_gate=True,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
+            gate_activation=gate_activation,
         )
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
@@ -250,6 +269,7 @@ def rms_norm_gated_token_major(
             N=N,
             ROWS=_MULTIROW_ROWS,
             HEADS_PER_TOK=heads,
+            GATE_SIGMOID=gate_sigmoid,
             num_warps=_MULTIROW_NUM_WARPS,
         )
     return out
@@ -262,8 +282,9 @@ def _(
     weight: torch.Tensor,
     eps: float,
     fp8_scale: torch.Tensor | None = None,
+    gate_activation: str = "silu",
 ) -> torch.Tensor:
-    del z, weight, eps
+    del z, weight, eps, gate_activation
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     return torch.empty_like(x, dtype=out_dtype)
 
@@ -279,7 +300,13 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     fp8_scale=None,
+    gate_activation="silu",
 ):
+    if gate_activation not in ("silu", "sigmoid"):
+        raise ValueError(
+            f"gate_activation must be 'silu' or 'sigmoid', got {gate_activation!r}"
+        )
+    gate_sigmoid = gate_activation == "sigmoid"
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -327,6 +354,7 @@ def _layer_norm_fwd(
                 N=group_size,
                 ROWS=_MULTIROW_ROWS,
                 HEADS_PER_TOK=1,
+                GATE_SIGMOID=gate_sigmoid,
                 num_warps=_MULTIROW_NUM_WARPS,
             )
         return out, mean, rstd
@@ -358,6 +386,7 @@ def _layer_norm_fwd(
             BLOCK_N=BLOCK_N,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
+            GATE_SIGMOID=gate_sigmoid,
             num_warps=num_warps,
         )
     return out, mean, rstd

@@ -31,11 +31,13 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     scope, so backends can import trtllm attention classes at module scope
     without an import cycle.
     """
+    from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
     from .msa_sparse_gqa import MsaSparseGqaFmha
 
     return {
         "cute_dsl_mla": CuteDslMlaFmha,
         "msa_sparse_gqa": MsaSparseGqaFmha,
+        "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }

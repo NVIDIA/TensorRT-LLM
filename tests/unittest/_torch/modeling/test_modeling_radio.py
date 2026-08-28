@@ -8,7 +8,8 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
+from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel, VisionTransformer
+from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -132,6 +133,30 @@ def _init_finite_weights(model: torch.nn.Module) -> None:
                 torch.nn.init.normal_(param, std=0.02)
             else:
                 param.zero_()
+
+
+def test_radio_run_blocks_lowers_torch_compiling_for_eager_fallback():
+    """A graph miss must keep RADIO attention off the compiled LM path."""
+    x = torch.zeros(1, 4)
+    attn_metadata = mock.Mock()
+    attn_metadata.seq_lens.tolist.return_value = [1]
+
+    observed = []
+    vision_tower = mock.Mock()
+    vision_tower._blocks_graph_runner.maybe_run.side_effect = lambda **_: observed.append(
+        is_torch_compiling()
+    )
+    vision_tower._run_blocks_eager.side_effect = (
+        lambda x, _: observed.append(is_torch_compiling()) or x
+    )
+
+    with torch_compiling(True):
+        output = VisionTransformer._run_blocks(vision_tower, x, attn_metadata)
+        assert is_torch_compiling(), "RADIO must restore the engine's compile flag"
+
+    assert output is x
+    assert observed == [False, False]
+    assert not is_torch_compiling()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

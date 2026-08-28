@@ -491,3 +491,31 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     # Every chunk logs when the interval is zero: 3 files x 4 KB at a 1 KB
     # chunk size means at least 12 heartbeats (short reads only add more).
     assert len(progress_logs) >= 12
+
+
+def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
+    """A model that re-opens shards itself needs the directory back.
+
+    Kimi K3 streams its rank-local experts per shard file to avoid holding
+    the whole mapping open. A lazy slice does not carry its file, and
+    transformers 5.x no longer sets ``PretrainedConfig._name_or_path``, so
+    without this the model silently fell back to the shared mapping and the
+    step was OOM-killed.
+    """
+    import json
+
+    import safetensors.torch
+    import torch
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "kimi_k3"}))
+    safetensors.torch.save_file(
+        {"w": torch.zeros(2, 2)}, tmp_path / "model-00001-of-00001.safetensors"
+    )
+
+    loader = HfWeightLoader()
+    try:
+        weights = loader.load_weights(str(tmp_path), Mapping())
+        assert isinstance(weights, ConsumableWeightsDict)
+        assert weights.checkpoint_dir == str(tmp_path)
+    finally:
+        loader.cleanup()

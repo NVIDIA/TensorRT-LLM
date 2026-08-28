@@ -167,7 +167,6 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline
 - `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
-- `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 

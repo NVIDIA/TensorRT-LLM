@@ -221,6 +221,7 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
         },
         "cache_transceiver_config": {
             "backend": "UCX",
+            "transceiver_runtime": "CPP",
             "max_tokens_in_buffer": max_tokens_in_buffer,
         },
         "num_postprocess_workers": 4,
@@ -256,6 +257,7 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
         },
         "cache_transceiver_config": {
             "backend": "UCX",
+            "transceiver_runtime": "CPP",
             "max_tokens_in_buffer": max_tokens_in_buffer,
         },
         "moe_config": {

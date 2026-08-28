@@ -20,7 +20,7 @@ def test_profile_kvcache():
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.9)
     cuda_graph_config = CudaGraphConfig(max_batch_size=512)
-    VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
+    VLM_MODEL = "Qwen3/Qwen3-VL-2B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
 
     dynamic_batch_config = DynamicBatchConfig(

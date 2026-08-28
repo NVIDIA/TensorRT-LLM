@@ -190,9 +190,10 @@ VENV=${TRTLLM_VENV:-$REPO/.venv-3.12}
 #   footprint and KV budget: drafter weights, capture buffer, and DFlash
 #   context-KV slots leave less headroom than the SA config assumes
 #   (0.25/8192 OOM'd in warmup on GB300).
-MAX_BATCH_SIZE=32
-MAX_NUM_TOKENS=8192
-KV_FRAC=0.25
+# These defaults remain overridable for NVFP4 topology-specific runs.
+MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-32}
+MAX_NUM_TOKENS=${MAX_NUM_TOKENS:-8192}
+KV_FRAC=${KV_FRAC:-0.25}
 KV_REUSE_ARG="--disable_kv_cache_reuse"
 case "$MODE" in
     sa)
@@ -219,23 +220,29 @@ case "$MODE" in
         SPEC_STATS_DEFAULT=1
         ;;
     *)
-        EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
+        # Honour an externally exported EVAL_CONFIG so alternative topologies
+        # (e.g. the NVFP4 DEP8 config) can reuse this script unchanged.
+        EVAL_CONFIG=${EVAL_CONFIG:-$REPO/examples/kimi_k3/eval_extra_llm_options.yaml}
         ;;
 esac
 
 # Per-task eval settings (see the header for the mmmu rationale). The task
 # subcommand string is expanded into the container command below, so keep it
 # on a single line. Per-sample MMMU outputs land next to the job log.
-MAX_SEQ_LEN=8192
 case "$TASK" in
     gsm8k)
+        MAX_SEQ_LEN=${MAX_SEQ_LEN:-8192}
         TASK_CMD="gsm8k"
         ;;
     mmmu)
-        MAX_SEQ_LEN=24576
+        MAX_SEQ_LEN=${MAX_SEQ_LEN:-24576}
         TASK_CMD="mmmu --post_process_fn kimi_k3_mmmu --max_input_length 8192 --max_output_length 16384 --preserve_caller_max_tokens --output_path '$REPO/kimi-k3-mmmu-results-$SLURM_JOB_ID'"
         ;;
 esac
+# Advanced evals such as GPQA can override the subcommand and its flags while
+# reusing the same server launch and topology wrapper.
+EVAL_TASK=${EVAL_TASK:-$TASK_CMD}
+EVAL_TASK_ARGS=${EVAL_TASK_ARGS:-}
 
 # Per-parallel-layout adjustments (see the header). The TEP rewrite happens on
 # a per-job copy so the checked-in YAMLs stay canonical for DEP16. In the
@@ -327,6 +334,14 @@ srun --mpi=pmix \
         # sa/dflash modes, off otherwise (explicit env still wins either way).
         export TLLM_EVAL_SPEC_STATS=\"\${TLLM_EVAL_SPEC_STATS:-$SPEC_STATS_DEFAULT}\"
 
+        # Kimi K3 weight/precision switches. Forwarded explicitly rather than
+        # relying on environment propagation into the container, so that a run
+        # either has the setting it was submitted with or fails visibly - a
+        # silently-unset precision flag would look like a clean A/B while
+        # actually re-running the same configuration twice.
+        export KIMI_K3_FP8_WEIGHT_READ=\"${KIMI_K3_FP8_WEIGHT_READ:-0}\"
+        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ=\$KIMI_K3_FP8_WEIGHT_READ\"
+
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;
         # without this the job silently tests the main checkout's code).
@@ -336,7 +351,7 @@ srun --mpi=pmix \
             '$VENV/bin/trtllm-eval' \
             --model \"$MODEL\" \
             --backend pytorch \
-            --tp_size 16 \
+            --tp_size ${TP_SIZE:-16} \
             --max_batch_size $MAX_BATCH_SIZE \
             --max_seq_len $MAX_SEQ_LEN \
             --max_num_tokens $MAX_NUM_TOKENS \
@@ -344,5 +359,5 @@ srun --mpi=pmix \
             $KV_REUSE_ARG \
             --trust_remote_code \
             --config '$EVAL_CONFIG' \
-            $TASK_CMD
+            $EVAL_TASK $EVAL_TASK_ARGS
     "

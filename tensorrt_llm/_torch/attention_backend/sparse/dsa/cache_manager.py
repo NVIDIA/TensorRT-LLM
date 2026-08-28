@@ -38,6 +38,36 @@ def _get_indexer_k_cache_bytes_per_token(
     return data_bytes + scale_bytes
 
 
+def _resolve_fp8_ds_mla_head_dim(
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    head_dim: int,
+    dtype: DataType,
+) -> Tuple[bool, int]:
+    """Validate and lower the inline-scale cache layout to storage elements."""
+    # The Python LLM API config owns ``dtype``; direct cache-manager users and
+    # older fixtures may still pass the mirrored pybind config, which does not
+    # expose Python-only fields.
+    use_fp8_ds_mla = getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+    if not use_fp8_ds_mla:
+        return False, head_dim
+
+    from ..inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
+
+    if tokens_per_block != PAGE_SIZE:
+        raise ValueError(
+            f"FlashInfer DSA FMHA requires tokens_per_block={PAGE_SIZE}, got {tokens_per_block}."
+        )
+    if head_dim != 576:
+        raise ValueError(f"inline-scale KV layout requires head_dim=576, got {head_dim}.")
+    elem_bytes = {DataType.BF16: 2, DataType.FP8: 1}.get(dtype)
+    if elem_bytes is None:
+        raise ValueError(f"inline-scale KV layout requires BF16 or FP8, got {dtype}.")
+    if TOKEN_BYTES % elem_bytes != 0:
+        raise ValueError("inline-scale KV token size must align to the cache dtype.")
+    return True, TOKEN_BYTES // elem_bytes
+
+
 def _get_indexer_k_cache_size_per_token(
     model_config: ModelConfig,
     mapping: Mapping,
@@ -128,6 +158,9 @@ class DSACacheManager(KVCacheManager):
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
+        self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
+            kv_cache_config, tokens_per_block, head_dim, dtype
+        )
 
         from tensorrt_llm._torch.speculative import get_num_spec_layers
 
@@ -262,8 +295,17 @@ class DSACacheManager(KVCacheManager):
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
-        mem_per_token *= num_attention_layers * head_dim
+        kv_cache_config = kwargs.get("kv_cache_config")
+        if (
+            kv_cache_config is not None
+            and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+        ):
+            from ..inline_scale_kv import TOKEN_BYTES
+
+            mem_per_token = num_attention_layers * TOKEN_BYTES
+        else:
+            # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
+            mem_per_token *= num_attention_layers * head_dim
 
         if num_layers is not None:
             num_indexer_layers = max(num_layers, 1)
@@ -380,6 +422,9 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self.index_head_dim = sparse_params.index_head_dim
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         self._unique_primary_pool: Optional[torch.Tensor] = None
+        self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
+            kv_cache_config, tokens_per_block, head_dim, dtype
+        )
 
         from tensorrt_llm._torch.speculative import get_num_spec_layers
 

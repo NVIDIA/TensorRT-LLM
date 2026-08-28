@@ -87,12 +87,16 @@ on this turn**.
 State tokens you will see in the table:
 
 - Stage states: `PENDING` (not yet started), `IN_PROGRESS` (active),
-  `CLOSED` (verified by QA), and the transient `CLOSED (pending QA)`
-  the Reviewer uses while submitting to QA.
+  `CLOSED` (verified by QA), the transient `CLOSED (pending QA)`
+  the Reviewer uses while submitting to QA, and `INTERRUPTED`
+  (preempted by a feedback-triggered replan; terminal, PlanDrafter-
+  owned).
 - Goal states: `[Undo]` (not yet started), `[Doing]` (active, with an
   `(iterations=N)` suffix the Reviewer maintains), `[Done]` (closed
-  with evidence), `[Failed]` (Reviewer judged unrecoverable). At most
-  one `[Doing]` Goal per Stage.
+  with evidence), `[Failed]` (Reviewer judged unrecoverable), and
+  `[Skipped]` (preempted by a feedback-triggered replan; terminal,
+  PlanDrafter-owned — never work on it, its still-needed work lives in
+  a later Stage's Goals). At most one `[Doing]` Goal per Stage.
 
 ### Per-turn rules
 

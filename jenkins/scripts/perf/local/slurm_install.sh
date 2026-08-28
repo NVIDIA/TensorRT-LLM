@@ -78,6 +78,17 @@ slurm_install_setup() {
             retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
         fi
 
+        # Generic post-install hook (opt-in; no-op unless POST_INSTALL_HOOK set).
+        # Runs ONCE per node here, on the localid-0 task, INSIDE the locked section
+        # and BEFORE the lock file is written -- so the other ranks (which wait on
+        # the lock below) don't start the workload until the hook has finished
+        # (e.g. BOLT swapping in instrumented libs, which must be in place before
+        # any worker rank loads them). Container-visible path; must be idempotent.
+        if [ -n "${POST_INSTALL_HOOK:-}" ]; then
+            echo "(Running POST_INSTALL_HOOK) $POST_INSTALL_HOOK"
+            bash "$POST_INSTALL_HOOK"
+        fi
+
         cd /tmp
         echo "(Writing install lock) Current directory: $(pwd)"
         touch "$lock_file"

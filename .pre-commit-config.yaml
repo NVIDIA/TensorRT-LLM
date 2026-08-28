@@ -62,7 +62,6 @@ common-files: &common_files |
         examples/llm-api/quickstart_advanced.py |
         examples/llm-api/quickstart_example.py |
         examples/llm-api/quickstart_multimodal.py |
-        examples/llm-api/star_attention.py |
         examples/longbench/eval_longbench_v1.py |
         examples/models/core/gpt_oss/openai_chat_client_function_calling.py |
         examples/models/core/kimi_k2/kimi_k2_tool_calling_example.py |
@@ -112,7 +111,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
         tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
         tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/star_flashinfer.py |
         tensorrt_llm/_torch/attention_backend/trtllm.py |
         tensorrt_llm/_torch/attention_backend/utils.py |
         tensorrt_llm/_torch/attention_backend/vanilla.py |
@@ -321,7 +319,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/speculative/__init__.py |
         tensorrt_llm/_torch/speculative/auto_heuristic.py |
         tensorrt_llm/_torch/speculative/drafter.py |
-        tensorrt_llm/_torch/speculative/drafting_loops.py |
         tensorrt_llm/_torch/speculative/eagle3.py |
         tensorrt_llm/_torch/speculative/interface.py |
         tensorrt_llm/_torch/speculative/model_drafter.py |
@@ -831,7 +828,6 @@ legacy-files: &legacy_files |
         examples/llm-api/quickstart_advanced.py |
         examples/llm-api/quickstart_example.py |
         examples/llm-api/quickstart_multimodal.py |
-        examples/llm-api/star_attention.py |
         examples/longbench/eval_longbench_v1.py |
         examples/models/core/gpt_oss/openai_chat_client_function_calling.py |
         examples/models/core/kimi_k2/kimi_k2_tool_calling_example.py |
@@ -881,7 +877,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
         tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
         tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/star_flashinfer.py |
         tensorrt_llm/_torch/attention_backend/trtllm.py |
         tensorrt_llm/_torch/attention_backend/utils.py |
         tensorrt_llm/_torch/attention_backend/vanilla.py |
@@ -1090,7 +1085,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/speculative/__init__.py |
         tensorrt_llm/_torch/speculative/auto_heuristic.py |
         tensorrt_llm/_torch/speculative/drafter.py |
-        tensorrt_llm/_torch/speculative/drafting_loops.py |
         tensorrt_llm/_torch/speculative/eagle3.py |
         tensorrt_llm/_torch/speculative/interface.py |
         tensorrt_llm/_torch/speculative/model_drafter.py |
@@ -1547,7 +1541,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:

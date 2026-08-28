@@ -192,6 +192,7 @@ def kda_decode_mtp_kernel(
             cute.make_layout((KERNEL_WIDTH * vec_size,), stride=(1,)), cutlass.Float32
         )
     r_exp_A = cutlass.Float32(0.0)
+    run_precompute = False
     if cutlass.const_expr(USE_REGULAR_METADATA) or eos > bos:
         if cutlass.const_expr(FUSE_PRECOMPUTE or RUNTIME_PRECOMPUTE_FLAG):
             if cutlass.const_expr(RUNTIME_PRECOMPUTE_FLAG):

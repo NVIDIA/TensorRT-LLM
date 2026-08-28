@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
 
@@ -122,6 +123,69 @@ def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
     assert transformer_config.pretrained_config.num_attention_heads == 40
     assert transformer_2_config.pretrained_config.num_layers == 48
     assert transformer_2_config.pretrained_config.num_attention_heads == 32
+
+
+def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig, VisualGenArgs
+
+    events = []
+
+    class FakePipeline(nn.Module):
+        transformer_components = []
+
+        def __init__(self, config):
+            super().__init__()
+            self.pipeline_config = config
+
+        def to(self, device):
+            return self
+
+        def load_transformer_weights(self, checkpoint_dir):
+            events.append("load_transformer_weights")
+            return {}
+
+        def load_weights(self, weights):
+            events.append("load_weights")
+
+        def load_standard_components(self, checkpoint_dir, device, skip_components=None, **kwargs):
+            events.append("load_standard_components")
+
+        def post_load_weights(self):
+            events.append("post_load_weights")
+
+        def _setup_runtime_lora(self):
+            events.append("runtime_lora")
+
+        def torch_compile(self):
+            pass
+
+        def _setup_cache_acceleration(self):
+            events.append("cache_acceleration")
+
+    args = VisualGenArgs(
+        model="/tmp/model",
+        runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+    )
+    config = DiffusionPipelineConfig(runtime_lora=args.runtime_lora_config)
+
+    monkeypatch.setattr(PipelineLoader, "_resolve_checkpoint_dir", lambda self, path: path)
+    monkeypatch.setattr(PipelineLoader, "_resolve_pipeline_config", lambda self, path: {})
+    monkeypatch.setattr(
+        DiffusionPipelineConfig,
+        "from_pretrained",
+        staticmethod(lambda checkpoint_dir, args=None, **kwargs: config),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_loader.AutoPipeline.from_config",
+        lambda config, checkpoint_dir: FakePipeline(config),
+    )
+    monkeypatch.setattr(PipelineLoader, "_materialize_meta_tensors", lambda self, pipeline: None)
+
+    PipelineLoader(args, device="cpu").load(skip_warmup=True)
+
+    assert events.index("runtime_lora") > events.index("post_load_weights")
 
 
 def test_load_wan_pipeline_basic(checkpoint_exists):

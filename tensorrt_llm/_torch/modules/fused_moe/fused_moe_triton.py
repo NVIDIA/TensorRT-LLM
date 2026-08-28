@@ -38,6 +38,7 @@ from triton_kernels.tensor_details import layout
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...model_config import ModelConfig
+from ...utils import ActivationType
 from ..linear import TensorParallelMode, load_weight_shard
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
                             MoERejectReason)
@@ -1550,10 +1551,15 @@ class TritonFusedMoE(MoE):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """Triton MoE: SM90 only, and only the gpt-oss style swiglu.
+        """Triton MoE: SM90 only, SwiGLU-family activations only.
 
         Supports unquantized BF16, FP8 per-tensor QDQ, W4A8_MXFP4_FP8 and
         W4A16_MXFP4.
+
+        Both SwiGLU flavours run: the gpt-oss package (bias + alpha/beta/limit)
+        fuses the activation into the GEMM, while plain SwiGLU takes the unfused
+        ``swiglu_torch`` path. That is a performance difference, not a
+        capability one, so it is not expressed as a rejection here.
         """
         sm_version = d.env.sm
         quant_algo = p.quant_algo
@@ -1569,11 +1575,17 @@ class TritonFusedMoE(MoE):
                 MoERejectReason.EPLB_UNSUPPORTED,
                 "TritonFusedMoE does not implement the EPLB slot hooks")
 
-        # Require gpt-oss SwiGLU; abstain when the style is unknown.
-        if p.swiglu_gptoss_style is False:
+        # The kernel always computes SwiGLU -- the fused ``swiglu_fn`` when
+        # beta == 1.0, ``swiglu_torch`` otherwise -- so the constraint that
+        # matters is the activation family, not which SwiGLU flavour it is. A
+        # non-SwiGLU activation would be silently mis-computed as SwiGLU, so it
+        # must be turned down here.
+        if p.activation_type not in (ActivationType.Swiglu,
+                                     ActivationType.SwigluBias):
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "TritonFusedMoE only supports swiglu_gptoss_style=True")
+                f"TritonFusedMoE computes SwiGLU, got activation={p.activation}"
+            )
 
         if d.smart_router:
             return _reject(
@@ -1701,15 +1713,6 @@ class TritonFusedMoE(MoE):
                 return TritonMXFP4FusedMoEMethod(activation_dtype=self.dtype)
         else:
             return TritonUnquantizedFusedMoEMethod()
-
-    def create_weights(self):
-        if self._weights_created:
-            return
-
-        self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
-
-        self._weights_created = True
 
     def forward_impl(
         self,

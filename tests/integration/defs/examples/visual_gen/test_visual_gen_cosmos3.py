@@ -15,6 +15,7 @@
 
 """Single-GPU integration and accuracy tests for Cosmos3."""
 
+import contextlib
 import os
 from dataclasses import dataclass
 
@@ -35,6 +36,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _golden_media_path,
     _lpips_deterministic_algorithms,
     _lpips_model_path,
+    _lpips_pinned_fp32_matmul_precision,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
@@ -160,7 +162,9 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
-            with torch.no_grad():
+            # Pin fp32-matmul arithmetic: the goldens are cut and compared
+            # under "highest" so they reproduce on both PyPI and NGC torch.
+            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
                     # The goldens were generated against an empty uncond branch,
@@ -246,7 +250,22 @@ def _generate_cosmos3_feature_image(case, output_path):
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
         _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
-        with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):
+        # Pin fp32-matmul arithmetic only for the profiles whose goldens are
+        # re-baselined under it. NVFP4's golden is waived (nvbugs/6572800) and
+        # not re-cut here, so it keeps generating under the host default; pin
+        # it when that golden is re-cut. Note the NVFP4 profile reaches this
+        # same function inside a spawned process, so the guard has to be here
+        # rather than at the call site.
+        precision_context = (
+            contextlib.nullcontext()
+            if case.features.quantization == "NVFP4"
+            else _lpips_pinned_fp32_matmul_precision()
+        )
+        with (
+            _lpips_deterministic_algorithms(),
+            precision_context,
+            _fixed_nvfp4_quantization_backend(case.features),
+        ):
             args = _build_single_device_feature_args(
                 model_path,
                 case.features,
@@ -569,6 +588,12 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
+            # Deliberately NOT pinned with _lpips_pinned_fp32_matmul_precision:
+            # this golden is a diffusers cross-stack reference whose provenance
+            # records no fp32-matmul state, so whether pinning improves or
+            # degrades agreement is unknown. The test is skipped in CI anyway
+            # (checkpoint absent), and its golden is not re-cut here. Pin this
+            # path when the golden is re-cut and the flag can be recorded.
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_I2V_4STEP_LPIPS_PROMPT,
@@ -760,7 +785,7 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
             # The goldens were generated against an empty uncond branch, so pin it
             # here rather than inheriting the video-mode default negative prompt.
             forward_kwargs.setdefault("negative_prompt", "")
-            with torch.no_grad():
+            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
                 result = pipeline.forward(
                     seed=COSMOS3_EDGE_LPIPS_SEED,
                     use_guardrails=False,

@@ -102,10 +102,12 @@ def test_lora(client: openai.OpenAI, model_name: str,
             model=model_name,
             prompt=prompt,
             max_tokens=20,
+            temperature=0.0,
             extra_body=extra_body,
         )
-        # lora output is not deterministic, so do not check if match with reference
-        # TODO: need to fix this
-        print(f"response: {response.choices[0].text}")
+        output = response.choices[0].text
+        print(f"response: {output}")
         print(f"reference: {reference}")
-        # assert similar(response.choices[0].text, reference)
+        assert output == reference, (
+            f"Unexpected output for LoRA adapter {lora_adapter_name!r}: "
+            f"prompt={prompt!r}, response={output!r}, reference={reference!r}")

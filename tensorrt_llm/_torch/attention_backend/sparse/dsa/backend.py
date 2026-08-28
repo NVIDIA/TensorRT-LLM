@@ -59,6 +59,8 @@ class DSATrtllmAttention(TrtllmAttention):
             sparse_params = sparse_attention_config.to_sparse_params(layer_idx=layer_idx)
         if sparse_params is None:
             raise ValueError("sparse_params is required for DSATrtllmAttention and cannot be None")
+        kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         TrtllmAttention.__init__(
             self,
             layer_idx,

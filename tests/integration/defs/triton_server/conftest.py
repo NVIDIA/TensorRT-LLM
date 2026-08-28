@@ -282,19 +282,6 @@ def llama_v2_tokenizer_model_root():
 
 
 @pytest.fixture(scope="session")
-def mistral_v1_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mistral_v1_tokenizer_model_root = os.path.join(models_root,
-                                                   "mistral-7b-v0.1")
-
-    assert os.path.exists(
-        mistral_v1_tokenizer_model_root
-    ), f"{mistral_v1_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mistral_v1_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
 def gpt_tokenizer_model_root(llm_backend_venv):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -386,19 +373,6 @@ def blip2_opt_model_root():
 
 
 @pytest.fixture(scope="session")
-def llava_onevision_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_onevision_model_root = os.path.join(models_root,
-                                              "llava-onevision-qwen2-7b-ov-hf")
-
-    assert os.path.exists(
-        llava_onevision_model_root
-    ), f"{llava_onevision_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_onevision_model_root
-
-
-@pytest.fixture(scope="session")
 def test_video_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -459,19 +433,6 @@ def llama3_v1_8b_model_root():
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return llama_model_root
-
-
-@pytest.fixture(scope="session")
-def mixtral_8x7b_v0_1_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mixtral_8x7b_v0_1_model_root = os.path.join(models_root,
-                                                "Mixtral-8x7B-v0.1")
-
-    assert os.path.exists(
-        mixtral_8x7b_v0_1_model_root
-    ), f"{mixtral_8x7b_v0_1_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mixtral_8x7b_v0_1_model_root
 
 
 @pytest.fixture(scope="session")

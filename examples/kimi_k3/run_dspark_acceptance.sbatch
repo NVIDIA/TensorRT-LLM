@@ -167,7 +167,7 @@ if [[ "$SKIP_BASELINE" -eq 0 ]]; then
 fi
 
 echo "=== leg (b): DSpark-on measurement ==="
-LEG_ENV_EXPORT="export TLLM_DFLASH_ACCEPT_STATS_DIR='$OUTDIR/accept-stats'" \
+LEG_ENV_EXPORT="export TLLM_DFLASH_ACCEPT_STATS_DIR='$OUTDIR/accept-stats' TLLM_DFLASH_ACCEPT_STATS_FLUSH_EVERY=1" \
     run_leg dspark --drafter "$DRAFTER" $CONF_ARGS \
     --stats-dir "$OUTDIR/accept-stats" \
     --output-json "$OUTDIR/results_dspark.json"

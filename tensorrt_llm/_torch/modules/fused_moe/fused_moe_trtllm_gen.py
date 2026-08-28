@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -21,7 +20,7 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -31,12 +30,12 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
                       Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from ..gated_mlp import GatedMLP
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             require_comm_plan)
 from .impl_environment import MoEDep
-from .interface import (FORCE_SEPARATED_ROUTING, MoE, MoEWeightLoadingMode,
-                        _reject)
+from .interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode, _reject
 from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 
 # isort: off
@@ -60,7 +59,7 @@ class RoutingParams:
     routed_scaling_factor: Optional[float]
 
 
-class TRTLLMGenFusedMoE(MoE):
+class TRTLLMGenFusedMoE(MoEImplBase):
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
 
@@ -129,9 +128,19 @@ class TRTLLMGenFusedMoE(MoE):
         ActivationType.Relu2,
     }
 
+    # Quantization algorithms with fused SiTu FC1 cubins in the TRTLLM-Gen
+    # batched-GEMM kernel drop. NVFP4 feeds the group-16 `Bmm_E2m1_E2m1E2m1_...
+    # _siTuGlu_*` kernels; W4A8_MXFP4_MXFP8 the group-32
+    # `Bmm_MxE4m3_MxE2m1MxE4m3_..._siTuGlu_*` ones. There is no standalone
+    # SiTu activation kernel, so anything without a fused cubin is rejected.
+    _SITU_SUPPORTED_QUANT_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """TRTLLM-Gen kernels: SM100/SM103, bfloat16 activations.
+        """TRTLLM-Gen kernels: the SM100 (Blackwell) family, bfloat16 activations.
 
         Quantized coverage is ``_SUPPORTED_QUANT_ALGOS``. The unquantized BF16
         path is served by a FlashInfer kernel, so it is available only where
@@ -140,11 +149,14 @@ class TRTLLMGenFusedMoE(MoE):
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
-        # TRTLLMGenFusedMoE requires SM in {100, 103}
-        if sm_version not in {100, 103}:
+        # The cubin drop is sm_100f (family-compatible) plus arch-specific
+        # sm_100a/sm_103a, so the whole SM100 family is servable; the C++
+        # selector (KernelRunner.cpp isSMCompatible) picks sm_100f on family
+        # members without their own arch build.
+        if not is_sm_100f(sm_version):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+                f"TRTLLMGenFusedMoE requires the SM100 family, got SM{sm_version}"
             )
 
         # forward_impl asserts x.dtype == torch.bfloat16
@@ -238,13 +250,15 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
         trtllm_gen_activation_alpha: Optional[float] = None,
         trtllm_gen_activation_beta: Optional[float] = None,
     ):
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -280,12 +294,6 @@ class TRTLLMGenFusedMoE(MoE):
         self.use_flashinfer = self._check_flashinfer_backend_support()
         backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
         self.op_backend: MoEOpBackend = get_op_backend(backend_name)
-
-        # Note: Load balancer initialization is handled by base class _init_load_balancer()
-        # If no load balancer is available, the base class will set:
-        # - self.num_slots = self.num_experts
-        # - self.expert_size_per_partition = self.num_experts // self.ep_size
-        # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
         self._weights_created = False
         self.num_fused_shared_expert = 0
@@ -370,24 +378,36 @@ class TRTLLMGenFusedMoE(MoE):
             raise ValueError(
                 "TRTLLM-Gen SiTu requires bfloat16 activations, got "
                 f"{self.dtype}.")
-        if get_sm_version() not in {100, 103}:
-            raise ValueError("TRTLLM-Gen SiTu requires SM100 or SM103, got "
+        if not is_sm_100f():
+            raise ValueError("TRTLLM-Gen SiTu requires the SM100 family, got "
                              f"SM{get_sm_version()}.")
-        if (self.quant_config is None
-                or self.quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8):
-            quant_algo = (None if self.quant_config is None else
-                          self.quant_config.quant_algo)
+        quant_algo = (None if self.quant_config is None else
+                      self.quant_config.quant_algo)
+        if quant_algo not in self._SITU_SUPPORTED_QUANT_ALGOS:
+            supported = ", ".join(
+                sorted(algo.name for algo in self._SITU_SUPPORTED_QUANT_ALGOS))
             raise ValueError(
-                "TRTLLM-Gen SiTu requires W4A8_MXFP4_MXFP8 quantization, "
+                f"TRTLLM-Gen SiTu requires one of {supported} quantization, "
                 f"got {quant_algo}.")
         if self.tp_size > 1:
             # Intra-expert MoE TP: w1/w3 column-shard and w2 row-shard along
-            # the intermediate dim (the stock MXFP4 quant-method loaders slice
-            # the group-32 packed bytes and scales per rank). Require the
+            # the intermediate dim (the stock MXFP4/NVFP4 quant-method loaders
+            # slice the packed bytes and scales per rank). Require the
             # per-rank shard to stay a whole multiple of the quant method's
             # weight alignment so per-shard scale groups and the padded
             # weight buffers line up without fractional groups.
-            alignment = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment
+            if quant_algo == QuantAlgo.NVFP4:
+                # NVFP4 picks its alignment from the layer shape in
+                # create_weights (32 -> 128 or 256), which runs after this
+                # check. Ask for the resolved value: the class attribute is
+                # only the starting point, and validating against it would
+                # admit shards the loader cannot lay out.
+                alignment, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(
+                    self.hidden_size, self.intermediate_size_per_partition)
+            else:
+                # MXFP4's alignment is a fixed class attribute.
+                alignment = (
+                    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment)
             if (self.intermediate_size % self.tp_size != 0
                     or self.intermediate_size_per_partition % alignment != 0):
                 raise ValueError(
@@ -557,13 +577,15 @@ class TRTLLMGenFusedMoE(MoE):
             if not isinstance(self.op_backend, TRTLLMOpBackend):
                 raise ValueError(
                     "TRTLLM-Gen SiTu requires the native TRTLLM op backend.")
-            if not self.has_w4a8_mxfp4_mxfp8:
+            if not (self.has_nvfp4 or self.has_w4a8_mxfp4_mxfp8):
+                raise ValueError("TRTLLM-Gen SiTu requires the NVFP4 or "
+                                 "W4A8_MXFP4_MXFP8 path.")
+            expected_scaling_vector_size = 16 if self.has_nvfp4 else 32
+            if self.scaling_vector_size != expected_scaling_vector_size:
                 raise ValueError(
-                    "TRTLLM-Gen SiTu requires the W4A8_MXFP4_MXFP8 path.")
-            if self.scaling_vector_size != 32:
-                raise ValueError(
-                    "TRTLLM-Gen SiTu requires MXFP4 scaling vector size 32, "
-                    f"got {self.scaling_vector_size}.")
+                    "TRTLLM-Gen SiTu requires scaling vector size "
+                    f"{expected_scaling_vector_size} for this quantization "
+                    f"mode, got {self.scaling_vector_size}.")
             # For SiTu these hold the backend-local activation parameters
             # (populated by create_weights, which runs before this check).
             for name in ("swiglu_alpha", "swiglu_beta"):
@@ -581,10 +603,19 @@ class TRTLLMGenFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
-                return NVFP4TRTLLMGenFusedMoEMethod(
-                ) if self.swiglu_alpha is not None or self.activation_type in [
-                    ActivationType.Relu2, ActivationType.Silu
-                ] else NVFP4TRTLLMGenFusedMoEBaseMethod()
+                # ``is_situ_activation`` (not ``swiglu_alpha is not None``):
+                # SiTu fills the swiglu_alpha/swiglu_beta slots from
+                # create_weights, i.e. after this runs, so keying off the
+                # tensor would make the selected method depend on *when*
+                # _get_quant_method is called. Like the SwiGLU-alpha and
+                # element-wise cases, SiTu needs the padded method's
+                # alignment handling.
+                needs_padded_method = (
+                    self.swiglu_alpha is not None or self.is_situ_activation
+                    or self.activation_type
+                    in [ActivationType.Relu2, ActivationType.Silu])
+                return (NVFP4TRTLLMGenFusedMoEMethod() if needs_padded_method
+                        else NVFP4TRTLLMGenFusedMoEBaseMethod())
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
@@ -616,10 +647,11 @@ class TRTLLMGenFusedMoE(MoE):
         # rejected by _validate_backend_local_activation) and feed the same
         # gemm1_alpha/gemm1_beta op slots. Safe with respect to the
         # `swiglu_alpha is not None` gates: create_moe.py checks the
-        # constructor kwargs (None for SiTu); _get_quant_method consults
-        # swiglu_alpha only on the nvfp4 branch (SiTu requires
-        # W4A8_MXFP4_MXFP8) and has already run above; _check_configs runs
-        # after this point and its swiglu gate admits w4a8_mxfp4_mxfp8.
+        # constructor kwargs (None for SiTu); _get_quant_method's nvfp4 branch
+        # keys off is_situ_activation rather than swiglu_alpha, so it returns
+        # the same method before and after this point; _check_configs runs
+        # after this point and its swiglu gate admits both nvfp4 and
+        # w4a8_mxfp4_mxfp8.
         if self.is_situ_activation:
             self.swiglu_alpha = nn.Parameter(torch.full(
                 (self.expert_size_per_partition, ),
@@ -658,21 +690,6 @@ class TRTLLMGenFusedMoE(MoE):
                 self.trtllm_gen_activation_alpha))
             self.swiglu_beta.data.fill_(float(self.trtllm_gen_activation_beta))
 
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
-        assert self._weights_created
-
-        assert len(weights) == 1
-        weights = weights[0]
-
-        kargs = {}
-        if "allow_partial_loading" in inspect.getfullargspec(
-                self.quant_method.load_weights).args:
-            kargs["allow_partial_loading"] = allow_partial_loading
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
-                                       **kargs)
-
     def try_fused_kimi_route_quant(
         self,
         x: Union[torch.Tensor, MxFp8QuantizedTensor],
@@ -689,8 +706,7 @@ class TRTLLMGenFusedMoE(MoE):
                 or isinstance(x, MxFp8QuantizedTensor)):
             return None
 
-        sm_version = get_sm_version()
-        if (not 100 <= sm_version < 110 or not self.has_w4a8_mxfp4_mxfp8
+        if (not is_sm_100f() or not self.has_w4a8_mxfp4_mxfp8
                 or not isinstance(self.op_backend, TRTLLMOpBackend)
                 or not isinstance(self.routing_method,
                                   DeepSeekV3MoeRoutingMethod)):

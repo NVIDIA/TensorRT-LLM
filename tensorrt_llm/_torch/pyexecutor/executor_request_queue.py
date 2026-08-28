@@ -3,8 +3,7 @@ import datetime
 import queue
 import threading
 import time
-from itertools import repeat
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -23,7 +22,6 @@ class RequestQueueItem:
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
-    query: Optional[list] = None  # only used in `StarAttention`
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -91,15 +89,12 @@ class ExecutorRequestQueue:
 
         return child_req_ids
 
-    def _enqueue_impl(
-        self, requests_and_queries: Iterable[Tuple[ExecutorRequest,
-                                                   Optional[List]]]
-    ) -> List[int]:
+    def _enqueue_impl(self, requests: Iterable[ExecutorRequest]) -> List[int]:
         req_ids = []
         with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
-            for request, query in requests_and_queries:
+            for request in requests:
                 req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
@@ -108,8 +103,7 @@ class ExecutorRequestQueue:
                 self.request_queue.put(
                     RequestQueueItem(req_id,
                                      request,
-                                     child_req_ids=child_req_ids,
-                                     query=query))
+                                     child_req_ids=child_req_ids))
                 req_ids.append(req_id)
         return req_ids
 
@@ -117,15 +111,13 @@ class ExecutorRequestQueue:
         """
         Enqueue new requests
         """
-        return self._enqueue_impl(zip(requests, repeat(None)))
+        return self._enqueue_impl(requests)
 
-    def enqueue_request(self,
-                        request: ExecutorRequest,
-                        query: Optional[List] = None) -> int:
+    def enqueue_request(self, request: ExecutorRequest) -> int:
         """
-        Enqueue a new request, query is only used in `StarAttention`.
+        Enqueue a new request.
         """
-        return self._enqueue_impl([(request, query)])[0]
+        return self._enqueue_impl([request])[0]
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:

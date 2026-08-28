@@ -67,7 +67,7 @@ def run_test(
         .tolist()
     )
     input_new_tokens_list = input_new_tokens.tolist()
-    num_accepted_draft_tokens = torch_sampler._process_draft_tokens_tree(
+    num_accepted_draft_tokens = torch_sampler._two_model_spec_dec._process_draft_tokens_tree(
         request=input_request,
         new_tokens_tensor=input_new_tokens,
         new_tokens_list=input_new_tokens_list,

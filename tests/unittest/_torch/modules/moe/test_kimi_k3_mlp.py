@@ -299,7 +299,7 @@ def test_kimi_k3_dense_layer_uses_gated_mlp(
         def forward(self, hidden_states, *args, **kwargs):
             return hidden_states
 
-    monkeypatch.setattr(modeling_kimi_linear, "KimiKDARuntime", _IdentityAttention)
+    monkeypatch.setattr(modeling_kimi_linear, "KimiKDALinearAttention", _IdentityAttention)
     monkeypatch.setattr(distributed, "AllReduce", _IdentityAllReduce)
 
     mapping = Mapping(

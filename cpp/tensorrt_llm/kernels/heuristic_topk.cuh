@@ -164,6 +164,9 @@ constexpr int SAFETY_MARGIN = 2048;
 constexpr int MAX_CANDIDATES = TOP_K + SAFETY_MARGIN * 2; // 6144
 
 constexpr int MAX_REFINE_ITERS = 15;
+// Phase-3 repair budget: bisecting on the uint32 key image collapses any
+// bracket to adjacent floats in <= 32 steps; 40 adds slack.
+constexpr int MAX_REPAIR_ITERS = 40;
 constexpr int NUM_BINS = 2048;
 
 static_assert(TOP_K % BLOCK_SIZE == 0);
@@ -420,6 +423,23 @@ __device__ __forceinline__ float warpReduceMax(float val)
 #endif
 
 // ============================================================================
+// Order-preserving float <-> uint32 map (arch-independent)
+// ============================================================================
+// Same bijection as floatToOrderedUint above but defined for every
+// __CUDA_ARCH__; the Phase-3 repair bisects on this key image so the
+// bracket provably collapses (a float-average midpoint has no such bound).
+__device__ __forceinline__ unsigned gvrOrderKey(float f)
+{
+    unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+__device__ __forceinline__ float gvrOrderKeyToFloat(unsigned u)
+{
+    return __uint_as_float((u & 0x80000000u) ? (u & ~0x80000000u) : ~u);
+}
+
+// ============================================================================
 // Device: Block count ≥ threshold in GLOBAL memory  (1-sync pattern)
 // ============================================================================
 
@@ -661,15 +681,23 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         }
         __syncthreads();
 
+        // Degenerate hint (all gathered values identical or out of range):
+        // reset to a trusted bracket instead of emitting row[0:K]; done = 2
+        // skips the secant (it cannot converge on a full-range bracket) and
+        // hands the row to the Phase-3 repair. The hint only affects speed.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
             if (tid == 0)
-                for (int i = 0; i < topK && i < N; i++)
-                {
-                    outputIndices[i] = i;
-                    outputValues[i] = input[i];
-                }
-            return;
+            {
+                float const seed = (smem->val_hi <= -FLT_MAX) ? 0.0f : smem->pmax_saved;
+                smem->val_lo = -FLT_MAX;
+                smem->val_hi = FLT_MAX;
+                smem->cnt_lo = N;
+                smem->cnt_hi = 0;
+                smem->threshold = seed;
+                smem->done = 2;
+            }
+            __syncthreads();
         }
 
         // ================================================================
@@ -773,25 +801,42 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
     // Phase 3 (GVR Verify) — Ballot-free candidate collect
     // ================================================================
 
-    // When done==1, Phase 2 already verified the candidate count is in
-    // [kK, kCC]; skip the redundant full-N blockCountGE re-check.
+    // done==1: Phase 2 verified cand_count in [kK, kCC]; skip the re-check.
+    // Otherwise the secant did not converge and `threshold` carries no
+    // guarantee: repair BOTH sides (the old loop only handled overflow, so
+    // an undershooting threshold shipped a -1-padded, silently wrong top-K).
     if (smem->done != 1)
     {
         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
-        if (tid == 0 && smem->cand_count > kCC)
-            smem->val_lo = smem->threshold;
+        // Anchor the untested bracket end at a float extreme: Phase 1 seeds
+        // both ends from HINTED values with invented counts, so they can sit
+        // on the same side of the K-th value. count(-FLT_MAX) >= kK,
+        // count(FLT_MAX) = 0.
+        if (tid == 0)
+        {
+            int c = smem->cand_count;
+            if (c > kCC)
+            {
+                smem->val_lo = smem->threshold;
+                smem->val_hi = FLT_MAX;
+            }
+            else if (c < kK)
+            {
+                smem->val_hi = smem->threshold;
+                smem->val_lo = -FLT_MAX;
+            }
+        }
         __syncthreads();
 
-        for (int retry = 0; retry < 10 && smem->cand_count > kCC; retry++)
+        // Invariant maintained below: count(val_lo) >= kK.
+        for (int retry = 0; retry < MAX_REPAIR_ITERS && (smem->cand_count > kCC || smem->cand_count < kK); retry++)
         {
+            unsigned const klo = gvrOrderKey(smem->val_lo);
+            unsigned const khi = gvrOrderKey(smem->val_hi);
+            if (khi <= klo + 1u)
+                break; // bracket collapsed to adjacent representable values
             if (tid == 0)
-            {
-                float lo = smem->val_lo, hi = smem->val_hi;
-                float mid = (lo + hi) * 0.5f;
-                if (mid == lo)
-                    mid = hi;
-                smem->threshold = mid;
-            }
+                smem->threshold = gvrOrderKeyToFloat(klo + ((khi - klo) >> 1));
             __syncthreads();
             blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
             if (tid == 0)
@@ -803,6 +848,70 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
                     smem->val_hi = smem->threshold;
             }
             __syncthreads();
+        }
+
+        // Still short of kK: the bracket collapsed; val_lo admits >= kK by
+        // the anchor invariant (or the row has < kK finite entries and the
+        // -1 tail pad is the correct answer).
+        if (smem->cand_count < kK)
+        {
+            if (tid == 0)
+                smem->threshold = smem->val_lo;
+            __syncthreads();
+            blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
+        }
+        // blockCountGE publishes cand_count from tid 0 only; the branch below
+        // must be uniform across the block.
+        __syncthreads();
+
+        // Collapsed bracket still over kCC = a tie plateau wider than the
+        // candidate buffer: emit everything strictly above val_lo (< kK by
+        // construction) plus arbitrary ties — a valid tie-aware top-K. The
+        // adjacency guard keeps the emit sound if the loop ever ran dry.
+        if (smem->cand_count > kCC && gvrOrderKey(smem->val_hi) <= gvrOrderKey(smem->val_lo) + 1u)
+        {
+            float const thr = smem->threshold;
+            if (tid == 0)
+                smem->out_count = 0;
+            __syncthreads();
+            for (int i = tid; i < N; i += BLOCK_SIZE)
+            {
+                float const v = __ldg(&input[i]);
+                if (v > thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = v;
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            int const n_gt = min(smem->out_count, kK);
+            if (tid == 0)
+                smem->out_count = n_gt;
+            __syncthreads();
+            for (int i = tid; i < N && smem->out_count < kK; i += BLOCK_SIZE)
+            {
+                float const v = __ldg(&input[i]);
+                if (v == thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = v;
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            for (int i = min(smem->out_count, kK) + tid; i < kK; i += BLOCK_SIZE)
+            {
+                outputValues[i] = -FLT_MAX;
+                outputIndices[i] = -1;
+            }
+            return;
         }
     }
 
@@ -1227,15 +1336,23 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         }
         __syncthreads();
 
+        // Degenerate hint (all gathered values identical or out of range):
+        // reset to a trusted bracket instead of emitting row[0:K]; done = 2
+        // skips the secant (it cannot converge on a full-range bracket) and
+        // hands the row to the Phase-3 repair. The hint only affects speed.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
             if (tid == 0)
-                for (int i = 0; i < topK && i < N; i++)
-                {
-                    outputIndices[i] = i;
-                    outputValues[i] = __ldg(&input[i]); // both InputT, no convert
-                }
-            return;
+            {
+                float const seed = (smem->val_hi <= -FLT_MAX) ? 0.0f : smem->pmax_saved;
+                smem->val_lo = -FLT_MAX;
+                smem->val_hi = FLT_MAX;
+                smem->cnt_lo = N;
+                smem->cnt_hi = 0;
+                smem->threshold = seed;
+                smem->done = 2;
+            }
+            __syncthreads();
         }
 
         // ================================================================
@@ -1339,23 +1456,37 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
     // Phase 3 — Ballot-free candidate collect
     // ================================================================
 
+    // Mirror of the fp32 Phase-3 repair in gvrTopKJob (see comments there).
     if (smem->done != 1)
     {
         blockCountGEDtype<InputT>(input, N, smem->threshold, smem, tid, warp_id, lane);
-        if (tid == 0 && smem->cand_count > kCC)
-            smem->val_lo = smem->threshold;
+        // See the fp32 path: anchor the untested bracket end at a float extreme
+        // so count(val_lo) >= kK > count(val_hi) holds by construction.
+        if (tid == 0)
+        {
+            int c = smem->cand_count;
+            if (c > kCC)
+            {
+                smem->val_lo = smem->threshold;
+                smem->val_hi = FLT_MAX;
+            }
+            else if (c < kK)
+            {
+                smem->val_hi = smem->threshold;
+                smem->val_lo = -FLT_MAX;
+            }
+        }
         __syncthreads();
 
-        for (int retry = 0; retry < 10 && smem->cand_count > kCC; retry++)
+        // Invariant maintained below: count(val_lo) >= kK.
+        for (int retry = 0; retry < MAX_REPAIR_ITERS && (smem->cand_count > kCC || smem->cand_count < kK); retry++)
         {
+            unsigned const klo = gvrOrderKey(smem->val_lo);
+            unsigned const khi = gvrOrderKey(smem->val_hi);
+            if (khi <= klo + 1u)
+                break; // bracket collapsed to adjacent representable values
             if (tid == 0)
-            {
-                float lo = smem->val_lo, hi = smem->val_hi;
-                float mid = (lo + hi) * 0.5f;
-                if (mid == lo)
-                    mid = hi;
-                smem->threshold = mid;
-            }
+                smem->threshold = gvrOrderKeyToFloat(klo + ((khi - klo) >> 1));
             __syncthreads();
             blockCountGEDtype<InputT>(input, N, smem->threshold, smem, tid, warp_id, lane);
             if (tid == 0)
@@ -1367,6 +1498,72 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
                     smem->val_hi = smem->threshold;
             }
             __syncthreads();
+        }
+
+        if (smem->cand_count < kK)
+        {
+            if (tid == 0)
+                smem->threshold = smem->val_lo;
+            __syncthreads();
+            blockCountGEDtype<InputT>(input, N, smem->threshold, smem, tid, warp_id, lane);
+        }
+        // blockCountGEDtype publishes cand_count from tid 0 only; the branch
+        // below must be uniform across the block.
+        __syncthreads();
+
+        // Collapsed bracket with > kCC elements at the threshold: emit the
+        // strictly-greater set plus arbitrary ties directly (see fp32 path).
+        // The direct emit below is only valid once the bracket has collapsed:
+        // it assumes count(> thr) < kK, which is exactly "val_hi is the next
+        // representable value above val_lo and count(val_hi) < kK". If the
+        // loop ran out of iterations without collapsing (it cannot, given
+        // MAX_REPAIR_ITERS >= 32, but the guard keeps that an invariant rather
+        // than an assumption) fall through to the ordinary collect.
+        if (smem->cand_count > kCC && gvrOrderKey(smem->val_hi) <= gvrOrderKey(smem->val_lo) + 1u)
+        {
+            float const thr = smem->threshold;
+            if (tid == 0)
+                smem->out_count = 0;
+            __syncthreads();
+            for (int i = tid; i < N; i += BLOCK_SIZE)
+            {
+                float const v = Trait::to_fp32(__ldg(&input[i]));
+                if (v > thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = Trait::from_fp32(v);
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            int const n_gt = min(smem->out_count, kK);
+            if (tid == 0)
+                smem->out_count = n_gt;
+            __syncthreads();
+            for (int i = tid; i < N && smem->out_count < kK; i += BLOCK_SIZE)
+            {
+                float const v = Trait::to_fp32(__ldg(&input[i]));
+                if (v == thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = Trait::from_fp32(v);
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            InputT const neg_max = Trait::from_fp32(-FLT_MAX);
+            for (int i = min(smem->out_count, kK) + tid; i < kK; i += BLOCK_SIZE)
+            {
+                outputValues[i] = neg_max;
+                outputIndices[i] = -1;
+            }
+            return;
         }
     }
 

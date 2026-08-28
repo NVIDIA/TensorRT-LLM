@@ -486,24 +486,6 @@ def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
     assert by_path["int_field"].kind == "value"
 
 
-def test_collect_llm_api_config_captures_star_attention_backend():
-    """attn_backend allowlist recognizes the real FLASHINFER_STAR_ATTENTION value.
-
-    The recognized set mirrors get_attention_backend dispatch; the previously
-    listed FLASH_ATTENTION is not a real backend and is removed.
-    """
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        attn_backend="FLASHINFER_STAR_ATTENTION",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["attn_backend"] == "FLASHINFER_STAR_ATTENTION"
-    assert meta["capture_succeeded"] is True
-
-
 def test_collect_llm_api_config_swallows_expected_capture_errors(monkeypatch):
     """The inner net stays fail-silent for the expected sanitizer error family."""
     from tensorrt_llm.usage import llmapi_config

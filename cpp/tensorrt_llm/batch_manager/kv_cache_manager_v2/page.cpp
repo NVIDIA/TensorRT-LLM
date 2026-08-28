@@ -260,14 +260,16 @@ SharedPageLock PageHolder::lock(
 UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
-    if (holder->page->cacheLevel != kGpuLevel)
-        throw LogicError("Lock can only be applied to GPU-memory pages");
+    if (holder->page->cacheLevel != kHotLevel)
+    {
+        throw LogicError("Lock can only be applied to hot-tier pages");
+    }
 }
 
 UniqPageLock::~UniqPageLock()
 {
     Page& p = *page();
-    TLLM_CHECK_DEBUG(p.cacheLevel == kGpuLevel && !p.scheduledForEviction());
+    TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
     // Set readyEvent to the merged finish events of all readers. For committed (read-only)
     // pages, this means the next reader will wait for prior reads to complete, which is
     // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
@@ -416,7 +418,7 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
         wasScheduled[i] = t.page->scheduledForEviction();
         if (wasScheduled[i])
             storeMgr->excludeFromEviction(*t.page);
-        if (t.page->cacheLevel != kGpuLevel)
+        if (t.page->cacheLevel != kHotLevel)
         {
             PoolGroupIndex pgIdx = storeMgr->getPoolGroupIndex(t.lifeCycle);
             requirements[pgIdx] += 1;
@@ -430,7 +432,7 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
                   CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
         DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
         { kvCache._recordDroppedPages(pages, cacheLevel); };
-        storeMgr->prepareFreeSlots(kGpuLevel, requirements, migrationRecorder, dropRecorder);
+        storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
         // Migrate non-GPU pages.
         storeMgr->batchedMigrateToGpu(targets, kvCache, migrationRecorder);
     }
@@ -535,7 +537,7 @@ void ScratchSlotLock::unlock()
 {
     TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     mSlot.readyEvent = mOwner->finishEvent();
-    mOwner->storageManager()->releaseSlot(mLifeCycle, kGpuLevel, std::move(mSlot));
+    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, std::move(mSlot));
     TLLM_CHECK_DEBUG(!mSlot.hasValidSlot());
 }
 

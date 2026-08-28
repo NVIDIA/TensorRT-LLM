@@ -82,8 +82,11 @@ else
 fi
 
 # ---------------- Sanity checks ----------------
+# "unspecified" is allowed: same convention as L0_Test.groovy / submit.py —
+# omit #SBATCH --partition and let SLURM use the cluster default (e.g. oci-hsg).
 if [[ "$partition" == "CHANGE_ME" ]]; then
     echo "ERROR: please set 'partition' in $config_file." >&2
+    echo "       Use a real SLURM partition name, or 'unspecified' for the cluster default." >&2
     exit 1
 fi
 if [[ ${#test_ids[@]} -eq 0 ]]; then

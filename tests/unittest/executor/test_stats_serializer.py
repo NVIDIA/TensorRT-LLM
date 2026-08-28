@@ -406,6 +406,15 @@ class TestStatsSerializer:
                     ),
                 ),
             },
+            # Cold pool groups use their own numbering, unrelated to the hot id 7 above.
+            {
+                0: KVCacheV2PoolGroupIterationStats(
+                    pool_group_id=0,
+                    slot_size=(4 << 20,),
+                    window_sizes=(16, 64),
+                    stats=pool_group_stats,
+                )
+            },
         )
 
         result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
@@ -415,9 +424,9 @@ class TestStatsSerializer:
         assert d["kvCacheIterationStats"]["16"]["primaryPeakFreeNumBlocks"] == 12
         assert d["kvCacheIterationStats"]["16"]["primaryPeakUsedNumBlocks"] == 15
         assert d["kvCacheIterationStats"]["16"]["primaryPeakEvictableNumBlocks"] == 4
-        assert d["kvCacheIterationStats"]["16"]["secondaryPeakFreeNumBlocks"] == 6
-        assert d["kvCacheIterationStats"]["16"]["secondaryPeakUsedNumBlocks"] == 4
-        assert d["kvCacheIterationStats"]["16"]["secondaryPeakEvictableNumBlocks"] == 2
+        # Cold blocks are reported only by the cold pool-group view: a window bucket is keyed by the
+        # hot grouping and cold levels group lifecycles independently, so no window owns a cold group.
+        assert not [key for key in d["kvCacheIterationStats"]["16"] if key.startswith("secondary")]
         assert "kvCacheIterationStatsByPoolGroup" in d
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["7"]
         assert pool_group["poolGroupId"] == 7
@@ -426,13 +435,24 @@ class TestStatsSerializer:
         assert pool_group["primaryPeakFreeNumBlocks"] == 12
         assert pool_group["primaryPeakUsedNumBlocks"] == 15
         assert pool_group["primaryPeakEvictableNumBlocks"] == 4
-        assert pool_group["secondaryPeakFreeNumBlocks"] == 6
-        assert pool_group["secondaryPeakUsedNumBlocks"] == 4
-        assert pool_group["secondaryPeakEvictableNumBlocks"] == 2
         assert pool_group["iterGenAllocBlocks"] == 2
         assert "iterReusedBlocks" not in pool_group
         assert "iterMissedBlocks" not in pool_group
         assert "iterCacheHitRate" not in pool_group
+        # A hot pool group cannot index a cold level, so it reports no cold blocks either.
+        assert not [key for key in pool_group if key.startswith("secondary")]
+
+        # The cold view is the sole account of cold blocks, in its own pool-group numbering, and it
+        # omits the primary_* and iter* fields that do not apply to a cold group.
+        cold_group = d["kvCacheIterationStatsByColdPoolGroup"]["0"]
+        assert cold_group["coldPoolGroupId"] == 0
+        assert cold_group["slotSize"] == [4 << 20]
+        assert cold_group["windowSizes"] == [16, 64]
+        assert cold_group["secondaryPeakFreeNumBlocks"] == 6
+        assert cold_group["secondaryPeakUsedNumBlocks"] == 4
+        assert cold_group["secondaryPeakEvictableNumBlocks"] == 2
+        assert not [key for key in cold_group if key.startswith("primary")]
+        assert not [key for key in cold_group if key.startswith("iter")]
         assert "kvCacheIterationStatsByLifecycle" in d
         life_cycle = d["kvCacheIterationStatsByLifecycle"]["3"]
         assert life_cycle["lifeCycleId"] == 3

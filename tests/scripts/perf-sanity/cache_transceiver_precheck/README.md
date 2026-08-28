@@ -26,21 +26,19 @@ layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`.
 
 ## Enabling / disabling
 
-**Off by default** until the gate is validated on the post-merge stages
-(the precheck is a launch-script gate, not a pytest case, so it cannot be
-waived in `waives.txt` — this default is the waive). To opt in:
+**On by default** for every disaggregated perf-sanity test. To opt out:
 
 - per test yaml:
 
   ```yaml
   cache_transceiver_precheck:
-    enabled: true
+    enabled: false
     # optional overrides (defaults in precheck_config.PRECHECK_DEFAULTS):
     # request_lengths: [1024, 8192]
     # num_requests: 2
     # wave_timeout_s: 180
-    # wireup_timeout_s: 1800     # first-rep NIXL agent wire-up allowance
-    # step_timeout_s: 2700       # external srun timeout (default derives from topology)
+    # wireup_timeout_s: 600      # first-rep NIXL agent wire-up allowance
+    # step_timeout_s: 1200       # default; yaml overrides are capped at 1800
   ```
 
 - or globally at launch-script generation time: `TRTLLM_DISAGG_CT_PRECHECK=0`
@@ -50,13 +48,19 @@ waived in `waives.txt` — this default is the waive). To opt in:
 ## Timeouts
 
 The first rep of the schedule (the warmup rep) additionally budgets
-`wireup_timeout_s` (default `min(1800, 150 * max world size)`): the C++ NIXL
+`wireup_timeout_s` (default `min(600, 150 * max world size)`). "Wire-up" is
+the one-time exchange of agent and registered-memory metadata and creation of
+the peer endpoints before payload transfer. The C++ NIXL
 path pays a one-time serialized `fetchRemoteMD` metadata exchange per
 (receiver rank, ctx rank) agent pair, and cold cross-rack fetches were
 measured at 100-170s each — real serving absorbs this as slow first requests,
-so the precheck does too. Later reps run under the tight `wave_timeout_s`,
-which is what actually catches hangs. Set `PRECHECK_DEBUG=1` in the worker
-env to raise the C++/Python transceiver log levels when debugging a stall.
+so the precheck does too. The complete precheck has a topology-independent
+20-minute default external limit; exceptional yaml overrides may extend it to
+at most 30 minutes. Exceeding the configured limit is a network/environment
+failure, even with multiple peers. Later reps run under the tight
+`wave_timeout_s`, which is what actually catches hangs. Set `PRECHECK_DEBUG=1`
+in the worker env to raise the C++/Python transceiver log levels when debugging
+a stall.
 
 The Python sender's `kv_transfer_timeout_ms` is also a real request deadline.
 If block-all returns without every expected request completed—or any rank

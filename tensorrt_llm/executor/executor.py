@@ -127,7 +127,6 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
@@ -159,7 +158,6 @@ class GenerationExecutor(ABC):
             prompt_token_ids,
             sampling_params=sampling_params,
             postproc_params=postproc_params,
-            query_token_ids=query_token_ids,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
@@ -183,7 +181,6 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: Union[List[int], List[List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]],
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
@@ -198,8 +195,6 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             prompt_token_ids = [prompt_token_ids]
-            if query_token_ids:
-                query_token_ids = [query_token_ids]
 
         futures = []
         for i, p in enumerate(prompt_token_ids):
@@ -219,7 +214,6 @@ class GenerationExecutor(ABC):
             future = self.generate_async(
                 p,
                 sampling_params=sp,
-                query_token_ids=query_token_ids,
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 streaming=False,
@@ -470,6 +464,10 @@ class GenerationExecutor(ABC):
 
     def get_data_transceiver_state(self) -> bytes:
         return b""
+
+    def get_startup_metrics(self) -> dict | None:
+        """Return startup metrics, or ``None`` when temporarily unavailable."""
+        return {}
 
     @staticmethod
     def _create_ray_executor(

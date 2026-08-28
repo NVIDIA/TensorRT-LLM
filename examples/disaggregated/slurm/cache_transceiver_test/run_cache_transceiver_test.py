@@ -56,7 +56,10 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
@@ -830,6 +833,28 @@ def main():
     zmq_sock = open_sock()
 
     cases = build_cases(cfg)
+    # The C++ fabric-memory env getter is cached on its first KV pool
+    # allocation. Enable the default before any matrix case builds a pool, even
+    # when a C++ transceiver case appears before Python+V1 in the matrix.
+    python_v1_case = next(
+        (case for case in cases if case["runtime"] == "PYTHON" and case["cache_manager"] == "V1"),
+        None,
+    )
+    if python_v1_case is not None:
+        maybe_enable_fabric_memory_for_python_transceiver(
+            CacheTransceiverConfig(
+                backend=python_v1_case["backend"],
+                transceiver_runtime="PYTHON",
+            ),
+            KVCacheManager,
+        )
+        print(
+            f"[{role} rank={rank}] PYTHON+V1 case in matrix: "
+            "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY="
+            f"{os.environ.get('TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY')} "
+            "applies to every case in this run, including C++ transceiver ones",
+            flush=True,
+        )
     req_lens = cfg["test_matrix"]["request_lengths"]
     warmup = cfg["test_matrix"]["warmup_requests"]
     num_req = cfg["test_matrix"]["num_requests_per_length"]

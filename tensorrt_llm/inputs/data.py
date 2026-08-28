@@ -32,9 +32,6 @@ class TextPrompt(TypedDict):
     input processor for mm input processing.
     """
 
-    query: NotRequired[str]
-    """The query input text for star attention."""
-
 
 class TokensPrompt(TypedDict):
     """Schema for a tokenized prompt."""
@@ -62,9 +59,6 @@ class TokensPrompt(TypedDict):
     Optional multi-modal processor kwargs to be forwarded to the
     input processor for mm input processing.
     """
-
-    query_token_ids: NotRequired[List[int]]
-    """The query input token IDs for star attention."""
 
     multi_item_part_lens: NotRequired[List[int]]
     """Metadata for multi-item scoring.

@@ -188,60 +188,6 @@ def get_from_waiting_queue(
     return items
 
 
-def partition_context_for_star_attention(
-    ctx_ids_list: List[int], cp_rank: int, cp_size: int, block_size: int, anchor_block_size: int
-) -> Tuple[List[List[int]], List[List[int]], int]:
-    """Partition context for Star Attention CP.
-
-    Args:
-        ctx_ids_list: List of context token IDs.
-        cp_rank: Current CP rank.
-        cp_size: Total number of CP ranks.
-        block_size: Size of each block.
-        anchor_block_size: Size of anchor block.
-
-    Returns:
-        Tuple of (ctx_blocks, position_blocks, padding).
-    """
-    ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
-    ctx_len = ctx_ids.shape[-1]
-
-    if block_size is None:
-        block_size = ctx_len // cp_size
-    if anchor_block_size is None:
-        anchor_block_size = block_size
-
-    assert anchor_block_size <= block_size, (
-        f"cp_anchor_size {anchor_block_size} should be smaller than block_size {block_size}"
-    )
-
-    padding = 0
-    if ctx_len % block_size != 0:
-        padding = block_size - (ctx_len % block_size)
-        assert padding <= ctx_len, "block size is too large for context, please set it smaller"
-        ctx_ids = torch.cat((ctx_ids, torch.zeros_like(ctx_ids)[:, :padding]), dim=-1)
-    position_ids = torch.arange(0, ctx_ids.shape[-1]).unsqueeze(0)
-
-    ctx_ids_blocks = torch.tensor_split(torch.stack(ctx_ids.split(block_size, dim=-1)), cp_size)
-    position_ids_blocks = torch.tensor_split(
-        torch.stack(position_ids.split(block_size, dim=-1)), cp_size
-    )
-
-    if cp_rank != 0:
-        ctx_blocks = [ctx_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-        position_blocks = [position_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-    else:
-        ctx_blocks, position_blocks = [], []
-
-    for idx in range(len(ctx_ids_blocks[cp_rank])):
-        ctx_block = ctx_ids_blocks[cp_rank][idx]
-        position_block = position_ids_blocks[cp_rank][idx]
-        ctx_blocks.append(ctx_block.tolist()[0])
-        position_blocks.append(position_block.tolist()[0])
-
-    return ctx_blocks, position_blocks, padding
-
-
 def partition_context_for_helix(
     input_token_ids: List[int], cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> Tuple[List[int], List[int], int, int]:
@@ -378,79 +324,6 @@ def merge_helix_requests(
     return req_with_children
 
 
-def merge_star_attention_requests(
-    new_requests: List,
-    cp_rank: int,
-    cp_size: int,
-    cp_config: dict,
-    exclude_last_generation_logits: bool,
-) -> List[LlmRequest]:
-    """Merge requests for Star Attention CP.
-
-    Args:
-        new_requests: List of RequestQueueItem objects.
-        cp_rank: Current CP rank.
-        cp_size: Total number of CP ranks.
-        cp_config: CP configuration dict containing 'block_size' and 'cp_anchor_size'.
-        exclude_last_generation_logits: Whether to exclude last generation logits.
-
-    Returns:
-        List of LlmRequest objects.
-    """
-    result = []
-    block_size = cp_config["block_size"]
-    anchor_block_size = cp_config["cp_anchor_size"]
-
-    for req_item in new_requests:
-        req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
-        ctx_len0 = len(exe_req.input_token_ids)
-
-        ctx_blocks, position_blocks, last_block_padding_num = partition_context_for_star_attention(
-            exe_req.input_token_ids, cp_rank, cp_size, block_size, anchor_block_size
-        )
-
-        if cp_rank == cp_size - 1 and last_block_padding_num > 0:
-            ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
-            position_blocks[-1] = position_blocks[-1][:-last_block_padding_num]
-
-        # if has query
-        if query_token_ids:
-            ctx_blocks.append(query_token_ids)
-            position_blocks.append([i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))])
-
-        # insert the dummy block to align the number of ctx iterations of each rank
-        total_blocks = (ctx_len0 + block_size - 1) // block_size
-        num_blocks_per_rank = (total_blocks + cp_size - 1) // cp_size + 1  # 1 for query block
-        if len(ctx_blocks) == num_blocks_per_rank:
-            ctx_blocks.insert(1, [])
-            position_blocks.insert(1, [])
-        elif len(ctx_blocks) == num_blocks_per_rank + 1:
-            # anchor + ctx_blocks + qry_block
-            pass
-        else:
-            raise ValueError(
-                f"Invalid context partition: rank = {cp_rank}, "
-                f"len(ctx_blocks) = {len(ctx_blocks)}, "
-                f"num_blocks_per_rank = {num_blocks_per_rank}"
-            )
-
-        # fake data for scheduler
-        ctx_blocks_list = [0] * (block_size + anchor_block_size)
-
-        req = executor_request_to_llm_request(
-            req_id, exe_req, exclude_last_generation_logits, ctx_blocks_list
-        )
-        req.gen_iters = 0
-        req.ctx_iters = 0
-        req.ctx_blocks = ctx_blocks
-        req.ctx_position_blocks = position_blocks
-        req.query_id = query_token_ids
-
-        result.append(req)
-
-    return result
-
-
 @nvtx_range("merge_requests")
 def merge_requests(
     new_requests: List,
@@ -466,8 +339,8 @@ def merge_requests(
 
     Args:
         new_requests: List of RequestQueueItem objects.
-        cp_config: CP configuration dict. May contain 'cp_type', 'tokens_per_block',
-            'block_size', 'cp_anchor_size'.
+        cp_config: CP configuration dict. May contain 'cp_type' and
+            'tokens_per_block'.
         cp_rank: Current CP rank.
         cp_size: Total number of CP ranks.
         exclude_last_generation_logits: Whether to exclude last generation logits.
@@ -480,15 +353,7 @@ def merge_requests(
     """
     if "cp_type" in cp_config:
         cp_type = cp_config["cp_type"]
-        if cp_type == CpType.STAR:
-            return merge_star_attention_requests(
-                new_requests,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                cp_config=cp_config,
-                exclude_last_generation_logits=exclude_last_generation_logits,
-            )
-        elif cp_type == CpType.HELIX:
+        if cp_type == CpType.HELIX:
             return merge_helix_requests(
                 new_requests,
                 cp_rank=cp_rank,

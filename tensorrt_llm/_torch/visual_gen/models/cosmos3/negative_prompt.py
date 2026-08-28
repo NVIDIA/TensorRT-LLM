@@ -30,7 +30,7 @@ COSMOS3_VIDEO_NEGATIVE_PROMPT = {
     "subjects": [
         {
             "description": "Blurry, poorly defined subjects with inconsistent shapes and unrealistic proportions.",
-            "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color bleeding between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
+            "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color smearing between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
             "relationship": "Subjects appear disconnected from the environment, floating or improperly grounded in the scene without proper occlusion or spatial coherence.",
             "location": "Subjects are poorly placed within the frame, appearing at awkward positions that violate basic compositional rules.",
             "relative_size": "Inconsistent scale relationships between subjects and the environment, with objects appearing too large or too small relative to their surroundings.",
@@ -50,7 +50,7 @@ COSMOS3_VIDEO_NEGATIVE_PROMPT = {
         },
         {
             "description": "Extremely low-quality subjects with visible rendering artifacts, broken mesh geometry, and completely unrealistic proportions throughout.",
-            "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color bleeding between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
+            "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color smearing between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
             "relationship": "Subjects appear disconnected from the environment, floating or improperly grounded in the scene without proper occlusion or spatial coherence.",
             "location": "Subjects are poorly placed within the frame, appearing at awkward positions that violate basic compositional rules.",
             "relative_size": "Inconsistent scale relationships between subjects and the environment, with objects appearing too large or too small relative to their surroundings.",
@@ -70,7 +70,7 @@ COSMOS3_VIDEO_NEGATIVE_PROMPT = {
         },
         {
             "description": "Poorly generated subjects exhibiting all hallmarks of failed neural rendering — flickering edges, inconsistent depth, and uncanny spatial relationships.",
-            "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color bleeding between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
+            "appearance_details": "Distorted features, visible compression artifacts, muddy textures lacking fine detail, color smearing between elements, and unnatural skin tones or surface textures that appear artificial or computer-generated.",
             "relationship": "Subjects appear disconnected from the environment, floating or improperly grounded in the scene without proper occlusion or spatial coherence.",
             "location": "Subjects are poorly placed within the frame, appearing at awkward positions that violate basic compositional rules.",
             "relative_size": "Inconsistent scale relationships between subjects and the environment, with objects appearing too large or too small relative to their surroundings.",
@@ -99,7 +99,7 @@ COSMOS3_VIDEO_NEGATIVE_PROMPT = {
     "aesthetics": {
         "composition": "Cluttered, poorly framed composition with no clear focal point. Important elements are cut off by the frame edges. The rule of thirds is completely ignored, leading to an unbalanced and visually unpleasant arrangement.",
         "color_scheme": "Oversaturated, garish colors that clash violently. Color banding is visible in gradient areas. The overall palette feels artificial and digitally processed rather than natural.",
-        "mood_atmosphere": "Unsettling, uncanny atmosphere that fails to evoke any intended emotional response. The scene feels lifeless and sterile despite attempting to portray dynamic action.",
+        "mood_atmosphere": "Unsettling, uncanny atmosphere that fails to evoke any intended emotional response. The scene feels inert and sterile despite attempting to portray dynamic action.",
         "patterns": "Visible tiling artifacts in textures, moiré patterns, and aliasing on edges.",
     },
     "cinematography": {

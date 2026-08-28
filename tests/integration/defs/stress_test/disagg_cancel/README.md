@@ -59,7 +59,6 @@ tests/integration/defs/stress_test/disagg_cancel/
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
     ├── marathon_cpp_v1_deepseek.yaml
-    └── marathon_python_v2_qwen.yaml   (placeholder; not yet parametrized)
 ```
 
 Future additions:

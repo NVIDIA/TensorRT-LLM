@@ -18,8 +18,4 @@ __all__ = [
 
 if IS_FLASHINFER_AVAILABLE:
     from .flashinfer import FlashInferAttention, FlashInferAttentionMetadata
-    from .star_flashinfer import StarAttention, StarAttentionMetadata
-    __all__ += [
-        "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
-        "StarAttentionMetadata"
-    ]
+    __all__ += ["FlashInferAttention", "FlashInferAttentionMetadata"]

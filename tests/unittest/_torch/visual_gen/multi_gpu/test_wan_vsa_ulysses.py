@@ -75,8 +75,6 @@ def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", p
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    # Disable NVLS before init_process_group; resolves B200 timeout errors
-    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
 

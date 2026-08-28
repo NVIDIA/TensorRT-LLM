@@ -57,6 +57,7 @@ class _StatsRequest:
     is_disagg_generation_transmission_complete: bool = False
     is_finished_due_to_cancellation: bool = False
     context_phase_params: None = None
+    return_perf_metrics: bool = False
     py_draft_tokens: list[int] = field(default_factory=list)
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS

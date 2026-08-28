@@ -472,69 +472,35 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", True, False, False, False, False, False, False,
-            False
-        ],
-        [
-            True, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [False, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", False, False, False, False, True, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True, False],
-        [
-            False, "TRTLLM", False, False, False, False, False, True, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, True, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False, False],
-        [
-            True, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [
-            False, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False, False],
-        [
-            True, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
+        [True, "TRTLLM", True, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, False, False, False],
+        [False, "FLASHINFER", True, False, False, False, False, False, False],
+        [False, "TRTLLM", False, True, True, False, False, False, False],
+        [True, "TRTLLM", False, True, True, False, False, False, False],
+        [True, "TRTLLM", True, False, True, True, False, False, False],
+        [True, "TRTLLM", True, False, True, False, False, False, False],
+        [True, "TRTLLM", True, False, False, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, True, True, False],
+        [False, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False],
+        [True, "FLASHINFER", False, False, False, False, False, False, False],
+        [False, "FLASHINFER", False, False, False, False, False, False, False],
         # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, True, False, False, True],
+        [False, "TRTLLM", True, False, False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool, multi_batch: bool,
-                      attention_dp: bool, use_hf_speculative_model: bool):
+                      multi_batch: bool, attention_dp: bool,
+                      use_hf_speculative_model: bool):
     if not use_one_model:
         pytest.skip("Two model Eagle3 is deprecated")
 
@@ -586,7 +552,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=use_one_model,
     )
-    spec_config._allow_chain_drafter = use_chain_drafter
 
     # Create the LLM instance
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -984,56 +949,6 @@ def test_multi_eagle3(use_one_model: bool):
                                               sampling_params,
                                               streaming=True):
             pass
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
-    """Test CDL sampling with 2 requests and max_batch_size=2."""
-    attn_backend = "TRTLLM"
-    enable_block_reuse = False
-    use_one_model = False
-    enable_chunked_prefill = False
-
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    max_batch_size = 1
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
-                                        enable_padding=True)
-
-    llm_common_config = dict(
-        model=target_model_dir,
-        attn_backend=attn_backend,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
-        enable_chunked_prefill=enable_chunked_prefill,
-    )
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
-    )
-
-    # Create the LLM instance
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-    prompts = ["The president of the United States is"]
-
-    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=0.9)
-    llm_spec.generate(prompts, sampling_params)
-    llm_spec.shutdown()
 
 
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],

@@ -24,32 +24,42 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 | List | Count | Contents |
 |------|-------|----------|
 | `MAXIMIZE_METRICS` | 8 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) + spec-decoding `d_al` |
-| `MINIMIZE_METRICS` | 10 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + `d_mean_gen_worker_per_iter_device_step_time` (gen_only-only) |
+| `MINIMIZE_METRICS` | 14 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five gen_only-only `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
 
-**Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated **only** on `d_mean_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there.
+**Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 
-#### `d_mean_gen_worker_per_iter_device_step_time` (gen_only only)
+A newly added gated metric has no baseline history, and `check_regression` skips any metric whose baseline is absent or non-positive (`continue`), so the median cannot fail a build until enough runs accrue.
 
-This metric is parsed from each `gen_server_{i}.log` produced by the disagg run (one per gen worker, in the run's `output_dir`). Lines look like:
+#### `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (gen_only only)
+
+These metrics are parsed from each `gen_server_{i}.log` produced by the disagg run (one per gen worker, in the run's `output_dir`). Lines look like:
 
 ```
-[TRT-LLM] [I] [_torch][RANK 0] iter = 5, ..., host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
+[TRT-LLM] [I] [_torch][RANK 0] iter = 5, ..., num_scheduled_requests = 1, ..., host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
 ```
 
 The device value reported at iter `N` is the device step time of iter `N-1` (device runs async).
 
 **Per-client computation** (DisaggTestCmds.run_cmd, BENCHMARK branch):
 1. Immediately before launching each client, snapshot `os.path.getsize()` of every `gen_server_{i}.log`. After the client's benchmark subprocess returns, only the bytes between that snapshot and current EOF are parsed — so each client gets its own segment of gen-worker iterations rather than sharing a single global average.
-2. Per file (per segment): streaming Welford mean of `prev_device_step_time` over all iters with `iter >= 5` (iters 0-4 are excluded: iter 0/1 include KV-cache transfer wait time, and iters 2-4 are warmup that has not yet reached steady state). Lines where `prev_device_step_time = N/A` (e.g. iter 1) do not match the parser and are skipped. Welford keeps memory at O(1) and is numerically stable for arbitrarily large iteration counts.
-3. Across files: average the per-file means → per-client metric value.
-4. The per-client value is appended as the trailing line of `trtllm-benchmark.{server_idx}.{client_idx}.log`:
+2. Per file (per segment), collect the `prev_device_step_time` of every *usable* iteration. A row is usable when all of the following hold:
+   - `iter >= 5` — iter 0/1 include KV-cache transfer wait time, and iters 2-4 are warmup that has not yet reached steady state. Lines where `prev_device_step_time = N/A` (e.g. iter 1) do not match the parser and are skipped anyway.
+   - Its immediately preceding iteration did **not** report `num_scheduled_requests = 0`. Such an iteration did no GPU work, so its loop period is pure idle (waiting on KV-cache transfer) — and because the device runs async, that idle period is what the *next* row's `prev_device_step_time` reports. One such row inflated this mean by 19% on nvbugs 6627789 while the steady-state iterations were unchanged at ~7.3 ms. The `nsr = 0` row itself is kept: its own value describes the previous iteration, which did do work. The exclusion requires the predecessor's iter number to be exactly `cur_iter - 1`; if it is not adjacent, or did not parse, the row is kept (failing toward inclusion rather than silently dropping real data). "Predecessor" is tracked **per emitting rank** (`global_rank`, read off the same line), so ranks interleaved in one file are never read as each other's predecessor. `py_executor.py` logs only rank 0 unless `TLLM_PROFILE_LOG_RANKS` is set and no lane sets it today — but a single shared predecessor slot would fail in the *wrong* direction on a mixed-rank file, letting a foreign rank's nonzero `num_scheduled_requests` mask the idle iteration so the exclusion quietly stops excluding while still looking armed.
+3. Per file, bucket the usable rows by `num_generation_tokens` and keep only the **mode** bucket (ties → the larger token count). Concurrency ramps down at the tail of a run, so the trailing iterations do less work per step and are not comparable to the plateau. A file with no parseable `num_generation_tokens` anywhere falls back to all of its usable rows (nvbugs 6487036 / 6487040: the field rendered as `tensor(256)` and matched nothing).
+4. Compute mean, median, stdev (ddof=1, `0.0` for fewer than two samples), P75 and P99 of that bucket per file, then average each statistic across files (unweighted) → the per-client metric values. Averaging a median across workers is not itself a median of the pooled sample; it is the same unweighted per-file rule the mean has always used, kept for consistency and continuity of baselines.
+5. Because the percentiles and stdev need the whole sample, the scan retains rows rather than streaming; retention is capped per worker (`_MAX_RETAINED_ITER_ROWS`) so a pathological log cannot grow it without bound.
+6. The per-client values are appended to `trtllm-benchmark.{server_idx}.{client_idx}.log`, one statistic per line:
    ```
-   Average Per Iter Device Step Time (ms): <value>
+   Average Per Iter Device Step Time (ms): <mean>
+   Median Per Iter Device Step Time (ms): <median>
+   Stdev Per Iter Device Step Time (ms): <std>
+   P75 Per Iter Device Step Time (ms): <p75>
+   P99 Per Iter Device Step Time (ms): <p99>
    ```
-   Downstream `parse_metrics_from_output` picks it up via `GEN_ONLY_PERF_METRIC_LOG_QUERIES`.
+   Downstream `parse_metrics_from_output` picks them up via `GEN_ONLY_PERF_METRIC_LOG_QUERIES`. It breaks out of its regex loop on the first match per line, so each statistic must stay on its own line with a distinct leading word.
 
-If the metric cannot be parsed for a `gen_only` run, `check_test_failure` raises `RuntimeError` and no data is uploaded.
+If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `RuntimeError` and no data is uploaded.
 
 ### Match Keys
 

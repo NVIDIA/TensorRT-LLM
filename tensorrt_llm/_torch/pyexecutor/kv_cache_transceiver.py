@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from os import getenv
+from os import environ, getenv
 from typing import Any, Dict, List, Optional
 
 import tensorrt_llm
@@ -30,8 +30,38 @@ _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
 _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
+_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+def maybe_enable_fabric_memory_for_python_transceiver(
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        kv_cache_manager_cls: type) -> None:
+    """Default the C++ V1 KV pool to fabric memory for the Python transceiver.
+
+    This must run before any KV pool allocation because the C++ environment
+    getter caches the value on first read. Explicit user settings are always
+    respected.
+
+    Args:
+        cache_transceiver_config: Configuration used to select the cache
+            transceiver runtime and backend.
+        kv_cache_manager_cls: KV-cache manager class to check for C++ V1 pool
+            allocation.
+    """
+    if (cache_transceiver_config is None
+            or cache_transceiver_config.backend is None
+            or cache_transceiver_config.transceiver_runtime != "PYTHON"):
+        return
+    if not issubclass(kv_cache_manager_cls, KVCacheManager):
+        return
+    if getenv(_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV) is None:
+        environ[_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV] = "1"
+        logger.info(
+            "Python cache transceiver with C++ KV cache manager detected; "
+            f"defaulting {_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV}=1 (set it "
+            "to 0 explicitly to disable)")
 
 
 def is_disagg_inflight_cancel_enabled() -> bool:

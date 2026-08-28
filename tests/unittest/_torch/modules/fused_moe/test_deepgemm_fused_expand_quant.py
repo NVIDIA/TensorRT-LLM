@@ -97,6 +97,45 @@ def _alloc_outputs(num_experts: int, m_max: int, hidden: int, *, device: str):
 
 
 @skip_unsupported
+def test_skip_data_expand_omits_unused_outputs() -> None:
+    num_rows, hidden, num_experts, top_k = 4, 512, 8, 4
+    x = torch.randn((num_rows, hidden), device="cuda", dtype=torch.float32)
+    token_selected_experts = torch.arange(top_k, device="cuda", dtype=torch.int32).repeat(
+        num_rows, 1
+    )
+    token_final_scales = torch.full(
+        (num_rows, top_k), 1.0 / top_k, device="cuda", dtype=torch.float32
+    )
+
+    outputs = torch.ops.trtllm.moe_permute_op(
+        x,
+        token_selected_experts,
+        token_final_scales,
+        None,
+        None,
+        None,
+        input_sf=None,
+        num_experts_on_rank=num_experts,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        cluster_size=1,
+        cluster_rank=0,
+        min_latency_mode=False,
+        use_fp8_block_scaling=False,
+        skip_data_expand=True,
+    )
+
+    permuted_row_to_unpermuted_row_tensor = outputs[0]
+    permuted_data_tensor = outputs[2]
+    permuted_token_final_scales_tensor = outputs[4]
+    assert permuted_row_to_unpermuted_row_tensor.numel() == num_rows * top_k
+    assert permuted_data_tensor.shape == (0, hidden)
+    assert permuted_token_final_scales_tensor.shape == (0,)
+
+
+@skip_unsupported
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s.name)
 def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
     device = "cuda"

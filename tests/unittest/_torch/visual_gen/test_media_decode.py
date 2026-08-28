@@ -30,6 +30,7 @@ from tensorrt_llm.media.decoding import (
     _lanczos_taps,
     decode_video_reference_window,
     resize_center_crop_uint8,
+    resize_fit_pad_uint8,
 )
 
 _TEST_DATA = Path(__file__).parent / "test_data"
@@ -40,6 +41,49 @@ _AVI = _TEST_DATA / "cosmos3_v2v_ref_9f_bframes.avi"
 def _frame_indices(frames: torch.Tensor) -> list[int]:
     """Recover each frame's display index from the red-channel ramp."""
     return [round((f[:, :, 0].float().mean().item() - 20) / 25) for f in frames]
+
+
+class TestResizeFitPad:
+    """The action counterpart to cover-scale + center-crop: contain-scale, then
+    pad. A gripper works at the frame edge, so cropping costs the policy the
+    evidence it acts on."""
+
+    def test_contains_the_whole_source(self):
+        """Cover-scale would crop the wide source; fit keeps all of it."""
+        frames = torch.full((2, 100, 400, 3), 200, dtype=torch.uint8)
+        out = resize_fit_pad_uint8(frames, target_h=200, target_w=400)
+        assert out.shape == (2, 200, 400, 3)
+        # 400x100 contained in 400x200 scales by 1.0 and pads the bottom half.
+        assert (out[:, :100] == 200).all()
+
+    def test_never_enlarges_a_small_source(self):
+        """min(..., 1.0): a small clip keeps its own pixels and a wider border
+        rather than being upscaled."""
+        frames = torch.full((1, 10, 20, 3), 255, dtype=torch.uint8)
+        out = resize_fit_pad_uint8(frames, target_h=64, target_w=64)
+        assert out.shape == (1, 64, 64, 3)
+        assert (out[0, :10, :20] == 255).all()
+
+    def test_native_resolution_is_identity(self):
+        frames = torch.zeros(2, 32, 32, 3, dtype=torch.uint8)
+        assert resize_fit_pad_uint8(frames, 32, 32) is frames
+
+    def test_aspect_ratio_is_preserved(self):
+        """The source is contained, not stretched: a square stays square."""
+        frames = torch.zeros(1, 64, 64, 3, dtype=torch.uint8)
+        frames[:, :, :, 0] = 255
+        out = resize_fit_pad_uint8(frames, target_h=64, target_w=128)
+        assert out.shape == (1, 64, 128, 3)
+        # A 1:1 source in a 2:1 canvas fills the height, so content is 64 wide.
+        assert (out[0, :, :64, 0] == 255).all()
+
+    def test_pad_falls_back_to_replicate_when_reflection_has_no_source(self):
+        """A pad run wider than the resized extent has nothing left to mirror;
+        reflect would raise, so the helper switches to edge replication."""
+        frames = torch.full((1, 4, 4, 3), 128, dtype=torch.uint8)
+        out = resize_fit_pad_uint8(frames, target_h=64, target_w=64)
+        assert out.shape == (1, 64, 64, 3)
+        assert (out[0, 4:, :4] == 128).all()
 
 
 class TestResizeCenterCrop:
@@ -202,6 +246,48 @@ class TestDecodeVideoReferenceWindow:
     def test_keep_last_ring_reorder(self, fixture):
         window = self._decode(fixture.read_bytes(), keep="last")
         assert _frame_indices(window) == [4, 5, 6, 7, 8]
+
+    def test_frame_step_thins_the_window(self):
+        window = decode_video_reference_window(
+            _MP4.read_bytes(),
+            first_frame=0,
+            last_frame=8,
+            target_h=64,
+            target_w=64,
+            device=self._DEVICE,
+            frame_step=2,
+        )
+        assert window.shape[0] == 5
+        assert _frame_indices(window) == [0, 2, 4, 6, 8]
+
+    def test_frame_step_keeps_a_partial_tail(self):
+        # The range end is not a multiple of the step: 0, 3, 6 and stop.
+        window = decode_video_reference_window(
+            _MP4.read_bytes(),
+            first_frame=0,
+            last_frame=7,
+            target_h=64,
+            target_w=64,
+            device=self._DEVICE,
+            frame_step=3,
+        )
+        assert _frame_indices(window) == [0, 3, 6]
+
+    def test_frame_step_one_matches_the_default(self):
+        span = dict(first_frame=0, last_frame=4, target_h=64, target_w=64, device=self._DEVICE)
+        assert torch.equal(
+            decode_video_reference_window(_MP4.read_bytes(), **span),
+            decode_video_reference_window(_MP4.read_bytes(), frame_step=1, **span),
+        )
+
+    def test_frame_step_rejects_trailing_windows(self):
+        # The trailing form wraps a ring whose length is unknown until EOS.
+        with pytest.raises(ValueError, match="non-negative ranges"):
+            self._decode(_MP4.read_bytes(), keep="last", frame_step=2)
+
+    def test_frame_step_must_be_positive(self):
+        with pytest.raises(ValueError, match="at least 1"):
+            self._decode(_MP4.read_bytes(), frame_step=0)
 
     def test_rgb_channel_layout(self):
         # Frame i carries a green horizontal bar at rows [7i, 7i+7) and a

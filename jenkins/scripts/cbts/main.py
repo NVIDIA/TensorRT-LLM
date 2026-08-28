@@ -172,7 +172,7 @@ class SelectionResult:
 
 
 # Tier 2 stands down past this many commits between the DB's revision and the PR's base.
-DEFAULT_COVERAGE_MAX_DRIFT = 10
+DEFAULT_COVERAGE_MAX_DRIFT = 30
 
 
 def _load_coverage_db_meta(path: Optional[str]) -> dict:

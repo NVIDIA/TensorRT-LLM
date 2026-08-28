@@ -49,11 +49,14 @@ def model_with_connector():
         def model_fn(*args, **kwargs):
 
             default_kwargs = {
-                "model": f"{llm_models_root()}/Qwen2-0.5B",
+                "model": f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
                 "backend": "pytorch",
                 "kv_connector_config": kv_connector_config,
                 "cuda_graph_config": None,
-                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1),
+                # Connector tests use at most 256 input tokens. Keep model
+                # construction independent of the GPU's available KV capacity.
+                "max_seq_len": 1024,
             }
 
             return LLM(*args, **{**default_kwargs, **kwargs})
@@ -600,7 +603,7 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         )
 
         llm_kwargs = dict(
-            model=f"{llm_models_root()}/Qwen2-0.5B",
+            model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
             backend="pytorch",
             kv_connector_config=kv_connector_config,
             cuda_graph_config=None,

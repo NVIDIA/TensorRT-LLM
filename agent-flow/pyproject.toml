@@ -8,8 +8,8 @@ dependencies = [
     "anyio>=4.0",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "claude-agent-sdk==0.2.128",
-    "openai-codex==0.144.4",
+    "claude-agent-sdk==0.2.143",
+    "openai-codex==0.147.0",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +21,8 @@ test = [
 [project.scripts]
 agent-team = "agent_flow.workflows.agent_team.cli:main"
 modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
+perf-analyze = "agent_flow.workflows.perf_analyze.cli:main"
+perf-optimize = "agent_flow.workflows.perf_optimize.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -94,4 +96,12 @@ max-args = 10
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "-p no:rerunfailures"
+
+# --strict-config: an unknown key in this table is an ERROR, not a warning.
+#
+# `asyncio_mode` is only understood while pytest-asyncio is installed. It is
+# declared in [project.optional-dependencies].test, but an environment without
+# it makes pytest emit `Unknown config option: asyncio_mode` as a warning and
+# then SKIP every `async def` test -- silently, for as long as nobody reads the
+# skip count. With this flag the missing plugin stops the run instead.
+addopts = "-p no:rerunfailures --strict-config"

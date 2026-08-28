@@ -112,7 +112,7 @@ same stripping, so this introduces no assumption the pipeline does not already m
 
 | Signal | Meaning |
 |---|---|
-| `test_meta` reports incomplete | `outcome != passed`, or `saved_procs < expected_workers + 1` — the DB's own account |
+| `test_case_meta` reports incomplete | `outcome != passed`, or `saved_procs < expected_workers + 1` — the compact DB's logical completeness view |
 | Drove inference but has no `py_executor` rows | the coordinator ran but the worker's coverage never arrived |
 | Footprint < 30 functions | the record is near-empty |
 | On a `-Ray-` stage | the GPU worker is uninstrumented, only driver-side rows exist |
@@ -148,32 +148,34 @@ omitted here and re-added by Groovy under the `MULTI_GPU_FILE_CHANGED` gate.
 
 ## 8. Where the DB comes from
 
-Only one producer exists: the `LLM/main/L0_PostMerge` job, which uploads
-`<build>/cbts-coverage/cbts_pystart_report.tar.gz`. Every DB therefore describes some revision of
-`main` (`artifact.COVERAGE_BRANCH`), and picking one means picking **which revision of `main`**
-the selection reasons about.
+Only one producer exists: the `LLM/main/L0_PostMerge` job. After each architecture's single-GPU
+stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
+`cbts_pystart_report_SBSA.tar.gz`. Every pair therefore describes one revision of `main`
+(`artifact.COVERAGE_BRANCH`). The later full-report tarball is not used for test selection.
 
 ### 8.1 Resolution
 
 ```
-Jenkins REST lastBuild                     → newest build number N
-for b in N .. N-9:                           (_MAX_PROBE)
-   ranged GET the tarball                  → skip b if absent
-   GET build_info.txt, parse `commit=`     → sha, or None
-   lag(sha)                                → how far main moved past it
-rank by (lag known, lag ascending, build descending)
+GitHub compare main...<PR head>                 → PR base commit
+Jenkins REST lastBuild                          → newest build number N
+for b in N .. N-49:                              (_MAX_PROBE)
+   ranged GET both architecture tarballs        → skip b unless both exist
+   GET build_info.txt, parse `commit=`           → sha; skip when absent
+   compare <sha>...<PR base>                     → retain ancestors and exact matches
+   retain distance to the PR base
+rank by (distance ascending, build descending)
 ```
 
-Ranking is by **revision, not build number**: a post-merge build can be a re-run of an older
-commit, so the highest build number is not necessarily the newest code. The build number is only
-the tie-break, and when no candidate's lag can be measured the ranking degenerates to exactly that
-tie-break — which is the pre-existing behaviour, not a regression.
+Requiring the pair prevents the selector from narrowing only one CPU architecture. Ranking is by
+**revision, not build number**: a post-merge build can be a re-run of an older commit, so the
+highest build number is not necessarily the closest safe revision. Build number only breaks ties.
+An exact PR-base match is allowed and wins with distance zero.
 
-### 8.2 Measuring the lag (ranking)
+### 8.2 Measuring the lag (reporting)
 
-The lag is `ahead_by` from GitHub's compare API on `<sha>...main` — against the **tip of `main`**,
-so every candidate is scored on one scale. `ahead_by` covers the full range; only the response's
-`commits` array is truncated at 250.
+After selection, lag is `ahead_by` from GitHub's compare API on `<sha>...main`. It reports overall
+freshness against the tip of `main`; it no longer ranks candidates. `ahead_by` covers the full
+range; only the response's `commits` array is truncated at 250.
 
 Since every candidate revision is a commit that already merged to `main`, it can only ever be
 *behind* the tip: `behind_by` stays 0 and the lag is non-negative. A non-zero `behind_by` would
@@ -184,61 +186,37 @@ There is no local-git path. The CI checkout is `depth: 1, noTags: true` with a s
 measurement would also answer against whatever ref it was given, and a merely stale ref returns a
 *smaller* number rather than an error.
 
-The API is queried once per distinct revision (`compare_distance` is cached), so probing ten builds
-is at most ten calls. It answers unless the revision has not reached the public mirror yet (404) or
-the token is missing (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is
-routinely already spent). Either way `lag` is `null`, the ranking degrades to its build-number
-tie-break, and the reason is on stderr.
+The compare API answers unless the revision has not reached the public mirror yet (404) or the
+token is missing (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is
+routinely already spent). An unmeasurable candidate-to-base relation is rejected; only the selected
+candidate's main-tip lag may remain `null`.
 
 The token comes from the `github-cred-trtllm-ci` credential — the one `getGithubMRChangedFile`
 already uses — bound around the `--print-selection` call in `_cbtsCoverageAudit` and read from
 `GITHUB_API_TOKEN`.
 
-This number ranks candidates and reports overall freshness. It is **not** what the gate decides on.
+This number reports overall freshness. It is **not** what the gate decides on.
 
 ### 8.2b Measuring the drift (gating)
 
-Ranking and gating ask different questions. "Which DB is freshest" is answered against the tip of
-`main`; "does this DB still describe the code under test" is not — the code under test is the PR
-head, which CI checks out directly (`env.gitlabMergeRequestLastCommit`), so the revision the DB has
-to match is the PR's **merge base**. A DB sitting one commit off the tip says nothing useful about
-a PR branched three hundred commits back, and the lag scores that case as fresh.
+The PR base is `merge_base_commit.sha` from `main...<PR head>`. Each candidate is compared as
+`<db sha>...<PR base>` and is eligible only when GitHub reports `ahead` (the PR base is ahead of the
+DB) or `identical`. `behind`, `diverged`, and unknown relations are rejected before download, so a
+coverage DB is never newer than the PR base.
 
-The drift is `merge_base_commit.sha` from `main...<pr head>`, then `ahead_by + behind_by` from
-`<db sha>...<merge base>` — two extra calls per run, and only for the candidate ranking already
-picked. Both revisions sit on the same linear history, so exactly one term is non-zero and the sum
-is their plain distance.
-
-Summing rather than picking a side is deliberate. The one dangerous failure is an edge `(F → T)`
-that the code under test really has and the DB never recorded, and **both directions produce it**:
-
-| DB is | relative to the PR base | how the edge goes missing |
-|---|---|---|
-| older | `ahead` | a caller added since, so `T` now reaches `F` and the DB never saw it |
-| newer | `behind` | a call path deleted since, so the DB reflects a graph the PR base still has intact |
-
-The fail-closed bound is symmetric too — a function absent from the DB force-runs either way — and
-it only catches whole-function absence, never a row set that is merely too narrow. So there is no
-principled basis for weighting one side, and the sum is also the only form that handles a genuinely
-diverged base: a PR targeting a release branch, which a `main`-collected DB does not describe at
-all, scores as the large number it is instead of slipping through on one small term.
-
-`drift_status` (`ahead` / `behind` / `diverged` / `identical`) rides along in the same response and
-is recorded, never weighted — it is there to answer empirically, later, whether one direction
-actually correlates with misses.
-
-Any step that cannot be answered leaves the drift null, which the gate reads as `unknown` and
-declines: freshness that cannot be shown is not assumed.
+For eligible candidates, drift is their plain ancestor distance to the PR base. The closest one
+wins, and `--coverage-max-drift` applies a second fail-closed bound: beyond 30 commits Tier 2
+declines and the PR runs in full.
 
 
 ### 8.3 What happens with the result
 
-`--prepare DIR` does the whole fetch in one call: select, measure, stream the tarball down
-(retried, and streamed rather than buffered — it runs past 200 MB), unpack it, write the selection
-JSON beside the sqlite as `cbts_coverage_db.json`, and print `{path, meta}`. Groovy is left with
-the two things only it can do — bind the credential and run `coverage_audit.py` over the result —
-and any failure anywhere is caught and non-fatal: `coverageDb.path` stays empty, Tier 2 never
-runs, and the PR gets a full run.
+`--prepare DIR` does the whole fetch in one call: resolve the PR base, select a complete pair,
+stream both tarballs down, unpack their identically named SQLite files separately, and union them
+with `compact_db.merge_databases`. It writes the selection JSON beside the merged SQLite as
+`cbts_coverage_db.json` and prints `{path, meta}`. Groovy is left with the two things only it can do
+— bind the credential and run `coverage_audit.py` over the result — and any failure anywhere is
+caught and non-fatal: no prepared DB is returned, Tier 2 never runs, and the PR gets a full run.
 
 Those two paths reach `main.py` as `--coverage-db` and `--coverage-db-meta`, so a new selection
 field needs no Groovy change. `main.py` records all of it and **gates on the drift**: past
@@ -256,7 +234,7 @@ All of it lands in the decision and in OpenSearch:
 | `coverage_db_lag` | `l_coverage_db_lag` | ranking / overall freshness; `null` / `-1` when unmeasurable |
 | `coverage_db_base_commit` | `s_coverage_db_base_commit` | the PR's merge base |
 | `coverage_db_drift` | `l_coverage_db_drift` | **the gated number**; `null` / `-1` when unmeasurable |
-| `coverage_db_drift_status` | `s_coverage_db_drift_status` | recorded, never weighted |
+| `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `identical` for every selected DB |
 | `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
 
 so the decline rate is queryable per verdict rather than only readable in `s_reason`.
@@ -276,8 +254,8 @@ so the decline rate is queryable per verdict rather than only readable in `s_rea
   "coverage_db_commit": "50edd738...",
   "coverage_db_lag": 11,
   "coverage_db_base_commit": "9f0da65d...",
-  "coverage_db_drift": 47,
-  "coverage_db_drift_status": "behind",
+  "coverage_db_drift": 7,
+  "coverage_db_drift_status": "ahead",
   "coverage_no_diff_files": 0,
   "reasons": [{"source": "coverage", "impacted": 118, "untrusted": 104, ...}]
 }

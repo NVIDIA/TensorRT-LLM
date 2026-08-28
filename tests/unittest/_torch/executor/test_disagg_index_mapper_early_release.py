@@ -24,7 +24,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
+from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -66,9 +67,10 @@ def create_mock_resource_manager(kv_cache_manager=None, seq_slot_manager=None):
     return resource_manager
 
 
-class _FakeExecutor:
-    """Minimal stand-in for PyExecutor so we can call the unbound
-    `_send_kv_async` method without constructing the real object."""
+class _FakeExecutor(PyExecutor):
+    """Minimal PyExecutor stand-in: inherits the real methods (so it keeps
+    working as `_send_kv_async` internals evolve) but skips
+    `PyExecutor.__init__` so no engine or distributed wiring is required."""
 
     def __init__(self, kv_cache_manager, async_transfer_manager, kv_cache_transceiver):
         self.kv_cache_manager = kv_cache_manager

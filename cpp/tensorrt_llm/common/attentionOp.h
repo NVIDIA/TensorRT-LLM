@@ -595,7 +595,7 @@ private:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     int mSM = tensorrt_llm::common::getSMVersion();
-    bool mUseTllmGen = (mSM >= 100) && (mSM != 120);
+    bool mUseTllmGen = (mSM >= 100) && (mSM != 120) && (mSM != 121);
     bool mForceMultiBlockWarned = false;
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();

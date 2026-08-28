@@ -534,7 +534,9 @@ class AgentTeamWorkflow:
         """
         while True:
             if state.stage == STAGE_REPLAN:
-                self._run_plan_drafter(iteration, mode="replan")
+                self._run_plan_drafter(
+                    iteration, mode="replan", feedback_triggered=state.feedback_replan
+                )
                 decision = self._latest_plan_drafter_decision()
 
                 # Hard score-floor enforcement (Q6 B): a low QA score
@@ -575,6 +577,7 @@ class AgentTeamWorkflow:
                     state.done = True
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     print_message(
                         f"[bold green]✔ plan_drafter DONE at iteration {iteration}[/bold green]",
@@ -602,11 +605,14 @@ class AgentTeamWorkflow:
                     )
                 state.next_iteration_index = i + 1
                 state.stage = STAGE_CODER
+                state.feedback_replan = False
                 self._checkpoint(state)
                 return False
 
             if state.stage == STAGE_REPLAN_REVIEWER:
-                self._run_plan_reviewer(iteration, phase="replan")
+                self._run_plan_reviewer(
+                    iteration, phase="replan", feedback_triggered=state.feedback_replan
+                )
                 review_decision = self._latest_plan_reviewer_decision()
                 if review_decision != "APPROVE":
                     print_message(
@@ -627,6 +633,7 @@ class AgentTeamWorkflow:
                     )
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     return False
                 state.stage = STAGE_REPLAN_HUMAN
@@ -639,6 +646,7 @@ class AgentTeamWorkflow:
                     # blocking on ask_human.
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     return False
                 self._run_plan_drafter(iteration, mode="replan_human")
@@ -650,6 +658,7 @@ class AgentTeamWorkflow:
                     )
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     return False
                 # POLISHING / DRAFT_READY / unset / DONE → re-invoke the
@@ -754,6 +763,7 @@ class AgentTeamWorkflow:
                 )
                 state.done = False
                 state.stage = STAGE_REPLAN
+                state.feedback_replan = True
                 self._checkpoint(state)
             if self.preset_plan is not None or self.preset_acceptance_criteria is not None:
                 print_message(
@@ -1029,7 +1039,9 @@ class AgentTeamWorkflow:
 
     # ------------------------------------------------------------------ agents
 
-    def _run_plan_drafter(self, iteration: int, mode: str) -> None:
+    def _run_plan_drafter(
+        self, iteration: int, mode: str, feedback_triggered: bool = False
+    ) -> None:
         """Invoke the PlanDrafter in ``draft`` / ``human`` / ``replan`` / ``replan_human`` mode.
 
         ``replan`` is only used when ``replan_on_qa=True``: it runs after
@@ -1046,6 +1058,13 @@ class AgentTeamWorkflow:
         plan revision — the plan-phase wording ("Plan iteration",
         "proceed to implementation") would misrepresent a run that is
         already mid-build.
+
+        ``feedback_triggered`` (replan mode only) marks a sub-cycle that
+        was forced by ``--trigger-replan-with-feedback`` rather than by a
+        QA verdict: the prompt tells the drafter the QA data may be stale
+        and that fresh human feedback — not the QA verdict — is the turn's
+        driver, so it may preempt in-progress work to act on the feedback
+        immediately.
         """
         self._progress_ctx.current_iteration = iteration
         if mode == "draft":
@@ -1140,12 +1159,30 @@ class AgentTeamWorkflow:
                     "feedback and address every item in this revision "
                     "before deciding again.\n\n"
                 )
+            feedback_note = (
+                "**Feedback-triggered replan**: this replan turn was "
+                "forced by fresh human feedback "
+                "(`--trigger-replan-with-feedback`), NOT by a QA verdict "
+                "— the QA data below predates the feedback and may be "
+                "stale. Call `read_human_feedback` FIRST; the newest "
+                "entry is this turn's driver. Restructure the plan so "
+                "the very next Coder turn acts on that feedback: you may "
+                "preempt in-progress work per your protocol's "
+                "feedback-triggered replan rules (when your prompt "
+                "extension defines them), deciding which preempted work "
+                "is still needed — reschedule it — and which the "
+                "feedback makes obsolete — drop it with justification "
+                "in your `summary`.\n\n"
+                if feedback_triggered
+                else ""
+            )
             prompt = (
                 f"Workspace: {self.workspace}\n"
                 f"Build iteration: {iteration}\n"
                 f"Phase: **replan** (PlanDrafter is re-invoked after every "
                 f"QA turn; decide DONE / POLISHING / DRAFT_READY based on "
                 f"what the build phase actually achieved).\n\n"
+                f"{feedback_note}"
                 f"Latest QA verdict: decision={qa_decision}, "
                 f"weighted_score={score_str}, min_score={min_score_str}.\n"
                 f"Hard rule: if `weighted_score` is below `min_score` (or "
@@ -1189,7 +1226,9 @@ class AgentTeamWorkflow:
             raise ValueError(f"unknown plan_drafter mode: {mode!r}")
         self.plan_drafter(prompt)
 
-    def _run_plan_reviewer(self, iteration: int, phase: str = "initial") -> None:
+    def _run_plan_reviewer(
+        self, iteration: int, phase: str = "initial", feedback_triggered: bool = False
+    ) -> None:
         """Run the PlanReviewer in initial-plan or replan-review mode.
 
         ``phase="initial"`` is the classic plan-phase review (a fresh
@@ -1199,11 +1238,28 @@ class AgentTeamWorkflow:
         replan turn; the prompt tells the reviewer it is reviewing a
         revision and to watch for unjustified relaxations to the
         acceptance criteria.
+
+        ``feedback_triggered`` (replan phase only) tells the reviewer the
+        revision under review came from a feedback-forced replan turn, so
+        prompt extensions that define feedback-triggered edit rights can
+        apply them instead of treating the preemption as a violation.
         """
         if phase not in ("initial", "replan"):
             raise ValueError(f"unknown plan_reviewer phase: {phase!r}")
         self._progress_ctx.current_iteration = iteration
         iter_label = "Build iteration" if phase == "replan" else "Plan iteration"
+        feedback_note = (
+            "This replan turn was **feedback-triggered** "
+            "(`--trigger-replan-with-feedback`): the PlanDrafter was "
+            "responding to fresh human feedback, not a QA verdict. Call "
+            "`read_human_feedback` to see the feedback the revision must "
+            "serve. Where your prompt extension defines "
+            "feedback-triggered edit rights (e.g. preempting in-progress "
+            "work), judge the revision under those rules; still REJECT "
+            "edits those rules do not allow.\n\n"
+            if (phase == "replan" and feedback_triggered)
+            else ""
+        )
         phase_note = (
             "Phase: **replan review** — the PlanDrafter has just revised "
             "`plan.md` and `acceptance-criteria.md` after a build-phase "
@@ -1213,6 +1269,7 @@ class AgentTeamWorkflow:
             "changes to `acceptance-criteria.md` (deletions, weakenings, "
             "scope reductions). REJECT silent relaxations; demand the "
             "PlanDrafter justify each change in their `summary`.\n\n"
+            f"{feedback_note}"
             if phase == "replan"
             else ""
         )

@@ -1393,16 +1393,28 @@ def test_v2_removed_event_emitted_when_last_level_page_is_dropped():
     # block count. (The deadlock-safety floor reserves the whole window, so a
     # large window would make the resize-down infeasible.) With more committed
     # blocks than fit after the shrink, the surplus reusable pages are dropped.
+    #
+    # Sizing matters for covering both layer groups. create_config alternates
+    # sliding_window_size by layer id, so layer group 0 is SWA and layer group 1 is full
+    # attention, and both share one pool group holding num_blocks * 2 pages. The pool
+    # group's floor is the sum of the two per-lifecycle floors: the SWA floor is
+    # num_sink_blocks + ceil((window - 1) / tokens_per_block) + 1 == 2 (the +1 is
+    # headroom for the slot-count oscillation as the window slides), and a full-attention
+    # lifecycle inherits the largest SWA floor, so the pool group cannot shrink below
+    # 2 + 2 == 4 slots. Eviction drops the stale SWA pages of layer group 0 first, so
+    # num_blocks must exceed the count that layer group 0 alone can absorb
+    # (num_blocks * 2 - 4 > num_blocks, i.e. num_blocks > 4) for the surplus to reach
+    # layer group 1 and exercise removal reporting for both groups.
     tokens_per_block = 8
     window_size = 8
-    num_blocks = 4
+    num_blocks = 6
     event_manager = NativeKVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
     manager = None
     try:
         manager = _create_test_manager(
             event_manager,
             tokens_per_block=tokens_per_block,
-            gpu_quota=16 << 20,
+            gpu_quota=24 << 20,
             window_size=window_size,
             kv_buf_size=1 << 20,
         )
@@ -1431,11 +1443,15 @@ def test_v2_removed_event_emitted_when_last_level_page_is_dropped():
                     event["data"]["block_hashes"]
                 )
 
-        # Both layer groups drop last-level pages, and every removed hash must
-        # have been stored earlier for that layer group.
+        # The shrink drops 12 - 4 == 8 pages: all 6 stale SWA pages of layer group 0 plus 2
+        # from layer group 1. Both layer groups therefore report removals, every removed
+        # hash must have been stored earlier for that same layer group, and each dropped
+        # page must be reported exactly once (removal is announced either per lifecycle or
+        # via whole-block removal when the last lifecycle page goes, never both).
         assert set(removed_hashes_by_layer_group) == {0, 1}
         for layer_group_id, removed_hashes in removed_hashes_by_layer_group.items():
             assert removed_hashes
+            assert len(removed_hashes) == len(set(removed_hashes))
             for removed_hash in removed_hashes:
                 assert removed_hash in stored_hashes_by_layer_group[layer_group_id]
     finally:

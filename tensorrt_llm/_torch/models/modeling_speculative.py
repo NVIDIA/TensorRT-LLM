@@ -45,6 +45,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              get_model_architecture, register_auto_model)
 
+_SPECULATIVE_POSITION_HEADROOM = "_speculative_position_headroom"
+
 
 def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     if hasattr(config,
@@ -993,7 +995,8 @@ class DFlashForCausalLM(nn.Module):
                     pretrained_config.vocab_size))
 
         self.target_layer_ids = dflash_config.get('target_layer_ids', None)
-        self.block_size = getattr(pretrained_config, 'block_size', None)
+        self.block_size = dflash_config.get(
+            'block_size', getattr(pretrained_config, 'block_size', None))
         self.dflash_attention_backend = dflash_attention_backend
         if self.dflash_attention_backend == 'VANILLA':
             self._dflash_flash_attention = get_dflash_flash_attention()
@@ -1778,6 +1781,7 @@ class DFlashForCausalLM(nn.Module):
         # Uniformity across layers is asserted in _build_fused_kv_buffers (above).
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
+        gqa_group_size = num_heads_per_rank // num_kv_heads_per_rank
 
         has_qk_norm = self._has_qk_norm
         is_bf16 = noise_embedding.dtype == torch.bfloat16
@@ -2020,8 +2024,27 @@ class DFlashForCausalLM(nn.Module):
             else:  # VANILLA, validated before entering the layer loop.
                 layer_k_cache = ctx_k_cache[:, layer_idx]
                 layer_v_cache = ctx_v_cache[:, layer_idx]
+
+                # Pack gqa_group_size query heads sharing a KV head into the
+                # row dimension: [B, blk, h_q, d] -> [B, group*blk, h_kv, d].
+                # Each CTA owns a whole query-head group and streams KV head's context once
+                # instead of gqa_group_size CTAs each re-reading it.
+                # Exact only while every row of the block attends to the same
+                # key set, i.e. non-causal, unwindowed layers. Causal or
+                # windowed layers mask by row, so they stay unpacked.
+                pack_gqa = (gqa_group_size > 1 and not causal
+                            and window_size == (-1, -1))
+                if pack_gqa:
+                    q_grouped = Q_bshd.reshape(B, block_size,
+                                               num_kv_heads_per_rank,
+                                               gqa_group_size, head_dim)
+                    q_packed = q_grouped.permute(0, 3, 1, 2, 4)
+                    q_in = q_packed.reshape(B, gqa_group_size * block_size,
+                                            num_kv_heads_per_rank, head_dim)
+                else:
+                    q_in = Q_bshd
                 out = flash_attention(
-                    q=Q_bshd,
+                    q=q_in,
                     k_cache=layer_k_cache,
                     v_cache=layer_v_cache,
                     k=k_noise_bshd,
@@ -2031,6 +2054,12 @@ class DFlashForCausalLM(nn.Module):
                     causal=causal,
                     window_size=window_size,
                 )
+                if pack_gqa:
+                    # Undo the packing: [B, group*blk, h_kv, d] -> [B, blk, h_q, d].
+                    out = out.view(B, gqa_group_size, block_size,
+                                   num_kv_heads_per_rank,
+                                   head_dim).permute(0, 2, 3, 1, 4)
+
             attn_output = out.reshape(B * block_size, q_size)
 
             # Per-drafter post-attention gate (no-op for generic DFlash; Laguna
@@ -2552,7 +2581,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = model_config.extra_attrs
+                    self.draft_config.extra_attrs = dict(
+                        model_config.extra_attrs)
+                    self.draft_config.extra_attrs[
+                        _SPECULATIVE_POSITION_HEADROOM] = (
+                            2 * spec_config.tokens_per_gen_step)
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(

@@ -387,6 +387,11 @@ def _forward_dsa_attn(
             indexer_intermediates=indexer_intermediates,
         )
 
+    # Join the prev_topk copy forked in sparse_attn_indexer; CUDA graph
+    # capture requires the join within the same layer's forward.
+    if self.mqa.indexer is not None:
+        self.mqa.indexer.maybe_join_prev_topk_copy()
+
 
 def should_use_short_mha(
     self, attn_metadata: AttentionMetadata, position_ids: Optional[torch.Tensor]
@@ -407,6 +412,7 @@ def should_use_short_mha(
         return False
     if not (
         self.short_seq_mha_threshold > 0
+        and self.kv_cache_dtype != "fp8_ds_mla"
         and not self.apply_rotary_emb
         and self.mapping.cp_size == 1
         and position_ids is not None

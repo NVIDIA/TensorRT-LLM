@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -26,9 +27,11 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -38,11 +41,35 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations.
 class Page;
 class KvCache;
+class CopyEngine;
+class StagingBufferManager;
 struct BatchedLockTarget;
 
 using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
 using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
+
+// Immutable bidirectional mapping between lifecycles and pool groups.
+class LifeCyclePoolGroupMapping
+{
+public:
+    LifeCyclePoolGroupMapping() = default;
+    explicit LifeCyclePoolGroupMapping(TypedVec<LifeCycleId, PoolGroupIndex> forward);
+
+    [[nodiscard]] PoolGroupIndex poolGroup(LifeCycleId lifeCycle) const;
+    [[nodiscard]] Span<LifeCycleId const> lifeCycles(PoolGroupIndex poolGroup) const;
+    [[nodiscard]] PoolGroupIndex numPoolGroups() const noexcept;
+
+    [[nodiscard]] TypedVec<LifeCycleId, PoolGroupIndex> const& forward() const noexcept
+    {
+        return mForward;
+    }
+
+private:
+    TypedVec<LifeCycleId, PoolGroupIndex> mForward;
+    std::vector<LifeCycleId> mInverse;
+    std::vector<size_t> mPoolGroupOffsets;
+};
 
 // ---------------------------------------------------------------------------
 // StorageStatistics — per-pool-group slot counts.
@@ -72,8 +99,9 @@ class CacheLevelManager
 {
 public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
-        CacheTierConfig const& tierConfig, StorageConfig const& storageConfig,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+        CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+        PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
 
     // Compute pool size granularity for a given cache tier and quota.
     static size_t cacheTierGranularity(CacheTier tier, size_t quota);
@@ -98,7 +126,9 @@ public:
 class StorageManager : public std::enable_shared_from_this<StorageManager>
 {
 public:
+    // Takes ownership of coldPageCodec immediately; nullptr selects the default lossless codec.
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
+        std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec = nullptr,
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
@@ -165,7 +195,7 @@ public:
 
     // Best-effort migration of grouped pages to a destination cache level.
     void prefetch(
-        CacheLevel dstLevel, TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
+        CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
     // ---- Query helpers -----------------------------------------------------
 
@@ -178,17 +208,32 @@ public:
 
     LifeCycleId numLifeCycles() const noexcept
     {
-        return mLifeCycleGrouping.size();
+        return mHotPoolGroupMapping.forward().size();
     }
 
-    PoolGroupIndex numPoolGroups() const noexcept
+    PoolGroupIndex numPoolGroups(CacheLevel level) const
     {
-        return mSlotDescList.size();
+        return mSlotDescLists.at(level).size();
     }
 
-    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList() const noexcept
+    PoolGroupIndex numPoolGroups() const
     {
-        return mSlotDescList;
+        return numPoolGroups(kHotLevel);
+    }
+
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList(CacheLevel level) const
+    {
+        return mSlotDescLists.at(level);
+    }
+
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList() const
+    {
+        return slotDescList(kHotLevel);
+    }
+
+    TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping(CacheLevel level) const
+    {
+        return poolGroupMapping(level).forward();
     }
 
     CacheLevel numCacheLevels() const noexcept
@@ -201,28 +246,32 @@ public:
         return lvl == numCacheLevels() - 1;
     }
 
+    PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
+    PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 
     // Return the byte size of each pool in a pool group.
+    TypedVec<PoolIndex, size_t> slotSize(CacheLevel level, PoolGroupIndex pgIdx) const;
     TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const;
 
     // Current ratio list for a cache level (proportional to byte usage per pool group).
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
 
-    // Compute init ratio from an assumed average history length and capacity.
-    TypedVec<PoolGroupIndex, float> ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const;
-
-    // Compute ratio from a BatchDesc.
-    TypedVec<PoolGroupIndex, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
-        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const;
+    // Compute lifecycle allocation weights, then project them onto a cache level's pool grouping.
+    TypedVec<LifeCycleId, float> ratioFromLength(
+        CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
+    TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
+        CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
 
     // Apply stored min_slots constraint to a ratio list for GPU level.
-    TypedVec<PoolGroupIndex, float> constrainRatio(TypedVec<PoolGroupIndex, float> const& ratio) const;
+    TypedVec<PoolGroupIndex, float> constrainPoolGroupRatio(TypedVec<PoolGroupIndex, float> const& ratio) const;
 
     // Byte address of a slot's buffer in GPU memory (per-layer, with offset).
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
 
+    void copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
+        SlotId srcSlotId, CUstream stream);
     // Pool group base address without per-layer offset.
     MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
@@ -238,12 +287,12 @@ public:
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
-    StorageStatistics getStatistics(CacheLevel level = kGpuLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0}) const;
-    TypedVec<PoolGroupIndex, float> getUtilization(CacheLevel level = kGpuLevel) const;
-    float getOverallUtilization(CacheLevel level = kGpuLevel) const;
+    StorageStatistics getStatistics(CacheLevel level = kHotLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0}) const;
+    TypedVec<PoolGroupIndex, float> getUtilization(CacheLevel level = kHotLevel) const;
+    float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).
-    SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kGpuLevel) const;
+    SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
@@ -258,43 +307,81 @@ public:
     }
 
     friend class KvCacheManager;
-    // White-box test introspection reaches computeSlotsForBatch() via friendship
+    // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
     friend class KvCacheIntrospection;
 
 private:
+    using PageQueue = std::deque<SharedPtr<Page>>;
+    using PagesByLifeCycle = TypedVec<LifeCycleId, PageQueue>;
+    using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;
+
     // Minimum per-pool-group slot counts to support a BatchDesc.
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(
+    TypedVec<PoolGroupIndex, SlotCount> computePoolGroupSlotsForBatch(
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
 
-    // Constraint-based partitioning helpers.
-    TypedVec<PoolGroupIndex, SlotCount> computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
+    TypedVec<LifeCycleId, SlotCount> computeSlotsForBatch(
+        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+
+    // Constraint floors apply only to the hot level. Lifecycle demands remain available only as ratio weights.
+    TypedVec<PoolGroupIndex, SlotCount> computePoolGroupMinSlotsFromConstraints(
+        std::vector<BatchDesc> const& constraints, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume = 1.0f) const;
+    TypedVec<LifeCycleId, SlotCount> computeSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse,
         float maxUtilForResume = 1.0f) const;
+    TypedVec<LifeCycleId, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const;
+    // Project source-level lifecycle byte weights onto destination pool groups while preserving the implied
+    // lifecycle slot-count proportions.
+    TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
+        CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
+    TypedVec<LifeCycleId, size_t> slotsToBytes(
+        TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio) const;
-    size_t minQuotaForLevel(
-        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity) const;
-
-    PoolIndex mNumPools(PoolGroupIndex pgIdx) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+    size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
     // Internal helpers.
-    void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+    [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
 
-    void _batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
+    void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
+        PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
+        DropRecorder const& dropRecorder = {});
+
+    std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
         bool defrag = false);
+    [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
+        CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
+    void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+
+    template <typename Submit>
+    bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
+        CUstream stream, Submit&& submit);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
+    LifeCyclePoolGroupMapping const& poolGroupMapping(CacheLevel level) const
+    {
+        TLLM_CHECK(level >= CacheLevel{0} && level < mSlotDescLists.size());
+        // Every cold level uses the same encoded page layout and therefore shares one pool-group mapping.
+        return level == kHotLevel ? mHotPoolGroupMapping : mColdPoolGroupMapping;
+    }
+
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
-    TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleGrouping; // lcId → pgIdx
+    LifeCyclePoolGroupMapping mHotPoolGroupMapping;
+    LifeCyclePoolGroupMapping mColdPoolGroupMapping;
+    // Codec batching representative for each lifecycle.
+    TypedVec<LifeCycleId, LayerGroupId> mBatchingLayerGroupIds;
+    // Codec-selected PageIndexPair memory location for each lifecycle.
+    TypedVec<LifeCycleId, PageIndexLocation> mPageIndexLocations;
     std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
     StorageConfig mStorageConfig;
 
@@ -310,6 +397,13 @@ private:
     // Whether SWA scratch reuse is enabled.
     std::optional<SwaScratchReuseConfig> mSwaScratchReuse;
 
+    // Owns the configured codec and outlives the storage and staging resources declared below.
+    std::unique_ptr<IKvCacheColdPageCodec> mColdPageCodec;
+
+    // Optional model-sized page staging is owned here and borrowed by CopyEngine.
+    std::unique_ptr<StagingBufferManager> mPageStagingManager;
+    std::unique_ptr<CopyEngine> mCopyEngine;
+
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().
     BufferAttr const& getBufferAttr(LayerId layerId, DataRole role) const
@@ -323,9 +417,18 @@ private:
     // Buffer attributes keyed by BufferId.
     std::map<BufferId, BufferAttr> mBufferAttr;
 
-    TypedVec<PoolGroupIndex, SlotDesc> mSlotDescList;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    // All GPU cache levels borrow this allocator. It must outlive mLevels.
+    std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
+
+    static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
+    static constexpr size_t kPageStagingDepth = 3;
+    static constexpr size_t kMaxIndexBatchBytes = 64u << 10u;
+    static constexpr size_t kIndexStagingBytes = 256u << 10u;
+    // Allocated only when a codec requests device indices; protected through codec completion.
+    std::unique_ptr<StagingBufferManager> mIndexStagingManager;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
