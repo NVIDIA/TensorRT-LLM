@@ -30,6 +30,10 @@ import pytest
 import yaml
 from openai.types.responses import (
     ResponseCompletedEvent,
+    ResponseContentPartAddedEvent,
+    ResponseCreatedEvent,
+    ResponseInProgressEvent,
+    ResponseOutputItemAddedEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseTextDeltaEvent,
 )
@@ -220,22 +224,30 @@ async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
         stream=True,
     )
 
-    got_partial_event = False
+    found_delta = False
     try:
         async for event in stream:
-            got_partial_event = True
             assert not isinstance(event, ResponseCompletedEvent), (
                 "Expected a non-terminal delta event before cancellation, "
                 "but received the completed response event instead"
             )
-            assert isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)), (
-                "Expected a streamed delta event before cancellation"
-            )
-            assert len(read_perf_metrics_jsonl(perf_metrics_output_dir)) == count_before, (
-                "JSONL perf metrics changed before the stream was cancelled, "
-                "which indicates the request may have already completed"
-            )
-            break
+            if isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)):
+                found_delta = True
+                assert len(read_perf_metrics_jsonl(perf_metrics_output_dir)) == count_before, (
+                    "JSONL perf metrics changed before the stream was cancelled, "
+                    "which indicates the request may have already completed"
+                )
+                break
+            # Legitimate lifecycle events emitted before the first model-output delta.
+            assert isinstance(
+                event,
+                (
+                    ResponseCreatedEvent,
+                    ResponseInProgressEvent,
+                    ResponseOutputItemAddedEvent,
+                    ResponseContentPartAddedEvent,
+                ),
+            ), f"Unexpected event before first delta: {type(event).__name__}: {event!r}"
     finally:
         # Explicitly close the stream early to simulate client cancellation.
         if hasattr(stream, "aclose"):
@@ -252,7 +264,7 @@ async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
             if inspect.isawaitable(maybe_awaitable):
                 await maybe_awaitable
 
-    assert got_partial_event, "Expected at least one streamed event before cancellation"
+    assert found_delta, "Expected at least one text/reasoning delta before cancellation"
 
     # Observe for a short window to ensure no completed record is appended later.
     for _ in range(6):
