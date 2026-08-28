@@ -29,26 +29,27 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .wan_vae import _NVFP4_SUPPORTED_GPU_NAMES, WanVAE, WanVAEConfig, _supports_nvfp4_device
+from .wan_vae import WanVAE, WanVAEConfig, _nvfp4_supported_sm_names, _supports_nvfp4_device
 
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
 _NVFP4_DYNAMIC_MIN_CHANNELS = 64
 
 
-def _nvfp4_enabled_for_device(
+def _resolve_nvfp4_device_support(
     device: torch.device,
     selected: set[str],
     *,
     explicit_request: bool,
 ) -> bool:
-    """Resolve NVFP4 execution when selected convolutions cannot run on ``device``."""
+    """Resolve NVFP4 execution, rejecting explicit requests on unsupported devices."""
     if not selected or _supports_nvfp4_device(device):
         return True
     if explicit_request:
-        raise ValueError(f"NVFP4 Wan VAE supports {_NVFP4_SUPPORTED_GPU_NAMES} GPUs")
+        raise ValueError(f"NVFP4 Wan VAE supports {_nvfp4_supported_sm_names()} GPUs")
     logger.warning(
         "The NVFP4 VAE checkpoint will use dequantized BF16 operators "
-        f"because the selected device is not one of the supported {_NVFP4_SUPPORTED_GPU_NAMES} GPUs."
+        "because the selected device is not one of the supported "
+        f"{_nvfp4_supported_sm_names()} GPUs."
     )
     return False
 
@@ -242,7 +243,7 @@ def _load_nvfp4_wan_vae(
             input_scales,
             dynamic_activation_quant,
         )
-        enable_fp4 = _nvfp4_enabled_for_device(
+        enable_fp4 = _resolve_nvfp4_device_support(
             device,
             selected,
             explicit_request=quant_config is not None,
@@ -379,7 +380,7 @@ def load_wan_vae(
         _resolve_input_scales(selected, {}, dynamic_activation_quant)
         # The explicit request makes this a validation-only call: unsupported
         # devices raise instead of selecting the BF16 fallback.
-        _nvfp4_enabled_for_device(device, selected, explicit_request=True)
+        _resolve_nvfp4_device_support(device, selected, explicit_request=True)
         n, n_static = swap_wan_convs_to_fp4(wan_vae, only_names=selected)
         if n != len(selected):
             raise ValueError(

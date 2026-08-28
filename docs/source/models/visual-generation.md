@@ -185,6 +185,8 @@ Omit `quant_config` for BF16/FP16 baseline.
 
 #### Wan VAE NVFP4
 
+FP4 VAE replaces eligible native VAE Conv3d operators with NVFP4
+weight-and-activation kernels while retaining BF16 outputs.
 Transformer and VAE quantization are selected independently. Use
 `quant_config` for transformer layers and `vae_quant_config` for the VAE.
 NVFP4 VAE execution currently supports native Wan-family VAEs on SM100, SM103,

@@ -401,10 +401,11 @@ class WanConv2d(nn.Conv2d):
 # alignment through 256 and 256-channel alignment above it; zero padding preserves
 # the convolution mathematically.
 # ---------------------------------------------------------------------------
-_FP4_FP8_MAX, _FP4_E2M1_MAX, _FP4_SF_VEC = 448.0, 6.0, 16
+_FP4_FP8_MAX = 448.0
+_FP4_E2M1_MAX = 6.0
+_FP4_SF_VEC = 16
 _FP4_E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
-_NVFP4_SUPPORTED_DEVICE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0)})
-_NVFP4_SUPPORTED_GPU_NAMES = "SM100, SM103, and SM120"
+_NVFP4_SUPPORTED_SM_VERSIONS = frozenset({100, 103, 120})
 
 
 class _FP4PrequantizedWeight(TypedDict):
@@ -455,11 +456,16 @@ def _supports_nvfp4_conv3d(module: nn.Module) -> bool:
 
 def _supports_nvfp4_device(device: torch.device) -> bool:
     """Return whether ``device`` has a provider-validated FP4 Conv3d architecture."""
-    return (
-        device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device) in _NVFP4_SUPPORTED_DEVICE_CAPABILITIES
-    )
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor in _NVFP4_SUPPORTED_SM_VERSIONS
+
+
+def _nvfp4_supported_sm_names() -> str:
+    """Return provider-validated FP4 Conv3d architectures for diagnostics."""
+    names = [f"SM{version}" for version in sorted(_NVFP4_SUPPORTED_SM_VERSIONS)]
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
 
 
 @lru_cache(maxsize=1)
@@ -597,7 +603,7 @@ def _fp4_conv_run(
     if not x.is_cuda:
         raise ValueError("FP4 Conv3d requires a CUDA input")
     if not _supports_nvfp4_device(x.device):
-        raise ValueError(f"FP4 Conv3d supports {_NVFP4_SUPPORTED_GPU_NAMES} GPUs")
+        raise ValueError(f"FP4 Conv3d supports {_nvfp4_supported_sm_names()} GPUs")
     if x.dtype is not torch.bfloat16:
         raise ValueError(f"FP4 Conv3d requires a bfloat16 input, got {x.dtype}")
     if gs_static is not None and (
@@ -689,7 +695,7 @@ def _fp4_conv_run(
     alpha = from_dlpack(((1.0 / pq["global_scale"]) / gs).to(torch.float32), assumed_align=4)
     stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     cta_tile_k = min(256, Cp)
-    from .fp4_conv_autotuner import FP4ConvTactic, run_tuned_fp4_conv
+    from ...modules.vae.nvfp4_conv_autotuner import FP4ConvTactic, run_tuned_fp4_conv
 
     def compile_tactic(tactic: FP4ConvTactic):
         key = (

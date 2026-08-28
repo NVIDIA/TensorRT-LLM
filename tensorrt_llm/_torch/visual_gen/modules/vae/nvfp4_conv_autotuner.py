@@ -28,6 +28,8 @@ from tensorrt_llm._torch.autotuner import (
 )
 from tensorrt_llm.logger import logger
 
+_NVFP4_CONV_TUNER_KEY = "nvfp4_conv3d"
+
 
 @dataclass(frozen=True)
 class FP4ConvTactic:
@@ -37,8 +39,8 @@ class FP4ConvTactic:
     use_2cta: bool
 
 
+# Validated largest-tile fallback used when no tuned selection is available.
 FP4_CONV_FIXED_TACTIC = FP4ConvTactic((256, 256), (2, 1), (2, 1), True)
-# Use the validated fixed configuration when no tuned selection is available.
 FP4_CONV_FALLBACK_TACTIC = FP4_CONV_FIXED_TACTIC
 
 # NVFP4 alignment fixes the M tile at 128 for 1CTA and 256 for 2CTA. Sweep N
@@ -80,12 +82,12 @@ def _launch_fallback_tactic(
         torch.cuda.synchronize()
     except RuntimeError as sync_error:
         logger.debug(
-            f"Wan NVFP4 Conv3d CUDA synchronize failed after tactic {failed_tactic}: {sync_error}"
+            f"NVFP4 Conv3d CUDA synchronize failed after tactic {failed_tactic}: {sync_error}"
         )
     logger.warning_once(
-        f"Wan NVFP4 Conv3d tactic {failed_tactic} failed for {signature}, "
+        f"NVFP4 Conv3d tactic {failed_tactic} failed for {signature}, "
         f"{problem_shape}; using the fallback tactic: {error}",
-        key=("wan_nvfp4_conv3d", "runtime_fallback", signature, problem_shape, failed_tactic),
+        key=(_NVFP4_CONV_TUNER_KEY, "runtime_fallback", signature, problem_shape, failed_tactic),
     )
     launch(compile_tactic(FP4_CONV_FALLBACK_TACTIC))
     return FP4_CONV_FALLBACK_TACTIC
@@ -141,8 +143,8 @@ class FP4ConvTunableRunner(TunableRunner):
             return FP4_CONV_FALLBACK_TACTIC
         if not isinstance(tactic, int) or not 0 <= tactic < len(FP4_CONV_TACTICS):
             logger.warning_once(
-                f"Wan NVFP4 Conv3d received invalid tactic ID {tactic}; using fallback",
-                key=("wan_nvfp4_conv3d", "invalid_tactic", repr(tactic)),
+                f"NVFP4 Conv3d received invalid tactic ID {tactic}; using fallback",
+                key=(_NVFP4_CONV_TUNER_KEY, "invalid_tactic", repr(tactic)),
             )
             return FP4_CONV_FALLBACK_TACTIC
         return FP4_CONV_TACTICS[tactic]
@@ -169,15 +171,15 @@ class FP4ConvTunableRunner(TunableRunner):
                         torch.cuda.synchronize()
                     except RuntimeError as sync_error:
                         logger.debug(
-                            "Wan NVFP4 Conv3d CUDA synchronize failed after "
+                            "NVFP4 Conv3d CUDA synchronize failed after "
                             f"tactic {tactic_id} compilation: {sync_error}"
                         )
                     self._failed_tactics.add(tactic_id)
                     logger.warning_once(
-                        "Wan NVFP4 Conv3d could not compile "
+                        "NVFP4 Conv3d could not compile "
                         f"tactic {tactic_id} for {self.signature}, {self.problem_shape}: {error}",
                         key=(
-                            "wan_nvfp4_conv3d",
+                            _NVFP4_CONV_TUNER_KEY,
                             "compile_failure",
                             self.signature,
                             self.problem_shape,
@@ -187,14 +189,14 @@ class FP4ConvTunableRunner(TunableRunner):
             return self.output
 
         if tactic in self._failed_tactics:
-            raise RuntimeError(f"Wan NVFP4 Conv3d tactic {tactic} failed during preparation")
+            raise RuntimeError(f"NVFP4 Conv3d tactic {tactic} failed during preparation")
         compiled = self.compile_tactic(self.resolve_tactic(tactic))
         try:
             self.launch(compiled)
         except Exception as error:
             if isinstance(tactic, int) and tactic >= 0:
                 self._failed_tactics.add(tactic)
-            raise RuntimeError(f"Wan NVFP4 Conv3d tactic {tactic} failed during launch") from error
+            raise RuntimeError(f"NVFP4 Conv3d tactic {tactic} failed during launch") from error
         return self.output
 
 
@@ -218,7 +220,7 @@ def run_tuned_fp4_conv(
     )
     inputs = list(tuning_inputs)
     selected_runner, tactic_id = tuner.choose_one(
-        "wan_nvfp4_conv3d",
+        _NVFP4_CONV_TUNER_KEY,
         [runner],
         FP4ConvTunableRunner.tuning_config,
         inputs,
@@ -237,8 +239,4 @@ def run_tuned_fp4_conv(
             compile_tactic=compile_tactic,
             launch=launch,
         )
-    logger.debug_once(
-        f"Wan NVFP4 Conv3d selected tactic {tactic} for {signature}",
-        key=("wan_nvfp4_conv3d", signature, tactic),
-    )
     return output, tactic
