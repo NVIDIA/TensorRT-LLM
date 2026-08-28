@@ -29,9 +29,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-# Aggregated mode will run install together with pytest in slurm_run.sh
+# Aggregated mode and infrastructure dry runs install in slurm_run.sh.
 # Disaggregated mode will run install separately in slurm_install.sh
-if [[ "$stageName" != *Disagg* ]]; then
+if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
@@ -121,7 +121,9 @@ slurm_wait_all_ranks() {
     touch "$readyDir/rank_${SLURM_PROCID}.ready"
 
     # Bounded so a dead rank fails the stage loudly instead of hanging until the
-    # partition walltime kills it; the ceiling exceeds the 2700s pip3 retry budget
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
     # in slurm_install.sh so a merely slow rank still releases the barrier.
     local timeoutSecs=3600
     local deadline=$((SECONDS + timeoutSecs))
@@ -140,10 +142,7 @@ slurm_wait_all_ranks() {
                  "all $numRanks ranks to be ready; ready: $ready/$numRanks"
             return 1
         fi
-        # One rank reports progress; all of them would spam the log every 10s.
-        if [ "$SLURM_PROCID" -eq 0 ]; then
-            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
-        fi
+        echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
         sleep 10
     done
 }
@@ -203,8 +202,10 @@ else
     pytest_exit_code=${PIPESTATUS[0]}
 fi
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-python3 "$llmSrcNode/tests/test_common/s3_output.py" \
-    --drain-spool "$jobWorkspace" || true
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # Every rank scans its own captured log for pytest-timeout banners and
 # writes records to its own per-rank JSONL. All steps are best-effort: a

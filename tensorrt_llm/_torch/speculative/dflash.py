@@ -194,6 +194,7 @@ class DFlashWorker(SpecWorkerBase):
         self.mapping = mapping
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
+        self._compute_block_size = None
 
         # Pre-allocated per-slot context K/V buffers, built lazily on the
         # first forward. Fixed-size so slot-indexed reads/writes are CUDA
@@ -308,9 +309,18 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
 
+        # checkpoint's trained block width
         self._resolved_block_size = getattr(draft_model, "block_size", None) or (
             self.max_draft_len + 1
         )
+        # what the draft forward actually computes
+        self._compute_block_size = self.max_draft_len + 1
+        if self.max_draft_len + 1 > self._resolved_block_size:
+            raise ValueError(
+                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
+                f"Lower max_draft_len to at most {self._resolved_block_size - 1}."
+                f"Current max_draft_len={self.max_draft_len}."
+            )
 
         # +block_size slack lets each backend append the per-iteration noise
         # K/V after the accumulated request context.
@@ -322,7 +332,7 @@ class DFlashWorker(SpecWorkerBase):
         nh = draft_model._num_heads
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
-        capacity = self._max_ctx + self._resolved_block_size
+        capacity = self._max_ctx + self._compute_block_size
         if self._dflash_attention_backend == "TRTLLM":
             page_size = self._ctx_page_size
             has_context_attention = any(
@@ -690,7 +700,7 @@ class DFlashWorker(SpecWorkerBase):
                 # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
                 # Plain DFlash reads mask slots 1..K; dspark shift_label reads
                 # slots 0..K-1 (see dflash_draft_slot_ids).
-                block_size = self._resolved_block_size
+                block_size = self._compute_block_size
                 shift_label = getattr(draft_model, "_dspark_shift_label", False)
                 gen_gather_ids = dflash_draft_slot_ids(
                     num_gens, block_size, K, shift_label, device="cuda"
@@ -901,7 +911,7 @@ class DFlashWorker(SpecWorkerBase):
             )
 
             # Use cached block_size (resolved once on first call)
-            block_size = self._resolved_block_size
+            block_size = self._compute_block_size
             query_tokens_per_req = block_size
 
             # Get slots for gen requests from pre-computed mapping

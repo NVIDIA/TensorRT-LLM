@@ -8162,6 +8162,211 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            dtype=output_dtype,
                            device=q.device)
 
+    # ------------------------------------------------------------------ #
+    #  CuTe DSL MiniMax-M3 index decode scoring (Blackwell SM100)         #
+    # ------------------------------------------------------------------ #
+    from ..cute_dsl_kernels.blackwell.cute_ptx_utils import \
+        TORCH_TO_CUTE_DTYPE as _M3_TORCH_TO_CUTE_DTYPE
+    from ..cute_dsl_kernels.blackwell.minimax_m3_index_decode_score import \
+        IndexDecodeScoreKernel
+
+    class CuteDSLMiniMaxM3IndexDecodeScoreRunner:
+        """Runner for the MiniMax-M3 indexer decode block-scoring kernel.
+
+        Caches compiled kernels keyed on the static params
+        (dtype, num_heads, max_decode_query_len, head_dim); batch, query-token
+        count, page count and block-table width stay symbolic, so one compile
+        covers every decode step of a given model shape.
+        """
+
+        kernel_cache = dict()
+        # One CTA per (request, split); each walks blocks split, split + 256,
+        # ... so a request longer than 256 pages just loops. Matches upstream.
+        SPLIT_K = 256
+        # The only geometry the kernel has been validated on.
+        SUPPORTED_HEAD_DIM = 128
+        SUPPORTED_PAGE_SIZE = IndexDecodeScoreKernel.BLOCK_K
+        # BLOCK_Q must fit one warp's worth of epilogue lanes.
+        MAX_BLOCK_Q = 32
+
+        @classmethod
+        def is_supported(
+            cls,
+            *,
+            q_dtype: torch.dtype,
+            num_heads: int,
+            head_dim: int,
+            page_size: int,
+            max_decode_query_len: int,
+        ) -> bool:
+            """Whether this kernel can serve the given decode geometry.
+
+            Callers use this to pick between the CuTe DSL scorer and the
+            fallback rather than catching an exception on the hot path.
+            """
+            return (is_sm_100f() and q_dtype in _M3_TORCH_TO_CUTE_DTYPE
+                    and head_dim == cls.SUPPORTED_HEAD_DIM
+                    and page_size == cls.SUPPORTED_PAGE_SIZE
+                    and num_heads * max_decode_query_len <= cls.MAX_BLOCK_Q
+                    and max_decode_query_len >= 1)
+
+        @classmethod
+        def _compile(cls, q_dtype: torch.dtype, num_heads: int,
+                     max_decode_query_len: int, head_dim: int):
+            key = (q_dtype, num_heads, max_decode_query_len, head_dim)
+            if key in cls.kernel_cache:
+                return
+
+            cute_dtype = _M3_TORCH_TO_CUTE_DTYPE[q_dtype]
+            page_size = cls.SUPPORTED_PAGE_SIZE
+
+            sym_total_tokens = cute.sym_int()
+            sym_batch = cute.sym_int()
+
+            # 16-element divisibility on every non-innermost stride is what the
+            # TMA descriptors for Q and K assume.
+            def _sym_stride():
+                return cute.sym_int64(divisibility=16)
+
+            q_fake = cute.runtime.make_fake_tensor(
+                cute_dtype, (sym_total_tokens, num_heads, head_dim),
+                stride=(_sym_stride(), _sym_stride(), 1))
+
+            # The index-K pool may be coalesced with the main K/V cache, in
+            # which case the per-page stride exceeds page_size * head_dim, so
+            # dim 0 is read at runtime.
+            k_fake = cute.runtime.make_fake_tensor(
+                cute_dtype, (cute.sym_int(), page_size, head_dim),
+                stride=(_sym_stride(), _sym_stride(), 1))
+
+            bt_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_batch, cute.sym_int()), stride_order=(1, 0))
+
+            # Every stride is symbolic because production passes a transposed
+            # view of the [heads, blocks, tokens] selector buffer, whose
+            # innermost logical stride is the token count rather than 1.
+            score_fake = cute.runtime.make_fake_tensor(
+                cutlass.Float32, (num_heads, sym_total_tokens, cute.sym_int()),
+                stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()))
+
+            sl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                            (sym_batch, ),
+                                                            stride_order=(0, ))
+
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
+            kernel = IndexDecodeScoreKernel(
+                cute_dtype,
+                num_heads,
+                max_decode_query_len,
+                cls.SPLIT_K,
+                head_dim,
+            )
+            cls.kernel_cache[key] = cute.compile(
+                kernel,
+                q_fake,
+                k_fake,
+                bt_fake,
+                score_fake,
+                sl_fake,
+                fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            logger.debug(
+                f"[compile cute_dsl minimax_m3_index_decode_score] {key}")
+
+        @classmethod
+        def forward(
+            cls,
+            idx_q: torch.Tensor,
+            index_k_cache: torch.Tensor,
+            block_table: torch.Tensor,
+            seq_lens: torch.Tensor,
+            score: torch.Tensor,
+            max_decode_query_len: int,
+        ) -> None:
+            """Score one decode step, compiling the kernel on first use.
+
+            The compile allocates, so it must not land inside a CUDA graph
+            capture. It does not: CUDAGraphRunner.capture runs eager warmup
+            forwards first, and those cover every geometry the graphs it then
+            captures will replay.
+            """
+            _, num_heads, head_dim = idx_q.shape
+            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
+            if key not in cls.kernel_cache:
+                cls._compile(idx_q.dtype, num_heads, max_decode_query_len,
+                             head_dim)
+            cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
+                                  seq_lens)
+
+    @torch.library.custom_op("trtllm::cute_dsl_minimax_m3_index_decode_score",
+                             mutates_args=("score", ),
+                             device_types="cuda")
+    def cute_dsl_minimax_m3_index_decode_score(
+        idx_q: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        score: torch.Tensor,
+        max_decode_query_len: int,
+    ) -> None:
+        """Write per-block max index scores for one decode step, in place.
+
+        Args:
+            idx_q: [total_q, num_index_heads, head_dim], BF16 or FP8 E4M3.
+                total_q must be batch * decode_query_len with a uniform
+                decode_query_len, which the kernel infers.
+            index_k_cache: [num_pages, page_size, head_dim], same dtype as
+                idx_q. May be a strided view of a coalesced pool.
+            block_table: [batch, max_blocks_per_seq] int32 page table.
+            seq_lens: [batch] int32 attended KV length per request.
+            score: [num_index_heads, total_q, max_blocks] float32, mutated in
+                place. Only blocks below ceil(seq_len / page_size) are written,
+                which is exactly the range the block selector reads. Arbitrary
+                strides are accepted so a transposed selector buffer can be
+                passed without a copy.
+            max_decode_query_len: compile-time bound on decode_query_len;
+                num_index_heads * max_decode_query_len must not exceed 32.
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL MiniMax-M3 index decode score only supports SM 100 "
+                f"family.")
+        logger.info_once(
+            f"cute_dsl_minimax_m3_index_decode_score inputs: "
+            f"idx_q dtype={idx_q.dtype} shape={tuple(idx_q.shape)} stride={idx_q.stride()}; "
+            f"index_k_cache dtype={index_k_cache.dtype} shape={tuple(index_k_cache.shape)} "
+            f"stride={index_k_cache.stride()}; "
+            f"block_table shape={tuple(block_table.shape)} stride={block_table.stride()}; "
+            f"seq_lens shape={tuple(seq_lens.shape)}; "
+            f"score dtype={score.dtype} shape={tuple(score.shape)} stride={score.stride()}; "
+            f"max_decode_query_len={max_decode_query_len}",
+            key="cute_dsl_minimax_m3_index_decode_score_inputs",
+        )
+        CuteDSLMiniMaxM3IndexDecodeScoreRunner.forward(
+            idx_q,
+            index_k_cache,
+            block_table,
+            seq_lens,
+            score,
+            max_decode_query_len,
+        )
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_minimax_m3_index_decode_score")
+    def _(
+        idx_q: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        score: torch.Tensor,
+        max_decode_query_len: int,
+    ) -> None:
+        return None
+
     # ======================================================================
     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell
     # ======================================================================
@@ -9417,13 +9622,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool]:
             """Fallback 4-tuple tactic ``(mma_qk, mma_pv, split_kv,
             is_persistent)`` for when the AutoTuner cache is not warmed and
-            ``choose_one`` returns its ``-1`` sentinel."""
+            ``choose_one`` returns its ``-1`` sentinel.
+
+            ``batch_size`` is rounded down to its tuning bucket
+            (``last_positive_power_of_2`` -- the same mapping the tuning
+            config uses) before deriving ``split_kv``: tuning profiles (and
+            therefore ``cute.compile``s) exactly the bucket-derived
+            ``split_kv`` variants, so a bucket-aligned fallback reuses an
+            already-compiled kernel where one exists instead of JIT-compiling
+            a fresh raw-batch ``split_kv`` variant in the serving loop. The
+            ``is_persistent`` choice is unaffected by the rounding (its
+            threshold is a power of two, so rounding down to a power of two
+            never crosses it), and both candidates are compiled during tuning
+            anyway."""
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
-            split_kv = self.get_default_split_kv(batch_size, self.seq_len_q,
+            bucketed_batch_size = last_positive_power_of_2(batch_size)
+            split_kv = self.get_default_split_kv(bucketed_batch_size,
+                                                 self.seq_len_q,
                                                  max_active_blocks)
-            is_persistent = self.get_default_is_persistent(batch_size)
+            is_persistent = self.get_default_is_persistent(bucketed_batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
         def forward(

@@ -964,7 +964,7 @@ DTYPES = [
 # Default runs the CI subset (TRTLLM_TEST_MOE_CI=1).
 # Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
 CI_MOE_MODEL_CONFIGS = [
-    MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
+    MoeModelConfig(60, 4, 2048, 1408),  # retained 60-expert backend shape
     MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
