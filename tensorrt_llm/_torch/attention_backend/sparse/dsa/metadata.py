@@ -20,6 +20,7 @@ from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
+from .gvr_prior_tracker import GvrPriorTracker
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
@@ -216,8 +217,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
 
+        # Realign GVR prior rows to request identity (composition changes,
+        # first-step-decode seeding) before the indexer consumes them.
+        self.prepare_for_gvr_prior()
+
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
+
+    def prepare_for_gvr_prior(self) -> None:
+        """Keep ``gvr_prior_indices`` rows aligned to request identity.
+
+        Hint quality only: GVR exactness never depends on the hint content.
+        """
+        tracker = getattr(self, "gvr_prior_tracker", None)
+        if tracker is None or not self.enable_gvr_topk or not self.request_ids:
+            return
+        ctx_ids = self.request_ids[: self.num_contexts]
+        gen_ids = self.request_ids[self.num_contexts : self.num_seqs]
+        tracker.realign(self.gvr_prior_indices, gen_ids, ctx_ids)
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
@@ -837,6 +854,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             self.gvr_prior_indices.zero_()
+            # One tracker per engine, shared by every metadata instance that
+            # aliases this buffer (eager + per-capture); the buffer was just
+            # zeroed, so row ownership resets with it.
+            tracker = getattr(self.kv_cache_manager, "_gvr_prior_tracker", None)
+            if tracker is None:
+                tracker = GvrPriorTracker()
+                self.kv_cache_manager._gvr_prior_tracker = tracker
+            tracker.reset()
+            self.gvr_prior_tracker = tracker
             if self.use_cute_dsl_topk:
                 self.kv_lens_row_reorder_buffer = self.get_empty(
                     self.cuda_graph_buffers,
