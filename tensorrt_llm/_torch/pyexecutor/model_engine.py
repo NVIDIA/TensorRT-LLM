@@ -745,8 +745,10 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_enabled = bool(self.torch_compile_config is not None)
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
-        torch_compile_generation = self.torch_compile_config.compile_generation if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'compile_generation'].default
+        compile_only_context_and_mixed_graphs = (
+            self.torch_compile_config.compile_only_context_and_mixed_graphs
+            if self.torch_compile_config is not None else TorchCompileConfig.
+            model_fields['compile_only_context_and_mixed_graphs'].default)
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
         torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
@@ -757,6 +759,10 @@ class PyTorchModelEngine(ModelEngine):
             'max_num_streams'].default
 
         self._torch_compile_enabled = torch_compile_enabled
+        self._compile_only_context_and_mixed_graphs = (
+            compile_only_context_and_mixed_graphs)
+        torch_compile_bypass_state = {"active": False}
+        self._torch_compile_bypass_state = torch_compile_bypass_state
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
@@ -809,12 +815,12 @@ class PyTorchModelEngine(ModelEngine):
                         self.model.model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
-                    if not torch_compile_generation:
+                    if compile_only_context_and_mixed_graphs:
                         compiled_decoder = self.model.model
                         compiled_forward = compiled_decoder.forward
                         logger.info(
-                            "torch.compile is disabled for generation-only "
-                            "batches")
+                            "torch.compile is limited to context and mixed "
+                            "execution graphs")
 
                         def phase_selective_forward(*args, **kwargs):
                             attrs = get_model_extra_attrs()
@@ -825,16 +831,18 @@ class PyTorchModelEngine(ModelEngine):
                                              else None)
                             # This is the finalized batch classification after
                             # any context-to-generation promotion.
-                            if (attn_metadata is not None
-                                    and attn_metadata.num_contexts == 0):
+                            if (torch_compile_bypass_state["active"]
+                                    or (attn_metadata is not None
+                                        and attn_metadata.num_contexts == 0)):
                                 return eager_decoder(*args, **kwargs)
                             return compiled_forward(*args, **kwargs)
 
                         compiled_decoder.forward = phase_selective_forward
                 elif callable(apply_llm_torch_compile):
-                    if not torch_compile_generation:
+                    if compile_only_context_and_mixed_graphs:
                         raise ValueError(
-                            "TorchCompileConfig.compile_generation=False is "
+                            "TorchCompileConfig."
+                            "compile_only_context_and_mixed_graphs=True is "
                             "only supported for DecoderModelForCausalLM models."
                         )
                     # TODO: Move this contract to MultimodalModelMixin once
@@ -843,9 +851,10 @@ class PyTorchModelEngine(ModelEngine):
                     apply_llm_torch_compile(backend=self._torch_compile_backend,
                                             fullgraph=torch_compile_fullgraph)
                 else:
-                    if not torch_compile_generation:
+                    if compile_only_context_and_mixed_graphs:
                         raise ValueError(
-                            "TorchCompileConfig.compile_generation=False is "
+                            "TorchCompileConfig."
+                            "compile_only_context_and_mixed_graphs=True is "
                             "only supported for DecoderModelForCausalLM models."
                         )
                     self.model = torch.compile(
@@ -1337,6 +1346,19 @@ class PyTorchModelEngine(ModelEngine):
         for request in mrope_seed_requests:
             request.py_mrope_delta_cache_slot = request.py_seq_slot
 
+    @contextmanager
+    def _without_torch_compile(self):
+        if not self._compile_only_context_and_mixed_graphs:
+            yield
+            return
+        state = self._torch_compile_bypass_state
+        previous = state["active"]
+        state["active"] = True
+        try:
+            yield
+        finally:
+            state["active"] = previous
+
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
         """
@@ -1467,7 +1489,9 @@ class PyTorchModelEngine(ModelEngine):
         self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            self._run_attention_warmup(resource_manager, can_run_general_warmup)
+            with self._without_torch_compile():
+                self._run_attention_warmup(resource_manager,
+                                           can_run_general_warmup)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
@@ -1488,14 +1512,16 @@ class PyTorchModelEngine(ModelEngine):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            self._run_autotuner_warmup(resource_manager)
+            with self._without_torch_compile():
+                self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            self._run_mamba_hybrid_warmup(resource_manager)
+            with self._without_torch_compile():
+                self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
@@ -1538,7 +1564,8 @@ class PyTorchModelEngine(ModelEngine):
             # fragmentation at runtime.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
-            self._general_warmup(resource_manager, warmup_requests_configs)
+            with self._without_torch_compile():
+                self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is

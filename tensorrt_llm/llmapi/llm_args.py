@@ -5233,11 +5233,12 @@ class TorchCompileConfig(StrictBaseModel):
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
-    compile_generation: bool = Field(
-        default=True,
-        description="Apply torch.compile to generation-only batches. When "
-        "disabled, context and mixed batches remain compiled while "
-        "generation-only batches use eager execution.",
+    compile_only_context_and_mixed_graphs: bool = Field(
+        default=False,
+        description="Compile only context and mixed-batch execution graphs. "
+        "When enabled, generation-only and auxiliary kernel warmup forwards "
+        "use eager execution, while dedicated context/mixed compilation and "
+        "piecewise CUDA graph warmup and capture remain compiled.",
         status="prototype")
 
     enable_inductor: bool = Field(
