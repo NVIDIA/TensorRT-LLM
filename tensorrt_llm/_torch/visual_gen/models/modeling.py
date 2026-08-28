@@ -20,8 +20,12 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import sol_attn_graph_phase
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    SolAttnAttentionConfig,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
@@ -74,23 +78,42 @@ class BaseDiffusionModel(nn.Module):
         the shared registrations.
         """
         sparse_config = self.model_config.attention.sparse_attention_config
-        if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+            disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
+                pretrained_config=self.model_config.pretrained_config,
+            )
+            if disabled_until_timestep is None:
+                return
+
+            # Skip Softmax switches graph-visible attention behavior at the
+            # timestep boundary while tensor shapes stay unchanged. Key the dense
+            # and sparse phases separately; if timestep is absent or None, the
+            # scheduler returns None and the runner omits this key part.
+            runner.register_extra_key_fn(
+                "skip_softmax_phase",
+                lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                    kwargs.get("timestep"),
+                    disabled_until_timestep=disabled_until_timestep,
+                ),
+            )
             return
 
-        disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
-            pretrained_config=self.model_config.pretrained_config,
-        )
-        if disabled_until_timestep is None:
-            return
+        if isinstance(sparse_config, SolAttnAttentionConfig):
+            disabled_until_timestep = sparse_config.disabled_until_timestep
+            if disabled_until_timestep is None:
+                # dense_layers is fixed per layer at construction, so it is
+                # already baked into each captured graph and needs no key.
+                return
 
-        # Skip Softmax switches graph-visible attention behavior at the
-        # timestep boundary while tensor shapes stay unchanged. Key the dense
-        # and sparse phases separately; if timestep is absent or None, the
-        # scheduler returns None and the runner omits this key part.
-        runner.register_extra_key_fn(
-            "skip_softmax_phase",
-            lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-                kwargs.get("timestep"),
-                disabled_until_timestep=disabled_until_timestep,
-            ),
-        )
+            # Sol-Attn switches between dense SDPA and the sparse kernel at the
+            # dense-prefix boundary, again without changing tensor shapes, so
+            # the two phases must not share a captured graph.
+            runner.register_extra_key_fn(
+                "sol_attn_phase",
+                lambda *args, **kwargs: sol_attn_graph_phase(
+                    kwargs.get("timestep"),
+                    disabled_until_timestep=disabled_until_timestep,
+                ),
+            )
+            return
