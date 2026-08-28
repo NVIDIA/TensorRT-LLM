@@ -27,12 +27,25 @@ from tensorrt_llm.llmapi import mpi_session
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _FLASHINFER_CUBIN_ENV = "FLASHINFER_CUBIN_DIR"
 _FLASHINFER_ISOLATION_ENV = "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"
+_BOOTSTRAP_PYTHON_ARGS = [
+    "-c",
+    mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+    mpi_session._FLASHINFER_WORKSPACE_ROOT,
+]
 pytestmark = pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 
 
 def _worker_flashinfer_env() -> tuple[str | None, str | None]:
     mpi_session.mpi4py.MPI.COMM_WORLD.barrier()
     return (os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV))
+
+
+def _pool_flashinfer_envs(n_workers: int = 2) -> list[tuple[str | None, str | None]]:
+    session = mpi_session.MpiPoolSession(n_workers=n_workers)
+    try:
+        return session.submit_sync(_worker_flashinfer_env)
+    finally:
+        session.shutdown()
 
 
 def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch, workspace_root: Path) -> None:
@@ -152,16 +165,8 @@ def test_worker_bootstrap_warns_when_unlock_fails(
     "n_workers, env_overrides, expected",
     [
         (1, {_FLASHINFER_ISOLATION_ENV: "1"}, None),
-        (4, {}, None),
-        (
-            4,
-            {_FLASHINFER_ISOLATION_ENV: "1"},
-            [
-                "-c",
-                mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
-                mpi_session._FLASHINFER_WORKSPACE_ROOT,
-            ],
-        ),
+        (4, {}, _BOOTSTRAP_PYTHON_ARGS),
+        (4, {_FLASHINFER_ISOLATION_ENV: "1"}, _BOOTSTRAP_PYTHON_ARGS),
         (4, {_FLASHINFER_ISOLATION_ENV: "0"}, None),
         (
             4,
@@ -210,15 +215,12 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
-    monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "1")
+    # No isolation env var: multi-worker pools isolate by default.
+    monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
     monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
     workspace_root = tmp_path / "workspaces"
     monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(workspace_root))
-    session = mpi_session.MpiPoolSession(n_workers=2)
-    try:
-        worker_envs = session.submit_sync(_worker_flashinfer_env)
-    finally:
-        session.shutdown()
+    worker_envs = _pool_flashinfer_envs()
 
     workspaces = {workspace for workspace, _ in worker_envs}
     assert len(workspaces) == 2
@@ -227,16 +229,19 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
     assert all(cubin == str(tmp_path / "cubins") for _, cubin in worker_envs)
 
 
+def test_mpi_pool_opt_out_shares_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+    monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "0")
+    monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
+
+    assert all(workspace is None for workspace, _ in _pool_flashinfer_envs())
+
+
 def test_mpi_pool_propagates_explicit_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     explicit = str(tmp_path / "explicit")
     monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "1")
     monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, explicit)
-    session = mpi_session.MpiPoolSession(n_workers=2)
-    try:
-        worker_envs = session.submit_sync(_worker_flashinfer_env)
-    finally:
-        session.shutdown()
 
-    assert all(workspace == explicit for workspace, _ in worker_envs)
+    assert all(workspace == explicit for workspace, _ in _pool_flashinfer_envs())

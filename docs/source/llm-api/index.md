@@ -128,14 +128,15 @@ The following tips typically assist new LLM API users who are familiar with othe
 
 ### FlashInfer JIT workspace for dynamically spawned MPI workers
 
-When the LLM API dynamically spawns multiple MPI workers, users affected by
-concurrent FlashInfer source-generation races can enable persistent, per-worker
-cache slots for FlashInfer JIT artifacts. Set
-`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1` before creating the LLM instance.
-The workaround preserves compiled artifacts between launches, and downloaded
-cubins remain in FlashInfer's shared cache. It is disabled by default and can
-be removed once FlashInfer guards source generation before writing shared
-workspace files.
+When the LLM API dynamically spawns multiple MPI workers, each worker is given
+its own persistent cache slot for FlashInfer JIT artifacts. Sharing one
+workspace lets a worker relink a module's `.so` in place while a peer has it
+mapped, which raises `SIGBUS` in the peer; the per-worker slots avoid that. The
+isolation preserves compiled artifacts between launches, and downloaded cubins
+remain in FlashInfer's shared cache. Set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to restore the shared workspace.
+Both the isolation and this variable can be removed once FlashInfer guards
+source generation and linking against concurrent readers.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence. Workers
 started outside the LLM API's dynamic MPI pool must configure their own

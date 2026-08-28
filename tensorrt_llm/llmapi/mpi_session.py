@@ -523,8 +523,12 @@ class MpiPoolSession(MpiSession):
                 "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
         env.update(self._env_overrides)
+        # A shared workspace makes every worker JIT-build FlashInfer's non-AOT
+        # modules (e.g. sampling) to one path, and FlashInfer relinks that .so
+        # in place while peers may already have it mmap'd -- faulting in a page
+        # of the replaced file raises SIGBUS. Isolate by default.
         isolate_workspace = (self.n_workers > 1 and env.get(
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "0") == "1"
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") == "1"
                              and "FLASHINFER_WORKSPACE_BASE" not in env)
         python_args = ([
             "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
