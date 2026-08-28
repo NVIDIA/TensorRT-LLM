@@ -1106,7 +1106,8 @@ class PyExecutor:
             return
         timed_out = self._pending_timed_out_requests
         self._pending_timed_out_requests = []
-        any_timed_out = any(self.dist.tp_allgather(bool(timed_out)))
+        any_timed_out = any(
+            self.dist.tp_allgather(bool(timed_out), small_payload=True))
         if any_timed_out:
             self._handle_errors(error_msg="Request timed out (KV transfer)",
                                 requests=timed_out,
@@ -3378,7 +3379,8 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
+            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size,
+                                                    small_payload=True)
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
