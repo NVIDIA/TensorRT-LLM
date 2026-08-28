@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import os
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -360,6 +361,28 @@ class MockVisualGenResult:
 # ---------------------------------------------------------------------------
 
 
+class _ThreadSettlingTestClient(TestClient):
+    """TestClient that outwaits starlette's FileResponse reader thread.
+
+    pytest-threadleak samples running threads at the end of a test's call
+    phase. ``FileResponse`` reads the download on an anyio pool thread
+    ("AnyIO worker thread") that is told to stop when the request's portal
+    closes but exits a few milliseconds later -- inside the sampling window,
+    so any file-shipping test in this module can fail as a phantom leak
+    (pipeline #52355 did). Joining here, still in the call phase, waits out
+    those milliseconds deterministically; stop is already queued, so the
+    deadline is a guard, not an expected wait.
+    """
+
+    def request(self, *args, **kwargs):
+        response = super().request(*args, **kwargs)
+        deadline = time.monotonic() + 10.0
+        for thread in threading.enumerate():
+            if thread.name == "AnyIO worker thread":
+                thread.join(max(0.0, deadline - time.monotonic()))
+        return response
+
+
 def _create_server(
     generator: MockVisualGen,
     model_name: str = "test-model",
@@ -385,7 +408,7 @@ def _create_server(
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
         )
-    client = TestClient(server.app)
+    client = _ThreadSettlingTestClient(server.app)
     # Expose the mock so tests can assert captured generate() arguments.
     client.mock_gen = generator
     return client
@@ -457,6 +480,28 @@ async def async_video_client(tmp_path):
     finally:
         await client.aclose()
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest.fixture()
+def action_video_client(tmp_path):
+    """Video client whose pipeline declares a tensor-only extra param.
+
+    Stands in for Cosmos3 action: the route must learn "this result needs a
+    tensor payload" from the spec, never from the parameter's name.
+    """
+    from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+    gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+    specs = {
+        "action_mode": ExtraParamSchema(type="str", default=None, requires_tensor_output=True),
+    }
+    gen.executor.extra_param_specs = specs
+    type(gen).extra_param_specs = property(lambda self: specs)
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen)
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+    del type(gen).extra_param_specs
 
 
 @pytest.fixture()
@@ -2921,3 +2966,86 @@ class TestAsyncVideoTransport:
         # AVI FileResponse carries ``video/x-msvideo``; the path
         # branch would have set ``application/json``.
         assert content.headers["content-type"] == "video/x-msvideo"
+
+
+class TestTensorOnlyFormatResolution:
+    """A request whose result an encoder cannot carry must not be served as video."""
+
+    @staticmethod
+    def _post(client, **body):
+        return client.post(
+            "/v1/videos/generations",
+            json={"prompt": "pick up the block", "size": "64x64", "seconds": 1.0, "fps": 8, **body},
+            headers={"content-type": "application/json"},
+        )
+
+    def test_auto_resolves_to_tensor_payload(self, action_video_client):
+        resp = self._post(action_video_client, extra_params={"action_mode": "policy"})
+        assert resp.status_code == 200
+        # 'auto' would otherwise have produced an encoded video, silently
+        # dropping the modality the request was made for.
+        assert resp.headers["content-type"] == "application/octet-stream"
+        assert resp.headers["content-disposition"].endswith('.safetensors"')
+
+    def test_explicit_tensor_format_passes_through(self, action_video_client):
+        resp = self._post(action_video_client, format="pt", extra_params={"action_mode": "policy"})
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].endswith('.pt"')
+
+    @pytest.mark.parametrize("fmt", ["mp4", "avi"])
+    def test_explicit_encoder_format_is_rejected(self, action_video_client, fmt):
+        """The caller stated two incompatible things; guessing either way is wrong."""
+        resp = self._post(action_video_client, format=fmt, extra_params={"action_mode": "policy"})
+        assert resp.status_code == 400
+        body = resp.json()
+        _assert_llm_envelope(body, code=400, message_contains="action_mode")
+        # The message must name the way out, not just the refusal.
+        assert "safetensors" in body["message"]
+
+    def test_untriggered_request_keeps_encoder_default(self, action_video_client):
+        """No tensor-only param set -> ordinary video request, unchanged."""
+        resp = self._post(action_video_client)
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("video/")
+
+
+class TestTensorOnlyFormatRule:
+    """Unit coverage of the resolution rule itself, without a server."""
+
+    @staticmethod
+    def _specs(**flags):
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        return {
+            name: ExtraParamSchema(type="str", default=None, requires_tensor_output=flag)
+            for name, flag in flags.items()
+        }
+
+    def test_no_specs_is_a_noop(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        assert _resolve_tensor_only_format("auto", {"action_mode": "policy"}, None) == "auto"
+        assert _resolve_tensor_only_format("auto", None, self._specs(a=True)) == "auto"
+
+    def test_only_a_declared_param_triggers(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        specs = self._specs(action_mode=True, stg_scale=False)
+        # a non-declaring param must not force a tensor payload
+        assert _resolve_tensor_only_format("auto", {"stg_scale": 2.0}, specs) == "auto"
+        assert (
+            _resolve_tensor_only_format("auto", {"action_mode": "policy"}, specs) == "safetensors"
+        )
+
+    def test_null_value_does_not_trigger(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        specs = self._specs(action_mode=True)
+        assert _resolve_tensor_only_format("auto", {"action_mode": None}, specs) == "auto"
+
+    def test_encoder_format_raises_naming_the_parameter(self):
+        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+
+        specs = self._specs(action_mode=True)
+        with pytest.raises(ValueError, match="action_mode"):
+            _resolve_tensor_only_format("mp4", {"action_mode": "policy"}, specs)

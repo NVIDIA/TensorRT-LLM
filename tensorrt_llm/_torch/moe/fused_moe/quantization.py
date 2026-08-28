@@ -4888,6 +4888,36 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                 delattr(module, attr)
 
 
+def _fc31_scale_c_omits_dequant(module: torch.nn.Module) -> bool:
+    """Whether the FC1 kernel's scaleC must be quantScaleC alone.
+
+    Mirrors the trtllm-gen host-side rule in
+    ``kernels/BatchedGemm/BatchedGemmTestUtils.h`` (the
+    ``!isLinearInX0(mActType) && mFusedAct`` branch) and ``getKernelScaleC``'s
+    ``doesEltwiseAct`` argument: scaleC carries a ``dequantScaleAb`` factor
+    only when the activation is linear in x0 *and* fused into the GEMM
+    epilogue. Two cases must drop that factor, or the kernel applies it twice:
+
+    * Relu2/Silu are element-wise, so dequantScaleAb reaches the kernel
+      through ptrScaleAct and is applied before the activation.
+    * SiTuGlu is not linear in x0 -- x0 feeds ``tanh(x0 / beta)`` -- so the
+      kernel folds dequantScaleAb into the tanh/sigmoid arguments via
+      scaleGate and applies scaleC to the activation *output* instead (see
+      the ``isLinearInX0`` branches in ``GemmGatedAct/GmemGatedAct.h``).
+
+    SwiGlu and GeGlu are linear in x0 and do need the combined scale.
+
+    Getting this wrong for SiTuGlu is not a small numeric error: the extra
+    dequantScaleAb factor (~6e-8) drives the FC1 output's per-block E4M3
+    scale factors below their smallest subnormal, so the NVFP4 intermediate
+    quantizes to exactly zero and the whole MoE returns zeros.
+    """
+    if getattr(module, "is_situ_activation", False):
+        return True
+    return getattr(module, "activation_type",
+                   None) in (ActivationType.Relu2, ActivationType.Silu)
+
+
 class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
@@ -5273,10 +5303,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
         # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
-        if hasattr(module, 'activation_type') and module.activation_type in [
-                ActivationType.Relu2, ActivationType.Silu
-        ]:
-            # For Relu2/Silu: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
+        if _fc31_scale_c_omits_dequant(module):
+            # scale_c_fc1 = quantScaleC only, broadcast to all experts.
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
                 module.expert_size_per_partition),
                                            non_blocking=True)
@@ -5304,13 +5332,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
             # The shared host copy of fc31_scale_c is consumed by online EPLB
             # when an expert is migrated into a local slot, so it must match
-            # the main-slot formula exactly (see load_quant_scales above).
-            # For Relu2/Silu: fc31_scale_c = fc2_input_scale (broadcast).
-            # For gated (SwiGlu): fc31_scale_c = fc2_input_scale * fc31_alpha.
-            if hasattr(module,
-                       'activation_type') and module.activation_type in [
-                           ActivationType.Relu2, ActivationType.Silu
-                       ]:
+            # the main-slot formula exactly (see _compute_fc31_scale_c above).
+            if _fc31_scale_c_omits_dequant(module):
                 local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
                 ).expand(num_shared).contiguous()
             else:
@@ -5326,8 +5349,42 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
 
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
+    # Starting point only: create_weights resolves both from the layer shape
+    # via resolve_alignments() below. Read the class attributes directly only
+    # when you mean "the unresolved default".
     weight_alignment = 32
     input_hidden_alignment = 32
+
+    @classmethod
+    def resolve_alignments(cls, hidden_size: int,
+                           intermediate_size_per_partition: int):
+        """The alignments create_weights will select for this shape.
+
+        Exposed as a classmethod because TRTLLMGenFusedMoE validates its
+        MoE-TP shard from __init__, i.e. before create_weights has run and
+        shadowed the class attributes with instance ones. Reading the class
+        attributes from there would validate against the unresolved default
+        (32) and admit shards this method cannot lay out.
+
+        Returns ``(weight_alignment, input_hidden_alignment)``.
+        """
+        # Padding is only enabled for hidden_size > 1024, since there are
+        # small unit tests that expect no padding.
+        if hidden_size > 1024 and hidden_size % 256 != 0:
+            # For now let's keep input alignment same as weight alignment.
+            # There are practical reasons that this might be a different
+            # value. See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod
+            # for more details.
+            return 256, 256
+        # Weight scales require M % 128 in
+        # get_shuffle_matrix_sf_a_row_indices. If the intermediate size after
+        # padding does not satisfy that, drop to a 128 weight alignment.
+        padded = (
+            (intermediate_size_per_partition + cls.weight_alignment - 1) //
+            cls.weight_alignment * cls.weight_alignment)
+        if padded % 128 != 0:
+            return 128, cls.input_hidden_alignment
+        return cls.weight_alignment, cls.input_hidden_alignment
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
@@ -5382,22 +5439,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         return (x + alignment - 1) // alignment * alignment
 
     def create_weights(self, module: torch.nn.Module):
-        # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
-        if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
-            self.weight_alignment = 256
-            # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
-            # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
-            self.input_hidden_alignment = 256
-
-        else:
-            # Weight scales require M % 128 in get_shuffle_matrix_sf_a_row_indices.
-            # Check if intermediate_size after padding satisfies this requirement.
-            # If not, set weight_alignment to 128.
-            intermediate_size_padded = self._round_up(
-                module.intermediate_size_per_partition, self.weight_alignment)
-            if intermediate_size_padded % 128 != 0:
-                self.weight_alignment = 128
-
+        self.weight_alignment, self.input_hidden_alignment = (
+            self.resolve_alignments(module.hidden_size,
+                                    module.intermediate_size_per_partition))
         super().create_weights(module, bias_dtype=torch.float32)
 
     def setup_quant_scales(self, module: torch.nn.Module):

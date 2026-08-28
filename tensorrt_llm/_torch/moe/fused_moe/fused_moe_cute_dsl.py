@@ -24,12 +24,8 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, ConstraintSpec,
                                            DynamicTensorSpec,
                                            OptimizationProfile, TunableRunner,
                                            TuningConfig)
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+    GroupedGemmInputsHelper
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import (ActivationType, AuxStreamType, EventType,
                                        Fp4QuantizedTensor,
@@ -327,6 +323,19 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 tile_size = tactic
         if tile_size is None:
             return True
+
+        # Imported here rather than at module scope: these runners are defined
+        # inside cute_dsl_custom_ops' ``if IS_CUTLASS_DSL_AVAILABLE:`` block,
+        # which has no else-branch, so at module scope a missing cutlass DSL
+        # would break every importer of this file -- and create_moe imports it
+        # eagerly under _torch.models, so that reaches all model startup rather
+        # than just this backend. Reaching this line means a CuteDSL runner is
+        # already being tuned, so the DSL is installed.
+        from ...custom_ops.cute_dsl_custom_ops import (
+            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+            Sm100BlockScaledContiguousGroupedGemmRunner,
+            Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 
         for runner, tactic in comb:
             if isinstance(

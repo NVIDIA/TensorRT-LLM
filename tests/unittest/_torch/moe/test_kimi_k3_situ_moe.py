@@ -6,8 +6,11 @@ Covers the SiTU cubin integration behavior:
 
 * runner-local ActType numeric stability (SwiGlu/Relu2/Silu unchanged,
   SiTu appended);
-* the native SiTU runner returns valid tactics and actually launches a
-  kernel whose name contains ``siTuGlu``;
+* the native SiTU runner actually launches a kernel whose name contains
+  ``siTuGlu``, and from the expected cubin family -- ``MxE4m3_MxE2m1`` for
+  the MXFP4 drop, ``E2m1_E2m1E2m1`` for the NVFP4 one (tactic availability
+  for both families is pinned at the op level in
+  tests/unittest/_torch/thop/serial/test_moe.py);
 * fused output matches the Python ``SituAndMul`` reference within
   MXFP8/MXFP4 quantization tolerance, for the default AND asymmetric
   non-default ``activation_situ_beta`` / ``activation_situ_linear_beta``;
@@ -17,6 +20,12 @@ Covers the SiTU cubin integration behavior:
   survive the fused path;
 * the fused path fails loudly without loaded weights (no silent
   random-weight fallback).
+
+The NVFP4 half of SiTU lives here too, on both FP4 backends: CUTLASS takes
+SiTU as an ``ActivationType``, TRTLLM-Gen as an out-of-band
+``trtllm_gen_activation_type`` served by the fused
+``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins. Tests that apply to both are
+parametrized over ``moe_backend`` rather than duplicated.
 """
 
 import dataclasses
@@ -266,17 +275,9 @@ def test_make_situ_alpha_beta_contract():
         )
 
 
-@situ_supported
-def test_situ_runner_returns_valid_tactics():
-    runner = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(int(ActType_TrtllmGen.SiTu), True)
-    # Representative low-latency and throughput shapes (topK, hidden,
-    # intermediate, localExperts, numTokens, validHidden, validIntermediate).
-    for num_tokens in (1, 8, 512):
-        tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
-        assert len(tactics) > 0, f"no valid SiTU tactic for num_tokens={num_tokens}"
-
-
-_LAUNCH_EVIDENCE_SCRIPT = r"""
+_LAUNCH_EVIDENCE_SCRIPTS = {
+    # MXFP4: the K3 fused block (MXFP8 activations x group-32 MXFP4 weights).
+    "mxfp4": r"""
 import torch
 from test_kimi_k3_situ_moe import _K3Config, _make_block_pair
 
@@ -287,12 +288,46 @@ x = torch.randn(1, 16, config.hidden_size, dtype=torch.bfloat16, device=device) 
 fused(x)
 torch.cuda.synchronize()
 assert fused._cubin_call_count == 1
-"""
+""",
+    # NVFP4: the routed MoE on the TRTLLM-Gen backend (group-16 scales).
+    "nvfp4": r"""
+import torch
+from test_kimi_k3_situ_moe import (
+    _TP_EXPERTS,
+    _TP_HIDDEN,
+    _TP_INTERMEDIATE,
+    _load_nvfp4_bank_for,
+    _make_nvfp4_expert_bank,
+    _make_nvfp4_moe,
+    _make_test_gate,
+)
+
+gate = _make_test_gate()
+moe = _make_nvfp4_moe(gate, moe_backend="TRTLLM")
+bank = _make_nvfp4_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
+_load_nvfp4_bank_for(moe, bank, "TRTLLM")
+
+torch.manual_seed(5)
+x = torch.randn(16, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+out = moe.forward(x, gate.compute_logits(x), all_rank_num_tokens=None)
+torch.cuda.synchronize()
+assert torch.isfinite(out).all()
+""",
+}
+
+# What separates the two fused SiTu FC1 cubin families in the launch log.
+_SITU_CUBIN_FAMILY = {"mxfp4": "MxE4m3_MxE2m1", "nvfp4": "E2m1_E2m1E2m1"}
 
 
 @situ_supported
-def test_fused_forward_launches_situ_kernel():
-    """Launch evidence: the FC1 kernel actually selected must be a siTuGlu cubin.
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+def test_fused_forward_launches_situ_kernel(fmt):
+    """Launch evidence: the FC1 kernel selected must be a siTuGlu cubin from
+    the expected quantization family.
+
+    ``siTuGlu`` alone only proves that *some* SiTu kernel ran. The family
+    substring is what separates the MXFP4 drop from the NVFP4 one, so a path
+    silently resolving to the other family still fails here.
 
     Runs in a subprocess because the C++ logger level is fixed at process
     start (TLLM_LOG_LEVEL) and TLLM_BATCHED_GEMM_PRINT_NAME logs at INFO.
@@ -307,17 +342,21 @@ def test_fused_forward_launches_situ_kernel():
     unittest_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
     env["PYTHONPATH"] = os.pathsep.join([this_dir, unittest_root, env.get("PYTHONPATH", "")])
     result = subprocess.run(
-        [sys.executable, "-c", _LAUNCH_EVIDENCE_SCRIPT],
+        [sys.executable, "-c", _LAUNCH_EVIDENCE_SCRIPTS[fmt]],
         capture_output=True,
         text=True,
         env=env,
-        cwd=os.path.dirname(os.path.abspath(__file__)),
+        cwd=this_dir,
         timeout=600,
     )
     log = result.stdout + result.stderr
     assert result.returncode == 0, f"fused forward failed:\n{log[-4000:]}"
     assert "siTuGlu" in log, (
         "expected the FC1 launch log to name a siTuGlu kernel; got:\n" + log[-4000:]
+    )
+    family = _SITU_CUBIN_FAMILY[fmt]
+    assert family.lower() in log.lower(), (
+        f"expected a {fmt.upper()} ({family}) SiTu cubin; got:\n" + log[-4000:]
     )
 
 
@@ -954,14 +993,22 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
     return bank
 
 
-def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS):
+def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
+    """NVFP4 + SiTU routed MoE on either FP4 backend.
+
+    CUTLASS takes SiTU as an ``ActivationType``; TRTLLM-Gen carries it out of
+    band as ``trtllm_gen_activation_type`` and serves it with the fused
+    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins (group-16 block scales).
+    ``_make_routed_moe`` already mirrors both of KimiK3MoERuntime's branches,
+    so the backend is the only variable.
+    """
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     return _make_routed_moe(
         _TP_INTERMEDIATE,
         gate,
         num_experts=num_experts,
-        moe_backend="CUTLASS",
+        moe_backend=moe_backend,
         routed_quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=_NVFP4_GROUP_SIZE),
     )
 
@@ -1012,6 +1059,26 @@ def _load_nvfp4_bank_whole(moe, bank):
             weights[f"{expert_id}.{key}"] = value
     moe.backend.load_weights([weights])
     return moe.backend
+
+
+def _load_nvfp4_bank_for(moe, bank, moe_backend):
+    """Load a bank and run the post-load transform, ready for ``forward``.
+
+    CUTLASS goes through K3's per-expert streaming adapter -- the path the real
+    checkpoint loader takes, and the one the buffer-equality tests above pin.
+    TRTLLM-Gen's NVFP4 quant method does not override
+    ``prepare_streaming_expert_load``, so it takes the stock whole-checkpoint
+    path instead; the loader is not what these tests are about, the kernel is.
+    """
+    if moe_backend == "CUTLASS":
+        backend = _stream_nvfp4_bank(moe, bank)
+        # _stream_nvfp4_bank already ran process_weights_after_loading, which
+        # the whole-checkpoint path leaves to post_load_weights below.
+        backend._weights_transformed = False
+    else:
+        backend = _load_nvfp4_bank_whole(moe, bank)
+    moe.post_load_weights()
+    return backend
 
 
 _NVFP4_LOADED_STATE = (
@@ -1271,11 +1338,17 @@ def _quantize_expert_to_nvfp4(w1, w2, w3, input_scale):
 
 @nvfp4_moe_supported
 @pytest.mark.parametrize(
-    "input_scale",
+    "moe_backend,input_scale",
     [
-        1.0,
+        pytest.param("CUTLASS", 1.0, id="CUTLASS-static_1.0"),
+        pytest.param("TRTLLM", 1.0, id="TRTLLM-static_1.0"),
+        # derived_act_scale is a CUTLASS-path finding (see the reason below),
+        # so it stays pinned to CUTLASS rather than becoming a strict xfail the
+        # TRTLLM-Gen path would have to reproduce.
         pytest.param(
+            "CUTLASS",
             None,
+            id="CUTLASS-derived_act_scale",
             marks=pytest.mark.xfail(
                 strict=True,
                 reason="OPEN: the conventional NVFP4 activation global scale is the WORSE "
@@ -1292,14 +1365,21 @@ def _quantize_expert_to_nvfp4(w1, w2, w3, input_scale):
             ),
         ),
     ],
-    ids=["static_1.0", "derived_act_scale"],
 )
-def test_nvfp4_streamed_experts_match_situ_reference(input_scale):
-    """Streamed NVFP4 experts against the golden activation.
+def test_nvfp4_experts_match_situ_reference(moe_backend, input_scale):
+    """NVFP4 SiTU experts against the golden activation, on both FP4 backends.
 
     The streamed-vs-whole-checkpoint tests compare two loaders that share all
     the scale handling, so they agree whether or not that handling is right.
     This compares against the definition instead.
+
+    ``moe_backend`` is the discriminating dimension: CUTLASS runs SiTU as an
+    ``ActivationType``, TRTLLM-Gen runs the fused ``E2m1_E2m1E2m1 siTuGlu``
+    FC1 cubins. The latter is the one that folds ``dequantScaleAb`` into the
+    tanh/sigmoid arguments instead of into scaleC; getting that wrong drives
+    the FC1 block scales below their smallest subnormal and the MoE returns
+    exact zeros, which the ``cosine > 0.95`` bound below rejects (an all-zero
+    output scores 0).
 
     ``static_1.0`` is what nvidia/Kimi-K3-NVFP4 actually ships for
     ``input_scale``; ``derived_act_scale`` is the conventional value computed
@@ -1327,10 +1407,8 @@ def test_nvfp4_streamed_experts_match_situ_reference(input_scale):
     ]
     bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
 
-    moe = _make_nvfp4_moe(gate, num_experts=num_experts)
-    _stream_nvfp4_bank(moe, bank)
-    moe.backend._weights_transformed = False
-    moe.post_load_weights()
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend=moe_backend)
+    _load_nvfp4_bank_for(moe, bank, moe_backend)
 
     router_logits = gate.compute_logits(x)
     actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
@@ -1341,7 +1419,8 @@ def test_nvfp4_streamed_experts_match_situ_reference(input_scale):
     cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
     rel_l2 = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected)
     print(
-        f"nvfp4-streamed[{input_scale}] vs reference: cosine={cosine.item():.6f} rel_l2={rel_l2.item():.6f}"
+        f"nvfp4[{moe_backend}][{input_scale}] vs reference: "
+        f"cosine={cosine.item():.6f} rel_l2={rel_l2.item():.6f}"
     )
     # The shipped configuration measures 0.9727 / 0.234. That residual is
     # activation quantization: this path takes the ACTIVATIONS to FP4 as well
@@ -1380,7 +1459,8 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-def test_nvfp4_kernel_actually_applies_situ():
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
     BF16 + SiTU already matches the golden reference, so the activation, the
@@ -1390,6 +1470,13 @@ def test_nvfp4_kernel_actually_applies_situ():
     epilogue and something falls back -- the output would be structurally
     wrong in exactly the way the GSM8K collapse showed, while every
     shape-and-buffer check stayed green.
+
+    Run for both FP4 backends: CUTLASS resolves SiTU through the activation
+    enum, TRTLLM-Gen through a distinct fused-cubin family
+    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``). A silent fallback is a different
+    failure on each, and this comparison is tolerance-free, so it catches
+    both -- including the degenerate all-zero FC1 output, which scores 0
+    against both references and so fails the assertion below.
 
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
@@ -1414,10 +1501,8 @@ def test_nvfp4_kernel_actually_applies_situ():
     ]
     bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
 
-    moe = _make_nvfp4_moe(gate, num_experts=num_experts)
-    _stream_nvfp4_bank(moe, bank)
-    moe.backend._weights_transformed = False
-    moe.post_load_weights()
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend=moe_backend)
+    _load_nvfp4_bank_for(moe, bank, moe_backend)
 
     router_logits = gate.compute_logits(x)
     actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
@@ -1437,13 +1522,15 @@ def test_nvfp4_kernel_actually_applies_situ():
     situ_cos, situ_l2 = score(situ)
     swiglu_cos, swiglu_l2 = score(swiglu)
     print(
-        f"NVFP4 kernel vs SiTU ref:   cosine={situ_cos:.6f} rel_l2={situ_l2:.6f}\n"
-        f"NVFP4 kernel vs SwiGLU ref: cosine={swiglu_cos:.6f} rel_l2={swiglu_l2:.6f}"
+        f"NVFP4[{moe_backend}] kernel vs SiTU ref:   "
+        f"cosine={situ_cos:.6f} rel_l2={situ_l2:.6f}\n"
+        f"NVFP4[{moe_backend}] kernel vs SwiGLU ref: "
+        f"cosine={swiglu_cos:.6f} rel_l2={swiglu_l2:.6f}"
     )
     assert situ_cos > swiglu_cos, (
-        f"the NVFP4 kernel matches a SwiGLU reference better than the SiTU one "
-        f"(situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the quantized path is "
-        f"not applying SiTU"
+        f"the NVFP4 {moe_backend} kernel matches a SwiGLU reference better than "
+        f"the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
+        f"quantized path is not applying SiTU"
     )
 
 

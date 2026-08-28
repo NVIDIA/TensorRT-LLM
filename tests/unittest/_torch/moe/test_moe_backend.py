@@ -69,12 +69,19 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
+    NVFP4TRTLLMGenFusedMoEBaseMethod,
+    NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
-from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
-from tensorrt_llm._utils import get_sm_version, mpi_rank
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    ActType_TrtllmGen,
+    MxFp8QuantizedTensor,
+    is_gated_activation,
+)
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -474,6 +481,232 @@ def test_marlin_override_quant_config_degrades_per_layer():
         )
     assert impl_class_for(report) is CutlassFusedMoE
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+# ============================================================================
+# TRTLLM-Gen SiTu backend contract
+# ============================================================================
+# SiTu rides the generic SwiGLU geometry and is carried out of band
+# (trtllm_gen_activation_type, not ActivationType), so the host-side wiring is
+# easy to get wrong in ways no shape check catches. Kernel-level coverage --
+# tactic availability, launch evidence and SiTu-vs-SwiGLU numerics -- lives in
+# test_kimi_k3_situ_moe.py (and thop/serial/test_moe.py for the runner). These
+# are the contracts that hold without running a cubin.
+
+_situ_supported = pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="TRTLLM-Gen SiTu cubins are sm_100f: the SM100 family only",
+)
+
+# Kimi K3 defaults. The gate-side SiTu beta is the cubin's ``alpha``, the
+# linear-side beta its ``beta``. See modeling_kimi_linear.py.
+_SITU_GATE_ALPHA = 4.0
+_SITU_LINEAR_BETA = 25.0
+
+
+def _make_trtllm_gen_moe(
+    *,
+    quant_config: Optional[QuantConfig],
+    situ: bool,
+    num_experts: int = 8,
+    top_k: int = 2,
+    hidden_size: int = 512,
+    intermediate_size: int = 256,
+) -> TRTLLMGenFusedMoE:
+    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=quant_config,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        moe_backend="TRTLLM",
+    )
+    situ_kwargs = (
+        dict(
+            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+            trtllm_gen_activation_alpha=_SITU_GATE_ALPHA,
+            trtllm_gen_activation_beta=_SITU_LINEAR_BETA,
+        )
+        if situ
+        else {}
+    )
+    return TRTLLMGenFusedMoE(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=model_config,
+        init_load_balancer=False,
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        # SiTu rides the generic SwiGLU geometry; the fused activation is
+        # selected by trtllm_gen_activation_type, not by activation_type.
+        activation_type=ActivationType.Swiglu,
+        **situ_kwargs,
+    )
+
+
+def _make_loaded_nvfp4_trtllm_gen_moe(situ: bool) -> TRTLLMGenFusedMoE:
+    """The same MoE with NVFP4 weights and quant scales actually loaded.
+
+    The scale contracts below are written by ``load_quant_scales``, so they
+    only exist after a real load; the stock quantize utils supply the weights.
+    """
+    num_experts, hidden_size, intermediate_size = 8, 512, 256
+    torch.manual_seed(0)
+    x = torch.randn((8, hidden_size), dtype=torch.bfloat16, device="cuda") * 0.5
+    util_cls, quant_config, quant_kwargs = get_test_quant_params(QuantAlgo.NVFP4, x, "TRTLLM")
+    quant_kwargs.pop("ref_cls", None)
+    quantize_util = util_cls(
+        num_experts=num_experts,
+        dtype=torch.bfloat16,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=False,
+        activation_type=ActivationType.Swiglu,
+    )
+    backend = _make_trtllm_gen_moe(
+        quant_config=quant_config,
+        situ=situ,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    backend.load_weights([quantize_util.create_weights(**quant_kwargs)])
+    backend.post_load_weights()
+    return backend.cuda()
+
+
+@_situ_supported
+def test_trtllm_gen_nvfp4_situ_selects_padded_quant_method() -> None:
+    """``_get_quant_method`` must key off ``is_situ_activation``.
+
+    SiTu fills the swiglu_alpha/swiglu_beta slots from ``create_weights``,
+    i.e. after ``_get_quant_method`` has already run, so keying off
+    ``swiglu_alpha is not None`` would make the selected method depend on
+    *when* it is resolved. Plain SwiGLU is the control: it still gets the
+    unpadded base method, so this is not asserting a constant.
+    """
+    situ = _make_loaded_nvfp4_trtllm_gen_moe(situ=True)
+    assert situ.is_situ_activation
+    assert isinstance(situ.quant_method, NVFP4TRTLLMGenFusedMoEMethod)
+    assert situ.scaling_vector_size == 16
+
+    plain = _make_loaded_nvfp4_trtllm_gen_moe(situ=False)
+    assert not plain.is_situ_activation
+    assert type(plain.quant_method) is NVFP4TRTLLMGenFusedMoEBaseMethod
+
+
+@_situ_supported
+def test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale() -> None:
+    """SiTuGlu is nonlinear in x0, so scaleC must be quantScaleC alone.
+
+    Pins the trtllm-gen host rule (``!isLinearInX0(mActType) && mFusedAct`` in
+    ``BatchedGemm/BatchedGemmTestUtils.h``) at the level where TRT-LLM
+    computes it, without needing to run a kernel. SwiGLU is the control: it
+    *is* linear in x0 and keeps the combined ``quantScaleC * dequantScaleAb``.
+
+    Getting this wrong is not a small numeric error. The extra dequantScaleAb
+    factor (~6e-8) drives the FC1 output's per-block E4M3 scale factors below
+    their smallest subnormal, so the NVFP4 intermediate quantizes to exactly
+    zero and the whole MoE returns zeros -- an output that still passes a
+    ``rtol=0.1, atol=0.15`` tolerance band, because these MoE outputs have a
+    standard deviation (~0.04) well below ``atol``.
+    """
+    situ = _make_loaded_nvfp4_trtllm_gen_moe(situ=True)
+    swiglu = _make_loaded_nvfp4_trtllm_gen_moe(situ=False)
+
+    # fc2_input_scale is quantScaleC; fc31_alpha is dequantScaleAb (the
+    # scaleGate the kernel already folds into the tanh/sigmoid arguments).
+    torch.testing.assert_close(
+        situ.fc31_scale_c.data.float(),
+        situ.fc2_input_scale.data.float().expand_as(situ.fc31_scale_c.data),
+        msg="SiTu fc31_scale_c must not carry the dequantScaleAb factor",
+    )
+    torch.testing.assert_close(
+        swiglu.fc31_scale_c.data.float(),
+        (swiglu.fc2_input_scale.data * swiglu.fc31_alpha.data).float(),
+        msg="SwiGLU fc31_scale_c must keep the combined scale",
+    )
+    # The two conventions must actually differ, otherwise this test would pass
+    # vacuously on a build where dequantScaleAb happens to be 1.
+    assert not torch.allclose(situ.fc31_scale_c.data.float(), swiglu.fc31_scale_c.data.float())
+
+
+@_situ_supported
+@pytest.mark.parametrize(
+    "quant_algo",
+    [
+        pytest.param(None, id="unquantized"),
+        pytest.param(QuantAlgo.FP8, id="fp8"),
+        pytest.param(QuantAlgo.W4A16_MXFP4, id="w4a16_mxfp4"),
+    ],
+)
+def test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins(quant_algo) -> None:
+    """There is no standalone SiTu activation kernel.
+
+    SiTu exists only as a fused FC1 epilogue, in the NVFP4 (group-16) and
+    W4A8_MXFP4_MXFP8 (group-32) cubin families. Anything else has to be
+    rejected at construction rather than silently resolving to SwiGLU, which
+    is structurally wrong output that no shape check would catch.
+    """
+    with pytest.raises(ValueError, match="requires one of .* quantization"):
+        _make_trtllm_gen_moe(quant_config=QuantConfig(quant_algo=quant_algo), situ=True)
+
+
+@_situ_supported
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,expected",
+    [
+        pytest.param(512, 256, (32, 32), id="no_padding"),
+        pytest.param(2880, 2880, (256, 256), id="hidden_not_256_aligned"),
+        pytest.param(1536, 192, (128, 32), id="intermediate_needs_128"),
+    ],
+)
+def test_nvfp4_trtllm_gen_resolve_alignments_matches_create_weights(
+    hidden_size, intermediate_size, expected
+) -> None:
+    """``resolve_alignments`` must predict what ``create_weights`` selects.
+
+    ``TRTLLMGenFusedMoE`` validates its MoE-TP shard from ``__init__``, i.e.
+    before ``create_weights`` has shadowed the class attributes with
+    shape-resolved instance ones, so the check has to predict them. If the two
+    ever drift apart the shard contract is validated against the wrong number.
+    """
+    predicted = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(hidden_size, intermediate_size)
+    assert predicted == expected
+
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=True,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    assert (
+        backend.quant_method.weight_alignment,
+        backend.quant_method.input_hidden_alignment,
+    ) == predicted
+
+
+@_situ_supported
+def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
+    """Why the MoE-TP check cannot read the class attribute.
+
+    ``hidden=1536``/``intermediate=192`` resolves to a 128 weight alignment.
+    192 is divisible by the class default (32) but not by 128, so validating
+    against ``NVFP4TRTLLMGenFusedMoEMethod.weight_alignment`` admits a shard
+    the loader cannot lay out. Pins the gap, so reverting the check to the
+    class attribute fails here rather than in a multi-GPU accuracy run.
+    """
+    resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
+    assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
+    assert 192 % resolved != 0
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
@@ -896,7 +1129,7 @@ DTYPES_TO_TEST = [
 CI_MOE_MODEL_CONFIGS = [
     # Real models (small/medium — tactic replay is model-size-independent,
     # e256 is covered by test_moe_module integration tests)
-    MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
+    MoeModelConfig(60, 4, 2048, 1408),  # retained 60-expert backend shape
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
     # Boundary tests for tactic correctness
@@ -1092,7 +1325,7 @@ TEST_PARAMS += generate_element_wise_test_params()
 #    - Supported by: CUTLASS (W4A8_MXFP4_MXFP8), TRTLLM (W4A8_MXFP4_MXFP8)
 #
 # 6. MODEL CONFIGURATIONS:
-#    - Real models: Mixtral, DeepSeek, Qwen, Grok, GPT-OSS
+#    - Real models: Mixtral, DeepSeek, Grok, GPT-OSS
 #    - Boundary cases: prime num_experts, small sizes, top_k=1, top_k=num_experts
 #
 # =============================================================================

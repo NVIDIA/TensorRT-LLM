@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Dict, Generic, Iterator, List, Literal, Optional,
-                    Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, Dict, Generic, Iterator, List, Literal,
+                    Optional, Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -33,7 +33,8 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
-from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
+from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
+                          is_builtin_zoo_module)
 
 
 @contextlib.contextmanager
@@ -696,10 +697,17 @@ class DecoderModelForCausalLM(nn.Module,
     ) -> Optional[Literal["CPP", "PYTHON"]]:
         """Return the model's preferred KV-cache transceiver runtime.
 
-        Subclasses can override this to opt into a specific transceiver
-        implementation ('CPP' or 'PYTHON') that is adopted when the user
-        leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'. Return None to defer to the global default (C++).
+        Subclasses can override this to pin a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
+        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'; unsupported configurations then fail loudly at
+        transceiver creation rather than being rerouted. Return None to
+        defer to the global default: the Python transceiver, falling back to
+        C++ only for conditions decidable from the transceiver config itself
+        (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other
+        incompatibilities fail at transceiver creation. The effective
+        runtime for a no-preference model is therefore
+        deployment-dependent.
 
         Args:
             pretrained_config: the loaded HF pretrained config (may be None
@@ -710,9 +718,9 @@ class DecoderModelForCausalLM(nn.Module,
 
         This preference is intentionally kept out of the generic
         :meth:`get_model_defaults` deep-merge: it must not materialize a
-        ``cache_transceiver_config`` when disaggregated serving is disabled,
-        and it is only honored when the effective backend supports it (the
-        Python transceiver requires NIXL).
+        ``cache_transceiver_config`` when disaggregated serving is disabled.
+        Preferences are adopted only for the 'auto' setting; a 'PYTHON'
+        preference still requires NIXL when the transceiver is created.
         """
         return None
 
@@ -897,6 +905,7 @@ class DecoderModelForCausalLM(nn.Module,
 
 
 MODEL_CLASS_MAPPING = {}
+DRAFT_MODEL_BUILDER_MAPPING = {}
 MODEL_CLASS_VISION_ENCODER_MAPPING = {}
 MODEL_CLASS_MAPPER_MAPPING = {}
 MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
@@ -997,6 +1006,120 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def _is_builtin_draft_model_builder(builder) -> bool:
+    return is_builtin_zoo_module(getattr(builder, "__module__", ""))
+
+
+# Speculative-decoding modes each decorated builder declared via
+# ``register_draft_model``, kept per function (``__dict__``, never inherited).
+# Recorded even when the builder loses its ``DRAFT_MODEL_BUILDER_MAPPING`` slot
+# to an external registration, so a builder can be mapped back to its modes
+# without scanning the mapping by identity (which would silently skip exactly
+# those overridden built-ins).
+_REGISTERED_SPEC_MODES_ATTR = "_registered_spec_modes"
+
+
+def register_draft_model(mode):
+    """Register the draft-model builder for a speculative-decoding mode.
+
+    The builder is a plain function
+    ``(model_config, draft_config, lm_head, model) -> nn.Module`` that owns
+    everything its mode needs to construct its draft model, so the generic
+    dispatcher never has to import a concrete draft implementation. Stack the
+    decorator to serve several modes with one builder (vanilla MTP and
+    MTP_EAGLE_ONE_MODEL share theirs, mirroring
+    ``SpeculativeDecodingMode.is_mtp_one_model()``).
+
+    Same registration priority as ``register_auto_model``: built-in builders
+    only fill empty slots and never overwrite, because under lazy loading a
+    built-in module may run its decorators *after* an external registration
+    (e.g. a drafter supplied through ``--custom_module_dirs``) and must not
+    clobber it. External registrations always overwrite.
+
+    The builder belongs in the ``modeling_*.py`` that defines the draft model,
+    never in the factory file, and needs an ``SPEC_MODE_TO_MODULE`` row in
+    ``_arch_index.py`` so it can be found without importing the zoo -- see the
+    "Adding a speculative decoding mode" notes there. Example (DSpark, whose
+    stage count is only knowable from the checkpoint)::
+
+        @register_draft_model(SpeculativeDecodingMode.DSPARK)
+        def _build_dspark_draft(model_config, draft_config, lm_head, model):
+            num_stages = count_dspark_stages(
+                model_config.spec_config.speculative_model)
+            validate_dspark_eplb_layer_base(model_config, draft_config)
+            return DSv4DSparkForCausalLM(
+                draft_config,
+                getattr(model, "aux_stream_dict", None),
+                num_stages=num_stages,
+                block_size=model_config.spec_config.block_size,
+            )
+
+    Args:
+        mode: the ``SpeculativeDecodingMode`` member this builder serves.
+
+    Returns:
+        The decorator binding a builder function to ``mode``.
+    """
+
+    def decorator(builder):
+        modes = builder.__dict__.get(_REGISTERED_SPEC_MODES_ATTR)
+        if modes is None:
+            modes = set()
+            setattr(builder, _REGISTERED_SPEC_MODES_ATTR, modes)
+        modes.add(mode)
+
+        existing = DRAFT_MODEL_BUILDER_MAPPING.get(mode)
+        if (existing is not None and existing is not builder
+                and _is_builtin_draft_model_builder(builder)):
+            logger.info(
+                f"Keeping existing draft-model builder "
+                f"{existing.__module__}.{existing.__qualname__} for "
+                f"speculative decoding mode {mode.name}; built-in "
+                f"{builder.__module__}.{builder.__qualname__} not registered.")
+            return builder
+        DRAFT_MODEL_BUILDER_MAPPING[mode] = builder
+        return builder
+
+    return decorator
+
+
+def _ensure_draft_model_registered(mode) -> None:
+    """Import the module providing ``mode``'s builder, if not yet loaded.
+
+    Mirrors ``_ensure_model_registered``: builders register as an import side
+    effect, and the model zoo is imported lazily, so this turns a mode into
+    "the decorator has run". Modes missing from the static index are left to
+    the caller's normal unsupported-mode handling.
+    """
+    module_name = SPEC_MODE_TO_MODULE.get(mode.name)
+    if module_name is None:
+        return
+    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Only swallow "the providing module itself is missing" (stale index
+        # entry); a missing dependency *inside* the module is a real error and
+        # must not be masked as "unsupported speculative decoding mode".
+        if e.name != full_name:
+            raise
+        logger.warning(f"Lazy import of {module_name} for speculative "
+                       f"decoding mode {mode.name} failed: {e!r}")
+
+
+def get_registered_draft_model_builder(mode) -> Optional[Callable]:
+    """Resolve ``mode`` to its registered draft-model builder, or ``None``.
+
+    The single entry point for builder lookups: the model zoo is imported
+    lazily, so this resolves the providing module on demand before reading the
+    registry. Do not read ``DRAFT_MODEL_BUILDER_MAPPING`` directly — a raw
+    ``.get()`` silently misses every not-yet-imported provider.
+    """
+    if mode not in DRAFT_MODEL_BUILDER_MAPPING:
+        _ensure_draft_model_registered(mode)
+    return DRAFT_MODEL_BUILDER_MAPPING.get(mode)
 
 
 def get_registered_vision_encoder(

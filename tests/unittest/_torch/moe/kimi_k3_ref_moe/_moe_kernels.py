@@ -74,8 +74,8 @@ def get_moe_sm_version() -> int:
 
 
 def is_native_situ_supported() -> bool:
-    """Native SiTU cubins are Blackwell sm_100f (SM100/SM103) only."""
-    return get_moe_sm_version() in (100, 103)
+    """Native SiTU cubins are Blackwell sm_100f: the whole SM100 family."""
+    return 100 <= get_moe_sm_version() < 110
 
 
 def assert_native_situ_supported(
@@ -88,8 +88,10 @@ def assert_native_situ_supported(
     if not torch.cuda.is_available():
         raise RuntimeError("native SiTU MoE requires CUDA; no CUDA device is available")
     sm = get_moe_sm_version()
-    if sm not in (100, 103):
-        raise RuntimeError(f"native SiTU MoE requires SM100/SM103 (Blackwell); running on SM{sm}")
+    if not 100 <= sm < 110:
+        raise RuntimeError(
+            f"native SiTU MoE requires the SM100 (Blackwell) family; running on SM{sm}"
+        )
     if group_size != SCALING_VECTOR_SIZE:
         raise RuntimeError(
             f"native SiTU MoE requires MXFP4 group_size {SCALING_VECTOR_SIZE}, got {group_size}"

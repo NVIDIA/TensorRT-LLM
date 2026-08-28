@@ -374,10 +374,10 @@ every specialized backend — `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
 `DeepGemmFusedMoE`, `DenseGEMMFusedMoE`, `MarlinFusedMoE` — while
 `TRTLLMGenFusedMoE` accepts only the algorithms in its `_GPTOSS_SUPPORTED_ALGOS`.
 
-Cutlass gates gpt-oss / MiniMax SwiGLU on unquantized, NVFP4, and the MXFP4
-family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `NVFP4`,
-`W4A16_MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The CUDA kernel is not
-the constraint — `torch.ops.trtllm.fused_moe` takes `swiglu_alpha` /
+Cutlass gates gpt-oss / MiniMax SwiGLU on unquantized, MXFP8, NVFP4, and the
+MXFP4 family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `MXFP8`,
+`NVFP4`, `W4A16_MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The CUDA kernel
+is not the constraint — `torch.ops.trtllm.fused_moe` takes `swiglu_alpha` /
 `swiglu_beta` / `swiglu_limit` on the same call for every path, including
 NVFP4 (`CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1>`), and TMA-WS GEMM1
 applies `SwigluBiasAdaptor` in `doActivation`. NVFP4 is eligible only when

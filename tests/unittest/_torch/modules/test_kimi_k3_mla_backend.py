@@ -66,7 +66,12 @@ def test_select_kimi_k3_mla_generation_backend_uses_trtllm_gen_for_fp8_kv_cache(
         ("cute-dsl", 0, 4, 4, 96, "cute-dsl"),
         ("cute-dsl", 1, 3, 3, 12, "trtllm-gen"),
         ("cute-dsl", 1, 3, 3, 96, "cute-dsl"),
-        ("cute-dsl", 0, 4, 8, 96, "trtllm-gen"),
+        # Generation-only multi-token (speculative verification): H=96 must
+        # stay on cute-dsl — trtllm-gen's decode gate rejects that head
+        # count, so falling back fails engine init. Smaller per-rank head
+        # counts (non-attention-DP shapes) keep the tuning fallback.
+        ("cute-dsl", 0, 4, 8, 96, "cute-dsl"),
+        ("cute-dsl", 0, 4, 8, 12, "trtllm-gen"),
         ("trtllm-gen", 1, 3, 3, 96, "trtllm-gen"),
     ],
 )
@@ -78,7 +83,7 @@ def test_kimi_k3_mla_decode_backend_policy_by_batch_shape(
     num_heads: int,
     expected_backend: str,
 ) -> None:
-    """K3 falls back outside plain decode except for unsafe H=96 mixed batches."""
+    """K3 falls back outside plain decode except when H=96 breaks trtllm-gen."""
     assert (
         _kimi_k3_mla_decode_backend_policy(
             requested_backend,
