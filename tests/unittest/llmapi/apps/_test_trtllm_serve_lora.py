@@ -14,20 +14,20 @@
 # limitations under the License.
 
 import os
-import subprocess
-import sys
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Generator
 
+import openai
 import pytest
 import yaml
 
-from ..lora_test_utils import qwen3_lora_adapter
-from .openai_server import RemoteOpenAIServer
+from tensorrt_llm.executor.request import LoRARequest
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
+from ..lora_test_utils import qwen3_lora_adapter
+from ..test_llm import get_model_path
+from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module", ids=["Qwen3/Qwen3-0.6B"])
@@ -80,25 +80,20 @@ def server(
 
 
 @pytest.fixture(scope="module")
-def example_root() -> str:
-    llm_root = os.getenv("LLM_ROOT")
-    return os.path.join(llm_root, "examples", "serve")
+def client(server: RemoteOpenAIServer) -> openai.OpenAI:
+    return server.get_client()
 
 
-@pytest.mark.parametrize("exe, script",
-                         [("python3", "openai_completion_client_for_lora.py")])
-def test_trtllm_serve_examples(exe: str, script: str,
-                               server: RemoteOpenAIServer, example_root: str,
-                               model_name: str,
-                               lora_adapter_path: Path) -> None:
-    client_script = os.path.join(example_root, script)
-    env = os.environ.copy()
-    env["TRTLLM_LORA_MODEL"] = model_name
-    env["TRTLLM_LORA_PATH"] = str(lora_adapter_path)
-    # CalledProcessError will be raised if any errors occur
-    subprocess.run([exe, client_script],
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   text=True,
-                   env=env,
-                   check=True)
+def test_trtllm_serve_lora_completion(client: openai.OpenAI, model_name: str,
+                                      lora_adapter_path: Path) -> None:
+    lora_request = LoRARequest(lora_name=lora_adapter_path.name,
+                               lora_int_id=0,
+                               lora_path=str(lora_adapter_path))
+    response = client.completions.create(
+        model=model_name,
+        prompt="The capital of France is",
+        max_tokens=20,
+        extra_body={"lora_request": asdict(lora_request)},
+    )
+
+    assert response.choices[0].text
