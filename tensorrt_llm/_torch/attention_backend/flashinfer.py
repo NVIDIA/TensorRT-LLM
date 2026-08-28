@@ -587,7 +587,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         """Replace evicted SWA pages with a safe in-range page index."""
         window_vec = getattr(self.kv_cache_manager, 'max_attention_window_vec',
                              None)
-        if not window_vec or window_vec[layer_idx % len(window_vec)] is None:
+        if not window_vec:
+            return
+        local_layer_idx = self.kv_cache_manager.layer_offsets[layer_idx]
+        if window_vec[local_layer_idx] is None:
             return
 
         # KVCacheManagerV2 marks evicted out-of-window pages with -1.
