@@ -81,11 +81,12 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
         ),
         num_contexts=0,
         num_ctx_tokens=0,
+        num_tokens=2,
         seq_lens=torch.tensor([1, 1]),
         kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
     )
 
-    output = attention(torch.empty(2, _Cfg.hidden_size), metadata)
+    output = attention(torch.empty(2, _Cfg.hidden_size, dtype=torch.bfloat16), metadata)
 
     assert output.shape == (2, _Cfg.hidden_size)
     assert captured["slot_indices"].data_ptr() == state_indices.data_ptr()
