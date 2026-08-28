@@ -1,70 +1,75 @@
+(kv-transfer)=
+
 # Introduction to KV Cache Transmission
 
-This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by dist-serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities.
+This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by disaggregated serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities. For configuring a deployment, see [Disaggregated Serving](../features/disagg-serving.md) instead.
+
+The implementation described here is the Python transceiver, which lives under [`tensorrt_llm/_torch/disaggregation/`](source:tensorrt_llm/_torch/disaggregation). `cache_transceiver_config.transceiver_runtime` defaults to `auto`, which selects it on the supported NIXL path and otherwise falls back to the older C++ transceiver (`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp` and friends). That C++ implementation is deprecated and will be removed in a future release; new work should target the Python path.
 
 ## Table of Contents
 
 - [Workflow](#workflow)
 - [Key Components](#key-components)
   - [Transceiver](#transceiver)
-  - [Sender and Receiver](#sender-and-receiver)
-  - [Formatter](#formatter)
-  - [Connection](#connection)
+  - [Messenger](#messenger)
+  - [Peer Registrar and Mappers](#peer-registrar-and-mappers)
+  - [Page Table](#page-table)
   - [Transfer Agent](#transfer-agent)
 - [Customization](#customization)
-  - [Encapsulation and Overloading of Low-Level Communication Libraries](#encapsulation-and-overloading-of-low-level-communication-libraries)
-  - [Modifications to Upper-Level Runtime Logic](#modifications-to-upper-level-runtime-logic)
-- [Evolution Outlook](#evolution-outlook)
+  - [Integrating a New Transport](#integrating-a-new-transport)
+  - [Supporting a New Cache Layout](#supporting-a-new-cache-layout)
+- [Current Limitations](#current-limitations)
 
 ## Workflow
 
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/media/kv_transfer.png?raw=true" alt="KV Cache Transfer Overview" width="500" height="auto">
+The control plane — discovery, per-request metadata, and completion notices — is ZeroMQ. The data plane is one-sided NIXL writes issued by the context worker into memory the generation worker has registered. The two never share a channel.
 
-1. Context phase completes computation, KV cache stays in device memory awaiting transmission.
-2. Context returns its communicator handle to the user, who selects the generation executor for continued communication.
-3. If no prior connection exists, it's established now. Generation phase shares its cache layout with context.
-4. Generation phase requests KV cache for specific tokens.
-5. Context sends KV cache to generation phase.
-6. Generation phase resumes computation, context releases KV cache.
+1. Context phase completes computation, KV cache stays in device memory awaiting transmission. The context worker publishes only the endpoint where it can be reached, on `ContextPhaseParams.disagg_info_endpoint`.
+2. On first contact with a context instance, the generation worker fetches that instance's `RankInfo` — topology, attention geometry, serialized page table, transfer agent descriptor — from the context rank 0, then registers its own `RankInfo` with every context rank. The result is cached per endpoint, so only the first request pays for the round trip.
+3. Generation phase requests KV cache for specific tokens, sending its destination block IDs to each overlapping context rank.
+4. Context computes both source and destination addresses locally and submits a one-sided NIXL transfer. On the default path that transfer carries one descriptor per cache fragment; only the optional bounce path coalesces a request into a single contiguous buffer and a single write. All address arithmetic happens on the context side; the generation worker's CPU is not involved.
+5. Context reports completion over the control plane. The receive session completes once every expected writer has reported.
+6. Generation phase resumes computation, context releases KV cache. Both sides run an allgather first, so every rank agrees on the outcome before any state transition.
 
 ## Key Components
 
 ### Transceiver
 
-Responsible for coordinating the sending and receiving of cache among different ranks within the same executor.
+`KvCacheTransceiverV2` in `transceiver.py`. Coordinates the sending and receiving of cache among the ranks of one executor, and implements the same interface `PyExecutor` drives for both runtimes. Every one of its methods runs on the executor main loop.
 
-### Sender and Receiver
+### Messenger
 
-Responsible for transmitting control plane messages. That is, during per-request transmission, the receiver bound to the generation informs the sender of the specific information it requires. The sender then sends the corresponding KV cache based on these messages.
+`native/messenger.py` wraps ZeroMQ `ROUTER`/`DEALER` sockets and owns a listener thread per socket. `native/transfer.py` builds the actual endpoints on top: `Sender` on the context side, `Receiver` on the generation side, and a rendezvous server on rank 0. Listener handlers mutate session state and enqueue work; they never block on a transfer.
 
-### Formatter
+### Peer Registrar and Mappers
 
-Performs KV cache data transmission and correctly handles the mapping between caches across different TP/PP configurations.
+`native/peer.py` resolves which peer ranks hold the same layers when context and generation use different TP/PP/DP configurations, and elects exactly one owner per destination so nothing is transferred twice. `native/mixers/` holds the per-architecture layout policies that turn a matched pool pair into `(src_ptrs, dst_ptrs, sizes)` — separate mappers for matching head counts, for head-major and token-major mismatches, for replicated pools, and for Mamba conv and SSM state.
 
-### Connection
+### Page Table
 
-Bidirectional byte-stream protocol facility. Apart from essential operations such as connection establishment, it mainly provides send and receive functionalities. UCX accesses the system through this facility. The `AgentConnection` data structure adapts the upper-layer bidirectional send/receive semantics into a unidirectional read/write operation model.
+`resource/page.py` describes a rank's KV storage independently of which cache manager produced it, which is what lets a V1 context worker talk to a V2 generation worker. `resource/kv_extractor.py` builds it from either manager generation and turns block IDs into slot pointers; `resource/cache_reuse.py` reports the cached prefix length uniformly, so context-side reuse, generation-side reuse, and sliding-window stale prefixes all resolve without a special case.
 
 ### Transfer Agent
 
-Unidirectional byte-stream read/write protocol facility. Apart from essential operations such as connection establishment, it primarily provides read and write functionalities. NIXL accesses the system through this facility.
+Unidirectional read/write protocol facility, defined by the `BaseTransferAgent` ABC in `base/agent.py`. It provides memory registration, remote agent loading, and transfer request submission. NIXL accesses the system through this facility, either through the `tensorrt_llm_transfer_agent_binding` nanobind module (preferred, releases the GIL while waiting) or through the Python `nixl` package when `TRTLLM_USE_PY_NIXL_KVCACHE=1`.
 
 ## Customization
 
-At the current stage, the customization work mainly involves inheriting the low-level data plane interfaces to enable the invocation of third-party communication libraries, as well as defining the data structures required for establishing connections in the data plane.
+### Integrating a New Transport
 
-### Encapsulation and Overloading of Low-Level Communication Libraries
+Inherit `BaseTransferAgent`. Any transport that can perform one-sided writes into registered remote memory fits; everything above the agent is transport-agnostic. Note that agent selection today happens in `nixl/agent.py` and `TransferWorker._setup_transfer_engine` constructs a NIXL agent directly, so a new backend needs a hook there as well — there is no configuration-driven agent registry yet.
 
-Each layer of interface described in the previous section supports overloading. Here, based on whether the underlying library uses a unidirectional or bidirectional protocol, we describe the customization methods respectively.
+Note also that `cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/` outlives the C++ transceiver: it builds the nanobind module that `base/agent.py` and `nixl/_agent_cpp.py` import.
 
-If the underlying library you are integrating uses a unidirectional communication model, with read/write as its primary interfaces, you should inherit the `executor::kv_cache::BaseTransferAgent` data structure. This structure mainly provides interfaces for memory registration, remote agent loading, and transfer request submission.
+### Supporting a New Cache Layout
 
-If the underlying library you are integrating uses a bidirectional communication model, you should inherit the `executor::kv_cache::Connection` data structure. This structure mainly provides send and receive interfaces.
+A new storage layout usually means a new mapper under `native/mixers/` plus a page-table builder change in `resource/kv_extractor.py`. Both peers must agree: pool role and mapper kind are matched exactly, and a mismatch raises rather than silently transferring a subset.
 
-### Modifications to Upper-Level Runtime Logic
+Unit tests for these seams live in `tests/unittest/disaggregated/` — byte-level transfer checks, topology and mapper selection, page-table construction, and multi-process end-to-end coverage.
 
-This corresponds to the communication info section shown in the figure above. Since different underlying communication connections may require completely different setup methods—for example, some use IP and port, others require a world rank, and some communication libraries establish connections using binary-transparent metadata—we provide sufficient flexibility to allow users to customize this part as needed.
+## Current Limitations
 
-## Evolution Outlook
-
-Currently, the architecture of KV transfer is being optimized. First, we plan to move the control plane logic up to Python to enable better integration with the Python runtime. In addition, we are reevaluating the current design choice of initiating communication only after the context computation is completed, which was originally made for flexibility. Lastly, since some control logic is still being transmitted through the data plane, we aim to clarify the relationship between the control and data planes, and to simplify and streamline the code logic of the data plane. Due to the modular architecture, these iterative enhancements are only loosely coupled with the `TransferAgent`. We aim to minimize the impact of future upgrades on third-party integrations.
+- **NIXL only.** MPI, UCX, and Mooncake deployments stay on the C++ transceiver.
+- **One KV slice per request.** The whole prompt moves in a single transfer after prefill completes. The session machinery is multi-slice capable and `KVSlice.layer_range` exists, but no producer sets it — there is no layer-wise or chunked transfer overlapping compute yet.
+- **Both sides must run the same build and the same transceiver runtime.** `RankInfo` is serialized field for field and carries no version tag, so there is nothing to negotiate against. Pairing a C++ context worker with a Python generation worker fails on the first request, because the context worker publishes no `disagg_info_endpoint`.
+- **Submitted NIXL operations cannot be aborted.** Cancellation is cooperative: an operation already handed to the transfer agent runs to completion. Lifecycle ownership is not complete either — safe retirement of a session after an ambiguous failure or a cancellation is not fully enforced, so do not assume the KV pages are reclaimed at a well-defined point on those paths.

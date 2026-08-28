@@ -21,7 +21,7 @@ CBTS narrows test cases only; Build always runs.
 
 | Layer | Where | Action |
 |---|---|---|
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages run only when present in `affected_stages` (not force-kept). Empty affectedSet + nothing force-kept → no-op. |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Intersect the baseline-eligible stage set with affected stages, then add PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages run only when present in `affected_stages` (not force-kept). Empty affectedSet + nothing force-kept → no-op. |
 | **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
@@ -91,7 +91,7 @@ jenkins/scripts/cbts/
 │   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
 │   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
 │   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
-│   └── artifact.py        resolve which post-merge touch DB to use (by collected revision)
+│   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
 ├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 └── tools/
     ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)

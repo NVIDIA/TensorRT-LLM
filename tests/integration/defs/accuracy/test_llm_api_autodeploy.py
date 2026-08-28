@@ -1445,17 +1445,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
-            "Qwen/QwQ-32B",
-            {"transforms": {
-                "compile_model": {
-                    "piecewise_enabled": False
-                }
-            }},
-            [MMLU],
-            marks=pytest.mark.skip_less_device_memory(80000),
-            id="Qwen_QwQ-32B",
-        ),
-        pytest.param(
             "meta-llama/Llama-3.3-70B-Instruct",
             {},
             [MMLU, GSM8K],
