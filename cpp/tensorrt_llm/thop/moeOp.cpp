@@ -513,8 +513,6 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t unpadded_hidden_size_val
-            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         if (mUseWoqPerChannel)
         {
@@ -523,6 +521,11 @@ public:
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
+        // Default the output width only after the per-channel weight-only layout is resolved: fc2's dims
+        // are transposed on that path (and packed two-per-byte for INT4), so hidden_size is not the
+        // logical width until the swap above.
+        int64_t unpadded_hidden_size_val
+            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
 
         if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
         {
@@ -796,16 +799,19 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t unpadded_hidden_size_val
-            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         if (mUseWoqPerChannel)
         {
-            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // Note: The weight shape for per-channel weight-only quantization is different, e.g., fc2_expert_weights:
             // [num_experts, inter_size, hidden_size]
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
+        // Default the output width only after the per-channel weight-only layout is resolved: fc2's dims
+        // are transposed on that path (and packed two-per-byte for INT4), so hidden_size is not the
+        // logical width until the swap above.
+        int64_t unpadded_hidden_size_val
+            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
