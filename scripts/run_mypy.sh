@@ -95,6 +95,76 @@ ensure_cuda_driver_stub() {
 
 ensure_cuda_driver_stub
 
+# ============================================================================
+# TEMPORARY DIAGNOSTIC — REMOVE BEFORE MERGING (DLFW 26.08 upgrade)
+#
+# On the 26.08 base image the import below dies at tensorrt_llm/_utils.py with
+#   mpi4py.MPI.Exception: MPI_ERR_OTHER: known error not in list
+# from `mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)`.
+#
+# The same call succeeds in the same container on a SLURM node under every
+# environment tried (with/without SLURM vars, with CI's env replicated), so the
+# trigger is specific to this CI pod. This block runs the call here, where it
+# actually fails, to capture (a) whether the standard MPI_COMM_TYPE_SHARED
+# fails too and (b) the underlying PMIx error that MPI_ERR_OTHER is hiding.
+# Never fails the build — the real gate is still the import below.
+# ============================================================================
+echo "=== [TEMP] MPI Split_type diagnostic ==============================="
+python3 - <<'PY' 2>&1 | sed 's/^/[TEMP] /' || true
+import os
+import traceback
+
+print("libmpi resolution for the built bindings:")
+os.system("ldd tensorrt_llm/bindings*.so 2>/dev/null "
+          "| grep -iE 'libmpi|libopen-pal|libpmix' || echo '  (none found)'")
+
+def matrix(tag):
+    from mpi4py import MPI
+    from mpi4py.util import pkl5
+    print(f"--- {tag} ---")
+    print("  lib :", MPI.Get_library_version().strip().splitlines()[0])
+    print("  size:", MPI.COMM_WORLD.Get_size())
+    for name, comm in (("raw ", MPI.COMM_WORLD),
+                       ("pkl5", pkl5.Intracomm(MPI.COMM_WORLD))):
+        for label, st in (("SHARED(0)", MPI.COMM_TYPE_SHARED), ("HOST(9)", 9)):
+            try:
+                c = comm.Split_type(split_type=st)
+                print(f"  {name} {label:10s} -> OK   size={c.Get_size()}")
+            except Exception as exc:                     # noqa: BLE001
+                print(f"  {name} {label:10s} -> FAIL {type(exc).__name__}: {exc}")
+
+try:
+    matrix("A: mpi4py only")
+except Exception:                                        # noqa: BLE001
+    traceback.print_exc()
+PY
+
+echo "=== [TEMP] same, but with torch imported first (as tensorrt_llm does) ==="
+python3 - <<'PY' 2>&1 | tail -25 | sed 's/^/[TEMP] /' || true
+import torch
+print("torch", torch.__version__)
+from mpi4py import MPI
+from mpi4py.util import pkl5
+for name, comm in (("raw ", MPI.COMM_WORLD),
+                   ("pkl5", pkl5.Intracomm(MPI.COMM_WORLD))):
+    for label, st in (("SHARED(0)", MPI.COMM_TYPE_SHARED), ("HOST(9)", 9)):
+        try:
+            c = comm.Split_type(split_type=st)
+            print(f"  {name} {label:10s} -> OK   size={c.Get_size()}")
+        except Exception as exc:                         # noqa: BLE001
+            print(f"  {name} {label:10s} -> FAIL {type(exc).__name__}: {exc}")
+PY
+
+echo "=== [TEMP] verbose PMIx/OMPI for the failing Split_type ============"
+PMIX_MCA_pmix_base_verbose=5 \
+OMPI_MCA_odls_base_verbose=5 \
+OMPI_MCA_ess_base_verbose=5 \
+python3 -c "
+from mpi4py import MPI
+MPI.COMM_WORLD.Split_type(split_type=9)
+" 2>&1 | tail -60 | sed 's/^/[TEMP] /' || true
+echo "=== [TEMP] end diagnostic ========================================="
+
 # What the gate below does and does not establish.
 #
 # `import tensorrt_llm.bindings` is one coarse check standing in for several
