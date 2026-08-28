@@ -99,6 +99,9 @@ class FallbackFmha(Fmha):
             return False
         if q is not None and q.dtype == torch.float8_e4m3fn:
             return False
+        attn = self.attn
+        if attn.is_mla_enable and attn.has_fp4_kv_cache:
+            return False
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             return False
         if not forward_args.update_kv_cache and not metadata.is_cross:

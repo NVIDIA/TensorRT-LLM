@@ -97,7 +97,6 @@ class _Fp8MlaContextScratch:
     max_num_sequences: int
     max_blocks_per_seq: int
     capacity_blocks: int
-    max_num_tokens: int
     page_size: int
     head_dim: int
     cache_stream: torch.cuda.Stream
@@ -122,12 +121,6 @@ class _Fp8MlaContextScratch:
         max_num_sequences = int(meta.max_num_sequences or meta.max_num_requests)
         max_blocks_per_seq = int(kv_cache_manager.max_blocks_per_seq)
         max_num_tokens = int(meta.max_num_tokens)
-        runtime_features = meta.runtime_features
-        if runtime_features.chunked_prefill:
-            max_num_tokens *= max(
-                1,
-                int(runtime_features.chunked_prefill_buffer_batch_size),
-            )
         max_nonempty_sequences = min(max_num_sequences, max_num_tokens)
         capacity_blocks = max(
             1,
@@ -188,7 +181,6 @@ class _Fp8MlaContextScratch:
             max_num_sequences=max_num_sequences,
             max_blocks_per_seq=max_blocks_per_seq,
             capacity_blocks=capacity_blocks,
-            max_num_tokens=max_num_tokens,
             page_size=page_size,
             head_dim=head_dim,
             cache_stream=torch.cuda.Stream(device=device),
@@ -205,43 +197,19 @@ class _Fp8MlaContextScratch:
         head_dim: int,
     ) -> bool:
         kv_cache_manager = meta.kv_cache_manager
-        required_max_num_tokens = int(meta.max_num_tokens)
-        if meta.runtime_features.chunked_prefill:
-            required_max_num_tokens *= max(
-                1,
-                int(meta.runtime_features.chunked_prefill_buffer_batch_size),
-            )
         return (
             kv_cache_manager is not None
             and self.pool.device == device
             and self.head_dim == head_dim
-            and self.max_num_tokens >= required_max_num_tokens
             and self.page_size == meta.tokens_per_block
             and self.cache_manager_view.max_seq_len == int(kv_cache_manager.max_seq_len)
             and self.max_num_sequences >= int(meta.max_num_sequences or meta.max_num_requests)
             and self.max_blocks_per_seq >= int(kv_cache_manager.max_blocks_per_seq)
         )
 
-    def prepare(
-        self,
-        meta: "TrtllmAttentionMetadata",
-        *,
-        context_lengths_cuda: Optional[torch.Tensor] = None,
-        context_lengths_cpu: Optional[torch.Tensor] = None,
-    ) -> None:
-        if context_lengths_cuda is None:
-            context_lengths_cuda = meta.prompt_lens_cuda_runtime
-        if context_lengths_cpu is None:
-            context_lengths_cpu = meta.prompt_lens_cpu_runtime
-        if (
-            context_lengths_cpu.device.type != "cpu"
-            or context_lengths_cpu.dtype != torch.int32
-            or context_lengths_cpu.ndim != 1
-            or context_lengths_cpu.numel() < meta.num_contexts
-        ):
-            raise ValueError("FP8 MLA context metadata requires a CPU int32 context-length tensor.")
+    def prepare(self, meta: "TrtllmAttentionMetadata") -> None:
         context_lengths = tuple(
-            int(length) for length in context_lengths_cpu[: meta.num_contexts].tolist()
+            int(length) for length in meta.prompt_lens_cpu_runtime[: meta.num_contexts].tolist()
         )
         self.host_total_kv_lens[0] = sum(context_lengths)
         self.host_total_kv_lens[1] = 0
@@ -270,6 +238,7 @@ class _Fp8MlaContextScratch:
                 f"{self.capacity_blocks} were allocated."
             )
 
+        context_lengths_cuda = meta.prompt_lens_cuda_runtime
         if (
             context_lengths_cuda.dtype != torch.int32
             or not context_lengths_cuda.is_cuda
@@ -299,14 +268,19 @@ class _Fp8MlaContextScratch:
 
 def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
     """Build a direct-attribute FP8 view without per-access Python forwarding."""
+    from ..fmha.fallback import FallbackFmha
+    from ..fmha.manager import FmhaManager
+
     fp8_attn = copy.copy(attn)
     fp8_attn.quant_mode = int(QuantMode(0).set_fp8_kv_cache())
     fp8_attn.has_fp4_kv_cache = False
     fp8_attn.has_fp8_kv_cache = True
     # FMHA instances hold weak references to their owning attention object.
-    # Do not reuse instances copied from the FP4 attention; the caller binds
-    # this FP8 view explicitly to TRTLLM's regular FMHA implementation.
-    fp8_attn.fmha_libs = []
+    # Do not reuse the manager copied from the FP4 attention; bind this FP8
+    # view explicitly to TRTLLM's regular FMHA implementation.
+    fp8_manager = FmhaManager(fp8_attn)
+    fp8_manager.fmha_libs = [FallbackFmha(fp8_attn)]
+    fp8_attn._fmha_manager = fp8_manager
     fp8_attn.local_layer_idx = 0
     # This branch resolves local cache layers through layer_idx. The
     # disposable cache has exactly one layer, so bind the copied view to it.
@@ -317,15 +291,8 @@ def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
 def _build_fp8_mla_context_metadata(
     meta: "TrtllmAttentionMetadata",
     scratch: _Fp8MlaContextScratch,
-    *,
-    kv_lens_cuda: Optional[torch.Tensor] = None,
-    kv_lens_cpu: Optional[torch.Tensor] = None,
 ) -> "TrtllmAttentionMetadata":
     """Route the mandatory FP8 cache write through a direct metadata view."""
-    if kv_lens_cuda is None:
-        kv_lens_cuda = meta.prompt_lens_cuda_runtime[: meta.num_contexts]
-    if kv_lens_cpu is None:
-        kv_lens_cpu = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
     fp8_meta = copy.copy(meta)
     fp8_meta._fp4_mla_fp8_context_state = None
     fp8_meta.kv_cache_manager = scratch.cache_manager_view
@@ -337,8 +304,8 @@ def _build_fp8_mla_context_metadata(
     # The disposable cache represents only this context invocation. Expose
     # exact context-only lengths so cached prefixes, trailing generation
     # metadata, and stale totals cannot extend FP8 K/V quantization.
-    fp8_meta.kv_lens_cuda_runtime = kv_lens_cuda
-    fp8_meta.kv_lens_runtime = kv_lens_cpu
+    fp8_meta.kv_lens_cuda_runtime = meta.prompt_lens_cuda_runtime[: meta.num_contexts]
+    fp8_meta.kv_lens_runtime = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
     fp8_meta.host_total_kv_lens = scratch.host_total_kv_lens
     # Scratch lengths intentionally start from zero. Preserve the actual
     # absolute positions for Q/K RoPE through the native kernel's explicit

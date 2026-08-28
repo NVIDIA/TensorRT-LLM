@@ -80,40 +80,19 @@ def _compile_cutedsl(*args, **kwargs):
 _EXPLICIT_TORCH_STREAM: torch.cuda.Stream | None = None
 
 
-@contextlib.contextmanager
-def _launch_stream():
-    """Yield the CUDA driver stream these kernels should launch on.
+def _current_cu_stream() -> cuda.CUstream:
+    """Return the active PyTorch stream as a CUDA driver stream.
 
-    cuda2ctl capture cannot reliably query the default null stream, so SMART
-    wrappers can ask for an explicit one through DKG_MLA_EXPLICIT_STREAM. The
-    substitution must be bracketed rather than assigned: the caller's stream
-    already carries the RoPE, Q quantization and KV-cache writes these kernels
-    read, and it is also the stream their consumers read the output from.
-    Entering waits on the caller's work, leaving publishes ours back to it, and
-    ``torch.cuda.stream`` restores the thread's current stream on the way out.
-    A bare ``set_stream`` does none of the three.
-
-    Switching the current stream is illegal while a CUDA graph is capturing, so
-    the knob is ignored under capture and the caller's stream is used as-is.
+    cuda2ctl capture cannot reliably query the default null stream.  Keep the
+    default behavior for normal pytest/AModel runs, but allow SMART wrappers to
+    request an explicit stream through the environment.
     """
-    entry_stream = torch.cuda.current_stream()
-    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") != "1" or torch.cuda.is_current_stream_capturing():
-        yield cuda.CUstream(entry_stream.cuda_stream)
-        return
-
     global _EXPLICIT_TORCH_STREAM
-    if _EXPLICIT_TORCH_STREAM is None:
-        _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
-    start_event = torch.cuda.Event()
-    done_event = torch.cuda.Event()
-    start_event.record(entry_stream)
-    with torch.cuda.stream(_EXPLICIT_TORCH_STREAM):
-        _EXPLICIT_TORCH_STREAM.wait_event(start_event)
-        try:
-            yield cuda.CUstream(_EXPLICIT_TORCH_STREAM.cuda_stream)
-        finally:
-            done_event.record(_EXPLICIT_TORCH_STREAM)
-    entry_stream.wait_event(done_event)
+    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") == "1":
+        if _EXPLICIT_TORCH_STREAM is None:
+            _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
+        torch.cuda.set_stream(_EXPLICIT_TORCH_STREAM)
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
 @dataclass(frozen=True)
@@ -801,44 +780,44 @@ def fp4_mla_repack_v_cache(
     )
     if resolve_generation_pages and not use_tma_fast_path:
         raise ValueError("generation-aware V repack requires the PAGE128/BLOCKV128 TMA path")
-    with _launch_stream() as stream:
-        repack_fn = _compile_fp4_mla_v_repack(
-            v_packed.data_ptr(),
-            kv_cache.data_ptr(),
-            page_ids_data_ptr,
-            page_indptr_data_ptr,
-            kv_lens_data_ptr,
-            generation_lens_data_ptr,
-            page_size,
-            v_head_dim,
-            use_page_ids,
-            resolve_generation_pages,
-            max_touched_pages,
-            block_v,
-            use_tma_fast_path,
-            stream,
-        )
-        ptrs = _make_v_repack_ptrs(
-            v_packed.data_ptr(),
-            kv_cache.data_ptr(),
-            page_ids_data_ptr,
-            page_indptr_data_ptr,
-            kv_lens_data_ptr,
-            generation_lens_data_ptr,
-        )
-        repack_fn(
-            *ptrs,
-            stream,
-            ctm.Int32(layout.num_pages),
-            ctm.Int64(layout.stride_page),
-            ctm.Int64(layout.stride_token),
-            ctm.Int64(layout.stride_packed_dim),
-            ctm.Int64(v_packed.stride(0)),
-            ctm.Int64(v_packed.stride(1)),
-            ctm.Int64(page_ids_stride),
-            ctm.Int32(num_page_ids),
-            ctm.Int32(num_generation_sequences),
-        )
+    stream = _current_cu_stream()
+    repack_fn = _compile_fp4_mla_v_repack(
+        v_packed.data_ptr(),
+        kv_cache.data_ptr(),
+        page_ids_data_ptr,
+        page_indptr_data_ptr,
+        kv_lens_data_ptr,
+        generation_lens_data_ptr,
+        page_size,
+        v_head_dim,
+        use_page_ids,
+        resolve_generation_pages,
+        max_touched_pages,
+        block_v,
+        use_tma_fast_path,
+        stream,
+    )
+    ptrs = _make_v_repack_ptrs(
+        v_packed.data_ptr(),
+        kv_cache.data_ptr(),
+        page_ids_data_ptr,
+        page_indptr_data_ptr,
+        kv_lens_data_ptr,
+        generation_lens_data_ptr,
+    )
+    repack_fn(
+        *ptrs,
+        stream,
+        ctm.Int32(layout.num_pages),
+        ctm.Int64(layout.stride_page),
+        ctm.Int64(layout.stride_token),
+        ctm.Int64(layout.stride_packed_dim),
+        ctm.Int64(v_packed.stride(0)),
+        ctm.Int64(v_packed.stride(1)),
+        ctm.Int64(page_ids_stride),
+        ctm.Int32(num_page_ids),
+        ctm.Int32(num_generation_sequences),
+    )
 
 
 def fp4_mla_repack_v_cache_reference(

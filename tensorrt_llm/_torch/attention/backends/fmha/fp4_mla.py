@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -26,7 +26,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_context import (
     _FP8_CONTEXT_ATTN_ATTR,
     _FP8_CONTEXT_SCRATCH_ATTR,
     _build_fp8_mla_context_attn,
-    _build_fp8_mla_context_metadata,
     _execute_fp8_context_with_cache_update,
     _Fp8MlaContextScratch,
     _get_fp8_mla_context_metadata,
@@ -39,7 +38,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm.bindings import DataType
 
-from .fallback import FallbackFmha
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -53,8 +51,8 @@ class Fp4MlaFmha(PhasedFmha):
     """TRTLLM FMHA library for FP4 MLA context and no-dequant decode."""
 
     @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        return attn.uses_fp4_mla_attention
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
+        return attn.is_mla_enable and attn.has_fp4_kv_cache
 
     def forward(
         self,
@@ -83,17 +81,20 @@ class Fp4MlaFmha(PhasedFmha):
         if forward_args.attention_sinks is not None:
             raise NotImplementedError("FP4 MLA does not support attention sinks.")
 
-        sparse_runtime_params = forward_args.sparse_runtime_params
+        sparse_prediction = forward_args.sparse_prediction
+        sparse_params = self.attn.sparse_params
+        uses_spcompress = getattr(sparse_params, "uses_spcompress", None)
         if (
             (
-                sparse_runtime_params.sparse_kv_indices is not None
-                and sparse_runtime_params.sparse_kv_indices.numel() > 0
+                sparse_prediction.sparse_kv_indices is not None
+                and sparse_prediction.sparse_kv_indices.numel() > 0
             )
             or (
-                sparse_runtime_params.sparse_attn_indices is not None
-                and sparse_runtime_params.sparse_attn_indices.numel() > 0
+                sparse_prediction.sparse_attn_indices is not None
+                and sparse_prediction.sparse_attn_indices.numel() > 0
             )
             or metadata.num_sparse_topk > 0
+            or uses_spcompress
         ):
             raise NotImplementedError("FP4 MLA does not support sparse attention.")
 
@@ -127,8 +128,8 @@ class Fp4MlaFmha(PhasedFmha):
         metadata = params.meta
         forward_args = params.fwd
         q = params.qkv_input
-        k = params.k_input
-        v = params.v_input
+        k = params.key_input
+        v = params.value_input
         output = params.context_buf
         if q is None or k is None or v is None:
             raise RuntimeError("FP4 MLA context requires expanded Q, K, and V tensors.")
@@ -155,7 +156,7 @@ class Fp4MlaFmha(PhasedFmha):
 
         num_tokens = q.shape[0]
         output = output.view(num_tokens, -1)
-        local_layer = attn.get_fp4_mla_local_layer_idx(metadata)
+        local_layer = attn.get_local_layer_idx(metadata)
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_rope_head_dim = attn.qk_rope_head_dim or 0
 
@@ -196,7 +197,6 @@ class Fp4MlaFmha(PhasedFmha):
         fp8_attention = getattr(attn, _FP8_CONTEXT_ATTN_ATTR, None)
         if fp8_attention is None:
             fp8_attention = _build_fp8_mla_context_attn(attn)
-            fp8_attention.fmha_libs = [FallbackFmha(fp8_attention)]
             setattr(attn, _FP8_CONTEXT_ATTN_ATTR, fp8_attention)
         fp8_attention.rotary_inv_freq = attn.rotary_inv_freq
         fp8_attention.rotary_cos_sin = attn.rotary_cos_sin
@@ -220,121 +220,6 @@ class Fp4MlaFmha(PhasedFmha):
             scratch.cache_done_event,
         )
 
-    def forward_context_partition(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        *,
-        kv_lens_cuda: torch.Tensor,
-        kv_lens_cpu: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Run one explicit-KV partition through the FP8 MLA context kernel.
-
-        Returns whatever ``TrtllmAttention.forward`` returns for the FP8
-        context copy: the attention output plus its optional output scale.
-        """
-        if forward_args.output is None:
-            raise RuntimeError("FP4 MLA context partition requires an output buffer.")
-        if forward_args.latent_cache is not None:
-            raise RuntimeError("FP4 MLA context partition expects explicit K/V tensors.")
-        if forward_args.output_sf is not None:
-            raise NotImplementedError(
-                "FP4 MLA context partition does not support quantized attention output."
-            )
-        if forward_args.attention_mask not in (
-            PredefinedAttentionMask.CAUSAL,
-            PredefinedAttentionMask.FULL,
-        ):
-            raise NotImplementedError(
-                "FP4 MLA context partition requires a causal or full attention mask."
-            )
-        if forward_args.attention_mask_data is not None:
-            raise NotImplementedError(
-                "FP4 MLA context partition does not support custom attention masks."
-            )
-        if forward_args.attention_sinks is not None:
-            raise NotImplementedError("FP4 MLA context partition does not support attention sinks.")
-        if metadata.is_cuda_graph:
-            raise NotImplementedError("FP4 MLA chunked prefill does not support CUDA graphs.")
-        if metadata.num_contexts <= 0 or q.shape[0] != metadata.num_ctx_tokens:
-            raise RuntimeError(
-                "FP4 MLA context partition query token count must match context metadata."
-            )
-        if k.shape[0] != v.shape[0]:
-            raise RuntimeError("FP4 MLA context partition K/V token counts do not match.")
-
-        sparse_runtime_params = forward_args.sparse_runtime_params
-        if (
-            (
-                sparse_runtime_params.sparse_kv_indices is not None
-                and sparse_runtime_params.sparse_kv_indices.numel() > 0
-            )
-            or (
-                sparse_runtime_params.sparse_attn_indices is not None
-                and sparse_runtime_params.sparse_attn_indices.numel() > 0
-            )
-            or metadata.num_sparse_topk > 0
-        ):
-            raise NotImplementedError("FP4 MLA chunked prefill does not support sparse attention.")
-
-        require_fp4_mla_fp8_context_support()
-        kv_cache_manager = metadata.kv_cache_manager
-        if kv_cache_manager is None:
-            raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
-        kv_lora_rank = self.attn.kv_lora_rank or 0
-        qk_rope_head_dim = self.attn.qk_rope_head_dim or 0
-        scratch_head_dim = kv_lora_rank + qk_rope_head_dim
-        scratch = getattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, None)
-        if not isinstance(scratch, _Fp8MlaContextScratch) or not scratch.matches(
-            metadata,
-            device=q.device,
-            head_dim=scratch_head_dim,
-        ):
-            scratch = _Fp8MlaContextScratch.create(
-                metadata,
-                device=q.device,
-                head_dim=scratch_head_dim,
-            )
-            setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
-
-        attn = self.attn
-        fp8_attention = getattr(attn, _FP8_CONTEXT_ATTN_ATTR, None)
-        if fp8_attention is None:
-            fp8_attention = _build_fp8_mla_context_attn(attn)
-            fp8_attention.fmha_libs = [FallbackFmha(fp8_attention)]
-            setattr(attn, _FP8_CONTEXT_ATTN_ATTR, fp8_attention)
-        fp8_attention.rotary_inv_freq = attn.rotary_inv_freq
-        fp8_attention.rotary_cos_sin = attn.rotary_cos_sin
-
-        expected_kv_tokens = int(kv_lens_cpu[: metadata.num_contexts].sum().item())
-        if k.shape[0] != expected_kv_tokens:
-            raise RuntimeError(
-                "FP4 MLA context partition K/V token count does not match "
-                f"the KV lengths: got {k.shape[0]}, expected {expected_kv_tokens}."
-            )
-        scratch.prepare(
-            metadata,
-            context_lengths_cuda=kv_lens_cuda,
-            context_lengths_cpu=kv_lens_cpu,
-        )
-        fp8_metadata = _build_fp8_mla_context_metadata(
-            metadata,
-            scratch,
-            kv_lens_cuda=kv_lens_cuda[: metadata.num_contexts],
-            kv_lens_cpu=kv_lens_cpu[: metadata.num_contexts],
-        )
-        fp8_forward_args = replace(
-            forward_args,
-            output_sf=None,
-            kv_scale_orig_quant=None,
-            kv_scale_quant_orig=None,
-            latent_cache=None,
-        )
-        return fp8_attention.forward(q, k, v, fp8_metadata, fp8_forward_args)
-
     def run_mla_generation(self, params: FmhaParams) -> None:
         attn = params.attn
         metadata = params.meta
@@ -350,7 +235,7 @@ class Fp4MlaFmha(PhasedFmha):
         if metadata.num_generations <= 0:
             raise RuntimeError("FP4 MLA generation requires generation requests.")
 
-        local_layer = attn.get_fp4_mla_local_layer_idx(metadata)
+        local_layer = attn.get_local_layer_idx(metadata)
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_rope_head_dim = attn.qk_rope_head_dim or 0
         fused_head_dim = kv_lora_rank + qk_rope_head_dim
