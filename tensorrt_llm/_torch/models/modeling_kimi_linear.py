@@ -1548,7 +1548,8 @@ class KimiMLARuntime(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
-        out = self.mixer(hidden_states, attn_metadata)
+        # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
+        out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
