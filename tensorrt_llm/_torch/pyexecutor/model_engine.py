@@ -6907,12 +6907,6 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
-            if spec_metadata.context_prompt_lookahead_tokens is not None:
-                # No-cache context inputs contain the complete prompt, so
-                # there is never a valid token beyond the current chunk.
-                spec_metadata.populate_context_prompt_lookahead(
-                    [INVALID_PROMPT_LOOKAHEAD_TOKEN] *
-                    len(scheduled_requests.context_requests))
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

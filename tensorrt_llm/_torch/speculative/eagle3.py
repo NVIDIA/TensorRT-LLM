@@ -1367,8 +1367,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             accepted_tokens,
             num_contexts,
             prompt_lookahead_tokens=(
-                spec_metadata.context_prompt_lookahead_tokens
-                if self.is_mtp_eagle else None))
+                spec_metadata.context_prompt_lookahead_tokens),
+        )
 
         # generation
         input_ids_gen = accepted_tokens[
@@ -1397,7 +1397,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         batch_indices: torch.Tensor,
         prompt_lookahead_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select the next token, recurrent hidden row, and draft position."""
+        """Select the next token, recurrent hidden row, and draft position.
+
+        Args:
+            accepted_tokens: Accepted target tokens with shape
+                ``[batch_size, max_draft_len + 1]``.
+            num_accepted_tokens: Accepted-token count for each request with
+                shape ``[batch_size]``.
+            hidden_states: Target hidden states for the current input tokens.
+            position_ids: Position IDs corresponding to ``hidden_states``.
+            sequence_lengths: Current input length for each request with shape
+                ``[batch_size]``.
+            num_contexts: Number of context requests at the front of the batch.
+            batch_indices: Request row indices with shape ``[batch_size]``.
+            prompt_lookahead_tokens: Immediate prompt token following each
+                context chunk with shape ``[max_num_requests]``. Entries equal
+                to ``INVALID_PROMPT_LOOKAHEAD_TOKEN`` have no valid lookahead.
+
+        Returns:
+            The draft input IDs, recurrent hidden states, and draft position
+            IDs for the current batch.
+        """
         sequence_starts = torch.cumsum(
             sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
         recurrent_indices = sequence_starts + sequence_lengths - 1
@@ -1407,12 +1427,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_input_ids = accepted_tokens[batch_indices,
                                           num_accepted_tokens - 1]
         context_lookahead = prompt_lookahead_tokens[:num_contexts]
-        draft_input_ids[:num_contexts].copy_(
-            torch.where(
-                context_lookahead != INVALID_PROMPT_LOOKAHEAD_TOKEN,
-                context_lookahead,
-                draft_input_ids[:num_contexts],
-            ))
+        draft_input_ids[:num_contexts] = torch.where(
+            context_lookahead != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+            context_lookahead,
+            draft_input_ids[:num_contexts],
+        )
         recurrent_hidden_states = hidden_states[recurrent_indices]
         draft_position_ids = (
             _select_mtp_position_ids(position_ids, recurrent_indices) + 1)

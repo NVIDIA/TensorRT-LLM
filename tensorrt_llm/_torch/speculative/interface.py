@@ -693,10 +693,9 @@ class SpecMetadata:
         num_contexts = len(lookahead_tokens)
         if num_contexts == 0:
             return
-        if num_contexts > self.context_prompt_lookahead_tokens.shape[0]:
-            raise ValueError(
-                f"Context batch size {num_contexts} exceeds prompt lookahead "
-                f"capacity {self.context_prompt_lookahead_tokens.shape[0]}")
+        assert num_contexts <= self.context_prompt_lookahead_tokens.shape[0], (
+            f"Context batch size {num_contexts} exceeds prompt lookahead "
+            f"capacity {self.context_prompt_lookahead_tokens.shape[0]}")
 
         tokens_cpu = torch.tensor(
             lookahead_tokens,
