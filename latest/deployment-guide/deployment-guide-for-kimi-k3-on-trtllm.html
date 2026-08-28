@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/deployment-guide-for-kimi-k3-on-trtllm';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2 current active"><a class="current reference internal" href="#">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -481,7 +481,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -495,11 +495,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -651,7 +653,7 @@
 <p>To use the optimized CuTeDSL MLA kernel, install the FlashInfer revision used by the Kimi K3 example into the same in-place environment:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>.venv-3.12/bin/python<span class="w"> </span>-u<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--force-reinstall<span class="w"> </span>--no-deps<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--no-build-isolation<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span><span class="s2">&quot;flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc&quot;</span>
+<span class="w">    </span><span class="s2">"flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"</span>
 </pre></div>
 </div>
 <p>The <code class="docutils literal notranslate"><span class="pre">packaging&gt;=24.2</span></code> requirement of this source build is already satisfied by <code class="docutils literal notranslate"><span class="pre">requirements.txt</span></code>. The TensorRT LLM environment already provides FlashInfer’s runtime dependencies. The <code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> option prevents <code class="docutils literal notranslate"><span class="pre">pip</span></code> from replacing the pinned PyTorch, Triton, CUDA, and CuTeDSL packages. Install FlashInfer after TensorRT LLM because a later dependency-resolving TensorRT LLM installation can replace this source revision with the currently pinned <code class="docutils literal notranslate"><span class="pre">flashinfer-python==0.6.16</span></code>.</p>
@@ -706,26 +708,26 @@ srun<span class="w"> </span>-N<span class="w"> </span><span class="m">4</span><s
 <span class="w">    </span>--container-image<span class="o">=</span>/path/to/tensorrt-llm-container.sqsh<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mount-home<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mounts<span class="o">=</span><span class="si">${</span><span class="nv">REPO</span><span class="si">}</span>:<span class="si">${</span><span class="nv">REPO</span><span class="si">}</span>,<span class="si">${</span><span class="nv">MODEL</span><span class="si">}</span>:<span class="si">${</span><span class="nv">MODEL</span><span class="si">}</span>,<span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>:<span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>:ro<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
 <span class="s2">        ulimit -n 65536</span>
 
 <span class="s2">        # Node-local Triton cache: ~/.triton on shared NFS races across</span>
 <span class="s2">        # ranks during autotune JIT (stale file handles).</span>
 <span class="s2">        export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}</span>
-<span class="s2">        mkdir -p \&quot;\$TRITON_CACHE_DIR\&quot;</span>
+<span class="s2">        mkdir -p \"\$TRITON_CACHE_DIR\"</span>
 
 <span class="s2">        # Node-local flashinfer cache: the default (\$HOME) is shared NFS and</span>
 <span class="s2">        # races across ranks during cubin download (stale file handles).</span>
 <span class="s2">        export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-rank\${SLURM_PROCID:-0}</span>
 
 <span class="s2">        # Run from the in-place installation created by build_wheel.py.</span>
-<span class="s2">        export PATH=\&quot;</span><span class="si">${</span><span class="nv">REPO</span><span class="si">}</span><span class="s2">/.venv-3.12/bin:\$PATH\&quot;</span>
+<span class="s2">        export PATH=\"</span><span class="si">${</span><span class="nv">REPO</span><span class="si">}</span><span class="s2">/.venv-3.12/bin:\$PATH\"</span>
 
 <span class="s2">        exec </span><span class="si">${</span><span class="nv">REPO</span><span class="si">}</span><span class="s2">/tensorrt_llm/llmapi/trtllm-llmapi-launch \</span>
 <span class="s2">            trtllm-serve </span><span class="si">${</span><span class="nv">MODEL</span><span class="si">}</span><span class="s2"> \</span>
 <span class="s2">                --host 0.0.0.0 --port 8000 \</span>
 <span class="s2">                --config </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
-<span class="s2">    &quot;</span>
+<span class="s2">    "</span>
 </pre></div>
 </div>
 <blockquote>
@@ -826,7 +828,7 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <p>The server (the OpenAI-compatible REST endpoint) runs on the rank-0 node, listening on port <code class="docutils literal notranslate"><span class="pre">8000</span></code>. Send requests to that node’s hostname or IP; <code class="docutils literal notranslate"><span class="pre">localhost</span></code> only works from the rank-0 node itself.</p>
 <section id="health-check">
 <h3>Health Check<a class="headerlink" href="#health-check" title="Link to this heading">#</a></h3>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;Status: %{http_code}\n&quot;</span><span class="w"> </span><span class="s2">&quot;http://localhost:8000/health&quot;</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">"Status: %{http_code}\n"</span><span class="w"> </span><span class="s2">"http://localhost:8000/health"</span>
 </pre></div>
 </div>
 <p>When the <code class="docutils literal notranslate"><span class="pre">Status:</span> <span class="pre">200</span></code> code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.</p>
@@ -834,17 +836,17 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <section id="basic-test">
 <h3>Basic Test<a class="headerlink" href="#basic-test" title="Link to this heading">#</a></h3>
 <p>After the TensorRT LLM server is set up and shows <code class="docutils literal notranslate"><span class="pre">Application</span> <span class="pre">startup</span> <span class="pre">complete</span></code>, you can send requests to the server:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
-<span class="s1">    &quot;model&quot;: &quot;/path/to/kimi-k3-checkpoint&quot;,</span>
-<span class="s1">    &quot;messages&quot;: [</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span>-d<span class="w"> </span><span class="s1">'{</span>
+<span class="s1">    "model": "/path/to/kimi-k3-checkpoint",</span>
+<span class="s1">    "messages": [</span>
 <span class="s1">        {</span>
-<span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
-<span class="s1">            &quot;content&quot;: &quot;Where is New York?&quot;</span>
+<span class="s1">            "role": "user",</span>
+<span class="s1">            "content": "Where is New York?"</span>
 <span class="s1">        }</span>
 <span class="s1">    ],</span>
-<span class="s1">    &quot;max_tokens&quot;: 64,</span>
-<span class="s1">    &quot;temperature&quot;: 0</span>
-<span class="s1">}&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
+<span class="s1">    "max_tokens": 64,</span>
+<span class="s1">    "temperature": 0</span>
+<span class="s1">}'</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">"\n"</span>
 </pre></div>
 </div>
 <p>The response should contain a <code class="docutils literal notranslate"><span class="pre">choices[0].message.content</span></code> field completing the request, plus a <code class="docutils literal notranslate"><span class="pre">usage</span></code> section with the token counts.</p>
@@ -853,12 +855,12 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <section id="running-evaluations-to-verify-accuracy-optional">
 <h2>Running Evaluations to Verify Accuracy (Optional)<a class="headerlink" href="#running-evaluations-to-verify-accuracy-optional" title="Link to this heading">#</a></h2>
 <p>The repository ships a ready-made multi-node GSM8K evaluation job built on <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code> with the tested DEP16 settings:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sbatch<span class="w"> </span>examples/kimi_k3/run_gsm8k_kimi_k3.sbatch<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sbatch<span class="w"> </span>examples/kimi_k3/run_eval_kimi_k3.sbatch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--model<span class="w"> </span>/path/to/kimi-k3-checkpoint<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--image<span class="w"> </span>/path/to/tensorrt-llm-container.sqsh
 </pre></div>
 </div>
-<p>The job writes progress and results to <code class="docutils literal notranslate"><span class="pre">kimi-k3-gsm8k-&lt;job-id&gt;.log</span></code> in the submission directory. If no local dataset path is configured, <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code> downloads GSM8K from the Hugging Face Hub. The completed log contains a results table with the normalized GSM8K exact-match scores. With the tested checkpoint and the settings in this example, users should expect approximately:</p>
+<p>The job writes progress and results to <code class="docutils literal notranslate"><span class="pre">kimi-k3-eval-&lt;job-id&gt;.log</span></code> in the submission directory. If no local dataset path is configured, <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code> downloads GSM8K from the Hugging Face Hub. The completed log contains a results table with the normalized GSM8K exact-match scores. With the tested checkpoint and the settings in this example, users should expect approximately:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Filter</p></th>
@@ -888,7 +890,7 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <span class="w">    </span>--image<span class="w"> </span>/path/to/tensorrt-llm-container.sqsh<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--isl<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--osl<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--concurrencies<span class="w"> </span><span class="s2">&quot;64 128 256&quot;</span>
+<span class="w">    </span>--concurrencies<span class="w"> </span><span class="s2">"64 128 256"</span>
 </pre></div>
 </div>
 <p>Set <code class="docutils literal notranslate"><span class="pre">--mode</span></code> to <code class="docutils literal notranslate"><span class="pre">dep16</span></code>, <code class="docutils literal notranslate"><span class="pre">tep16</span></code>, or <code class="docutils literal notranslate"><span class="pre">tep8</span></code>. The script derives <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> from the requested input and output lengths as <code class="docutils literal notranslate"><span class="pre">ISL</span> <span class="pre">+</span> <span class="pre">OSL</span> <span class="pre">+</span> <span class="pre">128</span></code>, and writes the server log, client log, generated YAML, and per-concurrency JSON results to the job’s output directory.</p>
@@ -901,29 +903,29 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <span class="nv">PORT</span><span class="o">=</span><span class="m">8000</span>
 <span class="nv">ISL</span><span class="o">=</span><span class="m">8192</span>
 <span class="nv">OSL</span><span class="o">=</span><span class="m">1024</span>
-<span class="nv">CONCURRENCIES</span><span class="o">=</span><span class="s2">&quot;64 128 256&quot;</span>
+<span class="nv">CONCURRENCIES</span><span class="o">=</span><span class="s2">"64 128 256"</span>
 <span class="nv">NUM_ROUNDS</span><span class="o">=</span><span class="m">5</span>
 <span class="nv">RESULT_DIR</span><span class="o">=</span>/path/to/kimi-k3-results
 
-mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RESULT_DIR</span><span class="si">}</span><span class="s2">&quot;</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">RESULT_DIR</span><span class="si">}</span><span class="s2">"</span>
 
 <span class="k">for</span><span class="w"> </span>concurrency<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">CONCURRENCIES</span><span class="si">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
 <span class="w">    </span>python3<span class="w"> </span>-m<span class="w"> </span>tensorrt_llm.serve.scripts.benchmark_serving<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--model<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">MODEL</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--host<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">HOST</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--port<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PORT</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--model<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">MODEL</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--host<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">HOST</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--port<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">PORT</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--dataset-name<span class="w"> </span>random<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--random-ids<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--tokenize-on-client<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--random-input-len<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ISL</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--random-output-len<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">OSL</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--num-prompts<span class="w"> </span><span class="s2">&quot;</span><span class="k">$((</span><span class="nv">concurrency</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">NUM_ROUNDS</span><span class="k">))</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--max-concurrency<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--random-input-len<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">ISL</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--random-output-len<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">OSL</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--num-prompts<span class="w"> </span><span class="s2">"</span><span class="k">$((</span><span class="nv">concurrency</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">NUM_ROUNDS</span><span class="k">))</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--max-concurrency<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--ignore-eos<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--save-result<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--result-dir<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RESULT_DIR</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--result-filename<span class="w"> </span><span class="s2">&quot;concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json&quot;</span>
+<span class="w">        </span>--result-dir<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">RESULT_DIR</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--result-filename<span class="w"> </span><span class="s2">"concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json"</span>
 <span class="k">done</span>
 </pre></div>
 </div>
@@ -1133,8 +1135,8 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">&quot;</
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -1206,9 +1208,9 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">&quot;</
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/telemetry';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,12 +74,12 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Sparse Attention Development Guide" href="sparse-attention-development-guide.html" />
-    <link rel="prev" title="Introduction to KV Cache Transmission" href="kv-transfer.html" />
+    <link rel="prev" title="KVCacheManagerV2 Cold-Page Codec Design" href="kv-cache-cold-page-codec.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -481,7 +481,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -495,11 +495,13 @@
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -618,7 +620,7 @@ below; the runtime can capture nothing absent from this list.</p>
 unset or when the safety sanitizer rejects the runtime value.</p>
 <section id="torchllmargs">
 <h3><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code><a class="headerlink" href="#torchllmargs" title="Link to this heading">#</a></h3>
-<p>289 captured fields.</p>
+<p>295 captured fields.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Captured key</p></th>
@@ -711,7 +713,7 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'str'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, <code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code>, <code class="docutils literal notranslate"><span class="pre">FLASHINFER_STAR_ATTENTION</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, <code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['pytorch']</span></code></p></td>
@@ -785,23 +787,11 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cp_config.block_size</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cp_config.cp_anchor_size</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cp_config.cp_type</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;enum</span> <span class="pre">'CpType'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">ULYSSES</span></code>, <code class="docutils literal notranslate"><span class="pre">STAR</span></code>, <code class="docutils literal notranslate"><span class="pre">RING</span></code>, <code class="docutils literal notranslate"><span class="pre">HELIX</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ULYSSES</span></code>, <code class="docutils literal notranslate"><span class="pre">RING</span></code>, <code class="docutils literal notranslate"><span class="pre">HELIX</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cp_config.fifo_version</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
@@ -1203,7 +1193,7 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'str'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">float16</span></code>, <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, <code class="docutils literal notranslate"><span class="pre">float32</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">float16</span></code>, <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, <code class="docutils literal notranslate"><span class="pre">float32</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8_ds_mla</span></code>, <code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
@@ -1373,26 +1363,38 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p>allowlist</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">dummy</span></code>, <code class="docutils literal notranslate"><span class="pre">vision_only</span></code>, <code class="docutils literal notranslate"><span class="pre">gms</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.lora_ckpt_source</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.cuda_graph_specialize_lora</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.lora_ckpt_source</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['hf',</span> <span class="pre">'nemo']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">hf</span></code>, <code class="docutils literal notranslate"><span class="pre">nemo</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.max_cpu_loras</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.max_cpu_loras</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.max_lora_rank</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.max_lora_rank</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.max_loras</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.max_loras</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lora_config.overlap_lora_and_base</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -1452,10 +1454,10 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Literal['AUTO',</span> <span class="pre">'CUTLASS',</span> <span class="pre">'CUTEDSL',</span> <span class="pre">'WIDEEP',</span> <span class="pre">'TRTLLM',</span> <span class="pre">'DEEPGEMM',</span> <span class="pre">'DENSEGEMM',</span> <span class="pre">'VANILLA',</span> <span class="pre">'TRITON',</span> <span class="pre">'MARLIN',</span> <span class="pre">'MEGAMOE_DEEPGEMM',</span> <span class="pre">'MEGAMOE_CUTEDSL']</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Literal['AUTO',</span> <span class="pre">'CUTLASS',</span> <span class="pre">'CUTEDSL',</span> <span class="pre">'TRTLLM',</span> <span class="pre">'DEEPGEMM',</span> <span class="pre">'DENSEGEMM',</span> <span class="pre">'VANILLA',</span> <span class="pre">'TRITON',</span> <span class="pre">'MARLIN',</span> <span class="pre">'MEGAMOE_DEEPGEMM',</span> <span class="pre">'MEGAMOE_CUTEDSL']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code>, <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code>, <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">WIDEEP</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, <code class="docutils literal notranslate"><span class="pre">DEEPGEMM</span></code>, <code class="docutils literal notranslate"><span class="pre">DENSEGEMM</span></code>, <code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRITON</span></code>, <code class="docutils literal notranslate"><span class="pre">MARLIN</span></code>, <code class="docutils literal notranslate"><span class="pre">MEGAMOE_DEEPGEMM</span></code>, <code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code>, <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code>, <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, <code class="docutils literal notranslate"><span class="pre">DEEPGEMM</span></code>, <code class="docutils literal notranslate"><span class="pre">DENSEGEMM</span></code>, <code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRITON</span></code>, <code class="docutils literal notranslate"><span class="pre">MARLIN</span></code>, <code class="docutils literal notranslate"><span class="pre">MEGAMOE_DEEPGEMM</span></code>, <code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">moe_config.disable_finalize_fusion</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
@@ -1493,359 +1495,383 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_side_stream_max_ahead</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_scheduling_policy</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;enum</span> <span class="pre">'MultimodalEncoderSchedulingPolicy'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
+<td><p></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DISABLED</span></code>, <code class="docutils literal notranslate"><span class="pre">DEFAULT</span></code>, <code class="docutils literal notranslate"><span class="pre">EAGER</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_side_stream_max_ahead</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">multimodal_config.video_pruning_rate</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">multimodal_config.video_pruning_rate</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mx_config.preshard_strategy</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mx_config.preshard_strategy</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'str'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">per_module</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mx_config.server_query_timeout_s</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mx_config.server_query_timeout_s</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Annotated[int,</span> <span class="pre">Ge(ge=0)]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_postprocess_workers</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_postprocess_workers</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_serve_frontends</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_serve_frontends</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvfp4_gemm_config.allowed_backends</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvfp4_gemm_config.allowed_backends</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">List[Literal['cutlass',</span> <span class="pre">'cublaslt',</span> <span class="pre">'cutedsl',</span> <span class="pre">'cuda_core',</span> <span class="pre">'marlin']]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">cutlass</span></code>, <code class="docutils literal notranslate"><span class="pre">cublaslt</span></code>, <code class="docutils literal notranslate"><span class="pre">cutedsl</span></code>, <code class="docutils literal notranslate"><span class="pre">cuda_core</span></code>, <code class="docutils literal notranslate"><span class="pre">marlin</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">orchestrator_type</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">orchestrator_type</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Literal['rpc',</span> <span class="pre">'ray']]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">rpc</span></code>, <code class="docutils literal notranslate"><span class="pre">ray</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.device_cache_percent</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.device_cache_percent</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'float'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.host_cache_size</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.host_cache_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.max_adapter_size</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.max_adapter_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.max_pages_per_block_device</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.max_pages_per_block_device</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.max_pages_per_block_host</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.max_pages_per_block_host</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_copy_streams</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_copy_streams</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_device_module_layer</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_device_module_layer</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_ensure_workers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_ensure_workers</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_host_module_layer</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_host_module_layer</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_put_workers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.num_put_workers</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.optimal_adapter_size</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peft_cache_config.optimal_adapter_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">perf_metrics_max_requests</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">perf_metrics_max_requests</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pp_partition</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pp_partition</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[int]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">print_iter_log</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_capture_num_tokens</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[int]]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_cuda_graph_backend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;enum</span> <span class="pre">'PrefillCudaGraphBackend'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
+<td><p>allowlist</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">disabled</span></code>, <code class="docutils literal notranslate"><span class="pre">piecewise</span></code>, <code class="docutils literal notranslate"><span class="pre">breakable</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">print_iter_log</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.e2e_request_latency_buckets</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.e2e_request_latency_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_decode_time_buckets</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_decode_time_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_inference_time_buckets</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_inference_time_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_prefill_time_buckets</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_prefill_time_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_queue_time_buckets</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.request_queue_time_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.time_per_output_token_buckets</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.time_per_output_token_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.time_to_first_token_buckets</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prometheus_metrics_config.time_to_first_token_buckets</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[float]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ray_placement_config.defer_workers_init</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ray_placement_config.defer_workers_init</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ray_placement_config.per_worker_gpu_share</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ray_placement_config.per_worker_gpu_share</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ray_placement_config.placement_bundle_indices</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ray_placement_config.placement_bundle_indices</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[List[int]]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">reasoning_parser</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reasoning_parser</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[str]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">deepseek-r1</span></code>, <code class="docutils literal notranslate"><span class="pre">laguna</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code>, <code class="docutils literal notranslate"><span class="pre">minimax_m2</span></code>, <code class="docutils literal notranslate"><span class="pre">minimax_m2_append_think</span></code>, <code class="docutils literal notranslate"><span class="pre">nano-v3</span></code>, <code class="docutils literal notranslate"><span class="pre">gemma4</span></code>, <code class="docutils literal notranslate"><span class="pre">kimi_k2</span></code>, <code class="docutils literal notranslate"><span class="pre">kimi_k25</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">deepseek-r1</span></code>, <code class="docutils literal notranslate"><span class="pre">poolside_v1</span></code>, <code class="docutils literal notranslate"><span class="pre">laguna</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code>, <code class="docutils literal notranslate"><span class="pre">minimax_m2</span></code>, <code class="docutils literal notranslate"><span class="pre">minimax_m2_append_think</span></code>, <code class="docutils literal notranslate"><span class="pre">nano-v3</span></code>, <code class="docutils literal notranslate"><span class="pre">gemma4</span></code>, <code class="docutils literal notranslate"><span class="pre">kimi_k2</span></code>, <code class="docutils literal notranslate"><span class="pre">kimi_k25</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reorder_policy_config.policy_args.agent_inflight_seq_num</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">reorder_policy_config.policy_args.agent_inflight_seq_num</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">reorder_policy_config.policy_args.agent_percentage</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reorder_policy_config.policy_args.agent_percentage</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'float'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reorder_policy_config.policy_name</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">reorder_policy_config.policy_name</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Literal['AgentTree']]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">AgentTree</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">request_stats_max_iterations</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">request_stats_max_iterations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">return_perf_metrics</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">return_perf_metrics</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_force_async_worker</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_force_async_worker</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_type</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_type</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Union[str,</span> <span class="pre">tensorrt_llm.llmapi.llm_args.SamplerType]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">TRTLLMSampler</span></code>, <code class="docutils literal notranslate"><span class="pre">TorchSampler</span></code>, <code class="docutils literal notranslate"><span class="pre">auto</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.capacity_scheduler_policy</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.capacity_scheduler_policy</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;enum</span> <span class="pre">'CapacitySchedulerPolicy'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>, <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code>, <code class="docutils literal notranslate"><span class="pre">STATIC_BATCH</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.context_chunking_policy</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.context_chunking_policy</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">FIRST_COME_FIRST_SERVED</span></code>, <code class="docutils literal notranslate"><span class="pre">EQUAL_PROGRESS</span></code>, <code class="docutils literal notranslate"><span class="pre">FORCE_CHUNK</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.dynamic_batch_config.enable_batch_size_tuning</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.dynamic_batch_config.enable_batch_size_tuning</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.enable_prefix_aware_scheduling</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.enable_prefix_aware_scheduling</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.use_python_scheduler</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.use_python_scheduler</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.waiting_queue_policy</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduler_config.waiting_queue_policy</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;enum</span> <span class="pre">'WaitingQueuePolicy'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fcfs</span></code>, <code class="docutils literal notranslate"><span class="pre">priority</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">skip_tokenizer_init</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">skip_tokenizer_init</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.algorithm</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.algorithm</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['dsa']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">dsa</span></code>, <code class="docutils literal notranslate"><span class="pre">deepseek_v4</span></code>, <code class="docutils literal notranslate"><span class="pre">minimax_m3</span></code>, <code class="docutils literal notranslate"><span class="pre">rocket</span></code>, <code class="docutils literal notranslate"><span class="pre">skip_softmax</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.compress_ratios</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.compress_ratios</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">List[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.enable_heuristic_topk</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.enable_heuristic_topk</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.implementation</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.implementation</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['triton',</span> <span class="pre">'msa']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">msa</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_head_dim</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_head_dim</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_n_heads</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_n_heads</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_share_for_mtp_iteration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_share_for_mtp_iteration</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_topk</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.index_topk</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.indexer_k_dtype</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.indexer_k_dtype</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['fp8',</span> <span class="pre">'fp4']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">fp4</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.indexer_kv_dtype</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Literal['bf16',</span> <span class="pre">'fp8']</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
+<td><p></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bf16</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.indexer_max_chunk_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
@@ -2015,55 +2041,67 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.begin_thinking_phase_token</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.attention_backend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Literal['VANILLA',</span> <span class="pre">'TRTLLM']</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
+<td><p></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.begin_thinking_phase_token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.block_size</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.block_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Annotated[int,</span> <span class="pre">Gt(gt=0)]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.decoding_type</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.decoding_type</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['AUTO']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code>, <code class="docutils literal notranslate"><span class="pre">DFlash</span></code>, <code class="docutils literal notranslate"><span class="pre">DSpark</span></code>, <code class="docutils literal notranslate"><span class="pre">Draft_Target</span></code>, <code class="docutils literal notranslate"><span class="pre">Eagle3</span></code>, <code class="docutils literal notranslate"><span class="pre">Eagle</span></code>, <code class="docutils literal notranslate"><span class="pre">Lookahead</span></code>, <code class="docutils literal notranslate"><span class="pre">MTP</span></code>, <code class="docutils literal notranslate"><span class="pre">Medusa</span></code>, <code class="docutils literal notranslate"><span class="pre">NGram</span></code>, <code class="docutils literal notranslate"><span class="pre">PARD</span></code>, <code class="docutils literal notranslate"><span class="pre">SA</span></code>, <code class="docutils literal notranslate"><span class="pre">SaveState</span></code>, <code class="docutils literal notranslate"><span class="pre">User_Provided</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.dynamic_tree_max_topK</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.dynamic_tree_max_topK</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_layers_to_capture</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_layers_to_capture</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Set[int]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_model_arch</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_model_arch</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['llama3',</span> <span class="pre">'mistral_large3']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">llama3</span></code>, <code class="docutils literal notranslate"><span class="pre">mistral_large3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_one_model</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_one_model</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle_choices</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle_choices</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[List[int]]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_global_pool</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_global_pool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_penalty</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
@@ -2381,12 +2419,12 @@ unset or when the safety sanitizer rejects the runtime value.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="kv-transfer.html"
+       href="kv-cache-cold-page-codec.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Introduction to KV Cache Transmission</p>
+        <p class="prev-next-title">KVCacheManagerV2 Cold-Page Codec Design</p>
       </div>
     </a>
     <a class="right-next"
@@ -2441,8 +2479,8 @@ unset or when the safety sanitizer rejects the runtime value.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -2514,9 +2552,9 @@ unset or when the safety sanitizer rejects the runtime value.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

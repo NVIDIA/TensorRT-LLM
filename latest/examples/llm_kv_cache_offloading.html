@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'examples/llm_kv_cache_offloading';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -406,7 +406,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -477,7 +477,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -491,11 +491,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -594,12 +596,12 @@
                   
   <section id="kv-cache-offloading">
 <h1>KV Cache Offloading<a class="headerlink" href="#kv-cache-offloading" title="Link to this heading">#</a></h1>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/1cef02e901be43081b1ba6d4981e94ed3bd9c1e8/examples/llm-api/llm_kv_cache_offloading.py">NVIDIA/TensorRT-LLM</a>.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="sd">&#39;&#39;&#39;</span>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/785c948197b55267260fec3f7f52e47000888d0a/examples/llm-api/llm_kv_cache_offloading.py">NVIDIA/TensorRT-LLM</a>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="sd">'''</span>
 <span class="linenos">  2</span><span class="sd">This script demonstrates the effectiveness of KV cache host offloading in TensorRT-LLM.</span>
 <span class="linenos">  3</span>
 <span class="linenos">  4</span><span class="sd">**Scenario:**</span>
-<span class="linenos">  5</span><span class="sd">The script simulates a scenario where the GPU&#39;s KV cache is severely limited,</span>
+<span class="linenos">  5</span><span class="sd">The script simulates a scenario where the GPU's KV cache is severely limited,</span>
 <span class="linenos">  6</span><span class="sd">while multiple requests with recurring prompts (like system prompts) are processed.</span>
 <span class="linenos">  7</span>
 <span class="linenos">  8</span><span class="sd">1.  **Constrained GPU Cache:** The GPU KV cache is configured to be very small,</span>
@@ -612,15 +614,15 @@
 <span class="linenos"> 15</span><span class="sd">**Demonstration:**</span>
 <span class="linenos"> 16</span>
 <span class="linenos"> 17</span><span class="sd">* **Without Offloading (Default):**</span>
-<span class="linenos"> 18</span><span class="sd">    - When the first prompt &#39;A&#39; is processed, its KV cache is stored on the GPU.</span>
-<span class="linenos"> 19</span><span class="sd">    - When prompt &#39;B&#39; arrives, the cache manager needs space and discards the cache for &#39;A&#39;.</span>
-<span class="linenos"> 20</span><span class="sd">    - When prompt &#39;A&#39; is sent again, its cache must be recomputed from scratch.</span>
+<span class="linenos"> 18</span><span class="sd">    - When the first prompt 'A' is processed, its KV cache is stored on the GPU.</span>
+<span class="linenos"> 19</span><span class="sd">    - When prompt 'B' arrives, the cache manager needs space and discards the cache for 'A'.</span>
+<span class="linenos"> 20</span><span class="sd">    - When prompt 'A' is sent again, its cache must be recomputed from scratch.</span>
 <span class="linenos"> 21</span><span class="sd">    - **Expected Outcome:** The log will show `reused blocks: 0` and `cache hit rate: 0`.</span>
 <span class="linenos"> 22</span>
 <span class="linenos"> 23</span><span class="sd">* **With Offloading (`--enable_offloading`):**</span>
-<span class="linenos"> 24</span><span class="sd">    - When prompt &#39;B&#39; arrives, the cache for &#39;A&#39; is not discarded but is instead</span>
+<span class="linenos"> 24</span><span class="sd">    - When prompt 'B' arrives, the cache for 'A' is not discarded but is instead</span>
 <span class="linenos"> 25</span><span class="sd">      *offloaded* from the fast GPU VRAM to the slower (but larger) host CPU RAM.</span>
-<span class="linenos"> 26</span><span class="sd">    - When prompt &#39;A&#39; is sent again, its KV cache is loaded back from host RAM</span>
+<span class="linenos"> 26</span><span class="sd">    - When prompt 'A' is sent again, its KV cache is loaded back from host RAM</span>
 <span class="linenos"> 27</span><span class="sd">      to the GPU, which is significantly faster than recomputing it.</span>
 <span class="linenos"> 28</span><span class="sd">    - **Expected Outcome:** The log will show positive values for `reused blocks`</span>
 <span class="linenos"> 29</span><span class="sd">      and a non-zero `cache hit rate`, confirming that the cache was successfully</span>
@@ -639,7 +641,7 @@
 <span class="linenos"> 42</span><span class="sd">    TLLM_LOG_LEVEL=DEBUG python llm_kv_cache_offloading.py --enable_offloading 2&gt;&amp;1 | tee offloading_enabled.log</span>
 <span class="linenos"> 43</span><span class="sd">    ```</span>
 <span class="linenos"> 44</span><span class="sd">    (Check the log for non-zero reuse)</span>
-<span class="linenos"> 45</span><span class="sd">&#39;&#39;&#39;</span>
+<span class="linenos"> 45</span><span class="sd">'''</span>
 <span class="linenos"> 46</span>
 <span class="linenos"> 47</span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
 <span class="linenos"> 48</span>
@@ -650,10 +652,10 @@
 <span class="linenos"> 53</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">args</span><span class="p">):</span>
 <span class="linenos"> 54</span>    <span class="c1"># Define two distinct prompts to simulate different requests or system prompts.</span>
 <span class="linenos"> 55</span>    <span class="n">prompt_a</span> <span class="o">=</span> <span class="p">(</span>
-<span class="linenos"> 56</span>        <span class="s2">&quot;Returns the per-iterations statistics computed since last call to this method. &quot;</span>
-<span class="linenos"> 57</span>        <span class="s2">&quot;Contains at most iter_stats_max_iterations iterations.&quot;</span><span class="p">)</span>
-<span class="linenos"> 58</span>    <span class="n">prompt_b</span> <span class="o">=</span> <span class="p">(</span><span class="s2">&quot;Use for skipping decoding step for non generation model, &quot;</span>
-<span class="linenos"> 59</span>                <span class="s2">&quot;and return the batch_output (such as mm_embeddings)&quot;</span><span class="p">)</span>
+<span class="linenos"> 56</span>        <span class="s2">"Returns the per-iterations statistics computed since last call to this method. "</span>
+<span class="linenos"> 57</span>        <span class="s2">"Contains at most iter_stats_max_iterations iterations."</span><span class="p">)</span>
+<span class="linenos"> 58</span>    <span class="n">prompt_b</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"Use for skipping decoding step for non generation model, "</span>
+<span class="linenos"> 59</span>                <span class="s2">"and return the batch_output (such as mm_embeddings)"</span><span class="p">)</span>
 <span class="linenos"> 60</span>
 <span class="linenos"> 61</span>    <span class="c1"># Use a batch size of 1 to process requests sequentially, making the cache</span>
 <span class="linenos"> 62</span>    <span class="c1"># eviction and reuse cycle easy to observe.</span>
@@ -662,7 +664,7 @@
 <span class="linenos"> 65</span>
 <span class="linenos"> 66</span>    <span class="c1"># --- KV Cache Configuration ---</span>
 <span class="linenos"> 67</span>    <span class="c1"># Set a small GPU KV cache size (in number of tokens). This is crucial for the demo,</span>
-<span class="linenos"> 68</span>    <span class="c1"># as it&#39;s only large enough to hold the KV cache for a single request.</span>
+<span class="linenos"> 68</span>    <span class="c1"># as it's only large enough to hold the KV cache for a single request.</span>
 <span class="linenos"> 69</span>    <span class="n">kv_cache_max_tokens</span> <span class="o">=</span> <span class="mi">256</span>
 <span class="linenos"> 70</span>    <span class="c1"># Define the size of a single cache block.</span>
 <span class="linenos"> 71</span>    <span class="n">kv_cache_page_size</span> <span class="o">=</span> <span class="mi">16</span>
@@ -673,7 +675,7 @@
 <span class="linenos"> 76</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">)</span>
 <span class="linenos"> 77</span>
 <span class="linenos"> 78</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-<span class="linenos"> 79</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen/Qwen3-8B&quot;</span><span class="p">,</span>
+<span class="linenos"> 79</span>        <span class="n">model</span><span class="o">=</span><span class="s2">"Qwen/Qwen3-8B"</span><span class="p">,</span>
 <span class="linenos"> 80</span>        <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
 <span class="linenos"> 81</span>        <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">,</span>
 <span class="linenos"> 82</span>        <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
@@ -685,45 +687,45 @@
 <span class="linenos"> 88</span>
 <span class="linenos"> 89</span>    <span class="c1"># Process four requests sequentially using two distinct prompts (A, B, A, B).</span>
 <span class="linenos"> 90</span>    <span class="c1"># This pattern is designed to showcase the cache eviction and reuse behavior.</span>
-<span class="linenos"> 91</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;--- First Round ---&quot;</span><span class="p">)</span>
+<span class="linenos"> 91</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"--- First Round ---"</span><span class="p">)</span>
 <span class="linenos"> 92</span>    <span class="c1"># 1. Process prompt A. Its cache is stored on the GPU.</span>
 <span class="linenos"> 93</span>    <span class="n">output_a</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt_a</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
 <span class="linenos"> 94</span>    <span class="nb">print</span><span class="p">(</span>
-<span class="linenos"> 95</span>        <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos"> 95</span>        <span class="sa">f</span><span class="s2">"Prompt: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span>
 <span class="linenos"> 96</span>    <span class="p">)</span>
-<span class="linenos"> 97</span>    <span class="c1"># 2. Process prompt B. Its cache replaces/offloads A&#39;s cache.</span>
+<span class="linenos"> 97</span>    <span class="c1"># 2. Process prompt B. Its cache replaces/offloads A's cache.</span>
 <span class="linenos"> 98</span>    <span class="n">output_b</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt_b</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
 <span class="linenos"> 99</span>    <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">100</span>        <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">100</span>        <span class="sa">f</span><span class="s2">"Prompt: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span>
 <span class="linenos">101</span>    <span class="p">)</span>
 <span class="linenos">102</span>
-<span class="linenos">103</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">--- Second Round ---&quot;</span><span class="p">)</span>
+<span class="linenos">103</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- Second Round ---"</span><span class="p">)</span>
 <span class="linenos">104</span>    <span class="c1"># 3. Process prompt A again.</span>
 <span class="linenos">105</span>    <span class="c1">#    - Without offloading: Must recompute from scratch.</span>
 <span class="linenos">106</span>    <span class="c1">#    - With offloading: Recovers cache from host RAM.</span>
 <span class="linenos">107</span>    <span class="n">output_a</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt_a</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
 <span class="linenos">108</span>    <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">109</span>        <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">109</span>        <span class="sa">f</span><span class="s2">"Prompt: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_a</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span>
 <span class="linenos">110</span>    <span class="p">)</span>
 <span class="linenos">111</span>    <span class="c1"># 4. Process prompt B again.</span>
 <span class="linenos">112</span>    <span class="c1">#    - Without offloading: Must recompute from scratch.</span>
 <span class="linenos">113</span>    <span class="c1">#    - With offloading: Recovers cache from host RAM.</span>
 <span class="linenos">114</span>    <span class="n">output_b</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt_b</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
 <span class="linenos">115</span>    <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">116</span>        <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">116</span>        <span class="sa">f</span><span class="s2">"Prompt: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output_b</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span>
 <span class="linenos">117</span>    <span class="p">)</span>
 <span class="linenos">118</span>
 <span class="linenos">119</span>    <span class="n">llm</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 <span class="linenos">120</span>
 <span class="linenos">121</span>
-<span class="linenos">122</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+<span class="linenos">122</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
 <span class="linenos">123</span>    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span>
 <span class="linenos">124</span>        <span class="n">description</span><span class="o">=</span>
-<span class="linenos">125</span>        <span class="s2">&quot;A script to demonstrate the effectiveness of KV cache host offloading.&quot;</span>
+<span class="linenos">125</span>        <span class="s2">"A script to demonstrate the effectiveness of KV cache host offloading."</span>
 <span class="linenos">126</span>    <span class="p">)</span>
-<span class="linenos">127</span>    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--enable_offloading&#39;</span><span class="p">,</span>
-<span class="linenos">128</span>                        <span class="n">action</span><span class="o">=</span><span class="s1">&#39;store_true&#39;</span><span class="p">,</span>
-<span class="linenos">129</span>                        <span class="n">help</span><span class="o">=</span><span class="s1">&#39;Enable host RAM for KV cache offloading.&#39;</span><span class="p">)</span>
+<span class="linenos">127</span>    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">'--enable_offloading'</span><span class="p">,</span>
+<span class="linenos">128</span>                        <span class="n">action</span><span class="o">=</span><span class="s1">'store_true'</span><span class="p">,</span>
+<span class="linenos">129</span>                        <span class="n">help</span><span class="o">=</span><span class="s1">'Enable host RAM for KV cache offloading.'</span><span class="p">)</span>
 <span class="linenos">130</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
 <span class="linenos">131</span>    <span class="n">main</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
 </pre></div>
@@ -782,8 +784,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -855,9 +857,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

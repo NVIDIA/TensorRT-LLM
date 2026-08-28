@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'torch/adding_custom_kernels';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -408,7 +408,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -479,7 +479,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -493,11 +493,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -661,8 +663,8 @@
 <p>Place the kernel under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/</span></code></a>. The convention is one header (<code class="docutils literal notranslate"><span class="pre">MyKernel.h</span></code>) and one source file (<code class="docutils literal notranslate"><span class="pre">myKernel.cu</span></code>):</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/kernels/MyKernel.h</span>
 <span class="cp">#pragma once</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/config.h&quot;</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/cudaUtils.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"tensorrt_llm/common/config.h"</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"tensorrt_llm/common/cudaUtils.h"</span>
 
 <span class="n">TRTLLM_NAMESPACE_BEGIN</span>
 <span class="k">namespace</span><span class="w"> </span><span class="nn">kernels</span><span class="w"> </span><span class="p">{</span>
@@ -674,8 +676,8 @@
 </pre></div>
 </div>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/kernels/myKernel.cu</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;MyKernel.h&quot;</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/assert.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"MyKernel.h"</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"tensorrt_llm/common/assert.h"</span>
 
 <span class="n">TRTLLM_NAMESPACE_BEGIN</span>
 <span class="k">namespace</span><span class="w"> </span><span class="nn">kernels</span><span class="w"> </span><span class="p">{</span>
@@ -707,9 +709,9 @@
 <li><p>Registers the op into the <code class="docutils literal notranslate"><span class="pre">trtllm</span></code> <code class="docutils literal notranslate"><span class="pre">torch.library</span></code> namespace and provides a CUDA implementation.</p></li>
 </ol>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/thop/MyKernelOp.cpp</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/opUtils.h&quot;</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/runtime/torchUtils.h&quot;</span>
-<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/kernels/MyKernel.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"tensorrt_llm/common/opUtils.h"</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"tensorrt_llm/runtime/torchUtils.h"</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"tensorrt_llm/kernels/MyKernel.h"</span>
 
 <span class="k">namespace</span><span class="w"> </span><span class="nn">th</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">torch</span><span class="p">;</span>
 <span class="k">namespace</span><span class="w"> </span><span class="nn">tk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="o">::</span><span class="nn">kernels</span><span class="p">;</span>
@@ -718,8 +720,8 @@
 <span class="k">namespace</span><span class="w"> </span><span class="nn">torch_ext</span><span class="w"> </span><span class="p">{</span>
 
 <span class="kt">void</span><span class="w"> </span><span class="nf">my_kernel_op</span><span class="p">(</span><span class="n">th</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="w"> </span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">th</span><span class="o">::</span><span class="n">Tensor</span><span class="o">&amp;</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="cm">/*, ... */</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">()</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">out</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">(),</span><span class="w"> </span><span class="s">&quot;Tensors must be CUDA&quot;</span><span class="p">);</span>
-<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">is_contiguous</span><span class="p">(),</span><span class="w"> </span><span class="s">&quot;x must be contiguous&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">()</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">out</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">(),</span><span class="w"> </span><span class="s">"Tensors must be CUDA"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">is_contiguous</span><span class="p">(),</span><span class="w"> </span><span class="s">"x must be contiguous"</span><span class="p">);</span>
 <span class="w">    </span><span class="c1">// ... more validation ...</span>
 
 <span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">stream</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">at</span><span class="o">::</span><span class="n">cuda</span><span class="o">::</span><span class="n">getCurrentCUDAStream</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">get_device</span><span class="p">());</span>
@@ -731,11 +733,11 @@
 
 <span class="n">TORCH_LIBRARY_FRAGMENT</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="c1">// Schema string. Use Tensor(a!) for in-place / mutated outputs.</span>
-<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;my_kernel_op(Tensor x, Tensor(a!) out) -&gt; ()&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">"my_kernel_op(Tensor x, Tensor(a!) out) -&gt; ()"</span><span class="p">);</span>
 <span class="p">}</span>
 
 <span class="n">TORCH_LIBRARY_IMPL</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">CUDA</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">impl</span><span class="p">(</span><span class="s">&quot;my_kernel_op&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">torch_ext</span><span class="o">::</span><span class="n">my_kernel_op</span><span class="p">);</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">impl</span><span class="p">(</span><span class="s">"my_kernel_op"</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">torch_ext</span><span class="o">::</span><span class="n">my_kernel_op</span><span class="p">);</span>
 <span class="p">}</span>
 </pre></div>
 </div>
@@ -848,7 +850,7 @@
     <span class="kn">import</span><span class="w"> </span><span class="nn">cuda.tile</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ct</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">..cuda_tile_kernels</span><span class="w"> </span><span class="kn">import</span> <span class="n">rms_norm_kernel</span>  <span class="c1"># the JIT kernel above</span>
 
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">&quot;trtllm::cuda_tile_rms_norm&quot;</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">"trtllm::cuda_tile_rms_norm"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">cuda_tile_rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
         <span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
         <span class="n">ct</span><span class="o">.</span><span class="n">launch</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">(),</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],),</span>
@@ -1046,8 +1048,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -1119,9 +1121,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

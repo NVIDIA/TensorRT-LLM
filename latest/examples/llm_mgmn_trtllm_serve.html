@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'examples/llm_mgmn_trtllm_serve';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -406,7 +406,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -477,7 +477,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -491,11 +491,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -594,7 +596,7 @@
                   
   <section id="run-trtllm-serve-with-pytorch-backend-on-slurm">
 <h1>Run trtllm-serve with pytorch backend on Slurm<a class="headerlink" href="#run-trtllm-serve-with-pytorch-backend-on-slurm" title="Link to this heading">#</a></h1>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/1cef02e901be43081b1ba6d4981e94ed3bd9c1e8/examples/llm-api/llm_mgmn_trtllm_serve.sh">NVIDIA/TensorRT-LLM</a>.</p>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/785c948197b55267260fec3f7f52e47000888d0a/examples/llm-api/llm_mgmn_trtllm_serve.sh">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#!/bin/bash</span>
 <span class="linenos"> 2</span><span class="c1">#SBATCH -A &lt;account&gt;</span>
 <span class="linenos"> 3</span><span class="c1">#SBATCH -p &lt;partition&gt;</span>
@@ -633,8 +635,8 @@
 <span class="linenos">36</span><span class="c1">#    - --host 0.0.0.0: Server bind address (0.0.0.0 allows external access)</span>
 <span class="linenos">37</span><span class="c1">#</span>
 <span class="linenos">38</span><span class="c1"># EXAMPLE USAGE:</span>
-<span class="linenos">39</span><span class="c1">#   export CONTAINER_IMAGE=&quot;nvcr.io/nvidia/tensorrt_llm:latest&quot;</span>
-<span class="linenos">40</span><span class="c1">#   export LOCAL_MODEL=&quot;/path/to/llama-model&quot;</span>
+<span class="linenos">39</span><span class="c1">#   export CONTAINER_IMAGE="nvcr.io/nvidia/tensorrt_llm:latest"</span>
+<span class="linenos">40</span><span class="c1">#   export LOCAL_MODEL="/path/to/llama-model"</span>
 <span class="linenos">41</span><span class="c1">#   sbatch llm_mgmn_trtllm_serve.sh</span>
 <span class="linenos">42</span><span class="c1">#</span>
 <span class="linenos">43</span><span class="c1"># NOTE: After the server starts, you can send requests to it using curl or</span>
@@ -655,7 +657,7 @@
 <span class="linenos">58</span>
 <span class="linenos">59</span><span class="c1"># The following variables are expected to be set in the environment:</span>
 <span class="linenos">60</span><span class="c1"># You can set them via --export in the srun/sbatch command.</span>
-<span class="linenos">61</span><span class="c1">#   CONTAINER_IMAGE: the docker image to use, you&#39;d better install tensorrt_llm in it, or install it in the task.</span>
+<span class="linenos">61</span><span class="c1">#   CONTAINER_IMAGE: the docker image to use, you'd better install tensorrt_llm in it, or install it in the task.</span>
 <span class="linenos">62</span><span class="c1">#   MOUNT_DIR: the directory to mount in the container</span>
 <span class="linenos">63</span><span class="c1">#   MOUNT_DEST: the destination directory in the container</span>
 <span class="linenos">64</span><span class="c1">#   WORKDIR: the working directory in the container</span>
@@ -665,7 +667,7 @@
 <span class="linenos">68</span><span class="c1">#      not supported in Slurm mode, you need to download the model and put it in</span>
 <span class="linenos">69</span><span class="c1">#      the LOCAL_MODEL directory.</span>
 <span class="linenos">70</span>
-<span class="linenos">71</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Starting trtllm-serve...&quot;</span>
+<span class="linenos">71</span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Starting trtllm-serve..."</span>
 <span class="linenos">72</span><span class="c1"># Just launch trtllm-serve job with trtllm-llmapi-launch command.</span>
 <span class="linenos">73</span>srun<span class="w"> </span>-l<span class="w"> </span><span class="se">\</span>
 <span class="linenos">74</span><span class="w">    </span>--container-image<span class="o">=</span><span class="si">${</span><span class="nv">CONTAINER_IMAGE</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
@@ -673,7 +675,7 @@
 <span class="linenos">76</span><span class="w">    </span>--container-workdir<span class="o">=</span><span class="si">${</span><span class="nv">WORKDIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="linenos">77</span><span class="w">    </span>--export<span class="o">=</span>ALL,PYTHONPATH<span class="o">=</span><span class="si">${</span><span class="nv">SOURCE_ROOT</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="linenos">78</span><span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span><span class="se">\</span>
-<span class="linenos">79</span><span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="linenos">79</span><span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
 <span class="linenos">80</span><span class="s2">        set -ex</span>
 <span class="linenos">81</span><span class="s2">        </span><span class="nv">$PROLOGUE</span>
 <span class="linenos">82</span><span class="s2">        export PATH=</span><span class="nv">$PATH</span><span class="s2">:~/.local/bin</span>
@@ -683,7 +685,7 @@
 <span class="linenos">86</span><span class="s2">            --tp_size 16 \</span>
 <span class="linenos">87</span><span class="s2">            --host 0.0.0.0 \</span>
 <span class="linenos">88</span><span class="s2">            </span><span class="si">${</span><span class="nv">ADDITIONAL_OPTIONS</span><span class="si">}</span>
-<span class="linenos">89</span><span class="s2">    &quot;</span>
+<span class="linenos">89</span><span class="s2">    "</span>
 </pre></div>
 </div>
 </section>
@@ -740,8 +742,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -813,9 +815,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware &#8212; TensorRT LLM</title>
+    <title>Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware &#8212; TensorRT LLM</title>
   
   
   
@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,18 +52,18 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
     <script src="../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/deployment-guide-for-qwen3.5-on-trtllm';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -481,7 +481,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -495,11 +495,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -579,7 +581,7 @@
     
     <li class="breadcrumb-item"><a href="index.html" class="nav-link">Model Recipes</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</span></li>
   </ul>
 </nav>
 </div>
@@ -596,11 +598,154 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="deployment-guide-for-qwen3-5-on-tensorrt-llm-blackwell-hopper-hardware">
-<h1>Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware<a class="headerlink" href="#deployment-guide-for-qwen3-5-on-tensorrt-llm-blackwell-hopper-hardware" title="Link to this heading">#</a></h1>
+  <section id="deployment-guide-for-qwen3-8-moe-and-qwen3-5-moe-on-tensorrt-llm-blackwell-hardware">
+<h1>Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware<a class="headerlink" href="#deployment-guide-for-qwen3-8-moe-and-qwen3-5-moe-on-tensorrt-llm-blackwell-hardware" title="Link to this heading">#</a></h1>
 <section id="introduction">
 <h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
-<p>This deployment guide provides step-by-step instructions for running the Qwen3.5-397B-A17B model using TensorRT LLM. It covers model access, environment setup, server configuration, and inference validation.</p>
+<p>This guide describes how to serve the Qwen3.8 MoE and Qwen3.5 MoE hybrid models with the TensorRT LLM PyTorch backend. It covers the following checkpoints:</p>
+<ul class="simple">
+<li><p><strong>Qwen3.8-2.4T-A95B MoE FP8</strong> — 2.4 trillion total parameters and 95 billion active parameters per token.</p></li>
+<li><p><strong>Qwen3.5-397B-A17B MoE NVFP4</strong> — 397 billion total parameters and 17 billion active parameters per token.</p></li>
+</ul>
+<p>The models share the <code class="docutils literal notranslate"><span class="pre">qwen3_5_moe_text</span></code> decoder architecture and use the same TensorRT LLM implementation, registered as <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code>. Both interleave three gated-delta-network (GDN) linear-attention layers with one grouped-query-attention (GQA) layer, and both use 512 routed experts with top-10 routing.</p>
+<p>Sharing an implementation does not make their deployment configurations interchangeable. Qwen3.8 MoE is substantially larger, uses an FP8 checkpoint, and is text-only. The NVIDIA Qwen3.5 MoE NVFP4 checkpoint uses a multimodal wrapper around the shared text decoder. Parallelism, quantization backends, cache sizing, and expert placement must be selected for the exact checkpoint.</p>
+</section>
+<section id="architecture-and-checkpoint-differences">
+<h2>Architecture and Checkpoint Differences<a class="headerlink" href="#architecture-and-checkpoint-differences" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Property</p></th>
+<th class="head text-right"><p>Qwen3.8-2.4T-A95B MoE FP8</p></th>
+<th class="head text-right"><p>Qwen3.5-397B-A17B MoE NVFP4</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Hugging Face text architecture</p></td>
+<td class="text-right"><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code></p></td>
+<td class="text-right"><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code> inside <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Decoder layers</p></td>
+<td class="text-right"><p>92</p></td>
+<td class="text-right"><p>60</p></td>
+</tr>
+<tr class="row-even"><td><p>Hidden size</p></td>
+<td class="text-right"><p>8192</p></td>
+<td class="text-right"><p>4096</p></td>
+</tr>
+<tr class="row-odd"><td><p>GDN / GQA layers</p></td>
+<td class="text-right"><p>69 / 23</p></td>
+<td class="text-right"><p>45 / 15</p></td>
+</tr>
+<tr class="row-even"><td><p>Routed experts / experts per token</p></td>
+<td class="text-right"><p>512 / 10</p></td>
+<td class="text-right"><p>512 / 10</p></td>
+</tr>
+<tr class="row-odd"><td><p>Built-in MTP modules</p></td>
+<td class="text-right"><p>1 recurrent module</p></td>
+<td class="text-right"><p>1 recurrent module</p></td>
+</tr>
+<tr class="row-even"><td><p>Recommended checkpoint precision in this guide</p></td>
+<td class="text-right"><p>Block-scaled FP8 routed experts</p></td>
+<td class="text-right"><p>NVFP4 with FP8 KV cache</p></td>
+</tr>
+<tr class="row-odd"><td><p>Modality</p></td>
+<td class="text-right"><p>Text</p></td>
+<td class="text-right"><p>Text, image, and video</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The Qwen3.8 MoE FP8 checkpoint quantizes the routed expert projections to FP8 (E4M3) with 128x128 weight block scales and dynamic activation scaling. Attention, GDN projections, shared experts, routers, embeddings, and the LM head are excluded from quantization and retain their checkpoint dtypes.</p>
+<p>The serving configuration controls the attention KV-cache dtype and GDN recurrent-state dtype independently through <code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype</span></code> and <code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code>. The GDN state supports <code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">float16</span></code>, <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, and <code class="docutils literal notranslate"><span class="pre">float32</span></code>.</p>
+</section>
+<section id="support-status">
+<h2>Support Status<a class="headerlink" href="#support-status" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Capability</p></th>
+<th class="head"><p>Qwen3.8 MoE FP8</p></th>
+<th class="head"><p>Qwen3.5 MoE NVFP4</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Aggregated serving</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-odd"><td><p>Disaggregated serving</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-even"><td><p>MTP speculative decoding</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-odd"><td><p>Static EPLB</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-even"><td><p>Online EPLB</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-odd"><td><p>Attention data parallelism and expert parallelism</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-even"><td><p>GDN state replay</p></td>
+<td><p>Supported</p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV cache manager V2</p></td>
+<td><p>Supported and default</p></td>
+<td><p>Supported and default</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="performance">
+<h2>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h2>
+<p>The performance reference uses GB300, aggregated serving, and an exact 8192-input/1024-output-token workload. Low-latency profiles use TP16/EP1 on 16 GPUs at concurrency 1. High-throughput profiles use attention DP with TP32/EP32 on 32 GPUs and a 544-slot static EPLB map. Low-latency throughput is output tokens per second per user (<code class="docutils literal notranslate"><span class="pre">1000</span> <span class="pre">/</span> <span class="pre">median</span> <span class="pre">TPOT</span></code>); high-throughput is total input-plus-output tokens per second per GPU.</p>
+<p>The following are the best audited Qwen3.8 MoE FP8 checkpoint points across the validated implementation variants:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Objective</p></th>
+<th class="head"><p>Speculative decoding</p></th>
+<th class="head"><p>Topology</p></th>
+<th class="head text-right"><p>Concurrency</p></th>
+<th class="head text-right"><p>Best audited value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Low latency</p></td>
+<td><p>Disabled</p></td>
+<td><p>TP16/EP1</p></td>
+<td class="text-right"><p>1</p></td>
+<td class="text-right"><p><strong>133.502 output tok/s/user</strong> (7.491 ms median TPOT)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Low latency</p></td>
+<td><p>MTP3</p></td>
+<td><p>TP16/EP1</p></td>
+<td class="text-right"><p>1</p></td>
+<td class="text-right"><p><strong>383.051 output tok/s/user</strong> (2.611 ms median TPOT)</p></td>
+</tr>
+<tr class="row-even"><td><p>High throughput</p></td>
+<td><p>Disabled</p></td>
+<td><p>Attention DP32/EP32, Static544</p></td>
+<td class="text-right"><p>3264</p></td>
+<td class="text-right"><p><strong>4059.200 total tok/s/GPU</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p>High throughput</p></td>
+<td><p>MTP3</p></td>
+<td><p>Attention DP32/EP32, Static544</p></td>
+<td class="text-right"><p>2304</p></td>
+<td class="text-right"><p><strong>4118.164 total tok/s/GPU</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>MTP3 performance results use a controlled accepted-draft count of 2.3.</p>
 </section>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
@@ -615,36 +760,59 @@
 <section id="models">
 <h2>Models<a class="headerlink" href="#models" title="Link to this heading">#</a></h2>
 <ul class="simple">
+<li><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8">Qwen/Qwen3.8-2.4T-A95B-FP8</a> (FP8; the checkpoint the Qwen3.8 profiles in this guide target)</p></li>
+<li><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B">Qwen/Qwen3.8-2.4T-A95B</a> (base, BF16)</p></li>
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4">nvidia/Qwen3.5-397B-A17B-NVFP4</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3.5-397B-A17B">Qwen/Qwen3.5-397B-A17B</a> (base, BF16)</p></li>
 </ul>
 </section>
 <section id="gpu-requirements">
 <h2>GPU Requirements<a class="headerlink" href="#gpu-requirements" title="Link to this heading">#</a></h2>
-<p>The NVFP4 checkpoint is the recommended (and minimum-footprint) deployment precision for Qwen3.5. It quantizes the linear layers in the MoE blocks to NVFP4 and uses an FP8 KV cache.</p>
+<p>The following table lists the minimum validated GPU counts for the checkpoints and platforms covered by this guide:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
-<tr class="row-odd"><th class="head"><p>Platform</p></th>
+<tr class="row-odd"><th class="head"><p>Checkpoint</p></th>
+<th class="head"><p>Platform</p></th>
 <th class="head"><p>Minimum GPUs</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>B200</p></td>
+<tr class="row-even"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>B200</p></td>
+<td><p>16x B200</p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>B300</p></td>
+<td><p>16x B300</p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>GB200</p></td>
+<td><p>16x GB200</p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>GB300</p></td>
+<td><p>16x GB300</p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3.5-397B-A17B MoE NVFP4</p></td>
+<td><p>B200</p></td>
 <td><p>4x B200</p></td>
 </tr>
-<tr class="row-odd"><td><p>B300</p></td>
+<tr class="row-odd"><td><p>Qwen3.5-397B-A17B MoE NVFP4</p></td>
+<td><p>B300</p></td>
 <td><p>4x B300</p></td>
 </tr>
-<tr class="row-even"><td><p>GB200</p></td>
+<tr class="row-even"><td><p>Qwen3.5-397B-A17B MoE NVFP4</p></td>
+<td><p>GB200</p></td>
 <td><p>4x GB200</p></td>
 </tr>
-<tr class="row-odd"><td><p>GB300</p></td>
+<tr class="row-odd"><td><p>Qwen3.5-397B-A17B MoE NVFP4</p></td>
+<td><p>GB300</p></td>
 <td><p>4x GB300</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>The NVFP4 checkpoint has been validated on B200 with <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">=</span> <span class="pre">4</span></code>. A single node of 4 Blackwell GPUs fits the NVFP4 weights plus the KV cache with headroom.</p>
+<p>The Qwen3.8 MoE FP8 checkpoint uses <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size:</span> <span class="pre">16</span></code> for the minimum-GPU configurations on B200, B300, GB200, and GB300. The Qwen3.5 MoE NVFP4 checkpoint has been validated with <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size:</span> <span class="pre">4</span></code>.</p>
 </section>
 <section id="deployment-steps">
 <h2>Deployment Steps<a class="headerlink" href="#deployment-steps" title="Link to this heading">#</a></h2>
@@ -657,7 +825,7 @@
 -p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
 --name<span class="w"> </span>tensorrt_llm<span class="w"> </span><span class="se">\</span>
-nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24<span class="w"> </span><span class="se">\</span>
+nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc25<span class="w"> </span><span class="se">\</span>
 /bin/bash
 </pre></div>
 </div>
@@ -668,135 +836,75 @@ nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24<span class="w"> </span><span class
 <li><p>The command also maps port <code class="docutils literal notranslate"><span class="pre">8000</span></code> from the container to your host so you can access the LLM API endpoint from your host.</p></li>
 <li><p>See the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags</a> for all the available containers. The containers published in the main branch weekly have <code class="docutils literal notranslate"><span class="pre">rcN</span></code> suffix, while the monthly release with QA tests has no <code class="docutils literal notranslate"><span class="pre">rcN</span></code> suffix. Use the <code class="docutils literal notranslate"><span class="pre">rc</span></code> release to get the latest model and feature support.</p></li>
 </ul>
-<p>If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html">https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html</a></p>
+<p>If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html">https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html</a>.</p>
 </section>
 <section id="recommended-performance-settings">
 <h3>Recommended Performance Settings<a class="headerlink" href="#recommended-performance-settings" title="Link to this heading">#</a></h3>
 <p>We maintain YAML configuration files with recommended performance settings in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs"><code class="docutils literal notranslate"><span class="pre">examples/configs</span></code></a> directory. These config files are present in the TensorRT LLM container at the path <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples/configs</span></code>. You can use these out-of-the-box, or adjust them to your specific use case.</p>
+<p>Set the TensorRT LLM directory and select one of the configuration files listed below:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_DIR</span><span class="o">=</span>/app/tensorrt_llm<span class="w"> </span><span class="c1"># change as needed to match your environment</span>
-<span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/configs/curated/qwen3.5.yaml
+<span class="nb">cd</span><span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span><span class="s2">"</span>
+<span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/configs/curated/qwen3.8-low-latency.yaml
 </pre></div>
 </div>
-<p>Note: if you don’t have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.</p>
-<div class="dropdown admonition">
-<p class="admonition-title">Show code</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span>/tmp/config.yml
-
-cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FILE}</span>
-
-<span class="s">max_batch_size: 512</span>
-<span class="s">max_num_tokens: 2048</span>
-<span class="s">tensor_parallel_size: 4</span>
-<span class="s">moe_expert_parallel_size: 4</span>
-<span class="s">trust_remote_code: true</span>
-<span class="s">enable_attention_dp: true</span>
-<span class="s">cuda_graph_config:</span>
-<span class="s">  enable_padding: true</span>
-<span class="s">  max_batch_size: 256</span>
-<span class="s">moe_config:</span>
-<span class="s">  backend: CUTEDSL</span>
-<span class="s">kv_cache_config:</span>
-<span class="s">  free_gpu_memory_fraction: 0.8</span>
-<span class="s">  enable_block_reuse: false</span>
-<span class="s">num_postprocess_workers: 4</span>
-<span class="s">EOF</span>
-</pre></div>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Checkpoint</p></th>
+<th class="head"><p>Profile</p></th>
+<th class="head"><p>Configuration file</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>Low latency</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/ddd5dad53c23c1710152570087d6d424/qwen3.8-low-latency.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.8-low-latency.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>Low latency with MTP3</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/9f7b3965bdcd01f0f65dd20f7ae6cd5c/qwen3.8-low-latency-mtp3.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.8-low-latency-mtp3.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>High throughput</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/8efe1c977f4179255dc7789a55ed952e/qwen3.8-high-throughput.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.8-high-throughput.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3.8-2.4T-A95B MoE FP8</p></td>
+<td><p>High throughput with MTP3</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/fb50b7c89a6b243e8c3d0d5f33a98331/qwen3.8-high-throughput-mtp3.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.8-high-throughput-mtp3.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3.5-397B-A17B MoE NVFP4</p></td>
+<td><p>General deployment</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/fd308611ee31c8aaacf1f74f8410b1f6/qwen3.5.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5.yaml</span></code></span></a></p></td>
+</tr>
+</tbody>
+</table>
 </div>
+<p>The MTP draft length is configurable through <code class="docutils literal notranslate"><span class="pre">speculative_config.max_draft_len</span></code>; the MTP3 profiles set it to 3. The high-throughput profiles use the following static expert placements:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Profile</p></th>
+<th class="head"><p>Static EPLB configuration</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>High throughput without MTP</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/00be5dd0d72bb46de6b0e72ceb58cdb2/qwen3.8-ep32-static544.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.8-ep32-static544.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-odd"><td><p>High throughput with MTP3</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/8a0c216f0cdd797c136ed278a1b0be44/qwen3.8-ep32-static544-mtp3.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.8-ep32-static544-mtp3.yaml</span></code></span></a></p></td>
+</tr>
+</tbody>
+</table>
 </div>
-<p>The config is a starting point tuned for max throughput on 4x B200; adjust the parallelism, batch sizes, and KV cache fraction to match your hardware and traffic pattern.</p>
+<p>Each file assigns expert IDs to 544 global slots for every MoE layer. Repeated expert IDs create replicas of heavily routed experts. <code class="docutils literal notranslate"><span class="pre">layer_updates_per_iter:</span> <span class="pre">0</span></code> keeps the assignment static. The no-MTP map covers the 92 target-model layers, while the MTP3 map also includes the MTP layer. These placements are specific to Qwen3.8-2.4T-A95B, EP32, the selected MTP mode, and the benchmark traffic distribution. Generate a new placement when any of those inputs changes. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer">EPLB example</a> for collecting routing statistics and generating a placement file.</p>
 </section>
 <section id="launch-the-tensorrt-llm-server">
 <h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
-<p>Below is an example command to launch the TensorRT LLM server with the Qwen3.5 NVFP4 model from within the container.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>nvidia/Qwen3.5-397B-A17B-NVFP4<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span>--reasoning_parser<span class="w"> </span>qwen3_5<span class="w"> </span>--tool_parser<span class="w"> </span>qwen3<span class="w"> </span>--config<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
+<p>Below is an example command to launch the TensorRT LLM server from within the container with the checkpoint that matches the configuration file you selected above.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>&lt;model_path_or_hf_id&gt;<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span>--reasoning_parser<span class="w"> </span>qwen3_5<span class="w"> </span>--tool_parser<span class="w"> </span>qwen3<span class="w"> </span>--config<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
 </pre></div>
 </div>
-<p>Qwen3.5 uses the <code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code> reasoning parser (its chat template pre-injects a <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> block, so reasoning starts at the beginning of the response). The <code class="docutils literal notranslate"><span class="pre">qwen3</span></code> tool parser handles the Qwen3 function-call format.</p>
+<p>Qwen3.8 and Qwen3.5 both use the <code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code> reasoning parser (their chat template pre-injects a <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> block, so reasoning starts at the beginning of the response). The <code class="docutils literal notranslate"><span class="pre">qwen3</span></code> tool parser handles the Qwen3 function-call format.</p>
 <p>After the server is set up, the client can now send prompt requests to the server and receive results.</p>
-</section>
-<section id="llm-api-options-yaml-configuration">
-<h3>LLM API Options (YAML Configuration)<a class="headerlink" href="#llm-api-options-yaml-configuration" title="Link to this heading">#</a></h3>
-<!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
-<p>These options provide control over TensorRT LLM’s behavior and are set within the YAML file passed to the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command via the <code class="docutils literal notranslate"><span class="pre">--config</span></code> argument.</p>
-<section id="tensor-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> Sets the <strong>tensor-parallel size</strong>. This should typically match the number of GPUs you intend to use for a single model instance.</p></li>
-</ul>
-</section>
-<section id="moe-expert-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> Sets the <strong>expert-parallel size</strong> for Mixture-of-Experts (MoE) models. Like <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code>, this should generally match the number of GPUs you’re using. This setting has no effect on non-MoE models.</p></li>
-</ul>
-</section>
-<section id="enable-attention-dp">
-<h4><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code><a class="headerlink" href="#enable-attention-dp" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> Enables <strong>attention data parallelism</strong> for the attention/linear-attention layers while keeping the MoE expert-parallel. This generally improves throughput at high concurrency and long context.</p></li>
-</ul>
-</section>
-<section id="kv-cache-config-free-gpu-memory-fraction">
-<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-config-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> A value between <code class="docutils literal notranslate"><span class="pre">0.0</span></code> and <code class="docutils literal notranslate"><span class="pre">1.0</span></code> that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.</p></li>
-<li><p><strong>Recommendation:</strong> If you experience OOM errors, try reducing this value to <code class="docutils literal notranslate"><span class="pre">0.7</span></code> or lower.</p></li>
-</ul>
-</section>
-<section id="max-batch-size">
-<h4><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> The maximum number of user requests that can be grouped into a single batch for processing. The actual max batch size that can be achieved depends on total sequence length (input + output).</p></li>
-</ul>
-</section>
-<section id="max-num-tokens">
-<h4><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-num-tokens" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.</p></li>
-</ul>
-</section>
-<section id="max-seq-len">
-<h4><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-seq-len" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> The maximum possible sequence length for a single request, including both input and generated output tokens. We won’t specifically set it. It will be inferred from model config.</p></li>
-</ul>
-</section>
-<section id="trust-remote-code">
-<h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description:</strong> Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.</p></li>
-</ul>
-</section>
-<section id="cuda-graph-config">
-<h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
-<ul>
-<li><p><strong>Description</strong>: A section for configuring CUDA graphs to optimize performance.</p></li>
-<li><p><strong>Options</strong>:</p>
-<ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">enable_padding</span></code>: If <code class="docutils literal notranslate"><span class="pre">&quot;true&quot;</span></code>, input batches are padded to the nearest <code class="docutils literal notranslate"><span class="pre">cuda_graph_batch_size</span></code>. This can significantly improve performance.</p>
-<p><strong>Default</strong>: <code class="docutils literal notranslate"><span class="pre">false</span></code></p>
-</li>
-<li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>: Sets the maximum batch size for which a CUDA graph will be created.</p>
-<p><strong>Default</strong>: <code class="docutils literal notranslate"><span class="pre">0</span></code></p>
-<p><strong>Recommendation</strong>: Set this to the same value as the <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code> command-line option.</p>
-</li>
-</ul>
-</li>
-</ul>
-</section>
-<section id="moe-config">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h4>
-<ul class="simple">
-<li><p><strong>Description</strong>: Configuration for Mixture-of-Experts (MoE) models.</p></li>
-<li><p><strong>Options</strong>:</p>
-<ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: The backend to use for MoE operations.
-<strong>Default</strong>: <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></li>
-</ul>
-</li>
-</ul>
-<p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code> class</a> for the full list of options which can be used in the YAML configuration file.</p>
-</section>
 </section>
 </section>
 <section id="testing-api-endpoint">
@@ -805,58 +913,47 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <h3>Basic Test<a class="headerlink" href="#basic-test" title="Link to this heading">#</a></h3>
 <p>Start a new terminal on the host to test the TensorRT LLM server you just launched.</p>
 <p>You can query the health/readiness of the server using:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;Status: %{http_code}\n&quot;</span><span class="w"> </span><span class="s2">&quot;http://localhost:8000/health&quot;</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">"Status: %{http_code}\n"</span><span class="w"> </span><span class="s2">"http://localhost:8000/health"</span>
 </pre></div>
 </div>
 <p>When the <code class="docutils literal notranslate"><span class="pre">Status:</span> <span class="pre">200</span></code> code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.</p>
 <p>After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
-<span class="s1">    &quot;model&quot;: &quot;nvidia/Qwen3.5-397B-A17B-NVFP4&quot;,</span>
-<span class="s1">    &quot;messages&quot;: [</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w">  </span>-d<span class="w"> </span><span class="s1">'{</span>
+<span class="s1">    "model": "&lt;model_path_or_hf_id&gt;",</span>
+<span class="s1">    "messages": [</span>
 <span class="s1">        {</span>
-<span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
-<span class="s1">            &quot;content&quot;: &quot;Where is New York?&quot;</span>
+<span class="s1">            "role": "user",</span>
+<span class="s1">            "content": "Where is New York?"</span>
 <span class="s1">        }</span>
 <span class="s1">    ],</span>
-<span class="s1">    &quot;max_tokens&quot;: 1024,</span>
-<span class="s1">    &quot;top_p&quot;: 1.0</span>
-<span class="s1">}&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
+<span class="s1">    "max_tokens": 1024,</span>
+<span class="s1">    "top_p": 1.0</span>
+<span class="s1">}'</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">"\n"</span>
 </pre></div>
 </div>
-</section>
-<section id="troubleshooting-tips">
-<h3>Troubleshooting Tips<a class="headerlink" href="#troubleshooting-tips" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>, or <code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code>.</p></li>
-<li><p>Ensure your model checkpoints are compatible with the expected format.</p></li>
-<li><p>For performance issues, check GPU utilization with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> while the server is running.</p></li>
-<li><p>If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.</p></li>
-<li><p>For connection issues, make sure the server port (<code class="docutils literal notranslate"><span class="pre">8000</span></code> in this guide) is not being used by another application.</p></li>
-<li><p>Reasoning is controlled with <code class="docutils literal notranslate"><span class="pre">--reasoning_parser</span> <span class="pre">qwen3_5</span></code>. To toggle thinking per request, pass <code class="docutils literal notranslate"><span class="pre">enable_thinking</span></code> through <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs</span></code> in the request body, for example <code class="docutils literal notranslate"><span class="pre">{&quot;chat_template_kwargs&quot;:</span> <span class="pre">{&quot;enable_thinking&quot;:</span> <span class="pre">true}}</span></code> (set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> to disable reasoning).</p></li>
-</ul>
 </section>
 </section>
 <section id="benchmarking-performance">
 <h2>Benchmarking Performance<a class="headerlink" href="#benchmarking-performance" title="Link to this heading">#</a></h2>
 <p>To benchmark the performance of your TensorRT LLM server you can leverage the built-in <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script. To do this, first create a wrapper <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> script.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39; &gt; bench.sh</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;'EOF' &gt; bench.sh</span>
 <span class="s">#!/usr/bin/env bash</span>
 <span class="s">set -euo pipefail</span>
 
-<span class="s">MODEL_NAME=&quot;nvidia/Qwen3.5-397B-A17B-NVFP4&quot;</span>
+<span class="s">MODEL_NAME="&lt;model_path_or_hf_id&gt;"</span>
 
-<span class="s">concurrency_list=&quot;1 2 4 8 16 32 64 128 256&quot;</span>
+<span class="s">concurrency_list="1 2 4 8 16 32 64 128 256"</span>
 <span class="s">multi_round=5</span>
-<span class="s">isl=1024</span>
+<span class="s">isl=8192</span>
 <span class="s">osl=1024</span>
-<span class="s">result_dir=/tmp/qwen3_5_output</span>
+<span class="s">result_dir=/tmp/qwen3_output</span>
 
 <span class="s">for concurrency in ${concurrency_list}; do</span>
 <span class="s">    num_prompts=$((concurrency * multi_round))</span>
 <span class="s">    python -m tensorrt_llm.serve.scripts.benchmark_serving \</span>
 <span class="s">        --model ${MODEL_NAME} \</span>
 <span class="s">        --backend openai \</span>
-<span class="s">        --dataset-name &quot;random&quot; \</span>
+<span class="s">        --dataset-name "random" \</span>
 <span class="s">        --random-input-len ${isl} \</span>
 <span class="s">        --random-output-len ${osl} \</span>
 <span class="s">        --random-prefix-len 0 \</span>
@@ -865,7 +962,7 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <span class="s">        --max-concurrency ${concurrency} \</span>
 <span class="s">        --ignore-eos \</span>
 <span class="s">        --tokenize-on-client \</span>
-<span class="s">        --percentile-metrics &quot;ttft,tpot,itl,e2el&quot;</span>
+<span class="s">        --percentile-metrics "ttft,tpot,itl,e2el"</span>
 <span class="s">done</span>
 <span class="s">EOF</span>
 chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
@@ -874,8 +971,8 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <p>To achieve max throughput, with attention DP on, one needs to sweep up to <code class="docutils literal notranslate"><span class="pre">concurrency</span> <span class="pre">=</span> <span class="pre">max_batch_size</span> <span class="pre">*</span> <span class="pre">num_gpus</span></code>.</p>
 <p>If you want to save the results to a file add the following options.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>--save-result<span class="w"> </span><span class="se">\</span>
---result-dir<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">result_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
---result-filename<span class="w"> </span><span class="s2">&quot;concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json&quot;</span>
+--result-dir<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">result_dir</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+--result-filename<span class="w"> </span><span class="s2">"concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json"</span>
 </pre></div>
 </div>
 <p>For more benchmarking options see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py">benchmark_serving.py</a></p>
@@ -883,6 +980,90 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>./bench.sh
 </pre></div>
 </div>
+</section>
+<section id="key-configuration-options">
+<h2>Key Configuration Options<a class="headerlink" href="#key-configuration-options" title="Link to this heading">#</a></h2>
+<p>These options control TensorRT LLM behavior and are set in the YAML file passed to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> with the <code class="docutils literal notranslate"><span class="pre">--config</span></code> argument.</p>
+<section id="tensor-parallel-size">
+<h3><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h3>
+<p>Sets the tensor-parallel size. This should typically match the number of GPUs used by one model instance.</p>
+</section>
+<section id="moe-expert-parallel-size">
+<h3><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h3>
+<p>Sets the expert-parallel size for MoE layers. It can differ from the attention tensor-parallel behavior when attention data parallelism is enabled.</p>
+</section>
+<section id="enable-attention-dp">
+<h3><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code><a class="headerlink" href="#enable-attention-dp" title="Link to this heading">#</a></h3>
+<p>Enables data parallelism for attention and linear-attention layers while keeping the MoE layers expert-parallel. This is primarily a throughput-oriented configuration.</p>
+</section>
+<section id="kv-cache-config-free-gpu-memory-fraction">
+<h3><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-config-free-gpu-memory-fraction" title="Link to this heading">#</a></h3>
+<p>Specifies the fraction of free GPU memory reserved for the KV cache after the model is loaded. Reduce this value if initialization reports an out-of-memory error.</p>
+</section>
+<section id="kv-cache-config-use-kv-cache-manager-v2">
+<h3><code class="docutils literal notranslate"><span class="pre">kv_cache_config.use_kv_cache_manager_v2</span></code><a class="headerlink" href="#kv-cache-config-use-kv-cache-manager-v2" title="Link to this heading">#</a></h3>
+<p>Selects KV cache manager V2 when set to <code class="docutils literal notranslate"><span class="pre">true</span></code>. Preserve the value in the curated profile unless the alternative cache-management path has been qualified with the selected topology and MTP mode.</p>
+</section>
+<section id="kv-cache-config-avg-seq-len">
+<h3><code class="docutils literal notranslate"><span class="pre">kv_cache_config.avg_seq_len</span></code><a class="headerlink" href="#kv-cache-config-avg-seq-len" title="Link to this heading">#</a></h3>
+<p>Helps KV cache manager V2 divide memory between attention KV blocks and recurrent GDN state. Set it to the expected average total sequence length for throughput deployments.</p>
+</section>
+<section id="kv-cache-config-mamba-ssm-cache-dtype">
+<h3><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code><a class="headerlink" href="#kv-cache-config-mamba-ssm-cache-dtype" title="Link to this heading">#</a></h3>
+<p>Selects the GDN recurrent-state dtype independently of the attention KV-cache dtype. Supported values are <code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">float16</span></code>, <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, and <code class="docutils literal notranslate"><span class="pre">float32</span></code>.</p>
+</section>
+<section id="max-batch-size">
+<h3><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading">#</a></h3>
+<p>Sets the maximum number of requests that can be grouped into one scheduled batch. The achievable batch size also depends on the total input and output sequence lengths.</p>
+</section>
+<section id="max-num-tokens">
+<h3><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-num-tokens" title="Link to this heading">#</a></h3>
+<p>Sets the maximum total number of tokens across all requests in one scheduled batch.</p>
+</section>
+<section id="max-seq-len">
+<h3><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-seq-len" title="Link to this heading">#</a></h3>
+<p>Sets the maximum sequence length for one request, including input and generated tokens.</p>
+</section>
+<section id="trust-remote-code">
+<h3><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h3>
+<p>Allows Hugging Face to load custom model and tokenizer code from the model repository. Enable it only for trusted model sources.</p>
+</section>
+<section id="cuda-graph-config">
+<h3><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h3>
+<p>Controls CUDA graph capture and padding:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_padding</span></code>: Pads input batches to a captured CUDA graph batch size.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>: Sets the largest batch size for which CUDA graphs are captured.</p></li>
+</ul>
+</section>
+<section id="moe-config">
+<h3><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h3>
+<p>Controls MoE execution:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: Selects the MoE backend.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>: Limits the number of tokens processed by one fused MoE invocation before chunking.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">load_balancer</span></code>: Accepts a static EPLB configuration file or an inline Online EPLB configuration.</p></li>
+</ul>
+</section>
+<section id="speculative-config-max-draft-len">
+<h3><code class="docutils literal notranslate"><span class="pre">speculative_config.max_draft_len</span></code><a class="headerlink" href="#speculative-config-max-draft-len" title="Link to this heading">#</a></h3>
+<p>Sets the MTP draft length. Tune it for the deployment objective; the MTP3 profiles set it to 3.</p>
+<p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code> API reference</a> for the complete configuration schema, <a class="reference internal" href="../features/kvcache.html"><span class="std std-doc">KV cache documentation</span></a> for hybrid-state cache settings, and <a class="reference internal" href="../features/speculative-decoding.html"><span class="std std-doc">speculative decoding documentation</span></a> for MTP details.</p>
+</section>
+</section>
+<section id="troubleshooting-tips">
+<h2>Troubleshooting Tips<a class="headerlink" href="#troubleshooting-tips" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>, or <code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code>. If the error occurs during CUDA graph capture, also reduce <code class="docutils literal notranslate"><span class="pre">cuda_graph_config.max_batch_size</span></code>.</p></li>
+<li><p>Ensure your model checkpoints are compatible with the expected format. If a Qwen3.8 MoE checkpoint is routed to an unsupported architecture, verify that its <code class="docutils literal notranslate"><span class="pre">config.json</span></code> advertises <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code> and <code class="docutils literal notranslate"><span class="pre">qwen3_5_moe_text</span></code>.</p></li>
+<li><p>If MTP output is empty or incorrect, confirm that the checkpoint contains its MTP weights and that the selected <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> is configured consistently on every rank.</p></li>
+<li><p>For performance issues, check GPU utilization with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> while the server is running and complete initialization and warmup before measuring performance.</p></li>
+<li><p>If static EPLB regresses throughput, verify the placement-file hash and <code class="docutils literal notranslate"><span class="pre">num_slots</span></code>, and recollect statistics using representative traffic. Do not reuse a map from another checkpoint or MTP mode.</p></li>
+<li><p>If online EPLB is enabled, wait for the configured observation and migration period before measuring steady state, and retain logs that show completed layer updates.</p></li>
+<li><p>If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.</p></li>
+<li><p>For connection issues, make sure the server port (<code class="docutils literal notranslate"><span class="pre">8000</span></code> in this guide) is not being used by another application.</p></li>
+<li><p>Reasoning is controlled with <code class="docutils literal notranslate"><span class="pre">--reasoning_parser</span> <span class="pre">qwen3_5</span></code>. To toggle thinking per request, pass <code class="docutils literal notranslate"><span class="pre">enable_thinking</span></code> through <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs</span></code> in the request body, for example <code class="docutils literal notranslate"><span class="pre">{&quot;chat_template_kwargs&quot;:</span> <span class="pre">{&quot;enable_thinking&quot;:</span> <span class="pre">true}}</span></code> (set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> to disable reasoning).</p></li>
+</ul>
 </section>
 </section>
 
@@ -936,6 +1117,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-and-checkpoint-differences">Architecture and Checkpoint Differences</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#support-status">Support Status</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-requirements">GPU Requirements</a></li>
@@ -943,27 +1127,31 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-docker-container">Run Docker Container</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-performance-settings">Recommended Performance Settings</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api-options-yaml-configuration">LLM API Options (YAML Configuration)</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-size"><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-expert-parallel-size"><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-attention-dp"><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config-free-gpu-memory-fraction"><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trust-remote-code"><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
-</ul>
-</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-api-endpoint">Testing API Endpoint</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-test">Basic Test</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-tips">Troubleshooting Tips</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-performance">Benchmarking Performance</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-configuration-options">Key Configuration Options</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-size"><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-expert-parallel-size"><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-attention-dp"><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config-free-gpu-memory-fraction"><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config-use-kv-cache-manager-v2"><code class="docutils literal notranslate"><span class="pre">kv_cache_config.use_kv_cache_manager_v2</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config-avg-seq-len"><code class="docutils literal notranslate"><span class="pre">kv_cache_config.avg_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config-mamba-ssm-cache-dtype"><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trust-remote-code"><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#speculative-config-max-draft-len"><code class="docutils literal notranslate"><span class="pre">speculative_config.max_draft_len</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-tips">Troubleshooting Tips</a></li>
 </ul>
   </nav></div>
 
@@ -982,8 +1170,8 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -1055,9 +1243,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

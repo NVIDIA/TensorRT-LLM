@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/index';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -481,7 +481,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -495,11 +495,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -607,14 +609,14 @@
 <span class="linenos"> 4</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
 <span class="linenos"> 5</span>
 <span class="linenos"> 6</span>    <span class="c1"># Model could accept HF model name, a path to local HF model,</span>
-<span class="linenos"> 7</span>    <span class="c1"># or Model Optimizer&#39;s quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.</span>
-<span class="linenos"> 8</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos"> 7</span>    <span class="c1"># or Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.</span>
+<span class="linenos"> 8</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="p">)</span>
 <span class="linenos"> 9</span>
 <span class="linenos">10</span>    <span class="c1"># Sample prompts.</span>
 <span class="linenos">11</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">12</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">13</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">14</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">12</span>        <span class="s2">"Hello, my name is"</span><span class="p">,</span>
+<span class="linenos">13</span>        <span class="s2">"The capital of France is"</span><span class="p">,</span>
+<span class="linenos">14</span>        <span class="s2">"The future of AI is"</span><span class="p">,</span>
 <span class="linenos">15</span>    <span class="p">]</span>
 <span class="linenos">16</span>
 <span class="linenos">17</span>    <span class="c1"># Create a sampling params.</span>
@@ -622,17 +624,17 @@
 <span class="linenos">19</span>
 <span class="linenos">20</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
 <span class="linenos">21</span>        <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">22</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">22</span>            <span class="sa">f</span><span class="s2">"Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span>
 <span class="linenos">23</span>        <span class="p">)</span>
 <span class="linenos">24</span>
 <span class="linenos">25</span>    <span class="c1"># Got output like</span>
-<span class="linenos">26</span>    <span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
-<span class="linenos">27</span>    <span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
-<span class="linenos">28</span>    <span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
-<span class="linenos">29</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
+<span class="linenos">26</span>    <span class="c1"># Prompt: 'Hello, my name is', Generated text: '\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming'</span>
+<span class="linenos">27</span>    <span class="c1"># Prompt: 'The president of the United States is', Generated text: 'likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the'</span>
+<span class="linenos">28</span>    <span class="c1"># Prompt: 'The capital of France is', Generated text: 'Paris.'</span>
+<span class="linenos">29</span>    <span class="c1"># Prompt: 'The future of AI is', Generated text: 'an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are'</span>
 <span class="linenos">30</span>
 <span class="linenos">31</span>
-<span class="linenos">32</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">32</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">'__main__'</span><span class="p">:</span>
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
@@ -644,7 +646,7 @@
 <section id="using-a-model-from-the-hugging-face-hub">
 <h3>1. Using a Model from the Hugging Face Hub<a class="headerlink" href="#using-a-model-from-the-hugging-face-hub" title="Link to this heading">#</a></h3>
 <p>To load a model directly from the <a class="reference external" href="https://huggingface.co/">Hugging Face Model Hub</a>, simply pass its model ID (i.e., repository name) to the LLM constructor. The model will be automatically downloaded:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="p">)</span>
 </pre></div>
 </div>
 <p>You can also use <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints</a> (FP4, FP8, etc) of popular models provided by NVIDIA in the same way.</p>
@@ -665,6 +667,73 @@
 </div></blockquote>
 </section>
 </section>
+<section id="startup-metrics">
+<h2>Startup Metrics<a class="headerlink" href="#startup-metrics" title="Link to this heading">#</a></h2>
+<p>For the PyTorch backend, the beta <code class="docutils literal notranslate"><span class="pre">LLM.startup_metrics</span></code> property reports weight-loading timings from
+worker rank 0. Values are wall-clock seconds. The property returns an empty dictionary when the
+backend does not provide startup metrics.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">llm</span><span class="o">.</span><span class="n">startup_metrics</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>A typical result has the following structure:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"model_loader"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w">  </span><span class="mf">1.971</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"checkpoint_preparation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.177</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"weight_population_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.598</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"post_load_processing_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.005</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> object contains timings for the main LLM weights. If a draft model is used,
+additional field <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code> and <code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code> will appear.
+A <code class="docutils literal notranslate"><span class="pre">draft_model_loader</span></code> object can also appear in deprecated 2-model style MTP setting.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">total_model_loading_seconds</span></code></p></td>
+<td><p>Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">checkpoint_preparation_seconds</span></code></p></td>
+<td><p>Time spent warming up, parsing and preparing checkpoint tensors for the model. Some checkpoint formats can populate model storage directly during this phase.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">weight_population_seconds</span></code></p></td>
+<td><p>Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code></p></td>
+<td><p>Checkpoint preparation time for draft weights loaded as part of the model loader.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code></p></td>
+<td><p>Weight population time for draft weights loaded as part of the model loader.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">post_load_processing_seconds</span></code></p></td>
+<td><p>Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> exposes the same rank-0 payload in the <code class="docutils literal notranslate"><span class="pre">startup_metrics</span></code> field of the
+<code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/server_info</span></code> response:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">curl http://localhost:8000/server_info</span>
+</pre></div>
+</div>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"startup_metrics"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"model_loader"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.971</span><span class="p">,</span>
+<span class="w">      </span><span class="err">...</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
 <section id="tips-and-troubleshooting">
 <h2>Tips and Troubleshooting<a class="headerlink" href="#tips-and-troubleshooting" title="Link to this heading">#</a></h2>
 <p>The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:</p>
@@ -682,6 +751,20 @@
 <h3>MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.<a class="headerlink" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1" title="Link to this heading">#</a></h3>
 <p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
 <p>This limitation is applicable for multi-GPU inference only.</p>
+</section>
+<section id="flashinfer-jit-workspace-for-dynamically-spawned-mpi-workers">
+<h3>FlashInfer JIT workspace for dynamically spawned MPI workers<a class="headerlink" href="#flashinfer-jit-workspace-for-dynamically-spawned-mpi-workers" title="Link to this heading">#</a></h3>
+<p>When the LLM API dynamically spawns multiple MPI workers, users affected by
+concurrent FlashInfer source-generation races can enable persistent, per-worker
+cache slots for FlashInfer JIT artifacts. Set
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1</span></code> before creating the LLM instance.
+The workaround preserves compiled artifacts between launches, and downloaded
+cubins remain in FlashInfer’s shared cache. It is disabled by default and can
+be removed once FlashInfer guards source generation before writing shared
+workspace files.</p>
+<p>An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code> takes precedence. Workers
+started outside the LLM API’s dynamic MPI pool must configure their own
+workspace isolation.</p>
 </section>
 <section id="cannot-quit-after-generation">
 <h3>Cannot quit after generation<a class="headerlink" href="#cannot-quit-after-generation" title="Link to this heading">#</a></h3>
@@ -762,10 +845,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#using-a-local-hugging-face-model">2. Using a Local Hugging Face Model</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#startup-metrics">Startup Metrics</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tips-and-troubleshooting">Tips and Troubleshooting</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtimeerror-only-rank-0-can-start-multi-node-session-got-1">RuntimeError: only rank 0 can start multi-node session, got 1</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hang-issue-on-slurm-node">Hang issue on Slurm Node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flashinfer-jit-workspace-for-dynamically-spawned-mpi-workers">FlashInfer JIT workspace for dynamically spawned MPI workers</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cannot-quit-after-generation">Cannot quit after generation</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-hanging-when-using-docker-run-net-host">Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code></a></li>
 </ul>
@@ -788,8 +873,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -861,9 +946,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       
