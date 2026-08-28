@@ -101,7 +101,7 @@ class TestStaticQuantGuard:
         loader.load_linear_weights(module, "proj_out", [weight_dict])
         assert module.loaded == [weight_dict]
 
-    def test_unquantizable_module_keeps_high_precision_weights(self):
+    def test_unquantizable_module_keeps_high_precision_weights(self) -> None:
         """A module that was never built quantized must not be refused.
 
         ``quant_algo`` falls back to the global recipe for any module without
@@ -119,7 +119,7 @@ class TestStaticQuantGuard:
         loader.load_linear_weights(module, "language_model.embed_tokens", [weight_dict])
         assert module.loaded == [weight_dict]
 
-    def test_quantized_destination_still_refuses_unquantized_checkpoint(self):
+    def test_quantized_destination_still_refuses_unquantized_checkpoint(self) -> None:
         """The destination check must not weaken the guard it sits in front of.
 
         A module built for FP8 holds a float8 buffer, so a high-precision

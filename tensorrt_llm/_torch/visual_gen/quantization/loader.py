@@ -157,7 +157,7 @@ class DynamicLinearWeightLoader:
         weight_dict: Dict[str, torch.Tensor],
         quant_algo: Optional[QuantAlgo],
         name: str,
-        module: Optional[Linear] = None,
+        module: Linear | None = None,
     ) -> None:
         """Refuse static quant recipes against checkpoints without scales.
 

@@ -367,3 +367,33 @@ class TestTransformerWiring:
         stub = self._stub_transformer({"diffusion_step_policy": _policy()["runtime"]})
         self._install(stub)
         assert stub.step_precision_controller is None
+
+    def test_installing_twice_keeps_wrappers_on_the_live_controller(self) -> None:
+        """post_load_weights running twice must not orphan the wrappers.
+
+        The second install previously skipped already-wrapped modules and then
+        cleared the controller, leaving every wrapper bound to one nothing
+        drives: set_denoising_step would stop reaching the layers it steers,
+        silently, with the edge steps landing on the quantized path.
+        """
+        stub = self._stub_transformer(_policy())
+        self._install(stub)
+        first_controller = stub.step_precision_controller
+
+        self._install(stub)
+        second_controller = stub.step_precision_controller
+        assert second_controller is not None, "controller was cleared by the second install"
+
+        gen = stub.gen_layers[0].quant_method
+        reasoner = stub.language_model.layers[0].quant_method
+        assert gen.controller is second_controller
+        assert reasoner.controller is second_controller
+        # Not double-wrapped: the base method must still be the FP8 one.
+        assert not isinstance(gen.base_method, StepPrecisionFp8LinearMethod)
+        # And the live controller actually steers them.
+        second_controller.set_step(0, num_steps=50)
+        assert gen.high_precision is True
+        second_controller.set_step(25, num_steps=50)
+        assert gen.high_precision is False
+        assert reasoner.high_precision is True
+        assert first_controller is not None

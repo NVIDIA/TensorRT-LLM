@@ -274,12 +274,20 @@ def install_step_precision(
         for module in root.modules():
             if not isinstance(module, Linear):
                 continue
-            if not isinstance(module.quant_method, FP8QDQLinearMethod):
+            existing = module.quant_method
+            if isinstance(existing, StepPrecisionFp8LinearMethod):
+                # Installing twice must not leave wrappers pointing at a
+                # controller nobody drives: rebind them to the live one instead
+                # of skipping, or set_denoising_step would silently stop
+                # reaching the layers it is supposed to steer.
+                existing.controller = controller
+                existing.always_high = always_high
+                wrapped += 1
                 continue
-            if isinstance(module.quant_method, StepPrecisionFp8LinearMethod):
+            if not isinstance(existing, FP8QDQLinearMethod):
                 continue
             module.quant_method = StepPrecisionFp8LinearMethod(
-                module.quant_method, controller, always_high=always_high
+                existing, controller, always_high=always_high
             )
             wrapped += 1
     return wrapped
