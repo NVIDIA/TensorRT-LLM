@@ -2065,16 +2065,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     "Kimi K3 helix supports speculative decoding only with "
                     f"DSpark (standalone drafter); got {decoding_type!r}."
                 )
-            # A standalone drafter always carries its own checkpoint, so
-            # its absence identifies the embedded flavour.
-            if spec_config.speculative_model is None:
-                raise ValueError(
-                    "Kimi K3 helix supports only the standalone DSpark "
-                    "drafter (speculative_model must point at a drafter "
-                    "checkpoint); the embedded (in-target) flavour shares "
-                    "the target KV bookkeeping in ways the helix ledger "
-                    "does not model."
-                )
         cp = model_config.mapping.cp_size
         repurposed_tp = model_config.mapping.tp_size * cp
         if cfg.num_attention_heads % repurposed_tp != 0:
