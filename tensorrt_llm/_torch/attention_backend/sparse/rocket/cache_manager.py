@@ -24,6 +24,7 @@ from .params import RocketKVParams
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
+    from tensorrt_llm.sampling_params import SamplingParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -124,6 +125,7 @@ class RocketKVCacheManager(KVCacheManager):
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
         draft_kv_cache_manager=None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ):
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -136,6 +138,7 @@ class RocketKVCacheManager(KVCacheManager):
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if prepare_resource:
             for req in requests:

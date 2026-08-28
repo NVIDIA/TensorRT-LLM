@@ -56,6 +56,22 @@ class BackendClient(ABC):
         """
         return None
 
+    async def list_available_skills(self) -> list[str] | None:
+        """Skill names this client's session can invoke, if knowable.
+
+        Answered **without sending a turn**: both concrete backends
+        already hold the answer by the time the client is connected —
+        Claude Code from the CLI's initialize response, Codex from the
+        ``skills_list`` RPC its client issues at creation — so a caller
+        that only wants to know what is installed never has to pay for a
+        model call to find out.
+
+        ``None`` means *the backend could not say*, which is not the same
+        as an empty list: callers must not read it as "no skills are
+        installed". The default returns ``None``.
+        """
+        return None
+
 
 class Backend(ABC):
     async def __aenter__(self) -> "Backend":
