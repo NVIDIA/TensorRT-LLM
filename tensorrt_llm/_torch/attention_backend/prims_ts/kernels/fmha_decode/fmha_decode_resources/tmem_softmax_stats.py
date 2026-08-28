@@ -244,6 +244,11 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Allocate TMEM columns for softmax stat handoff records."""
+        if self.cfg.keeps_stats_via_smem:
+            # Do not expose a fictitious TMEM access to the allocator or the
+            # exhaustive dependency checker. The constexpr store/load paths
+            # below use only the SMEM ring for this profile.
+            return []
         if self._alloc is None:
             self._alloc = TmemAllocation(
                 name=f"{self.name}",
@@ -257,8 +262,8 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
     ) -> ResourceVars:
         """Initialize loop and tail-visible softmax stat arrays."""
         num_sg = self.cfg.num_softmax_scale_groups
-        # Also store final per-instance stats as instance attributes so
-        # TmemCorrResource can combine inst0 and inst1 in the tail.
+        # Retain final per-instance stats alongside the loop-carried values;
+        # the correction task receives them explicitly for the tail merge.
         self._inst_new_max_arr = cutlass.Array(
             Float32, num_sg, space=cutlass.AddressSpace.rmem
         )
@@ -478,7 +483,6 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
                 stats_ptr,
                 stats,
             )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
@@ -491,13 +495,12 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
             )
         stats_ptr = self._stats_ptr(stage_info)
         # Reload exactly the payload shape written by _store_stats_vector; the
-        # wait/fence makes the TMEM read visible to scalar consumers.
+        # TMEM view fence makes the read visible to scalar consumers.
         loaded = prims.tcgen05_ld(
             "32x32b",
             stats_ptr,
             num=self.cfg.num_softmax_scale_groups * 2,
         )
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
         return loaded
 

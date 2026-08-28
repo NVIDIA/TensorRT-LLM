@@ -1097,11 +1097,21 @@ def create_softmax_task(
                         q_offset = sp.cache_q_offset()
                     if tmem_sp.uses_packed_dense_k_mask:
                         seqlen_k = sp.cache_seqlen_k()
+                    window_start = Int32(0)
+                    window_end = Int32(0)
+                    if tmem_sp.uses_variable_window:
+                        window_start, window_end = sp.cache_variable_window_bounds()
                     vec.acquire()
                     with domain_loop(loop_start, loop_end, loop_step):
                         # Softmax(i): wait for QK(Q,Ki) -> S(i).
                         sp.wait()
-                        if tmem_sp.uses_left_window_loop_mask:
+                        if tmem_sp.uses_variable_window:
+                            old_row_max, row_max = sp.variable_window_row_max(
+                                row_max=row_max,
+                                window_start=window_start,
+                                window_end=window_end,
+                            )
+                        elif tmem_sp.uses_left_window_loop_mask:
                             old_row_max, row_max = sp.left_masked_row_max(
                                 row_max=row_max,
                                 q_offset=q_offset,
@@ -1369,10 +1379,20 @@ def create_softmax_task(
                     q_offset = sp.cache_q_offset()
                 if tmem_sp.uses_packed_dense_k_mask:
                     seqlen_k = sp.cache_seqlen_k()
+                window_start = Int32(0)
+                window_end = Int32(0)
+                if tmem_sp.uses_variable_window:
+                    window_start, window_end = sp.cache_variable_window_bounds()
                 vec.acquire()
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp.wait()
-                    if tmem_sp.uses_left_window_loop_mask:
+                    if tmem_sp.uses_variable_window:
+                        old_row_max, row_max = sp.variable_window_row_max(
+                            row_max=row_max,
+                            window_start=window_start,
+                            window_end=window_end,
+                        )
+                    elif tmem_sp.uses_left_window_loop_mask:
                         old_row_max, row_max = sp.left_masked_row_max(
                             row_max=row_max,
                             q_offset=q_offset,
@@ -1557,12 +1577,22 @@ def create_softmax_task(
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
                 seqlen_k = sp.cache_seqlen_k()
+            window_start = Int32(0)
+            window_end = Int32(0)
+            if tmem_sp.uses_variable_window:
+                window_start, window_end = sp.cache_variable_window_bounds()
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
                 sp.wait()
                 # Compute row max and publish vec.
-                if tmem_sp.uses_left_window_loop_mask:
+                if tmem_sp.uses_variable_window:
+                    old_row_max, row_max = sp.variable_window_row_max(
+                        row_max=row_max,
+                        window_start=window_start,
+                        window_end=window_end,
+                    )
+                elif tmem_sp.uses_left_window_loop_mask:
                     old_row_max, row_max = sp.left_masked_row_max(
                         row_max=row_max,
                         q_offset=q_offset,

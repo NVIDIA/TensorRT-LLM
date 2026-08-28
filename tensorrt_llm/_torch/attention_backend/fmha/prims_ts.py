@@ -36,6 +36,11 @@ from tensorrt_llm.quantization.mode import QuantMode
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
+    from tensorrt_llm._torch.attention_backend.prims_ts.decode import BatchDecodePagedTSWrapper
+    from tensorrt_llm._torch.attention_backend.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
     from tensorrt_llm._torch.attention_backend.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -44,6 +49,11 @@ if TYPE_CHECKING:
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
+_WORKSPACE_ALIGNMENT = 256
+
+
+def _align_workspace_offset(byte_offset: int) -> int:
+    return (byte_offset + _WORKSPACE_ALIGNMENT - 1) // _WORKSPACE_ALIGNMENT * _WORKSPACE_ALIGNMENT
 
 
 def _get_prims_decode_workspace_size(*args, **kwargs) -> int:
@@ -62,24 +72,24 @@ def _get_prims_mla_workspace_size(*args, **kwargs) -> int:
     return get_prims_ts_batch_decode_mla_workspace_size(*args, **kwargs)
 
 
-def _run_prims_context(*args, **kwargs) -> torch.Tensor:
-    from tensorrt_llm._torch.attention_backend.prims_ts import batch_prefill_with_paged_kv_cache
+def _create_prims_context_wrapper() -> "BatchPrefillPagedTSWrapper":
+    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
 
-    return batch_prefill_with_paged_kv_cache(*args, **kwargs)
-
-
-def _run_prims_decode(*args, **kwargs) -> torch.Tensor:
-    from tensorrt_llm._torch.attention_backend.prims_ts import prims_ts_batch_decode_with_kv_cache
-
-    return prims_ts_batch_decode_with_kv_cache(*args, **kwargs)
+    return BatchPrefillPagedTSWrapper(kv_layout="HND")
 
 
-def _run_prims_mla_decode(*args, **kwargs) -> torch.Tensor:
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
-        prims_ts_batch_decode_with_kv_cache_mla,
+def _create_prims_decode_wrapper() -> "BatchDecodePagedTSWrapper":
+    from tensorrt_llm._torch.attention_backend.prims_ts.decode import BatchDecodePagedTSWrapper
+
+    return BatchDecodePagedTSWrapper(kv_layout="HND")
+
+
+def _create_prims_mla_decode_wrapper() -> "BatchMLADecodePagedTSWrapper":
+    from tensorrt_llm._torch.attention_backend.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
     )
 
-    return prims_ts_batch_decode_with_kv_cache_mla(*args, **kwargs)
+    return BatchMLADecodePagedTSWrapper()
 
 
 class PrimsTSFmha(PhasedFmha):
@@ -93,17 +103,28 @@ class PrimsTSFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
-        self._prims_workspace: Optional[torch.Tensor] = None
         self._page_indices_buffer: Optional[torch.Tensor] = None
         self._fixed_indptr_buffer: Optional[torch.Tensor] = None
         self._sequence_lengths_buffer: Optional[torch.Tensor] = None
+        self._context_page_indices_buffer: Optional[torch.Tensor] = None
+        self._context_page_gather_indices_buffer: Optional[torch.Tensor] = None
+        self._context_page_columns_buffer: Optional[torch.Tensor] = None
+        self._context_last_page_indices_buffer: Optional[torch.Tensor] = None
         self._metadata_row_capacity = 0
         self._metadata_column_capacity = 0
+        self._context_metadata_row_capacity = 0
+        self._context_page_column_capacity = 0
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
         self._multi_processor_count: Optional[int] = None
-        # CUDA graphs retain raw workspace pointers. Keep superseded buffers
-        # alive if a later request needs a larger allocation.
-        self._retained_prims_workspaces: list[torch.Tensor] = []
+        self._retained_metadata_buffers: list[tuple[torch.Tensor, ...]] = []
+        # Every other plan attribute is fixed by this layer/model instance.
+        # Batch size is the only execution profile that needs its own wrapper.
+        self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
+        self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
+        self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
+        self._workspace_allocation: Optional[tuple[object, ...]] = None
+        self._decode_workspace_offset_bytes: Optional[int] = None
+        self._decode_workspace_required_bytes = 0
 
     def _get_total_num_blocks(
         self,
@@ -524,8 +545,15 @@ class PrimsTSFmha(PhasedFmha):
         device: torch.device,
         row_capacity: int,
         column_capacity: int,
+        page_size: int,
+        *,
+        need_context: bool = False,
     ) -> None:
-        needs_allocation = (
+        pages_per_kv_tile = 128 // page_size
+        context_column_capacity = (
+            (column_capacity + pages_per_kv_tile - 1) // pages_per_kv_tile
+        ) * pages_per_kv_tile
+        base_needs_allocation = (
             self._page_indices_buffer is None
             or self._fixed_indptr_buffer is None
             or self._sequence_lengths_buffer is None
@@ -533,26 +561,96 @@ class PrimsTSFmha(PhasedFmha):
             or self._metadata_row_capacity < row_capacity
             or self._metadata_column_capacity != column_capacity
         )
-        if not needs_allocation:
+        context_needs_allocation = need_context and (
+            self._context_page_indices_buffer is None
+            or self._context_page_gather_indices_buffer is None
+            or self._context_page_columns_buffer is None
+            or self._context_last_page_indices_buffer is None
+            or self._context_page_indices_buffer.device != device
+            or self._context_metadata_row_capacity < row_capacity
+            or self._context_page_column_capacity != context_column_capacity
+        )
+        if not base_needs_allocation and not context_needs_allocation:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "PrimTS metadata buffers must be allocated before CUDA graph capture."
             )
-        self._page_indices_buffer = torch.empty(
-            (row_capacity, column_capacity), dtype=torch.int32, device=device
-        )
-        self._fixed_indptr_buffer = torch.arange(
-            row_capacity + 1, dtype=torch.int32, device=device
-        ).mul_(column_capacity)
-        self._sequence_lengths_buffer = torch.empty(row_capacity, dtype=torch.int32, device=device)
-        self._metadata_row_capacity = row_capacity
-        self._metadata_column_capacity = column_capacity
+        retained_buffers: list[torch.Tensor] = []
+        if base_needs_allocation:
+            if (
+                self._page_indices_buffer is not None
+                and self._fixed_indptr_buffer is not None
+                and self._sequence_lengths_buffer is not None
+            ):
+                retained_buffers.extend(
+                    (
+                        self._page_indices_buffer,
+                        self._fixed_indptr_buffer,
+                        self._sequence_lengths_buffer,
+                    )
+                )
+            self._page_indices_buffer = torch.empty(
+                (row_capacity, column_capacity), dtype=torch.int32, device=device
+            )
+            self._fixed_indptr_buffer = torch.arange(
+                row_capacity + 1, dtype=torch.int32, device=device
+            ).mul_(column_capacity)
+            self._sequence_lengths_buffer = torch.empty(
+                row_capacity, dtype=torch.int32, device=device
+            )
+            self._metadata_row_capacity = row_capacity
+            self._metadata_column_capacity = column_capacity
+
+        if context_needs_allocation:
+            if (
+                self._context_page_indices_buffer is not None
+                and self._context_page_gather_indices_buffer is not None
+                and self._context_page_columns_buffer is not None
+                and self._context_last_page_indices_buffer is not None
+            ):
+                retained_buffers.extend(
+                    (
+                        self._context_page_indices_buffer,
+                        self._context_page_gather_indices_buffer,
+                        self._context_page_columns_buffer,
+                        self._context_last_page_indices_buffer,
+                    )
+                )
+            self._context_page_indices_buffer = torch.zeros(
+                (row_capacity, 2, context_column_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._context_page_gather_indices_buffer = torch.empty(
+                (row_capacity, context_column_capacity),
+                dtype=torch.int64,
+                device=device,
+            )
+            self._context_page_columns_buffer = torch.arange(
+                context_column_capacity,
+                dtype=torch.int64,
+                device=device,
+            )
+            self._context_last_page_indices_buffer = torch.empty(
+                row_capacity,
+                dtype=torch.int64,
+                device=device,
+            )
+            self._context_metadata_row_capacity = row_capacity
+            self._context_page_column_capacity = context_column_capacity
+
+        if retained_buffers:
+            # Captured copies and kernel nodes retain these addresses. A replay
+            # still updates the old destinations, so keeping the allocations
+            # alive preserves both pointer validity and live metadata values.
+            self._retained_metadata_buffers.append(tuple(retained_buffers))
 
     def _make_fixed_stride_csr(
         self,
         block_tables: torch.Tensor,
         batch_size: int,
+        page_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Copy the K page table into stable fixed-stride CSR storage."""
         if block_tables.ndim != 3 or block_tables.shape[1] != 2:
@@ -567,19 +665,85 @@ class PrimsTSFmha(PhasedFmha):
                 f"Invalid PrimTS CSR batch size {batch_size} for {block_tables.shape[0]} rows."
             )
         columns = int(block_tables.shape[-1])
-        self._ensure_metadata_buffers(block_tables.device, batch_size, columns)
+        self._ensure_metadata_buffers(block_tables.device, batch_size, columns, page_size)
         if self._page_indices_buffer is None or self._fixed_indptr_buffer is None:
             raise RuntimeError("PrimTS metadata buffers were not allocated.")
         page_table = self._page_indices_buffer[:batch_size]
         page_table.copy_(block_tables[:batch_size, 0, :])
         return self._fixed_indptr_buffer[: batch_size + 1], page_table.reshape(-1)
 
+    def _stage_context_metadata(
+        self,
+        block_tables: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        *,
+        batch_size: int,
+        page_size: int,
+        max_kv_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build the live native context metadata entirely on the current stream."""
+        if block_tables.ndim != 3 or block_tables.shape[1] != 2:
+            raise RuntimeError(
+                "PrimTS expects block tables with shape [batch, 2, max_blocks], got "
+                f"{tuple(block_tables.shape)}."
+            )
+        if block_tables.dtype != torch.int32 or cu_kv_seqlens.dtype != torch.int32:
+            raise RuntimeError("PrimTS context metadata must use int32 tensors.")
+        if cu_kv_seqlens.numel() < batch_size + 1:
+            raise RuntimeError("PrimTS context cumulative KV lengths are too short.")
+
+        pages_per_kv_tile = 128 // page_size
+        active_pages = (max_kv_len + page_size - 1) // page_size
+        required_padded_pages = (
+            (active_pages + pages_per_kv_tile - 1) // pages_per_kv_tile
+        ) * pages_per_kv_tile
+        padded_pages = self._context_page_column_capacity
+        if (
+            self._sequence_lengths_buffer is None
+            or self._context_page_indices_buffer is None
+            or self._context_page_gather_indices_buffer is None
+            or self._context_page_columns_buffer is None
+            or self._context_last_page_indices_buffer is None
+            or batch_size > self._context_metadata_row_capacity
+            or required_padded_pages > padded_pages
+        ):
+            raise RuntimeError("PrimTS context metadata storage was not prepared.")
+
+        logical_kv_indptr = cu_kv_seqlens[: batch_size + 1]
+        seq_lens_kv = self._sequence_lengths_buffer[:batch_size]
+        torch.sub(
+            logical_kv_indptr[1:],
+            logical_kv_indptr[:-1],
+            out=seq_lens_kv,
+        )
+        last_page_indices = self._context_last_page_indices_buffer[:batch_size]
+        last_page_indices.copy_(seq_lens_kv)
+        last_page_indices.sub_(1)
+        last_page_indices.div_(page_size, rounding_mode="floor")
+        gather_indices = self._context_page_gather_indices_buffer[:batch_size, :padded_pages]
+        torch.minimum(
+            self._context_page_columns_buffer[:padded_pages].view(1, -1),
+            last_page_indices.view(-1, 1),
+            out=gather_indices,
+        )
+        dense_page_idx_kv = self._context_page_indices_buffer[:batch_size, :, :padded_pages]
+        torch.gather(
+            block_tables[:batch_size, 0, :],
+            1,
+            gather_indices,
+            out=dense_page_idx_kv[:, 0, :],
+        )
+        dense_page_idx_kv[:, 1, :].copy_(dense_page_idx_kv[:, 0, :])
+        return logical_kv_indptr, seq_lens_kv, dense_page_idx_kv
+
     def _get_mla_sequence_lengths(
         self,
         sequence_lengths: torch.Tensor,
         batch_size: int,
+        *,
+        copy_to_stable_storage: bool = False,
     ) -> torch.Tensor:
-        """Return live MLA lengths with the 16-byte alignment PrimTS requires."""
+        """Return live MLA lengths with the storage guarantees PrimTS requires."""
         if sequence_lengths.dtype != torch.int32:
             raise RuntimeError(
                 f"PrimTS expects int32 sequence lengths, got {sequence_lengths.dtype}."
@@ -590,7 +754,7 @@ class PrimsTSFmha(PhasedFmha):
                 f"{sequence_lengths.numel()} entries."
             )
         active_sequence_lengths = sequence_lengths[:batch_size]
-        if active_sequence_lengths.data_ptr() % 16 == 0:
+        if not copy_to_stable_storage and active_sequence_lengths.data_ptr() % 16 == 0:
             return active_sequence_lengths
 
         buffer = self._sequence_lengths_buffer
@@ -606,11 +770,160 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("PrimTS sequence-length storage is not 16-byte aligned.")
         return aligned_sequence_lengths
 
-    def _get_prims_workspace(self) -> torch.Tensor:
-        workspace = self._prims_workspace
-        if workspace is None:
-            raise RuntimeError("PrimTS workspace has not been prepared.")
-        return workspace
+    def _update_workspace_allocation(self, workspace: torch.Tensor) -> None:
+        """Invalidate provisional plans when the shared workspace is reallocated."""
+
+        storage = workspace.untyped_storage()
+        allocation = (
+            workspace.device,
+            storage.data_ptr(),
+            storage.nbytes(),
+            workspace.storage_offset(),
+            workspace.numel(),
+            workspace.element_size(),
+        )
+        if allocation == self._workspace_allocation:
+            return
+        self._workspace_allocation = allocation
+        self._context_wrappers.clear()
+        self._decode_wrappers.clear()
+        self._mla_decode_wrappers.clear()
+
+    def _get_or_plan_context_wrapper(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        *,
+        batch_size: int,
+        max_seq_len_q: int,
+        max_seq_len_k: int,
+        max_num_pages_per_seq_kv: int,
+        page_size: int,
+        mask_type: str,
+        window_left: int,
+        sm_scale: float,
+        output_dtype: torch.dtype,
+    ) -> "BatchPrefillPagedTSWrapper":
+        wrapper = self._context_wrappers.get(batch_size)
+        if wrapper is not None:
+            wrapper.reset_workspace_buffer(workspace_buffer)
+            return wrapper
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS context must be planned before CUDA graph capture.")
+        wrapper = _create_prims_context_wrapper()
+        wrapper.reset_workspace_buffer(workspace_buffer)
+        wrapper.plan_live(
+            q,
+            k_cache,
+            v_cache,
+            batch_size=batch_size,
+            max_seq_len_q=max_seq_len_q,
+            max_seq_len_k=max_seq_len_k,
+            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+            page_size=page_size,
+            mask_type=mask_type,
+            window_left=window_left,
+            sm_scale=sm_scale,
+            output_scale=1.0,
+            out_dtype=output_dtype,
+        )
+        self._context_wrappers[batch_size] = wrapper
+        return wrapper
+
+    def _get_or_plan_decode_wrapper(
+        self,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        *,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        seq_len_q: int,
+        max_kv_len: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        mask_type: str,
+        window_left: int,
+    ) -> "BatchDecodePagedTSWrapper":
+        batch_size = int(paged_kv_indptr.numel()) - 1
+        if batch_size <= 0:
+            raise RuntimeError("PrimTS decode requires a positive batch size.")
+        wrapper = self._decode_wrappers.get(batch_size)
+        if wrapper is not None:
+            return wrapper
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS decode must be planned before CUDA graph capture.")
+        wrapper = _create_prims_decode_wrapper()
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            None,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            seq_len_q=seq_len_q,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+            o_data_type=output_dtype,
+            mask_type=mask_type,
+            window_left=window_left,
+            max_kv_len=max_kv_len,
+            live_metadata=True,
+            workspace_buffer=workspace_buffer,
+        )
+        self._decode_wrappers[batch_size] = wrapper
+        return wrapper
+
+    def _get_or_plan_mla_decode_wrapper(
+        self,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        *,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        max_seq_len_q: int,
+        max_kv_len: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        mask_type: str,
+    ) -> "BatchMLADecodePagedTSWrapper":
+        batch_size = int(block_tables.shape[0])
+        if batch_size <= 0:
+            raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
+        wrapper = self._mla_decode_wrappers.get(batch_size)
+        if wrapper is not None:
+            return wrapper
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS MLA decode must be planned before CUDA graph capture.")
+        wrapper = _create_prims_mla_decode_wrapper()
+        wrapper.plan(
+            block_tables,
+            seq_lens,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            page_size,
+            max_seq_len_q=max_seq_len_q,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+            o_data_type=output_dtype,
+            mask_type=mask_type,
+            max_kv_len=max_kv_len,
+            live_metadata=True,
+            workspace_buffer=workspace_buffer,
+        )
+        self._mla_decode_wrappers[batch_size] = wrapper
+        return wrapper
 
     def prepare_workspace(
         self,
@@ -626,10 +939,17 @@ class PrimsTSFmha(PhasedFmha):
         if block_offsets is None:
             raise RuntimeError("PrimTS requires paged KV-cache block offsets.")
         column_capacity = int(block_offsets.shape[-1])
+        input_type = forward_args.attention_input_type
+        has_context = metadata.num_contexts > 0 and input_type != AttentionInputType.generation_only
+        has_generation = (
+            metadata.num_generations > 0 and input_type != AttentionInputType.context_only
+        )
         self._ensure_metadata_buffers(
             q.device,
             max(int(metadata.max_num_requests), 1),
             column_capacity,
+            int(metadata.tokens_per_block),
+            need_context=has_context and not self.attn.is_mla_enable,
         )
 
         if self._multi_processor_count is None:
@@ -637,13 +957,8 @@ class PrimsTSFmha(PhasedFmha):
                 q.device
             ).multi_processor_count
 
-        input_type = forward_args.attention_input_type
-        has_context = metadata.num_contexts > 0 and input_type != AttentionInputType.generation_only
-        has_generation = (
-            metadata.num_generations > 0 and input_type != AttentionInputType.context_only
-        )
-
         required_thop_bytes = 0
+        generation_fmha_workspace_bytes = 0
         if has_context and not self.attn.is_mla_enable:
             context_layout = thop.get_trtllm_gen_context_workspace_layout(
                 q.dtype,
@@ -672,16 +987,19 @@ class PrimsTSFmha(PhasedFmha):
                 self.attn.num_kv_heads,
             )
             required_thop_bytes = max(required_thop_bytes, int(generation_layout["total_size"]))
-        current_thop_bytes = workspace.numel() * workspace.element_size()
-        if current_thop_bytes < required_thop_bytes:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "TRT-LLM QKV preprocessing workspace must be sized before CUDA graph capture."
-                )
-            required_numel = math.ceil(required_thop_bytes / workspace.element_size())
-            workspace.resize_((required_numel,))
+            generation_fmha_workspace_bytes = int(generation_layout["trtllm_gen_workspace_size"])
 
         if not has_generation:
+            current_workspace_bytes = workspace.numel() * workspace.element_size()
+            if current_workspace_bytes < required_thop_bytes:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "TRT-LLM QKV preprocessing workspace must be sized before "
+                        "CUDA graph capture."
+                    )
+                required_numel = math.ceil(required_thop_bytes / workspace.element_size())
+                workspace.resize_((required_numel,))
+            self._update_workspace_allocation(workspace)
             return
 
         batch_size = int(metadata.num_generations)
@@ -692,15 +1010,10 @@ class PrimsTSFmha(PhasedFmha):
         )
         seq_len_q = num_gen_tokens // batch_size
         max_seq_len = column_capacity * int(metadata.tokens_per_block)
-        generation_kv_lens = metadata.kv_lens_runtime[
-            int(metadata.num_contexts) : int(metadata.num_contexts) + batch_size
-        ]
-        max_active_kv_len = int(generation_kv_lens.max())
         mask_type = self._get_prims_mask_type(forward_args)
-        window_left = self._get_window_left(
-            int(forward_args.attention_window_size),
-            max_active_kv_len,
-        )
+        # is_supported() rejects cyclic sliding-window page tables. Keep the
+        # sizing key aligned with the non-windowed plan selected at runtime.
+        window_left = -1
 
         if self.attn.is_mla_enable:
             required_bytes = _get_prims_mla_workspace_size(
@@ -734,32 +1047,44 @@ class PrimsTSFmha(PhasedFmha):
                 device=q.device,
             )
 
-        prims_workspace = self._prims_workspace
-        if (
-            prims_workspace is None
-            or prims_workspace.device != q.device
-            or prims_workspace.numel() < required_bytes
-        ):
+        decode_workspace_min_offset_bytes: Optional[int] = None
+        if self.attn.is_mla_enable:
+            required_workspace_bytes = max(required_thop_bytes, required_bytes)
+        else:
+            self._decode_workspace_required_bytes = required_bytes
+            if required_bytes <= generation_fmha_workspace_bytes:
+                self._decode_workspace_offset_bytes = None
+                required_workspace_bytes = required_thop_bytes
+            else:
+                # The fused preprocessing layout exposes a fixed-size FMHA
+                # slab. Bind large plans to an aligned tail measured from the
+                # final root allocation so mixed-context layout changes do not
+                # move a cached batch profile's workspace.
+                decode_workspace_min_offset_bytes = _align_workspace_offset(required_thop_bytes)
+                required_workspace_bytes = decode_workspace_min_offset_bytes + required_bytes
+        current_workspace_bytes = workspace.numel() * workspace.element_size()
+        if current_workspace_bytes < required_workspace_bytes:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("PrimTS workspace must be allocated before CUDA graph capture.")
-            if prims_workspace is not None:
-                self._retained_prims_workspaces.append(prims_workspace)
-            self._prims_workspace = torch.zeros(
-                required_bytes,
-                dtype=torch.uint8,
-                device=q.device,
+                raise RuntimeError(
+                    "PrimTS caller workspace must be sized before CUDA graph capture."
+                )
+            required_numel = math.ceil(required_workspace_bytes / workspace.element_size())
+            workspace.resize_((required_numel,))
+        if decode_workspace_min_offset_bytes is not None:
+            current_workspace_bytes = workspace.numel() * workspace.element_size()
+            available_tail_bytes = current_workspace_bytes - required_bytes
+            decode_workspace_offset_bytes = (
+                available_tail_bytes // _WORKSPACE_ALIGNMENT * _WORKSPACE_ALIGNMENT
             )
+            if decode_workspace_offset_bytes < decode_workspace_min_offset_bytes:
+                raise RuntimeError("PrimTS decode workspace tail does not fit its root allocation.")
+            self._decode_workspace_offset_bytes = decode_workspace_offset_bytes
+        self._update_workspace_allocation(workspace)
 
     @staticmethod
     def _get_prims_mask_type(forward_args: AttentionForwardArgs) -> str:
         mask_type = AttentionMaskType(forward_args.mask_type)
         return "causal" if mask_type == AttentionMaskType.causal else "dense"
-
-    @staticmethod
-    def _get_window_left(attention_window_size: int, max_seq_len: int) -> int:
-        if attention_window_size < max_seq_len:
-            return attention_window_size - 1
-        return -1
 
     @staticmethod
     def _get_bmm1_scale(attn: "TrtllmAttention") -> float:
@@ -785,37 +1110,7 @@ class PrimsTSFmha(PhasedFmha):
             kv_pool.narrow(0, kv_page_offset, usable_pages),
         )
 
-    @staticmethod
-    def _make_exact_context_csr(
-        block_tables: torch.Tensor,
-        kv_lengths_host: torch.Tensor,
-        page_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the exact compact CSR metadata required by PrimTS context planning."""
-        lengths = [int(length) for length in kv_lengths_host.tolist()]
-        page_counts = [(length + page_size - 1) // page_size for length in lengths]
-        max_columns = int(block_tables.shape[-1])
-        if any(count <= 0 or count > max_columns for count in page_counts):
-            raise RuntimeError(
-                "PrimTS context KV lengths require an invalid number of page-table columns."
-            )
-        offsets = [0]
-        for count in page_counts:
-            offsets.append(offsets[-1] + count)
-        page_indices = torch.cat(
-            [block_tables[row, 0, :page_count] for row, page_count in enumerate(page_counts)]
-        ).contiguous()
-        indptr = torch.tensor(offsets, dtype=torch.int32, device=block_tables.device)
-        last_page_lengths = torch.tensor(
-            [((length - 1) % page_size) + 1 for length in lengths],
-            dtype=torch.int32,
-            device=block_tables.device,
-        )
-        return indptr, page_indices, last_page_lengths
-
     def run_context(self, params: FmhaParams) -> None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("PrimTS context planning cannot run during CUDA graph capture.")
         if params.qkv_input is None or params.context_buf is None:
             raise RuntimeError("PrimTS context requires QKV input and an output buffer.")
         if params.sequence_lengths is None or params.context_lengths is None:
@@ -835,9 +1130,9 @@ class PrimsTSFmha(PhasedFmha):
             _kv_scale_pool,
             _bmm1_scale,
             _bmm2_scale,
-            _fmha_workspace,
+            fmha_workspace,
             cu_q_seqlens,
-            _cu_kv_seqlens,
+            cu_kv_seqlens,
             _max_q_len,
             _max_kv_len,
             window_left,
@@ -893,31 +1188,46 @@ class PrimsTSFmha(PhasedFmha):
         if kv_page_offset is None:
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
-        kv_lengths_host = meta.kv_lens_runtime[
-            params.seq_offset : params.seq_offset + params.batch_size
-        ]
-        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = self._make_exact_context_csr(
+        max_seq_len_q = int(getattr(meta, "max_context_length", params.input_seq_length))
+        max_seq_len_k = int(
+            getattr(
+                meta,
+                "max_seq_len",
+                int(block_tables.shape[-1]) * params.tokens_per_block,
+            )
+        )
+        logical_kv_indptr, seq_lens_kv, dense_page_idx_kv = self._stage_context_metadata(
             block_tables,
-            kv_lengths_host,
-            params.tokens_per_block,
+            cu_kv_seqlens,
+            batch_size=params.batch_size,
+            page_size=params.tokens_per_block,
+            max_kv_len=max_seq_len_k,
         )
         mask_type = self._get_prims_mask_type(fwd)
-        _run_prims_context(
+        wrapper = self._get_or_plan_context_wrapper(
             q_processed,
             k_cache,
             v_cache,
-            cu_q_seqlens,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
+            fmha_workspace,
+            batch_size=params.batch_size,
+            max_seq_len_q=max_seq_len_q,
+            max_seq_len_k=max_seq_len_k,
+            max_num_pages_per_seq_kv=int(dense_page_idx_kv.shape[-1]),
             page_size=params.tokens_per_block,
-            kv_layout="HND",
             mask_type=mask_type,
             window_left=window_left,
             sm_scale=self._get_bmm1_scale(attn),
-            output_scale=1.0,
-            out_dtype=params.context_buf.dtype,
+            output_dtype=params.context_buf.dtype,
+        )
+        wrapper.run(
+            q_processed,
+            k_cache,
+            v_cache,
             out=params.context_buf,
+            qo_indptr=cu_q_seqlens,
+            logical_kv_indptr=logical_kv_indptr,
+            dense_page_idx_kv=dense_page_idx_kv,
+            seq_lens_kv=seq_lens_kv,
         )
 
         thop.trtllm_gen_context_postprocess(
@@ -981,7 +1291,7 @@ class PrimsTSFmha(PhasedFmha):
             _kv_scale_pool,
             _bmm1_scale,
             _bmm2_scale,
-            _fmha_workspace,
+            fmha_workspace,
             _cu_seqlens,
             _max_q_len,
             _max_kv_len,
@@ -1043,6 +1353,7 @@ class PrimsTSFmha(PhasedFmha):
         paged_kv_indptr, paged_kv_indices = self._make_fixed_stride_csr(
             block_tables,
             batch_size,
+            params.tokens_per_block,
         )
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
         seq_lens = params.sequence_lengths[:batch_size]
@@ -1056,25 +1367,55 @@ class PrimsTSFmha(PhasedFmha):
         if params.input_seq_length == 1:
             query = query[:, 0]
             output = output[:, 0]
-        prims_workspace = self._get_prims_workspace()
-        prims_workspace.zero_()
-        _run_prims_decode(
-            query,
-            (k_cache, v_cache),
-            prims_workspace,
+        mask_type = self._get_prims_mask_type(fwd)
+        decode_workspace = self._get_decode_workspace(
+            params.workspace,
+            fmha_workspace,
+        )
+        wrapper = self._get_or_plan_decode_wrapper(
             paged_kv_indptr,
             paged_kv_indices,
-            seq_lens,
-            max_seq_len,
+            decode_workspace,
+            num_qo_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_dim=attn.head_dim,
+            page_size=params.tokens_per_block,
             seq_len_q=params.input_seq_length,
+            max_kv_len=max_seq_len,
+            q_dtype=query.dtype,
+            kv_dtype=k_cache.dtype,
+            output_dtype=output.dtype,
+            mask_type=mask_type,
+            window_left=window_left,
+        )
+        control_offset = wrapper._workspace_layout.split_kv_counter.byte_offset
+        decode_workspace[control_offset : wrapper._workspace_layout.total_bytes].zero_()
+        wrapper.run(
+            query,
+            (k_cache, v_cache),
+            seq_lens,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
             bmm1_scale=self._get_bmm1_scale(attn),
             bmm2_scale=1.0,
             out=output,
-            out_dtype=output.dtype,
-            mask_type=self._get_prims_mask_type(fwd),
-            window_left=window_left,
-            kv_layout="HND",
         )
+
+    def _get_decode_workspace(
+        self,
+        root_workspace: torch.Tensor,
+        thop_fmha_workspace: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the shared slab or the reserved large-plan tail."""
+
+        byte_offset = self._decode_workspace_offset_bytes
+        if byte_offset is None:
+            return thop_fmha_workspace
+        root_bytes = root_workspace.reshape(-1).view(torch.uint8)
+        byte_end = byte_offset + self._decode_workspace_required_bytes
+        if byte_end > root_bytes.numel():
+            raise RuntimeError("PrimTS decode workspace was not sized before kernel execution.")
+        return root_bytes[byte_offset:byte_end]
 
     def run_mla_generation(self, params: FmhaParams) -> None:
         if params.qkv_input is None or params.context_buf is None:
@@ -1102,7 +1443,11 @@ class PrimsTSFmha(PhasedFmha):
         )
         if kv_cache is None or block_tables is None:
             raise RuntimeError("TRT-LLM did not return PrimTS MLA KV metadata.")
-        _, page_indices = self._make_fixed_stride_csr(block_tables, batch_size)
+        _, page_indices = self._make_fixed_stride_csr(
+            block_tables,
+            batch_size,
+            params.tokens_per_block,
+        )
         dense_block_tables = page_indices.view(batch_size, block_tables.shape[-1])
         seq_len_q = params.input_seq_length
         query = params.qkv_input.view(
@@ -1121,25 +1466,35 @@ class PrimsTSFmha(PhasedFmha):
         bmm1_scale = 1.0 / (
             attn.q_scaling * math.sqrt(int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim))
         )
+        mask_type = self._get_prims_mask_type(params.fwd)
         seq_lens = self._get_mla_sequence_lengths(
             params.sequence_lengths,
             batch_size,
         )
-        _run_prims_mla_decode(
-            query,
-            kv_cache,
-            self._get_prims_workspace(),
-            int(attn.kv_lora_rank),
-            int(attn.qk_rope_head_dim),
+        caller_workspace = params.workspace.reshape(-1).view(torch.uint8)
+        wrapper = self._get_or_plan_mla_decode_wrapper(
             dense_block_tables,
             seq_lens,
-            max_seq_len,
+            caller_workspace,
+            num_heads=attn.num_heads,
+            kv_lora_rank=int(attn.kv_lora_rank),
+            qk_rope_head_dim=int(attn.qk_rope_head_dim),
+            page_size=params.tokens_per_block,
             max_seq_len_q=seq_len_q,
+            max_kv_len=max_seq_len,
+            q_dtype=query.dtype,
+            kv_dtype=kv_cache.dtype,
+            output_dtype=output.dtype,
+            mask_type=mask_type,
+        )
+        wrapper.run(
+            query,
+            kv_cache,
+            block_tables=dense_block_tables,
+            seq_lens=seq_lens,
             out=output,
             bmm1_scale=bmm1_scale,
             bmm2_scale=1.0,
-            mask_type=self._get_prims_mask_type(params.fwd),
-            out_dtype=output.dtype,
         )
 
 

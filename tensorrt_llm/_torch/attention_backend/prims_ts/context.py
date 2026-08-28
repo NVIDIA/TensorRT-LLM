@@ -28,10 +28,15 @@ head-paired GQA.
 Causal windows are bottom-right aligned: for row ``q``, the inclusive right
 position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
 position.
+
+PrimTS context entry points are intentionally excluded from ``fi_trace`` for
+now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
+register trace templates.
 """
 
 from dataclasses import dataclass
 import functools
+import itertools
 import math
 import numbers
 import struct
@@ -60,6 +65,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
+_CONTEXT_TILE_SIZE_Q = 128
 # Query-paired D128 represents two 128-row Q tiles in one work tile.  Kernel
 # coordinates include the padded tail of that 256-row span and, for masking,
 # its exclusive right boundary.  Reserve the maximum 255-row tail padding in
@@ -215,9 +221,10 @@ def _validate_device(device: torch.device) -> int:
 def _validate_mask(mask_type: str) -> None:
     if not isinstance(mask_type, str):
         raise TypeError("mask_type must be a string")
-    if mask_type not in ("dense", "causal"):
+    if mask_type not in ("dense", "causal", "variable_window"):
         raise ValueError(
-            f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}"
+            "mask_type must be exactly 'dense', 'causal', or "
+            f"'variable_window', got {mask_type!r}"
         )
 
 
@@ -233,6 +240,70 @@ def _validate_window_left(window_left: int, mask_type: str) -> int:
     if window_left > 0 and mask_type != "causal":
         raise ValueError("a positive window_left requires mask_type='causal'")
     return window_left
+
+
+def _validate_variable_window_bounds(
+    starts: Optional[torch.Tensor],
+    ends: Optional[torch.Tensor],
+    *,
+    geometry: _ContextGeometry,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate inclusive per-query K bounds for contiguous attention."""
+    if starts is None or ends is None:
+        raise ValueError(
+            "variable_window_token_starts and variable_window_token_ends are "
+            "required for mask_type='variable_window'"
+        )
+    if geometry.packed:
+        raise NotImplementedError(
+            "variable_window currently requires fixed [B, S, H, D] tensors"
+        )
+    expected_shape = (geometry.batch_size, geometry.max_seq_len_q)
+    for tensor, name in (
+        (starts, "variable_window_token_starts"),
+        (ends, "variable_window_token_ends"),
+    ):
+        _validate_tensor(tensor, name)
+        if tensor.device != geometry.device:
+            raise ValueError(
+                f"{name} must be on {geometry.device}, got {tensor.device}"
+            )
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+            )
+        _validate_compact(tensor, name, "[B, Sq]")
+    return starts.flatten(), ends.flatten()
+
+
+def _build_variable_window_cta_starts(
+    starts: torch.Tensor, *, geometry: _ContextGeometry
+) -> torch.Tensor:
+    """Reduce fixed per-row starts into one minimum for each kernel Q CTA."""
+    tile_size_q = (
+        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+        if geometry.head_dim == _CONTEXT_TILE_SIZE_Q
+        else _CONTEXT_TILE_SIZE_Q
+    )
+    num_seq_tiles = (geometry.max_seq_len_q + tile_size_q - 1) // tile_size_q
+    padded_rows = num_seq_tiles * tile_size_q
+    starts_2d = starts.view(geometry.batch_size, geometry.max_seq_len_q)
+    if padded_rows != geometry.max_seq_len_q:
+        padded = torch.full(
+            (geometry.batch_size, padded_rows),
+            _INT32_MAX,
+            dtype=torch.int32,
+            device=geometry.device,
+        )
+        padded[:, : geometry.max_seq_len_q] = starts_2d
+        starts_2d = padded
+    return (
+        starts_2d.view(geometry.batch_size, num_seq_tiles, tile_size_q)
+        .amin(dim=-1)
+        .flatten()
+    )
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -261,6 +332,14 @@ def _validate_extent(value: int, name: str) -> int:
     if value > _INT32_MAX:
         raise NotImplementedError(f"{name} must fit in a signed int32")
     return value
+
+
+def _validate_static_extent(value: object, name: str) -> int:
+    """Validate one explicit positive plan bound."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    return _validate_extent(value, name)
 
 
 def _validate_padded_data_extent(value: int, name: str) -> int:
@@ -319,9 +398,7 @@ def _read_indptr(
             f"the final {name} offset must equal the packed tensor extent; "
             f"expected {expected_total}, got {values[-1]}"
         )
-    lengths = tuple(
-        curr - prev for prev, curr in zip(values[:-1], values[1:], strict=True)
-    )
+    lengths = tuple(curr - prev for prev, curr in itertools.pairwise(values))
     if any(length <= 0 for length in lengths):
         raise ValueError(f"{name} offsets must be strictly increasing")
     return values, lengths
@@ -742,9 +819,13 @@ def _resolve_paged_geometry(
 ) -> tuple[_PagedContextGeometry, _PagedContextMetadata]:
     """Validate packed-Q paged-KV inputs and materialize their static ABI."""
 
+    _validate_mask(mask_type)
+    if mask_type == "variable_window":
+        raise NotImplementedError(
+            "mask_type='variable_window' is not supported for paged context"
+        )
     _validate_base_tensors(q, k_cache, v_cache)
     _validate_output_dtype(output_dtype)
-    _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     page_size = _validate_page_size(page_size)
     device_index = _validate_device(q.device)
@@ -924,6 +1005,127 @@ def _resolve_paged_geometry(
     return geometry, metadata
 
 
+def _resolve_live_paged_geometry(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    batch_size: int,
+    max_seq_len_q: int,
+    max_seq_len_k: int,
+    max_num_pages_per_seq_kv: int,
+    page_size: int,
+    mask_type: str,
+    window_left: int,
+    output_dtype: torch.dtype,
+) -> _PagedContextGeometry:
+    """Validate static bounds for a reusable live-metadata specialization."""
+
+    _validate_base_tensors(q, k_cache, v_cache)
+    _validate_output_dtype(output_dtype)
+    _validate_mask(mask_type)
+    if mask_type == "variable_window":
+        raise NotImplementedError(
+            "mask_type='variable_window' is not supported for paged context"
+        )
+    window_left = _validate_window_left(window_left, mask_type)
+    page_size = _validate_page_size(page_size)
+    batch_size = _validate_static_extent(batch_size, "batch_size")
+    max_seq_len_q = _validate_static_extent(max_seq_len_q, "max_seq_len_q")
+    max_seq_len_k = _validate_static_extent(max_seq_len_k, "max_seq_len_k")
+    max_num_pages_per_seq_kv = _validate_static_extent(
+        max_num_pages_per_seq_kv, "max_num_pages_per_seq_kv"
+    )
+    device_index = _validate_device(q.device)
+    device = torch.device("cuda", device_index)
+
+    if q.ndim != 3:
+        raise ValueError(
+            f"paged context Q must use packed [total_q, Hq, D] storage; got rank {q.ndim}"
+        )
+    if k_cache.ndim != 4:
+        raise ValueError(
+            "paged K/V caches must use [num_pages, Hkv, page_size, D] "
+            f"storage; got rank {k_cache.ndim}"
+        )
+    total_q, num_qo_heads, q_head_dim = map(int, q.shape)
+    num_physical_pages, num_kv_heads, cache_page_size, kv_head_dim = map(
+        int, k_cache.shape
+    )
+    _validate_padded_data_extent(total_q, "total_q")
+    _validate_extent(num_physical_pages, "num_physical_pages")
+    if total_q < batch_size or total_q > batch_size * max_seq_len_q:
+        raise ValueError(
+            "q must contain between batch_size and batch_size * max_seq_len_q "
+            f"rows; got {total_q} rows for batch_size={batch_size} and "
+            f"max_seq_len_q={max_seq_len_q}"
+        )
+    if cache_page_size != page_size:
+        raise ValueError(
+            f"K/V cache page extent must equal page_size={page_size}; got {cache_page_size}"
+        )
+    _validate_head_dim(q_head_dim, kv_head_dim)
+    _validate_compact(q, "q", "[total_q, Hq, D]")
+    _validate_compact(k_cache, "k_cache", "[num_pages, Hkv, page_size, D]")
+    _validate_compact(v_cache, "v_cache", "[num_pages, Hkv, page_size, D]")
+
+    _validate_padded_data_extent(
+        batch_size * max_seq_len_q, "batch_size * max_seq_len_q"
+    )
+    _validate_padded_data_extent(
+        batch_size * max_seq_len_k, "batch_size * max_seq_len_k"
+    )
+    pages_per_kv_tile = _CONTEXT_KV_TILE_N // page_size
+    if max_num_pages_per_seq_kv % pages_per_kv_tile != 0:
+        raise ValueError(
+            "max_num_pages_per_seq_kv must pad each page-table row to a "
+            f"multiple of {pages_per_kv_tile} pages for page_size={page_size}"
+        )
+    required_page_columns = (max_seq_len_k + page_size - 1) // page_size
+    if max_num_pages_per_seq_kv < required_page_columns:
+        raise ValueError(
+            "max_num_pages_per_seq_kv must cover max_seq_len_k: requires at "
+            f"least {required_page_columns} columns, got {max_num_pages_per_seq_kv}"
+        )
+    _validate_extent(
+        2 * batch_size * max_num_pages_per_seq_kv,
+        "dense page-table elements",
+    )
+
+    head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
+    head_paired = window_left > 0
+    if head_paired and (head_ratio <= 1 or head_ratio % 2 != 0):
+        raise NotImplementedError(
+            "a positive left window requires grouped-query attention with an "
+            f"even Hq/Hkv ratio greater than one; got {head_ratio}"
+        )
+
+    return _PagedContextGeometry(
+        device=device,
+        device_index=device_index,
+        batch_size=batch_size,
+        total_q=total_q,
+        max_seq_len_q=max_seq_len_q,
+        max_seq_len_k=max_seq_len_k,
+        page_size=page_size,
+        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+        num_physical_pages=num_physical_pages,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=q_head_dim,
+        q_dtype=q.dtype,
+        output_dtype=output_dtype,
+        mask_type=mask_type,
+        window_left=window_left,
+        head_paired=head_paired,
+        uniform_packed_lengths=False,
+        has_q_offset=mask_type == "causal",
+        packed_dense_k_mask=mask_type == "dense",
+        q_shape=tuple(q.shape),
+        kv_shape=tuple(k_cache.shape),
+    )
+
+
 def _semantic_key(geometry: _ContextGeometry) -> tuple[object, ...]:
     return (
         geometry.device_index,
@@ -1007,6 +1209,7 @@ def _get_compiled_context(
     input_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     is_causal = mask_type == "causal"
+    has_variable_window = mask_type == "variable_window"
     # Construct the scheduler-independent topology first. Immutable
     # single-instance domains can use the lower-overhead static persistent
     # queue; paired or live-ragged domains are reconstructed with CLC.
@@ -1018,6 +1221,7 @@ def _get_compiled_context(
         d=head_dim,
         is_persistent=True,
         is_causal=is_causal,
+        has_variable_window=has_variable_window,
         balance_causal_workload=_uses_heavy_first_static_causal_raster(
             mask_type=mask_type,
             window_left=window_left,
@@ -1064,6 +1268,7 @@ def _get_compiled_context(
             d=head_dim,
             is_persistent=True,
             is_causal=is_causal,
+            has_variable_window=has_variable_window,
             is_clc_dynamic=True,
             head_paired=head_paired,
             window_size_left=window_left if window_left > 0 else 0,
@@ -1080,6 +1285,7 @@ def _get_compiled_context(
             d=head_dim,
             is_persistent=False,
             is_causal=is_causal,
+            has_variable_window=has_variable_window,
             is_clc_dynamic=False,
             head_paired=head_paired,
             window_size_left=window_left if window_left > 0 else 0,
@@ -1113,6 +1319,9 @@ def _get_compiled_context(
         output_scale: cute.Tensor,
         qo_indptr: cute.Tensor,
         kv_indptr: cute.Tensor,
+        variable_window_token_starts: cute.Tensor,
+        variable_window_token_ends: cute.Tensor,
+        variable_window_cta_starts: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1135,6 +1344,9 @@ def _get_compiled_context(
                 kv_indptr,
                 cutlass.Int32(static_max_seq_len_q),
                 cutlass.Int32(static_max_seq_len_k),
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
+                variable_window_cta_starts=variable_window_cta_starts,
             )
         else:
             fmha(
@@ -1146,6 +1358,9 @@ def _get_compiled_context(
                 output_scale,
                 static_max_active_clusters,
                 stream,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
+                variable_window_cta_starts=variable_window_cta_starts,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1179,6 +1394,24 @@ def _get_compiled_context(
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     qo_indptr_fake = fake_compact(cutlass.Int32, indptr_shape, 4)
     kv_indptr_fake = fake_compact(cutlass.Int32, indptr_shape, 4)
+    variable_window_shape = (
+        (batch_size * max_seq_len_q,) if has_variable_window else (1,)
+    )
+    variable_window_starts_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
+    variable_window_ends_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
+    variable_window_tile_size_q = (
+        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+        if head_dim == _CONTEXT_TILE_SIZE_Q
+        else _CONTEXT_TILE_SIZE_Q
+    )
+    variable_window_cta_shape = (
+        (batch_size * cute.ceil_div(max_seq_len_q, variable_window_tile_size_q),)
+        if has_variable_window
+        else (1,)
+    )
+    variable_window_cta_starts_fake = fake_compact(
+        cutlass.Int32, variable_window_cta_shape, 4
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1194,6 +1427,9 @@ def _get_compiled_context(
             output_scale_fake,
             qo_indptr_fake,
             kv_indptr_fake,
+            variable_window_starts_fake,
+            variable_window_ends_fake,
+            variable_window_cta_starts_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -1513,6 +1749,124 @@ def _validate_paged_runtime_inputs(
     _validate_compact(v_cache, "v_cache", "[num_pages, Hkv, page_size, D]")
 
 
+def _validate_live_paged_runtime_inputs(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    geometry: _PagedContextGeometry,
+) -> None:
+    """Validate live data tensors without fixing their packed/page extents."""
+
+    _validate_base_tensors(q, k_cache, v_cache)
+    if q.device != geometry.device:
+        raise ValueError(f"q must be on {geometry.device}, got {q.device}")
+    if q.dtype != geometry.q_dtype:
+        raise ValueError(f"q must have dtype {geometry.q_dtype}, got {q.dtype}")
+    if q.ndim != 3 or tuple(q.shape[1:]) != (
+        geometry.num_qo_heads,
+        geometry.head_dim,
+    ):
+        raise ValueError(
+            "q must have shape [total_q, Hq, D] with "
+            f"Hq/D=({geometry.num_qo_heads}, {geometry.head_dim}), got {tuple(q.shape)}"
+        )
+    expected_kv_tail = (
+        geometry.num_kv_heads,
+        geometry.page_size,
+        geometry.head_dim,
+    )
+    if k_cache.ndim != 4 or tuple(k_cache.shape[1:]) != expected_kv_tail:
+        raise ValueError(
+            "k_cache must have shape [num_pages, Hkv, page_size, D] with "
+            f"Hkv/page/D={expected_kv_tail}, got {tuple(k_cache.shape)}"
+        )
+    total_q = int(q.shape[0])
+    _validate_padded_data_extent(total_q, "total_q")
+    if total_q < geometry.batch_size or total_q > (
+        geometry.batch_size * geometry.max_seq_len_q
+    ):
+        raise ValueError(
+            "q must contain between batch_size and batch_size * max_seq_len_q "
+            f"rows; got {total_q} rows for batch_size={geometry.batch_size} and "
+            f"max_seq_len_q={geometry.max_seq_len_q}"
+        )
+    _validate_extent(int(k_cache.shape[0]), "num_physical_pages")
+    _validate_compact(q, "q", "[total_q, Hq, D]")
+    _validate_compact(k_cache, "k_cache", "[num_pages, Hkv, page_size, D]")
+    _validate_compact(v_cache, "v_cache", "[num_pages, Hkv, page_size, D]")
+
+
+def _validate_live_paged_metadata(
+    qo_indptr: torch.Tensor,
+    logical_kv_indptr: torch.Tensor,
+    dense_page_idx_kv: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
+    geometry: _PagedContextGeometry,
+) -> None:
+    """Validate live metadata storage without reading any device values."""
+
+    for indptr, name in (
+        (qo_indptr, "qo_indptr"),
+        (logical_kv_indptr, "logical_kv_indptr"),
+    ):
+        _validate_indptr_tensor(indptr, name, device=geometry.device)
+        if indptr.numel() != geometry.batch_size + 1:
+            raise ValueError(
+                f"{name} must contain batch_size + 1 elements "
+                f"({geometry.batch_size + 1}), got {indptr.numel()}"
+            )
+
+    _validate_paged_metadata_tensor(seq_lens_kv, "seq_lens_kv", device=geometry.device)
+    if seq_lens_kv.numel() != geometry.batch_size:
+        raise ValueError(
+            "seq_lens_kv must contain one value per request; expected "
+            f"{geometry.batch_size}, got {seq_lens_kv.numel()}"
+        )
+
+    _validate_tensor(dense_page_idx_kv, "dense_page_idx_kv")
+    if dense_page_idx_kv.device != geometry.device:
+        raise ValueError(
+            f"dense_page_idx_kv must be on {geometry.device}, got {dense_page_idx_kv.device}"
+        )
+    if dense_page_idx_kv.dtype != torch.int32:
+        raise TypeError("dense_page_idx_kv must have dtype torch.int32")
+    expected_page_shape = (
+        geometry.batch_size,
+        2,
+        geometry.max_num_pages_per_seq_kv,
+    )
+    if tuple(dense_page_idx_kv.shape) != expected_page_shape:
+        raise ValueError(
+            f"dense_page_idx_kv must have shape {expected_page_shape}, "
+            f"got {tuple(dense_page_idx_kv.shape)}"
+        )
+    _validate_compact(
+        dense_page_idx_kv,
+        "dense_page_idx_kv",
+        "[B, 2, max_num_pages_per_seq_kv]",
+    )
+    _validate_alignment(dense_page_idx_kv, "dense_page_idx_kv", 4)
+
+
+def _validate_live_scale_tensor(
+    scale: torch.Tensor,
+    name: str,
+    *,
+    device: torch.device,
+) -> None:
+    """Validate one allocation-free runtime scale input."""
+
+    _validate_tensor(scale, name)
+    if scale.device != device:
+        raise ValueError(f"{name} must be on {device}, got {scale.device}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"{name} must have dtype torch.float32")
+    if tuple(scale.shape) != (1,):
+        raise ValueError(f"{name} must have shape [1], got {tuple(scale.shape)}")
+    _validate_compact(scale, name, "[1]")
+    _validate_alignment(scale, name, 4)
+
+
 def _prepare_out(
     out: Optional[torch.Tensor],
     *,
@@ -1565,6 +1919,7 @@ class BatchPrefillTSWrapper:
 
     @flashinfer_api
     def __init__(self) -> None:
+        """Initialize an unplanned task-scheduled context-attention wrapper."""
         self._planned = False
 
     @flashinfer_api
@@ -1576,8 +1931,10 @@ class BatchPrefillTSWrapper:
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
-        mask_type: Literal["dense", "causal"] = "dense",
+        mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
@@ -1586,6 +1943,28 @@ class BatchPrefillTSWrapper:
 
         Packed cumulative offsets remain live device inputs. Their runtime
         values must follow the replay contract documented on this wrapper.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            Fixed or packed query, key, and value tensors.
+        qo_indptr, kv_indptr : torch.Tensor, optional
+            Cumulative query and K/V offsets for packed-ragged input.
+        mask_type : {"dense", "causal", "variable_window"}
+            Attention mask mode. ``variable_window`` is supported only for
+            fixed-shape inputs.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
+            Inclusive per-query K bounds required for ``variable_window``.
+            Both must be CUDA int32 tensors shaped ``[B, Sq]`` and satisfy
+            ``0 <= starts[b, q] <= ends[b, q] < Sk``.
+        sm_scale : float, optional
+            Softmax scale; defaults to the inverse square root of head size.
+        output_scale : float
+            Scale applied to the attention output.
+        out_dtype : torch.dtype, optional
+            Output dtype; defaults to the query dtype.
         """
 
         if out_dtype is None:
@@ -1604,6 +1983,39 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
+        if mask_type == "variable_window":
+            validated_window_starts, validated_window_ends = (
+                _validate_variable_window_bounds(
+                    variable_window_token_starts,
+                    variable_window_token_ends,
+                    geometry=geometry,
+                )
+            )
+            # Variable-window bounds are plan metadata. Keep one internal
+            # snapshot so row masks and the reduced CTA origins cannot diverge
+            # if the caller later modifies its tensors.
+            planned_window_starts = validated_window_starts.clone()
+            planned_window_ends = validated_window_ends.clone()
+            planned_window_cta_starts = _build_variable_window_cta_starts(
+                planned_window_starts, geometry=geometry
+            )
+        else:
+            if (
+                variable_window_token_starts is not None
+                or variable_window_token_ends is not None
+            ):
+                raise ValueError(
+                    "variable-window bounds require mask_type='variable_window'"
+                )
+            planned_window_starts = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_window_ends = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_window_cta_starts = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -1642,6 +2054,9 @@ class BatchPrefillTSWrapper:
         self._kv_indptr = planned_kv_indptr
         self._scale_softmax_log2 = scale_tensor
         self._output_scale = output_scale_tensor
+        self._variable_window_token_starts = planned_window_starts
+        self._variable_window_token_ends = planned_window_ends
+        self._variable_window_cta_starts = planned_window_cta_starts
         self._compiled = compiled
         self._policy = policy
         self._planned = True
@@ -1655,7 +2070,15 @@ class BatchPrefillTSWrapper:
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch on the current stream into output disjoint from Q, K, and V."""
+        """Launch on the current stream into output disjoint from Q, K, and V.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            Runtime query, key, and value tensors matching the plan.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
@@ -1672,6 +2095,9 @@ class BatchPrefillTSWrapper:
                 ("kv_indptr", self._kv_indptr),
                 ("scale_softmax_log2", self._scale_softmax_log2),
                 ("output_scale", self._output_scale),
+                ("variable_window_token_starts", self._variable_window_token_starts),
+                ("variable_window_token_ends", self._variable_window_token_ends),
+                ("variable_window_cta_starts", self._variable_window_cta_starts),
             )
         self._compiled(
             q,
@@ -1682,12 +2108,21 @@ class BatchPrefillTSWrapper:
             self._output_scale,
             self._qo_indptr,
             self._kv_indptr,
+            self._variable_window_token_starts,
+            self._variable_window_token_ends,
+            self._variable_window_cta_starts,
         )
         return out
 
 
 class BatchPrefillPagedTSWrapper:
     """Plan and reuse packed-Q context attention over HND paged K/V caches.
+
+    ``plan`` preserves the FlashInfer-compatible snapshot interface.
+    ``plan_live`` instead compiles from explicit static bounds and makes all
+    request metadata live ``run`` inputs. The latter mode is intended for
+    runtimes that already own kernel-native cumulative offsets, sequence
+    lengths, and a dense padded page table.
 
     ``plan`` validates FlashInfer CSR page metadata once, translates it to the
     dense page-table ABI consumed by the context kernel, and retains both the
@@ -1713,13 +2148,51 @@ class BatchPrefillPagedTSWrapper:
     packed ``[total_q, Hq, D]`` storage. Supported page sizes are 16, 32, 64,
     and 128. Dense plans with uniform snapshotted logical K lengths aligned to
     128 rows compile the request-local softmax K mask away.
+
+    Context attention needs no scratch workspace. An optional caller workspace
+    is retained only for API parity with decode wrappers and is never read or
+    written, so it may be shared across ordered or concurrent context launches.
     """
 
     @flashinfer_api
-    def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
+    def __init__(
+        self,
+        kv_layout: Literal["HND"] = "HND",
+        *,
+        workspace_buffer: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Create an unplanned paged-context wrapper.
+
+        Args:
+            kv_layout: K/V layout. Only ``"HND"`` is supported.
+            workspace_buffer: Optional caller-owned tensor retained for API
+                parity. Context kernels use zero bytes of it.
+        """
+
+        if workspace_buffer is not None and not isinstance(
+            workspace_buffer, torch.Tensor
+        ):
+            raise TypeError("workspace_buffer must be a torch.Tensor or None")
         _validate_kv_layout(kv_layout)
         self._kv_layout = kv_layout
+        self._workspace_buffer = workspace_buffer
+        self._live_metadata = False
         self._planned = False
+
+    @flashinfer_api
+    def reset_workspace_buffer(self, workspace_buffer: Optional[torch.Tensor]) -> None:
+        """Rebind the optional caller workspace without invalidating a plan.
+
+        Context attention derives no views from this tensor and never reads or
+        writes it. Rebinding therefore only changes the strong reference kept
+        for wrapper-API uniformity, including while an existing plan is cached.
+        """
+
+        if workspace_buffer is not None and not isinstance(
+            workspace_buffer, torch.Tensor
+        ):
+            raise TypeError("workspace_buffer must be a torch.Tensor or None")
+        self._workspace_buffer = workspace_buffer
 
     @flashinfer_api
     def plan(
@@ -1743,6 +2216,29 @@ class BatchPrefillPagedTSWrapper:
 
         Runtime Q lengths may vary within the planned maximum-Q capacity and
         must remain no greater than the snapshotted K length for causal plans.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Packed query tensor.
+        k_cache, v_cache : torch.Tensor
+            Separate HND key and value page pools.
+        qo_indptr : torch.Tensor
+            Cumulative packed-query offsets.
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+            FlashInfer CSR page metadata.
+        page_size : int
+            Number of K/V tokens stored in each page.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        sm_scale : float, optional
+            Softmax scale; defaults to the inverse square root of head size.
+        output_scale : float
+            Scale applied to the attention output.
+        out_dtype : torch.dtype, optional
+            Output dtype; defaults to the query dtype.
         """
 
         if out_dtype is None:
@@ -1771,8 +2267,6 @@ class BatchPrefillPagedTSWrapper:
         scale_softmax_log2 = _validate_scale(
             sm_scale * math.log2(math.e), "sm_scale * log2(e)"
         )
-        compiled, policy = _get_compiled_paged_context(*_paged_semantic_key(geometry))
-
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
@@ -1795,6 +2289,10 @@ class BatchPrefillPagedTSWrapper:
             geometry.max_num_pages_per_seq_kv,
         )
 
+        # Keep all runtime tensor allocation ahead of CUTLASS JIT, matching
+        # BatchPrefillTSWrapper.plan and its compute-sanitizer ordering.
+        compiled, policy = _get_compiled_paged_context(*_paged_semantic_key(geometry))
+
         # Publish only after validation, compilation, and allocation succeed.
         self._geometry = geometry
         self._qo_indptr = qo_indptr
@@ -1808,6 +2306,115 @@ class BatchPrefillPagedTSWrapper:
         self._output_scale = output_scale_tensor
         self._compiled = compiled
         self._policy = policy
+        self._live_metadata = False
+        self._planned = True
+
+    @flashinfer_api
+    def plan_live(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        batch_size: int,
+        max_seq_len_q: int,
+        max_seq_len_k: int,
+        max_num_pages_per_seq_kv: int,
+        page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
+        mask_type: Literal["dense", "causal"] = "dense",
+        window_left: int = -1,
+        sm_scale: Optional[float] = None,
+        output_scale: float = 1.0,
+        out_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        """Compile a reusable specialization with live native metadata.
+
+        ``q`` and the cache tensors select device, dtype, head geometry, and
+        page geometry. Their packed-Q and physical-page extents may change at
+        ``run`` time. ``batch_size``, the two per-request sequence bounds, and
+        ``max_num_pages_per_seq_kv`` are static JIT capacities. The page-table
+        capacity must be a multiple of ``128 / page_size`` and must cover
+        ``max_seq_len_k``. ``batch_size`` is exact: every run must provide
+        exactly ``B`` sequence lengths and ``B + 1`` cumulative offsets.
+
+        This mode deliberately uses conservative variable-length policy:
+        uniform-length specialization is disabled, causal plans always derive
+        the bottom-right Q offset from live prefixes, and dense plans always
+        apply the live K-length mask. It performs no device-to-host metadata
+        reads. Two one-element scale tensors are allocated once here; callers
+        may replace either with a live tensor in ``run``.
+
+        Every ``run`` must provide four int32 CUDA tensors:
+
+        * ``qo_indptr[B + 1]`` starts at zero, increases strictly, ends at the
+          packed Q extent, and has deltas no larger than ``max_seq_len_q``.
+        * ``logical_kv_indptr[B + 1]`` starts at zero, increases strictly, and
+          has deltas equal to ``seq_lens_kv``.
+        * ``seq_lens_kv[B]`` contains positive lengths no larger than
+          ``max_seq_len_k``. Causal runs additionally require ``Sq[b] <= Sk[b]``.
+        * ``dense_page_idx_kv[B, 2, max_num_pages_per_seq_kv]`` is compact and
+          every entry is a valid physical page ID. Both planes must describe
+          the same logical page row when K and V use separate isomorphic pools;
+          padded tail entries must still resolve to valid storage.
+
+        The hot path trusts those value contracts to avoid synchronization.
+        Metadata may change only between completed launches or graph replays,
+        and captured graphs require stable tensor addresses. The wrapper owns
+        no mutable scratch and the compiled plan may be launched concurrently
+        when each launch supplies disjoint live metadata and output storage.
+        """
+
+        if out_dtype is None:
+            if not isinstance(q, torch.Tensor):
+                raise TypeError("q must be a torch.Tensor")
+            resolved_out_dtype = q.dtype
+        else:
+            resolved_out_dtype = out_dtype
+        geometry = _resolve_live_paged_geometry(
+            q,
+            k_cache,
+            v_cache,
+            batch_size=batch_size,
+            max_seq_len_q=max_seq_len_q,
+            max_seq_len_k=max_seq_len_k,
+            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+            page_size=page_size,
+            mask_type=mask_type,
+            window_left=window_left,
+            output_dtype=resolved_out_dtype,
+        )
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(geometry.head_dim)
+        sm_scale = _validate_scale(sm_scale, "sm_scale")
+        output_scale = _validate_scale(output_scale, "output_scale")
+        scale_softmax_log2 = _validate_scale(
+            sm_scale * math.log2(math.e), "sm_scale * log2(e)"
+        )
+        scale_tensor = torch.tensor(
+            [scale_softmax_log2], dtype=torch.float32, device=geometry.device
+        )
+        output_scale_tensor = torch.tensor(
+            [output_scale], dtype=torch.float32, device=geometry.device
+        )
+
+        # Keep all runtime tensor allocation ahead of CUTLASS JIT, matching
+        # the legacy paged plan and its compute-sanitizer ordering.
+        compiled, policy = _get_compiled_paged_context(*_paged_semantic_key(geometry))
+
+        # Publish only after validation, compilation, and allocation succeed.
+        self._geometry = geometry
+        self._qo_indptr = None
+        self._paged_kv_indptr = None
+        self._paged_kv_indices = None
+        self._paged_kv_last_page_len = None
+        self._logical_kv_indptr = None
+        self._seq_lens_kv = None
+        self._dense_page_idx_kv = None
+        self._scale_softmax_log2 = scale_tensor
+        self._output_scale = output_scale_tensor
+        self._compiled = compiled
+        self._policy = policy
+        self._live_metadata = True
         self._planned = True
 
     @flashinfer_api
@@ -1818,12 +2425,89 @@ class BatchPrefillPagedTSWrapper:
         v_cache: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        qo_indptr: Optional[torch.Tensor] = None,
+        logical_kv_indptr: Optional[torch.Tensor] = None,
+        dense_page_idx_kv: Optional[torch.Tensor] = None,
+        seq_lens_kv: Optional[torch.Tensor] = None,
+        scale_softmax_log2: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch the planned page-table specialization on the current stream."""
+        """Launch the planned page-table specialization on the current stream.
+
+        Legacy ``plan`` calls use retained metadata and reject live metadata
+        arguments. ``plan_live`` calls require all four live metadata tensors.
+        Optional scale overrides must be one-element float32 CUDA tensors and
+        are read directly by the kernel. With a caller-provided ``out``, this
+        method performs no tensor allocation, device-to-host copy, or metadata
+        synchronization.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Runtime packed query tensor matching the plan.
+        k_cache, v_cache : torch.Tensor
+            Runtime HND key and value page pools matching the plan.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        qo_indptr, logical_kv_indptr, dense_page_idx_kv, seq_lens_kv : torch.Tensor, optional
+            Live metadata required by a ``plan_live`` specialization.
+        scale_softmax_log2, output_scale : torch.Tensor, optional
+            Live one-element float32 scale tensors.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
-        _validate_paged_runtime_inputs(q, k_cache, v_cache, self._geometry)
+        if self._live_metadata:
+            if (
+                qo_indptr is None
+                or logical_kv_indptr is None
+                or dense_page_idx_kv is None
+                or seq_lens_kv is None
+            ):
+                raise ValueError(
+                    "plan_live() requires qo_indptr, logical_kv_indptr, "
+                    "dense_page_idx_kv, and seq_lens_kv on every run()"
+                )
+            _validate_live_paged_runtime_inputs(q, k_cache, v_cache, self._geometry)
+            _validate_live_paged_metadata(
+                qo_indptr,
+                logical_kv_indptr,
+                dense_page_idx_kv,
+                seq_lens_kv,
+                self._geometry,
+            )
+        else:
+            if (
+                qo_indptr is not None
+                or logical_kv_indptr is not None
+                or dense_page_idx_kv is not None
+                or seq_lens_kv is not None
+            ):
+                raise ValueError(
+                    "live metadata arguments require plan_live(); legacy plan() "
+                    "uses its snapshotted metadata"
+                )
+            _validate_paged_runtime_inputs(q, k_cache, v_cache, self._geometry)
+            qo_indptr = self._qo_indptr
+            logical_kv_indptr = self._logical_kv_indptr
+            dense_page_idx_kv = self._dense_page_idx_kv
+            seq_lens_kv = self._seq_lens_kv
+
+        if scale_softmax_log2 is None:
+            scale_softmax_log2 = self._scale_softmax_log2
+        else:
+            _validate_live_scale_tensor(
+                scale_softmax_log2,
+                "scale_softmax_log2",
+                device=self._geometry.device,
+            )
+        if output_scale is None:
+            output_scale = self._output_scale
+        else:
+            _validate_live_scale_tensor(
+                output_scale, "output_scale", device=self._geometry.device
+            )
+
         caller_provided_out = out is not None
         out = _prepare_out(out, q=q, output_dtype=self._geometry.output_dtype)
         if caller_provided_out:
@@ -1832,27 +2516,27 @@ class BatchPrefillPagedTSWrapper:
                 ("q", q),
                 ("k_cache", k_cache),
                 ("v_cache", v_cache),
-                ("qo_indptr", self._qo_indptr),
+                ("qo_indptr", qo_indptr),
                 ("paged_kv_indptr", self._paged_kv_indptr),
                 ("paged_kv_indices", self._paged_kv_indices),
                 ("paged_kv_last_page_len", self._paged_kv_last_page_len),
-                ("logical_kv_indptr", self._logical_kv_indptr),
-                ("seq_lens_kv", self._seq_lens_kv),
-                ("dense_page_idx_kv", self._dense_page_idx_kv),
-                ("scale_softmax_log2", self._scale_softmax_log2),
-                ("output_scale", self._output_scale),
+                ("logical_kv_indptr", logical_kv_indptr),
+                ("seq_lens_kv", seq_lens_kv),
+                ("dense_page_idx_kv", dense_page_idx_kv),
+                ("scale_softmax_log2", scale_softmax_log2),
+                ("output_scale", output_scale),
             )
         self._compiled(
             q,
             k_cache,
             v_cache,
             out,
-            self._scale_softmax_log2,
-            self._output_scale,
-            self._qo_indptr,
-            self._logical_kv_indptr,
-            self._dense_page_idx_kv,
-            self._seq_lens_kv,
+            scale_softmax_log2,
+            output_scale,
+            qo_indptr,
+            logical_kv_indptr,
+            dense_page_idx_kv,
+            seq_lens_kv,
         )
         return out
 
@@ -1865,8 +2549,10 @@ def batch_prefill(
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     kv_indptr: Optional[torch.Tensor] = None,
-    mask_type: Literal["dense", "causal"] = "dense",
+    mask_type: Literal["dense", "causal", "variable_window"] = "dense",
     window_left: int = -1,
+    variable_window_token_starts: Optional[torch.Tensor] = None,
+    variable_window_token_ends: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
@@ -1881,6 +2567,30 @@ def batch_prefill(
     left window; a positive value selects the private head-paired GQA policy
     and retains at most ``window_left + 1`` keys at each causal row, including
     when ``S_q < S_kv``.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Fixed or packed query, key, and value tensors.
+    qo_indptr, kv_indptr : torch.Tensor, optional
+        Cumulative query and K/V offsets for packed-ragged input.
+    mask_type : {"dense", "causal", "variable_window"}
+        Attention mask mode. ``variable_window`` is supported only for
+        fixed-shape inputs.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
+        Inclusive per-query K bounds required for ``variable_window``. Both
+        must be CUDA int32 tensors shaped ``[B, Sq]`` and satisfy
+        ``0 <= starts[b, q] <= ends[b, q] < Sk``.
+    sm_scale : float, optional
+        Softmax scale; defaults to the inverse square root of head size.
+    output_scale : float
+        Scale applied to the attention output.
+    out_dtype : torch.dtype, optional
+        Requested output dtype.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
     """
 
     resolved_out_dtype = (
@@ -1895,6 +2605,8 @@ def batch_prefill(
         kv_indptr=kv_indptr,
         mask_type=mask_type,
         window_left=window_left,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
         sm_scale=sm_scale,
         output_scale=output_scale,
         out_dtype=resolved_out_dtype,
@@ -1929,6 +2641,33 @@ def batch_prefill_with_paged_kv_cache(
     use FlashInfer's CSR representation.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
     256; Q, K, and V must share one supported dtype.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Packed query tensor.
+    k_cache, v_cache : torch.Tensor
+        Separate HND key and value page pools.
+    qo_indptr : torch.Tensor
+        Cumulative packed-query offsets.
+    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+        FlashInfer CSR page metadata.
+    page_size : int
+        Number of K/V tokens stored in each page.
+    kv_layout : {"HND"}
+        Layout of the separate K and V page pools.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    sm_scale : float, optional
+        Softmax scale; defaults to the inverse square root of head size.
+    output_scale : float
+        Scale applied to the attention output.
+    out_dtype : torch.dtype, optional
+        Requested output dtype.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
     """
 
     resolved_out_dtype = (
@@ -1954,8 +2693,8 @@ def batch_prefill_with_paged_kv_cache(
 
 
 __all__ = [
-    "BatchPrefillTSWrapper",
     "BatchPrefillPagedTSWrapper",
+    "BatchPrefillTSWrapper",
     "batch_prefill",
     "batch_prefill_with_paged_kv_cache",
 ]

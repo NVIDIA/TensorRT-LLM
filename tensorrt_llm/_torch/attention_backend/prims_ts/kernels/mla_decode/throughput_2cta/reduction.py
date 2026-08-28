@@ -177,11 +177,16 @@ def run_reduction_kernel(
         lse_max = kernel.lse_dtype(-kernel.lse_dtype.inf)
         for i in cutlass.range_constexpr(lse_per_thread):
             split_kv_idx = lane_idx + i * cfg.threads_per_warp
-            local_lse[i] = (
-                acc_lse_tile[split_kv_idx]
-                if query_is_valid and cute.elem_less(split_kv_idx, local_split_kv)
-                else -kernel.lse_dtype.inf
+            active_slot = query_is_valid & cute.elem_less(
+                split_kv_idx,
+                local_split_kv,
             )
+            local_lse[i] = -kernel.lse_dtype.inf
+            # Keep the workspace access inside the dynamic predicate. Split
+            # capacities need not be warp-aligned, so padded lanes must not
+            # form an address beyond the producer allocation.
+            if active_slot:
+                local_lse[i] = acc_lse_tile[split_kv_idx]
             lse_max = fmax_f32(lse_max, local_lse[i])
         lse_max = warp_reduce_max_f32(lse_max)
         lse_max = lse_max if lse_max != -kernel.lse_dtype.inf else 0.0

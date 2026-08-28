@@ -1,12 +1,13 @@
 schema_version: 1
 vendors:
   flashinfer-prims-ts:
-    url: https://github.com/flashinfer-ai/flashinfer.git
-    commit: 74790b32b55f6c45a4fee78007b4d2b2109497e3
+    url: https://github.com/yuxianq/flashinfer.git
+    branch: trtllm-prims-ts
+    commit: b50dcbbd0d0b301e3d0ffbbf5fddaa594821ee43
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention_backend/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:73b261782f33688add0c2adba6c578550dac50489b6ad6add36516e743604e94
-    digest: sha256-tree-v1:70caa47cfc6a2a7a33c7b38a082063098dd39568e600328d96c2cb5033eb1e14
+    patch_digest: sha256:fec27c64b06f97b0488af685ea7be24d10efba5274a0bed28cf548216f5d5da8
+    digest: sha256-tree-v1:968317ed0aa28ab1c7100f5af8c2f98d6d7d023600ec6972ee09d5cb5a9f479b

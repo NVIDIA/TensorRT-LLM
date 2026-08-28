@@ -140,7 +140,8 @@ class SmemPResource(MlaResource):
         super().initialize_runtime_state_internal(context, captured_schedule)
         self._init_smem_state_from_context(context)
         if cutlass.const_expr(
-            self.cfg.use_clc_dynamic_persistent_scheduler == 1
+            self.owns_order_p01_alloc
+            and self.cfg.use_clc_dynamic_persistent_scheduler == 1
             and self._order_p01_barrier_ptr is not None
         ):
             self._init_order_p01_barriers()
@@ -261,11 +262,13 @@ class SmemPResource(MlaResource):
                         (pair_idx % (2 * max(cfg.tile_size_q // 8, 1))) // 2
                     ) * 2
                     scale_idx = scale_base + (s_idx % 2)
-                    p_val = cute.math.exp2(
-                        s_arr[s_idx] * self.scale_softmax_log2
-                        + neg_scaled_max[scale_idx],
-                        fastmath=True,
-                    )
+                    p_val = Float32(0.0)
+                    if new_max_arr[scale_idx] != neg_max_f32():
+                        p_val = cute.math.exp2(
+                            s_arr[s_idx] * self.scale_softmax_log2
+                            + neg_scaled_max[scale_idx],
+                            fastmath=True,
+                        )
                     p_vals[elem_idx] = p_val
                     local_sums[scale_idx] += p_val
                 regs_p[packed_idx] = pack_float4_to_fp8_e4m3(

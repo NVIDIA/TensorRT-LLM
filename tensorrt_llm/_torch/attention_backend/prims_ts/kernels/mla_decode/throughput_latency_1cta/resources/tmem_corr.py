@@ -77,7 +77,11 @@ from ...helpers.ops import (
     tcgen05_st_16x32bx2_f32,
     vector_from_scalars,
 )
-from ...helpers.query import groups_tokens_heads_q_row_state, public_query_flat_row
+from ...helpers.query import (
+    groups_tokens_heads_q_row_state,
+    public_query_flat_row,
+    split_o_element_offset,
+)
 from ...helpers.tile import (
     batch_idx_for_stage_cfg,
     cta_idx_head_dim_v_for_stage,
@@ -427,21 +431,14 @@ class TmemCorrResource(MlaResource):
                     )
                 elif valid_output_row:
                     if cutlass.const_expr(self.acc_o_tensor is not None):
-                        split_kv = Int32(cfg.num_ctas_per_seq_kv)
-                        base_elem_offset = (
-                            global_head_idx * Int32(split_kv * cfg.head_dim_v)
-                            + cta_idx_kv * Int32(cfg.head_dim_v)
-                            + head_dim_offset
-                            + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
-                            + cta_idx_q
-                            * Int32(cfg.num_heads_q * split_kv * cfg.head_dim_v)
-                            + batch_idx
-                            * Int32(
-                                cfg.seq_len_q
-                                * cfg.num_heads_q
-                                * split_kv
-                                * cfg.head_dim_v
-                            )
+                        base_elem_offset = split_o_element_offset(
+                            cfg,
+                            batch_idx,
+                            cta_idx_q,
+                            global_head_idx,
+                            cta_idx_kv,
+                            head_dim_offset
+                            + Int32(v_stage_idx * cfg.head_dim_per_stage_v),
                         )
                         base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
                         element_bytes = cfg.partial_o_dtype_bytes
@@ -625,9 +622,9 @@ class TmemCorrResource(MlaResource):
         if cutlass.const_expr(self.cfg.use_cluster_reduction == 1):
             cfg = self.cfg
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-            is_correction_warp = warp_idx >= Int32(
-                cfg.correction_warp_idx
-            ) and warp_idx < Int32(cfg.correction_warp_idx + cfg.correction_num_warps)
+            is_correction_warp = (warp_idx >= Int32(cfg.correction_warp_idx)) & (
+                warp_idx < Int32(cfg.correction_warp_idx + cfg.correction_num_warps)
+            )
             if is_correction_warp:
                 thread_idx, _, _ = cute.arch.thread_idx()
                 warp_grp_thread_idx = thread_idx - Int32(cfg.correction_warp_idx * 32)
@@ -786,10 +783,17 @@ class TmemCorrResource(MlaResource):
                                 lse_sum += cute.math.exp2(
                                     local_lse[split_idx] - lse_max, fastmath=True
                                 )
+                            has_finite_mass = (
+                                lse_sum != Float32(0.0) and lse_sum == lse_sum
+                            )
+                            is_fully_masked = lse_sum == Float32(0.0)
                             global_lse = (
                                 lse_max + cute.math.log2(lse_sum, fastmath=True)
-                                if lse_sum != Float32(0.0) and lse_sum == lse_sum
+                                if has_finite_mass
                                 else Float32(Float32.inf)
+                            )
+                            published_lse = (
+                                Float32(-Float32.inf) if is_fully_masked else global_lse
                             )
 
                             if (
@@ -806,7 +810,7 @@ class TmemCorrResource(MlaResource):
                                     )
                                     (
                                         self.lse_tensor.iterator.raw_ptr() + lse_offset
-                                    ).store(global_lse)
+                                    ).store(published_lse)
 
                             acc_vec = vector_from_scalars(
                                 (
@@ -1446,16 +1450,13 @@ class TmemCorrResource(MlaResource):
             )
             if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
                 if cutlass.const_expr(self.acc_o_tensor is not None):
-                    split_kv = Int32(cfg.num_ctas_per_seq_kv)
-                    base_elem_offset = (
-                        global_head_idx * Int32(split_kv * cfg.head_dim_v)
-                        + cta_idx_kv * Int32(cfg.head_dim_v)
-                        + store_col_offset
-                        + cta_idx_q * Int32(cfg.num_heads_q * split_kv * cfg.head_dim_v)
-                        + batch_idx
-                        * Int32(
-                            cfg.seq_len_q * cfg.num_heads_q * split_kv * cfg.head_dim_v
-                        )
+                    base_elem_offset = split_o_element_offset(
+                        cfg,
+                        batch_idx,
+                        cta_idx_q,
+                        global_head_idx,
+                        cta_idx_kv,
+                        store_col_offset,
                     )
                     base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
                     element_bytes = cfg.partial_o_dtype_bytes
