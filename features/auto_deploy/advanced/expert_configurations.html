@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../../../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/auto_deploy/advanced/expert_configurations';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -408,7 +408,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -479,7 +479,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../sparse-attention.html">Sparse Attention</a></li>
@@ -493,11 +493,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -615,24 +617,24 @@ objects can be used to configure advanced runtime options in TensorRT-LLM.</p></
 <p>The script supports flexible CLI argument parsing using dot notation to modify nested configurations dynamically. You can target any field in both the <code class="docutils literal notranslate"><span class="pre">ExperimentConfig</span></code> in <code class="docutils literal notranslate"><span class="pre">examples/auto_deploy/build_and_run_ad.py</span></code> and nested <code class="docutils literal notranslate"><span class="pre">AutoDeployConfig</span></code> or <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code> objects in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch.auto_deploy.llm_args</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Configure model parameters</span>
 <span class="c1"># NOTE: config values like num_hidden_layers are automatically resolved into the appropriate nested</span>
-<span class="c1"># dict value ``{&quot;args&quot;: {&quot;model_kwargs&quot;: {&quot;num_hidden_layers&quot;: 10}}}`` although not explicitly</span>
+<span class="c1"># dict value ``{"args": {"model_kwargs": {"num_hidden_layers": 10}}}`` although not explicitly</span>
 <span class="c1"># specified as CLI arg</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"meta-llama/Meta-Llama-3.1-8B-Instruct"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.model-kwargs.num-hidden-layers<span class="o">=</span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.model-kwargs.hidden-size<span class="o">=</span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.tokenizer-kwargs.padding-side<span class="o">=</span>left
 
 <span class="c1"># Configure runtime and backend options</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.world-size<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.compile-backend<span class="o">=</span>torch-opt<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.attn-backend<span class="o">=</span>flashinfer
 
 <span class="c1"># Configure prompting and benchmarking</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;microsoft/phi-4&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"microsoft/phi-4"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--prompt.batch-size<span class="o">=</span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--prompt.sp-kwargs.max-tokens<span class="o">=</span><span class="m">200</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--prompt.sp-kwargs.temperature<span class="o">=</span><span class="m">0</span>.7<span class="w"> </span><span class="se">\</span>
@@ -683,17 +685,17 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <p>Then use these configurations:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using single YAML config</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"meta-llama/Meta-Llama-3.1-8B-Instruct"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--yaml-extra<span class="w"> </span>my_config.yaml
 
 <span class="c1"># Using multiple YAML configs (deep merged in order, later files have higher priority)</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"meta-llama/Meta-Llama-3.1-8B-Instruct"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--yaml-extra<span class="w"> </span>my_config.yaml<span class="w"> </span>production.yaml
 
 <span class="c1"># Targeting nested AutoDeployConfig with separate YAML</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"meta-llama/Meta-Llama-3.1-8B-Instruct"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--yaml-extra<span class="w"> </span>my_config.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.yaml-extra<span class="w"> </span>autodeploy_overrides.yaml
 </pre></div>
@@ -728,7 +730,7 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># The outer yaml-extra affects the entire ExperimentConfig</span>
 <span class="c1"># The inner args.yaml-extra affects only the AutoDeployConfig</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"meta-llama/Meta-Llama-3.1-8B-Instruct"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--yaml-extra<span class="w"> </span>experiment_config.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.yaml-extra<span class="w"> </span>autodeploy_config.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.world-size<span class="o">=</span><span class="m">8</span><span class="w">  </span><span class="c1"># CLI override beats both YAML configs</span>
@@ -744,7 +746,7 @@ cat<span class="w"> </span>tensorrt_llm/_torch/auto_deploy/config/default.yaml
 
 <span class="c1"># Override specific transform settings</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.transforms.export-to-gm.strict<span class="o">=</span><span class="nb">true</span>
 </pre></div>
 </div>
@@ -809,8 +811,8 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -882,9 +884,9 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

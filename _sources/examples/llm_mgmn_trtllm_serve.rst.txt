@@ -1,6 +1,6 @@
 Run trtllm-serve with pytorch backend on Slurm
 ==============================================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/1cef02e901be43081b1ba6d4981e94ed3bd9c1e8/examples/llm-api/llm_mgmn_trtllm_serve.sh.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/785c948197b55267260fec3f7f52e47000888d0a/examples/llm-api/llm_mgmn_trtllm_serve.sh.
 
 .. literalinclude:: ../../../examples/llm-api/llm_mgmn_trtllm_serve.sh
     :lines: 1-46,50-92

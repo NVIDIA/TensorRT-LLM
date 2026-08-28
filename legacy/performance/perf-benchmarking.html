@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'legacy/performance/perf-benchmarking';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -408,7 +408,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -479,7 +479,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
@@ -493,11 +493,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -797,14 +799,14 @@ defined at the same time. If you specify <code class="docutils literal notransla
 <p>Refer to the following examples of valid entries for the benchmark:</p>
 <ul>
 <li><p>Entries with a human-readable prompt and no logits.</p>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;prompt&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend.&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">}</span>
-<span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;prompt&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Generate an infinite response to the following: Na, na, na, na&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">}</span>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend."</span><span class="p">,</span><span class="w"> </span><span class="nt">"output_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Generate an infinite response to the following: Na, na, na, na"</span><span class="p">,</span><span class="w"> </span><span class="nt">"output_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">}</span>
 </pre></div>
 </div>
 </li>
 <li><p>Entries which contain logits.</p>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="nt">&quot;input_ids&quot;</span><span class="p">:[</span><span class="mi">863</span><span class="p">,</span><span class="mi">22056</span><span class="p">,</span><span class="mi">25603</span><span class="p">,</span><span class="mi">11943</span><span class="p">,</span><span class="mi">8932</span><span class="p">,</span><span class="mi">13195</span><span class="p">,</span><span class="mi">3132</span><span class="p">,</span><span class="mi">25032</span><span class="p">,</span><span class="mi">21747</span><span class="p">,</span><span class="mi">22213</span><span class="p">],</span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
-<span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">&quot;input_ids&quot;</span><span class="p">:[</span><span class="mi">14480</span><span class="p">,</span><span class="mi">13598</span><span class="p">,</span><span class="mi">15585</span><span class="p">,</span><span class="mi">6591</span><span class="p">,</span><span class="mi">1252</span><span class="p">,</span><span class="mi">8259</span><span class="p">,</span><span class="mi">30990</span><span class="p">,</span><span class="mi">26778</span><span class="p">,</span><span class="mi">7063</span><span class="p">,</span><span class="mi">30065</span><span class="p">,</span><span class="mi">21764</span><span class="p">,</span><span class="mi">11023</span><span class="p">,</span><span class="mi">1418</span><span class="p">],</span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">"task_id"</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="nt">"input_ids"</span><span class="p">:[</span><span class="mi">863</span><span class="p">,</span><span class="mi">22056</span><span class="p">,</span><span class="mi">25603</span><span class="p">,</span><span class="mi">11943</span><span class="p">,</span><span class="mi">8932</span><span class="p">,</span><span class="mi">13195</span><span class="p">,</span><span class="mi">3132</span><span class="p">,</span><span class="mi">25032</span><span class="p">,</span><span class="mi">21747</span><span class="p">,</span><span class="mi">22213</span><span class="p">],</span><span class="nt">"output_tokens"</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"task_id"</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">"input_ids"</span><span class="p">:[</span><span class="mi">14480</span><span class="p">,</span><span class="mi">13598</span><span class="p">,</span><span class="mi">15585</span><span class="p">,</span><span class="mi">6591</span><span class="p">,</span><span class="mi">1252</span><span class="p">,</span><span class="mi">8259</span><span class="p">,</span><span class="mi">30990</span><span class="p">,</span><span class="mi">26778</span><span class="p">,</span><span class="mi">7063</span><span class="p">,</span><span class="mi">30065</span><span class="p">,</span><span class="mi">21764</span><span class="p">,</span><span class="mi">11023</span><span class="p">,</span><span class="mi">1418</span><span class="p">],</span><span class="nt">"output_tokens"</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
 </pre></div>
 </div>
 </li>
@@ -1105,13 +1107,13 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 </ul>
 <p>The generated dataset will include LoRA request metadata. Below is an example of a single such request data entry:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">  </span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;input_ids&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">3452</span><span class="p">,</span><span class="w"> </span><span class="mi">88226</span><span class="p">,</span><span class="w"> </span><span class="mi">102415</span><span class="p">,</span><span class="w"> </span><span class="err">...</span><span class="p">],</span>
-<span class="w">  </span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">152</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;lora_request&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;lora_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;lora_0&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;lora_int_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;lora_path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/path/to/loras/0&quot;</span>
+<span class="w">  </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"input_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">3452</span><span class="p">,</span><span class="w"> </span><span class="mi">88226</span><span class="p">,</span><span class="w"> </span><span class="mi">102415</span><span class="p">,</span><span class="w"> </span><span class="err">...</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"output_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">152</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"lora_request"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"lora_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"lora_0"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"lora_int_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"lora_path"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/path/to/loras/0"</span>
 <span class="w">  </span><span class="p">}</span>
 <span class="p">}</span>
 </pre></div>
@@ -1165,9 +1167,9 @@ Each subdirectory should contain the LoRA adapter files for that specific task.<
 <p>It will download the media files to <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> directory and prepare the dataset with their paths. Note that the <code class="docutils literal notranslate"><span class="pre">prompt</span></code> fields are texts and not tokenized ids. This is due to the fact that
 the <code class="docutils literal notranslate"><span class="pre">prompt</span></code> and the media (image/video) are processed by a preprocessor for multimodal files.</p>
 <p>Sample dataset for multimodal:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="s2">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">&quot;prompt&quot;</span><span class="p">:</span><span class="s2">&quot;Brahma Industries sells vinyl replacement windows to home improvement retailers nationwide. The national sales manager believes that if they invest an additional $25,000 in advertising, they would increase sales volume by 10,000 units. &lt;image 1&gt; What is the total contribution margin?&quot;</span><span class="p">,</span><span class="s2">&quot;media_paths&quot;</span><span class="p">:[</span><span class="s2">&quot;/tmp/tmp9so41y3r.jpg&quot;</span><span class="p">],</span><span class="s2">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">126</span><span class="p">}</span>
-<span class="p">{</span><span class="s2">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="s2">&quot;prompt&quot;</span><span class="p">:</span><span class="s2">&quot;Let us compute for the missing amounts under work in process inventory, what is the cost of goods manufactured? &lt;image 1&gt;&quot;</span><span class="p">,</span><span class="s2">&quot;media_paths&quot;</span><span class="p">:[</span><span class="s2">&quot;/tmp/tmpowsrb_f4.jpg&quot;</span><span class="p">],</span><span class="s2">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">119</span><span class="p">}</span>
-<span class="p">{</span><span class="s2">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">2</span><span class="p">,</span><span class="s2">&quot;prompt&quot;</span><span class="p">:</span><span class="s2">&quot;Tsuji is reviewing the price of a 3-month Japanese yen/U.S. dollar currency futures contract, using the currency and interest rate data shown below. Because the 3-month Japanese interest rate has just increased to .50%, Itsuji recognizes that an arbitrage opportunity exists nd decides to borrow $1 million U.S. dollars to purchase Japanese yen. Calculate the yen arbitrage profit from Itsuji&#39;s strategy, using the following data: &lt;image 1&gt; &quot;</span><span class="p">,</span><span class="s2">&quot;media_paths&quot;</span><span class="p">:[</span><span class="s2">&quot;/tmp/tmpxhdvasex.jpg&quot;</span><span class="p">],</span><span class="s2">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">126</span><span class="p">}</span>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="s2">"task_id"</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">"prompt"</span><span class="p">:</span><span class="s2">"Brahma Industries sells vinyl replacement windows to home improvement retailers nationwide. The national sales manager believes that if they invest an additional $25,000 in advertising, they would increase sales volume by 10,000 units. &lt;image 1&gt; What is the total contribution margin?"</span><span class="p">,</span><span class="s2">"media_paths"</span><span class="p">:[</span><span class="s2">"/tmp/tmp9so41y3r.jpg"</span><span class="p">],</span><span class="s2">"output_tokens"</span><span class="p">:</span><span class="mi">126</span><span class="p">}</span>
+<span class="p">{</span><span class="s2">"task_id"</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="s2">"prompt"</span><span class="p">:</span><span class="s2">"Let us compute for the missing amounts under work in process inventory, what is the cost of goods manufactured? &lt;image 1&gt;"</span><span class="p">,</span><span class="s2">"media_paths"</span><span class="p">:[</span><span class="s2">"/tmp/tmpowsrb_f4.jpg"</span><span class="p">],</span><span class="s2">"output_tokens"</span><span class="p">:</span><span class="mi">119</span><span class="p">}</span>
+<span class="p">{</span><span class="s2">"task_id"</span><span class="p">:</span><span class="mi">2</span><span class="p">,</span><span class="s2">"prompt"</span><span class="p">:</span><span class="s2">"Tsuji is reviewing the price of a 3-month Japanese yen/U.S. dollar currency futures contract, using the currency and interest rate data shown below. Because the 3-month Japanese interest rate has just increased to .50%, Itsuji recognizes that an arbitrage opportunity exists nd decides to borrow $1 million U.S. dollars to purchase Japanese yen. Calculate the yen arbitrage profit from Itsuji's strategy, using the following data: &lt;image 1&gt; "</span><span class="p">,</span><span class="s2">"media_paths"</span><span class="p">:[</span><span class="s2">"/tmp/tmpxhdvasex.jpg"</span><span class="p">],</span><span class="s2">"output_tokens"</span><span class="p">:</span><span class="mi">126</span><span class="p">}</span>
 <span class="o">...</span>
 </pre></div>
 </div>
@@ -1265,13 +1267,13 @@ file is present in checkpoints quantized with <a class="reference external" href
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
 above:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;producer&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;modelopt&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;0.23.0rc1&quot;</span>
+<span class="w">    </span><span class="nt">"producer"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"modelopt"</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"0.23.0rc1"</span>
 <span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="nt">"quantization"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">"quant_algo"</span><span class="p">:</span><span class="w"> </span><span class="s2">"FP8"</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">"kv_cache_quant_algo"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
 <span class="w">    </span><span class="p">}</span>
 <span class="p">}</span>
 </pre></div>
@@ -1315,7 +1317,7 @@ follow when a checkpoint does not specify a KV cache quantization algorithm:</p>
 </div>
 <p>If you would like to force the KV cache quantization, you can specify the following in the YAML file to force the precision
 when the checkpoint precision is <code class="docutils literal notranslate"><span class="pre">null</span></code>:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;fp8&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="s">"fp8"</span>
 </pre></div>
 </div>
 <div class="admonition tip">
@@ -1593,8 +1595,8 @@ The choices are specified with a YAML file like the following example (<code cla
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -1666,9 +1668,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

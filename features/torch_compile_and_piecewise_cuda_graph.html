@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Torch Compile &amp; Piecewise CUDA Graph &#8212; TensorRT LLM</title>
+    <title>Torch Compile &amp; Prefill CUDA Graph &#8212; TensorRT LLM</title>
   
   
   
@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/torch_compile_and_piecewise_cuda_graph';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -481,7 +481,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention.html">Sparse Attention</a></li>
@@ -495,11 +495,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -576,7 +578,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Torch Compile &amp; Piecewise CUDA Graph</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Torch Compile &amp; Prefill CUDA Graph</span></li>
   </ul>
 </nav>
 </div>
@@ -593,8 +595,8 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="torch-compile-piecewise-cuda-graph">
-<h1>Torch Compile &amp; Piecewise CUDA Graph<a class="headerlink" href="#torch-compile-piecewise-cuda-graph" title="Link to this heading">#</a></h1>
+  <section id="torch-compile-prefill-cuda-graph">
+<h1>Torch Compile &amp; Prefill CUDA Graph<a class="headerlink" href="#torch-compile-prefill-cuda-graph" title="Link to this heading">#</a></h1>
 <p>In this guide, we show how to enable torch.compile and Piecewise CUDA Graph in TensorRT LLM. TensorRT LLM uses torch.compile for lightweight vertical fusion and Piecewise CUDA Graph.</p>
 <p>Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (primarily attention) in eager mode while capturing and replaying the supported parts with CUDA Graph to reduce context-phase launch overhead. We implement this on top of torch.compile because partitioning a model between CUDA Graph and eager execution—and managing graphs in pure eager mode—is cumbersome.</p>
 <section id="table-of-contents">
@@ -651,12 +653,35 @@
 Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
 </div>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nn">...</span><span class="w"> </span><span class="c1"># Other extra config</span>
+<span class="nt">prefill_cuda_graph_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">piecewise</span>
+<span class="nt">prefill_capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">'${capture_num_tokens}'</span><span class="w"> </span><span class="c1"># e.g. [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]</span>
 <span class="nt">torch_compile_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;${capture_num_tokens}&#39;</span><span class="w"> </span><span class="c1"># List of num tokens to capture. e.g., [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]</span>
 <span class="w">  </span><span class="nt">enable_userbuffers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
-<span class="w">  </span><span class="nt">enable_piecewise_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">TorchCompileConfig.enable_piecewise_cuda_graph</span></code> and
+<code class="docutils literal notranslate"><span class="pre">TorchCompileConfig.capture_num_tokens</span></code> are deprecated aliases for these
+prefill-specific options.</p>
+<p>The experimental breakable implementation can capture the model body without
+torch.compile:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">prefill_cuda_graph_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">breakable</span>
+<span class="nt">prefill_capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">256</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">512</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>The breakable backend is experimental. The integration coverage in this change
+includes BF16 Qwen3.5 on one GPU and NVFP4 DeepSeek models on multiple GPUs,
+with both context-only and mixed context/decode batches using the KV cache.</p>
+<p>The following restrictions are enforced:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">torch_compile_config</span></code>, LoRA, and multimodal models are rejected during
+engine initialization.</p></li>
+<li><p>Speculative decoding is supported.</p></li>
+<li><p>Context-logit requests run eagerly instead of replaying a breakable CUDA
+graph.</p></li>
+</ul>
+<p>Other model families, quantization modes, and parallel configurations are not
+yet covered by this experimental backend’s integration tests and should be
+validated before use.</p>
 </section>
 <section id="tips-for-piecewise-cuda-graph">
 <h2>Tips for Piecewise CUDA Graph<a class="headerlink" href="#tips-for-piecewise-cuda-graph" title="Link to this heading">#</a></h2>
@@ -668,9 +693,10 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w"> </span><span class="c1"># Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it.</span>
 
 <span class="nt">torch_compile_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;${capture_num_tokens}&#39;</span><span class="w"> </span><span class="c1"># Specify capture_num_tokens for piecewise cuda graph</span>
 <span class="w">  </span><span class="nt">enable_userbuffers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
-<span class="w">  </span><span class="nt">enable_piecewise_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+
+<span class="nt">prefill_cuda_graph_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">piecewise</span>
+<span class="nt">prefill_capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">'${capture_num_tokens}'</span>
 </pre></div>
 </div>
 </section>
@@ -703,11 +729,11 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li><p>Speculative Decoding in Two-Model Style</p></li>
 </ol>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">speculative_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;MTP&quot;</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="s">"MTP"</span>
 <span class="w">  </span><span class="nt">mtp_eagle_one_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span><span class="w"> </span><span class="c1"># Not supported</span>
 
 <span class="nt">speculative_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Eagle3&quot;</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="s">"Eagle3"</span>
 <span class="w">  </span><span class="nt">eagle3_one_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span><span class="w"> </span><span class="c1"># Not supported</span>
 </pre></div>
 </div>
@@ -729,7 +755,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </ol>
 <p>After wrapping the op into a torch custom op, the implementation is a completely <strong>black box</strong> for torch compile. Instead, torch.compile will fully rely on a fake kernel to do the tracing.</p>
 <p>Below is a simple example of flashinfer op’s fake kernel.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">&quot;trtllm::flashinfer_silu_and_mul&quot;</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">"trtllm::flashinfer_silu_and_mul"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">flashinfer_silu_and_mul</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">silu_and_mul</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">enable_pdl</span><span class="o">=</span><span class="n">ENABLE_PDL</span><span class="p">)</span>
 
@@ -956,8 +982,8 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li><p>For an int argument that would change during runtime, use <code class="docutils literal notranslate"><span class="pre">SymInt</span></code> rather than int in the C++ custom op definition. Otherwise, it will trigger a recompile when the value changes.</p>
 <div class="highlight-c++ notranslate"><div class="highlight"><pre><span></span><span class="n">TORCH_LIBRARY_FRAGMENT</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span>
 <span class="p">{</span>
-<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;allgather(Tensor input, SymInt[]? sizes, int[] group) -&gt; Tensor&quot;</span><span class="p">);</span>
-<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -&gt; Tensor[]&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">"allgather(Tensor input, SymInt[]? sizes, int[] group) -&gt; Tensor"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">"allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -&gt; Tensor[]"</span><span class="p">);</span>
 <span class="p">}</span>
 </pre></div>
 </div>
@@ -1090,8 +1116,8 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -1163,9 +1189,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

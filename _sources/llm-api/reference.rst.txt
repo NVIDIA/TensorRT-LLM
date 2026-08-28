@@ -376,7 +376,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: update_forward_refs,model_json_schema,parse_obj,model_copy,model_validate_strings,model_construct,model_parametrized_name,copy,model_rebuild,model_post_init,parse_file,model_validate,validate,model_extra,model_fields,schema_json,model_computed_fields,model_dump,model_dump_json,parse_raw,construct,model_fields_set,model_validate_json,model_config,json,dict,from_orm,schema
+    :exclude-members: model_computed_fields,schema,dict,model_parametrized_name,json,schema_json,model_post_init,model_copy,parse_raw,update_forward_refs,copy,model_validate_strings,model_construct,model_extra,validate,model_rebuild,parse_obj,model_dump_json,model_fields,model_fields_set,parse_file,model_dump,model_validate_json,model_config,construct,model_json_schema,model_validate,from_orm
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
@@ -475,6 +475,14 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.PrometheusMetricsConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.PrefillCudaGraphBackend
     :members:
     :undoc-members:
     :show-inheritance:

@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/kv-transfer';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Telemetry" href="telemetry.html" />
+    <link rel="next" title="KVCacheManagerV2 Cold-Page Codec Design" href="kv-cache-cold-page-codec.html" />
     <link rel="prev" title="LLM API Change Guide" href="api-change.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -481,7 +481,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
@@ -495,11 +495,13 @@
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -594,8 +596,9 @@
                 <article class="bd-article">
                   
   <section id="introduction-to-kv-cache-transmission">
-<h1>Introduction to KV Cache Transmission<a class="headerlink" href="#introduction-to-kv-cache-transmission" title="Link to this heading">#</a></h1>
-<p>This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by dist-serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities.</p>
+<span id="kv-transfer"></span><h1>Introduction to KV Cache Transmission<a class="headerlink" href="#introduction-to-kv-cache-transmission" title="Link to this heading">#</a></h1>
+<p>This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by disaggregated serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities. For configuring a deployment, see <a class="reference internal" href="../features/disagg-serving.html"><span class="std std-doc">Disaggregated Serving</span></a> instead.</p>
+<p>The implementation described here is the Python transceiver, which lives under <a class="reference internal" href="#source:tensorrt_llm/_torch/disaggregation"><span class="xref myst"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/disaggregation/</span></code></span></a>. <code class="docutils literal notranslate"><span class="pre">cache_transceiver_config.transceiver_runtime</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">auto</span></code>, which selects it on the supported NIXL path and otherwise falls back to the older C++ transceiver (<code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp</span></code> and friends). That C++ implementation is deprecated and will be removed in a future release; new work should target the Python path.</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
@@ -603,73 +606,77 @@
 <li><p><a class="reference internal" href="#key-components"><span class="xref myst">Key Components</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#transceiver"><span class="std std-ref">Transceiver</span></a></p></li>
-<li><p><a class="reference internal" href="#sender-and-receiver"><span class="xref myst">Sender and Receiver</span></a></p></li>
-<li><p><a class="reference internal" href="#formatter"><span class="std std-ref">Formatter</span></a></p></li>
-<li><p><a class="reference internal" href="#connection"><span class="std std-ref">Connection</span></a></p></li>
+<li><p><a class="reference internal" href="#messenger"><span class="std std-ref">Messenger</span></a></p></li>
+<li><p><a class="reference internal" href="#peer-registrar-and-mappers"><span class="xref myst">Peer Registrar and Mappers</span></a></p></li>
+<li><p><a class="reference internal" href="#page-table"><span class="xref myst">Page Table</span></a></p></li>
 <li><p><a class="reference internal" href="#transfer-agent"><span class="xref myst">Transfer Agent</span></a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="../examples/llm_api_examples.html#customization"><span class="std std-ref">Customization</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#encapsulation-and-overloading-of-low-level-communication-libraries"><span class="xref myst">Encapsulation and Overloading of Low-Level Communication Libraries</span></a></p></li>
-<li><p><a class="reference internal" href="#modifications-to-upper-level-runtime-logic"><span class="xref myst">Modifications to Upper-Level Runtime Logic</span></a></p></li>
+<li><p><a class="reference internal" href="#integrating-a-new-transport"><span class="xref myst">Integrating a New Transport</span></a></p></li>
+<li><p><a class="reference internal" href="#supporting-a-new-cache-layout"><span class="xref myst">Supporting a New Cache Layout</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#evolution-outlook"><span class="xref myst">Evolution Outlook</span></a></p></li>
+<li><p><a class="reference internal" href="#current-limitations"><span class="xref myst">Current Limitations</span></a></p></li>
 </ul>
 </section>
 <section id="workflow">
 <h2>Workflow<a class="headerlink" href="#workflow" title="Link to this heading">#</a></h2>
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/media/kv_transfer.png?raw=true" alt="KV Cache Transfer Overview" width="500" height="auto">
+<p>The control plane — discovery, per-request metadata, and completion notices — is ZeroMQ. The data plane is one-sided NIXL writes issued by the context worker into memory the generation worker has registered. The two never share a channel.</p>
 <ol class="arabic simple">
-<li><p>Context phase completes computation, KV cache stays in device memory awaiting transmission.</p></li>
-<li><p>Context returns its communicator handle to the user, who selects the generation executor for continued communication.</p></li>
-<li><p>If no prior connection exists, it’s established now. Generation phase shares its cache layout with context.</p></li>
-<li><p>Generation phase requests KV cache for specific tokens.</p></li>
-<li><p>Context sends KV cache to generation phase.</p></li>
-<li><p>Generation phase resumes computation, context releases KV cache.</p></li>
+<li><p>Context phase completes computation, KV cache stays in device memory awaiting transmission. The context worker publishes only the endpoint where it can be reached, on <code class="docutils literal notranslate"><span class="pre">ContextPhaseParams.disagg_info_endpoint</span></code>.</p></li>
+<li><p>On first contact with a context instance, the generation worker fetches that instance’s <code class="docutils literal notranslate"><span class="pre">RankInfo</span></code> — topology, attention geometry, serialized page table, transfer agent descriptor — from the context rank 0, then registers its own <code class="docutils literal notranslate"><span class="pre">RankInfo</span></code> with every context rank. The result is cached per endpoint, so only the first request pays for the round trip.</p></li>
+<li><p>Generation phase requests KV cache for specific tokens, sending its destination block IDs to each overlapping context rank.</p></li>
+<li><p>Context computes both source and destination addresses locally and submits a one-sided NIXL transfer. On the default path that transfer carries one descriptor per cache fragment; only the optional bounce path coalesces a request into a single contiguous buffer and a single write. All address arithmetic happens on the context side; the generation worker’s CPU is not involved.</p></li>
+<li><p>Context reports completion over the control plane. The receive session completes once every expected writer has reported.</p></li>
+<li><p>Generation phase resumes computation, context releases KV cache. Both sides run an allgather first, so every rank agrees on the outcome before any state transition.</p></li>
 </ol>
 </section>
 <section id="key-components">
 <h2>Key Components<a class="headerlink" href="#key-components" title="Link to this heading">#</a></h2>
 <section id="transceiver">
 <h3>Transceiver<a class="headerlink" href="#transceiver" title="Link to this heading">#</a></h3>
-<p>Responsible for coordinating the sending and receiving of cache among different ranks within the same executor.</p>
+<p><code class="docutils literal notranslate"><span class="pre">KvCacheTransceiverV2</span></code> in <code class="docutils literal notranslate"><span class="pre">transceiver.py</span></code>. Coordinates the sending and receiving of cache among the ranks of one executor, and implements the same interface <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code> drives for both runtimes. Every one of its methods runs on the executor main loop.</p>
 </section>
-<section id="sender-and-receiver">
-<h3>Sender and Receiver<a class="headerlink" href="#sender-and-receiver" title="Link to this heading">#</a></h3>
-<p>Responsible for transmitting control plane messages. That is, during per-request transmission, the receiver bound to the generation informs the sender of the specific information it requires. The sender then sends the corresponding KV cache based on these messages.</p>
+<section id="messenger">
+<h3>Messenger<a class="headerlink" href="#messenger" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">native/messenger.py</span></code> wraps ZeroMQ <code class="docutils literal notranslate"><span class="pre">ROUTER</span></code>/<code class="docutils literal notranslate"><span class="pre">DEALER</span></code> sockets and owns a listener thread per socket. <code class="docutils literal notranslate"><span class="pre">native/transfer.py</span></code> builds the actual endpoints on top: <code class="docutils literal notranslate"><span class="pre">Sender</span></code> on the context side, <code class="docutils literal notranslate"><span class="pre">Receiver</span></code> on the generation side, and a rendezvous server on rank 0. Listener handlers mutate session state and enqueue work; they never block on a transfer.</p>
 </section>
-<section id="formatter">
-<h3>Formatter<a class="headerlink" href="#formatter" title="Link to this heading">#</a></h3>
-<p>Performs KV cache data transmission and correctly handles the mapping between caches across different TP/PP configurations.</p>
+<section id="peer-registrar-and-mappers">
+<h3>Peer Registrar and Mappers<a class="headerlink" href="#peer-registrar-and-mappers" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">native/peer.py</span></code> resolves which peer ranks hold the same layers when context and generation use different TP/PP/DP configurations, and elects exactly one owner per destination so nothing is transferred twice. <code class="docutils literal notranslate"><span class="pre">native/mixers/</span></code> holds the per-architecture layout policies that turn a matched pool pair into <code class="docutils literal notranslate"><span class="pre">(src_ptrs,</span> <span class="pre">dst_ptrs,</span> <span class="pre">sizes)</span></code> — separate mappers for matching head counts, for head-major and token-major mismatches, for replicated pools, and for Mamba conv and SSM state.</p>
 </section>
-<section id="connection">
-<h3>Connection<a class="headerlink" href="#connection" title="Link to this heading">#</a></h3>
-<p>Bidirectional byte-stream protocol facility. Apart from essential operations such as connection establishment, it mainly provides send and receive functionalities. UCX accesses the system through this facility. The <code class="docutils literal notranslate"><span class="pre">AgentConnection</span></code> data structure adapts the upper-layer bidirectional send/receive semantics into a unidirectional read/write operation model.</p>
+<section id="page-table">
+<h3>Page Table<a class="headerlink" href="#page-table" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">resource/page.py</span></code> describes a rank’s KV storage independently of which cache manager produced it, which is what lets a V1 context worker talk to a V2 generation worker. <code class="docutils literal notranslate"><span class="pre">resource/kv_extractor.py</span></code> builds it from either manager generation and turns block IDs into slot pointers; <code class="docutils literal notranslate"><span class="pre">resource/cache_reuse.py</span></code> reports the cached prefix length uniformly, so context-side reuse, generation-side reuse, and sliding-window stale prefixes all resolve without a special case.</p>
 </section>
 <section id="transfer-agent">
 <h3>Transfer Agent<a class="headerlink" href="#transfer-agent" title="Link to this heading">#</a></h3>
-<p>Unidirectional byte-stream read/write protocol facility. Apart from essential operations such as connection establishment, it primarily provides read and write functionalities. NIXL accesses the system through this facility.</p>
+<p>Unidirectional read/write protocol facility, defined by the <code class="docutils literal notranslate"><span class="pre">BaseTransferAgent</span></code> ABC in <code class="docutils literal notranslate"><span class="pre">base/agent.py</span></code>. It provides memory registration, remote agent loading, and transfer request submission. NIXL accesses the system through this facility, either through the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm_transfer_agent_binding</span></code> nanobind module (preferred, releases the GIL while waiting) or through the Python <code class="docutils literal notranslate"><span class="pre">nixl</span></code> package when <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_PY_NIXL_KVCACHE=1</span></code>.</p>
 </section>
 </section>
 <section id="customization">
 <h2>Customization<a class="headerlink" href="#customization" title="Link to this heading">#</a></h2>
-<p>At the current stage, the customization work mainly involves inheriting the low-level data plane interfaces to enable the invocation of third-party communication libraries, as well as defining the data structures required for establishing connections in the data plane.</p>
-<section id="encapsulation-and-overloading-of-low-level-communication-libraries">
-<h3>Encapsulation and Overloading of Low-Level Communication Libraries<a class="headerlink" href="#encapsulation-and-overloading-of-low-level-communication-libraries" title="Link to this heading">#</a></h3>
-<p>Each layer of interface described in the previous section supports overloading. Here, based on whether the underlying library uses a unidirectional or bidirectional protocol, we describe the customization methods respectively.</p>
-<p>If the underlying library you are integrating uses a unidirectional communication model, with read/write as its primary interfaces, you should inherit the <code class="docutils literal notranslate"><span class="pre">executor::kv_cache::BaseTransferAgent</span></code> data structure. This structure mainly provides interfaces for memory registration, remote agent loading, and transfer request submission.</p>
-<p>If the underlying library you are integrating uses a bidirectional communication model, you should inherit the <code class="docutils literal notranslate"><span class="pre">executor::kv_cache::Connection</span></code> data structure. This structure mainly provides send and receive interfaces.</p>
+<section id="integrating-a-new-transport">
+<h3>Integrating a New Transport<a class="headerlink" href="#integrating-a-new-transport" title="Link to this heading">#</a></h3>
+<p>Inherit <code class="docutils literal notranslate"><span class="pre">BaseTransferAgent</span></code>. Any transport that can perform one-sided writes into registered remote memory fits; everything above the agent is transport-agnostic. Note that agent selection today happens in <code class="docutils literal notranslate"><span class="pre">nixl/agent.py</span></code> and <code class="docutils literal notranslate"><span class="pre">TransferWorker._setup_transfer_engine</span></code> constructs a NIXL agent directly, so a new backend needs a hook there as well — there is no configuration-driven agent registry yet.</p>
+<p>Note also that <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/</span></code> outlives the C++ transceiver: it builds the nanobind module that <code class="docutils literal notranslate"><span class="pre">base/agent.py</span></code> and <code class="docutils literal notranslate"><span class="pre">nixl/_agent_cpp.py</span></code> import.</p>
 </section>
-<section id="modifications-to-upper-level-runtime-logic">
-<h3>Modifications to Upper-Level Runtime Logic<a class="headerlink" href="#modifications-to-upper-level-runtime-logic" title="Link to this heading">#</a></h3>
-<p>This corresponds to the communication info section shown in the figure above. Since different underlying communication connections may require completely different setup methods—for example, some use IP and port, others require a world rank, and some communication libraries establish connections using binary-transparent metadata—we provide sufficient flexibility to allow users to customize this part as needed.</p>
+<section id="supporting-a-new-cache-layout">
+<h3>Supporting a New Cache Layout<a class="headerlink" href="#supporting-a-new-cache-layout" title="Link to this heading">#</a></h3>
+<p>A new storage layout usually means a new mapper under <code class="docutils literal notranslate"><span class="pre">native/mixers/</span></code> plus a page-table builder change in <code class="docutils literal notranslate"><span class="pre">resource/kv_extractor.py</span></code>. Both peers must agree: pool role and mapper kind are matched exactly, and a mismatch raises rather than silently transferring a subset.</p>
+<p>Unit tests for these seams live in <code class="docutils literal notranslate"><span class="pre">tests/unittest/disaggregated/</span></code> — byte-level transfer checks, topology and mapper selection, page-table construction, and multi-process end-to-end coverage.</p>
 </section>
 </section>
-<section id="evolution-outlook">
-<h2>Evolution Outlook<a class="headerlink" href="#evolution-outlook" title="Link to this heading">#</a></h2>
-<p>Currently, the architecture of KV transfer is being optimized. First, we plan to move the control plane logic up to Python to enable better integration with the Python runtime. In addition, we are reevaluating the current design choice of initiating communication only after the context computation is completed, which was originally made for flexibility. Lastly, since some control logic is still being transmitted through the data plane, we aim to clarify the relationship between the control and data planes, and to simplify and streamline the code logic of the data plane. Due to the modular architecture, these iterative enhancements are only loosely coupled with the <code class="docutils literal notranslate"><span class="pre">TransferAgent</span></code>. We aim to minimize the impact of future upgrades on third-party integrations.</p>
+<section id="current-limitations">
+<h2>Current Limitations<a class="headerlink" href="#current-limitations" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>NIXL only.</strong> MPI, UCX, and Mooncake deployments stay on the C++ transceiver.</p></li>
+<li><p><strong>One KV slice per request.</strong> The whole prompt moves in a single transfer after prefill completes. The session machinery is multi-slice capable and <code class="docutils literal notranslate"><span class="pre">KVSlice.layer_range</span></code> exists, but no producer sets it — there is no layer-wise or chunked transfer overlapping compute yet.</p></li>
+<li><p><strong>Both sides must run the same build and the same transceiver runtime.</strong> <code class="docutils literal notranslate"><span class="pre">RankInfo</span></code> is serialized field for field and carries no version tag, so there is nothing to negotiate against. Pairing a C++ context worker with a Python generation worker fails on the first request, because the context worker publishes no <code class="docutils literal notranslate"><span class="pre">disagg_info_endpoint</span></code>.</p></li>
+<li><p><strong>Submitted NIXL operations cannot be aborted.</strong> Cancellation is cooperative: an operation already handed to the transfer agent runs to completion. Lifecycle ownership is not complete either — safe retirement of a session after an ambiguous failure or a cancellation is not fully enforced, so do not assume the KV pages are reclaimed at a well-defined point on those paths.</p></li>
+</ul>
 </section>
 </section>
 
@@ -693,11 +700,11 @@
       </div>
     </a>
     <a class="right-next"
-       href="telemetry.html"
+       href="kv-cache-cold-page-codec.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Telemetry</p>
+        <p class="prev-next-title">KVCacheManagerV2 Cold-Page Codec Design</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -726,18 +733,18 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#workflow">Workflow</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-components">Key Components</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#transceiver">Transceiver</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sender-and-receiver">Sender and Receiver</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#formatter">Formatter</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#connection">Connection</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#messenger">Messenger</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#peer-registrar-and-mappers">Peer Registrar and Mappers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#page-table">Page Table</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#transfer-agent">Transfer Agent</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customization">Customization</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#encapsulation-and-overloading-of-low-level-communication-libraries">Encapsulation and Overloading of Low-Level Communication Libraries</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#modifications-to-upper-level-runtime-logic">Modifications to Upper-Level Runtime Logic</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#integrating-a-new-transport">Integrating a New Transport</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#supporting-a-new-cache-layout">Supporting a New Cache Layout</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#evolution-outlook">Evolution Outlook</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-limitations">Current Limitations</a></li>
 </ul>
   </nav></div>
 
@@ -756,8 +763,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -829,9 +836,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       

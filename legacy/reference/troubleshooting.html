@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
 
 
 
@@ -52,7 +52,7 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../_static/config_selector.js?v=5991fb72"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'legacy/reference/troubleshooting';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc24" />
+  <meta name="docsearch:version" content="1.3.0rc25" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -408,7 +408,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
@@ -479,7 +479,7 @@
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
@@ -493,11 +493,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
@@ -622,7 +624,7 @@
         <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
         <span class="c1"># Here register the tensor `inter` as our debug output tensor</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;inter&#39;</span><span class="p">,</span> <span class="n">inter</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">'inter'</span><span class="p">,</span> <span class="n">inter</span><span class="p">)</span>
         <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">output</span>
 </pre></div>
@@ -638,7 +640,7 @@
 <li><p>Print the tensors at runtime.</p></li>
 </ol>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;inter&#39;</span><span class="p">])</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">'inter'</span><span class="p">])</span>
 </pre></div>
 </div>
 </section>
@@ -656,7 +658,7 @@
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
         <span class="c1"># Register as model output</span>
         <span class="c1"># ------------------------------------------------------</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">'mlp_output'</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
         <span class="c1"># ------------------------------------------------------</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
@@ -702,14 +704,14 @@ trtllm-build<span class="w"> </span><span class="se">\</span>
             <span class="n">ok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Executing TRT engine failed step=</span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">!&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Executing TRT engine failed step=</span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">!"</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
             <span class="c1"># -------------------------------------------</span>
             <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="nb">print</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
-            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Step: </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-            <span class="nb">print</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="p">[</span><span class="s1">&#39;transformer.layers.6.mlp_output&#39;</span><span class="p">])</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Step: </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="p">[</span><span class="s1">'transformer.layers.6.mlp_output'</span><span class="p">])</span>
             <span class="c1"># -------------------------------------------</span>
 </pre></div>
 </div>
@@ -728,7 +730,7 @@ trtllm-build<span class="w"> </span><span class="se">\</span>
 <li><p>See the value of the tensor.</p></li>
 </ol>
 <div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>......
-dict_keys([&#39;context_lengths&#39;, &#39;cache_indirection&#39;, &#39;position_ids&#39;, &#39;logits&#39;, &#39;last_token_ids&#39;, &#39;input_ids&#39;, &#39;kv_cache_block_pointers&#39;, &#39;host_kv_cache_block_pointers&#39;, &#39;sequence_length&#39;, &#39;host_past_key_value_lengths&#39;, &#39;host_sink_token_length&#39;, &#39;host_request_types&#39;, &#39;host_max_attention_window_sizes&#39;, &#39;host_context_lengths&#39;, &#39;transformer.layers.0.mlp_output&#39;, &#39;transformer.layers.1.mlp_output&#39;, &#39;transformer.layers.2.mlp_output&#39;, &#39;transformer.layers.3.mlp_output&#39;, &#39;transformer.layers.4.mlp_output&#39;, &#39;transformer.layers.5.mlp_output&#39;, &#39;transformer.layers.6.mlp_output&#39;, &#39;transformer.layers.7.mlp_output&#39;, &#39;transformer.layers.8.mlp_output&#39;, &#39;transformer.layers.9.mlp_output&#39;, &#39;transformer.layers.10.mlp_output&#39;, &#39;transformer.layers.11.mlp_output&#39;, &#39;transformer.layers.12.mlp_output&#39;, &#39;transformer.layers.13.mlp_output&#39;, &#39;transformer.layers.14.mlp_output&#39;, &#39;transformer.layers.15.mlp_output&#39;, &#39;transformer.layers.16.mlp_output&#39;, &#39;transformer.layers.17.mlp_output&#39;, &#39;transformer.layers.18.mlp_output&#39;, &#39;transformer.layers.19.mlp_output&#39;, &#39;transformer.layers.20.mlp_output&#39;, &#39;transformer.layers.21.mlp_output&#39;, &#39;transformer.layers.22.mlp_output&#39;, &#39;transformer.layers.23.mlp_output&#39;])
+dict_keys(['context_lengths', 'cache_indirection', 'position_ids', 'logits', 'last_token_ids', 'input_ids', 'kv_cache_block_pointers', 'host_kv_cache_block_pointers', 'sequence_length', 'host_past_key_value_lengths', 'host_sink_token_length', 'host_request_types', 'host_max_attention_window_sizes', 'host_context_lengths', 'transformer.layers.0.mlp_output', 'transformer.layers.1.mlp_output', 'transformer.layers.2.mlp_output', 'transformer.layers.3.mlp_output', 'transformer.layers.4.mlp_output', 'transformer.layers.5.mlp_output', 'transformer.layers.6.mlp_output', 'transformer.layers.7.mlp_output', 'transformer.layers.8.mlp_output', 'transformer.layers.9.mlp_output', 'transformer.layers.10.mlp_output', 'transformer.layers.11.mlp_output', 'transformer.layers.12.mlp_output', 'transformer.layers.13.mlp_output', 'transformer.layers.14.mlp_output', 'transformer.layers.15.mlp_output', 'transformer.layers.16.mlp_output', 'transformer.layers.17.mlp_output', 'transformer.layers.18.mlp_output', 'transformer.layers.19.mlp_output', 'transformer.layers.20.mlp_output', 'transformer.layers.21.mlp_output', 'transformer.layers.22.mlp_output', 'transformer.layers.23.mlp_output'])
 Step: 0
 tensor([[ 0.0294, -0.0260, -0.0776,  ..., -0.0560, -0.0235,  0.0273],
         [-0.0071,  0.5879,  0.1993,  ..., -1.0449, -0.6299,  0.5957],
@@ -737,30 +739,30 @@ tensor([[ 0.0294, -0.0260, -0.0776,  ..., -0.0560, -0.0235,  0.0273],
         [ 0.1212, -0.0903, -0.5918,  ..., -0.1045, -0.3445,  0.1082],
         [-1.0723, -0.0732,  0.6157,  ...,  0.3452,  0.2998,  0.2649],
         [-0.7134,  0.9692, -0.1141,  ..., -0.0096,  0.9521,  0.1437]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 1
 tensor([[-0.2107,  0.5874,  0.8179,  ...,  0.7900, -0.6890,  0.6064]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 2
 tensor([[ 0.4192, -0.0047,  1.3887,  ..., -0.9028, -0.0682, -0.2820]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 3
 tensor([[-0.7949, -0.5073, -0.1721,  ..., -0.5830, -0.1378, -0.0070]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 4
 tensor([[-0.0804,  0.1272, -0.6255,  ..., -0.1072, -0.0523,  0.7144]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 5
 tensor([[-0.3328, -0.8828,  0.3442,  ...,  0.8149, -0.0630,  1.2305]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 6
 tensor([[-0.2225, -0.2079, -0.1459,  ..., -0.3555, -0.1672,  0.1135]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
+       device='cuda:0', dtype=torch.float16)
 Step: 7
 tensor([[ 0.1290, -0.1556,  0.3977,  ..., -0.8218, -0.3291, -0.8672]],
-       device=&#39;cuda:0&#39;, dtype=torch.float16)
-Input [Text 0]: &quot;Born in north-east France, Soyer trained as a&quot;
-Output [Text 0 Beam 0]: &quot; chef before moving to London in the early&quot;
+       device='cuda:0', dtype=torch.float16)
+Input [Text 0]: "Born in north-east France, Soyer trained as a"
+Output [Text 0 Beam 0]: " chef before moving to London in the early"
 </pre></div>
 </div>
 </section>
@@ -769,9 +771,9 @@ Output [Text 0 Beam 0]: &quot; chef before moving to London in the early&quot;
 <p>If problems come from plugins, try setting the environment variable <code class="docutils literal notranslate"><span class="pre">CUDA_LAUNCH_BLOCKING=1</span></code> to make kernels launch synchronously with their return status checked immediately.</p>
 <p>If problems come from runtime-shape of the input tensors, double-check the shape (rank and length of each rank) and location (CPU / GPU) of input tensors for the engine obey the build-time setting.</p>
 <p>For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users’ rewriting), too large or too small input shape, etc..</p>
-<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>unexpected shape for input &#39;XXX&#39; for model &#39;YYY&#39;. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>unexpected shape for input 'XXX' for model 'YYY'. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.
 
-[TensorRT-LLM][ERROR] Assertion failed: Tensor &#39;input_ids&#39; has invalid shape (8192), expected (-1) (/code/tensorrt_llm/cpp/tensorrt_llm/runtime/tllmRuntime.cpp:149)
+[TensorRT-LLM][ERROR] Assertion failed: Tensor 'input_ids' has invalid shape (8192), expected (-1) (/code/tensorrt_llm/cpp/tensorrt_llm/runtime/tllmRuntime.cpp:149)
 
 RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 8192 but got size 1024 for tensor number 1 in the list.
 </pre></div>
@@ -882,15 +884,15 @@ encounter interferences:</p>
 <span class="n">PMI2_Init</span> <span class="n">failed</span> <span class="n">to</span> <span class="n">initialize</span><span class="o">.</span>  <span class="n">Return</span> <span class="n">code</span><span class="p">:</span> <span class="mi">14</span>
 <span class="o">--------------------------------------------------------------------------</span>
 <span class="o">--------------------------------------------------------------------------</span>
-<span class="n">The</span> <span class="n">application</span> <span class="n">appears</span> <span class="n">to</span> <span class="n">have</span> <span class="n">been</span> <span class="n">direct</span> <span class="n">launched</span> <span class="n">using</span> <span class="s2">&quot;srun&quot;</span><span class="p">,</span>
-<span class="n">but</span> <span class="n">OMPI</span> <span class="n">was</span> <span class="ow">not</span> <span class="n">built</span> <span class="k">with</span> <span class="n">SLURM</span><span class="s1">&#39;s PMI support and therefore cannot</span>
+<span class="n">The</span> <span class="n">application</span> <span class="n">appears</span> <span class="n">to</span> <span class="n">have</span> <span class="n">been</span> <span class="n">direct</span> <span class="n">launched</span> <span class="n">using</span> <span class="s2">"srun"</span><span class="p">,</span>
+<span class="n">but</span> <span class="n">OMPI</span> <span class="n">was</span> <span class="ow">not</span> <span class="n">built</span> <span class="k">with</span> <span class="n">SLURM</span><span class="s1">'s PMI support and therefore cannot</span>
 <span class="n">execute</span><span class="o">.</span> <span class="n">There</span> <span class="n">are</span> <span class="n">several</span> <span class="n">options</span> <span class="k">for</span> <span class="n">building</span> <span class="n">PMI</span> <span class="n">support</span> <span class="n">under</span>
 <span class="n">SLURM</span><span class="p">,</span> <span class="n">depending</span> <span class="n">upon</span> <span class="n">the</span> <span class="n">SLURM</span> <span class="n">version</span> <span class="n">you</span> <span class="n">are</span> <span class="n">using</span><span class="p">:</span>
 
-  <span class="n">version</span> <span class="mf">16.05</span> <span class="ow">or</span> <span class="n">later</span><span class="p">:</span> <span class="n">you</span> <span class="n">can</span> <span class="n">use</span> <span class="n">SLURM</span><span class="s1">&#39;s PMIx support. This</span>
+  <span class="n">version</span> <span class="mf">16.05</span> <span class="ow">or</span> <span class="n">later</span><span class="p">:</span> <span class="n">you</span> <span class="n">can</span> <span class="n">use</span> <span class="n">SLURM</span><span class="s1">'s PMIx support. This</span>
   <span class="n">requires</span> <span class="n">that</span> <span class="n">you</span> <span class="n">configure</span> <span class="ow">and</span> <span class="n">build</span> <span class="n">SLURM</span> <span class="o">--</span><span class="k">with</span><span class="o">-</span><span class="n">pmix</span><span class="o">.</span>
 
-  <span class="n">Versions</span> <span class="n">earlier</span> <span class="n">than</span> <span class="mf">16.05</span><span class="p">:</span> <span class="n">you</span> <span class="n">must</span> <span class="n">use</span> <span class="n">either</span> <span class="n">SLURM</span><span class="s1">&#39;s PMI-1 or</span>
+  <span class="n">Versions</span> <span class="n">earlier</span> <span class="n">than</span> <span class="mf">16.05</span><span class="p">:</span> <span class="n">you</span> <span class="n">must</span> <span class="n">use</span> <span class="n">either</span> <span class="n">SLURM</span><span class="s1">'s PMI-1 or</span>
   <span class="n">PMI</span><span class="o">-</span><span class="mi">2</span> <span class="n">support</span><span class="o">.</span> <span class="n">SLURM</span> <span class="n">builds</span> <span class="n">PMI</span><span class="o">-</span><span class="mi">1</span> <span class="n">by</span> <span class="n">default</span><span class="p">,</span> <span class="ow">or</span> <span class="n">you</span> <span class="n">can</span> <span class="n">manually</span>
   <span class="n">install</span> <span class="n">PMI</span><span class="o">-</span><span class="mf">2.</span> <span class="n">You</span> <span class="n">must</span> <span class="n">then</span> <span class="n">build</span> <span class="n">Open</span> <span class="n">MPI</span> <span class="n">using</span> <span class="o">--</span><span class="k">with</span><span class="o">-</span><span class="n">pmi</span> <span class="n">pointing</span>
   <span class="n">to</span> <span class="n">the</span> <span class="n">SLURM</span> <span class="n">PMI</span> <span class="n">library</span> <span class="n">location</span><span class="o">.</span>
@@ -962,8 +964,8 @@ dedicated MPI environment, not the one provided by your Slurm allocation.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
 
 
   <footer class="bd-footer">
@@ -1035,9 +1037,9 @@ dedicated MPI environment, not the one provided by your Slurm allocation.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 09, 2026.</p>
+  <p>Last updated on August 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
   
 </div></div>
       
