@@ -1083,19 +1083,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 )
 
     def prepare_for_spec_decode(self, kv_lens: torch.Tensor):
-        # fp8_paged_mqa_logits supports seq_len 1/2/4 on sm100 and 1/2 on
-        # sm90. Flatten Q and expand kv_lens and block_table for other MTP
-        # configurations.
+        # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits, vendored at
+        # DeepGEMM@8b1392b) runs a native next_n >= 1 on sm100+: the scheduler
+        # decomposes next_n into atoms of <= 2, so no per-draft-token Q flatten /
+        # kv_lens / block_table expansion is needed on Blackwell for any MTP
+        # depth. sm90 still lacks native MTP support (seq_len 1/2 only) and must
+        # expand for max_draft_tokens > 1.
         # TODO:
-        # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
-        # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+        # - Drop this sm90 branch (and the expanded buffers) once
+        #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
-        self.use_expanded_buffers_for_mtp = not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or (
-                (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100
-            )
+        self.use_expanded_buffers_for_mtp = (
+            not use_dsl and self.max_draft_tokens > 1 and get_sm_version() == 90
         )
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
