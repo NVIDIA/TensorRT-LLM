@@ -77,7 +77,9 @@ class BaseDiffusionModel(nn.Module):
         if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
             return
 
-        disabled_until_timestep = sparse_config.disabled_until_timestep
+        disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
+            pretrained_config=self.model_config.pretrained_config,
+        )
         if disabled_until_timestep is None:
             return
 
