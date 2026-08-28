@@ -17,13 +17,15 @@ import pytest
 
 from tensorrt_llm._torch.attention_backend.fmha import registry
 
-EXPECTED_DEFAULT_LIBS = (
-    "msa_sparse_gqa",
+EXPECTED_CANONICAL_LIBS = (
     "prims_ts",
     "cute_dsl_mla",
+    "msa_sparse_gqa",
+    "flashinfer_sparse_mla",
     "flashinfer_trtllm_gen",
     "fallback",
 )
+EXPECTED_DEFAULT_LIBS = tuple(name for name in EXPECTED_CANONICAL_LIBS if name != "prims_ts")
 
 
 def _enabled_names() -> tuple[str, ...]:
@@ -32,11 +34,11 @@ def _enabled_names() -> tuple[str, ...]:
     return tuple(names_by_class[cls] for cls in classes)
 
 
-def test_default_fmha_lib_order_prioritizes_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
     assert registry.DEFAULT_FMHA_LIBS == EXPECTED_DEFAULT_LIBS
-    assert tuple(registry.FMHA_LIBS) == EXPECTED_DEFAULT_LIBS
+    assert tuple(registry.FMHA_LIBS) == EXPECTED_CANONICAL_LIBS
     assert _enabled_names() == EXPECTED_DEFAULT_LIBS
 
 
@@ -65,19 +67,10 @@ def test_exact_fmha_lib_env_preserves_order_and_deduplicates(
     )
 
 
-def test_delta_fmha_lib_env_applies_entries_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(
-        "TLLM_FMHA_LIBS",
-        "-prims_ts, -fallback, +fallback, +prims_ts",
-    )
+def test_delta_fmha_lib_env_emits_canonical_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
 
-    assert _enabled_names() == (
-        "msa_sparse_gqa",
-        "cute_dsl_mla",
-        "flashinfer_trtllm_gen",
-        "fallback",
-        "prims_ts",
-    )
+    assert _enabled_names() == EXPECTED_CANONICAL_LIBS
 
 
 @pytest.mark.parametrize(
