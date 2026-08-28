@@ -97,16 +97,22 @@ class Attention(nn.Module):
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
-        _is_vsa = (
-            base_backend == "CUTEDSL"
-            and _sa_cfg is not None
-            and getattr(_sa_cfg, "algorithm", None) == "vsa"
-        )
+        _sa_algo = getattr(_sa_cfg, "algorithm", None) if _sa_cfg is not None else None
+        _is_vsa = base_backend == "CUTEDSL" and _sa_algo == "vsa"
+        _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
+        # Cross-attention fallback: TRTLLM and CUTEDSL VSA/Sol-Attn are self-attn only.
+        if self.qkv_mode == QKVMode.SEPARATE_QKV and (
+            base_backend == "TRTLLM" or _is_vsa or _is_sol_attn
+        ):
             backend_name = "VANILLA"
-            requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
+            requested = (
+                f"{base_backend} (VSA)"
+                if _is_vsa
+                else f"{base_backend} (Sol-Attn)"
+                if _is_sol_attn
+                else base_backend
+            )
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
             logger.warning_once(
@@ -120,6 +126,12 @@ class Attention(nn.Module):
         if _is_vsa and cp_size > 1:
             raise ValueError(
                 f"VSA needs the full token sequence per rank, so it is incompatible "
+                f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
+                f"ulysses or cfg parallelism instead."
+            )
+        if _is_sol_attn and cp_size > 1:
+            raise ValueError(
+                f"Sol-Attn needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )

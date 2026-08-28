@@ -57,13 +57,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     )
     target_sparsity: Optional[float] = PydanticField(
         default=None,
-        ge=0.0,
+        gt=0.0,
         le=1.0,
         description="Semantic target sparsity in [0, 1]; requires a calibration formula.",
     )
     disabled_until_timestep: Optional[float] = PydanticField(
         default=None,
-        ge=0.0,
+        gt=0.0,
         le=1.0,
         description="Normalized timestep cutoff below which skip-softmax is enabled.",
     )
@@ -221,6 +221,72 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return None
 
 
+class SolAttnAttentionConfig(BaseSparseAttentionConfig):
+    """Sol-Attn sparse attention configuration for visual generation.
+
+    Dynamic block routing + sparse computation + approximation correction in
+    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL, sm100
+    (B200/GB200) and sm120 (RTX Blackwell) only, head_dim=128, bf16, MHA.
+
+    On an unsupported *shape, dtype, or architecture* the kernel falls back to
+    dense SDPA and counts the fallback, so setting this config on the wrong GPU
+    degrades rather than fails. Two cases are not covered by that fallback and do raise: GQA/MQA
+    (num_kv_heads != num_heads) here at construction, and context parallelism
+    (cp_size > 1), rejected in visual_gen/modules/attention.py.
+    """
+
+    algorithm: Literal["sol_attn"] = "sol_attn"
+    tau: float = PydanticField(
+        1.0,
+        description="Per-block routing threshold; higher tau routes more blocks sparse.",
+    )
+    thresh_type: Literal["diag", "exact"] = PydanticField(
+        "diag",
+        description="Threshold policy forwarded to the kernel (kernel default: 'diag').",
+    )
+    kv_splits: Literal["auto", "1"] = PydanticField(
+        "auto",
+        description=(
+            "KV split policy. Only 1 split is valid on the shipped sm100/sm120 "
+            "kernels, so 'auto' and '1' are equivalent; the 2/4 path was "
+            "SM90-only and returns with that kernel. Constrained rather than a "
+            "free string because any other value is rejected deep inside the "
+            "kernel, which would silently degrade the whole run to dense."
+        ),
+    )
+    disabled_until_timestep: Optional[float] = PydanticField(
+        None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Dense-prefix cutoff on the normalized denoising timestep, with the "
+            "same sense as skip_softmax's field of the same name: the layer runs "
+            "dense while timestep >= this value and switches to the sparse kernel "
+            "below it. Larger timesteps are earlier, noisier steps, so this "
+            "protects the high-noise prefix. Use None (not 0.0) to disable the "
+            "prefix; 0.0 is rejected because it would run dense on every step "
+            "and silently turn Sol-Attn off entirely. "
+            "The timestep is supplied as a forward kwarg by every VisualGen "
+            "pipeline, so no per-pipeline wiring is required."
+        ),
+    )
+    dense_layers: Optional[str] = PydanticField(
+        None,
+        description=(
+            "Comma-separated layer indices/ranges (e.g. '0,2-4') forced dense "
+            "regardless of the dense prefix. Evaluated per-layer at construction "
+            "time; no pipeline wiring required."
+        ),
+    )
+
+    def to_sparse_params(self, **kwargs):
+        # Sol-Attn's knobs are consumed directly by SolAttnAttention.__init__
+        # (constructed via CUTEDSL backend dispatch in create_attention), not
+        # lowered into a shared SparseParams -- the vendored kernel has no
+        # checkpoint-calibration step to resolve here, unlike skip_softmax.
+        return None
+
+
 class VideoSparseAttentionConfig(StrictBaseModel):
     """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
 
@@ -235,7 +301,7 @@ class VideoSparseAttentionConfig(StrictBaseModel):
     )
     vsa_sparsity: float = PydanticField(
         0.9,
-        ge=0.0,
+        gt=0.0,
         le=1.0,
         description=(
             "Fraction of cubes dropped on the fine stage. 0.0 keeps all cubes "
