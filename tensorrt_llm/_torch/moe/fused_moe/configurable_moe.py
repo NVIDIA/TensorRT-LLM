@@ -489,10 +489,13 @@ class ConfigurableMoE(MoE):
         Extract quantization configuration from model_config
 
         """
-        if model_config.quant_config is None:
+        # Prefer the resolved per-module override (e.g. W4A8_AWQ for experts)
+        # over the global config which may be MIXED_PRECISION.
+        quant_config = getattr(self, "_override_quant_config", None) or model_config.quant_config
+        if quant_config is None:
             return None
 
-        quant_mode = model_config.quant_config.layer_quant_mode
+        quant_mode = quant_config.layer_quant_mode
         return {
             "has_fp8_qdq": quant_mode.has_fp8_qdq()
             if hasattr(quant_mode, "has_fp8_qdq")
