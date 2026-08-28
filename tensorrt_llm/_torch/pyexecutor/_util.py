@@ -698,13 +698,14 @@ class KvCacheCreator:
                                 manager_cls,
                                 model_config,
                                 kv_cache_config: Optional[KvCacheConfig] = None,
+                                mapping=None,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
         return CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
-                self._mapping,
+                mapping if mapping is not None else self._mapping,
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
@@ -734,6 +735,17 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
+        # DRAFT cost unit convention under helix: compute per GLOBAL token with
+        # the same repurposed mapping runtime construction uses (the drafter is
+        # dense, not helix-sharded), then multiply by cp_size to express it per
+        # rank-LOCAL target token so the split's slopes share a unit (the
+        # target stores only every cp_size-th page per rank). Intercepts are
+        # per-request rank-local bytes and stay unscaled.
+        draft_mapping = self._mapping
+        helix_cp_scale = 1
+        if self._mapping.has_cp_helix():
+            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
+            helix_cp_scale = self._mapping.cp_size
         total = self._per_manager_cache_cost(
             self._kv_cache_manager_cls,
             model_config,
@@ -745,9 +757,13 @@ class KvCacheCreator:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
-            total += self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                  draft_model_config,
-                                                  kv_cache_config)
+            draft_cost = self._per_manager_cache_cost(
+                draft_kv_cache_manager_cls,
+                draft_model_config,
+                kv_cache_config,
+                mapping=draft_mapping)
+            total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
+                               intercept=draft_cost.intercept)
         elif use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -766,17 +782,24 @@ class KvCacheCreator:
                     effective_draft_config,
                     draft_kv_cache_config,
                     is_disagg=self._is_disagg)
-                total += self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls, effective_draft_config,
-                    draft_kv_cache_config)
+                draft_cost = self._per_manager_cache_cost(
+                    draft_kv_cache_manager_cls,
+                    effective_draft_config,
+                    draft_kv_cache_config,
+                    mapping=draft_mapping)
+                total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
+                                   intercept=draft_cost.intercept)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
-                total += self._per_manager_cache_cost(
+                draft_cost = self._per_manager_cache_cost(
                     self._kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
+                    mapping=draft_mapping,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
+                total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
+                                   intercept=draft_cost.intercept)
         return total
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,

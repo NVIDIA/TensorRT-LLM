@@ -305,6 +305,22 @@ def get_qwen3_hybrid_num_attention_layers(config):
     return sum(layer_mask)
 
 
+def mamba_effective_tp_size(mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
+
+    Attention-DP replicates the state and takes precedence; helix repurposes
+    CP ranks as plain TP for recurrent-state layers. Must match the runtime
+    pool construction (mamba_cache_manager) or the budget split withholds
+    unsharded-state bytes the allocator never uses (observed: 27.2 GiB/rank
+    mis-withheld on a helix16 gen worker whose real pool is 1/16-sharded).
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
+
+
 @dataclasses.dataclass
 class MambaKVCacheParams:
     """Normalized mamba-related inputs for kv_cache_manager_cls.
@@ -364,7 +380,7 @@ class MambaKVCacheParams:
 
     def get_states_bytes_per_layer(self, mapping) -> int:
         """Return the total bytes of Mamba state per layer, used for budgeting."""
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = mamba_effective_tp_size(mapping)
         d_inner = self.head_dim * self.num_heads
         conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
         nheads = self.num_heads // tp_size
