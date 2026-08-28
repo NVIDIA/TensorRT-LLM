@@ -139,7 +139,7 @@ Omit `quant_config` for BF16/FP16 baseline.
 In addition to linear-layer quantization, VisualGen exposes several **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
 
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
-- **FP8 / MXFP8** (`CUDNN` backend): Runs cuDNN's fused FP8 SDPA. `qk_dtype='fp8'` uses one scale per tensor; `qk_dtype='mxfp8'` with `v_dtype='mxfp8'` uses MXFP8 block scaling. Both require Blackwell-class GPUs and `head_dim <= 128`.
+- **FP8 / MXFP8** (`CUDNN` backend): Runs cuDNN's fused FP8 SDPA. `qk_dtype='fp8'` uses one scale per tensor; `qk_dtype='mxfp8'` with `v_dtype='mxfp8'` uses MXFP8 block scaling. Both require Blackwell-class GPUs and `head_dim in {32, 64, 96, 128}`.
 - **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
 
 
