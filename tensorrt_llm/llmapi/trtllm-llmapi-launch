@@ -57,13 +57,13 @@ function use_unique_flashinfer_workspace {
     local workspace
 
     if ! workspace=$(mktemp -d "$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.XXXXXXXX"); then
-        log_stderr "Failed to create a temporary FlashInfer JIT workspace"
-        return 1
+        log_stderr "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
+        exit 1
     fi
 
     flashinfer_temporary_workspace="$workspace"
     export FLASHINFER_WORKSPACE_BASE="$workspace"
-    export TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER=1
+    export TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1
     set_shared_flashinfer_cubin_dir
     log_stderr "Using temporary FlashInfer JIT workspace after persistent workspace isolation failed: $FLASHINFER_WORKSPACE_BASE"
 }
@@ -121,6 +121,8 @@ function configure_flashinfer_workspace {
     local workspace_slot="$mpi_rank"
     local workspace
     local lock_status
+    # Slots intentionally persist for JIT cache reuse. Contention can create
+    # additional rank-N slots up to the high-water mark of concurrent jobs.
     while true; do
         workspace="$workspace_root/rank-$workspace_slot"
         if ! mkdir -p "$workspace" || ! exec 200>>"$workspace/.lock"; then
@@ -133,7 +135,7 @@ function configure_flashinfer_workspace {
         if try_lock_flashinfer_workspace; then
             flashinfer_workspace_lock_held=1
             export FLASHINFER_WORKSPACE_BASE="$workspace"
-            export TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER=1
+            export TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1
             set_shared_flashinfer_cubin_dir
             log_stderr "FlashInfer JIT workspace: $FLASHINFER_WORKSPACE_BASE"
             return

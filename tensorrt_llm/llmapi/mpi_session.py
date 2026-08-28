@@ -33,8 +33,7 @@ T = TypeVar("T")
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
-_FLASHINFER_WORKSPACE_FROM_LAUNCHER_ENV = (
-    "TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER")
+_FLASHINFER_WORKSPACE_MANAGED_ENV = "TRTLLM_FLASHINFER_WORKSPACE_MANAGED"
 _FLASHINFER_WORKER_BOOTSTRAP = """
 import fcntl
 import os
@@ -55,6 +54,8 @@ if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
         slot_stride = MPI.COMM_WORLD.Get_size()
         # Reuse the rank's cache when possible. Concurrent pools with the same
         # rank skip locked slots in world-size strides, keeping every worker apart.
+        # Slots intentionally persist for JIT cache reuse, so the workspace root
+        # can grow to the high-water mark of concurrent pools.
         while True:
             workspace = workspace_root / f"rank-{slot}"
             workspace.mkdir(parents=True, exist_ok=True)
@@ -88,7 +89,10 @@ if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
             raise RuntimeError(
                 f"rank {rank} could not create an isolated FlashInfer workspace; "
                 f"persistent setup failed with {error} and temporary setup "
-                f"failed with {temporary_error}"
+                f"failed with {temporary_error}. Configure "
+                f"FLASHINFER_WORKSPACE_BASE to a writable process-unique path, "
+                f"or set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 to disable "
+                f"automatic isolation if the shared-workspace risk is acceptable"
             ) from temporary_error
         os.environ["FLASHINFER_WORKSPACE_BASE"] = temporary_workspace.name
         print(
@@ -98,9 +102,11 @@ if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
             file=sys.stderr,
         )
 
-    # Preserve FlashInfer's default cubin cache before changing its workspace
-    # base. Importing flashinfer.jit.env here would initialize all of its
-    # workspace constants before the isolated base is configured.
+    os.environ["TRTLLM_FLASHINFER_WORKSPACE_MANAGED"] = "1"
+
+    # Preserve FlashInfer's default cubin cache without importing
+    # flashinfer.jit.env. The environment must be fully configured before that
+    # module initializes its workspace constants.
     if "FLASHINFER_CUBIN_DIR" not in os.environ and os.environ.get("HOME"):
         os.environ["FLASHINFER_CUBIN_DIR"] = str(
             Path(os.environ["HOME"]) / ".cache" / "flashinfer" / "cubins"
@@ -547,21 +553,20 @@ class MpiPoolSession(MpiSession):
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
                 "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
-        workspace_from_launcher = (
-            env.get(_FLASHINFER_WORKSPACE_FROM_LAUNCHER_ENV) == "1")
+        workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
         explicit_workspace_override = (_FLASHINFER_WORKSPACE_ENV
                                        in self._env_overrides)
         isolate_workspace = (
-            self.n_workers > 1
+            (self.n_workers > 1 or workspace_managed)
             and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
-                 (workspace_from_launcher and not explicit_workspace_override)))
+                 (workspace_managed and not explicit_workspace_override)))
         if isolate_workspace:
             env.pop(_FLASHINFER_WORKSPACE_ENV, None)
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
-            env.pop(_FLASHINFER_WORKSPACE_FROM_LAUNCHER_ENV, None)
+            env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
         python_args = ([
             "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
         ] if isolate_workspace else None)

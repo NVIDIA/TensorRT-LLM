@@ -137,6 +137,11 @@ the same generated source files without forcing a cold JIT compilation on
 every launch. Set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking
 the launcher or creating the LLM instance to disable this behavior.
 
+Persistent slots are not pruned automatically, so their count can grow with
+peak job concurrency. When no TensorRT-LLM processes are using the cache, the
+slots may be deleted safely; subsequent launches rebuild the removed JIT
+artifacts.
+
 If persistent workspace setup is unavailable, each process falls back to a
 process-unique temporary workspace that is removed when the process exits.
 Persistent cache reuse is not available for this fallback.

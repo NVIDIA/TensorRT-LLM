@@ -248,7 +248,45 @@ def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
 
     workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
     assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
-    assert "TRTLLM_FLASHINFER_WORKSPACE_FROM_LAUNCHER=1" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_aborts_when_no_workspace_is_available(
+        tmp_path: Path) -> None:
+    env = os.environ.copy()
+    for name in (
+            "SLURM_NTASKS",
+            "SLURM_PROCID",
+            "OMPI_COMM_WORLD_SIZE",
+            "OMPI_COMM_WORLD_RANK",
+            "PMI_SIZE",
+            "PMI_ID",
+            "FLASHINFER_WORKSPACE_BASE",
+            "FLASHINFER_CUBIN_DIR",
+            "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+    ):
+        env.pop(name, None)
+    env["PMI_RANK"] = "0"
+    env["HOME"] = ""
+    env["TMPDIR"] = str(tmp_path / "missing")
+
+    launcher = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+                "trtllm-llmapi-launch")
+    result = subprocess.run(  # nosec B603
+        ["/bin/bash", str(launcher), "/usr/bin/true"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
+        in result.stderr)
 
 
 # ---- wait_shutdown: shutdown blocks until worker processes actually exit ----
