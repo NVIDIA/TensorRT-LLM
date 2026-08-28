@@ -14,12 +14,12 @@
 # limitations under the License.
 """Regression tests for issue #13949.
 
-Ensures /v1/responses perf metrics parity with chat/completions.
+Ensures /v1/responses perf metrics parity with chat/completions, validated
+through the JSONL output interface (``perf_metrics_output_dir``).
 """
 
 import asyncio
 import inspect
-import json
 import logging
 import os
 import re
@@ -33,6 +33,7 @@ from openai.types.responses import (
     ResponseReasoningTextDeltaEvent,
     ResponseTextDeltaEvent,
 )
+from test_common.perf_metrics_utils import read_perf_metrics_jsonl, wait_for_perf_metrics_jsonl
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -46,8 +47,14 @@ _INPUT = "What is 1+1? Answer briefly."
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file():
-    """Write a temporary YAML file enabling return_perf_metrics and yield its path."""
+def perf_metrics_output_dir(tmp_path_factory):
+    """Shared directory where the server writes perf_metrics-*.jsonl records."""
+    return tmp_path_factory.mktemp("perf_metrics")
+
+
+@pytest.fixture(scope="module")
+def temp_extra_llm_api_options_file(perf_metrics_output_dir):
+    """Write a temporary YAML file enabling JSONL perf metrics output and yield its path."""
     fd, temp_file_path = tempfile.mkstemp(
         prefix="responses_perf_metrics_options_",
         suffix=".yaml",
@@ -56,7 +63,7 @@ def temp_extra_llm_api_options_file():
     try:
         extra_llm_api_options_dict = {
             "return_perf_metrics": True,
-            "perf_metrics_max_requests": 20,
+            "perf_metrics_output_dir": str(perf_metrics_output_dir),
         }
         with open(temp_file_path, "w", encoding="utf-8") as f:
             yaml.dump(extra_llm_api_options_dict, f)
@@ -89,16 +96,10 @@ def server(temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_perf_metrics(server: RemoteOpenAIServer) -> list:
-    """Return the current /perf_metrics list (may be empty)."""
-    response = urlopen(f"{server.url_root}/perf_metrics", timeout=5)  # noqa: S310
-    assert response.status == 200
-    return json.loads(response.read())
-
-
 def _assert_perf_metrics_entry_valid(entry: dict, context: str = ""):
-    """Assert that a single /perf_metrics entry has the expected structure."""
+    """Assert that a single JSONL perf_metrics record has the expected structure."""
     assert "request_id" in entry, f"{context}: missing 'request_id'"
+    assert entry["status"] == "complete", f"{context}: status != 'complete'"
     assert "perf_metrics" in entry, f"{context}: missing 'perf_metrics'"
 
     data = entry["perf_metrics"]
@@ -120,6 +121,11 @@ def _assert_perf_metrics_entry_valid(entry: dict, context: str = ""):
         f"{context}: first_token_time after last_token_time"
     )
 
+    kv_cache = data["kv_cache_metrics"]
+    assert kv_cache["num_new_allocated_blocks"] <= kv_cache["num_total_allocated_blocks"], (
+        f"{context}: num_new_allocated_blocks > num_total_allocated_blocks"
+    )
+
 
 def _parse_prometheus_counter(data: str, metric_name: str) -> float | None:
     """Return the value of a Prometheus counter/gauge line, or None."""
@@ -136,11 +142,13 @@ def _parse_prometheus_counter(data: str, metric_name: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def test_non_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServer):
-    """Non-streaming /v1/responses must append one entry to /perf_metrics."""
+def test_non_streaming_responses_populates_perf_metrics(
+    server: RemoteOpenAIServer,
+    perf_metrics_output_dir,
+):
+    """Non-streaming /v1/responses must append one JSONL record."""
     # Establish baseline count (other tests may have run first in the module).
-    before = _fetch_perf_metrics(server)
-    count_before = len(before)
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
 
     client = server.get_client()
     client.responses.create(
@@ -150,22 +158,24 @@ def test_non_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServ
         stream=False,
     )
 
-    after = _fetch_perf_metrics(server)
-    assert len(after) == count_before + 1, (
-        f"Expected exactly one new /perf_metrics entry after non-streaming "
-        f"/v1/responses; got {len(after) - count_before} new entries"
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, count_before + 1)
+    assert len(records) == count_before + 1, (
+        f"Expected exactly one new JSONL record after non-streaming "
+        f"/v1/responses; got {len(records) - count_before} new records"
     )
 
-    new_entry = after[-1]
+    new_entry = records[-1]
     _assert_perf_metrics_entry_valid(new_entry, "non-streaming responses")
     # Disaggregated-only fields must be absent.
     assert "ctx_request_id" not in new_entry
 
 
-def test_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServer):
-    """Streaming /v1/responses must append one entry to /perf_metrics after stream completes."""
-    before = _fetch_perf_metrics(server)
-    count_before = len(before)
+def test_streaming_responses_populates_perf_metrics(
+    server: RemoteOpenAIServer,
+    perf_metrics_output_dir,
+):
+    """Streaming /v1/responses must append one JSONL record after stream completes."""
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
 
     client = server.get_client()
     # Consume the entire stream so that create_streaming_generator runs to
@@ -179,13 +189,13 @@ def test_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServer):
     for _ in stream:
         pass
 
-    after = _fetch_perf_metrics(server)
-    assert len(after) == count_before + 1, (
-        f"Expected exactly one new /perf_metrics entry after streaming "
-        f"/v1/responses; got {len(after) - count_before} new entries"
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, count_before + 1)
+    assert len(records) == count_before + 1, (
+        f"Expected exactly one new JSONL record after streaming "
+        f"/v1/responses; got {len(records) - count_before} new records"
     )
 
-    new_entry = after[-1]
+    new_entry = records[-1]
     _assert_perf_metrics_entry_valid(new_entry, "streaming responses")
     assert "ctx_request_id" not in new_entry
 
@@ -193,10 +203,10 @@ def test_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServer):
 @pytest.mark.asyncio(loop_scope="module")
 async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
     server: RemoteOpenAIServer,
+    perf_metrics_output_dir,
 ):
-    """Partially consumed /v1/responses streams must not append completed perf_metrics entries."""
-    before = _fetch_perf_metrics(server)
-    count_before = len(before)
+    """Partially consumed /v1/responses streams must not append completed perf_metrics records."""
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
 
     client = server.get_async_client()
     cancel_input = (
@@ -221,8 +231,8 @@ async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
             assert isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)), (
                 "Expected a streamed delta event before cancellation"
             )
-            assert len(_fetch_perf_metrics(server)) == count_before, (
-                "/perf_metrics changed before the stream was cancelled, "
+            assert len(read_perf_metrics_jsonl(perf_metrics_output_dir)) == count_before, (
+                "JSONL perf metrics changed before the stream was cancelled, "
                 "which indicates the request may have already completed"
             )
             break
@@ -244,18 +254,20 @@ async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
 
     assert got_partial_event, "Expected at least one streamed event before cancellation"
 
-    # Observe for a short window to ensure no completed entry is appended later.
+    # Observe for a short window to ensure no completed record is appended later.
     for _ in range(6):
         await asyncio.sleep(0.5)
-        assert len(_fetch_perf_metrics(server)) == count_before, (
-            "Cancelled /v1/responses stream should not append /perf_metrics entries"
+        assert len(read_perf_metrics_jsonl(perf_metrics_output_dir)) == count_before, (
+            "Cancelled /v1/responses stream should not append perf metrics JSONL records"
         )
 
 
-def test_repeated_requests_append_multiple_entries(server: RemoteOpenAIServer):
-    """Each /v1/responses request must append exactly one entry (no duplicates)."""
-    before = _fetch_perf_metrics(server)
-    count_before = len(before)
+def test_repeated_requests_append_multiple_entries(
+    server: RemoteOpenAIServer,
+    perf_metrics_output_dir,
+):
+    """Each /v1/responses request must append exactly one record (no duplicates)."""
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
 
     client = server.get_client()
     n = 3
@@ -267,19 +279,24 @@ def test_repeated_requests_append_multiple_entries(server: RemoteOpenAIServer):
             stream=False,
         )
 
-    after = _fetch_perf_metrics(server)
-    assert len(after) == count_before + n, (
-        f"Expected {n} new entries after {n} non-streaming /v1/responses "
-        f"requests; got {len(after) - count_before}"
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, count_before + n)
+    assert len(records) == count_before + n, (
+        f"Expected {n} new JSONL records after {n} non-streaming /v1/responses "
+        f"requests; got {len(records) - count_before}"
     )
 
-    # Every new entry must be structurally valid.
-    for i, entry in enumerate(after[count_before:], start=1):
+    # Every new record must be structurally valid.
+    for i, entry in enumerate(records[count_before:], start=1):
         _assert_perf_metrics_entry_valid(entry, f"repeated request {i}")
 
 
-def test_responses_request_id_present_in_metrics(server: RemoteOpenAIServer):
-    """Each /perf_metrics entry for /v1/responses must contain a non-empty request_id."""
+def test_responses_request_id_present_in_metrics(
+    server: RemoteOpenAIServer,
+    perf_metrics_output_dir,
+):
+    """Each JSONL perf_metrics record for /v1/responses must contain a non-empty request_id."""
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
+
     client = server.get_client()
     client.responses.create(
         model=_MODEL,
@@ -288,12 +305,14 @@ def test_responses_request_id_present_in_metrics(server: RemoteOpenAIServer):
         stream=False,
     )
 
-    entries = _fetch_perf_metrics(server)
-    assert entries, "No /perf_metrics entries found"
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, count_before + 1)
+    assert len(records) == count_before + 1, (
+        "Expected exactly one new JSONL record after /v1/responses"
+    )
 
-    latest = entries[-1]
-    assert "request_id" in latest, "request_id missing from /perf_metrics entry"
-    assert latest["request_id"], "request_id is empty in /perf_metrics entry"
+    latest = records[-1]
+    assert "request_id" in latest, "request_id missing from perf_metrics JSONL record"
+    assert latest["request_id"], "request_id is empty in perf_metrics JSONL record"
 
 
 def test_prometheus_counter_advances_for_responses(server: RemoteOpenAIServer):
@@ -323,46 +342,49 @@ def test_prometheus_counter_advances_for_responses(server: RemoteOpenAIServer):
     )
 
 
-def test_parity_with_chat_completions(server: RemoteOpenAIServer):
-    """Both /v1/responses and /v1/chat/completions must produce structurally identical /perf_metrics entries."""
+def test_parity_with_chat_completions(
+    server: RemoteOpenAIServer,
+    perf_metrics_output_dir,
+):
+    """Both /v1/responses and /v1/chat/completions must produce structurally identical JSONL records."""
     client = server.get_client()
 
     # Chat completions entry.
-    before_chat = _fetch_perf_metrics(server)
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
     client.chat.completions.create(
         model=_MODEL,
         messages=[{"role": "user", "content": _INPUT}],
         max_tokens=16,
         stream=False,
     )
-    after_chat = _fetch_perf_metrics(server)
-    assert len(after_chat) == len(before_chat) + 1, (
-        "chat/completions did not produce exactly one /perf_metrics entry"
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, count_before + 1)
+    assert len(records) == count_before + 1, (
+        "chat/completions did not produce exactly one JSONL perf metrics record"
     )
-    chat_entry = after_chat[-1]
+    chat_entry = records[-1]
 
     # Responses API entry.
-    before_resp = _fetch_perf_metrics(server)
+    count_before = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
     client.responses.create(
         model=_MODEL,
         input=_INPUT,
         max_output_tokens=16,
         stream=False,
     )
-    after_resp = _fetch_perf_metrics(server)
-    assert len(after_resp) == len(before_resp) + 1, (
-        "/v1/responses did not produce exactly one /perf_metrics entry"
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, count_before + 1)
+    assert len(records) == count_before + 1, (
+        "/v1/responses did not produce exactly one JSONL perf metrics record"
     )
-    resp_entry = after_resp[-1]
+    resp_entry = records[-1]
 
-    # Both entries must have the same top-level keys.
+    # Both records must have the same top-level keys.
     chat_keys = set(chat_entry.keys())
     resp_keys = set(resp_entry.keys())
     assert chat_keys == resp_keys, (
-        f"Key mismatch between chat/completions and /v1/responses entries: "
+        f"Key mismatch between chat/completions and /v1/responses records: "
         f"chat={chat_keys}, responses={resp_keys}"
     )
 
-    # Both entries must have structurally valid perf_metrics.
+    # Both records must have structurally valid perf_metrics.
     _assert_perf_metrics_entry_valid(chat_entry, "chat/completions parity")
     _assert_perf_metrics_entry_valid(resp_entry, "responses parity")
