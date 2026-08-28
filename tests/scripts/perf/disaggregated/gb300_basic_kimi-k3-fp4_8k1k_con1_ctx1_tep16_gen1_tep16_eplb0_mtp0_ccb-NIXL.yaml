@@ -106,7 +106,7 @@ worker_config:
       tokens_per_block: 64
       dtype: auto
     moe_config:
-      backend: MEGAMOE_DEEPGEMM
+      backend: TRTLLM
     cache_transceiver_config:
       backend: NIXL
       transceiver_runtime: PYTHON
@@ -132,7 +132,7 @@ worker_config:
       tokens_per_block: 64
       dtype: auto
     moe_config:
-      backend: MEGAMOE_DEEPGEMM
+      backend: TRTLLM
     cache_transceiver_config:
       backend: NIXL
       transceiver_runtime: PYTHON
