@@ -1968,7 +1968,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // Unlike the single-GPU-infra-incomplete policy below, post-merge
                 // skips too: with no artifact there is no signal to be had.
                 if (buildInfraIncomplete) {
-                    stage("[Test-SBSA] Skipped - build infra-incomplete") {
+                    stage("[Test-SBSA] Blocked - build infra-incomplete") {
                         echo "SBSA build was infra-incomplete (UNSTABLE); skipping SBSA test sub-jobs (no artifact to test). Build stays UNSTABLE."
                     }
                     return

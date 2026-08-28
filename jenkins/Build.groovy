@@ -51,9 +51,8 @@ POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "432
 // UNSTABLE (infra-incomplete) instead of FAILURE, so the parent layer
 // (L0_MergeRequest.launchJob) can skip this arch's test consumers without
 // cancelling the healthy sibling architecture. When false, every failure
-// rethrows and the original bare-boolean fail-fast is fully restored. Only
-// K8s-scoped aborts are deferred today; SLURM-scoped aborts fall back to
-// today's fail-fast (see runBranchesWithInfraDefer).
+// rethrows and the original bare-boolean fail-fast is fully restored. Build
+// stages run only on K8s builders, so K8s is the only infra scope deferred here.
 //
 // Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
 // env var on the job. Env values are strings ("false" is truthy in Groovy), so
