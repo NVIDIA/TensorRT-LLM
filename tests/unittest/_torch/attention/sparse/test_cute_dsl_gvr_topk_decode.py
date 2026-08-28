@@ -399,34 +399,27 @@ def test_cute_dsl_gvr_topk_decode_seqlen_sorted(
 # ===========================================================================
 # Degenerate-hint bracket-rewrite race regression tests.
 #
-# Phase 1 gathers the row values at ``pre_idx``; when every gathered value
-# lands on one value (all-zeros pre_idx — the documented production cold
-# start — or a hint whose gathered values fall in one tie class), the
-# kernel rewrites the Phase-1 bracket to a synthetic one under a guarded
-# barrier. Without a barrier between the bracket reads and that rewrite, a
-# straggler warp can read the already-rewritten bracket, evaluate the
-# degenerate condition differently, and skip the guarded barrier — barrier
-# divergence: wrong index sets, unwritten output slots, out-of-range
-# indices, intermittent illegal memory access. The same read-vs-rewrite
-# pattern (and fix) applies to the leader-published ``done`` flag in the
-# Phase-2 refine/collapse loops and the Phase-4 bin-search publish. The
-# corruption is a timing race, so the tests launch repeatedly and poison
-# the output buffer before every launch (an unwritten slot then fails the
-# checker's range assertion); detection is probabilistic pre-fix, while
-# the fixed kernel must pass every launch. The junk-arange hints used
-# elsewhere in this module gather the argmax column plus ``top_k - 1``
-# distinct arange columns, whose randn values essentially never all
-# collide, so the existing sweeps do not arm the degenerate rewrite —
-# which is why they could not catch this.
+# When every hint-gathered value lands in one tie class, the kernel rewrites
+# its Phase-1 bracket under a guarded barrier; without the read/rewrite
+# barriers a straggler warp can see the rewrite early, skip that barrier,
+# and corrupt the row (wrong sets, unwritten slots, out-of-range indices,
+# intermittent illegal access). The same discipline covers the Phase-2
+# ``done`` flags and the Phase-4 bin-search publish. Degenerate hints are reachable: CUDA-graph
+# capture-warmup dummy rows (every startup), disagg gen-side first decode
+# (prior zeroed/stale), stale or position-shifted priors, and value-collision
+# ties (independent of hint quality). The corruption is a timing race, so
+# each test launches repeatedly over a poisoned output buffer: detection is
+# probabilistic pre-fix; the fixed kernel must pass every launch.
 # ===========================================================================
 
 
 @skip_not_sm100
-def test_cute_dsl_gvr_topk_decode_all_zeros_pre_idx(tie_aware_check):
-    """All-zeros ``pre_idx`` (production cold start) must not corrupt output.
+def test_cute_dsl_gvr_topk_decode_all_zeros_pre_idx(tie_aware_check) -> None:
+    """All-zeros ``pre_idx`` must not corrupt output.
 
-    With ``pre_idx = 0`` every row gathers ``top_k`` copies of ``row[1]``
-    (``pre_idx_offset = 1`` at cr=1), so every CTA takes the degenerate-hint
+    Reached by CUDA-graph capture-warmup dummy rows and by disagg gen-side
+    first decode (no local prefill). With ``pre_idx = 0`` every row gathers
+    ``top_k`` copies of ``row[1]``, so every CTA takes the degenerate-hint
     bracket rewrite — the race site. Pre-fix this shape returned wrong sets,
     unwritten output slots, and out-of-range indices on most launches.
     """
@@ -466,23 +459,19 @@ def test_cute_dsl_gvr_topk_decode_all_zeros_pre_idx(tie_aware_check):
 
 @skip_not_sm100
 @pytest.mark.parametrize("scenario", ["quantized", "plateau_wider_than_kc"])
-def test_cute_dsl_gvr_topk_decode_tie_degenerate_hint(scenario, tie_aware_check):
-    """Tie-heavy rows + argmax-only hint over zeros.
+def test_cute_dsl_gvr_topk_decode_tie_degenerate_hint(scenario, tie_aware_check) -> None:
+    """Tie-heavy rows + argmax-only hint: value collisions arm the rewrite.
 
-    ``pre_idx`` carries only the argmax invariant (slot 0) over zeros — a
-    synthetic low-information hint (production keeps the full previous
-    top-k after the first step, and starts fully zeroed before it); on
-    tie-heavy rows the two gathered columns
-    collide bitwise (~32/1024 rows in the quantized scenario; every row in
-    the plateau scenario), arming the degenerate-hint bracket rewrite even
-    though a real hint is present.
+    On tie-heavy rows the hint-gathered columns collide bitwise (~32/1024
+    rows in the quantized scenario; every row in the plateau scenario), so
+    the degenerate-hint bracket rewrite fires even with a good hint — ties
+    make the race reachable regardless of hint quality.
 
-    ``quantized``: logits quantized to 0.25 steps (~60 distinct values),
-    the shape class that crashed pre-fix with an intermittent illegal
-    memory access. ``plateau_wider_than_kc``: two-valued rows whose 0.0 tie
-    class is far wider than the candidate buffer ``kC``, pinning the
-    Phase-2 plateau-collapse terminal + Phase-4 plateau fill (no threshold
-    count can land in [K, kC]). Both scenarios share one compile variant.
+    ``quantized``: logits quantized to 0.25 steps, the shape class that
+    crashed pre-fix with an intermittent illegal memory access.
+    ``plateau_wider_than_kc``: two-valued rows whose 0.0 tie class is far
+    wider than the candidate buffer ``kC``, pinning the Phase-2
+    plateau-collapse terminal + Phase-4 plateau fill.
     """
     top_k = 512
     num_rows, N = 1024, 16384

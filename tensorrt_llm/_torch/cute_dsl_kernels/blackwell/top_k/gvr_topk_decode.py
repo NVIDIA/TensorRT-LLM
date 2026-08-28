@@ -1828,10 +1828,8 @@ class GvrTopKKernel:
         # ---- Secant refinement loop ----
         it = cutlass.Int32(0)
         while it < cutlass.Int32(self.MAX_REFINE_ITERS) and s_iscalars[1] == cutlass.Int32(0):
-            # All threads must finish reading the loop guard (s_iscalars[1])
-            # before tid0 can rewrite it below (done = 2/3 on bracket
-            # exhaustion): a straggler warp reading the rewritten flag would
-            # skip the guarded barriers — barrier divergence.
+            # All threads read the loop guard before tid0 rewrites it below
+            # (done = 2/3): a straggler would skip the guarded barriers.
             cute.arch.barrier()
             # tid==0 computes new threshold via secant interpolation.
             if tidx == 0:
@@ -4489,14 +4487,8 @@ class GvrTopKKernel:
         # budget-collapse guard cannot fire on this unmeasured bracket.
         v_lo = s_thr[1]
         v_hi = s_thr[2]
-        # Every thread must finish reading the Phase-1 bracket BEFORE tid0
-        # rewrites it below: without this barrier a straggler warp can read
-        # the already-rewritten synthetic bracket, evaluate the degenerate
-        # condition differently, and skip the guarded barrier — barrier
-        # divergence, i.e. wrong sets / unwritten output slots / illegal
-        # memory access. Fires whenever the gathered hint values are
-        # degenerate: all-zeros pre_idx (production cold start) on any row,
-        # or any hint whose gathered values land in one tie class.
+        # Every thread reads the Phase-1 bracket before tid0 rewrites it
+        # below: a straggler would skip the guarded barrier (divergence).
         cute.arch.barrier()
         if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
             if tidx == 0:
@@ -4753,11 +4745,8 @@ class GvrTopKKernel:
                         ):
                             it4 = cutlass.Int32(40)  # guard: skip collapse
                         while it4 < cutlass.Int32(40) and s_iscalars[1] == cutlass.Int32(0):
-                            # Loop-guard read vs tid0's done=3 rewrite below:
-                            # barrier so a straggler warp cannot read the
-                            # terminal flag early and skip the guarded
-                            # barrier (same discipline as the degenerate-
-                            # hint rewrite).
+                            # Loop-guard read before tid0's done=3 rewrite
+                            # below (same discipline as the bracket rewrite).
                             cute.arch.barrier()
                             if tidx == cutlass.Int32(0):
                                 lo4 = s_thr[1]
