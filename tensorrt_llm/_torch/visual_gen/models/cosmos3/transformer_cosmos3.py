@@ -29,6 +29,11 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
+from tensorrt_llm._torch.visual_gen.attention_backend import (
+    AttentionBackend,
+    AttentionTensorLayout,
+    UlyssesAttention,
+)
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -676,8 +681,8 @@ class Cosmos3CrossAttention(Attention):
         eps = model_config.pretrained_config.rms_norm_eps
         self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
-        # Multi-control pairs stay replicated across sequence-parallel ranks;
-        # this backend deliberately has no Ulysses/Ring/Attention2D wrapper.
+        # Bare fallback for single-worker multi-control and unsupported context-parallel
+        # compositions. Pure Ulysses uses the normal wrapped attention backend below.
         self.multi_control_attn = create_attention(
             backend="VANILLA",
             layer_idx=self.layer_idx,
@@ -699,15 +704,25 @@ class Cosmos3CrossAttention(Attention):
         k: torch.Tensor,
         v: torch.Tensor,
         timestep: Optional[torch.Tensor],
+        backend: Optional[AttentionBackend] = None,
     ) -> torch.Tensor:
-        out = self.multi_control_attn.forward(
-            q=q.transpose(1, 2),
-            k=k.transpose(1, 2),
-            v=v.transpose(1, 2),
+        active_backend = backend or self.multi_control_attn
+        layout = getattr(active_backend, "preferred_layout", AttentionTensorLayout.HND)
+        if layout == AttentionTensorLayout.HND:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+        out = active_backend.forward(
+            q=q,
+            k=k,
+            v=v,
             attention_mask=PredefinedAttentionMask.FULL,
             timestep=timestep,
+            batch_size=q.shape[0],
+            seq_len=q.shape[2] if layout == AttentionTensorLayout.HND else q.shape[1],
+            seq_len_kv=k.shape[2] if layout == AttentionTensorLayout.HND else k.shape[1],
         )
-        return out.transpose(1, 2)
+        return out.transpose(1, 2) if layout == AttentionTensorLayout.HND else out
 
     def _forward_multi_control(
         self,
@@ -799,6 +814,178 @@ class Cosmos3CrossAttention(Attention):
             target_output = target_output + additional_target_output
         return torch.cat([*control_outputs, target_output], dim=1).flatten(2)
 
+    @staticmethod
+    def _ulysses_rank_segments(
+        tensor: torch.Tensor,
+        *,
+        batch_idx: int,
+        global_start: int,
+        global_end: int,
+        local_sequence_length: int,
+        rank_stride: int,
+        rank_offset: int,
+        world_size: int,
+    ) -> list[torch.Tensor]:
+        """Return rank-ordered slices for one global range in post-Ulysses packed KV."""
+        segments = []
+        for rank in range(world_size):
+            shard_start = rank * local_sequence_length
+            shard_end = shard_start + local_sequence_length
+            overlap_start = max(global_start, shard_start)
+            overlap_end = min(global_end, shard_end)
+            if overlap_start >= overlap_end:
+                continue
+            packed_start = rank * rank_stride + rank_offset + overlap_start - shard_start
+            packed_end = packed_start + overlap_end - overlap_start
+            segments.append(tensor[batch_idx : batch_idx + 1, packed_start:packed_end])
+        return segments
+
+    def _forward_multi_control_ulysses(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        control_token_sizes: tuple[int, ...],
+        control_weights: tuple[float, ...],
+        sequence_length: int,
+        timestep: Optional[torch.Tensor],
+        real_text_lens: Optional[list[int]],
+    ) -> torch.Tensor:
+        """Run multi-control after Ulysses exchanges sequence shards for head shards."""
+        if not isinstance(self.attn, UlyssesAttention):
+            raise ValueError("Cosmos3 multi-control Ulysses requires a UlyssesAttention backend.")
+        if len(control_token_sizes) != len(control_weights):
+            raise ValueError(
+                "Cosmos3 control token sizes and weights must have the same length: "
+                f"sizes={len(control_token_sizes)}, weights={len(control_weights)}."
+            )
+
+        control_tokens = sum(control_token_sizes)
+        full_padded_sequence_length = q.shape[1] * self.attn.world_size
+        if control_tokens <= 0 or control_tokens >= sequence_length:
+            raise ValueError(
+                "Cosmos3 multi-control attention requires non-empty control and target "
+                f"token ranges, got control_tokens={control_tokens}, total_tokens={sequence_length}."
+            )
+        if sequence_length > full_padded_sequence_length:
+            raise ValueError(
+                "Cosmos3 multi-control sequence length exceeds the Ulysses padded sequence: "
+                f"sequence_length={sequence_length}, padded={full_padded_sequence_length}."
+            )
+
+        local_text_length = k_und.shape[1]
+        local_gen_length = k.shape[1]
+        rank_stride = local_text_length + local_gen_length
+        q_full = self.attn.sequence_to_head(q, name="q")
+        k_full = self.attn.sequence_to_head(torch.cat([k_und, k], dim=1), name="k")
+        v_full = self.attn.sequence_to_head(torch.cat([v_und, v], dim=1), name="v")
+
+        target_start = control_tokens
+        target_end = sequence_length
+        text_lengths = real_text_lens or [local_text_length * self.attn.world_size] * q.shape[0]
+        control_outputs: list[torch.Tensor] = []
+        target_outputs: list[torch.Tensor] = []
+        control_start = 0
+        for control_size, weight in zip(control_token_sizes, control_weights, strict=True):
+            if control_size <= 0:
+                raise ValueError(
+                    f"Cosmos3 control token sizes must be positive, got {control_token_sizes}."
+                )
+            control_end = control_start + control_size
+            batch_outputs = []
+            for batch_idx, text_length in enumerate(text_lengths):
+                k_segments = self._ulysses_rank_segments(
+                    k_full,
+                    batch_idx=batch_idx,
+                    global_start=0,
+                    global_end=int(text_length),
+                    local_sequence_length=local_text_length,
+                    rank_stride=rank_stride,
+                    rank_offset=0,
+                    world_size=self.attn.world_size,
+                )
+                v_segments = self._ulysses_rank_segments(
+                    v_full,
+                    batch_idx=batch_idx,
+                    global_start=0,
+                    global_end=int(text_length),
+                    local_sequence_length=local_text_length,
+                    rank_stride=rank_stride,
+                    rank_offset=0,
+                    world_size=self.attn.world_size,
+                )
+                for range_start, range_end in (
+                    (control_start, control_end),
+                    (target_start, target_end),
+                ):
+                    k_segments.extend(
+                        self._ulysses_rank_segments(
+                            k_full,
+                            batch_idx=batch_idx,
+                            global_start=range_start,
+                            global_end=range_end,
+                            local_sequence_length=local_gen_length,
+                            rank_stride=rank_stride,
+                            rank_offset=local_text_length,
+                            world_size=self.attn.world_size,
+                        )
+                    )
+                    v_segments.extend(
+                        self._ulysses_rank_segments(
+                            v_full,
+                            batch_idx=batch_idx,
+                            global_start=range_start,
+                            global_end=range_end,
+                            local_sequence_length=local_gen_length,
+                            rank_stride=rank_stride,
+                            rank_offset=local_text_length,
+                            world_size=self.attn.world_size,
+                        )
+                    )
+
+                q_pair = torch.cat(
+                    [
+                        q_full[batch_idx : batch_idx + 1, control_start:control_end],
+                        q_full[batch_idx : batch_idx + 1, target_start:target_end],
+                    ],
+                    dim=1,
+                )
+                batch_outputs.append(
+                    self._run_multi_control_attention(
+                        q_pair,
+                        torch.cat(k_segments, dim=1),
+                        torch.cat(v_segments, dim=1),
+                        timestep,
+                        backend=self.attn.inner_backend,
+                    )
+                )
+
+            pair_output = torch.cat(batch_outputs, dim=0)
+            control_outputs.append(pair_output[:, :control_size])
+            target_outputs.append(pair_output[:, control_size:] * weight)
+            control_start = control_end
+
+        target_output = target_outputs[0]
+        for additional_target_output in target_outputs[1:]:
+            target_output = target_output + additional_target_output
+        output = torch.cat([*control_outputs, target_output], dim=1)
+        if output.shape[1] < full_padded_sequence_length:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        output.shape[0],
+                        full_padded_sequence_length - output.shape[1],
+                        output.shape[2],
+                        output.shape[3],
+                    ),
+                ],
+                dim=1,
+            )
+        return self.attn.head_to_sequence(output).flatten(2)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -810,6 +997,7 @@ class Cosmos3CrossAttention(Attention):
         real_text_lens: Optional[list[int]] = None,
         control_token_sizes: Optional[tuple[int, ...]] = None,
         control_weights: Optional[tuple[float, ...]] = None,
+        multi_control_sequence_length: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -838,17 +1026,31 @@ class Cosmos3CrossAttention(Attention):
                 raise ValueError(
                     "Cosmos3 multi-control attention requires both control token sizes and weights."
                 )
-            out = self._forward_multi_control(
-                q,
-                k,
-                v,
-                k_und,
-                v_und,
-                control_token_sizes,
-                control_weights,
-                timestep,
-                real_text_lens,
-            )
+            if multi_control_sequence_length is not None:
+                out = self._forward_multi_control_ulysses(
+                    q,
+                    k,
+                    v,
+                    k_und,
+                    v_und,
+                    control_token_sizes,
+                    control_weights,
+                    multi_control_sequence_length,
+                    timestep,
+                    real_text_lens,
+                )
+            else:
+                out = self._forward_multi_control(
+                    q,
+                    k,
+                    v,
+                    k_und,
+                    v_und,
+                    control_token_sizes,
+                    control_weights,
+                    timestep,
+                    real_text_lens,
+                )
         elif real_text_lens is not None and batch_size > 1:
             outs = []
             for b in range(batch_size):
@@ -1019,6 +1221,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         real_text_lens: Optional[list[int]] = None,
         control_token_sizes: Optional[tuple[int, ...]] = None,
         control_weights: Optional[tuple[float, ...]] = None,
+        multi_control_sequence_length: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1034,6 +1237,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             real_text_lens=real_text_lens,
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
+            multi_control_sequence_length=multi_control_sequence_length,
         )
         hidden_states = residual + hidden_states
 
@@ -1283,6 +1487,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         tp_size = vgm.tp_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         ring_size = vgm.ring_size if vgm else 1
+        self.multi_control_ulysses_enabled = (
+            vgm is not None and ulysses_size > 1 and vgm.cp_size == 1
+        )
         head_divisibility_factor = tp_size * ulysses_size
 
         if (ulysses_size > 1 or tp_size > 1) and (
@@ -1721,11 +1928,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             len(control_lantent_list), control_weights
         )
         use_multi_control_attention = len(control_lantent_list) > 1
+        use_multi_control_ulysses = (
+            use_multi_control_attention and self.multi_control_ulysses_enabled
+        )
+        use_sequence_sharding = not use_multi_control_attention or use_multi_control_ulysses
 
-        if use_multi_control_attention and self.sharder.is_active:
+        if use_multi_control_attention and self.sharder.is_active and not use_multi_control_ulysses:
             logger.warning_once(
-                "Cosmos3 multi-control attention requires full [control_i, target] sequences, "
-                "so the generator runs replicated across sequence-parallel ranks.",
+                "Cosmos3 multi-control attention with context parallelism runs the generator "
+                "replicated across sequence-parallel ranks.",
                 key="cosmos3_multi_control_replicated_sequence",
             )
 
@@ -1764,7 +1975,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 )
             self.cached_freqs_gen = freqs_gen
 
-            if self.sharder.is_active and not use_multi_control_attention:
+            if self.sharder.is_active and use_sequence_sharding:
                 # Round max_real_len up to next multiple of sharder.size.
                 # At most size-1 extra positions, negligible softmax dilution.
                 val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
@@ -1902,7 +2113,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         multi_control_token_sizes = control_token_sizes if use_multi_control_attention else None
         multi_control_weights = normalized_control_weights if use_multi_control_attention else None
         cos, sin = freqs_gen_combined
-        if not use_multi_control_attention:
+        if use_sequence_sharding:
             hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
             cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
             sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
@@ -1911,9 +2122,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         with offload_context("generator"):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
-                if not self.sharder.is_active or use_multi_control_attention:
-                    k_und = k_und[:, :max_real_len]
-                    v_und = v_und[:, :max_real_len]
+                if use_multi_control_attention:
+                    if not use_multi_control_ulysses:
+                        k_und = k_und[:, :max_real_len]
+                        v_und = v_und[:, :max_real_len]
                     hidden_gen = layer(
                         hidden_gen,
                         k_und,
@@ -1923,6 +2135,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         real_text_lens=real_text_lens,
                         control_token_sizes=multi_control_token_sizes,
                         control_weights=multi_control_weights,
+                        multi_control_sequence_length=(
+                            S_gen if use_multi_control_ulysses else None
+                        ),
+                    )
+                elif not self.sharder.is_active:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und[:, :max_real_len],
+                        v_und[:, :max_real_len],
+                        freqs_gen,
+                        timestep=timestep,
+                        real_text_lens=real_text_lens,
                     )
                 else:
                     hidden_gen = layer(
@@ -1933,7 +2157,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         timestep=timestep,
                     )
 
-        if not use_multi_control_attention:
+        if use_sequence_sharding:
             hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
