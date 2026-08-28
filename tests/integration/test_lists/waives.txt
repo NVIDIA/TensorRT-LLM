@@ -133,7 +133,6 @@ full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=Fa
 full:B200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
 full:B200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
-full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-deepseek_r1_v2_fp4_mtp_stress] SKIP (https://nvbugs/6649386)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_eagle_trtllm_stress] SKIP (https://nvbugs/6649384)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress] SKIP (https://nvbugs/6621362)
 full:B200/test_e2e.py::test_multi_nodes_eval[Qwen3/Qwen3-235B-A22B-tp16-mmlu] SKIP (https://nvbugs/6424188)
