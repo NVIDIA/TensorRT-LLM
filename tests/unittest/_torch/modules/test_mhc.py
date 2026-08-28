@@ -545,14 +545,40 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
         for hidden_size in (4096, 7168, 8192)
     }
 
-    # After P0 (Path D KS=112 enable + scalar-vec tail in Phase 4), the
-    # support trait reduces to `hidden % bf16_vec == 0` and `h_tiles % ks == 0`,
-    # so any KS in the table that divides HIDDEN/BLOCK_K is supported.
-    # h_tiles(4096) = 64 → KS divisors of 64; h_tiles(7168) = 112 → divisors
-    # of 112; hidden=8192 is not in the supported-hidden allowlist.
+    # Support reduces to `hidden % bf16_vec == 0` plus an even split, so any KS
+    # dividing HIDDEN/BLOCK_K qualifies: h_tiles(4096) = 64 → divisors of 64;
+    # h_tiles(7168) = 112 → divisors of 112. KS=53/106 are the two uneven
+    # exceptions, admitted at H=7168 only. hidden=8192 is not in the
+    # supported-hidden allowlist.
     assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
-    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 56, 112}
+    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 53, 56, 106, 112}
     assert supported_by_hidden_size[8192] == set()
+
+
+def test_mhc_fused_hc_single_wave_target_mma_ks():
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
+
+    expected = {32: 112, 64: 112, 128: 106, 256: 53, 8192: 8, 16384: 4}
+    assert {
+        m: _fused_hc_target_mma_ks(7168, m, sm_count=212, is_sm107=True) for m in expected
+    } == expected
+
+    # The selected split must fit the launch guard, otherwise get_valid_tactics
+    # drops the MMA tactics and emits nothing at all for the shape.
+    sm_count = 212
+    for hidden_size in (4096, 7168):
+        for m in range(64, 40000, 64):
+            ks = _fused_hc_target_mma_ks(hidden_size, m, sm_count=sm_count, is_sm107=True)
+            assert ((m + 63) // 64) * ks <= sm_count * 5, (hidden_size, m, ks)
+
+
+def test_mhc_fused_hc_uneven_splits_unreachable_off_sm107():
+    """The uneven split counts must stay unselectable on non-SM107 devices."""
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
+
+    for hidden_size in (4096, 7168):
+        for m in range(32, 33000, 32):
+            assert _fused_hc_target_mma_ks(hidden_size, m) not in (53, 106)
 
 
 @pytest.mark.parametrize("n", [128, 2048])

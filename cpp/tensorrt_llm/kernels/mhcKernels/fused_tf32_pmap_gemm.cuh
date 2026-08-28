@@ -199,8 +199,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
     constexpr uint32_t H_TILES_PER_HC = HIDDEN / BLOCK_K;
-    static_assert(H_TILES_PER_HC % kNumSplits == 0, "H_TILES_PER_HC must be divisible by kNumSplits");
-    constexpr uint32_t H_TILES_PER_SPLIT = H_TILES_PER_HC / kNumSplits;
+    static_assert(kNumSplits <= H_TILES_PER_HC, "Each split must own at least one H tile");
+    constexpr uint32_t H_TILES_BASE = H_TILES_PER_HC / kNumSplits;
+    constexpr uint32_t H_TILES_EXTRA = H_TILES_PER_HC % kNumSplits;
     constexpr uint32_t kNumCastStages = 4;
     constexpr uint32_t kSwizzleAMode = cute::min(BLOCK_K * sizeof(nv_bfloat16), 128);
     constexpr uint32_t kSwizzleBMode = cute::min(BLOCK_K * sizeof(float), 128);
@@ -312,8 +313,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const uint32_t m_block_idx = block_idx / kNumSplits;
     const uint32_t k_split_idx = block_idx % kNumSplits;
     const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
-    constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
+    // Give the first H_TILES_EXTRA splits one extra tile. Even splits fold back
+    // to the original constants.
+    uint32_t h_tile_start;
+    uint32_t h_tiles_this_split;
+    if constexpr (H_TILES_EXTRA == 0)
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE;
+        h_tiles_this_split = H_TILES_BASE;
+    }
+    else
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE + cute::min(k_split_idx, H_TILES_EXTRA);
+        h_tiles_this_split = H_TILES_BASE + static_cast<uint32_t>(k_split_idx < H_TILES_EXTRA);
+    }
+    const uint32_t num_total_stages = h_tiles_this_split * HC_MULT;
 
     // Prologue removed: pmap threads load their own post_mix/comb_mix rows
     // directly into registers below, so the MMA/TMA warps never wait on those
@@ -326,7 +340,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
-            for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+            for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
@@ -496,7 +510,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
         uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
         {
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
@@ -749,8 +763,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     constexpr uint32_t HC_MULT3 = HC_MULT * (2 + HC_MULT);
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
     constexpr uint32_t H_TILES_PER_HC = HIDDEN / BLOCK_K;
-    static_assert(H_TILES_PER_HC % kNumSplits == 0, "H_TILES_PER_HC must be divisible by kNumSplits");
-    constexpr uint32_t H_TILES_PER_SPLIT = H_TILES_PER_HC / kNumSplits;
+    static_assert(kNumSplits <= H_TILES_PER_HC, "Each split must own at least one H tile");
+    constexpr uint32_t H_TILES_BASE = H_TILES_PER_HC / kNumSplits;
+    constexpr uint32_t H_TILES_EXTRA = H_TILES_PER_HC % kNumSplits;
     constexpr uint32_t kNumCastStages = 4;
     constexpr uint32_t kSwizzleAMode = cute::min(BLOCK_K * sizeof(nv_bfloat16), 128);
     constexpr uint32_t kSwizzleBMode = cute::min(BLOCK_K * sizeof(float), 128);
@@ -863,8 +878,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     const uint32_t m_block_idx = block_idx / kNumSplits;
     const uint32_t k_split_idx = block_idx % kNumSplits;
     const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
-    constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
+    // Give the first H_TILES_EXTRA splits one extra tile. Even splits fold back
+    // to the original constants.
+    uint32_t h_tile_start;
+    uint32_t h_tiles_this_split;
+    if constexpr (H_TILES_EXTRA == 0)
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE;
+        h_tiles_this_split = H_TILES_BASE;
+    }
+    else
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE + cute::min(k_split_idx, H_TILES_EXTRA);
+        h_tiles_this_split = H_TILES_BASE + static_cast<uint32_t>(k_split_idx < H_TILES_EXTRA);
+    }
+    const uint32_t num_total_stages = h_tiles_this_split * HC_MULT;
 
     // Prologue: pmap warp group loads post_mix_prev, comb_mix_prev into SMEM
     if (warp_idx >= kNumMMAThreads / 32)
@@ -907,7 +935,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
-            for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+            for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
@@ -1071,7 +1099,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
         uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
         {
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
