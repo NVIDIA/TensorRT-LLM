@@ -62,7 +62,7 @@ worker_config:
     moe_expert_parallel_size: 16
     pipeline_parallel_size: 1
     context_parallel_size: 1
-    enable_attention_dp: true
+    enable_attention_dp: false
     enable_chunked_prefill: false
     cuda_graph_config:
       max_batch_size: 32
@@ -123,7 +123,7 @@ worker_config:
     moe_expert_parallel_size: 16
     pipeline_parallel_size: 1
     context_parallel_size: 1
-    enable_attention_dp: true
+    enable_attention_dp: false
     enable_chunked_prefill: false
     cuda_graph_config: null
     kv_cache_config:
