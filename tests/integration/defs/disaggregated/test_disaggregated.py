@@ -2093,13 +2093,20 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
         gen_env = {"TLLM_LOG_LEVEL": "INFO"}
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_nixl",
-                           env=env,
-                           gen_env=gen_env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           assert_gen_log_contains=assert_gen_log_contains)
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_nixl",
+        env=env,
+        gen_env=gen_env,
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        assert_gen_log_contains=assert_gen_log_contains,
+        # On Blackwell the CuTe DSL MLA decode JIT and
+        # autotuner warmup push cold-start readiness to
+        # ~370s, past the 300s default; H100 registers in
+        # ~138s. Match the 1200s budget other disagg tests
+        # already use so slow warmup is not read as a hang.
+        server_start_timeout=1200)
 
 
 @skip_no_hopper
