@@ -106,9 +106,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
-  # Fused CUDA decode op and CuTe MTP verify kernel (SM103-only selector cases
-  # self-skip on B200).
-  - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
+  # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
