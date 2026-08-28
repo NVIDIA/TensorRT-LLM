@@ -25,13 +25,14 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
-def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
+def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 
     cute = ModuleType("cutlass.cute")
     cute.core = SimpleNamespace()
+    cute.ThrCopy = object()
     cute.ThrMma = object()
     cute.make_rmem_tensor = object()
     cutlass = ModuleType("cutlass")
@@ -43,6 +44,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
     msa_package_available.cache_clear()
     try:
         assert msa_package_available()
+        assert cute.core.ThrCopy is cute.ThrCopy
         assert cute.core.ThrMma is cute.ThrMma
         assert cute.make_fragment is cute.make_rmem_tensor
     finally:

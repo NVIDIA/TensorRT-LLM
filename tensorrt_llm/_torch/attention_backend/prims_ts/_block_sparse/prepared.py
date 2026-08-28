@@ -17,7 +17,8 @@
 
 from dataclasses import dataclass
 
-from .._utils import round_up
+from flashinfer.utils import round_up
+
 from .common import _SIGNED_INT32_MAX, _block_sparse_kv_atom_size
 
 _SECTION_ALIGNMENT_WORDS = 4

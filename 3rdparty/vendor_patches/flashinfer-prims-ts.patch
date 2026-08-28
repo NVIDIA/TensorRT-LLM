@@ -1,62 +1,5 @@
-diff --git a/_api.py b/_api.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..59238dbc477df3b8068a9e56559ad1c531be5aee
---- /dev/null
-+++ b/_api.py
-@@ -0,0 +1,51 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-+# Copyright (c) 2026 by FlashInfer team.
-+#
-+# Licensed under the Apache License, Version 2.0 (the "License");
-+# you may not use this file except in compliance with the License.
-+# You may obtain a copy of the License at
-+#
-+#   http://www.apache.org/licenses/LICENSE-2.0
-+#
-+# Unless required by applicable law or agreed to in writing, software
-+# distributed under the License is distributed on an "AS IS" BASIS,
-+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+# See the License for the specific language governing permissions and
-+# limitations under the License.
-+
-+"""Local compatibility for FlashInfer's optional API instrumentation."""
-+
-+from collections.abc import Callable
-+from typing import TypeVar, overload
-+
-+_CallableT = TypeVar("_CallableT", bound=Callable[..., object])
-+
-+
-+@overload
-+def flashinfer_api(func: _CallableT, *, trace: object | None = None) -> _CallableT: ...
-+
-+
-+@overload
-+def flashinfer_api(
-+    func: None = None, *, trace: object | None = None
-+) -> Callable[[_CallableT], _CallableT]: ...
-+
-+
-+def flashinfer_api(
-+    func: _CallableT | None = None, *, trace: object | None = None
-+) -> _CallableT | Callable[[_CallableT], _CallableT]:
-+    """Preserve the upstream decorator ABI without FlashInfer instrumentation.
-+
-+    TensorRT-LLM does not vendor FlashInfer's API logging and trace-template
-+    framework. Returning the original callable preserves the zero-overhead
-+    behavior used by FlashInfer when instrumentation is disabled.
-+    """
-+
-+    del trace
-+    if func is not None:
-+        return func
-+
-+    def decorator(wrapped: _CallableT) -> _CallableT:
-+        return wrapped
-+
-+    return decorator
 diff --git a/_block_sparse/compiler.py b/_block_sparse/compiler.py
-index 1afcdb5b89f1edf2e6018d0f933ec53da3185893..4b53ad6867efc1b16168aadf6415687284ea2c15 100644
+index 1afcdb5b89f1edf2e6018d0f933ec53da3185893..c91a0f9393af21a50757e92b8019a7a938502828 100644
 --- a/_block_sparse/compiler.py
 +++ b/_block_sparse/compiler.py
 @@ -1,3 +1,4 @@
@@ -64,18 +7,8 @@ index 1afcdb5b89f1edf2e6018d0f933ec53da3185893..4b53ad6867efc1b16168aadf64156872
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -19,8 +20,7 @@ import functools
- 
- import torch
- 
--from flashinfer.utils import ceil_div
--
-+from .._utils import ceil_div
- from .config import _BlockSparseCompileKey, _make_block_sparse_config
- 
- 
 diff --git a/_block_sparse/config.py b/_block_sparse/config.py
-index 941b32348c118ca030c21f228238b3b47ce0150c..091dce91c097903ea4ece05d43ea1d6a0fc49ed5 100644
+index 941b32348c118ca030c21f228238b3b47ce0150c..6ae8e0e2a51498cc5751dce19c262fbc61dda419 100644
 --- a/_block_sparse/config.py
 +++ b/_block_sparse/config.py
 @@ -1,3 +1,4 @@
@@ -83,18 +16,8 @@ index 941b32348c118ca030c21f228238b3b47ce0150c..091dce91c097903ea4ece05d43ea1d6a
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -20,8 +21,7 @@ from typing import TYPE_CHECKING, Literal, cast
- 
- import torch
- 
--from flashinfer.utils import ceil_div
--
-+from .._utils import ceil_div
- from ..decode import _dtype_key, _validate_mask, _validate_positive_int
- from .common import (
-     _PREPARED_KV_ROUTE_SIZE,
 diff --git a/_block_sparse/plan.py b/_block_sparse/plan.py
-index 4824f07b667f0b0f8d9e95c2aa612619ebe7f791..a2492e8ceec74ff531f47800b5f306dd8724efe3 100644
+index 4824f07b667f0b0f8d9e95c2aa612619ebe7f791..da77552f1a0d704f21afb45c492e2fce33d159f9 100644
 --- a/_block_sparse/plan.py
 +++ b/_block_sparse/plan.py
 @@ -1,3 +1,4 @@
@@ -102,18 +25,8 @@ index 4824f07b667f0b0f8d9e95c2aa612619ebe7f791..a2492e8ceec74ff531f47800b5f306dd
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -22,8 +23,7 @@ from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
- 
- import torch
- 
--from flashinfer.utils import ceil_div
--
-+from .._utils import ceil_div
- from .common import _SIGNED_INT32_MAX
- from .compiler import _get_compiled_block_sparse
- from .config import (
 diff --git a/_block_sparse/prepared.py b/_block_sparse/prepared.py
-index 091becbd33b893aa8c4627f29a93eabf961c6fc4..4b0dd08d868b8062a134a7d77ea079e52a76e3d2 100644
+index 091becbd33b893aa8c4627f29a93eabf961c6fc4..b84e71f857ebeeab986557f77f98f8211eeceb62 100644
 --- a/_block_sparse/prepared.py
 +++ b/_block_sparse/prepared.py
 @@ -1,3 +1,4 @@
@@ -121,52 +34,8 @@ index 091becbd33b893aa8c4627f29a93eabf961c6fc4..4b0dd08d868b8062a134a7d77ea079e5
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -16,8 +17,7 @@
- 
- from dataclasses import dataclass
- 
--from flashinfer.utils import round_up
--
-+from .._utils import round_up
- from .common import _SIGNED_INT32_MAX, _block_sparse_kv_atom_size
- 
- _SECTION_ALIGNMENT_WORDS = 4
-diff --git a/_utils.py b/_utils.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..733fc7a7641ceb21714018b6332a103e213a0704
---- /dev/null
-+++ b/_utils.py
-@@ -0,0 +1,28 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-+# Copyright (c) 2026 by FlashInfer team.
-+#
-+# Licensed under the Apache License, Version 2.0 (the "License");
-+# you may not use this file except in compliance with the License.
-+# You may obtain a copy of the License at
-+#
-+#   http://www.apache.org/licenses/LICENSE-2.0
-+#
-+# Unless required by applicable law or agreed to in writing, software
-+# distributed under the License is distributed on an "AS IS" BASIS,
-+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+# See the License for the specific language governing permissions and
-+# limitations under the License.
-+
-+"""Local integer helpers used by the vendored PrimTS package."""
-+
-+
-+def ceil_div(x: int, y: int) -> int:
-+    """Return the ceiling of ``x / y`` for positive integral extents."""
-+
-+    return (x + y - 1) // y
-+
-+
-+def round_up(x: int, y: int) -> int:
-+    """Round ``x`` up to the nearest multiple of ``y``."""
-+
-+    return ceil_div(x, y) * y
 diff --git a/block_sparse.py b/block_sparse.py
-index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..f95717f9895b8597932b4a32516b1cb679507d8a 100644
+index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8f21e7e0e 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -174,21 +43,18 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..f95717f9895b8597932b4a32516b1cb6
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -31,12 +32,7 @@ from typing import Literal
- 
+@@ -32,10 +33,6 @@ from typing import Literal
  import torch
  
--from flashinfer.api_logging import flashinfer_api
+ from flashinfer.api_logging import flashinfer_api
 -from flashinfer.trace.templates.attention import (
 -    prims_ts_block_sparse_trace,
 -    prims_ts_paged_block_sparse_trace_dispatch,
 -)
--
-+from ._api import flashinfer_api
+ 
  from ._block_sparse.config import (
      _BlockSparseStaticProfile,
-     _validate_block_sparse_static_profile,
-@@ -335,7 +331,7 @@ def _inspect_one_shot_block_sparse_routes(
+@@ -335,7 +332,7 @@ def _inspect_one_shot_block_sparse_routes(
      )
  
  
@@ -197,7 +63,7 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..f95717f9895b8597932b4a32516b1cb6
  def block_sparse_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -668,7 +664,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -668,7 +665,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
@@ -207,7 +73,7 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..f95717f9895b8597932b4a32516b1cb6
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index fdded4cbe7bf232c7a0abddb9bd4b737dd50fa25..c119419e60862e1cb2ca30723c91abeeba24078b 100644
+index fdded4cbe7bf232c7a0abddb9bd4b737dd50fa25..dcc0fa5130a22f7e7e3623ff3d819e0d21ffcd0d 100644
 --- a/context.py
 +++ b/context.py
 @@ -1,3 +1,4 @@
@@ -215,18 +81,8 @@ index fdded4cbe7bf232c7a0abddb9bd4b737dd50fa25..c119419e60862e1cb2ca30723c91abee
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -43,8 +44,7 @@ from typing import TYPE_CHECKING, Literal, Optional
- 
- import torch
- 
--from flashinfer.api_logging import flashinfer_api
--
-+from ._api import flashinfer_api
- from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
- 
- 
 diff --git a/decode.py b/decode.py
-index b1adfbaab789a8fc274c47361cc4252b231ce77e..7e07283a35311787f88a90e39890c7ebad82b51f 100644
+index b1adfbaab789a8fc274c47361cc4252b231ce77e..b5e1754f4a2ed822c617ef1a4d7a6b5f3dbefbf7 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -234,22 +90,19 @@ index b1adfbaab789a8fc274c47361cc4252b231ce77e..7e07283a35311787f88a90e39890c7eb
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -24,13 +25,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
- 
+@@ -25,11 +26,6 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
  import torch
  
--from flashinfer.api_logging import flashinfer_api
+ from flashinfer.api_logging import flashinfer_api
 -from flashinfer.trace.templates.attention import (
 -    attention_ts_decode_trace_dispatch,
 -    prims_ts_decode_trace_dispatch,
 -    prims_ts_decode_wrapper_trace_dispatch,
 -)
--
-+from ._api import flashinfer_api
+ 
  from ._tensor_aliasing import (
      _validate_out_does_not_overlap_inputs,
-     _validate_tensor_does_not_overlap_inputs,
-@@ -1875,7 +1870,7 @@ def _launch_decode(
+@@ -1875,7 +1871,7 @@ def _launch_decode(
      return runtime.out
  
  
@@ -258,7 +111,7 @@ index b1adfbaab789a8fc274c47361cc4252b231ce77e..7e07283a35311787f88a90e39890c7eb
  def prims_ts_batch_decode_with_kv_cache(
      query: torch.Tensor,
      kv_cache: PagedKVCache,
-@@ -2537,7 +2532,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2537,7 +2533,7 @@ class BatchDecodePagedTSWrapper:
          self._policy = policy
          self._planned = True
  
@@ -267,7 +120,7 @@ index b1adfbaab789a8fc274c47361cc4252b231ce77e..7e07283a35311787f88a90e39890c7eb
      def run(
          self,
          q: torch.Tensor,
-@@ -2704,7 +2699,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2704,7 +2700,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
@@ -277,7 +130,7 @@ index b1adfbaab789a8fc274c47361cc4252b231ce77e..7e07283a35311787f88a90e39890c7eb
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/mla_decode.py b/mla_decode.py
-index 188f293d9d2662ac7cee4a3323608b3038bab2f6..40a557db34d6f9d82c3f2bd14f51fc656589456c 100644
+index 188f293d9d2662ac7cee4a3323608b3038bab2f6..34c05751085c11c78b386044a53e4e3a455aa7ac 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -285,22 +138,19 @@ index 188f293d9d2662ac7cee4a3323608b3038bab2f6..40a557db34d6f9d82c3f2bd14f51fc65
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -21,13 +22,7 @@ from typing import Any, Literal, Optional, cast
- 
+@@ -22,11 +23,6 @@ from typing import Any, Literal, Optional, cast
  import torch
  
--from flashinfer.api_logging import flashinfer_api
+ from flashinfer.api_logging import flashinfer_api
 -from flashinfer.trace.templates.attention import (
 -    prims_ts_decode_mla_one_shot_trace_dispatch,
 -    prims_ts_decode_mla_trace_dispatch,
 -    prims_ts_decode_mla_wrapper_trace_dispatch,
 -)
--
-+from ._api import flashinfer_api
+ 
  from ._tensor_aliasing import (
      _validate_out_does_not_overlap_inputs,
-     _validate_tensor_does_not_overlap_inputs,
-@@ -1391,7 +1386,7 @@ def _launch_mla_decode(
+@@ -1391,7 +1387,7 @@ def _launch_mla_decode(
      return runtime.out
  
  
@@ -309,7 +159,7 @@ index 188f293d9d2662ac7cee4a3323608b3038bab2f6..40a557db34d6f9d82c3f2bd14f51fc65
  def prims_ts_batch_decode_with_kv_cache_mla(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -1920,7 +1915,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1920,7 +1916,7 @@ class BatchMLADecodePagedTSWrapper:
          self._split_kv = int(dict(policy)["split_kv"])
          self._planned = True
  
@@ -318,7 +168,7 @@ index 188f293d9d2662ac7cee4a3323608b3038bab2f6..40a557db34d6f9d82c3f2bd14f51fc65
      def run(
          self,
          query: torch.Tensor,
-@@ -2014,7 +2009,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2014,7 +2010,7 @@ class BatchMLADecodePagedTSWrapper:
          )
  
  

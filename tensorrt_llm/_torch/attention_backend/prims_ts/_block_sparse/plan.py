@@ -23,7 +23,8 @@ from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
 
 import torch
 
-from .._utils import ceil_div
+from flashinfer.utils import ceil_div
+
 from .common import _SIGNED_INT32_MAX
 from .compiler import _get_compiled_block_sparse
 from .config import (

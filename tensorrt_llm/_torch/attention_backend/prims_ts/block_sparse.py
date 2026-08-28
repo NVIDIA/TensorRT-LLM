@@ -32,7 +32,8 @@ from typing import Literal
 
 import torch
 
-from ._api import flashinfer_api
+from flashinfer.api_logging import flashinfer_api
+
 from ._block_sparse.config import (
     _BlockSparseStaticProfile,
     _validate_block_sparse_static_profile,

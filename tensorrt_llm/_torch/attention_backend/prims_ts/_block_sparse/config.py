@@ -21,7 +21,8 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 
-from .._utils import ceil_div
+from flashinfer.utils import ceil_div
+
 from ..decode import _dtype_key, _validate_mask, _validate_positive_int
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
