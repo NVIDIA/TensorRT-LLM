@@ -98,6 +98,7 @@ l0_cpu:
   - unittest/llmapi/test_mpi_session.py ISOLATION
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
+  - unittest/llmapi/test_rl_control_auth.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
