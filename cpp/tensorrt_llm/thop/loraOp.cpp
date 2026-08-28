@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
+#include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/lora/loraGroupGEMMParamFillRowReorderFusion.h"
 #include "tensorrt_llm/kernels/selectiveScan/selectiveScan.h"
@@ -40,6 +41,11 @@ enum class RequestType : int32_t
     kCONTEXT = 0,
     kGENERATION = 1
 };
+
+bool loraGroupedGemmSupportsFp8(int64_t smVersion)
+{
+    return tk::supportsFp8GroupedGemm(static_cast<int>(smVersion));
+}
 
 int64_t getNumTokens(th::Tensor const& input)
 {
@@ -360,6 +366,8 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("lora_grouped_gemm_supports_fp8", &tensorrt_llm::torch_ext::loraGroupedGemmSupportsFp8);
+
     m.def(
         "lora_grouped_gemm(Tensor input, "
         "Tensor host_request_types, "

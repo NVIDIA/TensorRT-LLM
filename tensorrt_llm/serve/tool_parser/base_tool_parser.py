@@ -17,6 +17,11 @@ class BaseToolParser(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     needs_raw_special_tokens: bool = False
+    # Parsers whose forced/named ``tool_choice`` output still carries the
+    # model's native tool-call markup (rather than grammar-constrained bare
+    # JSON arguments) set this to True so the serving layer runs extraction
+    # on the named-choice path instead of passing raw text through.
+    extracts_forced_tool_calls: bool = False
 
     def __init__(self):
         # Streaming state management
@@ -80,7 +85,7 @@ class BaseToolParser(ABC):
                         -1,  # Caller should update this based on the actual tools array called
                         name=name,
                         parameters=json.dumps(
-                            act.get("parameters") or act.get("arguments", {}),
+                            act.get("parameters") or act.get("arguments") or {},
                             ensure_ascii=False,
                         ),
                     ))
@@ -109,6 +114,17 @@ class BaseToolParser(ABC):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Finalize a stream that ended before the format's closing markers.
+
+        Called once by the serving layer when generation finishes, after the
+        last ``parse_streaming_increment`` call, so parsers that buffer whole
+        sections can emit whatever the truncated stream still holds. The
+        default is a no-op to preserve the existing behavior of parsers that
+        manage ``self._buffer`` incrementally.
+        """
+        return StreamingParseResult()
 
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
@@ -223,7 +239,19 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                # A finished call may carry no "arguments" key at all, or an
+                # explicit null. Both mean "no arguments" and are normalized to
+                # {} so the call still completes, matching what parse_base_json
+                # returns on the non-streaming path. While the JSON is still
+                # partial a missing key only means "not streamed yet", so it is
+                # left alone and the elif prev_arguments branch keeps handling it.
+                if is_current_complete and cur_arguments is None:
+                    cur_arguments = {}
+
+                # An empty argument object is falsy but still has to be streamed and
+                # completed, otherwise a zero-argument tool call never finishes and its
+                # text stays in the buffer forever.
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])

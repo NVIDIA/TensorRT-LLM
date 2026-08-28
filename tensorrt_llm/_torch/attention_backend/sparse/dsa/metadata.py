@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -31,14 +33,8 @@ from .params import DSAMetadataParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
-# dtype of the indexer MQA-logits that feed the top-k. All paged_mqa_logits
-# paths produce fp32 today (DSL fp8/fp4 default output_dtype=fp32; DeepGEMM
-# fp8 hardcodes kFloat; DeepGEMM fp4 defaults logits_dtype=kFloat32 and is not
-# overridden here), and the decode forward feeds logits to the top-k without a
-# cast. dtype is a top-k compile-key dimension, so the warmup pre-compiles for
-# exactly this value. If a paged_mqa_logits caller ever emits a different dtype
-# (e.g. overriding the DeepGEMM fp4 logits_dtype to bf16), update this constant
-# or the warmup silently compiles the wrong variant.
+# Indexer MQA-logits are currently always fp32. The dtype is part of the
+# CuTe DSL Top-K compile key, so warmup must use the runtime dtype.
 _INDEXER_LOGITS_DTYPE = torch.float32
 
 if TYPE_CHECKING:
@@ -58,6 +54,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     sparse_metadata_params: Optional[DSAMetadataParams] = None
+    use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
@@ -148,6 +145,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "DSAtrtllmAttentionMetadata requires DSACacheManager-compatible "
                 f"cache manager, got {type(self.kv_cache_manager)}"
             )
+        self.use_fp8_ds_mla = getattr(self.kv_cache_manager, "use_fp8_ds_mla", False)
 
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -159,6 +157,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.enable_indexer_skip = sparse_metadata_params.enable_indexer_skip
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
+        )
+        self.enable_gvr_topk = (
+            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
         )
         self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
@@ -218,6 +219,90 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
 
+    def prepare_for_draft_forward(self) -> dict | None:
+        """Select native DSA indexer metadata for a draft forward."""
+        # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
+        # different dual-pool layout. Only native DSA cache managers use the DSA
+        # draft-replay buffers below.
+        if not is_dsa_cache_manager(self.kv_cache_manager):
+            return None
+
+        saved_state = {
+            "host_indexer_k_cache_block_offsets": self.host_indexer_k_cache_block_offsets,
+            "indexer_k_cache_block_offsets": self.indexer_k_cache_block_offsets,
+            "host_slot_mapping_fp8": self.host_slot_mapping_fp8,
+            "host_slot_mapping_scale": self.host_slot_mapping_scale,
+            "slot_mapping_fp8": self.slot_mapping_fp8,
+            "slot_mapping_scale": self.slot_mapping_scale,
+            "block_table": self.block_table,
+            "block_table_expanded": self.block_table_expanded,
+            "host_block_table_expanded": self.host_block_table_expanded,
+        }
+        # The cached-KV feature owns these references even when an optimized
+        # path aliases them to slot_mapping_*. With the feature disabled, the
+        # aliases are lazy and may not exist on the first generation replay.
+        if self.enable_context_mla_with_cached_kv:
+            saved_state.update(
+                {
+                    "slot_mapping_fp8_fullkv": self.slot_mapping_fp8_fullkv,
+                    "slot_mapping_scale_fullkv": self.slot_mapping_scale_fullkv,
+                }
+            )
+
+        # Rebind to the draft manager's dedicated buffers instead of
+        # overwriting the target tensors in place. Rebinding is invisible to
+        # CUDA graph capture, so the target and draft segments of the graph
+        # bake distinct addresses (like draft_kv_cache_block_offsets) and no
+        # graph-recorded copy from a transient host buffer is needed.
+        self.host_indexer_k_cache_block_offsets = self.host_draft_indexer_k_cache_block_offsets
+        self.indexer_k_cache_block_offsets = self.draft_indexer_k_cache_block_offsets
+        self.host_slot_mapping_fp8 = self.host_draft_slot_mapping_fp8
+        self.slot_mapping_fp8 = self.draft_slot_mapping_fp8
+        self.host_slot_mapping_scale = self.host_draft_slot_mapping_scale
+        self.slot_mapping_scale = self.draft_slot_mapping_scale
+        self.block_table = self.draft_block_table
+        self.block_table_expanded = self.draft_block_table_expanded
+        self.host_block_table_expanded = self.host_draft_block_table_expanded
+        self._invalidate_pool_view_cache()
+
+        # Recording a capture executes no kernels, so the draft mappings only
+        # need refreshing when the transfers actually run: eager forwards
+        # (warmup) and the pre-replay call from model_engine. The per-step
+        # advance inside the captured graph re-derives slot mappings on
+        # device from the rebound block-offset buffer.
+        # kv_cache_manager was already swapped to the draft manager above.
+        if not torch.cuda.is_current_stream_capturing():
+            self.prepare_for_indexer_k_cache()
+            self._refresh_expanded_block_table()
+            Indexer.recompute_slot_mappings(self)
+        Indexer.recompute_context_kv_gather_mappings(self)
+
+        return saved_state
+
+    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+        """Restore native DSA indexer metadata after a draft forward."""
+        if saved_state is None:
+            return
+
+        self.host_indexer_k_cache_block_offsets = saved_state["host_indexer_k_cache_block_offsets"]
+        self.indexer_k_cache_block_offsets = saved_state["indexer_k_cache_block_offsets"]
+        self.host_slot_mapping_fp8 = saved_state["host_slot_mapping_fp8"]
+        self.host_slot_mapping_scale = saved_state["host_slot_mapping_scale"]
+        self.slot_mapping_fp8 = saved_state["slot_mapping_fp8"]
+        self.slot_mapping_scale = saved_state["slot_mapping_scale"]
+        self.block_table = saved_state["block_table"]
+        self.block_table_expanded = saved_state["block_table_expanded"]
+        self.host_block_table_expanded = saved_state["host_block_table_expanded"]
+        self._invalidate_pool_view_cache()
+        if "slot_mapping_fp8_fullkv" in saved_state:
+            self.slot_mapping_fp8_fullkv = saved_state["slot_mapping_fp8_fullkv"]
+            self.slot_mapping_scale_fullkv = saved_state["slot_mapping_scale_fullkv"]
+        else:
+            # The draft recomputation rebound the aliases to the draft tensors;
+            # point them back at the restored target tensors.
+            self.slot_mapping_fp8_fullkv = self.slot_mapping_fp8
+            self.slot_mapping_scale_fullkv = self.slot_mapping_scale
+
     def get_indexer_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         if self._indexer_compress_ratio <= 1:
             return kv_lens
@@ -229,38 +314,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return max(1, self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
 
     def warmup_cute_dsl_radix_topk(self, next_n: int) -> None:
-        """Pre-compile the radix-filter CuTe DSL decode top-k during warmup.
-
-        Eager decode iters (mixed prefill+decode batch, or ``cuda_graph``
-        disabled) whose ``num_rows`` lands in a ``cluster_size`` band that
-        graph capture did not exercise otherwise pay a first-touch JIT stall
-        on a live request. ``num_cols`` is fixed at ``indexer_max_seq_len``,
-        so only the ``cluster_size`` dimension needs sweeping; delegate to the
-        custom-op warmup helper, which owns the band enumeration.
-
-        ``next_n`` (a compile-key dimension) is supplied by the caller from
-        the engine's static spec-decode config.
-
-        No-op unless decode actually routes to
-        ``cute_dsl_indexer_topk_decode``: heuristic top-k uses the GVR kernel
-        and plain (no cute_dsl_topk) decode uses the C++ op. Called once from
-        ``ModelEngine.warmup``.
-        """
-        if not self.use_cute_dsl_topk or self.enable_heuristic_topk:
+        """Pre-compile CuTe DSL radix variants not covered by engine warmup."""
+        sparse_params = self.sparse_metadata_params
+        if not self.use_cute_dsl_topk or (
+            sparse_params.enable_heuristic_topk and get_sm_version() >= 100
+        ):
             return
         if self.kv_cache_manager is None:
             return
-        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        top_k = self.sparse_mla_topk
         if not top_k:
             return
-        # The radix-filter DSL kernel does not support a compressed indexer
-        # combined with multi-row MTP: decode dispatches to it only when
-        # compress_ratio == 1 or next_n == 1. The compress_ratio > 1 &&
-        # next_n > 1 case routes to the C++ op (or GVR when heuristic top-k is
-        # on), so there is nothing to pre-compile here.
-        # TODO: extending the radix-filter path to compress_ratio > 1 &&
-        # next_n > 1 is straightforward; once the dispatch above is relaxed to
-        # use it there, drop this guard so the case is pre-compiled too.
         if self._indexer_compress_ratio > 1 and next_n > 1:
             return
         try:
@@ -269,6 +333,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         except ImportError:
             return
+
         warmup_cute_dsl_radix_topk_decode(
             top_k=int(top_k),
             num_cols=int(self.get_indexer_max_seq_len()),
@@ -277,7 +342,81 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_sms=self.num_sms,
         )
 
-    def on_update_kv_lens(self):
+    def warmup_selfsampling_topk(
+        self, next_n: int, batch_sizes: Optional[List[int]] = None
+    ) -> None:
+        """Pre-compile the self-sampling GVR varlen engine during warmup.
+
+        Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
+        by the exact row count AND the logits row stride: rows cover the
+        small eager batches plus every configured CUDA-graph batch size, and
+        the stride mirrors what the active paged-MQA producer emits, so the
+        warmed keys are the ones dispatch actually looks up. Batches outside
+        this set still compile lazily on first touch. The helper enumerates
+        one representative row per distinct engine compile key, so large
+        batch lists warm in bounded time and memory. No-op unless the opt-in
+        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        """
+        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
+            return
+        # same hardware gates as the dispatch flag (indexer __init__): never
+        # compile these kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+            return
+        if not self.enable_gvr_topk or self.kv_cache_manager is None:
+            return
+        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not top_k or int(top_k) not in (512, 1024, 2048):
+            return
+        cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
+        if cr not in (1, 4):
+            return
+        try:
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                gvr_topk_decode_self_sampling_host as _ss_host,
+            )
+        except ImportError:
+            return
+        nn = int(next_n)
+        # warm the small row counts eager mixed batches commonly produce;
+        # larger eager row counts lazy-JIT on first touch, and CUDA-graph
+        # geometries are covered through ``batch_sizes`` below
+        eager_warm_rows = 32
+        rows = set(range(nn, eager_warm_rows + 1, nn)) or {nn}
+        for bs in batch_sizes or ():
+            rows.add(int(bs) * nn)
+        msl_c = int(self.get_indexer_max_seq_len())
+        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+            # mirror the DSL paged-MQA arena stride (rows round up to 256
+            # elements). A drift here only degrades warmup to unused keys —
+            # dispatch still lazy-JITs the true key outside capture.
+            row_stride = (msl_c + 255) // 256 * 256
+        else:
+            # DeepGEMM emits exact-width rows; a non-float4 width falls
+            # through at the dispatch format gate, so there is nothing to warm
+            row_stride = msl_c
+            if row_stride % 4:
+                return
+        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
+        # is compressed — same multiply-back as the dispatch seam)
+        try:
+            _ss_host.warmup_varlen(
+                int(top_k),
+                msl_c * cr,
+                compress_ratio=cr,
+                next_n=int(next_n),
+                num_rows_list=tuple(sorted(rows)),
+                row_stride=row_stride,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # warmup is best-effort: the dispatch works without it (engines
+            # JIT lazily outside capture), so do not fail engine init
+            logger.warning(
+                "self-sampling GVR warmup ran out of memory; varlen engines "
+                "will JIT-compile lazily on first touch instead."
+            )
+
+    def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -286,6 +425,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
+
+        super().on_update_kv_lens()
 
         # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
@@ -312,6 +453,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
 
             global_positions = start_positions[req_indices] + token_offsets
+            if self.use_fp8_ds_mla:
+                self.token_positions_cuda[: self.num_tokens] = global_positions.to(torch.int32)
             # Honor MXFP4 indexer K cache layout (½ byte per value vs FP8's
             # 1 byte) when the cache manager exposes a use_fp4 flag.
             index_head_dim = self.kv_cache_manager.index_head_dim
@@ -396,11 +539,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
-    def _compute_kv_lens_row_reorder(self):
-        """Prepare longest-job-first row order for GVR top-k."""
+    def _compute_kv_lens_row_reorder(self) -> None:
+        """Prepare the longest-job-first GVR row order once per forward step."""
         next_n = 1 + self.max_draft_tokens
         if (
-            self.enable_heuristic_topk
+            self.enable_gvr_topk
             and self.use_cute_dsl_topk
             and self.num_generations * next_n >= 2 * self.num_sms
         ):
@@ -476,37 +619,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=prefer_pinned(),
         )
 
-    def _create_radix_aux_buffers(self, capture_graph=False):
-        # Persistent scratch for Radix-split-work indexer path (blocks_per_row > 1).
-        # Mirrors the fix the Heuristic path applied: per-call th::empty inside
-        # indexer_topk_decode produces stale pointers under CUDA Graph replay when
-        # the caching allocator is perturbed by chunked prefill at high CONC.
-        # Sized to the worst case kMaxBlocksPerRowDecode=10 from
-        # cpp/tensorrt_llm/kernels/indexerTopK.cu, times the max number of
-        # generation rows (num_seqs * (1 + max_draft_tokens)); the cpp op aborts
-        # if this is smaller than num_rows*blocks_per_row*index_topk. Allocated
-        # unconditionally: even with enable_heuristic_topk=True the dispatcher can
-        # fall back to Radix when canUseHeuristic returns False (small numColumns,
-        # etc.). MUST be re-created whenever max_draft_tokens changes (see
-        # update_spec_dec_param) or it is left too small once MTP raises the
-        # generation-row count.
-        _radix_max_blocks_per_row = 10
-        _radix_max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-        self.radix_aux_indices = self.get_empty(
-            self.cuda_graph_buffers,
-            (_radix_max_gen_tokens, _radix_max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_indices",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.radix_aux_logits = self.get_empty(
-            self.cuda_graph_buffers,
-            (_radix_max_gen_tokens, _radix_max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_logits",
-            dtype=torch.float32,
-            capture_graph=capture_graph,
-        )
-
     def create_buffers_for_indexer(self, capture_graph=False):
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -568,6 +680,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        self.token_positions_cuda = None
+        if self.use_fp8_ds_mla:
+            self.token_positions_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name="token_positions_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Allocate separate indexer block-offset and slot-mapping buffers for
         # the draft KV cache manager, mirroring draft_kv_cache_block_offsets:
         # the draft-replay context swaps these in by rebinding, so CUDA graph
@@ -611,7 +732,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
-        # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
+        # Allocate these buffers dynamically in Indexer.prepare()
+        # based on the actual total_kv_len to save memory.
         if self.enable_context_mla_with_cached_kv:
             self.slot_mapping_fp8_fullkv = None
             self.slot_mapping_scale_fullkv = None
@@ -702,37 +824,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        # Per-layer persistent buffers for heuristic TopK pre_idx.
-        # Indexed by [local_layer_idx, generation_position, :].
-        # The graph captures reads/writes on these stable-address buffers;
-        # each replay's write becomes the next replay's read (feedback loop).
-        self.enable_heuristic_topk = (
-            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
-        if self.enable_heuristic_topk:
-            num_local_layers = self.kv_cache_manager.num_local_layers
-            self.heuristic_prev_topk = self.get_empty(
+        if self.enable_gvr_topk:
+            self.gvr_prior_indices = self.get_empty(
                 self.cuda_graph_buffers,
-                (num_local_layers, self.max_num_sequences, self.num_sparse_topk),
-                cache_name="heuristic_prev_topk",
+                (
+                    self.kv_cache_manager.num_local_layers,
+                    self.max_num_sequences,
+                    self.num_sparse_topk,
+                ),
+                cache_name="gvr_prior_indices",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            # Zero-initialize so the first decode step's pre_idx (kernel
-            # adds +1 offset) points to index 1 — a valid but benign candidate.
-            # Without this, uninitialized memory produces random hint indices.
-            self.heuristic_prev_topk.zero_()
-            # The C++ top-k path needs a stable scratch address.
-            if not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
-            # GVR row order also needs a stable address for CUDA graphs.
+            self.gvr_prior_indices.zero_()
             if self.use_cute_dsl_topk:
                 self.kv_lens_row_reorder_buffer = self.get_empty(
                     self.cuda_graph_buffers,
@@ -741,12 +845,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
-
-        # Persistent scratch for the Radix-split-work indexer path. Re-created
-        # in update_spec_dec_param when max_draft_tokens changes so it stays
-        # large enough for the MTP generation-row count.
-        self._create_radix_aux_buffers(capture_graph=capture_graph)
-
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -829,7 +927,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: bool = False,
         spec_metadata: Optional["SpecMetadata"] = None,
         spec_tree_manager: Optional["SpecTreeManager"] = None,
         num_contexts: int = 0,
@@ -842,7 +939,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped,
             spec_metadata,
             spec_tree_manager,
             num_contexts=num_contexts,
@@ -854,23 +950,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
-            # Resize heuristic scratch buffer for new max_draft_tokens.
-            if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
-            # The Radix-split-work scratch (radix_aux_*) is sized the same way
-            # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
-            # unconditionally, so it must be resized here too -- otherwise the
-            # cpp indexer_topk_decode op aborts once MTP raises max_draft_tokens
-            # ("radix_aux_* must hold at least num_rows*blocks_per_row*index_topk
-            # elements").
-            self._create_radix_aux_buffers(capture_graph=capture_graph)
 
     def _update_indexer_k_cache_block_offsets(self) -> torch.Tensor:
         """Refresh INDEX_KEY offsets and return their physical pool slots."""

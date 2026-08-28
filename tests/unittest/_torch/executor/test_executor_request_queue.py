@@ -100,31 +100,15 @@ def test_enqueue_request_single(executor_queue):
     assert req_id in executor_queue.start_times
 
 
-def test_enqueue_request_with_query(executor_queue):
-    """Test enqueuing a request with query data."""
-    mock_request = Mock()
-    query_data = [1, 2, 3, 4]
-    with patch.object(executor_queue, '_generate_child_request_ids'):
-        req_id = executor_queue.enqueue_request(mock_request, query=query_data)
-
-    assert req_id == 8
-
-    # Verify the item was enqueued with query
-    item = executor_queue.request_queue.get_nowait()
-    assert item.id == req_id
-    assert item.request == mock_request
-
-
 @pytest.mark.parametrize("n_children", [0, 1, 2])
 def test_enqueue_request_with_child_ids(executor_queue, n_children):
-    """Test enqueuing a request with query data."""
+    """Test enqueuing a request with child request ids."""
     mock_request = Mock()
-    query_data = [1, 2, 3, 4]
     with patch(
             'tensorrt_llm._torch.pyexecutor.executor_request_queue.get_num_child_requests'
     ) as mock_children:
         mock_children.return_value = n_children
-        req_id = executor_queue.enqueue_request(mock_request, query=query_data)
+        req_id = executor_queue.enqueue_request(mock_request)
 
     assert req_id == 8
 

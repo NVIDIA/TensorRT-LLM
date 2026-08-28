@@ -13,14 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .block_sparse_attn_dsl_fwd import (
-    VideoSparseAttentionForwardGroup2QInterleaveKV as VideoSparseAttentionForward,
-)
 from .interface import CUTE_AVAILABLE, block_sparse_attn_from_indices_cute, is_cute_supported
 
 __all__ = [
     "CUTE_AVAILABLE",
-    "VideoSparseAttentionForward",
     "block_sparse_attn_from_indices_cute",
     "is_cute_supported",
 ]

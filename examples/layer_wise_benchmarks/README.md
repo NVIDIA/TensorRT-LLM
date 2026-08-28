@@ -100,6 +100,28 @@ NP=1 ./mpi_launch.sh ./run.sh config_gen.yaml --model nvidia/NVIDIA-Nemotron-3-N
 NP=2 ./mpi_launch.sh ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --mamba-ssm-cache-dtype float16 --batch-size 4
 NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --mamba-ssm-cache-dtype float16 --batch-size 512
 
+# Run Kimi K3 (KimiLinear: KDA + MLA hybrid), $K3 being a local checkpoint directory.
+# Layer indices are 0-based, so 4,5,6,7 is three KDA layers followed by one full-attention
+# (MLA) layer -- one full period of the 3:1 pattern. Layer 0 is the only dense layer.
+# --moe-backend must be TRTLLM: the SiTU routed experts support only TRTLLM and
+# MEGAMOE_DEEPGEMM, the config files default to CUTLASS, and of those two only TRTLLM is in
+# the balance-method whitelist -- MEGAMOE_DEEPGEMM additionally needs
+# --balance-method NotModified. GEN also builds a prefill runner, so
+# --moe-backend-for-prefill must be set to match.
+# The attn-residual snapshot stack grows one entry every attn_res_block_size (12) layers and
+# is seeded from layer_indices[0], so a slice at 0,1,2,3 measures a cheaper attn_res than one
+# at 48,49,50,51.
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1
+
+# Run Kimi K3 with 3 draft tokens per step (seq_len_q = 1 + 3). --spec-max-draft-len makes
+# the cache manager allocate the KDA multi-token verify buffers; without it the run stops
+# with an error. No sampler exists here, so no draft is ever accepted.
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --batch-size 32 --seq-len-q 4 --spec-max-draft-len 3
+
+# Run Kimi K3 at the serving parallelism (DEP16, see examples/kimi_k3/eval_extra_llm_options.yaml)
+NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
+
 # Run with DeepEP A2A
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL
@@ -377,3 +399,25 @@ Limitations:
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 
    Please use a local model through the `--model` option, or follow Hugging Face's instructions: "We had to rate limit your IP. To continue using our service, create a HF account or login to your existing account, and make sure you pass a HF_TOKEN if you're using the API."
+
+3. Error `Routing results are not replaced` with a MoE backend that routes inside the kernel.
+
+   `--balance-method` overrides routing in Python, so it needs the top-k to be computed outside the MoE kernel. Under attention DP that is always the case; with `--no-enable-attention-dp` the top-k can be fused into the kernel instead. Either add `-x TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1` or set `--balance-method NotModified`.
+
+4. Error `Kimi K3 needs --spec-max-draft-len N for seq_len_q N+1`.
+
+   Kimi K3's multi-token verify path reads speculative KDA state buffers that the cache manager only allocates when it is built with a speculative config. Add `--spec-max-draft-len` equal to `seq_len_q - 1`. Note that the harness has no sampler, so no draft is ever accepted and the result is the zero-acceptance corner of the verify kernel, not a steady-state number.
+
+5. Error `AttributeError: 'KimiLinearConfig' object has no attribute 'n_routed_experts'` with `--scaled-from`.
+
+   Weak scaling rewrites `n_routed_experts`, which Kimi K3's config does not have (it uses `num_experts`). `--scaled-from` is not supported for this model.
+
+6. Numbers look plausible but a factor of ~10 too slow on a hybrid model.
+
+   Several model fast paths fall back silently. Check these lines in the rank-0 log:
+
+   - `KDA kernel dispatch: prefill=optimized decode=optimized verify=optimized`
+   - `fused prefill/decode/verify projections on <N> KDA layers` — `N` must equal the number of KDA layers in `--layer-indices`; `0` means every KDA layer is running the reference path (~70 us/layer of glue around a ~5 us kernel)
+   - `Mamba Cache (kda-replay) is allocated` — only with `--spec-max-draft-len`; without it the legacy per-step verify buffers are used instead
+
+   For reference, Kimi K3 on 4 GPUs (DEP4, one GB200 node) with `--layer-indices 4,5,6,7` and `--load-format DUMMY` runs ~60 ms per CTX iteration at `--batch-size 1 --seq-len-q 8193`, and ~4.2 ms per GEN iteration at `--batch-size 32 --seq-len-q 4 --seq-len-kv-cache 8193 --spec-max-draft-len 3`.

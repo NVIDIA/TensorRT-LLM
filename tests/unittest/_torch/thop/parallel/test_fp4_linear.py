@@ -902,14 +902,20 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
         m, n, k)
     bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.5
 
+    # Request the unbiased GEMM in fp32 and add the bias in fp32 so the
+    # reference rounds to bf16 exactly once, like the fused epilogue does.
+    # A bf16 out_no_bias would round twice, and since 1 bf16 ULP is 2.0 once
+    # |out| reaches ~256, cancellation against the bias promotes that discarded
+    # remainder into a multi-ULP error that the fused (single-rounded) result
+    # does not have.
     out_no_bias = torch.ops.trtllm.nvfp4_gemm(act_fp4,
                                               w_fp4,
                                               act_sf,
                                               w_sf,
                                               alpha,
-                                              torch.bfloat16,
+                                              torch.float32,
                                               allowed_backends=backend)
-    ref = out_no_bias + bias
+    ref = (out_no_bias + bias.float()).to(torch.bfloat16)
 
     out_fused = torch.ops.trtllm.nvfp4_gemm(act_fp4,
                                             w_fp4,
@@ -920,5 +926,6 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
                                             allowed_backends=backend,
                                             bias=bias)
 
-    # bf16 1-ULP at cast boundary (~0.0039) — fused vs gemm+add differs by ULP-level rounding.
+    # Tolerance is kept because the biased and unbiased calls may pick
+    # different autotuner tactics, i.e. a different accumulation order.
     torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)

@@ -193,6 +193,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.chunk_unit_size = 0
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
+        self.has_cp_helix = kv_cache_manager._has_cp_helix
         draft_mgr_name = (
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
         )
@@ -993,6 +994,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         success = self.kv_cache_manager.try_allocate_generation(req)
 
         if not success:
+            if self.has_cp_helix:
+                # No-evict stance: every validated helix run used
+                # GUARANTEED_NO_EVICT semantics; eviction stays off under
+                # helix until a KV-pressure e2e validates it.
+                raise RuntimeError(
+                    f"[V2Scheduler] KV allocation failed for helix request "
+                    f"{req.py_request_id}; eviction is disabled under helix "
+                    f"CP pending end-to-end validation. Increase "
+                    f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
+                    f"or max_tokens (GLOBAL tokens across CP ranks, not "
+                    f"per-rank), or reduce concurrency."
+                )
             req_it_end, success = self._try_evict_for_gen(
                 req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
             )

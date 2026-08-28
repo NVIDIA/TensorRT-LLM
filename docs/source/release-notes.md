@@ -30,6 +30,12 @@ All published functionality in the Release Notes has been fully tested and verif
 
 - `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
 
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 `pool_ratio` values are now specified in layer-group ID order, with exactly one normalized hot-tier byte ratio per layer group, instead of hot pool-group order. Cold-tier initialization preserves the implied layer-group slot-count proportions while accounting for cold page sizes.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 reports cold-tier `secondary*` statistics in `kvCacheIterationStatsByColdPoolGroup`. These keys are no longer present in the hot pool-group or window-size views.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] VisualGen video `response_format`.**</span> Video generation (`POST /v1/videos/sync`, `POST /v1/videos`) narrows `response_format` to `{file, path}` (default `file`): the old `url` value — which returned raw bytes, not a URL — is renamed to `file`, and `b64_json` is removed. Requests still sending `url` or `b64_json` now get an error that names the replacement. The internal `output_path` is no longer emitted by `GET /v1/videos/{id}` or `GET /v1/videos` (status only); a co-located client obtains the on-disk path via `response_format="path"`. Image `response_format` is unchanged and additively gains `path`. The synchronous route is now `POST /v1/videos/sync`, with `POST /v1/videos/generations` kept as a deprecated alias. `response_format="path"` returns absolute server-side file paths and can be disabled server-side with `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` (enabled by default; paths stay under the media-storage directory).
+
 ### Fixed Issues
 
 ### Known Issues

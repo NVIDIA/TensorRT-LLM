@@ -188,7 +188,7 @@ TEST(KvCacheManagerV2TypedIndexTest, StrongIndexSupportsValueTypeUpperBoundCompa
 
 TEST(KvCacheManagerV2TypedIndexTest, StrongIndexDefaultsMatchSentinels)
 {
-    static_assert(CacheLevel{}.value() == kGpuLevel.value(), "CacheLevel default should name the GPU level");
+    static_assert(CacheLevel{}.value() == kHotLevel.value(), "CacheLevel default should name the hot level");
     static_assert(BeamIndex{}.value() == kDefaultBeamIndex.value(), "BeamIndex default should name the default beam");
     static_assert(BlockOrdinal{}.value() == kBadBlockOrdinal.value(), "BlockOrdinal default should be invalid");
     static_assert(PageIndex{}.value() == kBadPageIndex.value(), "PageIndex default should be invalid");
@@ -328,6 +328,26 @@ TEST(KvCacheManagerV2TypedIndexTest, TypedVecSupportsVectorInterop)
     EXPECT_EQ(values.size(), PoolGroupIndex{2});
     EXPECT_EQ(values.raw().at(0), 3);
     EXPECT_EQ(values[PoolGroupIndex{1}], 5);
+}
+
+TEST(KvCacheManagerV2TypedIndexTest, LifeCyclePoolGroupMappingProvidesForwardAndInverseLookup)
+{
+    LifeCyclePoolGroupMapping mapping(
+        TypedVec<LifeCycleId, PoolGroupIndex>{PoolGroupIndex{1}, PoolGroupIndex{0}, PoolGroupIndex{1}});
+
+    EXPECT_EQ(mapping.numPoolGroups(), PoolGroupIndex{2});
+    EXPECT_EQ(mapping.poolGroup(LifeCycleId{0}), PoolGroupIndex{1});
+    EXPECT_EQ(mapping.poolGroup(LifeCycleId{1}), PoolGroupIndex{0});
+    EXPECT_EQ(mapping.poolGroup(LifeCycleId{2}), PoolGroupIndex{1});
+
+    auto const firstPoolGroup = mapping.lifeCycles(PoolGroupIndex{0});
+    ASSERT_EQ(firstPoolGroup.size(), 1);
+    EXPECT_EQ(firstPoolGroup[0], LifeCycleId{1});
+
+    auto const secondPoolGroup = mapping.lifeCycles(PoolGroupIndex{1});
+    ASSERT_EQ(secondPoolGroup.size(), 2);
+    EXPECT_EQ(secondPoolGroup[0], LifeCycleId{0});
+    EXPECT_EQ(secondPoolGroup[1], LifeCycleId{2});
 }
 
 } // namespace

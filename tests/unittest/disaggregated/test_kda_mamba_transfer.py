@@ -17,28 +17,35 @@
 Synthetic loopback coverage of the KDA recurrent-state transfer path:
 
 * KDA slot layout, mapped onto the Mamba cache-manager parametrization the
-  way ``_util.py`` does for ``kimi_linear``:
+  way ``_util.py`` does for ``kimi_linear`` (params come from
+  ``extract_mamba_kv_cache_params`` UNSCALED — global head counts):
     - short-conv slot  ``[3*H*hd, W]``  **bf16** (qwen3_next ``[Q|K|V]``
       3-section layout, all sections equal width),
     - delta-rule slot  ``[H, hd, hd]``  **fp32**  (``state_size == head_dim``),
-    - EP pre-scale: ``num_heads``/``n_groups`` multiplied by ``tp_size`` when
-      attention-DP is off, so the per-rank state is full-size (replicated).
+    - TP semantics: the manager itself gates on the mapping
+      (``tp_size = 1`` under attention-DP, else ``mapping.tp_size``) and
+      divides ``num_heads``/``n_groups``/``conv_dim`` by it. So the per-rank
+      state is a head shard when attention-DP is off (matching the model's
+      head-sharded KDA compute in ``KimiKDARuntime``) and a full-size
+      replica under attention-DP.
 
 * ``test_kda_layer_group_descriptors`` checks that the V2 page table
   describes BOTH slots with exact byte sizes and that the matched-TP
   ``MambaPolicy`` descriptors tile each layer's slot bytes exactly.
 
 * ``test_kda_transfer`` performs a real single-node NIXL loopback transfer
-  and bitwise-compares both dtypes on the gen side.
+  and bitwise-compares both dtypes on the gen side: matched and
+  heterogeneous ctx/gen TP, attention-DP on and off.
 
-* ``test_kda_hetero_tp_rejected`` asserts the peer-registration
-  guard: with replicated (pre-scaled) state, heterogeneous
-  ctx/gen TP (attention-DP off) is rejected instead of producing fragment
-  pointers outside the slot; supported layouts still validate.
+* ``test_kda_hetero_tp_sharded_accepted`` asserts that peer registration
+  accepts heterogeneous ctx/gen TP with attention-DP off for what
+  production actually builds (head-sharded per-rank state, so the global
+  TP-aggregated size invariant holds).
 """
 
 import uuid
-from typing import Dict, List
+from types import SimpleNamespace
+from typing import List
 
 import pytest
 import torch
@@ -48,7 +55,10 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+    MambaPolicy,
+    mamba_receiver_payload_bytes,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -56,6 +66,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -81,9 +92,34 @@ _NUM_TOTAL_LAYERS = NUM_KDA_LAYERS + 1
 _KDA_MASK = [False] + [True] * NUM_KDA_LAYERS
 _ATTN_MASK = [True] + [False] * NUM_KDA_LAYERS
 
-# Full per-layer slot byte sizes (replicated on every rank for K3).
+# Global (TP-aggregated) per-layer slot byte sizes. Per-rank slot bytes are
+# these divided by tp_size when attention-DP is off (head-sharded state) and
+# equal to these under attention-DP (replicated state).
 CONV_SLOT_BYTES = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
 SSM_SLOT_BYTES = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
+
+
+def _kimi_linear_config():
+    """Minimal ``kimi_linear`` HF-config stand-in for the production mapping.
+
+    Just enough attributes for ``extract_mamba_kv_cache_params`` (the
+    ``is_kimi_linear`` route): KDA layers are 1..NUM_KDA_LAYERS+1 (1-indexed),
+    layer 1 is the dummy full-attention layer.
+    """
+    kda_layers = [i + 1 for i, m in enumerate(_KDA_MASK) if m]
+    full_attn_layers = [i + 1 for i, m in enumerate(_KDA_MASK) if not m]
+    return SimpleNamespace(
+        model_type="kimi_linear",
+        linear_attn_config={
+            "head_dim": KDA_HEAD_DIM,
+            "short_conv_kernel_size": KDA_W,
+            "num_heads": KDA_NUM_HEADS,
+            "kda_layers": kda_layers,
+            "full_attn_layers": full_attn_layers,
+        },
+        num_hidden_layers=_NUM_TOTAL_LAYERS,
+        torch_dtype=CONV_DTYPE,
+    )
 
 
 def _create_kda_managers(
@@ -91,13 +127,19 @@ def _create_kda_managers(
 ):
     """Create MixedMambaHybridCacheManagers with K3-style KDA slots.
 
-    Mirrors the ``is_kimi_linear`` route in ``_util.py:1855-1915``: KDA is
-    mapped onto (state_size=hd, conv_kernel=W+1, num_heads=H, n_groups=H,
-    head_dim=hd, model_type='qwen3_next'), and ``num_heads``/``n_groups``
-    are pre-scaled by tp_size when attention-DP is off so the per-rank
-    state stays full-size (EP-only parallelism, replicated KDA state).
+    Mirrors the ``is_kimi_linear`` route in ``_util.py``: the mamba params
+    come from ``extract_mamba_kv_cache_params`` UNSCALED (global
+    ``num_heads``/``n_groups``); the manager applies its own TP gate
+    (``tp_size = 1`` under attention-DP, else ``mapping.tp_size``) and
+    divides ``num_heads``/``n_groups``/``conv_dim`` by it — the same
+    head-shard semantics the model runtime uses (``KimiKDARuntime``
+    constructs the mixer with ``num_heads // tp_size``).
     """
-    state_tp = tp if not enable_attention_dp else 1
+    params = extract_mamba_kv_cache_params(_kimi_linear_config())
+    assert params.mamba_layer_mask == _KDA_MASK
+    assert params.target_full_attention_layer_mask == _ATTN_MASK
+    assert params.dtype == CONV_DTYPE
+    assert params.mamba_ssm_cache_dtype == SSM_DTYPE  # kimi_linear forces fp32
     managers = []
     for rank in range(tp):
         mapping = Mapping(
@@ -108,15 +150,15 @@ def _create_kda_managers(
             enable_attention_dp=enable_attention_dp,
         )
         mgr = MixedMambaHybridCacheManager(
-            mamba_d_state=KDA_HEAD_DIM,
-            mamba_d_conv=KDA_W + 1,
-            mamba_num_heads=KDA_NUM_HEADS * state_tp,
-            mamba_n_groups=KDA_NUM_HEADS * state_tp,
-            mamba_head_dim=KDA_HEAD_DIM,
-            mamba_num_layers=NUM_KDA_LAYERS,
-            mamba_layer_mask=_KDA_MASK,
-            mamba_cache_dtype=CONV_DTYPE,
-            mamba_ssm_cache_dtype=SSM_DTYPE,
+            mamba_d_state=params.state_size,
+            mamba_d_conv=params.conv_kernel,
+            mamba_num_heads=params.num_heads,
+            mamba_n_groups=params.n_groups,
+            mamba_head_dim=params.head_dim,
+            mamba_num_layers=params.num_mamba_layers,
+            mamba_layer_mask=params.mamba_layer_mask,
+            mamba_cache_dtype=params.dtype,
+            mamba_ssm_cache_dtype=params.mamba_ssm_cache_dtype,
             # dummy attention layer (page table scaffolding)
             kv_cache_config=KvCacheConfig(
                 max_tokens=256 * max_batch_size,
@@ -145,56 +187,14 @@ def _get_mamba_layer_group(page_table) -> MambaLayerGroup:
     return mlgs[0]
 
 
-def _layer_slot_start(pool, local_layer_idx: int, slot: int) -> int:
-    return pool.base_address + (local_layer_idx * pool.num_slots + slot) * pool.slot_bytes
-
-
-def _assert_frags_tile_slots(frags, mlg: MambaLayerGroup, slot: int):
-    """Assert (ptr, size) frags exactly tile every layer's slot bytes."""
-    ptrs, sizes = frags
-    covered: Dict[int, List[tuple]] = {}
-    for ptr, size in zip(ptrs, sizes):
-        pool = None
-        for cand in (mlg.conv_states, mlg.ssm_states):
-            lo = cand.base_address
-            hi = lo + len(mlg.mamba_layer_offsets) * cand.num_slots * cand.slot_bytes
-            if lo <= ptr < hi:
-                pool = cand
-                break
-        assert pool is not None, f"frag ptr {ptr} outside both mamba pools"
-        rel = ptr - pool.base_address
-        layer = rel // (pool.num_slots * pool.slot_bytes)
-        in_layer = rel - layer * pool.num_slots * pool.slot_bytes
-        frag_slot = in_layer // pool.slot_bytes
-        off = in_layer - frag_slot * pool.slot_bytes
-        assert frag_slot == slot, f"frag targets slot {frag_slot}, expected {slot}"
-        assert off + size <= pool.slot_bytes, (
-            f"frag [{off}, {off + size}) exceeds slot_bytes {pool.slot_bytes}"
-        )
-        covered.setdefault((id(pool), int(layer)), []).append((off, off + size))
-
-    # Exact tiling per (pool, layer): sorted intervals must be contiguous
-    # from 0 to slot_bytes with no overlap.
-    n_layers = len(mlg.mamba_layer_offsets)
-    for pool in (mlg.conv_states, mlg.ssm_states):
-        for layer in range(n_layers):
-            intervals = sorted(covered.get((id(pool), layer), []))
-            assert intervals, f"layer {layer} of pool not covered"
-            pos = 0
-            for lo, hi in intervals:
-                assert lo == pos, f"gap/overlap at byte {pos} (next frag at {lo})"
-                pos = hi
-            assert pos == pool.slot_bytes, (
-                f"layer {layer}: covered {pos} of {pool.slot_bytes} slot bytes"
-            )
-
-
 # ---------------------------------------------------------------------------
 # Descriptor-level tests (no NIXL transfer)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("enable_attention_dp", [True, False], ids=["adp_on", "adp_off_tp1"])
 def test_kda_layer_group_descriptors(enable_attention_dp):
     """V2 page table must describe BOTH KDA slots with exact byte extents."""
+    from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
     mgr = _create_kda_managers(1, enable_attention_dp=enable_attention_dp)[0]
     try:
         pt = build_page_table_from_manager(mgr)
@@ -209,49 +209,44 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert tuple(conv.shape[2:]) == (3 * KDA_NUM_HEADS * KDA_HEAD_DIM, KDA_W)
         assert tuple(ssm.shape[2:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
 
-        # Both pools present, byte-exact (bf16 conv, fp32 delta).
-        assert mlg.conv_states is not None and mlg.ssm_states is not None
-        assert mlg.conv_states.base_address == conv.data_ptr()
-        assert mlg.ssm_states.base_address == ssm.data_ptr()
-        assert mlg.conv_states.slot_bytes == CONV_SLOT_BYTES
-        assert mlg.ssm_states.slot_bytes == SSM_SLOT_BYTES
-        assert mlg.conv_states.num_slots == conv.shape[1]
-        assert mlg.ssm_states.num_slots == ssm.shape[1]
+        # Both pool_views present with correct roles and byte sizes.
+        conv_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE), None)
+        ssm_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE), None)
+        assert conv_pv is not None and ssm_pv is not None
+        assert conv_pv.bytes_per_layer == CONV_SLOT_BYTES
+        assert ssm_pv.bytes_per_layer == SSM_SLOT_BYTES
 
         # qwen3_next 3-sectioning: equal sections summing to the conv slot.
         assert mlg.conv_section_bytes == [CONV_SLOT_BYTES // 3] * 3
-        assert sum(mlg.conv_section_bytes) == mlg.conv_states.slot_bytes
+        assert sum(mlg.conv_section_bytes) == conv_pv.bytes_per_layer
         assert mlg.ssm_bytes_per_head == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-        assert mlg.ssm_states.slot_bytes // mlg.ssm_bytes_per_head == KDA_NUM_HEADS
+        assert ssm_pv.bytes_per_layer // mlg.ssm_bytes_per_head == KDA_NUM_HEADS
 
-        # Layer offsets cover exactly the KDA layers.
-        assert sorted(mlg.mamba_layer_offsets.keys()) == [i for i, m in enumerate(_KDA_MASK) if m]
+        # local_layers cover exactly the KDA layers (by global_layer_id).
+        assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
+            i for i, m in enumerate(_KDA_MASK) if m
+        ]
 
-        # Matched-parallelism frags: 2 pools x layers, full-slot, exact tiling.
-        ri = RankInfo.from_kv_cache_manager("kda_test", mgr, device_id=0)
-        src_slot, dst_slot = 0, 1
-        src_frags, dst_frags, sizes = MambaPolicy.build_mamba_frags(
-            mlg, mlg, src_slot, dst_slot, ri, ri
+        # Matched-parallelism payload: receiver_payload_bytes must equal
+        # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
+        payload = mamba_receiver_payload_bytes(
+            sender_page_table=pt,
+            receiver_page_table=pt,
+            dst_slot=1,
         )
-        assert len(src_frags) == len(dst_frags) == len(sizes) == 2 * NUM_KDA_LAYERS
-        _assert_frags_tile_slots((src_frags, sizes), mlg, src_slot)
-        _assert_frags_tile_slots((dst_frags, sizes), mlg, dst_slot)
-
-        # Full-slot copies at the expected per-layer addresses.
-        for glid, lid in sorted(mlg.mamba_layer_offsets.items()):
-            assert _layer_slot_start(mlg.conv_states, lid, src_slot) in src_frags
-            assert _layer_slot_start(mlg.ssm_states, lid, src_slot) in src_frags
+        assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()
 
 
-def test_kda_hetero_tp_rejected():
-    """Replicated KDA state + heterogeneous TP (ADP off) must be rejected.
+def test_kda_hetero_tp_sharded_accepted():
+    """Heterogeneous ctx/gen TP with ADP off passes peer validation.
 
-    Hetero ctx/gen TP would silently corrupt replicated state: the TP-mismatch
-    mappers assume sharded state and would compute shard offsets past the
-    end of K3's replicated (pre-scaled) slots. The peer-registration gate
-    (``MambaPolicy.validate_peer_compatible``) must reject this loudly.
+    With attention-DP off, production builds a head-sharded per-rank KDA
+    state (the manager divides num_heads/n_groups/conv_dim by tp_size,
+    matching ``KimiKDARuntime``'s head-sharded compute), so
+    ``per_rank_slot_bytes * tp`` is TP-invariant and the global-size gate in
+    ``MambaPolicy.validate_peer_compatible`` accepts hetero ctx/gen TP.
     """
     ctx_mgrs = _create_kda_managers(2, enable_attention_dp=False)
     gen_mgrs = _create_kda_managers(4, enable_attention_dp=False)
@@ -259,16 +254,36 @@ def test_kda_hetero_tp_rejected():
     try:
         ctx_pt = build_page_table_from_manager(ctx_mgr)
         gen_pt = build_page_table_from_manager(gen_mgr)
+
+        # Production per-rank slots are the global sizes divided by tp.
+        from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
+        ctx_mlg = _get_mamba_layer_group(ctx_pt)
+        gen_mlg = _get_mamba_layer_group(gen_pt)
+        ctx_conv_bpl = next(
+            pv.bytes_per_layer for pv in ctx_mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE
+        )
+        ctx_ssm_bpl = next(
+            pv.bytes_per_layer for pv in ctx_mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE
+        )
+        gen_conv_bpl = next(
+            pv.bytes_per_layer for pv in gen_mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE
+        )
+        gen_ssm_bpl = next(
+            pv.bytes_per_layer for pv in gen_mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE
+        )
+        assert ctx_conv_bpl == CONV_SLOT_BYTES // 2
+        assert ctx_ssm_bpl == SSM_SLOT_BYTES // 2
+        assert gen_conv_bpl == CONV_SLOT_BYTES // 4
+        assert gen_ssm_bpl == SSM_SLOT_BYTES // 4
+
         ctx_ri = RankInfo.from_kv_cache_manager("kda_ctx", ctx_mgr, device_id=0)
         gen_ri = RankInfo.from_kv_cache_manager("kda_gen", gen_mgr, device_id=0)
-
-        with pytest.raises(ValueError, match="TP-aggregated"):
-            MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+        MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
 
         # And via the registrar entry point used at runtime.
         registrar = PeerRegistrar(ctx_ri, KVRegionExtractorV1(ctx_pt))
-        with pytest.raises(ValueError, match="TP-aggregated"):
-            registrar.register("kda_gen", 1, gen_ri)
+        registrar.register("kda_gen", 1, gen_ri)
     finally:
         for mgr in ctx_mgrs + gen_mgrs:
             mgr.shutdown()
@@ -277,13 +292,17 @@ def test_kda_hetero_tp_rejected():
 @pytest.mark.parametrize(
     "ctx_cfg,gen_cfg",
     [
-        ((2, False), (2, False)),  # matched TP, ADP off (EP pre-scaled)
+        ((2, False), (2, False)),  # matched TP, ADP off (head-sharded)
         ((2, True), (4, True)),  # heterogeneous DEP with ADP on both sides
     ],
     ids=["matched_tp2_adp_off", "hetero_dep_adp_on"],
 )
 def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
-    """Matched-TP and ADP-on-both-sides layouts must pass peer validation."""
+    """Matched-TP and ADP-on-both-sides layouts must pass peer validation.
+
+    Hetero TP with ADP off (also supported for K3's sharded state) is
+    covered by ``test_kda_hetero_tp_sharded_accepted``.
+    """
     ctx_tp, ctx_adp = ctx_cfg
     gen_tp, gen_adp = gen_cfg
     ctx_mgrs = _create_kda_managers(ctx_tp, enable_attention_dp=ctx_adp)
@@ -302,19 +321,60 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
 
 def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_ids=None):
     """MambaLayerGroup-only page table with fake addresses (no CUDA needed)."""
-    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, PhysicalPool
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        KVCachePageTable,
+        LocalLayer,
+        MapperKind,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
 
     if layer_ids is None:
         layer_ids = range(1, NUM_KDA_LAYERS + 1)
+    local_layers = [
+        LocalLayer(local_layer_id=i, global_layer_id=glid) for i, glid in enumerate(layer_ids)
+    ]
+    sorted_lids = [ll.local_layer_id for ll in local_layers]
+    conv_pool = PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8)
+    ssm_pool = PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8)
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_slot_bytes,
+        ),
+    ]
     mlg = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets={glid: i for i, glid in enumerate(layer_ids)},
-        conv_states=PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8),
-        ssm_states=PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8),
+        local_layers=local_layers,
+        pool_views=pool_views,
         conv_section_bytes=[conv_slot_bytes // 3] * 3,
         ssm_bytes_per_head=KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize,
     )
-    return KVCachePageTable(tokens_per_block=8, layer_groups=[mlg], pool_groups=[])
+    return KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[mlg],
+        pool_groups=[PhysicalPoolGroup(pools=[conv_pool, ssm_pool])],
+    )
 
 
 def _synthetic_rank_info(tp: int, adp: bool):
@@ -346,25 +406,30 @@ def _synthetic_rank_info(tp: int, adp: bool):
 @pytest.mark.parametrize(
     "ctx,gen,ok",
     [
-        # (tp, adp, slot_scale_denominator): replicated K3 state = full slots.
-        ((2, False, 1), (4, False, 1), False),  # hetero TP, ADP off: would corrupt state
+        # (tp, adp, slot_scale_denominator). denom == tp models K3's actual
+        # head-sharded per-rank slots (slot_bytes = full // tp when ADP off);
+        # denom == 1 with tp > 1 and ADP off models a hypothetical model that
+        # keeps a replicated full-size per-rank state while reporting
+        # mamba_tp > 1 — the layout the global-size gate must reject under
+        # hetero TP (shard offsets would land past the end of the slot).
+        ((2, False, 1), (4, False, 1), False),  # replicated slots, hetero TP: reject
         ((4, False, 1), (2, False, 1), False),  # ...both directions
-        ((2, True, 1), (2, False, 1), False),  # mixed ADP, replicated
-        ((2, False, 1), (2, False, 1), True),  # matched TP
-        ((2, True, 1), (4, True, 1), True),  # hetero DEP, ADP on both
-        ((2, False, 2), (4, False, 4), True),  # sharded state, hetero TP
+        ((2, True, 1), (2, False, 1), False),  # ADP on vs sharded-claim, full slots both
+        ((2, False, 1), (2, False, 1), True),  # matched TP: sizes agree either way
+        ((2, True, 1), (4, True, 1), True),  # hetero DEP, ADP on both (replicated)
+        ((2, False, 2), (4, False, 4), True),  # K3 layout: sharded slots, hetero TP
     ],
     ids=[
-        "reject_hetero_tp_adp_off",
-        "reject_hetero_tp_adp_off_rev",
-        "reject_mixed_adp_replicated",
+        "reject_hetero_tp_replicated_slots",
+        "reject_hetero_tp_replicated_slots_rev",
+        "reject_mixed_adp_full_slots",
         "accept_matched_tp",
         "accept_hetero_dep_adp_on",
         "accept_sharded_hetero_tp",
     ],
 )
 def test_kda_peer_validation_synthetic_cpu(ctx, gen, ok):
-    """CPU-only reject/accept matrix for the gap-F1 guard (no CUDA manager)."""
+    """CPU-only reject/accept matrix for the global-size guard (no CUDA manager)."""
     full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
     full_conv = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
 
@@ -426,8 +491,27 @@ def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
 # ---------------------------------------------------------------------------
 # Loopback transfer over a real NIXL agent (single node)
 # ---------------------------------------------------------------------------
+def _shard_kda_ssm(full_ssm: torch.Tensor, tp: int, rank: int) -> torch.Tensor:
+    """Head shard of the [H, hd, hd] delta-rule state (identity for tp=1)."""
+    n = KDA_NUM_HEADS // tp
+    return full_ssm[rank * n : (rank + 1) * n].clone()
+
+
+def _shard_kda_conv(full_conv: torch.Tensor, tp: int, rank: int) -> torch.Tensor:
+    """Per-section shard of the [3*H*hd, W] conv state (identity for tp=1).
+
+    qwen3_next [Q | K | V] sectioning with three equal H*hd sections; each
+    section is sharded independently across tp, like the manager's
+    conv_section_dims.
+    """
+    sec = KDA_NUM_HEADS * KDA_HEAD_DIM
+    n = sec // tp
+    parts = [full_conv[s * sec + rank * n : s * sec + (rank + 1) * n] for s in range(3)]
+    return torch.cat(parts, dim=0).clone()
+
+
 def _generate_ground_truth(num_requests: int, seed: int = 20260722):
-    """Full replicated KDA states per (request, kda_layer), two dtypes."""
+    """Full (global, unsharded) KDA states per (request, kda_layer), two dtypes."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     results = []
     for _ in range(num_requests):
@@ -452,7 +536,24 @@ def _generate_ground_truth(num_requests: int, seed: int = 20260722):
 
 
 def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = False):
-    """Loopback: matched ctx/gen TP, replicated full-size KDA state per rank."""
+    """Loopback KDA transfer, matched or heterogeneous ctx/gen TP.
+
+    ADP off: per-rank state is a head shard (state_tp = tp) and every TP rank
+    participates in each request; the TP-mismatch mappers re-tile shards
+    between the two TP layouts. ADP on: per-rank state is a full-size replica
+    (state_tp = 1) and each request belongs to ONE dp rank per side (the
+    production scheduler routes it), so only that rank moves and verifies it
+    (same routing as ``test_kv_transfer.add_and_verify_request``).
+    """
+    ctx_state_tp = 1 if enable_attention_dp else ctx_tp
+    gen_state_tp = 1 if enable_attention_dp else gen_tp
+
+    def _ctx_ranks(req_idx: int) -> List[int]:
+        return [req_idx % ctx_tp] if enable_attention_dp else list(range(ctx_tp))
+
+    def _gen_ranks(req_idx: int) -> List[int]:
+        return [req_idx % gen_tp] if enable_attention_dp else list(range(gen_tp))
+
     ctx_mgrs = _create_kda_managers(ctx_tp, enable_attention_dp=enable_attention_dp)
     gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=enable_attention_dp)
     ctx_tcs, gen_tcs = [], []
@@ -466,8 +567,12 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             transceiver_runtime="PYTHON",
             max_tokens_in_buffer=512,
         )
-        ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
-        gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
+        ctx_tcs = _create_transceivers(
+            ctx_tp, ctx_mgrs, config, enable_attention_dp=enable_attention_dp
+        )
+        gen_tcs = _create_transceivers(
+            gen_tp, gen_mgrs, config, enable_attention_dp=enable_attention_dp
+        )
         ctx_endpoint = ctx_tcs[0]._context_info_endpoint
 
         sampling_params = SamplingParams()
@@ -497,7 +602,7 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             )
             gen_req.py_disaggregated_params = DisaggregatedParams(
                 ctx_request_id=ctx_rid,
-                ctx_dp_rank=0,
+                ctx_dp_rank=_ctx_ranks(req_idx)[0] if enable_attention_dp else 0,
                 ctx_info_endpoint=ctx_endpoint,
                 disagg_request_id=unique_rid,
             )
@@ -520,21 +625,29 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
         for mgr in gen_mgrs:
             mgr.update_resources(gen_batch)
 
-        # Ground truth: identical full state on every ctx rank (replicated).
+        # Ground truth: each ctx rank gets its shard of the global state
+        # (the full state on every rank when replicated under ADP).
         ground_truth = _generate_ground_truth(len(REQUEST_LENGTHS))
-        for mgr in ctx_mgrs:
+        for rank, mgr in enumerate(ctx_mgrs):
+            # Under ADP state_tp is 1 and every rank holds shard 0 (the full
+            # state); with ADP off rank r holds shard r.
+            shard_rank = rank % ctx_state_tp
             for req_idx, rid in enumerate(ctx_rids):
                 slot = mgr.mamba_cache_index[rid]
                 for layer_idx in mgr._impl.mamba_layer_offsets:
                     full = ground_truth[req_idx][layer_idx]
-                    mgr.get_conv_states(layer_idx)[slot] = full["conv"]
-                    mgr.get_ssm_states(layer_idx)[slot] = full["ssm"]
+                    mgr.get_conv_states(layer_idx)[slot] = _shard_kda_conv(
+                        full["conv"], ctx_state_tp, shard_rank
+                    )
+                    mgr.get_ssm_states(layer_idx)[slot] = _shard_kda_ssm(
+                        full["ssm"], ctx_state_tp, shard_rank
+                    )
 
-        for rank in range(gen_tp):
-            for req in gen_reqs:
+        for req_idx, req in enumerate(gen_reqs):
+            for rank in _gen_ranks(req_idx):
                 gen_tcs[rank].request_and_receive_async(req)
-        for rank in range(ctx_tp):
-            for req in ctx_reqs:
+        for req_idx, req in enumerate(ctx_reqs):
+            for rank in _ctx_ranks(req_idx):
                 ctx_tcs[rank].respond_and_send_async(req)
         _run_concurrent(
             ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
@@ -543,28 +656,39 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
 
         # Transfer-size metric must include the fixed-size KDA state — the actual
         # transferred bytes must cover the computed payload size: per rank,
-        # num_layers * (conv + ssm) slot bytes on top of any KV bytes.
-        kda_bytes_per_rank = NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
+        # num_layers * (conv + ssm) per-rank slot bytes on top of any KV bytes.
+        # The transceiver's _kv_size_rank_factor is 1 under attention-DP (the
+        # local slot already holds the full replicated state) and gen_tp
+        # otherwise (the request total is the sum of the per-rank shards).
         rank_factor = 1 if enable_attention_dp else gen_tp
+        kda_bytes_per_rank = NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES) // gen_state_tp
         for req in gen_reqs:
             assert req.py_kv_cache_xfer_bytes >= kda_bytes_per_rank * rank_factor, (
                 f"kv_cache_xfer_bytes={req.py_kv_cache_xfer_bytes} misses the KDA "
                 f"state payload ({kda_bytes_per_rank} bytes/rank x {rank_factor})"
             )
 
-        # Bitwise comparison on every gen rank (state is replicated).
+        # Bitwise comparison of every participating gen rank's shard (the
+        # single owning dp rank under ADP; all TP ranks otherwise).
         for gen_rank, mgr in enumerate(gen_mgrs):
+            shard_rank = gen_rank % gen_state_tp
             for req_idx, rid in enumerate(gen_rids):
+                if gen_rank not in _gen_ranks(req_idx):
+                    continue
                 slot = mgr.mamba_cache_index[rid]
                 for layer_idx in mgr._impl.mamba_layer_offsets:
                     full = ground_truth[req_idx][layer_idx]
+                    expected = {
+                        "conv": _shard_kda_conv(full["conv"], gen_state_tp, shard_rank),
+                        "ssm": _shard_kda_ssm(full["ssm"], gen_state_tp, shard_rank),
+                    }
                     for name, getter in (
                         ("conv", mgr.get_conv_states),
                         ("ssm", mgr.get_ssm_states),
                     ):
                         torch.testing.assert_close(
                             getter(layer_idx)[slot].cpu(),
-                            full[name],
+                            expected[name],
                             rtol=0,
                             atol=0,
                             msg=lambda m, n=name, r=gen_rank, ri=req_idx, li=layer_idx: (
@@ -582,10 +706,29 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "ctx_tp,gen_tp",
-    [(1, 1), (2, 2)],
-    ids=["tp1_tp1", "tp2_tp2_ep_prescaled"],
+    "ctx_tp,gen_tp,enable_attention_dp",
+    [
+        (1, 1, False),
+        (2, 2, False),
+        (2, 2, True),
+        (2, 4, True),
+        (2, 4, False),
+        (4, 2, False),
+    ],
+    ids=[
+        "tp1_tp1",
+        "matched_tp2_adp_off_sharded",
+        "matched_tp2_adp_on_replicated",
+        "hetero_dep_adp_on",
+        "hetero_ctx_tp2_gen_tp4_adp_off_sharded",
+        "hetero_ctx_tp4_gen_tp2_adp_off_sharded",
+    ],
 )
-def test_kda_transfer(ctx_tp, gen_tp):
-    """KDA two-dtype state transfer, matched parallelism, real NIXL loopback."""
-    run_kda_transfer_test(ctx_tp, gen_tp)
+def test_kda_transfer(ctx_tp, gen_tp, enable_attention_dp):
+    """KDA two-dtype state transfer over real NIXL loopback.
+
+    Covers matched TP with ADP on/off, hetero DEP with ADP on, and hetero
+    ctx/gen TP with ADP off (head-sharded state re-tiled by the TP-mismatch
+    mappers, both expand and contract directions).
+    """
+    run_kda_transfer_test(ctx_tp, gen_tp, enable_attention_dp=enable_attention_dp)

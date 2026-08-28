@@ -13,9 +13,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import get_model_path
 
 
-@pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])
+@pytest.fixture(scope="module", ids=["Qwen3/Qwen3-VL-2B-Instruct"])
 def model_name():
-    return "Qwen2.5-VL-3B-Instruct"
+    return "Qwen3/Qwen3-VL-2B-Instruct"
 
 
 @pytest.fixture(scope="module")
@@ -104,7 +104,7 @@ def test_trtllm_serve_multimodal_benchmark(server: RemoteOpenAIServer,
         "--dataset-name",
         dataset_name,
         "--model",
-        "qwen2.5-vl",
+        "qwen3-vl",
         "--tokenizer",
         model_path,
         "--num-prompts",

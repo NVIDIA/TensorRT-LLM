@@ -146,6 +146,7 @@ class ModelLoader:
         kv_cache_dtype = self.llm_args.kv_cache_config.dtype
         explicit_kv_cache_quant_algo = {
             "fp8": QuantAlgo.FP8,
+            "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False
@@ -674,19 +675,54 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
     return use_v2
 
 
+def _transceiver_python_fallback_reason(
+        llm_args: 'TorchLlmArgs') -> Optional[str]:
+    """Why 'auto' should not default to the Python transceiver, or None.
+
+    Checks only the constraints that are decidable from
+    ``cache_transceiver_config`` itself (backend and timeout). Any other
+    incompatibility (e.g. non-helix context parallelism) is NOT resolved
+    here and fails loudly at transceiver creation instead. Only consulted
+    when the model expressed no runtime preference: a model preferring
+    'PYTHON' may genuinely require it (e.g. recurrent-state transfer), so it
+    is never silently rerouted — transceiver creation raises with an
+    actionable message instead.
+    """
+    cfg = llm_args.cache_transceiver_config
+    effective_backend, _ = cfg._resolve_default_backend()
+    if effective_backend != "NIXL":
+        return (f"backend {effective_backend!r} (the Python transceiver "
+                "requires NIXL)")
+    if cfg.kv_transfer_timeout_ms is None:
+        return ("kv_transfer_timeout_ms=None (the Python transceiver "
+                "requires a finite timeout)")
+    # Deliberately reads only cache_transceiver_config: external callers
+    # (e.g. the perf-sanity cache-transceiver precheck) invoke the resolver
+    # with a lightweight stand-in object, and per-server fields beyond this
+    # config could resolve differently on ctx and gen servers (e.g. context
+    # parallelism, where only the gen side runs helix). Conditions the
+    # Python transceiver cannot serve (such as non-helix CP) fail loudly at
+    # transceiver creation instead.
+    return None
+
+
 def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
                                       model_cls: Optional[type] = None,
                                       pretrained_config: Any = None) -> None:
     """Resolve the 'auto' sentinel in cache_transceiver_config.transceiver_runtime.
 
     Semantics:
-    - Disagg disabled (config is None or backend is None): no-op. The model
-      preference must never materialize or alter a transceiver config that the
-      user did not enable.
+    - Disagg disabled (config is None or backend is None): no-op. Resolution
+      must never materialize or alter a transceiver config that the user did
+      not enable.
     - Explicit user value ('CPP'/'PYTHON'/None): left untouched.
-    - 'auto': adopt ``model_cls.get_preferred_transceiver_runtime()`` when the
-      effective backend supports it (the Python transceiver requires NIXL);
-      otherwise fall back to None (C++ transceiver).
+    - 'auto': a model preference from
+      ``model_cls.get_preferred_transceiver_runtime()`` ('CPP' or 'PYTHON')
+      is adopted verbatim — never rerouted, so unsupported configurations
+      surface as transceiver-creation errors. Without a preference, default
+      to the Python (V2) transceiver, falling back to None (C++ transceiver)
+      for configurations it does not support (non-NIXL backend or an
+      infinite kv_transfer_timeout_ms).
 
     ``pretrained_config`` is forwarded to the hook so implementation classes
     shared by several architectures can differentiate per checkpoint.
@@ -708,15 +744,18 @@ def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
             f"{model_cls.__name__}.get_preferred_transceiver_runtime() must "
             f"return 'CPP', 'PYTHON', or None, got {preferred!r}.")
 
-    effective_backend, _ = cfg._resolve_default_backend()
-    if preferred == "PYTHON" and effective_backend != "NIXL":
-        logger.info(
-            f"Model prefers the Python transceiver, but backend "
-            f"{effective_backend} does not support it; falling back to the "
-            f"C++ transceiver.")
-        preferred = None
+    resolved = preferred if preferred is not None else "PYTHON"
 
-    cfg.transceiver_runtime = preferred
+    # Fallbacks apply only to the no-preference default: an explicit model
+    # preference is adopted verbatim (see _transceiver_python_fallback_reason).
+    if preferred is None:
+        fallback_reason = _transceiver_python_fallback_reason(llm_args)
+        if fallback_reason is not None:
+            logger.info(
+                f"Falling back to the C++ transceiver: {fallback_reason}.")
+            resolved = None
+
+    cfg.transceiver_runtime = resolved
     logger.info(
-        f"Resolved transceiver_runtime='auto' to {preferred!r} for "
+        f"Resolved transceiver_runtime='auto' to {resolved!r} for "
         f"{model_cls.__name__ if model_cls is not None else 'unknown model'}.")

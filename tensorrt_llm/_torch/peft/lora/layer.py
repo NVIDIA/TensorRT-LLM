@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, List, Optional
 
 import torch
 
+from ...modules.multi_stream_utils import (do_multi_stream,
+                                           maybe_execute_in_parallel)
 from .cuda_graph_lora_params import CudaGraphLoraParams
 
 _FP8_LORA_TMA_ALIGNMENT = 16
@@ -213,9 +216,9 @@ MOE_LORA_MODULE_TO_KERNEL_SLOT = {
 
 def add_lora_result(output: torch.Tensor,
                     lora_result: Optional[torch.Tensor]) -> torch.Tensor:
-    if lora_result is None:
-        return output
-    return output + lora_result.to(output.dtype)
+    if lora_result is not None:
+        output.add_(lora_result.to(output.dtype))
+    return output
 
 
 class LoraLayer(torch.nn.Module):
@@ -227,6 +230,79 @@ class LoraLayer(torch.nn.Module):
         self.lora_module_types = lora_module_types
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
+
+        self._par_events: List[torch.cuda.Event] | None = None
+
+    @staticmethod
+    def forward_with_base(
+        base_forward: Callable[[], torch.Tensor],
+        lora_layers: tuple["LoraLayer", ...],
+        x: torch.Tensor,
+        lora_params: dict,
+        layer_idx: int | None,
+    ) -> torch.Tensor:
+        """
+        Run the base and LoRA branches and merge their outputs.
+
+        Args:
+            base_forward: Forward call for base model projection
+            lora_layers: Tuple of LoRA layers to be called
+            x: Input tensor
+            lora_params: CUDA Graph compatible LoRA parameters
+            layer_idx: Current layer index
+
+        Returns:
+            LoRA + base model output tensor
+
+        Note that lora_layers needs to be a tuple in order to
+        handle fused/unfused modules (e.g., QKV), where both
+        variants are invoked but only one runs through.
+        """
+        cuda_graph_params = lora_params.get('cuda_graph_params')
+        has_lora_layer = bool(cuda_graph_params) and any(
+            CudaGraphLoraParams.LoraLayerKey(
+                layer_idx=layer_idx,
+                module_ids=tuple(layer.lora_module_types),
+            ) in cuda_graph_params.layer_info for layer in lora_layers)
+
+        lora_aux_stream = lora_params.get("lora_aux_stream")
+        execute_in_parallel = (has_lora_layer and lora_aux_stream is not None
+                               and do_multi_stream()
+                               and not torch.compiler.is_compiling())
+
+        # Pack all LoRA forwards (e.g., fused/unfused) in a single tuple
+        def lora_forward() -> tuple[torch.Tensor | None, ...]:
+            return tuple(
+                lora_layer(x, lora_params, layer_idx)
+                for lora_layer in lora_layers)
+
+        if execute_in_parallel:
+            assert lora_aux_stream is not None
+            # Lazy allocation of parallel events
+            if lora_layers[0]._par_events is None:
+                lora_layers[0]._par_events = [
+                    torch.cuda.Event(), torch.cuda.Event()
+                ]
+
+            base_output, lora_outputs = maybe_execute_in_parallel(
+                base_forward,
+                lora_forward,
+                lora_layers[0]._par_events[0],
+                lora_layers[0]._par_events[1],
+                lora_aux_stream,
+                disable_on_compile=True,
+            )
+        else:
+            base_output, lora_outputs = base_forward(), lora_forward()
+
+        for lora_output in lora_outputs:
+            if not isinstance(lora_output, torch.Tensor):
+                continue
+            if execute_in_parallel:
+                lora_output.record_stream(torch.cuda.current_stream())
+            base_output = add_lora_result(base_output, lora_output)
+
+        return base_output
 
     def forward(
         self,
@@ -567,7 +643,8 @@ class LoraLayer(torch.nn.Module):
             output_buffer = output_buffer.to(torch.bfloat16)
 
         # TODO: move to kernel
-        restored_output = torch.zeros_like(output_buffer)
+        # sorted_ids is a permutation, so index_copy_ initializes every row.
+        restored_output = torch.empty_like(output_buffer)
         restored_output.index_copy_(0,
                                     cuda_graph_params.sorted_ids[:batch_size],
                                     output_buffer)

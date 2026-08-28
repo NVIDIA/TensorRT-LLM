@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import anyio
@@ -130,6 +131,34 @@ def test_layer_started_panel_includes_backend_version(capsys):
     assert "version" in captured.out
     assert "cli 9.9.9" in captured.out
     assert "sdk 0.0.1" in captured.out
+
+
+def test_fetch_available_skills_reads_the_client_without_sending_a_turn():
+    """The skill list is an inspection, not a conversation.
+
+    Both backends can answer from a connected session, so this must cost
+    a client and nothing else — a turn here would bill a model call on
+    every workflow launch that checks what is installed.
+    """
+    backend = FakeBackend([{"skills": ["trtllm-agent-toolkit:perf-analysis"]}])
+    layer = AgentLayer(_config())
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        skills = layer.fetch_available_skills()
+
+    assert skills == ["trtllm-agent-toolkit:perf-analysis"]
+    assert backend.create_client_calls == 1
+    assert backend.clients[0].send_count == 0
+    assert backend.clients[0].closed
+
+
+def test_fetch_available_skills_passes_through_a_backend_that_cannot_say():
+    """``None`` stays ``None`` — callers must not see it as "no skills"."""
+    backend = FakeBackend([{"text": "ok"}])
+    layer = AgentLayer(_config())
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        assert layer.fetch_available_skills() is None
 
 
 def test_codex_layer_started_panel_includes_version_and_reasoning_effort(capsys):
@@ -583,3 +612,34 @@ def test_prompt_builder_can_replace_content():
     assert result == "rewritten"
     assert backend.clients[0].messages == ["normalized prompt"]
     assert backend.clients[0].system_prompt == "custom"
+
+
+def test_on_activity_sees_every_event_and_cannot_fail_the_run():
+    """The observer hook, driven through a real turn.
+
+    Two properties, and they are really one: a caller can watch what the agent is
+    doing, and watching cannot change it. The second is what makes the hook safe
+    to point at a filesystem — the conversion service writes progress to disk from
+    here, and a full or read-only disk must not take down the turn it describes.
+    """
+    seen = []
+
+    def observer(kind, event):
+        seen.append((kind, getattr(event, "name", "")))
+        raise RuntimeError("observer exploded")
+
+    backend = FakeBackend(
+        [{"text": "done", "tool_calls": [ToolCallEvent(name="Read", input={"file_path": "x"})]}]
+    )
+    layer = AgentLayer(replace(_config(print_activity=False), on_activity=observer))
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        result = layer("go")
+
+    assert result == "done", "a raising observer must not change the result"
+    assert ("tool", "Read") in seen, "the observer must actually see the events"
+
+
+def test_no_observer_by_default():
+    """Every existing layer keeps the behaviour it had."""
+    assert _config().on_activity is None

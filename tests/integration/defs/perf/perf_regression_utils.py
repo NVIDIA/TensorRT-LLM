@@ -62,14 +62,9 @@ def get_job_info():
     is_post_merge = "PostMerge" in job_url
     is_pr_job = not is_post_merge
 
-    # Extract branch from job_url
-    # Pattern: LLM/job/main/job -> branch is "main"
-    branch = ""
+    raw_branch = global_vars.get("build_branch")
+    branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
-    if job_url:
-        branch_match = re.search(r"/job/LLM/job/([^/]+)/job/", job_url)
-        if branch_match:
-            branch = branch_match.group(1)
 
     # Initialize PR-specific fields
     trigger_mr_user = ""

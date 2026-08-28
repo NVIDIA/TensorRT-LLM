@@ -229,7 +229,8 @@ class MLA(nn.Module):
         o_lora_rank: int = 1024,
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
-    ):
+        flashinfer_mla_backend: Optional[str] = None,
+    ) -> None:
         """
         Initialize the MLA module.
 
@@ -260,6 +261,9 @@ class MLA(nn.Module):
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
+            flashinfer_mla_backend (Optional[str]): Generation backend for the
+                FlashInfer/TRTLLM-Gen MLA dispatcher. ``None`` preserves the
+                attention backend default.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -312,6 +316,7 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         config = config or ModelConfig()
+        self.kv_cache_dtype = config.extra_attrs.get("kv_cache_dtype", "auto")
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
             sparse_attn_cfg.to_sparse_params(
@@ -556,7 +561,9 @@ class MLA(nn.Module):
             sparse_params=self.sparse_params,
             dtype=dtype,
             aux_stream=mqa_aux_stream,
-            rope_append=True,
+            rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
+            kv_cache_dtype=self.kv_cache_dtype,
+            flashinfer_mla_backend=flashinfer_mla_backend,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")
@@ -1458,18 +1465,21 @@ class MLA(nn.Module):
                 else:
                     # Fused backend (TRTLLM): RoPE, latent-cache append and the
                     # trtllm-gen scheduler buffers are all produced in-kernel.
-                    self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    )
+                    if self.kv_cache_dtype == "fp8_ds_mla":
+                        fused_q[..., self.kv_lora_rank :] = q_pe
+                    else:
+                        self.mqa.mla_rope_generation(
+                            fused_q,
+                            q_pe,
+                            latent_cache,
+                            attn_metadata,
+                            cu_q_seqlens,
+                            cu_kv_seqlens,
+                            fmha_scheduler_counter,
+                            mla_bmm1_scale,
+                            mla_bmm2_scale,
+                            quant_q_buffer,
+                        )
 
             rope_stream = self.aux_stream if not has_fp8_kv_cache else None
             if self.k_b_proj_trans.dtype == torch.bfloat16:
@@ -1643,7 +1653,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.kv_cache_dtype == "fp8_ds_mla" or self.apply_rotary_emb:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [

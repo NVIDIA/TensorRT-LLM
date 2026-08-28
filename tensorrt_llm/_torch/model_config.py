@@ -47,8 +47,8 @@ from tensorrt_llm.models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
-    is_modelopt_quant_config, read_modelopt_quant_config,
-    warn_if_inline_diverges)
+    canonicalize_quant_algo, is_modelopt_quant_config,
+    read_modelopt_quant_config, warn_if_inline_diverges)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -234,6 +234,11 @@ class ModelConfig(Generic[TConfig]):
     max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
+    # Set in __post_init__; a normal field, not init=False, so that
+    # dataclasses.replace() and copy.copy() carry it.
+    _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
+                                                           repr=False,
+                                                           compare=False)
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
@@ -277,8 +282,8 @@ class ModelConfig(Generic[TConfig]):
     # If true, the multimodal encoder of a multimodal checkpoint is NOT
     # instantiated/loaded and the model serves text-only requests. This is
     # opt-in per model: each model implementation must honor this flag when
-    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
-    # model that does not check it simply ignores the flag (no-op).
+    # building its encoder (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL
+    # models); a model that does not check it simply ignores the flag (no-op).
     disable_mm_encoder: bool = False
 
     # Video pruning rate for VLM models (None = EVS disabled)
@@ -336,8 +341,23 @@ class ModelConfig(Generic[TConfig]):
 
         # Set default moe_max_num_tokens if not specified
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        # Record the provenance first: once filled in, a derived size is
+        # indistinguishable from one a deployment configured to the same number.
+        if self._moe_max_num_tokens_is_default is None:
+            self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+    def is_moe_max_num_tokens_default(self) -> bool:
+        """Whether ``moe_max_num_tokens`` was derived rather than configured.
+
+        A MoE backend with a conservative workspace cap uses this to clamp only
+        the derived size. A config rebuilt from another one's
+        ``moe_max_num_tokens`` -- the draft configs in
+        ``modeling_speculative.py`` -- reads as configured, which is safe: the
+        target's first MoE layer has already capped the forwarded size.
+        """
+        return bool(self._moe_max_num_tokens_is_default)
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -506,9 +526,12 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
+        # ``canonicalize_quant_algo`` is applied again here (and per layer
+        # below) because the ``quant_cfg.json`` overlay merged in for
+        # MIXED_PRECISION bypasses ``read_modelopt_quant_config``.
+        quant_config.quant_algo = (
+            QuantAlgo(canonicalize_quant_algo(json_quant_configs['quant_algo']))
+            if json_quant_configs.get('quant_algo') is not None else None)
         quant_config.kv_cache_quant_algo = (
             QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
             json_quant_configs.get('kv_cache_quant_algo') is not None else None)
@@ -560,7 +583,8 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
-                config.quant_algo = QuantAlgo(layer_cfg['quant_algo'])
+                config.quant_algo = QuantAlgo(
+                    canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:

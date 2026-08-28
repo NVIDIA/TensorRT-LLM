@@ -105,6 +105,14 @@ def test_load_wan_vae_defaults_to_native(monkeypatch):
     assert isinstance(wan_vae, WanVAE)
 
 
+def test_load_wan_vae_honors_diffusers_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint_dir = _require_wan22_ti2v_checkpoint()
+
+    monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "1")
+    wan_vae = load_wan_vae(str(checkpoint_dir), torch.device("cpu"))
+    assert isinstance(wan_vae, AutoencoderKLWan)
+
+
 def test_use_native_wan_vae_default(monkeypatch):
     """Native VAE is the default when the diffusers-fallback env is unset."""
     monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)

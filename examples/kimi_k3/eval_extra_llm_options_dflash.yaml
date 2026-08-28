@@ -1,0 +1,39 @@
+# Extra LLM-API options for Kimi K3 GSM8K/eval runs WITH DFlash speculative
+# decoding. STATUS: the real K3 drafter is a DSpark drafter (schema known
+# from the training team's dummy-dspark0724 checkpoint; weights still
+# training). The drafter-forward dspark semantics (Markov intra-block
+# bias, SWA, shift_label) ARE implemented; confidence-scheduled
+# verification is the remaining gap (weights loaded, unused — see
+# docs/kimi_k3_dflash_scaffold.md). Point speculative_model at the real
+# drafter when it drops, or at the output of
+# make_synthetic_dflash_drafter.py to exercise the wiring only (random
+# weights draft gibberish; acceptance ~0, so that validates plumbing, not
+# speedup). Deployment mirrors the SA config
+# (DEP16: attention-DP + MoE EP16, eager, max_batch_size <= 8) since that
+# is the memory-viable GB300 deployment; DFlash x attention-DP parity has
+# NOT been certified the way SA was — rerun the parity harness before
+# trusting outputs.
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+disable_overlap_scheduler: true
+# Eager like certified SA: the K3 CUDA-graphs regime has a known
+# verify/accept parity bug under investigation (SA+graphs probe); job
+# 2659946 accidentally ran DFlash with graphs on and scored 90.11 vs the
+# >=96.4 baseline. Keep null until the graphs regime is certified.
+cuda_graph_config: null
+enable_chunked_prefill: false
+kv_cache_config:
+  enable_block_reuse: false
+  # 0.20 (vs SA's 0.25): the drafter weights, hidden-state capture buffer,
+  # and DFlash context-KV slots eat into the SA config's already-thin
+  # warmup headroom on GB300 (0.25 OOMs there).
+  free_gpu_memory_fraction: 0.20
+  tokens_per_block: 64
+speculative_config:
+  decoding_type: DFlash
+  # block_size in the drafter config governs tokens drafted per step; the
+  # K3 dspark drafter uses 8 (same as K2.7).
+  max_draft_len: 7
+  # Path to the DFlash drafter checkpoint (real, or synthetic from
+  # make_synthetic_dflash_drafter.py).
+  speculative_model: /path/to/kimi-k3-dflash-drafter

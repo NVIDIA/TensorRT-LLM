@@ -21,6 +21,7 @@ import shutil
 import sys
 import sysconfig
 import tempfile
+import time
 import warnings
 from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
@@ -614,7 +615,38 @@ def _tar_pipe_copy(src: Path, dst: Path) -> bool:
     return producer.returncode == 0 and consumer.returncode == 0
 
 
-def sync_tree(src, dst, exclude: Sequence[str] = ()):
+# How recently a source file must have been written for its mtime to be
+# untrustworthy as a change marker. Inode timestamps come from a coarse clock
+# (one timer tick on Linux) and some filesystems store whole seconds, so a file
+# rewritten shortly after being copied can still report the mtime the copy
+# recorded. A size+mtime comparison would then call it unchanged and leave a
+# stale copy behind. Two seconds covers a whole-second-granularity destination
+# (which can make an mtime look up to a second older than it is) on top of the
+# tick granularity of the source.
+_MTIME_RACE_WINDOW = 2.0
+
+
+def _demote_racy_mtime(dst_file: Path, src_stat: Optional[os.stat_result],
+                       now: float) -> None:
+    """Break the mtime match for a copy whose source was just written.
+
+    A copy normally records the source's mtime so the next sync can skip it.
+    That is only sound once the source mtime has aged out of the window above;
+    before that the source can change again without its mtime moving. Backdating
+    the copy makes the next sync's comparison mismatch, so the file is re-copied
+    instead of silently kept stale. It costs one extra copy of files written
+    right before a sync, and converges: the re-copy records the real mtime.
+    """
+    if src_stat is None or src_stat.st_mtime <= now - _MTIME_RACE_WINDOW:
+        return
+    try:
+        os.utime(dst_file,
+                 (src_stat.st_atime, src_stat.st_mtime - _MTIME_RACE_WINDOW))
+    except OSError:
+        pass
+
+
+def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
     """Mirror the src directory into dst, touching only what changed.
 
     Replaces the rmtree+copytree pattern for artifact copy-back: files are
@@ -623,16 +655,36 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
     destination (which may be a slow network filesystem). A missing dst is
     populated via a streamed tar pipeline instead of per-file copies.
     Symlinks are dereferenced like copytree(symlinks=False); mtimes are
-    preserved so the next sync can compare against them. exclude lists
-    fnmatch patterns for entry names to skip.
+    preserved so the next sync can compare against them, except for sources
+    written within _MTIME_RACE_WINDOW of the copy, whose mtimes cannot yet
+    prove the content settled. exclude lists fnmatch patterns for entry names
+    to skip.
     """
     import fnmatch
 
     src = Path(src).resolve()
     dst = Path(dst)
+    now = time.time()
 
-    def excluded(name):
+    def excluded(name: str) -> bool:
         return any(fnmatch.fnmatch(name, pat) for pat in exclude)
+
+    def demote_racy_mtimes() -> None:
+        # A cold populate (tar or copytree) copies source mtimes verbatim, so
+        # apply the same guard the incremental path applies per file. Walk the
+        # source rather than the freshly written destination: the source is
+        # local and warm, and only the few racy entries need a write.
+        for root, dirs, files in os.walk(src, followlinks=True):
+            dirs[:] = [d for d in dirs if not excluded(d)]
+            rel = Path(root).relative_to(src)
+            for name in files:
+                if excluded(name):
+                    continue
+                try:
+                    src_stat = (Path(root) / name).stat()
+                except OSError:
+                    continue
+                _demote_racy_mtime(dst / rel / name, src_stat, now)
 
     if dst.is_symlink():
         dst.unlink()
@@ -641,11 +693,13 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
 
     if not dst.exists():
         if not exclude and _tar_pipe_copy(src, dst):
+            demote_racy_mtimes()
             return
         copytree(src,
                  dst,
                  symlinks=False,
                  ignore=shutil.ignore_patterns(*exclude) if exclude else None)
+        demote_racy_mtimes()
         return
 
     for root, dirs, files in os.walk(src, followlinks=True):
@@ -667,11 +721,16 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
         for name in files:
             src_file = Path(root) / name
             dst_file = dst_root / name
+            src_stat = None
             try:
                 src_stat = src_file.stat()
                 dst_stat = dst_file.stat()
+                # Trust the match only once the source mtime has aged past the
+                # race window; a just-written source can be rewritten again
+                # without the mtime moving, which would strand a stale copy.
                 if (src_stat.st_size == dst_stat.st_size
-                        and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3):
+                        and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
+                        and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
                     continue
             except OSError:
                 pass
@@ -679,6 +738,7 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
                 rmtree(dst_file)
             # copy2: mtime must survive for the next sync's comparison.
             shutil.copy2(src_file, dst_file)
+            _demote_racy_mtime(dst_file, src_stat, now)
 
 
 def stage_python_package(project_dir: Path, staging_dir: Path) -> None:

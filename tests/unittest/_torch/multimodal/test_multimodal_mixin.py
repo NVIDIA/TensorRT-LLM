@@ -621,11 +621,11 @@ def test_assemble_full_embedding_rejects_incompatible_items():
 
 
 def test_build_multimodal_encoder_input_slices_packed_grid_thw():
-    # Qwen-VL-style layout: `pixel_values` is a single packed tensor sized by the
+    # Qwen3-VL-style layout: `pixel_values` is a single packed tensor sized by the
     # cumulative patch counts declared in `image_grid_thw`. `second_per_grid_ts`
-    # stands in for any per-item sibling field (e.g. Qwen2.5-VL video timing) that
-    # must stay in sync with the sliced items; `per_request_scalar` stands in for
-    # non-per-item siblings that must pass through unchanged.
+    # stands in for any per-item sibling field that must stay in sync with the
+    # sliced items; `per_request_scalar` stands in for non-per-item siblings that
+    # must pass through unchanged.
     grids = torch.tensor([[1, 1, 2], [1, 1, 3], [1, 1, 1]])  # 2 + 3 + 1 patches
     pixels = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     per_item_meta = torch.tensor([0.1, 0.2, 0.3])
@@ -696,10 +696,10 @@ def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size()
 
 
 def test_build_multimodal_encoder_input_slices_audio_input_features():
-    # Whisper / Qwen2-Audio / Gemma4-audio layout: `input_features [B, mel, T]`
-    # stacked on dim 0, with an optional per-item mask that sibling-slices
-    # automatically. Two clips: item 0 and item 1 -- slice to [1, 0] to also
-    # confirm item order is preserved.
+    # Whisper / Gemma4-audio layout: `input_features [B, mel, T]` stacked on
+    # dim 0, with an optional per-item mask that sibling-slices automatically.
+    # Two clips: item 0 and item 1 -- slice to [1, 0] to also confirm item order
+    # is preserved.
     features = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
     mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
     param = MultimodalParams(

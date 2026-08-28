@@ -368,11 +368,11 @@ To serve the model in disaggregated mode, you should launch context and generati
 For example, you can launch a single context server on port 8001 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
-
 cat >./ctx_config.yml <<EOF
 print_iter_log: true
 enable_attention_dp: true
+cache_transceiver_config:
+  backend: NIXL
 EOF
 
 trtllm-serve \
@@ -392,8 +392,6 @@ trtllm-serve \
 And you can launch two generation servers on port 8002 and 8003 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
-
 cat >./gen_config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
@@ -410,6 +408,8 @@ cuda_graph_config:
     - 384
 print_iter_log: true
 enable_attention_dp: true
+cache_transceiver_config:
+  backend: NIXL
 EOF
 
 for port in {8002..8003}; do \

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from collections.abc import Callable
 from typing import Optional, Tuple, Union
 
@@ -8,10 +11,11 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
-from .linear import (Linear, TensorParallelMode, WeightMode,
-                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
+from .linear import (Linear, TensorParallelMode, UnquantizedLinearMethod,
+                     WeightMode, WeightsLoadingConfig,
+                     is_static_nvfp4_input_eligible)
 
 
 class MLP(nn.Module):
@@ -115,7 +119,7 @@ class MLP(nn.Module):
         # Static eligibility for the fused GELU(tanh) CuteDSL epilogue (mirrors
         # GatedMLP); the runtime quant_method check is deferred to first forward.
         self._use_fused_gelu, self._use_fused_gelu_fp4out = (
-            self._gelu_fusion_eligibility())
+            self._nvfp4_gelu_fusion_eligibility())
 
     # Minimum M for the fp4out CuTe DSL GELU kernel; below this its SFC epilogue
     # can write out-of-bounds (CTA tile height > output rows), so fall back to
@@ -148,29 +152,61 @@ class MLP(nn.Module):
                     self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
             return self.down_proj(self._fused_gelu(x))
 
-        x_up = self.up_proj(x)
-
-        # Weight loading may replace the quantization method after
-        # create_weights(), so do not rely on the cached eligibility alone.
-        if (self._use_fused_relu2_quant
-                and is_static_nvfp4_input_eligible(self.down_proj)):
-            x_act = self._fused_relu2_quant(x_up)
+        if self._unquantized_gelu_fusion_eligible(x):
+            x_act = self._fused_up_proj_gelu(x)
         else:
-            x_act = self.activation(x_up)
+            x_up = self.up_proj(x)
+            # Weight loading may replace the quantization method after
+            # create_weights(), so do not rely on the cached eligibility alone.
+            if (self._use_fused_relu2_quant
+                    and is_static_nvfp4_input_eligible(self.down_proj)):
+                x_act = self._fused_relu2_quant(x_up)
+            else:
+                x_act = self.activation(x_up)
 
         x_down = self.down_proj(x_act)
 
         return x_down
 
-    def _gelu_fusion_eligibility(self) -> Tuple[bool, bool]:
+    def _unquantized_gelu_fusion_eligible(self, x: torch.Tensor) -> bool:
+        """Whether the unquantized up projection can use the cuBLASLt GELU
+        epilogue without bypassing Linear post-processing or another GEMM
+        backend.
+        """
+        up_proj = self.up_proj
+        return (self.activation is gelu_tanh
+                and hasattr(torch, "_addmm_activation")
+                and isinstance(x, torch.Tensor) and x.dim() >= 2 and x.is_cuda
+                and x.dtype == torch.bfloat16 and not torch.is_grad_enabled()
+                and type(up_proj.quant_method) is UnquantizedLinearMethod
+                and up_proj.bias is not None
+                and up_proj.weight.dtype == torch.bfloat16
+                and not up_proj.gather_output
+                and not up_proj.use_custom_cublas_mm
+                and not up_proj.use_cute_dsl_bf16_gemm)
+
+    def _fused_up_proj_gelu(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the bf16 up projection with a fused GELU(tanh) epilogue."""
+        input_shape = x.shape
+        # VisualGen diffusion transformers commonly process long token
+        # sequences. Folding GELU into the up-projection avoids an extra
+        # full-tensor read/write and standalone activation kernel at large M.
+        output = torch._addmm_activation(self.up_proj.bias,
+                                         x.reshape(-1, input_shape[-1]),
+                                         self.up_proj.weight.t(),
+                                         use_gelu=True)
+        return output.reshape(*input_shape[:-1], output.shape[-1])
+
+    def _nvfp4_gelu_fusion_eligibility(self) -> Tuple[bool, bool]:
         """Return (bf16_out_ok, fp4_out_ok) static eligibility for the fused
         GELU(tanh) epilogue (mirrors GatedMLP's SwiGLU paths). Requires the
-        Blackwell CuteDSL op(s), SM 100/103, and an NVFP4 up_proj; fp4-out builds
-        on bf16-out and also needs an NVFP4 down_proj with a static input_scale
-        and no forced dynamic quantization. The runtime quant_method check is
-        applied in forward (quant_method can be downgraded after this).
+        Blackwell CuteDSL op(s), SM 100/103, a local (not gathered) NVFP4
+        up_proj output; fp4-out builds on bf16-out and also needs an NVFP4
+        down_proj with a static input_scale and no forced dynamic quantization.
+        The runtime quant_method check is applied in forward (quant_method can
+        be downgraded after this).
         """
-        if (self.activation is not gelu_tanh
+        if (self.activation is not gelu_tanh or self.up_proj.gather_output
                 or get_sm_version() not in (100, 103) or not getattr(
                     self.up_proj, "has_nvfp4_activation_quantization", False)):
             return False, False
@@ -268,11 +304,14 @@ class MLP(nn.Module):
     ) -> torch.Tensor:
         assert lora_params is not None
 
-        x_up = self.up_proj(x)
-
         assert self.layer_idx is not None, "layer_idx is required for lora"
-        x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
-        x_up = add_lora_result(x_up, x_up_lora)
+        x_up = LoraLayer.forward_with_base(
+            lambda: self.up_proj(x),
+            (self.up_lora, ),
+            x,
+            lora_params,
+            self.layer_idx,
+        )
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act,

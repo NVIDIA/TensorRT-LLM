@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 TestLlama3_1_8BInstruct::test_eagle3:
   ref_al: 1.987311931289228
   min_al: 1.8879463347247665
@@ -31,3 +33,9 @@ TestLlama3_1_8BInstruct::test_suffix_automaton:
 TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
   ref_al: 3.243380267550134
   min_al: 3.0812112541726275
+TestQwen3_5_4B::test_dflash:
+  ref_al: 3.96417002949639
+  min_al: 3.7659615280215704
+TestKimiK3::test_w4a16_mxfp4:
+  ref_al: 1.318
+  min_al: 1.15

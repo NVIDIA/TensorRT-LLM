@@ -46,6 +46,51 @@ _KV_SCHEME_DICT_MAP = {
 }
 _KV_SCHEME_STRING_ALGOS = {"FP8", "NVFP4", "INT8"}
 
+# ModelOpt ships algo spellings that predate the ``QuantAlgo`` enum names.
+# Lookup is case-insensitive: the same alias appears lowercase as a top-level
+# ``quant_algo`` (modelopt 0.x) and uppercase inside ``quantized_layers``
+# (modelopt >= 0.45, e.g. ``nvidia/Kimi-K3-NVFP4``).
+_QUANT_ALGO_ALIASES = {
+    # Per-block FP8, weight-only. Same on-disk layout as the DeepSeek block
+    # recipe (E4M3 weights + one FP32 scale per 128x128 block), so it maps onto
+    # FP8_BLOCK_SCALES; ``FP8BlockScalesLinearMethod.load_weights_vanilla``
+    # squeezes ModelOpt's two extra singleton scale dimensions.
+    "fp8_pb_wo": "FP8_BLOCK_SCALES",
+}
+
+
+def canonicalize_quant_algo(value: Any) -> Any:
+    """Map a ModelOpt ``quant_algo`` spelling onto its ``QuantAlgo`` name.
+
+    Case-insensitive. Unknown values pass through untouched so that ``QuantAlgo``
+    keeps ownership of rejecting genuinely invalid names.
+    """
+    if not isinstance(value, str):
+        return value
+    return _QUANT_ALGO_ALIASES.get(value.lower(), value)
+
+
+def _canonicalize_algos(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalize ``quant_algo`` at the top level and inside ``quantized_layers``.
+
+    MIXED_PRECISION checkpoints carry the real algo names per layer, so the
+    top-level key alone is not enough. Nested dicts are rebuilt rather than
+    mutated in place: ``result`` is only a shallow copy of the caller's config.
+    """
+    if "quant_algo" in result:
+        result["quant_algo"] = canonicalize_quant_algo(result["quant_algo"])
+    layers = result.get("quantized_layers")
+    if isinstance(layers, dict):
+        result["quantized_layers"] = {
+            name: (
+                {**cfg, "quant_algo": canonicalize_quant_algo(cfg["quant_algo"])}
+                if isinstance(cfg, dict) and "quant_algo" in cfg
+                else cfg
+            )
+            for name, cfg in layers.items()
+        }
+    return result
+
 
 def _kv_cache_scheme_to_algo(scheme: Any) -> Optional[str]:
     """Translate modelopt 1.x ``kv_cache_scheme`` to a legacy algo name.
@@ -97,10 +142,7 @@ def read_modelopt_quant_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             f"Not a modelopt quant config (producer={raw.get('producer')!r}, "
             f"quant_method={raw.get('quant_method')!r})"
         )
-    # Canonicalize the fp8_pb_wo legacy alias.
-    if result.get("quant_algo") == "fp8_pb_wo":
-        result["quant_algo"] = "FP8_BLOCK_SCALES"
-    return result
+    return _canonicalize_algos(result)
 
 
 def warn_if_inline_diverges(

@@ -123,6 +123,7 @@ tests/integration/defs/stress_test/artifacts/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
+.claude/ralph-loop.local.md
 
 .plans/
 

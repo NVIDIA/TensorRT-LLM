@@ -276,6 +276,63 @@ class _Built(NamedTuple):
     snapshot: object
 
 
+def _prefetched_workers_alive(session: object) -> bool:
+    """Whether every recorded worker is still the process spawned for this pool.
+
+    ``MpiPoolSession(wait_shutdown=True)`` records a complete set of
+    ``(pid, start_time)`` identities before a pool can be published. Checking
+    both values rejects workers that exited after publication without
+    mistaking a recycled PID for the original process.
+    """
+    identities = getattr(session, "_worker_identities", ())
+    if len(identities) != getattr(session, "n_workers", None):
+        return False
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    process_start_time = getattr(mpi_session, "_process_start_time", None)
+    if process_start_time is None:
+        return False
+    return all(
+        start_time is not None and process_start_time(pid) == start_time
+        for pid, start_time in identities
+    )
+
+
+def _reap_dead_pool(session: object) -> None:
+    """Abandon a part-dead pool and SIGKILL whichever workers are still up.
+
+    ``abandon()`` only disconnects the parent side. With a rank already gone the
+    manager thread stays wedged in MPI, so the survivors are never told to exit
+    and keep their GPU memory while the replacement pool spawns on top of them.
+    Mirrors ``MpiPoolSession._teardown_unidentified_pool``, recycling guard
+    included.
+    """
+    import signal
+
+    try:
+        session.abandon()
+    except Exception as exc:  # noqa: BLE001
+        # Broad on purpose: this pool is already known part-dead, so abandon()
+        # reaches into mpi4py with a rank missing and can fail in ways MPI does
+        # not enumerate. Swallowing is required -- the SIGKILL sweep below is
+        # what actually reclaims the survivors' GPU memory, and it must run
+        # whatever abandon() did. Surface it instead of passing silently.
+        print(
+            f"[session-prefetch] WARNING: abandon() failed on a part-dead pool: {exc!r}",
+            flush=True,
+        )
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    process_start_time = getattr(mpi_session, "_process_start_time", None)
+    if process_start_time is None:
+        return
+    for pid, start_time in getattr(session, "_worker_identities", ()):
+        if start_time is None or process_start_time(pid) != start_time:
+            continue  # already gone, or the PID was recycled
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 class SessionPrefetcher:
     def __init__(self):
         self._lock = threading.Lock()
@@ -496,6 +553,24 @@ class SessionPrefetcher:
         # recreate the same concurrent-bootstrap contention.
         built = self._drain()
         if built is None:
+            return None
+        if not _prefetched_workers_alive(built.session):
+            # A worker may die after the background build publishes its pool.
+            # Never hand that unusable executor to the next test: its queued
+            # initialization task would have no worker and can wait until the
+            # outer pytest timeout. The dead world cannot be joined, so
+            # abandon it before the synchronous fallback.
+            self.stats["pools_discarded_dead"] += 1
+            print(
+                "[session-prefetch] discarding prefetched pool with dead worker",
+                flush=True,
+            )
+            threading.Thread(
+                target=_reap_dead_pool,
+                args=(built.session,),
+                daemon=True,
+                name="session-prefetch-discard-dead",
+            ).start()
             return None
         if built.spec == spec and built.snapshot == _spawn_snapshot():
             # An instant handover is safe against the previous worker's GPU

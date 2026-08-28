@@ -162,8 +162,8 @@ class GvrRegKernel(GvrTpKernel):
     def count_reg(self, R: cutlass.Constexpr, a, tidx, s_rungs, s_ptcnt):
         TB = cutlass.const_expr(self.num_threads)
         MAXV = cutlass.const_expr(self.maxv)
-        tr = cute.make_fragment((R,), cutlass.Float32)
-        cnt = cute.make_fragment((R,), cutlass.Int32)
+        tr = cute.make_rmem_tensor((R,), cutlass.Float32)
+        cnt = cute.make_rmem_tensor((R,), cutlass.Int32)
         for r in cutlass.range_constexpr(R):
             tr[r] = s_rungs[r]
             cnt[r] = cutlass.Int32(0)
@@ -391,8 +391,8 @@ class GvrRegKernel(GvrTpKernel):
                 v1 = V4
 
             copy_atom = self._copy_atom()
-            a = cute.make_fragment((MAXV * 4,), cutlass.Float32)
-            frag4 = cute.make_fragment((4,), cutlass.Float32)
+            a = cute.make_rmem_tensor((MAXV * 4,), cutlass.Float32)
+            frag4 = cute.make_rmem_tensor((4,), cutlass.Float32)
             for u in cutlass.range_constexpr(MAXV):
                 i = v0 + tidx + cutlass.Int32(u * TB)
                 if i < v1:
@@ -728,7 +728,7 @@ class GvrRegKernel(GvrTpKernel):
                                 cute.arch.barrier()
                                 if tidx < cutlass.Int32(32):
                                     b8 = tidx * cutlass.Int32(8)
-                                    h = cute.make_fragment((8,), cutlass.Int32)
+                                    h = cute.make_rmem_tensor((8,), cutlass.Int32)
                                     Ssum = cutlass.Int32(0)
                                     for q in cutlass.range_constexpr(8):
                                         h[q] = s_hist[b8 + cutlass.Int32(q)]

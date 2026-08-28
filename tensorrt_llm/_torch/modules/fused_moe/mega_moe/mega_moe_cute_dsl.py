@@ -93,6 +93,7 @@ from ....custom_ops.cute_dsl_megamoe_custom_op import megamoe_activation_sf_byte
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -101,7 +102,7 @@ from ..impl_contract import (
     MoERunContext,
 )
 from ..impl_environment import MoEDep
-from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
 
@@ -138,8 +139,8 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     by ``kernel_fc12.py``, and the async-copy helpers used by
     ``dispatch_kernel.py``. PR
     https://github.com/NVIDIA/TensorRT-LLM/pull/14354 pins
-    ``nvidia-cutlass-dsl[cu13]==4.5.0`` which is the first release that
-    ships all of them; older wheels return ``(False, reason)``.
+    ``nvidia-cutlass-dsl[cu13]==4.6.1``; version 4.5.0 was the first release
+    that shipped all of them, and older wheels return ``(False, reason)``.
 
     Returns ``(True, None)`` on success or ``(False, reason)`` with an
     actionable message. The result is cached for the process lifetime.
@@ -321,7 +322,7 @@ class _MegaMoeBuffers:
 # ---------------------------------------------------------------------------
 
 
-class MegaMoECuteDsl(MoE):
+class MegaMoECuteDsl(MoEImplBase):
     """MoE backend wrapping the ported MegaMoE CuteDSL NVFP4 fused kernel.
 
     Capability gate (``can_implement``): SM100 family + NVFP4 +
@@ -464,16 +465,23 @@ class MegaMoECuteDsl(MoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: Optional[torch.Tensor] = None,
+        # ``activation=None`` infers Kimi K3 SiTU from the pretrained config and
+        # otherwise defaults to SwiGLU. Mirrors MegaMoEDeepGemm.
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
         # ``aux_stream_dict`` is accepted for ``create_moe_backend`` signature
         # uniformity but ignored: FUSED_COMM kernels must not use the chunk
         # overlap stream because launch order must be lockstep across EP.
         del aux_stream_dict
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -496,6 +504,22 @@ class MegaMoECuteDsl(MoE):
                 "MegaMoECuteDsl does not support apply_router_weight_on_input; "
                 "the fused kernel applies routing weights on the MoE output."
             )
+        # ``ActivationType.Swiglu`` describes the gated FC1 tensor geometry shared
+        # by SwiGLU and SiTU; the elementwise function is selected by
+        # ``activation`` below. Same reasoning as MegaMoEDeepGemm.
+        if activation_type != ActivationType.Swiglu:
+            raise ValueError(
+                f"MegaMoECuteDsl only supports ActivationType.Swiglu (got {activation_type})."
+            )
+        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
+            model_config,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        self.activation = activation
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # topk-score application point. v2 default is the deepgemm graph
@@ -529,6 +553,11 @@ class MegaMoECuteDsl(MoE):
         # used directly (NO trtllm-gen-style div_(fc31_alpha) normalization).
         # Reject non-uniform / per-expert clamp: the kernel bakes one constant.
         self.gate_up_clamp = self._resolve_gate_up_clamp(swiglu_limit)
+        if self.activation == "situ" and self.gate_up_clamp is not None:
+            raise ValueError(
+                "MegaMoECuteDsl SiTU does not support a gate/up clamp; "
+                "drop swiglu_limit for SiTU checkpoints."
+            )
 
         # Buffer sizing. MoE layers execute serially per forward; one pool
         # sized to the worst-case per-rank tokens covers every layer. The
@@ -608,6 +637,52 @@ class MegaMoECuteDsl(MoE):
     # ------------------------------------------------------------------
     # Topology
     # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_activation_config(
+        model_config,
+        *,
+        activation: Optional[str],
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
+    ):
+        """Resolve the elementwise activation and its SiTU constants.
+
+        ``activation=None`` infers SiTU from ``activation_situ_beta`` in the
+        pretrained config (Kimi K3 sets it) and otherwise selects SwiGLU. Kept
+        byte-for-byte equivalent to ``MegaMoEDeepGemm._resolve_activation_config``
+        so the two MegaMoE backends cannot disagree about the same checkpoint.
+        """
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        text_config = getattr(pretrained_config, "text_config", None)
+        cfg_beta = getattr(pretrained_config, "activation_situ_beta", None)
+        cfg_lbeta = getattr(pretrained_config, "activation_situ_linear_beta", None)
+        if cfg_beta is None:
+            cfg_beta = getattr(text_config, "activation_situ_beta", None)
+        if cfg_lbeta is None:
+            cfg_lbeta = getattr(text_config, "activation_situ_linear_beta", None)
+        if activation is None:
+            activation = "situ" if cfg_beta is not None else "swiglu"
+        activation = activation.lower()
+        if activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"MegaMoECuteDsl activation must be 'swiglu' or 'situ'; got {activation!r}."
+            )
+        if activation == "swiglu":
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError("SiTU beta parameters require activation='situ'.")
+            return activation, None, None
+        situ_beta = cfg_beta if situ_beta is None else situ_beta
+        situ_linear_beta = cfg_lbeta if situ_linear_beta is None else situ_linear_beta
+        if situ_beta is None or situ_linear_beta is None:
+            raise ValueError(
+                "MegaMoECuteDsl SiTU requires activation_situ_beta and "
+                "activation_situ_linear_beta in the pretrained config, or explicit "
+                "situ_beta and situ_linear_beta arguments."
+            )
+        if situ_beta <= 0 or situ_linear_beta <= 0:
+            raise ValueError("MegaMoECuteDsl SiTU beta parameters must be positive.")
+        return activation, float(situ_beta), float(situ_linear_beta)
+
     @staticmethod
     def _resolve_gate_up_clamp(
         swiglu_limit: Optional[torch.Tensor],
@@ -719,10 +794,20 @@ class MegaMoECuteDsl(MoE):
                 f"of the fused kernel); got moe.comm={type(moe.comm).__name__}."
             )
         top_k = moe.routing_method.experts_per_token
-        if top_k > 13:
+        # EXPERIMENTAL, pending kernel-side confirmation: raised 13 -> 16 to
+        # admit Kimi K3, whose routing is top-16. The original bound was
+        # described as matching *external coverage*, i.e. what had been
+        # validated, not a kernel capability -- and nothing in the CuTe DSL
+        # kernel hardcodes it: num_topk is a sizing parameter there
+        # (max_tokens_per_rank * num_topk, (max_tokens, num_topk, hidden)).
+        # That makes the widening plausible, NOT proven: shared-memory and
+        # register budgets grow with num_topk, and topk_reduce.py may carry
+        # fixed unrolls. Accuracy at one shape is evidence, not coverage.
+        _MEGAMOE_CUTEDSL_MAX_TOP_K = 16
+        if top_k > _MEGAMOE_CUTEDSL_MAX_TOP_K:
             raise ValueError(
-                f"MegaMoECuteDsl supports experts_per_token <= 13 "
-                f"(matches external coverage); got {top_k}."
+                f"MegaMoECuteDsl supports experts_per_token <= "
+                f"{_MEGAMOE_CUTEDSL_MAX_TOP_K}; got {top_k}."
             )
         if moe.moe_max_num_tokens <= 0:
             raise ValueError(
@@ -1442,6 +1527,8 @@ class MegaMoECuteDsl(MoE):
                 peer_offsets=peer_offsets,
                 apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
                 gate_up_clamp=self.gate_up_clamp,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
                 # Keep the deterministic standalone TopkReduce until form-B
                 # has dedicated GPU correctness and performance coverage.
                 in_kernel_fc2_reduce=False,

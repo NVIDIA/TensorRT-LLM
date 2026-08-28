@@ -1869,12 +1869,14 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # executor. A test that mirrored the predicate would keep passing if the
     # production check were deleted.
     # Everything _validate_request touches besides the beam checks runs after
-    # them and needs a live engine/sampler, so stub those two out; the beam
-    # width and beam_width_array branches are reached with the real code.
+    # them and needs a live engine/sampler/KV cache manager, so stub those out;
+    # the beam width and beam_width_array branches are reached with the real
+    # code.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
+        _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(
         PyExecutor._validate_request,

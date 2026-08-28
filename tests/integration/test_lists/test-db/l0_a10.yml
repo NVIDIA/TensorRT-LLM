@@ -18,6 +18,7 @@ l0_a10:
   - unittest/_torch/sampler/test_penalties.py
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
+  - unittest/_torch/test_fused_relu2.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
@@ -32,6 +33,7 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
+  - unittest/_torch/executor/test_resource_manager.py
   - unittest/_torch/modules/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
@@ -162,7 +164,7 @@ l0_a10:
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
-  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
+  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen3/Qwen3-0.6B]
   - test_e2e.py::test_openai_health
   - test_e2e.py::test_trtllm_serve_example
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit

@@ -1,0 +1,4 @@
+{
+    "model_mode": "image2video",
+    "prompt": "Recover the robot action trajectory from this clip of the arm picking up a pear and placing it into the bag."
+}

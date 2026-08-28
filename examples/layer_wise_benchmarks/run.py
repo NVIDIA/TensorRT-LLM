@@ -52,6 +52,13 @@ parser.add_argument(
 parser.add_argument("--kv-pool-headroom", type=int, default=1)
 parser.add_argument("--enable-swa-scratch-reuse", action="store_true")
 # Model init args
+parser.add_argument(
+    "--vision-config",
+    type=str,
+    choices=["none", "checkpoint"],
+    help="Which vision tower to build from a composite multimodal checkpoint. Default"
+    ' "none": drop it and profile the text decoder layers, which is all this tool runs.',
+)
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
@@ -59,6 +66,13 @@ parser.add_argument("--moe-backend", type=str)
 # whose Literal is the authoritative list. A second list here can only drift.
 parser.add_argument("--moe-backend-for-prefill", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
+parser.add_argument(
+    "--spec-max-draft-len",
+    type=int,
+    help="Draft tokens per generation step. Required by models whose multi-token verify"
+    " path needs cache-manager-allocated speculative buffers (Kimi K3 KDA). Must equal"
+    " seq_len_q - 1.",
+)
 group = parser.add_mutually_exclusive_group()
 group.add_argument(
     "--use-low-precision-moe-combine", action="store_true", dest="use_low_precision_moe_combine"
@@ -137,6 +151,8 @@ if args.kv_cache_dtype is None:
     args.kv_cache_dtype = "auto"
 if args.mamba_ssm_cache_dtype is None:
     args.mamba_ssm_cache_dtype = "auto"
+if args.vision_config is None:
+    args.vision_config = "none"
 if args.load_format is None:
     args.load_format = "DUMMY"
 if args.max_num_tokens is None:
@@ -153,7 +169,26 @@ if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
     parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
 if args.replay_verify_metadata is None:
     args.replay_verify_metadata = True
+if args.spec_max_draft_len is not None:
+    if args.run_type != "GEN":
+        parser.error("--spec-max-draft-len only applies to --run-type GEN")
+    if args.spec_max_draft_len < 1:
+        parser.error("--spec-max-draft-len must be >= 1")
+    if args.seq_len_q_list != [args.spec_max_draft_len + 1]:
+        parser.error(
+            f"--spec-max-draft-len {args.spec_max_draft_len} implies a single seq_len_q"
+            f" {args.spec_max_draft_len + 1}, got {args.seq_len_q_list}"
+        )
 print(args)
+
+# Speculative decoding shape only: the harness has no sampler, so no drafts are
+# ever accepted. This exists so the cache manager allocates the multi-token
+# verify buffers (Kimi K3 KDA replay caches) that seq_len_q > 1 needs.
+spec_config = None
+if args.spec_max_draft_len is not None:
+    from tensorrt_llm.llmapi.llm_args import SADecodingConfig
+
+    spec_config = SADecodingConfig(max_draft_len=args.spec_max_draft_len)
 
 # MPI args
 rank = mpi_rank()
@@ -175,6 +210,8 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     layer_indices=args.layer_indices,
     kv_pool_headroom=args.kv_pool_headroom,
     enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
+    spec_config=spec_config,
+    vision_config=args.vision_config,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
@@ -200,6 +237,8 @@ runner = Runner(
     mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
     use_low_precision_moe_combine=args.use_low_precision_moe_combine,
     use_cuda_graph=args.use_cuda_graph,
+    spec_config=spec_config,
+    vision_config=args.vision_config,
 )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
@@ -270,6 +309,7 @@ if args.run_type == "GEN":
             mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
             use_low_precision_moe_combine=args.use_low_precision_moe_combine,
             use_cuda_graph=False,
+            vision_config=args.vision_config,
         )
     logger.info("Layer-wise benchmarks: Create runner for prefill  ... Done")
 

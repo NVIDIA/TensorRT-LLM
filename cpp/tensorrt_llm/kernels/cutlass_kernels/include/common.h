@@ -36,6 +36,7 @@ enum class ActivationType
     Geglu = 6,
     SwigluBias = 7,
     Relu2 = 8,
+    SiTu = 9,
 };
 
 } // namespace kernels::cutlass_kernels

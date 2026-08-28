@@ -3,11 +3,9 @@ from __future__ import annotations
 import statistics
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.scaffolding.trace_replay.execution_trace import ExecutionTrace, TraceEvent
-
-Point3 = Tuple[float, float, Union[int, str]]
 
 
 def count_assistant_completion_tokens(events: List[TraceEvent]) -> int:
@@ -176,120 +174,122 @@ def compute_replay_run_metrics(
     return result
 
 
-def _step_from_run(r: Dict[str, Any]) -> Union[int, str]:
-    step = r.get("ladder_step")
-    if step is None:
-        step = r.get("max_batch_size")
-    return step if step is not None else "?"
+# ---------------------------------------------------------------------------
+# Steady-state window and job-level Pareto coordinates
+# ---------------------------------------------------------------------------
+#
+# A replayed agent session lasts minutes, so a concurrent run has a fill-up
+# ramp, a saturated middle, and a drain. Both job- and token-level metrics are
+# measured only over the saturated window, defined in admission order as::
+#
+#     window start = start time of the ``excl``-th admitted session
+#                    (the admission that fills the last slot)
+#     window end   = end time of the ``(N - excl + 1)``-th admitted session
+#                    (the first drain session's completion)
+#
+# with ``excl = max(1, min(concurrency, max_batch_size * dp_size))``. Job
+# membership is completion-based: a session counts if it *completes* inside the
+# window, whenever it was admitted. Requiring a session to be entirely inside
+# drops the in-flight population at both edges while keeping the full window in
+# the denominator, which undercounts jobs/h/GPU roughly twofold. LLM calls last
+# seconds rather than minutes, so the token-level metrics can use the stricter
+# fully-inside rule without measurable loss.
 
 
-def collect_token_pareto_points(runs: List[Dict[str, Any]]) -> List[Point3]:
-    """Return ``(median_tps_per_user, output_tps_per_gpu, ladder_step)``."""
-    pts: List[Point3] = []
-    for r in runs:
-        if r.get("status") != "success":
-            continue
-        x = r.get("median_tps_per_user")
-        if x is None:
-            x = r.get("pareto_x_median_tps_per_user")
-        y = r.get("output_tps_per_gpu")
-        if y is None:
-            y = r.get("pareto_y_output_tps_per_gpu")
-        if x is None or y is None:
-            continue
-        try:
-            xf, yf = float(x), float(y)
-        except (TypeError, ValueError):
-            continue
-        pts.append((xf, yf, _step_from_run(r)))
-    pts.sort(key=lambda t: t[0])
-    return pts
+def steady_state_excl_count(concurrency: int, max_batch_size: int, dp_size: int = 1) -> int:
+    """Sessions excluded from each end of the window (the saturation depth)."""
+    return max(1, min(int(concurrency), int(max_batch_size) * max(1, int(dp_size))))
 
 
-def _gpu_count_for_run(r: Dict[str, Any], data: Dict[str, Any]) -> Optional[int]:
-    """GPU count aligned with ``output_tps_per_gpu`` (aggregate / TP size)."""
-    cfg = r.get("llm_effective_config") or {}
-    tp = cfg.get("tensor_parallel_size")
-    if tp is not None:
-        try:
-            n = int(tp)
-            if n > 0:
-                return n
-        except (TypeError, ValueError):
-            pass
-    cli = data.get("cli_args") or {}
-    tp = cli.get("tensor_parallel_size")
-    if tp is not None:
-        try:
-            n = int(tp)
-            if n > 0:
-                return n
-        except (TypeError, ValueError):
-            pass
-    host = data.get("host") or {}
-    n = host.get("cuda_device_count")
-    if n is not None:
-        try:
-            c = int(n)
-            if c > 0:
-                return c
-        except (TypeError, ValueError):
-            pass
+def compute_steady_state_window(
+    *,
+    session_start_offset_s: List[float],
+    session_end_offset_s: List[float],
+    excl_count: int,
+) -> Dict[str, Any]:
+    """Return the saturation window over which the Pareto metrics are measured."""
+    n_sessions = len(session_start_offset_s)
+    if n_sessions <= 2 * excl_count:
+        return {
+            "valid": False,
+            "reason": f"total_sessions ({n_sessions}) <= 2 * excl_count ({excl_count})",
+            "excl_count": excl_count,
+        }
+    admission_order = sorted(range(n_sessions), key=lambda i: (session_start_offset_s[i], i))
+    start_s = session_start_offset_s[admission_order[excl_count - 1]]
+    end_s = session_end_offset_s[admission_order[n_sessions - excl_count]]
+    if end_s <= start_s:
+        return {"valid": False, "reason": "empty window", "excl_count": excl_count}
+    return {
+        "valid": True,
+        "start_offset_s": start_s,
+        "end_offset_s": end_s,
+        "duration_s": end_s - start_s,
+        "excl_count": excl_count,
+    }
+
+
+def _tpot_ms(entry: Dict[str, Any]) -> Optional[float]:
+    """Per-output-token latency of one LLM call, excluding time to first token."""
+    output_tokens = entry.get("replay_output_token_len") or 0
+    latency_s = entry.get("latency_s")
+    ttft_s = entry.get("ttft_s")
+    if output_tokens > 1 and latency_s is not None and ttft_s is not None:
+        return (float(latency_s) - float(ttft_s)) * 1000.0 / (output_tokens - 1)
     return None
 
 
-def _mean_trace_duration_s(r: Dict[str, Any]) -> Optional[float]:
-    """Mean wall time per trace (seconds), from ``session_duration_mean_s`` or sum/n."""
-    mean_s = r.get("session_duration_mean_s")
-    if mean_s is not None:
-        try:
-            mean_value = float(mean_s)
-            if mean_value >= 0:
-                return mean_value
-        except (TypeError, ValueError):
-            pass
-    total_s = r.get("session_duration_sum_s")
-    if total_s is None:
-        total_s = r.get("aggregate_latency_person_s")
-    n = r.get("n_sessions")
-    if total_s is None or n is None:
-        return None
-    try:
-        total_value = float(total_s)
-        sessions = float(n)
-    except (TypeError, ValueError):
-        return None
-    if sessions <= 0:
-        return None
-    return total_value / sessions
+def compute_steady_state_pareto(
+    *,
+    window: Dict[str, Any],
+    session_end_offset_s: List[float],
+    session_duration_mean_s: Optional[float],
+    replay_detail: List[Dict[str, Any]],
+    tensor_parallel_size: int,
+) -> Dict[str, Any]:
+    """Return the job- and token-level Pareto coordinates for one run.
 
+    ``job_y`` and ``token_y`` are per-GPU rates, normalized by
+    ``tensor_parallel_size``, which is the GPU count for the single-node
+    tensor/expert-parallel configurations this driver targets. ``token_y``
+    counts prefill input plus decode output, since a multi-turn agent workload
+    is prefill-dominated and an output-only axis understates it several-fold;
+    ``token_x`` stays decode-only because TPOT is a per-output-token latency.
+    """
+    if not window.get("valid"):
+        return {"valid": False, "reason": window.get("reason")}
+    num_gpus = int(tensor_parallel_size)
+    if num_gpus <= 0:
+        return {"valid": False, "reason": "tensor_parallel_size <= 0"}
 
-def collect_agent_pareto_points(
-    runs: List[Dict[str, Any]],
-    data: Dict[str, Any],
-) -> List[Point3]:
-    """Return ``(task/user/h, task/gpu/h, ladder_step)``."""
-    pts: List[Point3] = []
-    for r in runs:
-        if r.get("status") != "success":
-            continue
-        mean_s = _mean_trace_duration_s(r)
-        if mean_s is None or mean_s <= 0:
-            continue
-        x = 3600.0 / mean_s
-        n_raw = r.get("n_sessions")
-        wall = r.get("wall_clock_s")
-        g = _gpu_count_for_run(r, data)
-        if n_raw is None or wall is None or g is None or g <= 0:
-            continue
-        try:
-            n_sessions = float(n_raw)
-            wall_s = float(wall)
-        except (TypeError, ValueError):
-            continue
-        if wall_s <= 0:
-            continue
-        y = n_sessions * 3600.0 / (float(g) * wall_s)
-        pts.append((x, y, _step_from_run(r)))
-    pts.sort(key=lambda t: t[0])
-    return pts
+    start_s = window["start_offset_s"]
+    end_s = window["end_offset_s"]
+    duration_s = window["duration_s"]
+
+    jobs_completed = sum(1 for e in session_end_offset_s if start_s <= e <= end_s)
+    in_window = [
+        e
+        for e in replay_detail
+        if e.get("client_request_start_offset_s") is not None
+        and e.get("client_request_end_offset_s") is not None
+        and e["client_request_start_offset_s"] >= start_s
+        and e["client_request_end_offset_s"] <= end_s
+    ]
+    output_tokens = sum(int(e.get("usage_completion_tokens") or 0) for e in in_window)
+    input_tokens = sum(int(e.get("usage_prompt_tokens") or 0) for e in in_window)
+    tpots_ms = [t for t in (_tpot_ms(e) for e in in_window) if t is not None]
+
+    return {
+        "valid": True,
+        "job_x_jobs_per_h_per_user": (3600.0 / session_duration_mean_s)
+        if session_duration_mean_s
+        else None,
+        "job_y_jobs_per_h_per_gpu": 3600.0 * jobs_completed / (duration_s * num_gpus),
+        "token_x_tps_per_user": (1000.0 / statistics.median(tpots_ms)) if tpots_ms else None,
+        "token_y_tps_per_gpu": (input_tokens + output_tokens) / duration_s / num_gpus,
+        "token_y_tps_per_gpu_output_only": output_tokens / duration_s / num_gpus,
+        "jobs_completed_in_window": jobs_completed,
+        "llm_calls_in_window": len(in_window),
+        "window_duration_s": duration_s,
+        "num_gpus": num_gpus,
+    }

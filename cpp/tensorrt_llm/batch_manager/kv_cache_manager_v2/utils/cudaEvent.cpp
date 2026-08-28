@@ -72,10 +72,14 @@ CachedCudaEvent CachedCudaEvent::makeNull() noexcept
     return CachedCudaEvent{};
 }
 
-CachedCudaEvent::CachedCudaEvent(CudaStream stream)
-    : mEvent(std::make_shared<CudaEventPool::PoolItem>(CudaEventPool::instance().get()))
+CachedCudaEvent::CachedCudaEvent(CudaStream stream) noexcept
 {
-    cuCheck(cuEventRecord(mEvent->get(), reinterpret_cast<CUstream>(stream)));
+    terminateOnException("Failed to create or record a cached CUDA event",
+        [&]()
+        {
+            mEvent = std::make_shared<CudaEventPool::PoolItem>(CudaEventPool::instance().get());
+            cuCheck(cuEventRecord(mEvent->get(), reinterpret_cast<CUstream>(stream)));
+        });
 }
 
 bool CachedCudaEvent::queryComplete()
@@ -116,7 +120,7 @@ void CachedCudaEvent::waitInStream(CudaStream stream) const
     cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), mEvent->get(), 0));
 }
 
-void CachedCudaEvent::close()
+void CachedCudaEvent::close() noexcept
 {
     if (mEvent)
     {
@@ -133,7 +137,7 @@ CachedCudaStream::CachedCudaStream()
 {
 }
 
-CachedCudaEvent CachedCudaStream::recordEvent()
+CachedCudaEvent CachedCudaStream::recordEvent() noexcept
 {
     return CachedCudaEvent{reinterpret_cast<CudaStream>(handle())};
 }

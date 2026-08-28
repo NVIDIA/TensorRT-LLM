@@ -295,10 +295,9 @@ class ParallelVAE_Wan(ParallelVAEBase):
 
 
 # Two parallel-VAE wrappers, one per VAE *class* (not a temporary transition):
-#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by Cosmos3
-#                         (models/cosmos3) and the Wan TRTLLM_USE_DIFFUSER_VAE
-#                         debug fallback.
-#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan2.1/2.2.
+#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by the
+#                         TRTLLM_USE_DIFFUSER_VAE debug fallback for Wan and Cosmos3.
+#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan and Cosmos3.
 # They share all splitting logic via the base class; only the conv3d/attention
 # module classes differ. ParallelVAE_Wan stays as long as any model uses the
 # diffusers AutoencoderKLWan.

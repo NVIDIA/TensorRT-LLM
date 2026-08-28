@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -105,6 +106,14 @@ class Attention(nn.Module):
         # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
         if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
+            requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
+            # Warn once per (module class, requested, resolved) triple so the
+            # fallback is visible without per-module-instance log spam.
+            logger.warning_once(
+                f"{type(self).__name__}: requested attention backend {requested} does not "
+                f"support qkv_mode=SEPARATE_QKV; falling back to {backend_name}.",
+                key=(type(self).__name__, requested, backend_name),
+            )
         else:
             backend_name = base_backend
 

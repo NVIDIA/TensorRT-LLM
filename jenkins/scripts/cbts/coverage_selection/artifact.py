@@ -11,22 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Resolve which post-merge CBTS touch DB to use.
+"""Resolve which post-merge CBTS touch DBs to use.
 
-Candidates are the recent builds of `<ARTIFACT_BASE>` that have a
-`cbts-coverage/cbts_pystart_report.tar.gz`, ranked by how far `COVERAGE_BRANCH`
-has moved past the revision each collected (`build_info.txt`), since a build can
-be a re-run of an older commit; the build number is only a tie-break. That
-distance is `ahead_by` from the forge compare API — the CI checkout is depth-1,
-so git cannot answer it — and needs `GITHUB_API_TOKEN`, the anonymous quota
-being per-IP and exhausted by shared CI egress.
+Candidates are recent builds of `<ARTIFACT_BASE>` with both x86 and SBSA
+coverage tarballs. A candidate must have collected a revision at or before the
+PR base; the candidate closest to that base wins, with build number only a
+tie-break. Revision ordering comes from the forge compare API — the CI checkout
+is depth-1, so git cannot answer it — and needs `GITHUB_API_TOKEN`, the anonymous
+quota being per-IP and exhausted by shared CI egress.
 
-Ranking scores candidates against the tip of `COVERAGE_BRANCH`; gating scores the
-winner against the PR's merge base, which `--pr-head` supplies.
+The selected architecture DBs are merged locally through the compact coverage
+schema, producing the one DB consumed by `main.py`.
 
-Two entry points. `--print-selection` prints `{url, build, commit, lag,
+Two entry points. `--print-selection` prints `{urls, build, commit, lag,
 base_commit, drift, drift_status}` and stops. `--prepare DIR` goes on to
-download and unpack the winner, drop that JSON beside it, and print
+download, unpack, and merge the winner, drop that JSON beside it, and print
 `{path, meta}` — the two paths `main.py` needs.
 """
 
@@ -36,17 +35,26 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "coverage_utils"))
+
+from compact_db import merge_databases  # noqa: E402
+
 # Merged-artifact base for the main-branch L0_PostMerge job.
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
-TARBALL_NAME = "cbts_pystart_report.tar.gz"
+ARCH_TARBALL_NAMES = (
+    "cbts_pystart_report_x86_64.tar.gz",
+    "cbts_pystart_report_SBSA.tar.gz",
+)
 # sqlite at the tar root, and the selection JSON `prepare` drops beside it.
 DB_NAME = "cbts_touchmap.sqlite"
 META_NAME = "cbts_coverage_db.json"
@@ -61,8 +69,8 @@ GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
-# Max builds to walk back when recent builds have no tarball.
-_MAX_PROBE = 10
+# Cover the 30-commit freshness window plus missing or unsuccessful builds.
+_MAX_PROBE = 50
 # Per-request timeout in seconds, for the small JSON/metadata calls.
 _TIMEOUT = 15
 # Socket timeout for the tarball itself, which runs to hundreds of MB.
@@ -108,8 +116,12 @@ def latest_build_number(jenkins_base: str = _JENKINS_BASE) -> Optional[int]:
     return None
 
 
-def tarball_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
-    return f"{_URM}/{artifact_base}/{build}/cbts-coverage/{TARBALL_NAME}"
+def tarball_url(build: int, name: str, artifact_base: str = ARTIFACT_BASE) -> str:
+    return f"{_URM}/{artifact_base}/{build}/cbts-coverage/{name}"
+
+
+def tarball_urls(build: int, artifact_base: str = ARTIFACT_BASE) -> list[str]:
+    return [tarball_url(build, name, artifact_base) for name in ARCH_TARBALL_NAMES]
 
 
 def build_info_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
@@ -152,7 +164,7 @@ def _compare(base: str, head: str) -> Optional[dict]:
 
 
 def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int]:
-    """Commits `branch` gained since `commit` — ranking only; never negative."""
+    """Commits `branch` gained since `commit` — reporting only; never negative."""
     payload = _compare(commit, branch)
     if payload is None:
         return None
@@ -193,44 +205,68 @@ def drift(db_commit: str, base_commit: str) -> tuple[Optional[int], str]:
 
 
 def select_tarball(
+    pr_base_commit: str,
     artifact_base: str = ARTIFACT_BASE,
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
 ) -> Optional[dict]:
-    """Tarball of the least-trailing commit as {url, build, commit, lag}; build number breaks ties."""
+    """Closest complete architecture pair collected at or before `pr_base_commit`."""
     build = latest_build_number(jenkins_base)
     if build is None:
         print("[artifact] could not resolve latest build number", file=sys.stderr)
         return None
     candidates = []
     for b in range(build, max(0, build - max_probe), -1):
-        url = tarball_url(b, artifact_base)
-        if not _exists(url):
+        urls = tarball_urls(b, artifact_base)
+        if not all(_exists(url) for url in urls):
             continue
         commit = build_commit(b, artifact_base)
-        lag = compare_distance(commit) if commit else None
-        candidates.append({"url": url, "build": b, "commit": commit, "lag": lag})
+        if not commit:
+            print(f"[artifact] build {b}: commit unknown; skipped", file=sys.stderr)
+            continue
+        distance, status = drift(commit, pr_base_commit)
+        if distance is None:
+            print(
+                f"[artifact] build {b}: ordering against the PR base unknown; skipped",
+                file=sys.stderr,
+            )
+            continue
+        if status not in ("ahead", "identical"):
+            print(
+                f"[artifact] build {b}: relation to the PR base is {status or 'unknown'}; skipped",
+                file=sys.stderr,
+            )
+            continue
+        candidates.append(
+            {
+                "url": urls[0],
+                "urls": urls,
+                "build": b,
+                "commit": commit,
+                "base_commit": pr_base_commit,
+                "drift": distance,
+                "drift_status": status,
+            }
+        )
     if not candidates:
-        print(f"[artifact] no tarball in the last {max_probe} builds", file=sys.stderr)
-        return None
-    # Known lag first (smallest = closest to the branch tip); unknown falls back to build order.
-    best = min(candidates, key=lambda c: (c["lag"] is None, c["lag"] or 0, -c["build"]))
-    if best["lag"] is None:
         print(
-            f"[artifact] build {best['build']}: lag unknown, selected by build number",
+            f"[artifact] no complete x86/SBSA coverage pair at or before the PR base "
+            f"in the last {max_probe} builds",
             file=sys.stderr,
         )
-    skipped = [c["build"] for c in candidates if c["build"] > best["build"]]
-    if skipped:
+        return None
+    best = min(candidates, key=lambda c: (c["drift"], -c["build"]))
+    best["lag"] = compare_distance(best["commit"])
+    if best["lag"] is None:
         print(
-            f"[artifact] builds {skipped} carry an older commit than {best['build']}; skipped",
+            f"[artifact] build {best['build']}: lag behind main unknown",
             file=sys.stderr,
         )
     return best
 
 
 def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
-    """Add `base_commit` / `drift` / `drift_status` to the ranked winner, in place."""
+    """Add PR-base relation metadata to a pinned selection, in place."""
     sel.setdefault("base_commit", None)
     sel.setdefault("drift", None)
     sel.setdefault("drift_status", "unknown")
@@ -251,7 +287,8 @@ def describe(sel: dict) -> str:
         drifted = "drift unmeasured"
     else:
         base = (sel.get("base_commit") or "")[:10]
-        drifted = f"{sel['drift']} commit(s) {sel.get('drift_status')} the PR base {base}"
+        relation = "at" if sel["drift"] == 0 else "before"
+        drifted = f"{sel['drift']} commit(s) {relation} the PR base {base}"
     return (
         f"[artifact] build {sel.get('build')}, commit {(sel.get('commit') or 'unknown')[:10]}, "
         f"{lag}, {drifted}"
@@ -263,7 +300,7 @@ def download(url: str, dest: Path, attempts: int = _RETRIES) -> Optional[Path]:
 
     Streamed, not buffered: the artifact runs to hundreds of MB.
     """
-    out = dest / TARBALL_NAME
+    out = dest / url.rsplit("/", maxsplit=1)[-1]
     for attempt in range(1, attempts + 1):
         try:
             with (
@@ -293,26 +330,46 @@ def extract(tarball: Path, dest: Path) -> bool:
 
 
 def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
-    """Resolve, measure, download and unpack the DB; `{path, meta}` or None on any failure.
+    """Resolve, download, and merge the DB pair; `{path, meta}` or None on failure.
 
     `meta` is the selection JSON on disk, which `main.py --coverage-db-meta` reads.
     Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
     """
-    sel = select_tarball()
+    if not pr_head:
+        print("[artifact] PR head is required to select an ancestor coverage DB", file=sys.stderr)
+        return None
+    pr_base_commit = merge_base(pr_head)
+    if not pr_base_commit:
+        print("[artifact] could not resolve the PR base commit", file=sys.stderr)
+        return None
+    sel = select_tarball(pr_base_commit)
     if sel is None:
         return None
-    measure_drift(sel, pr_head)
     print(describe(sel), file=sys.stderr)
 
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    tarball = download(sel["url"], dest)
-    if tarball is None or not extract(tarball, dest):
-        return None
     db = dest / DB_NAME
-    if not db.is_file():
-        print(f"[artifact] {DB_NAME} not in the tarball", file=sys.stderr)
-        return None
+    with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
+        temp = Path(temp_dir)
+        source_dbs = []
+        for index, url in enumerate(sel["urls"]):
+            tarball = download(url, temp)
+            artifact_dir = temp / str(index)
+            artifact_dir.mkdir()
+            if tarball is None or not extract(tarball, artifact_dir):
+                return None
+            source_db = artifact_dir / DB_NAME
+            if not source_db.is_file():
+                print(f"[artifact] {DB_NAME} not in {url}", file=sys.stderr)
+                return None
+            source_dbs.append(source_db)
+        try:
+            connection = merge_databases(source_dbs, db)
+        except (OSError, sqlite3.Error, ValueError) as e:
+            print(f"[artifact] merge failed: {e}", file=sys.stderr)
+            return None
+        connection.close()
 
     meta = dest / META_NAME
     meta.write_text(json.dumps(sel))
@@ -326,7 +383,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--print-selection",
         action="store_true",
-        help="resolve and print {url, build, commit, lag, base_commit, drift, drift_status} as JSON",
+        help="resolve and print {urls, build, commit, lag, base_commit, drift, drift_status} as JSON",
     )
     ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
@@ -335,13 +392,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--prepare",
         metavar="DIR",
         default=None,
-        help="resolve, download and unpack the DB into DIR, then print {path, meta} as JSON",
+        help="resolve, download and merge the architecture DBs into DIR, then print "
+        "{path, meta} as JSON",
     )
     ap.add_argument(
         "--pr-head",
         default=None,
-        help="PR head revision; its merge base is what drift is measured against "
-        "(omitted leaves drift null, which the selector declines on).",
+        help="required PR head revision; its merge base is the inclusive upper bound "
+        "for eligible coverage revisions",
     )
     args = ap.parse_args(argv)
 
@@ -355,19 +413,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(ready))
         return 0
 
+    if not args.pr_head:
+        print("[artifact] --pr-head is required", file=sys.stderr)
+        return 1
+    pr_base_commit = merge_base(args.pr_head)
+    if not pr_base_commit:
+        return 1
+
     if args.build is not None:
+        urls = tarball_urls(args.build)
+        if not all(_exists(url) for url in urls):
+            return 1
         commit = build_commit(args.build)
         best = {
-            "url": tarball_url(args.build),
+            "url": urls[0],
+            "urls": urls,
             "build": args.build,
             "commit": commit,
             "lag": compare_distance(commit) if commit else None,
         }
+        measure_drift(best, args.pr_head)
+        if best["drift_status"] not in ("ahead", "identical"):
+            return 1
     else:
-        best = select_tarball()
+        best = select_tarball(pr_base_commit)
     if best is None:
         return 1
-    print(json.dumps(measure_drift(best, args.pr_head)))
+    print(json.dumps(best))
     return 0
 
 

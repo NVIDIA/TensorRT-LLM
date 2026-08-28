@@ -39,7 +39,7 @@ from typing import (
 import torch
 
 from ...logger import logger
-from ..utils import make_weak_ref
+from ..utils import make_weak_ref, torch_compiling
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
@@ -383,7 +383,13 @@ class MultimodalEncoderGraphRunner:
             capture_kwargs["pool"] = self._memory_pool
 
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode():
+        # `torch_compiling(False)` for the same reason as `inference_mode`: ambient state the encoder
+        # region must not inherit from whoever called us. Capture can be driven from `load_weights`,
+        # outside any engine forward, so the process-global compile flag may still carry a previous
+        # engine's value. `encoder_fn` is handed its metadata explicitly, so its layers must take
+        # the eager path rather than the custom op, which resolves metadata from `extra_attrs` that
+        # only an engine forward binds.
+        with torch.inference_mode(), torch_compiling(False):
             for _ in range(self._config.warmup_steps):
                 self._encoder_fn(static_inputs, metadata)
             torch.cuda.synchronize()

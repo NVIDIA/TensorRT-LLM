@@ -1,0 +1,180 @@
+# Example brief for the perf-optimize workflow. Copy this file to
+# `task.yaml`, fill in your paths and knobs, then run:
+#
+#     perf-optimize \
+#         --task path/to/your/task.yaml \
+#         --workspace workspace/perf-optimize/<model-name>
+#
+# Required: the two source paths below. The workflow refuses to start if
+# either is missing or does not point at an existing path.
+#
+# NOTE: perf-optimize MUTATES the TRT-LLM checkout — it must be a git
+# repo with a clean worktree; work happens on a dedicated
+# perf-optimize/<workspace>-<timestamp> branch (one commit per accepted
+# optimization). Source-level (`approach: code`) optimizations only take
+# effect when the checkout is the installed tensorrt_llm package
+# (editable install).
+
+checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>
+trtllm_repo_path: /path/to/TensorRT-LLM
+# Optional: the starting server tuning. It seeds the workspace's live
+# tuning config (tuning/extra_llm_api_options.yaml), which the optimizer
+# then evolves; omit to start from an empty ({}) config.
+# extra_llm_api_options: /path/to/extra_llm_api_options.yaml
+
+# Optional: the benchmark operating point(s) driven by
+# benchmark_serving.py. Every measurement in the campaign (baseline,
+# evaluator, final verification) replays the same point(s).
+benchmark:
+  dataset_name: random       # random | sharegpt | hf | sonnet | burstgpt
+  random_input_len: 1024     # ISL
+  random_output_len: 128     # OSL
+  num_prompts: 200
+  concurrency: 64
+  # concurrency: [8, 32, 128]  # list => Pareto-curve mode: every measurement
+  #                            # runs once per point (over one server launch)
+  #                            # and the evaluator applies the Pareto gate —
+  #                            # mean per-point gain must pass the thresholds
+  #                            # AND no point may regress beyond the noise
+  #                            # floor. Benchmark cost multiplies by the point
+  #                            # count; keep the list short (~3-5 points).
+  # num_prompts: [32, 128, 512]  # curve mode only: per-point num_prompts,
+  #                            # paired index-by-index with the concurrency
+  #                            # list (each entry >= its point). Keeps
+  #                            # low-concurrency points cheap instead of
+  #                            # replaying the full prompt count at every
+  #                            # point; a scalar means the same count
+  #                            # everywhere.
+  # request_rate: inf        # requests/sec; "inf" sends all at once
+  # dataset_path: /path/to/ShareGPT.json   # for sharegpt / hf datasets
+
+# Optional: which profilers the Analyzer runs each round, and the
+# steady-state iteration window that gates them (TLLM_PROFILE_START_STOP
+# for nsys/torch; ncu arms on the same window via --profile-from-start
+# off). ncu is the bounded per-kernel deep dive on the top nsys kernels,
+# interpreted with the perf-nsight-compute-analysis skill. A round profiles
+# after an accept or a reverted code attempt that may have changed ignored
+# build output; otherwise the next one re-plans from current evidence. Drop
+# torch/ncu to trim what profiling rounds cost.
+profile:
+  methods: [nsys, torch, ncu]
+  nsys_iter_range: "100-150"
+  # Optional: the per-kernel coverage contract. When present (an empty
+  # mapping enables the defaults shown), the analyzer's ncu dive covers
+  # EVERY kernel at/above min_share_pct of GPU time (extending down the
+  # kern_sum until coverage_target_pct is reached, over bounded capture
+  # passes), and each profiling round writes a schema-validated
+  # kernel_ledger.yaml answering two questions per kernel — can it be
+  # made faster? can it be fused with its neighbors? — each with a
+  # roadmap item or an evidence-backed dismissal. The orchestrator
+  # aborts the round on an incomplete ledger (a replan-only round runs
+  # no ncu and is waived), so the campaign cannot end with a kernel
+  # whose optimization/fusion possibility was never considered. Costs
+  # extra profiling time per round that profiles; requires nsys+ncu in
+  # methods.
+  # kernel_coverage:
+  #   min_share_pct: 0.5         # every kernel >= this share gets a row
+  #   coverage_target_pct: 95    # rows must cover >= this much GPU time
+
+# Optional: the optimization-loop knobs (defaults shown).
+# optimize:
+#   max_rounds: 5               # the loop RUNS this many rounds (each: an
+#                               # analyzer turn, then up to
+#                               # max_items_per_round items) — it only stops
+#                               # early when an analyzer turn finds nothing
+#                               # actionable or target_improvement_pct is met.
+#                               # Only rounds with stale/unproven runtime
+#                               # evidence pay for a profile, so this bounds
+#                               # items attempted far more tightly than GPU hours
+#   max_items_per_round: 3      # items applied per round, ONE AT A TIME (each
+#                               # keeps its own evaluator gate + revert); 1
+#                               # reproduces the original one-item-per-round loop
+#   max_attempts_per_item: 3    # total optimizer attempts per item: evaluator
+#                               # PUSH_BACK verdicts retry up to this bound (an
+#                               # explicit REJECT fails the item immediately)
+#   approaches: [config, code]  # allowed optimization approaches: config edits
+#                               # the live tuning YAML, code edits the TRT-LLM
+#                               # source. [code] forbids knob tuning (code-only
+#                               # campaign; needs an editable install); [config]
+#                               # leaves the checkout untouched. Disallowed
+#                               # attempts are auto-rejected before evaluation.
+#   accept_fraction: 0.5        # measured gain must reach this fraction of
+#                               # the item's expected_gain_pct ...
+#   noise_floor_pct: 1.0        # ... and at least this much outright
+#   focus_concurrencies: [32, 128]  # curve mode only, optional: the subset of
+#                               # benchmark.concurrency the gate SCORES — every
+#                               # curve→scalar mean (gate mean, ledger values,
+#                               # measured_gain_pct) uses only these points, so
+#                               # wins in the regime the product cares about are
+#                               # not diluted by the other points. Every point is
+#                               # still measured and none may regress beyond the
+#                               # noise floor. Omit to score all points.
+#   max_regression_pct: 8.0     # curve mode only, optional: an owner-DECLARED
+#                               # per-point regression budget for the no-regress
+#                               # condition — a point may regress up to this %
+#                               # when a large mean win justifies it (e.g. a
+#                               # saturated top point paying for gains everywhere
+#                               # else). Must be >= noise_floor_pct. Omit for the
+#                               # strict default (no point may regress beyond the
+#                               # noise floor). Accepted items that use the budget
+#                               # are called out point-by-point in the report.
+#   target_metric: output_throughput   # result-JSON key gains are computed on:
+#                               # output_throughput | total_token_throughput |
+#                               # request_throughput | mean/median/p99_{ttft,tpot,itl,e2el}_ms
+#   target_improvement_pct: 15.0   # optional early stop: the loop concludes once
+#                                  # the roadmap ledger's cumulative improvement
+#                                  # reaches this
+
+# Optional: accuracy verification the final-verification QA pass runs
+# once, at campaign end, against the live server (omit the whole block
+# to skip accuracy checks entirely).
+# accuracy:
+#   command: "trtllm-eval --model <checkpoint> ..."   # run verbatim
+#   baseline_score: 0.62        # reference score to compare against
+#   max_drop_pct: 1.0           # allowed relative drop vs baseline_score
+
+# Optional: include this section only when the servers + benchmarks must
+# run through Slurm (otherwise everything runs locally on the current
+# node). When present, both fields are required.
+# slurm-environment:
+#   slurm_partition: <partition>
+#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+
+# Optional: the one-shot analytical SOL-projection stage between the
+# baseline benchmark and round 1 (benchmarker -> projector ->
+# optimization rounds -> qa -> reporter) runs **by default**, so this
+# section only has to be written to turn it off or to hand the skill a
+# hint. The projector follows the internal-perf-sol-analysis skill
+# (trtllm-agent-toolkit) for the speed-of-light ceiling and writes
+# sol_projection.md; the Analyzer weighs it when ranking roadmap items
+# (and sanity-bounding their expected gains) and the report gains a
+# "Projection vs Measured" headroom-captured section. Every field is
+# optional: `enabled` gates the stage (default true) and `gpu` is the
+# part-name hint for the skill's peaks calculator when the automatic
+# mapping would guess wrong.
+# The skill is internal, so open-source builds of the toolkit strip it.
+# Without it the stage still completes: the projector falls back to the
+# perf-analysis skill, grounds the peaks from named sources instead of
+# the calculator, writes no peaks file, and the analyzer skips the
+# per-round measured-vs-SOL correlation. Set `enabled: false` to skip
+# the stage's wall-clock outright in an environment that has no toolkit.
+# sol:
+#   enabled: false   # skip the projector entirely
+#   gpu: H100
+
+# Optional: optimize a DISAGGREGATED deployment (context workers + generation
+# workers + router). `config` is the harness config consumed by
+# <trtllm_repo_path>/examples/disaggregated/slurm/benchmark/submit.py — the
+# workflow drives that harness instead of launching trtllm-serve itself.
+# That file owns the measurement conditions: `benchmark` fields you omit here
+# are filled from it, and any you set that disagree with it are an error.
+# Two of its conventions are easy to trip on: `concurrency` is the harness'
+# `concurrency_list` x `num_gen_servers` (what the client is actually driven
+# at), and `num_prompts` is `concurrency` x `multi_round`.
+# Profiling is nsys-only, the topology (worker counts, per-role parallel sizes)
+# is frozen for the campaign, and `extra_llm_api_options` cannot be combined
+# with this: the live tuning config is seeded from the harness config's
+# `worker_config` (its ctx / gen role configs), which is what the optimizer
+# then evolves.
+# disagg:
+#   config: /path/to/disagg/config.yaml

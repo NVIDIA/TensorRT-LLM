@@ -33,8 +33,9 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _StubExtraParamSpec:
-    def __init__(self, default: Any = None) -> None:
+    def __init__(self, default: Any = None, type: str = "str") -> None:
         self.default = default
+        self.type = type
 
 
 class _StubVisualGen:
@@ -68,7 +69,7 @@ def image_request_defaults():
 
 @pytest.fixture
 def video_request_defaults():
-    return VideoGenerationRequest(prompt="storm", response_format="b64_json")
+    return VideoGenerationRequest(prompt="storm", response_format="file")
 
 
 # =============================================================================
@@ -615,3 +616,56 @@ class TestMergeExtraParams:
         params = self._make_params()
         _merge_extra_params(params, request_extras=None, extra_param_specs={})
         assert params.extra_params is None
+
+
+# =============================================================================
+# Inline binary extra params — base64 in, bytes out
+# =============================================================================
+
+
+class TestInlineMediaDecoding:
+    """A pipeline that declares a ``bytes`` extra param must receive bytes.
+
+    JSON has no byte type, so an HTTP client can only inline binary as base64.
+    Decoding happens here rather than in the pipeline, which keeps a
+    bytes-only contract. Cosmos3 transfer's precomputed controls
+    (`depth`/`seg`/`wsm`) are unreachable over serving without it.
+    """
+
+    def _generator(self):
+        return _StubVisualGen(
+            extra_param_specs={
+                "video": _StubExtraParamSpec(type="bytes"),
+                "edge": _StubExtraParamSpec(type="bool_or_bytes_or_dict"),
+                "resolution": _StubExtraParamSpec(type="str"),
+            }
+        )
+
+    def test_base64_extra_param_reaches_the_pipeline_as_bytes(self):
+        request = VideoGenerationRequest(
+            prompt="storm",
+            extra_params={"video": base64.b64encode(b"\x00mp4").decode()},
+        )
+        params = parse_visual_gen_params(request, "id-b64", self._generator())
+        assert params.extra_params["video"] == b"\x00mp4"
+
+    def test_nested_control_reaches_the_pipeline_as_bytes(self):
+        request = VideoGenerationRequest(
+            prompt="storm",
+            extra_params={"edge": {"control": base64.b64encode(b"\x00ctrl").decode()}},
+        )
+        params = parse_visual_gen_params(request, "id-nested", self._generator())
+        assert params.extra_params["edge"]["control"] == b"\x00ctrl"
+
+    def test_non_media_params_are_untouched(self):
+        request = VideoGenerationRequest(
+            prompt="storm", extra_params={"resolution": "720", "edge": True}
+        )
+        params = parse_visual_gen_params(request, "id-plain", self._generator())
+        assert params.extra_params["resolution"] == "720"
+        assert params.extra_params["edge"] is True
+
+    def test_malformed_base64_is_a_client_error(self):
+        request = VideoGenerationRequest(prompt="storm", extra_params={"video": "not!b64!"})
+        with pytest.raises(ValueError, match="not valid base64"):
+            parse_visual_gen_params(request, "id-bad", self._generator())

@@ -302,6 +302,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "swiglu",
                     "relu2"
@@ -415,6 +420,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "none",
                     "relu2"
@@ -498,6 +508,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "none",
                     "relu2"
@@ -564,6 +579,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "none",
                     "relu2"
@@ -608,6 +628,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [
@@ -664,6 +689,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "none",
                     "relu2"
@@ -714,6 +744,11 @@
                     "none"
                 ],
                 [
+                    true,
+                    "situ",
+                    "none"
+                ],
+                [
                     false,
                     "none",
                     "relu2"
@@ -758,6 +793,11 @@
                 [
                     true,
                     "geglu",
+                    "none"
+                ],
+                [
+                    true,
+                    "situ",
                     "none"
                 ],
                 [

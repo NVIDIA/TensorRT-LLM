@@ -29,7 +29,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -46,6 +46,94 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication
+
+_CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
+_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
+# CFT combine wins at small/medium batch and ties/regresses at large batch, so it is gated by the
+# same per-call token-count threshold as dispatch.
+_CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
+_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+_CFT_ALIGNMENT_BYTES = 16
+
+
+def get_force_cft() -> bool | None:
+    value = os.environ.get(FORCE_CFT_ENV)
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    return None
+
+
+def should_use_cft(
+    can_use_cft: bool,
+    force_cft: bool | None,
+    max_batch: int | None,
+    runtime_max_tokens_per_rank: int,
+) -> bool:
+    if not can_use_cft:
+        return False
+    if force_cft is not None:
+        return force_cft
+    if max_batch is None:
+        return True
+    return runtime_max_tokens_per_rank <= max_batch
+
+
+def _use_cft_for_dispatch_payloads(use_cft: bool, payloads: list[torch.Tensor]) -> bool:
+    if not use_cft:
+        return False
+    for payload_index, payload in enumerate(payloads):
+        bytes_per_token = payload.shape[1] * payload.element_size()
+        if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: dispatch payload "
+                f"{payload_index} has {bytes_per_token} bytes per token, which is not "
+                f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_dispatch_alignment_{payload_index}_{bytes_per_token}",
+            )
+            return False
+    return True
+
+
+def _use_cft_for_combine_payload(
+    use_cft: bool, payload: torch.Tensor, use_low_precision: bool
+) -> bool:
+    if not use_cft:
+        return False
+    wire_element_size = 1 if use_low_precision else payload.element_size()
+    bytes_per_token = payload.shape[-1] * wire_element_size
+    if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: combine payload has "
+            f"{bytes_per_token} bytes per token, which is not "
+            f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based combine.",
+            key=f"moe_a2a_cft_combine_alignment_{bytes_per_token}",
+        )
+        return False
+    return True
+
+
+def _get_cft_max_batch(env_name: str, default: int) -> int:
+    env_value = os.environ.get(env_name)
+    if env_value is None:
+        return default
+    try:
+        threshold = int(env_value)
+    except ValueError as e:
+        raise ValueError(f"{env_name} must be an integer") from e
+    if threshold < 0:
+        raise ValueError(f"{env_name} must be non-negative")
+    return threshold
+
+
+def _get_cft_max_batch_for_dispatch() -> int | None:
+    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_DISPATCH_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH)
+
+
+def _get_cft_max_batch_for_combine() -> int | None:
+    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
 
 
 class NVLinkOneSided(Communication):
@@ -65,7 +153,7 @@ class NVLinkOneSided(Communication):
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
 
-    # Shared workspaces/memory across the process, keyed by payload layout.
+    # Shared workspaces/memory across the process, keyed by payload layout and CFT mode.
     _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
     _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
     _WORKSPACE: dict | None = None
@@ -85,9 +173,10 @@ class NVLinkOneSided(Communication):
         ep_size: int,
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
     ) -> int:
         return torch.ops.trtllm.moe_a2a_get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts
+            ep_size, max_num_tokens, eplb_stats_num_experts, can_use_cft_counted_writes
         )
 
     @staticmethod
@@ -99,12 +188,13 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int] = None,
         extra_payload_bytes_per_token: int = 0,
+        can_use_cft_counted_writes: bool = False,
     ) -> int:
         element_size = dtype.itemsize
 
         # Auxiliary data size
         workspace_size = NVLinkOneSided.get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts
+            ep_size, max_num_tokens, eplb_stats_num_experts, can_use_cft_counted_writes
         )
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
@@ -122,6 +212,11 @@ class NVLinkOneSided(Communication):
         # Required workspace for combine [ep_size, max_tokens] tokens
         workspace_size += ep_size * max_num_tokens * hidden_size * element_size
         workspace_size = pad_up(workspace_size, 128)
+        # CFT combine: dedicated combine RECEIVE region C (peer pushes land here;
+        # prepareCombine never touches it -> no proxy aliasing). Same size as the combine region.
+        if can_use_cft_counted_writes:
+            workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+            workspace_size = pad_up(workspace_size, 128)
         # extra payload bytes per token
         workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
         workspace_size = pad_up(workspace_size, 128)
@@ -161,6 +256,7 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
+        can_use_cft_counted_writes: bool = False,
         ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
@@ -183,6 +279,14 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
+            can_use_cft_counted_writes: If True, allow CFT handle-based counted
+                writes (fabric.try_put.counted via Logical Endpoints) for dispatch.
+                Requires sm_100+ (Blackwell or later), a build against CUDA 13.4+, an
+                NVLink fabric, and a driver exporting the CUDA logical endpoint API.
+                Defaults to False: CFT is opt-in, so the fence-based path remains the
+                default on every architecture. Callers that have verified the CFT
+                prerequisites may pass True, or set TRTLLM_MOE_A2A_FORCE_CFT=1 to force
+                CFT for supported workloads (0 forces the fence path).
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
@@ -212,6 +316,31 @@ class NVLinkOneSided(Communication):
             )
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
+        self._force_cft = get_force_cft()
+        if self._force_cft is False:
+            can_use_cft_counted_writes = False
+        self.can_use_cft_counted_writes = can_use_cft_counted_writes
+        if self._force_cft is None:
+            self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
+            self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
+        else:
+            self.cft_max_batch_for_dispatch = None
+            self.cft_max_batch_for_combine = None
+        if can_use_cft_counted_writes:
+            tllm_logger.info(
+                "NVLinkOneSided AlltoAll: CFT handle-based counted writes enabled for dispatch"
+            )
+            if self._force_cft is True:
+                tllm_logger.info("NVLinkOneSided AlltoAll: CFT forced for supported workloads")
+            elif self.cft_max_batch_for_dispatch is not None:
+                tllm_logger.info(
+                    "NVLinkOneSided AlltoAll: CFT dispatch disabled above "
+                    f"runtime_max_tokens_per_rank={self.cft_max_batch_for_dispatch}"
+                )
+        else:
+            tllm_logger.info(
+                "NVLinkOneSided AlltoAll: CFT handle-based counted writes disabled for dispatch"
+            )
 
         # Initialize constants from C++
         self._init_constants()
@@ -226,6 +355,7 @@ class NVLinkOneSided(Communication):
                 hidden_size,
                 dtype,
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
+                can_use_cft_counted_writes=self.can_use_cft_counted_writes,
             )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
@@ -261,15 +391,18 @@ class NVLinkOneSided(Communication):
             hidden_size,
             dtype,
             self.use_low_precision_combine,
+            self.can_use_cft_counted_writes,
         )
 
         workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
+        memory_cls = CftMnnvlMemory if self.can_use_cft_counted_writes else MnnvlMemory
+
         if workspace_state is None:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
+            mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             metainfo = torch.ops.trtllm.moe_a2a_initialize(
                 workspace,
@@ -277,6 +410,7 @@ class NVLinkOneSided(Communication):
                 self.ep_size,
                 self.max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
             )
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
@@ -289,9 +423,11 @@ class NVLinkOneSided(Communication):
                 "hidden_size": hidden_size,
                 "dtype": dtype,
                 "use_low_precision_combine": self.use_low_precision_combine,
+                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "cft_initialized": False,
             }
             NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         else:
@@ -306,6 +442,7 @@ class NVLinkOneSided(Communication):
                 "hidden_size": hidden_size,
                 "dtype": dtype,
                 "use_low_precision_combine": self.use_low_precision_combine,
+                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
             }
             for key, expected_value in expected_workspace_state.items():
                 assert workspace_state[key] == expected_value, (
@@ -347,6 +484,18 @@ class NVLinkOneSided(Communication):
                 poll_interval_s=alltoall_watchdog_poll_interval_s,
                 on_timeout=alltoall_watchdog_on_timeout,
             )
+
+        # Initialize CFT Logical Endpoints by binding the LE to the workspace.
+        # The LE IS the workspace — no separate allocation or payload layout needed.
+        if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
+            torch.ops.trtllm.moe_a2a_cft_initialize(
+                self.workspace,
+                self.mnnvl_mem.local_mem_handle,
+                int(self.workspace.size(1)),
+                self.ep_rank,
+                self.ep_size,
+            )
+            workspace_state["cft_initialized"] = True
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -409,6 +558,22 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    def use_cft_for_dispatch(self, runtime_max_tokens_per_rank: int) -> bool:
+        return should_use_cft(
+            self.can_use_cft_counted_writes,
+            self._force_cft,
+            self.cft_max_batch_for_dispatch,
+            runtime_max_tokens_per_rank,
+        )
+
+    def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
+        return should_use_cft(
+            self.can_use_cft_counted_writes,
+            self._force_cft,
+            self.cft_max_batch_for_combine,
+            runtime_max_tokens_per_rank,
+        )
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -445,6 +610,7 @@ class NVLinkOneSided(Communication):
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
+        can_use_cft_for_dispatch = self.use_cft_for_dispatch(runtime_max_tokens_per_rank)
 
         # Build payloads list - match TRTLLMGen baseline order for optimal performance
         # Order: [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
@@ -457,6 +623,11 @@ class NVLinkOneSided(Communication):
         payloads.append(token_selected_slots)
         if token_final_scales is not None:
             payloads.append(token_final_scales)
+        can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
+            can_use_cft_for_dispatch, payloads
+        )
+        expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
+        can_fuse_sanitize = can_use_cft_for_dispatch
 
         eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
@@ -485,6 +656,9 @@ class NVLinkOneSided(Communication):
                 self.top_k,
                 self.num_experts,
                 eplb_local_stats,
+                can_use_cft_for_dispatch,
+                expert_id_payload_index if can_fuse_sanitize else None,
+                int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 active_rank_mask,
             )
@@ -514,13 +688,14 @@ class NVLinkOneSided(Communication):
             token_selected_slots_recv = recv_buffers[1]
             token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
 
-        torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
-            token_selected_slots_recv,
-            self.workspace,
-            self.moe_a2a_metainfo,
-            self.ep_rank,
-            int(self.invalid_token_expert_id),
-        )
+        if not can_fuse_sanitize:
+            torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
+                token_selected_slots_recv,
+                self.workspace,
+                self.moe_a2a_metainfo,
+                self.ep_rank,
+                int(self.invalid_token_expert_id),
+            )
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends
         # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...]
@@ -609,6 +784,11 @@ class NVLinkOneSided(Communication):
             active_rank_mask_snapshot,
             requested_active_rank_mask,
         )
+        use_cft_for_combine = _use_cft_for_combine_payload(
+            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            final_hidden_states,
+            self.use_low_precision_combine,
+        )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -621,6 +801,7 @@ class NVLinkOneSided(Communication):
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
             bool(self.use_low_precision_combine),
+            use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
         )
@@ -649,7 +830,7 @@ class NVLinkOneSided(Communication):
         """
         Return the combine payload tensor in the workspace, which could be used
         as the output of MoE kernel to avoid extra copy.
-        See "payload_in_workspace" in combine method.
+        Passing the returned tensor to combine lets the C++ op detect workspace ownership.
 
         Args:
             runtime_max_tokens_per_rank: Runtime max tokens per rank

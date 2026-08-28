@@ -113,6 +113,15 @@ class MockBenchmarkExecutor:
         self.dist.tp_size = tp_size
         self.dist.world_size = tp_size
 
+        # State the gate's stall bound reads. 0 disables the bound, which is
+        # what these tests want twice over: they assert retry semantics, not
+        # the deadline (that is test_disagg_fill_gate_stall_bound.py's job),
+        # and they patch the whole `time` module -- so an enabled bound would
+        # do arithmetic on a Mock. `timeout_s <= 0` returns before the clock
+        # is read, so the patched module is never touched.
+        self._benchmark_fill_stall_since = None
+        self._benchmark_fill_stall_timeout_sec = 0.0
+
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     _dist_size = staticmethod(PyExecutor._dist_size)
@@ -121,6 +130,7 @@ class MockBenchmarkExecutor:
     _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
+    _fail_if_fill_gate_stalled = PyExecutor._fail_if_fill_gate_stalled
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +635,7 @@ class MockPadDummyExecutor:
         self.kv_cache_manager = Mock()
         self.kv_cache_manager.mapping.has_cp_helix.return_value = False
         self.kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        self.kv_cache_manager.is_linear_attention = False
         dummy_req = Mock()
         dummy_req.is_attention_dp_dummy = True
         self.kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
@@ -1196,9 +1207,7 @@ class TestFailFastDuringBenchmarkFill:
         assert result is not None
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
-        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
-            0, [admitted_req], False, False, is_idle=True
-        )
+        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with()
         ex._handle_errors.assert_not_called()
 
     def test_fill_with_no_init_requests_does_not_kill(self):
@@ -1231,8 +1240,7 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
         ex._prepare_disagg_gen_init.assert_called_once_with([])
-        ex._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
-        ex._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        ex._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(

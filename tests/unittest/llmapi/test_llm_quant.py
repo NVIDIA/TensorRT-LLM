@@ -274,6 +274,48 @@ def test_quant_cfg_fp8_pb_wo_alias_canonicalized():
 
 
 @pytest.mark.cpu_only
+def test_quant_cfg_fp8_pb_wo_alias_uppercase_per_layer():
+    """Uppercase ``FP8_PB_WO`` inside ``quantized_layers`` is canonicalized.
+
+    Shape taken from ``nvidia/Kimi-K3-NVFP4`` (modelopt 0.45): the top level is
+    MIXED_PRECISION and the real algos live per layer, spelled in upper case.
+    Before canonicalization reached the per-layer entries this raised
+    ``ValueError: 'FP8_PB_WO' is not a valid QuantAlgo``.
+    """
+    attn = "language_model.model.layers.0.self_attn.q_proj"
+    experts = "language_model.model.layers.1.block_sparse_moe.experts"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model_dir = Path(tmp_dir)
+        hf_quant_config_file = _write_hf_quant_config(
+            model_dir, {
+                "producer": {
+                    "name": "modelopt",
+                    "version": "0.45.0"
+                },
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "kv_cache_quant_algo": None,
+                    "quantized_layers": {
+                        attn: {
+                            "quant_algo": "FP8_PB_WO"
+                        },
+                        experts: {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16
+                        },
+                    },
+                },
+            })
+        quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
+            hf_quant_config_file, model_dir, None)
+        assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+        assert layer_quant_config[attn].quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        # Unaliased algos and their per-layer extras survive untouched.
+        assert layer_quant_config[experts].quant_algo == QuantAlgo.NVFP4
+        assert layer_quant_config[experts].group_size == 16
+
+
+@pytest.mark.cpu_only
 def test_quant_cfg_fp8_block_scales_trtllm_default_excludes():
     """TRTLLM moe_backend + FP8_BLOCK_SCALES + no excludes → defaults applied."""
     with tempfile.TemporaryDirectory() as tmp_dir:

@@ -39,7 +39,7 @@ _EXTRA_PRECISIONS = [_FP16, _BF16, _FP8]
 _EXTRA_LAYOUTS, _EXTRA_PAGES = ["HND", "NHD"], [32, 64]
 _EXTRA_CONFIG_IDS = (
     "llama3_8b_gqa",
-    "llama2_7b_qwen1_5_7b_mha",
+    "llama2_7b_decilm_7b_mha",
     "gemma3_1b_mqa_hd256",
 )
 

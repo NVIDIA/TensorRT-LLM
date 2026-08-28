@@ -20,11 +20,12 @@ for constraints.
 
 - **EP-only parallelism on BOTH sides**: `ep_size == tp_size`, no PP, no
   TP on linears. Deployed as DEP-N (`enable_attention_dp: true`).
-- **Matched ctx/gen parallelism (DEP16 = DEP16)** for now. Heterogeneous
-  ctx/gen TP with attention-DP *off* would silently corrupt memory for
-  K3's replicated KDA state and is rejected at peer registration — do
-  not deviate. Hetero DEP with attention-DP on both sides is believed
-  correct but unvalidated.
+- **Matched ctx/gen parallelism (DEP16 = DEP16)** for now: only this
+  geometry is validated end-to-end on hardware. Heterogeneous ctx/gen
+  parallelism passes peer validation and single-node loopback transfer
+  tests (with attention-DP off the KDA state is head-sharded across TP,
+  so the TP-mismatch mappers re-tile it; with attention-DP on it is
+  replicated), but no hetero geometry has been validated at scale.
 - **Ctx sizing = DEP16**: DEP16 is the smallest verified fit
   (~193 GiB weights/rank on GB300). A DEP8 ctx is estimated at
   ~273 GiB/rank for weights alone (extrapolating the 1.5 TB checkpoint:
@@ -51,6 +52,15 @@ for constraints.
   512 MiB value makes every 8k transfer fall back to the per-fragment
   tcp path (`[kv-bounce] in-place: transfer 649MiB exceeds the 512MiB
   bounce region`).
+
+## KDA state payload size
+
+Per-request recurrent-state payload (fixed, token-count independent):
+69 KDA layers x (conv `[3*96*128, 4]` bf16 + delta `[96, 128, 128]` fp32)
+= 454,459,392 bytes (~433 MiB). For synthetic-KV harnesses that size
+transfers per token: at K3's per-rank 211,968 B/token
+(69 layers x kvFactor 2 x 6 kv heads/rank x head_dim 128 x 2 B), 2144
+tokens reproduce this payload exactly.
 
 ## Launch sequence (manual, single ctx + single gen)
 
@@ -135,8 +145,8 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    keeps graphs off. Start with `gen_config_no_sa.yaml` for the first
    bring-up on a new cluster, then switch to `gen_config.yaml`.
 3. **Matched-DP only.** Keep ctx and gen at identical DEP16 with
-   attention-DP on both sides; heterogeneous parallelism with
-   attention-DP off is rejected (see constraints above).
+   attention-DP on both sides; heterogeneous parallelism passes peer
+   validation but is not validated end-to-end (see constraints above).
 4. **Cluster environment** (NVL72 nodes): on clusters where verbs
    transports cannot initialize, pin
    `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` (`UCX_TLS=all` hangs setup,

@@ -481,6 +481,14 @@ class AttentionPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
+    def should_send(self, peer_overlap, peer_rank_info) -> bool:
+        """Attention uses head-duplication routing."""
+        dup = peer_overlap.duplicate_head_factor
+        if dup <= 1:
+            return True
+        tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return (peer_rank_info.dp_rank % dup) == (tp_rank % dup)
+
     def _tp_per_dp(self, ri: RankInfo) -> int:
         if getattr(ri.attention, "enable_attention_dp", False):
             return ri.tp_size // ri.dp_size
@@ -545,10 +553,20 @@ class AttentionPolicy:
         return not (
             self._mismatch("is_mla", a.is_mla, b.is_mla)
             or self._fail_if(
-                self._ri.cp_size != 1 or peer_ri.cp_size != 1,
-                "cp_size must be 1 for both ranks",
+                self._ri.cp_size != 1 and peer_ri.cp_size != 1,
+                "cp_size must be 1 on at least one side (helix pairs a cp=1 "
+                "context instance with a cp=N generation instance)",
                 local=self._ri.cp_size,
                 peer=peer_ri.cp_size,
+            )
+            or self._fail_if(
+                (self._ri.cp_size != 1 or peer_ri.cp_size != 1)
+                and a.tokens_per_block != b.tokens_per_block,
+                "helix block-interleaved transfer requires equal "
+                "tokens_per_block on both sides (block boundaries must "
+                "coincide for [cp_rank::cp_size] ownership)",
+                local=a.tokens_per_block,
+                peer=b.tokens_per_block,
             )
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
             or self._fail_if(
@@ -597,7 +615,7 @@ class AttentionPolicy:
         peer_dup_head = max(1, factor_peer // factor_self)
         return dup_head, peer_dup_head
 
-    def build_kv_mapper(
+    def build_mapper(
         self,
         *,
         peer_ri: RankInfo,
@@ -608,6 +626,8 @@ class AttentionPolicy:
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
+        self_lg=None,
+        peer_lg=None,
     ) -> RegionMapperBase:
         """Pick the mapper for one view pair.
 

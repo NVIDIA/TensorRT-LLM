@@ -47,7 +47,6 @@ class FmhaParams:
     num_tokens: int = 0
     seq_offset: int = 0
     tokens_per_block: int = 64
-    fp8_context_fmha: bool = False
     kv_factor: int = 0
     total_num_blocks: int = 0
     # Context-only fields
@@ -83,6 +82,16 @@ class PhasedFmha(Fmha):
         if kv_cache_manager is None:
             return 0
 
+        get_page_index_upper_bound = getattr(
+            getattr(kv_cache_manager, "impl", None),
+            "get_page_index_upper_bound",
+            None,
+        )
+        if get_page_index_upper_bound is not None:
+            # KVCacheManagerV2 exposes an already-flattened page-index bound,
+            # unlike the legacy logical block count.
+            return int(kv_cache_manager.blocks_in_primary_pool)
+
         blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
         if blocks_in_primary_pool is None:
             blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
@@ -93,16 +102,6 @@ class PhasedFmha(Fmha):
         if blocks_in_primary_pool is None:
             return 0
         return int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * self.kv_factor
-
-    def get_fp8_context_fmha(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
-    ) -> bool:
-        return False
 
     def prepare_workspace(
         self,
@@ -146,7 +145,6 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
-        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
         self.prepare_workspace(
             q,
             k,
@@ -182,7 +180,6 @@ class PhasedFmha(Fmha):
             max_attention_window_size=max_attention_window_size,
             cyclic_attention_window_size=attention_window_size,
             tokens_per_block=tokens_per_block,
-            fp8_context_fmha=fp8_context_fmha,
             kv_factor=self.kv_factor,
             total_num_blocks=self._get_total_num_blocks(metadata),
             is_cross=metadata.is_cross,

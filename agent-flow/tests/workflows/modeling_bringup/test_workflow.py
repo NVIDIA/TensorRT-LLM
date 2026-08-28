@@ -438,6 +438,48 @@ def test_status_done_todo_rubric_in_coder_and_reviewer_prompts():
     )
 
 
+def test_feedback_replan_interrupt_protocol_reaches_every_role():
+    """The feedback-triggered Stage-interrupt protocol spans all five roles.
+
+    The PlanDrafter holds the override, the PlanReviewer audits it, the
+    Coder/Reviewer must tolerate (and never mutate) the resulting
+    ``INTERRUPTED`` / ``[Skipped]`` records, and QA must exclude interrupted
+    subsections from its verification scope.
+    """
+    mb_prompts = importlib.import_module("agent_flow.workflows.modeling_bringup.prompts")
+    importlib.reload(mb_prompts)
+    # The feedback-triggered interrupt protocol is Stage/Goal content, so it
+    # reaches the agents only under --replan-on-qa; the default bundle omits
+    # it by design (see test_stage_goal_blocks_absent_without_replan_on_qa).
+    bundle = mb_prompts.build_modeling_bringup_prompts(replan_on_qa=True)
+
+    # PlanDrafter: owns the interrupt override.
+    assert "## Feedback-triggered replan — Stage interrupt override" in bundle.plan_drafter, (
+        "plan_drafter prompt missing the interrupt override block"
+    )
+    assert "— INTERRUPTED (superseded by feedback iter <n>)" in bundle.plan_drafter
+    assert "[Skipped] — superseded by feedback iter <n>" in bundle.plan_drafter
+
+    # PlanReviewer: audits the interrupt shape instead of auto-REJECTing.
+    assert "### Feedback-triggered replan — interrupt audit" in bundle.plan_reviewer, (
+        "plan_reviewer prompt missing the interrupt audit rules"
+    )
+    # Interrupts outside a feedback-triggered turn stay violations.
+    assert "NOT declared feedback-triggered" in bundle.plan_reviewer
+
+    # Coder / Reviewer: the new terminal states are named and marked
+    # PlanDrafter-owned so neither agent works on or mutates them.
+    assert "[Skipped]" in bundle.coder
+    assert "INTERRUPTED" in bundle.coder
+    assert "[Skipped]" in bundle.reviewer
+    assert "— INTERRUPTED" in bundle.reviewer
+
+    # QA: interrupted subsections fall out of verification scope,
+    # including the final safety re-check.
+    assert "(INTERRUPTED iter <k>" in bundle.qa
+    assert "always out of scope" in bundle.qa
+
+
 def test_hf_reference_golden_policy_in_planner_and_coder_prompts():
     """The golden-generate cross-check guidance reaches exactly two roles.
 

@@ -45,13 +45,27 @@ using tensorrt_llm::common::fmtstr;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    // Blackwell family. Family-compatible (sm_100f) cubins load on any SM in
+    // [100, 110); arch-specific ones are locked to the SM they were built for.
+    // The batchedGemm drop ships Sm100f, Sm100a and Sm103a only, so family
+    // members other than 100/103 are served by Sm100f alone.
+    // Range kept in sync with tensorrt_llm::common::isSM100Family (cudaUtils.h),
+    // which is not constexpr and so cannot be reused here.
+    if (gpuSM >= 100 && gpuSM < 110)
     {
-        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
-    }
-    else if (gpuSM == 100)
-    {
-        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm100a;
+        if (kernelSM == SmVersion::Sm100f)
+        {
+            return true;
+        }
+        if (gpuSM == 100)
+        {
+            return kernelSM == SmVersion::Sm100a;
+        }
+        if (gpuSM == 103)
+        {
+            return kernelSM == SmVersion::Sm103a;
+        }
+        return false;
     }
     else if (gpuSM == 90)
     {

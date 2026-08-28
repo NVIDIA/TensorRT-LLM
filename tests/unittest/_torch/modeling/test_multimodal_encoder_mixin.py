@@ -19,7 +19,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
     MultimodalEncoderMixin,
 )
 from tensorrt_llm._torch.models.modeling_pixtral import PixtralVisionModel
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VisionModel
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModel
 
 
@@ -120,19 +119,6 @@ def test_pixtral_conservatively_allows_one_context_per_token():
     assert encoder.attn_metadata.kwargs["max_num_requests"] == 3
 
 
-def test_qwen2_maps_token_budget_to_full_and_window_attention_contexts():
-    encoder = SimpleNamespace(spatial_merge_unit=4)
-
-    capacities = Qwen2_5_VisionModel.get_encoder_attention_metadata_capacity(
-        encoder, max_num_tokens=100
-    )
-
-    assert capacities == {
-        "full_attention": 25,
-        "window_attention": 25,
-    }
-
-
 def test_qwen3_maps_token_budget_to_temporal_attention_contexts():
     encoder = SimpleNamespace(spatial_merge_unit=4)
 
@@ -144,9 +130,10 @@ def test_qwen3_maps_token_budget_to_temporal_attention_contexts():
 
 
 def test_subclass_can_override_setup_attn_metadata():
-    """Special encoders (e.g. RADIO with `kv_layout="NHD"`, Qwen2-VL with
-    multiple metadata objects) override `setup_attn_metadata`. Verify that
-    the override is honored and the default is not invoked."""
+    """Special encoders can override `setup_attn_metadata`.
+
+    Verify that the override is honored and the default is not invoked.
+    """
     captured = {}
 
     class _OverridingEncoder(nn.Module, MultimodalEncoderMixin):

@@ -24,7 +24,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table,
     build_page_table_from_manager,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_global_layer_ids,
     get_layer_byte_ranges,
@@ -32,7 +32,6 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_num_layer_groups,
     get_num_layers,
     get_physical_pool,
-    get_slot_address,
     get_unique_layers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
@@ -661,47 +660,76 @@ def test_v2_builder_validates_role_mapper_declaration():
 
 @pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
-    from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
+    import numpy as np
 
-    conv_pool = PhysicalPool(
-        base_address=1000,
-        slot_bytes=128,
-        num_slots=10,
-        slot_stride_bytes=512,
-        layer_stride_bytes=256,
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        LayerGroup,
+        LocalLayer,
+        MambaLayerGroup,
+        PhysicalPool,
+        PoolView,
     )
-    ssm_pool = PhysicalPool(
-        base_address=8000,
-        slot_bytes=256,
-        num_slots=8,
-        slot_stride_bytes=1024,
-        layer_stride_bytes=512,
-    )
+
+    sorted_lids = [0, 1, 2]
+    conv_slot_bytes = 128
+    ssm_slot_bytes = 256
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=10),
+        LocalLayer(local_layer_id=1, global_layer_id=11),
+        LocalLayer(local_layer_id=2, global_layer_id=12),
+    ]
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_slot_bytes,
+        ),
+    ]
     mlg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets={10: 0, 11: 1, 12: 2},
-        conv_states=conv_pool,
-        ssm_states=ssm_pool,
+        local_layers=local_layers,
+        pool_views=pool_views,
         conv_section_bytes=[512, 256, 256],
         ssm_bytes_per_head=128,
     )
 
     d = mlg.to_dict()
-    assert d["mamba_layer_offsets"] == {10: 0, 11: 1, 12: 2}
     assert d["conv_section_bytes"] == [512, 256, 256]
-
-    from tensorrt_llm._torch.disaggregation.resource.page import LayerGroup
+    assert d["kind"] == int(CacheKind.STATE)
+    assert "mamba_layer_offsets" not in d
 
     restored = LayerGroup.from_dict(d)
     assert isinstance(restored, MambaLayerGroup)
-    assert restored.mamba_layer_offsets == {10: 0, 11: 1, 12: 2}
-    assert restored.conv_states.base_address == 1000
-    assert restored.conv_states.slot_stride_bytes == 512
-    assert get_slot_address(restored.conv_states, 3) == 1000 + 3 * 512
-    assert restored.ssm_states.base_address == 8000
-    assert restored.ssm_states.slot_stride_bytes == 1024
+    assert len(restored.pool_views) == 2
+    assert restored.pool_views[0].pool_role == MAMBA_CONV_ROLE
+    assert restored.pool_views[0].bytes_per_layer == conv_slot_bytes
+    assert restored.pool_views[0].mapper_kind == MapperKind.SECTIONED
+    assert restored.pool_views[1].pool_role == MAMBA_SSM_ROLE
+    assert restored.pool_views[1].bytes_per_layer == ssm_slot_bytes
+    assert restored.pool_views[1].mapper_kind == MapperKind.INDEXED
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
+    assert [(ll.local_layer_id, ll.global_layer_id) for ll in restored.local_layers] == [
+        (0, 10),
+        (1, 11),
+        (2, 12),
+    ]
 
     legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
@@ -743,11 +771,18 @@ def test_v2_mamba_state_pool_rejects_non_affine_layer_offsets():
 
 
 def test_v2_mamba_registration_uses_coalesced_physical_pool():
+    import numpy as np
+
     from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
         KVCachePageTable,
+        LocalLayer,
         MambaLayerGroup,
         PhysicalPool,
         PhysicalPoolGroup,
+        PoolView,
     )
     from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 
@@ -761,23 +796,38 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         slot_bytes=physical_slot_bytes,
         num_slots=num_slots,
     )
+    sorted_lids = [0, 1]
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
+    ]
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, lid * state_bytes, state_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=state_bytes,
+        ),
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, (num_layers + lid) * state_bytes, state_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=state_bytes,
+        ),
+    ]
     mamba_group = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets={1: 0, 2: 1},
-        conv_states=PhysicalPool(
-            base_address=1000 + state_bytes,
-            slot_bytes=state_bytes,
-            num_slots=num_slots,
-            slot_stride_bytes=physical_slot_bytes,
-            layer_stride_bytes=2 * state_bytes,
-        ),
-        ssm_states=PhysicalPool(
-            base_address=1000,
-            slot_bytes=state_bytes,
-            num_slots=num_slots,
-            slot_stride_bytes=physical_slot_bytes,
-            layer_stride_bytes=2 * state_bytes,
-        ),
+        local_layers=local_layers,
+        pool_views=pool_views,
+        slot_major_layout=True,
     )
     page_table = KVCachePageTable(
         tokens_per_block=16,
@@ -785,37 +835,84 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         pool_groups=[PhysicalPoolGroup(pools=[physical_pool])],
     )
 
+    # V2 interleaved: one shared pool registered once
     assert get_unique_pool_memory_descs(page_table, device_id=3) == [
         (1000, physical_slot_bytes * num_slots, 3, "kv_cache_memory_pool0")
     ]
 
 
-def test_legacy_mamba_registration_uses_layer_major_pools():
+def test_legacy_mamba_registration_uses_layer_major_pools() -> None:
+    import numpy as np
+
     from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
         KVCachePageTable,
+        LocalLayer,
         MambaLayerGroup,
         PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
     )
     from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 
     num_layers = 3
-    conv_pool = PhysicalPool(base_address=1000, slot_bytes=128, num_slots=10)
-    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=256, num_slots=8)
+    num_slots = 10
+    # V1 layer-major: num_slots is per-layer, layer_stride = num_slots * slot_bytes
+    conv_pool = PhysicalPool(
+        base_address=1000,
+        slot_bytes=128,
+        num_slots=num_slots,
+        layer_stride_bytes=num_slots * 128,
+    )
+    ssm_pool = PhysicalPool(
+        base_address=8000,
+        slot_bytes=256,
+        num_slots=num_slots,
+        layer_stride_bytes=num_slots * 256,
+    )
+    sorted_lids = [0, 1, 2]
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=10),
+        LocalLayer(local_layer_id=1, global_layer_id=11),
+        LocalLayer(local_layer_id=2, global_layer_id=12),
+    ]
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_pool.slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_pool.slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_pool.slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_pool.slot_bytes,
+        ),
+    ]
     mamba_group = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets={10: 0, 11: 1, 12: 2},
-        conv_states=conv_pool,
-        ssm_states=ssm_pool,
+        local_layers=local_layers,
+        pool_views=pool_views,
     )
     page_table = KVCachePageTable(
         tokens_per_block=16,
         layer_groups=[mamba_group],
-        pool_groups=[],
+        pool_groups=[PhysicalPoolGroup(pools=[conv_pool, ssm_pool])],
     )
 
+    # Layer-major: registered size = num_layers * layer_stride
     assert get_unique_pool_memory_descs(page_table, device_id=3) == [
-        (1000, num_layers * conv_pool.num_slots * conv_pool.slot_bytes, 3, "kv_cache_memory_pool0"),
-        (8000, num_layers * ssm_pool.num_slots * ssm_pool.slot_bytes, 3, "kv_cache_memory_pool1"),
+        (1000, num_layers * conv_pool.layer_stride_bytes, 3, "kv_cache_memory_pool0"),
+        (8000, num_layers * ssm_pool.layer_stride_bytes, 3, "kv_cache_memory_pool1"),
     ]
 
 
@@ -847,11 +944,37 @@ def test_mixed_page_table_serialization():
     )
 
     # Mamba layer group
+    from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
+    mamba_sorted_lids = [0, 1]
+    mamba_local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
+    ]
+    mamba_pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, 1024) for lid in mamba_sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=1024,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, 2048) for lid in mamba_sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=2048,
+        ),
+    ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets={1: 0, 2: 1},
-        conv_states=PhysicalPool(base_address=5000, slot_bytes=1024, num_slots=4),
-        ssm_states=PhysicalPool(base_address=9000, slot_bytes=2048, num_slots=4),
+        local_layers=mamba_local_layers,
+        pool_views=mamba_pool_views,
         conv_section_bytes=[256, 128, 128],
         ssm_bytes_per_head=64,
     )
@@ -859,7 +982,10 @@ def test_mixed_page_table_serialization():
     page_table = KVCachePageTable(
         tokens_per_block=16,
         layer_groups=[attn_lg, mamba_lg],
-        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)])],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)]),
+            PhysicalPoolGroup(pools=[PhysicalPool(2000, 1024, 10), PhysicalPool(3000, 2048, 10)]),
+        ],
     )
 
     d = page_table.to_dict()
@@ -869,7 +995,12 @@ def test_mixed_page_table_serialization():
     assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
     assert isinstance(restored.layer_groups[1], MambaLayerGroup)
     assert restored.layer_groups[0].kv_head_num_per_rank == 4
-    assert restored.layer_groups[1].mamba_layer_offsets == {1: 0, 2: 1}
+    assert [
+        (ll.local_layer_id, ll.global_layer_id) for ll in restored.layer_groups[1].local_layers
+    ] == [
+        (0, 1),
+        (1, 2),
+    ]
 
     # Verify utils work correctly with mixed page table
     from tensorrt_llm._torch.disaggregation.resource.utils import (
