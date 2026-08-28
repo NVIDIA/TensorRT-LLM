@@ -214,8 +214,6 @@ def order_key_mid_f32(v_lo, v_hi):
     return order_key_signed_to_f32(m_mid), m_mid == m_lo
 
 
-
-
 def _fmin_f32_inline(a, b):
     """Single PTX ``min.f32`` → one SASS FMNMX.
 
