@@ -21,7 +21,7 @@ import os
 import weakref
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
@@ -37,6 +37,7 @@ from tensorrt_llm._torch.attention_backend.fmha import (
 from tensorrt_llm._torch.attention_backend.fmha.interface import (
     MlaBackendPolicy, _CuteDslMlaStagingKey)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -46,6 +47,11 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..pyexecutor.config_utils import is_mla
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
+from .fp4_mla import (FP4_MLA_KV_GLOBAL_SCALE, FP4_MLA_Q_GLOBAL_SCALE,
+                      HP_BLOCK_SIZE, can_fuse_fp4_mla_q_quant,
+                      configure_fp4_mla_device_page_table,
+                      populate_fp4_mla_append_metadata,
+                      scatter_fp4_mla_kv_cache)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         CustomAttentionMask, KVCacheParams, MLAParams,
@@ -414,6 +420,59 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     draft_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
 
+    # True during warmup forward passes (dummy requests, no real data).
+    is_warmup: bool = False
+
+    # High-precision BF16 KV pool for MLA FP4 models. The FP4 MLA V2 manager
+    # exposes compact paged rings.
+    high_precision_kv_pool: Optional[torch.Tensor] = None
+    _fp4_mla_hp_page_indices: Optional[torch.Tensor] = None
+    fp4_mla_v_scale_pool: Optional[torch.Tensor] = None
+    _fp4_mla_q_global_scale: Optional[torch.Tensor] = None
+    _fp4_mla_kv_global_scale: Optional[torch.Tensor] = None
+    batch_indices: Optional[torch.Tensor] = None
+    positions: Optional[torch.Tensor] = None
+    fp4_mla_generation_kv_lens: Optional[torch.Tensor] = None
+    fp4_mla_generation_append_lens: Optional[torch.Tensor] = None
+    fp4_mla_generation_lengths_num_tokens: int = field(init=False, default=-1)
+    fp4_mla_generation_lengths_num_seqs: int = field(init=False, default=-1)
+    fp4_mla_generation_lengths_num_contexts: int = field(init=False, default=-1)
+    _fp4_mla_generation_lengths_capture_recorded: bool = field(init=False,
+                                                               default=False,
+                                                               repr=False)
+    _fp4_mla_generation_cache_scattered: bool = field(init=False,
+                                                      default=False,
+                                                      repr=False)
+    _fp4_mla_device_page_table: bool = field(init=False,
+                                             default=False,
+                                             repr=False)
+    _fp4_mla_device_page_table_valid: bool = field(init=False,
+                                                   default=False,
+                                                   repr=False)
+    fp4_mla_page_table_stride: int = field(init=False, default=0, repr=False)
+    fp4_mla_context_repack_max_touched_pages: int = field(init=False,
+                                                          default=1,
+                                                          repr=False)
+    _fp4_mla_prequantized_q: Optional[torch.Tensor] = field(init=False,
+                                                            default=None,
+                                                            repr=False)
+    _fp4_mla_prequantized_q_sf: Optional[torch.Tensor] = field(init=False,
+                                                               default=None,
+                                                               repr=False)
+    _fp4_mla_q_batch_capacity: Optional[int] = field(init=False,
+                                                     default=None,
+                                                     repr=False)
+    _fp4_mla_fp8_context_state: Optional[Tuple[Any, Any]] = field(init=False,
+                                                                  default=None,
+                                                                  repr=False,
+                                                                  compare=False)
+    _paged_kv_indptr: Optional[torch.Tensor] = None
+    paged_kv_indptr_decode: Optional[torch.Tensor] = None
+    _paged_kv_indices: Optional[torch.Tensor] = None
+    num_blocks: Optional[List[int]] = None
+    num_context_blocks: int = 0
+    num_generation_blocks: int = 0
+
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
     flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None
@@ -504,6 +563,33 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Returns the number of tokens per block from the KV cache manager.
         """
         return self.kv_cache_manager.tokens_per_block if self.kv_cache_manager is not None else None
+
+    @property
+    def page_size(self) -> int:
+        """
+        Number of tokens per cache page.
+        """
+        assert self.kv_cache_manager is not None, "page_size requires a KV cache manager"
+        return self.kv_cache_manager.tokens_per_block
+
+    @property
+    def paged_kv_indices(self) -> torch.Tensor:
+        """
+        Flattened page table used by FP4 MLA helper kernels.
+        """
+        if self._paged_kv_indices is None:
+            raise RuntimeError("paged_kv_indices is not allocated.")
+        total_blocks = self.num_context_blocks + self.num_generation_blocks
+        return self._paged_kv_indices[:total_blocks]
+
+    @property
+    def paged_kv_indptr(self) -> torch.Tensor:
+        """
+        Page-table indptr used by FP4 MLA helper kernels.
+        """
+        if self._paged_kv_indptr is None:
+            raise RuntimeError("paged_kv_indptr is not allocated.")
+        return self._paged_kv_indptr[:self.num_seqs + 1]
 
     @property
     def host_kv_cache_pool_pointers(self) -> Optional[torch.Tensor]:
@@ -761,6 +847,110 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=prefer_pinned(),
                 )
 
+        # Bind the native paged high-precision BF16 KV pool for MLA FP4 models.
+        if (self.kv_cache_manager is not None
+                and self.kv_cache_manager.kv_factor == 1
+                and self.kv_cache_manager.dtype == DataType.NVFP4):
+            num_local_layers = self.kv_cache_manager.num_local_layers
+            head_dim = self.kv_cache_manager.head_dim
+            kv_factor = self.kv_cache_manager.kv_factor
+            hp_ring_size = int(self.kv_cache_manager._fp4_mla_hp_pool_size)
+            if hp_ring_size < HP_BLOCK_SIZE:
+                raise RuntimeError(
+                    "FP4 MLA high-precision ring must retain at least one "
+                    f"{HP_BLOCK_SIZE}-token quantization tile, got "
+                    f"{hp_ring_size} slots.")
+            hp_pool = self.kv_cache_manager.get_fp4_mla_hp_pool()
+            expected_tail = hp_ring_size * head_dim
+            if (not isinstance(hp_pool, torch.Tensor)
+                    or hp_pool.dtype != torch.bfloat16
+                    or hp_pool.device.type != 'cuda' or hp_pool.ndim != 4
+                    or hp_pool.shape[1] != num_local_layers
+                    or hp_pool.shape[2] != kv_factor
+                    or hp_pool.shape[3] != expected_tail):
+                raise RuntimeError(
+                    "FP4 MLA V2 HP pool must be a CUDA BF16 tensor shaped "
+                    "[pages, local_layers, kv_factor, ring * head_dim], got "
+                    f"{getattr(hp_pool, 'shape', None)}.")
+            self.high_precision_kv_pool = hp_pool
+            self.batch_indices = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="fp4_mla_batch_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.positions = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="fp4_mla_positions",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.fp4_mla_generation_kv_lens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="fp4_mla_generation_kv_lens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.fp4_mla_generation_append_lens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="fp4_mla_generation_append_lens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            page_table_capacity = (
+                self.max_num_sequences *
+                int(self.kv_cache_manager.max_blocks_per_seq))
+            self._paged_kv_indices = self.get_empty(
+                buffers,
+                (page_table_capacity, ),
+                cache_name="fp4_mla_paged_kv_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self._fp4_mla_hp_page_indices = self.get_empty(
+                buffers,
+                (page_table_capacity, ),
+                cache_name="fp4_mla_hp_page_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self._paged_kv_indptr = self.get_empty(
+                buffers,
+                (self.max_num_sequences + 1, ),
+                cache_name="fp4_mla_paged_kv_indptr",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.paged_kv_indptr_decode = self.get_empty(
+                buffers,
+                (self.max_num_sequences + 1, ),
+                cache_name="fp4_mla_paged_kv_indptr_decode",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self._fp4_mla_q_global_scale = self.get_empty(
+                buffers,
+                (1, ),
+                cache_name="fp4_mla_q_global_scale",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
+            self._fp4_mla_q_global_scale.fill_(FP4_MLA_Q_GLOBAL_SCALE)
+            self._fp4_mla_kv_global_scale = self.get_empty(
+                buffers,
+                (1, ),
+                cache_name="fp4_mla_kv_global_scale",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
+            self._fp4_mla_kv_global_scale.fill_(FP4_MLA_KV_GLOBAL_SCALE)
+            self.fp4_mla_v_scale_pool = self.kv_cache_manager.get_mla_v_scale_pool(
+            )
+
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
             self.helix_position_offsets = self.get_empty(
@@ -794,6 +984,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
+        if getattr(self, '_fp4_mla_device_page_table', False):
+            self._fp4_mla_device_page_table_valid = False
+        self._update_fp4_mla_append_metadata()
+
+    def _update_fp4_mla_append_metadata(self) -> None:
+        if self.high_precision_kv_pool is not None and self.num_tokens > 0:
+            self._invalidate_fp4_mla_generation_lengths()
+            if self._needs_fp4_mla_append_metadata():
+                self._populate_fp4_mla_batch_indices_positions()
 
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
@@ -802,6 +1001,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
+        if self.high_precision_kv_pool is None:
+            return
+
+        num_seqs = self.num_seqs
+        self.prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:num_seqs]
+        if not torch.cuda.is_current_stream_capturing():
+            self.prompt_lens_cpu_runtime = self.seq_lens_kv[:num_seqs]
+        self._update_fp4_mla_append_metadata()
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -811,6 +1018,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # The staged CuTe DSL page table and sequence lengths are derived from
         # the same per-iteration scheduler state.
         self._cute_dsl_mla_staging_key = None
+
+    def restore_from_spec_dec(self) -> None:
+        # The spec-dec draft loop pointed the FP4 MLA length aliases at the
+        # temporary _seq_lens_cuda clone made by prepare_for_spec_dec.  Rebind
+        # them to the restored stable buffers; otherwise the next forward's
+        # captured ops (CUDA graph) bake pointers to the clone, which is freed
+        # after capture, and every replay reads freed memory (garbage
+        # positions/kv lens -> corrupted KV writes and illegal memory access
+        # in the RoPE table lookup).
+        super().restore_from_spec_dec()
+        if self.high_precision_kv_pool is None:
+            return
+        num_seqs = self.num_seqs
+        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:num_seqs]
+        self.prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:num_seqs]
+        if not torch.cuda.is_current_stream_capturing():
+            self.prompt_lens_cpu_runtime = self.seq_lens_kv[:num_seqs]
 
     def update_helix_param(
         self,
@@ -921,6 +1145,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return None
 
     def prepare(self) -> None:
+        # The FP8 scratch metadata view is shared by every local FP4 MLA layer
+        # in one eager context forward and must be rebuilt for the next batch.
+        self._fp4_mla_fp8_context_state = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -1039,13 +1266,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # tokens. Use the actual KV length (without extra tokens) for
         # kv_lens_runtime, which becomes host_past_key_value_lengths and
         # eventually mMaxSeqLenKv.
+        if self.high_precision_kv_pool is not None:
+            # FP4 MLA needs the per-forward append lengths rather than the
+            # original prompt lengths. Context scratch-cache metadata and MTP
+            # generation both consume these runtime views.
+            kv_lens_runtime = kv_lens[:self.num_seqs]
+            prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:self.num_seqs]
+            prompt_lens_cpu_runtime = self.seq_lens_kv[:self.num_seqs]
+        else:
+            kv_lens_runtime = kv_lens[:self.num_seqs]
+            prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
+            prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
-            kv_lens=kv_lens[:self.num_seqs],
-            prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
-            prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
+            kv_lens=kv_lens_runtime,
+            prompt_lens_cuda=prompt_lens_cuda_runtime,
+            prompt_lens_cpu=prompt_lens_cpu_runtime,
             host_request_types=self.host_request_types[:self.num_seqs],
         )
+
+        if self.high_precision_kv_pool is not None:
+            self._invalidate_fp4_mla_generation_lengths()
+            self._configure_fp4_mla_page_metadata(kv_lens)
+            self._prepare_fp4_mla_append_metadata()
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
@@ -1096,6 +1339,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=prompt_lens,
             host_request_types=self.host_request_types[:num_seqs],
         )
+
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
@@ -1155,6 +1399,75 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._num_tokens = padded_num_tokens
         self._num_ctx_tokens = padded_num_tokens
         self.host_total_kv_lens[0] = padded_num_tokens
+
+    def _prepare_fp4_mla_append_metadata(self) -> None:
+        """Populate eager append metadata or defer it to CUDA graph replay.
+
+        CUDA graph ``_forward_step`` captures ``on_update_kv_lens`` before the
+        model forward. Let that captured update own these buffers instead of
+        launching the same metadata kernel eagerly during input preparation.
+
+        One-token generation is request-major in the fused FP4 update kernel,
+        so it derives the token position directly from the sequence length and
+        does not need these per-token buffers at capture or replay time.
+        """
+        if (self.is_cuda_graph or self.num_tokens == 0
+                or not self._needs_fp4_mla_append_metadata()):
+            return
+        self._populate_fp4_mla_batch_indices_positions()
+
+    def _needs_fp4_mla_append_metadata(self) -> bool:
+        """Return whether a forward still consumes materialized token indices."""
+        return self.num_contexts > 0
+
+    def _invalidate_fp4_mla_generation_lengths(self) -> None:
+        """Invalidate generation lengths before the next FP4 MLA forward step."""
+        self.fp4_mla_generation_lengths_num_tokens = -1
+        self.fp4_mla_generation_lengths_num_seqs = -1
+        self.fp4_mla_generation_lengths_num_contexts = -1
+        self._fp4_mla_generation_lengths_capture_recorded = False
+
+    def _configure_fp4_mla_page_metadata(self, kv_lens: torch.Tensor) -> None:
+        """Configure fixed-stride device page metadata."""
+        if self.kv_cache_manager is None or self.request_ids is None:
+            raise RuntimeError(
+                "FP4 MLA device page metadata requires a KV cache manager "
+                "and request IDs.")
+        assert self._paged_kv_indices is not None
+        assert self._paged_kv_indptr is not None
+        assert self.paged_kv_indptr_decode is not None
+        if not configure_fp4_mla_device_page_table(self, kv_lens):
+            raise RuntimeError(
+                "FP4 MLA requires fixed-stride device page metadata; the "
+                "current KV-cache manager or batch layout is unsupported.")
+
+    def _populate_fp4_mla_batch_indices_positions(self) -> None:
+        """Populate FP4 MLA scatter/HP append metadata in one CUDA launch."""
+        num_seqs = self.num_contexts + self.num_generations
+        if num_seqs == 0 or self.num_tokens == 0:
+            return
+        assert self.batch_indices is not None
+        assert self.positions is not None
+        assert self.kv_lens_cuda_runtime is not None
+        assert self.prompt_lens_cuda_runtime is not None
+
+        append_lens = self.seq_lens_kv_cuda[:num_seqs]
+        if not append_lens.is_cuda:
+            raise RuntimeError(
+                "FP4 MLA append metadata requires CUDA sequence lengths.")
+        # Use the canonical tensors rather than the *_runtime aliases. A
+        # spec-dec sub-step can replace the canonical append lengths, and CUDA
+        # graph capture requires their stable, live storage.
+        populate_fp4_mla_append_metadata(
+            append_lens,
+            self.kv_lens_cuda[:num_seqs],
+            self.batch_indices,
+            self.positions,
+            num_tokens=self.num_tokens,
+            num_sequences=num_seqs,
+            num_contexts=self.num_contexts,
+            num_context_tokens=self.num_ctx_tokens,
+        )
 
     def prepare_flash_mla(self) -> None:
         self._flash_mla_metadata_valid = False
@@ -1893,8 +2206,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
 
     def _ensure_rope_table_size(self, required_max_positions: int) -> None:
-        if required_max_positions > self.rope_params.max_positions:
-            self.rope_params.max_positions = required_max_positions
+        floats_per_position = self.rope_params.dim * (
+            2 if self.rope_params.duplicate_data else 1)
+        table_max_positions = (self.rotary_cos_sin.numel() //
+                               floats_per_position
+                               if self.rotary_cos_sin is not None
+                               and floats_per_position > 0 else 0)
+        if required_max_positions > table_max_positions:
+            self.rope_params.max_positions = max(required_max_positions,
+                                                 self.rope_params.max_positions)
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
 
@@ -2526,6 +2846,49 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
+        # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
+        # new latent to the paged cache, and fills the trtllm-gen scheduler
+        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
+        # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
+        # so we skip only the RoPE and do the append + scheduler init here: the
+        # generation FMHA only reads the cache, and the fallback path needs the
+        # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
+        if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and forward_args.attention_input_type
+                == AttentionInputType.generation_only):
+            num_ctx = metadata.num_contexts
+            n_gen = metadata.num_generations
+            # Use the GPU-resident length tensors (no host->device copy) so this
+            # stays CUDA-graph-capturable.
+            gen_q_lens = metadata.seq_lens_cuda[num_ctx:num_ctx + n_gen].to(
+                torch.int32)
+            gen_kv_lens = metadata.kv_lens_cuda_runtime[num_ctx:num_ctx +
+                                                        n_gen].to(torch.int32)
+            cu_q = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
+            cu_kv = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
+            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(
+                torch.int32) * self.num_heads
+            cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
+            forward_args.cu_q_seqlens = cu_q
+            forward_args.cu_kv_seqlens = cu_kv
+            if forward_args.fmha_scheduler_counter is None:
+                forward_args.fmha_scheduler_counter = torch.zeros(
+                    1, dtype=torch.uint32, device=q.device)
+            else:
+                forward_args.fmha_scheduler_counter.zero_()
+            assert forward_args.latent_cache is not None
+            from .utils import append_mla_latent_cache
+            append_mla_latent_cache(
+                metadata.kv_cache_manager,
+                self.get_local_layer_idx(metadata),
+                metadata.request_ids,
+                metadata.seq_lens.tolist(),
+                metadata.kv_cache_params.num_cached_tokens_per_seq,
+                forward_args.latent_cache,
+                kv_layout=metadata.kv_layout,
+                seq_start=num_ctx,
+            )
+
         if not self.fmha_libs:
             self.create_fmha_libs()
 
@@ -2770,6 +3133,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_only: bool = False,
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
+        fuse_fp4_q_quant: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2790,6 +3154,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_only (bool): Run the KV half only; the Q half already ran (q_b_layernorm folded the Q RoPE). Mutually exclusive with kv_done_elsewhere.
             kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
             quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
+            fuse_fp4_q_quant (bool): Quantize Q in the fused FP4 RoPE/cache update.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -2798,6 +3163,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Ensure RoPE cos/sin table covers the sequence length before the
         # kernel reads it.
         self._ensure_rope_table_size(metadata.max_seq_len)
+
+        if self.has_fp4_kv_cache:
+            self._fp4_mla_rope_generation(
+                fused_q,
+                q_pe,
+                latent_cache,
+                metadata,
+                fuse_q_quant=fuse_fp4_q_quant,
+            )
+            return
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -2850,3 +3225,71 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere,
             quant_scale_qkv,
         )
+
+    def _fp4_mla_rope_generation(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        *,
+        fuse_q_quant: bool = False,
+    ) -> None:
+        """Apply fused generation RoPE, Q quantization, and cache update."""
+        assert self.kv_lora_rank is not None
+        assert self.qk_rope_head_dim is not None
+
+        if q_pe.shape[-1] != self.qk_rope_head_dim:
+            raise RuntimeError(
+                f"FP4 MLA q_pe last dimension must be {self.qk_rope_head_dim}, "
+                f"got {q_pe.shape[-1]}.")
+        if latent_cache.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+            raise RuntimeError(
+                "FP4 MLA latent_cache last dimension must be "
+                f"{self.kv_lora_rank + self.qk_rope_head_dim}, got "
+                f"{latent_cache.shape[-1]}.")
+        if not fuse_q_quant:
+            raise RuntimeError(
+                "FP4 MLA generation requires fused Q quantization.")
+        if not self.can_fuse_fp4_mla_q_quant(fused_q, q_pe, latent_cache,
+                                             metadata):
+            raise RuntimeError(
+                "FP4 MLA fused Q quantization eligibility changed before "
+                "launch.")
+        if (self.rotary_cos_sin is None or q_pe.dtype != torch.bfloat16
+                or fused_q.dtype != torch.bfloat16
+                or latent_cache.dtype != torch.bfloat16
+                or self.rotary_cos_sin.dtype != torch.float32):
+            raise RuntimeError(
+                "FP4 MLA generation requires fused BF16 RoPE/cache update "
+                "with an FP32 rotary table.")
+
+        metadata._fp4_mla_generation_cache_scattered = False
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache,
+            self.layer_idx,
+            token_offset=getattr(metadata, "num_ctx_tokens", 0),
+            phase="generation",
+            local_layer=self.get_local_layer_idx(metadata),
+            v_head_dim=self.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=fused_q[..., self.kv_lora_rank:],
+            q_quant_input=fused_q,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA RoPE/cache scatter did not update the HP pool.")
+        metadata._fp4_mla_generation_cache_scattered = True
+
+    def can_fuse_fp4_mla_q_quant(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> bool:
+        return bool(
+            self.has_fp4_kv_cache
+            and can_fuse_fp4_mla_q_quant(metadata, fused_q, q_pe, latent_cache))

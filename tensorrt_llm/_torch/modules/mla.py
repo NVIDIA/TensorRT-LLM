@@ -1450,6 +1450,20 @@ class MLA(nn.Module):
                 device=q.device,
             )
 
+            fp4_mla = isinstance(self.mqa, TrtllmAttention) and self.mqa.has_fp4_kv_cache
+            if fp4_mla and (
+                self.k_b_proj_trans.dtype != torch.bfloat16
+                or latent_cache is None
+                or self.mapping.has_cp_helix()
+            ):
+                raise RuntimeError(
+                    "FP4 MLA generation requires fused BF16 Q "
+                    "quantization, RoPE, and cache update on the TRT-LLM "
+                    "backend."
+                )
+            fuse_fp4_q_quant = fp4_mla
+            fp4_rope_kwargs = {"fuse_fp4_q_quant": True} if fuse_fp4_q_quant else {}
+
             def _mla_gen_rope():
                 if self.apply_rotary_emb:
                     # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
@@ -1479,9 +1493,12 @@ class MLA(nn.Module):
                             mla_bmm1_scale,
                             mla_bmm2_scale,
                             quant_q_buffer,
+                            **fp4_rope_kwargs,
                         )
 
-            rope_stream = self.aux_stream if not has_fp8_kv_cache else None
+            rope_stream = (
+                None if fuse_fp4_q_quant else self.aux_stream if not has_fp8_kv_cache else None
+            )
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)

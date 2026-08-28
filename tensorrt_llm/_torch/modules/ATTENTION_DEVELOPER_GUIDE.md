@@ -298,8 +298,9 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `TritonCustomMaskFmha` provides Triton context attention for custom
-masks, `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+libraries. `Fp4MlaFmha` owns FP4 MLA context and no-dequant decode,
+`TritonCustomMaskFmha` provides Triton context attention for custom masks,
+`CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
 `FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
 DeepSeek-V4 and DSA,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
@@ -307,7 +308,7 @@ the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`triton_custom_mask,cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
+`fp4_mla,triton_custom_mask,cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
 use `TLLM_FMHA_LIBS=fallback` or
 `TLLM_FMHA_LIBS=-triton_custom_mask,-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
 to force the fallback
@@ -352,6 +353,7 @@ The FMHA package is split by role:
   context/generation and MHA/MLA entry points.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
+- `fmha/fp4_mla.py` implements FP4 MLA context and no-dequant decode.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
