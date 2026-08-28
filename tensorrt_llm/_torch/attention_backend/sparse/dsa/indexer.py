@@ -259,6 +259,52 @@ def transform_local_topk_and_prepare_pool_view(
     return global_indices, attn_metadata._cached_pool_view
 
 
+def transform_local_topk_and_prepare_pool_view_grouped(
+    topk_indices: torch.Tensor,
+    attn_metadata: "DSAtrtllmAttentionMetadata",
+    layer_ids: torch.Tensor,
+    page_index_scale: int,
+    is_generation: bool = False,
+) -> torch.Tensor:
+    """Grouped (cross-layer fan-out) variant of the local-topk → global-index
+    remap (``TRTLLM_DSA_GROUP_REMAP``).
+
+    Computes the global-index output for a whole full+shared indexer group in a
+    single launch. All members of a group share the same top-k selection,
+    ``req_idx`` and ``block_table`` (constant across layers within a forward);
+    only the additive ``layer_offset * tokens_per_block`` term differs per
+    member. ``layer_ids`` (int32 CUDA tensor of length ``group_size``) carries
+    each member's layer offset; ``page_index_scale`` is the (uniform) primary-
+    pool page scale for the group.
+
+    Returns a tensor of shape ``[group_size, num_tokens, topk]``; slice ``[z]``
+    is bit-identical to ``transform_local_topk_and_prepare_pool_view`` for the
+    member with offset ``layer_ids[z]``. MLA-only path.
+    """
+    assert topk_indices.dtype == torch.int32
+
+    attn_metadata._ensure_pool_view_cached()
+
+    if is_generation:
+        block_table = attn_metadata._cached_block_table_gen
+        req_idx = attn_metadata._cached_req_idx_gen
+    else:
+        block_table = attn_metadata._cached_block_table_ctx
+        req_idx = attn_metadata._cached_req_idx_ctx
+
+    global_indices = torch.ops.trtllm.convert_req_index_to_global_grouped(
+        req_idx,
+        block_table,
+        topk_indices,
+        attn_metadata._cached_tokens_per_block,
+        topk_indices.shape[1],
+        page_index_scale * attn_metadata._cached_tokens_per_block,
+        layer_ids,
+    )
+
+    return global_indices
+
+
 def split_prefill_chunks(
     seq_lens: torch.Tensor,
     max_chunk_size: int,
