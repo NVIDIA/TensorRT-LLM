@@ -587,66 +587,6 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
 }
 
-// Infra-scoped fail-fast (build-branch layer). Runs `jobs` under `parallel` so
-// a build branch whose failure is a positive K8s infra abort
-// (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its
-// siblings keep running instead of being SIGTERMed by failFast. A genuine
-// build failure (compile error, unclassified exception) is rethrown unchanged,
-// so failFast stays fully active for real failures; an interrupt (e.g. a
-// sibling's own fail-fast SIGTERM) is also rethrown and never swallowed. After
-// the join, a build job that saw ONLY infra aborts and no real failure
-// resolves to UNSTABLE (artifact missing for infra reasons, not a failure) so
-// the parent layer (L0_MergeRequest.launchJob) can skip this arch's test
-// consumers while sparing the healthy sibling architecture; a mixed job
-// already threw on its real failure and is FAILURE.
-//
-// Minimal copy of runBranchesWithInfraDefer in L0_Test.groovy: that definition
-// lives in the L0_Test pipeline script's own scope (not the shared lib), so it
-// is not visible here. Scope: classify() is scope-filtered, so this passes
-// K8S -- build pods only run on K8s builders today. Threading a SLURM scope
-// through is a follow-up, mirroring the L0_Test.groovy note. Gated on
-// ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior exactly (plain
-// failFast + parallel, no wrapping, no UNSTABLE).
-//
-// TODO(TRTLLMINF-324): de-duplicate this with the identical copy in
-// jenkins/L0_Test.groovy; see the ticket for the planned shared home.
-def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
-    if (!ENABLE_INFRA_SCOPED_FAILFAST) {
-        jobs.failFast = failFast
-        parallel jobs
-        return
-    }
-    // CPS serializes parallel-branch continuations onto a single VM thread, so a
-    // plain list append from the catch blocks below is safe -- there is no
-    // JVM-level concurrency to guard against here.
-    def deferred = []
-    def wrapped = jobs.collectEntries { stageName, body ->
-        [(stageName), {
-            try {
-                body()
-            } catch (InterruptedException e) {
-                throw e
-            } catch (Exception e) {
-                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)) {
-                    deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: K8s infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
-                    return
-                }
-                throw e
-            }
-        }]
-    }
-    wrapped.failFast = failFast
-    parallel wrapped
-    if (deferred) {
-        echo "[INFRA-DEFER] ${deferred.size()} build stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(artifact missing for infra reasons, no genuine build failure)."
-        currentBuild.result = 'UNSTABLE'
-    }
-}
-
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
@@ -730,10 +670,17 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     }
 
     stage("Build") {
-        // failFast is threaded through runBranchesWithInfraDefer (it sets the
-        // map key itself) so the flag-off path stays identical to the old
-        // `parallelJobs.failFast = enableFailFast; parallel parallelJobs`.
-        runBranchesWithInfraDefer(parallelJobs, enableFailFast)
+        // Infra-scoped fail-fast: a build branch that dies on a positive K8s infra
+        // abort is deferred (its siblings keep running) and the job resolves
+        // UNSTABLE instead of FAILURE, so L0_MergeRequest.launchJob can skip this
+        // arch's tests without cancelling the healthy sibling arch. The shared
+        // helper owns the parallel/failFast/UNSTABLE orchestration; the closure
+        // supplies the scope policy (build pods are K8s-only today). Gated on
+        // ENABLE_INFRA_SCOPED_FAILFAST; off = plain failFast + parallel, as before.
+        trtllm_utils.runBranchesWithInfraDefer(pipeline, parallelJobs, enableFailFast,
+                ENABLE_INFRA_SCOPED_FAILFAST) { e, stageName ->
+            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)
+        }
     } // Build stage
 }
 

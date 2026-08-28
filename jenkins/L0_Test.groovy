@@ -6015,85 +6015,21 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
     return configs
 }
 
-// Infra-scoped fail-fast (inner/branch layer). Runs `jobs` under `parallel` so a
-// branch whose post-retry failure is a positive infra abort
-// (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its siblings
-// keep running instead of being SIGTERMed by failFast. A genuine test/build
-// failure (or an unclassified one) is rethrown unchanged, so failFast stays fully
-// active for real failures; an interrupt (e.g. a sibling's own fail-fast SIGTERM)
-// is also rethrown and never swallowed. After the join, a sub-job that saw ONLY
-// infra aborts and no real failure resolves to UNSTABLE (coverage incomplete, not
-// a failure) so the parent layer (L0_MergeRequest.launchJob) can spare the healthy
-// sibling architecture; a mixed sub-job already threw on its real failure and is
-// FAILURE (currentBuild.result worst-of semantics won't downgrade it).
-//
-// Scope: classify() is scope-filtered, so each branch is classified under its real
-// execution scope, passed per-stage in `stageScopes` (built in launchTestJobs from
-// opts.slurmDispatcher). Every branch is checked under K8S -- this is where the
-// motivating pod-scheduling abort (KubernetesClientTimeoutException) matches, and
-// keeps K8s-pod aborts of a SLURM dispatcher pod deferrable exactly as before.
-// SLURM dispatcher stages are ADDITIONALLY checked under SLURM so a SLURM-scoped
-// abort (SSH outage to the head node, slurm_track ssh exit 255, monitor loss while
-// the job is still active) defers too instead of cascading via failFast. The inner
-// SLURM retry (runLLMTestlistOnSlurm) has already been exhausted by the time the
-// branch body returns here, so this stays post-retry, mirroring the K8s path.
-// Stages absent from stageScopes default to K8S-only (phase-1 behavior). Gated on
-// ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior exactly (plain
-// failFast + parallel, no wrapping, no UNSTABLE).
-def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:]) {
-    if (!ENABLE_INFRA_SCOPED_FAILFAST) {
-        jobs.failFast = failFast
-        parallel jobs
-        return
-    }
-    // CPS serializes parallel-branch continuations onto a single VM thread, so a
-    // plain list append from the catch blocks below is safe -- there is no
-    // JVM-level concurrency to guard against here.
-    def deferred = []
-    def wrapped = jobs.collectEntries { stageName, body ->
-        // A SLURM dispatcher stage can abort under either scope: its dispatcher pod
-        // is a K8s pod (K8S-scoped aborts) that in turn drives the SLURM job
-        // (SLURM-scoped aborts). Check K8S for every stage and SLURM in addition
-        // for SLURM stages, so neither class of infra abort cascades.
+// Deferrable-infra predicate for trtllm_utils.runBranchesWithInfraDefer. Every
+// branch is checked under K8S -- where the motivating pod-scheduling abort
+// (KubernetesClientTimeoutException) matches, and which also covers K8s-pod
+// aborts of a SLURM dispatcher pod. A SLURM dispatcher stage (per stageScopes,
+// built from opts.slurmDispatcher) is ADDITIONALLY checked under SLURM so a
+// SLURM-scoped abort (SSH outage to the head node, slurm_track ssh exit 255,
+// monitor loss while the job is still active) defers too instead of cascading
+// via failFast. The inner SLURM retry (runLLMTestlistOnSlurm) is already
+// exhausted by the time the branch body returns, so this stays post-retry,
+// mirroring the K8s path. Stages absent from stageScopes are K8S-only.
+def infraDeferPredicate(Map stageScopes) {
+    return { e, stageName ->
         boolean slurmScoped = (stageScopes[stageName] == InfraFailure.SLURM)
-        [(stageName), {
-            try {
-                body()
-            } catch (InterruptedException e) {
-                throw e
-            } catch (Exception e) {
-                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S) ||
-                        (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
-                    def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
-                    deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
-                    return
-                }
-                throw e
-            }
-        }]
-    }
-    wrapped.failFast = failFast
-    parallel wrapped
-    if (deferred) {
-        echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
-        // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
-        // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
-        // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
-        // burned against still-down infra. (A prospective short-circuit that cancels
-        // healthy siblings the moment a quorum aborts is deliberately NOT done here:
-        // it would reintroduce the cross-branch SIGTERM cascade this seam removes.
-        // Tracked as a follow-up.) NB: compare against jobs.size(), not
-        // wrapped.size() -- `wrapped.failFast = failFast` above adds a `failFast`
-        // key that `parallel` consumes, inflating wrapped's entry count by one.
-        if (deferred.size() == jobs.size()) {
-            echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
-                 "suspected cluster-wide / shared-frontend outage rather than isolated blips."
-        }
-        currentBuild.result = 'UNSTABLE'
+        FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S) ||
+            (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))
     }
 }
 
@@ -7268,7 +7204,8 @@ pipeline {
                                 echo "Skip multi-GPU testing. No test to run."
                             }
                             if (singleGpuJobs.size() > 0) {
-                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
+                                trtllm_utils.runBranchesWithInfraDefer(this, singleGpuJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(stageInfraScope))
                             } else if (isInfraDryRun()) {
                                 error "Skip single-GPU testing. No test to run for infrastructure dry run."
                             } else {
@@ -7277,20 +7214,23 @@ pipeline {
                         } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                             echo "Only run multi-GPU tests."
                             if (dgxJobs.size() > 0) {
-                                runBranchesWithInfraDefer(dgxJobs, params.enableFailFast, stageInfraScope)
+                                trtllm_utils.runBranchesWithInfraDefer(this, dgxJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(stageInfraScope))
                             } else {
                                 error "Skip multi-GPU testing. No test to run."
                             }
                         } else {
                             if (singleGpuJobs.size() > 0) {
-                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
+                                trtllm_utils.runBranchesWithInfraDefer(this, singleGpuJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(stageInfraScope))
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
 
                             if (dgxJobs.size() > 0) {
                                 stage(testPhase2StageName) {
-                                    runBranchesWithInfraDefer(dgxJobs, params.enableFailFast, stageInfraScope)
+                                    trtllm_utils.runBranchesWithInfraDefer(this, dgxJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(stageInfraScope))
                                 }
                             }
                         }
