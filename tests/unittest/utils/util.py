@@ -114,6 +114,9 @@ skip_blackwell = pytest.mark.skipif(
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
+skip_rubin = pytest.mark.skipif(
+    isSM100Family() and getSMVersion() != 100 and getSMVersion() != 103,
+    reason="This test is not supported on non-Blackwell 100f architectures")
 
 # If used together with @parameterized, we have to use unittest.skipIf instead of pytest.mark.skipif
 skip_pre_ada_unittest = unittest.skipIf(

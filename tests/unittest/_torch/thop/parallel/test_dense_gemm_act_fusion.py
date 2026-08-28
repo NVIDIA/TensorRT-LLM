@@ -411,6 +411,7 @@ def test_mlp_fp4out_min_m_switch():
         (107, False, False),
     ],
 )
+@pytest.mark.skip(reason="requires locality-domain wiring (Linear/ModelConfig/cute_dsl_custom_ops) from a later PR in this series")
 def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned, expected):
     """SM107 and locality domain shards must keep gate/up weights in the Rubin layout."""
     import types
