@@ -25,12 +25,6 @@ from tensorrt_llm.llmapi.mpi_session import (MpiPoolSession,
 from tensorrt_llm.llmapi.utils import print_colored
 
 
-def get_flashinfer_workspace() -> tuple[str | None, str | None]:
-    """Return the FlashInfer workspace and cubin cache configured for this rank."""
-    return (os.environ.get("FLASHINFER_WORKSPACE_BASE"),
-            os.environ.get("FLASHINFER_CUBIN_DIR"))
-
-
 @click.command()
 @click.option("--task_type",
               type=click.Choice([
@@ -56,9 +50,10 @@ def main(
             res = client.submit_sync(print_colored, f"{task}\n", "green")
             print(res)
         elif task_type == "flashinfer_workspace":
-            worker_envs = client.submit_sync(get_flashinfer_workspace)
-            workspaces = {workspace for workspace, _ in worker_envs}
-            cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
+            workspaces = set(
+                client.submit_sync(os.getenv, "FLASHINFER_WORKSPACE_BASE"))
+            cubin_dirs = set(
+                client.submit_sync(os.getenv, "FLASHINFER_CUBIN_DIR"))
             assert None not in workspaces
             assert len(workspaces) == 2
             workspace_root = (Path.home() / ".cache" / "tensorrt_llm" /
@@ -72,14 +67,11 @@ def main(
 
             nested_session = MpiPoolSession(n_workers=2)
             try:
-                nested_worker_envs = nested_session.submit_sync(
-                    get_flashinfer_workspace)
+                nested_workspaces = set(
+                    nested_session.submit_sync(os.getenv,
+                                               "FLASHINFER_WORKSPACE_BASE"))
             finally:
                 nested_session.shutdown()
-            nested_workspaces = {
-                workspace
-                for workspace, _ in nested_worker_envs
-            }
             assert None not in nested_workspaces
             assert len(nested_workspaces) == 2
             assert all(
