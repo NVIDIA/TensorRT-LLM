@@ -219,7 +219,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ),
             )
             await self._ctx_client.send_request(warm_req, server=ctx_server)
-            logger.debug(f"Warmed ctx {ctx_server} from gen {gen_server}: "
+            logger.info(f"Warmed ctx {ctx_server} from gen {gen_server}: "
                          f"{len(full_token_ids)} of "
                          f"{len(prompt_token_ids)}+{len(gen_token_ids)} tokens "
                          f"(block={block_size})")
