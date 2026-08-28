@@ -81,12 +81,12 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
     constexpr CUmemAllocationHandleType kHandleTypePreference[]
         = {CU_MEM_HANDLE_TYPE_FABRIC, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, CU_MEM_HANDLE_TYPE_NONE};
     bool supported = false;
-    for (auto handleType : kHandleTypePreference)
+    for (auto const handleType : kHandleTypePreference)
     {
-        for (unsigned char rdmaCapable : {1, 0})
+        for (bool const rdmaCapable : {true, false})
         {
             mProp.requestedHandleTypes = handleType;
-            mProp.allocFlags.gpuDirectRDMACapable = rdmaCapable;
+            mProp.allocFlags.gpuDirectRDMACapable = rdmaCapable ? 1 : 0;
             if (isPropSupported(mProp))
             {
                 supported = true;
