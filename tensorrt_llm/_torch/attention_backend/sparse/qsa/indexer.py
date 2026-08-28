@@ -11,10 +11,12 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
 from .params import QSASparseParams
@@ -186,9 +188,18 @@ class QSAIndexer(nn.Module):
                 is_neox=pos.is_neox,
             )
         self._pending_speculative_cache = None
+        use_cute_dsl_prefill_topk = (
+            os.environ.get("TRTLLM_QSA_CUTE_DSL_PREFILL_TOPK", "1") != "0"
+            and IS_CUTLASS_DSL_AVAILABLE
+            and is_sm_100f()
+        )
         self.top_k = TopK(
             params.block_topk,
-            prefill_implementation=TopKImplementation.CUDA_RADIX,
+            prefill_implementation=(
+                TopKImplementation.CUTE_DSL_RADIX
+                if use_cute_dsl_prefill_topk
+                else TopKImplementation.CUDA_RADIX
+            ),
             decode_implementation=TopKImplementation.CUDA_RADIX,
             compress_ratio=params.compress_ratio,
         )
