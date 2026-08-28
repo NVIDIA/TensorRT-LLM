@@ -143,13 +143,11 @@ def test_select_non_mla_fmha_combines_supported_phases() -> None:
     attn = _TestAttention()
     context_fmha = _TestPhasedFmha(attn, {FmhaPhase.CONTEXT}, "context", events)
     generation_fmha = _TestPhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
-    backend = SimpleNamespace(
-        fmha_libs=[context_fmha, generation_fmha],
-        phased_fmha_libs=[context_fmha, generation_fmha],
-    )
+    attn.fmha_libs = [context_fmha, generation_fmha]
+    attn.phased_fmha_libs = [context_fmha, generation_fmha]
 
     selected = TrtllmAttention._select_non_mla_fmha(
-        backend,
+        attn,
         torch.empty((2, 4)),
         None,
         None,
@@ -401,6 +399,9 @@ def test_flashinfer_context_fallback_scope(
 def _make_selection_backend() -> TrtllmAttention:
     backend = object.__new__(TrtllmAttention)
     backend.is_mla_enable = False
+    backend.kv_lora_rank = None
+    backend.head_dim = 4
+    backend.v_head_dim = None
     backend.fmha_libs = []
     backend.phased_fmha_libs = []
     backend.non_phased_fmha_libs = []
