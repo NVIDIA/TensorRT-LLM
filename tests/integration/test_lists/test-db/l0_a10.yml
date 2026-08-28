@@ -54,7 +54,21 @@ l0_a10:
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_mamba_transfer.py
-  - unittest/tools
+  # unittest/tools is listed per file rather than as a directory. The directory
+  # form swept test_layer_wise_benchmarks.py onto A10, whose DeepSeek FP4 cases
+  # pin SM100+ checkpoints -- that is https://nvbugs/6337228.
+  #
+  # Only files with at least one non-cpu_only test belong here: this stage runs
+  # unittests with `-m not cpu_only`, and one pytest invocation is made per
+  # entry, so a file whose tests are all cpu_only collects nothing and errors.
+  # The fully-cpu_only ones (test_config_database_sync, test_periodic_junit,
+  # test_prepare_dataset, test_test_to_stage_mapping) are covered by
+  # l0_cpu.yml, which lists unittest/tools as a directory.
+  - unittest/tools/test_host_profiler.py
+  - unittest/tools/test_infra_dry_run_pipeline.py
+  - unittest/tools/test_infra_dry_run_pytest.py
+  - unittest/tools/test_perf_sanity_matching.py
+  - unittest/tools/test_unittest_culprits.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
