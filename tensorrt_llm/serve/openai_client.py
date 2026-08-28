@@ -48,6 +48,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    ResponsesRequest,
+    ResponsesResponse,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -110,6 +112,10 @@ class OpenAIClient(ABC):
                 server,
                 hooks,
                 req_id,
+            )
+        elif isinstance(request, ResponsesRequest):
+            return await self._send_request(
+                "v1/responses", request, ResponsesResponse, server, hooks, req_id
             )
         else:
             raise ValueError(f"Invalid request type: {type(request)}")
