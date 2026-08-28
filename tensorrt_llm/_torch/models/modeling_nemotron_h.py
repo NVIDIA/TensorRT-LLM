@@ -29,10 +29,10 @@ from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.utils import ActivationType, relu2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
 from ..attention_backend import AttentionMetadata
@@ -912,7 +912,18 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
-            assert ckpt_nextn > 0, "There are not MTP modules in the checkpoint."
+            has_mtp_head_replacement = (
+                model_config.spec_config.uses_replacement_heads)
+            assert ckpt_nextn > 0 or has_mtp_head_replacement, (
+                "There are not MTP modules in the checkpoint. "
+                "Set speculative_config.speculative_model to a separate MTP "
+                "head replacement checkpoint, or use a target checkpoint that "
+                "embeds MTP.")
+            if ckpt_nextn == 0 and has_mtp_head_replacement:
+                # Neither checkpoint declares a head count: fall back to a
+                # single shared head, matching MTPForCausalLM's MTP-Eagle
+                # default.
+                ckpt_nextn = model_nextn = 1
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -976,6 +987,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                      weights: dict,
                      weight_mapper: BaseWeightMapper,
                      allow_partial_loading: bool = False):
+        from tensorrt_llm._torch.speculative.utils import (
+            filter_mtp_checkpoint_weights, uses_mtp_head_checkpoint)
+
+        if uses_mtp_head_checkpoint(self.model_config.spec_config):
+            # Filter before preprocess: mapper remaps mtp.layers.* ->
+            # model.layers.{N}.* and would otherwise load embedded MTP heads.
+            weights = filter_mtp_checkpoint_weights(weights)
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights,
                              weight_mapper=weight_mapper,

@@ -437,16 +437,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 1,
         },
     },
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "intermediate_size": 256,
-            "hidden_size": 64,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "num_local_experts": 2,
-        },
-    },
     "Qwen/Qwen3-30B-A3B": {
         "model_kwargs": {
             "num_hidden_layers": 2,
@@ -455,15 +445,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "num_experts": 16,
-        },
-    },
-    "microsoft/Phi-3-mini-4k-instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 128,
-            "intermediate_size": 256,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
         },
     },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
@@ -501,15 +482,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
             "num_experts_per_tok": 2,
             "q_lora_rank": 128,
-        },
-    },
-    "Qwen/Qwen2.5-3B-Instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
         },
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {

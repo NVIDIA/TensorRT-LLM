@@ -36,7 +36,10 @@ from tensorrt_llm._torch.disaggregation.native.bounce import core as bcore
 try:
     from tensorrt_llm._torch.disaggregation.native.bounce import buffer as bbuf
     from tensorrt_llm._torch.disaggregation.native.bounce import impl as btr
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+        MambaPolicy,
+        mamba_receiver_payload_bytes,
+    )
 
     _HAVE_TRANSPORT = True
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
@@ -221,48 +224,65 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
-# fan-in safety gate — equal total//num_writers split only for uniform TP-by-head
+# fan-in safety gate — equal total//num_writers split only for uniform writers
 # --------------------------------------------------------------------------- #
-def test_fanin_bounce_safe_gate():
+def test_fanin_bounce_safe_gate() -> None:
     """Restrict multi-writer equal-split bounce to uniform TP-by-head.
 
-    PP (overlap_pp_size>1 -> unequal per-writer sizes) and duplicate_head_factor>1
-    (MLA / duplicate TP heads -> some ranks don't send KV yet count in
-    expected_transfers) must fall back to the per-fragment path.
+    Uneven PP splits and duplicate_head_factor>1 (MLA / duplicate TP heads ->
+    some ranks don't send KV yet count in expected_transfers) must fall back to
+    the per-fragment path.
     """
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup, pp, ranks=(0,)):
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
         return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
 
-    def ri(lpp, page_table=None):
+    def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
 
-    def pt(mapper_kind):
+    def pt(mapper_kind: MapperKind) -> SimpleNamespace:
         view = SimpleNamespace(mapper_kind=mapper_kind)
         return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=[view])])
 
     # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
-    assert safe(ov(1, 1), ri([24])) is True
-    assert safe(ov(1, 0), ri([24])) is True
-    assert safe(ov(2, 1), ri([24])) is False  # duplicate heads / MLA -> some don't send
+    assert safe(ov(1, 1), ri([24]), None) is True
+    assert safe(ov(1, 0), ri([24]), None) is True
+    assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
-    assert safe(ov(1, 4), ri([20, 20, 20, 20])) is True
+    assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
-    assert safe(ov(1, 4), ri([20, 20, 20, 19])) is False
+    assert safe(ov(1, 4), ri([20, 20, 20, 19]), None) is False
     # incomplete per-stage info (single element for a multi-stage fan-in) -> conservative fall back
-    assert safe(ov(1, 4), ri([20])) is False
+    assert safe(ov(1, 4), ri([20]), None) is False
     # duplicate heads blocks even an otherwise-even PP split
-    assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+    assert safe(ov(2, 4), ri([20, 20, 20, 20]), None) is False
     # replicated views (one elected sender per destination) make multi-writer
     # contributions unequal -> fall back; single-writer overlap stays safe,
-    # and sharded-only view schemes are unaffected
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is False
-    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED))) is True
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
+    # and sharded-only view schemes are unaffected. Both page tables must be
+    # checked because the representative peer rank may be a fully masked PP
+    # stage while another sender stage owns the replicated rows.
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED)), None) is False
+    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED)), None) is True
+    assert (
+        safe(
+            ov(1, 1, ranks=(0, 1)),
+            ri([24], pt(MapperKind.NHD)),
+            pt(MapperKind.REPLICATED),
+        )
+        is False
+    )
+    assert (
+        safe(
+            ov(1, 1, ranks=(0, 1)),
+            ri([24], pt(MapperKind.NHD)),
+            pt(MapperKind.NHD),
+        )
+        is True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +389,33 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
+    def test_block_bytes_include_distinct_physical_pools_once(self) -> None:
+        entries = np.array([], dtype=BUFFER_ENTRY_DTYPE)
+        page_table = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[
+                AttentionLayerGroup(
+                    pool_group_idx=0,
+                    local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                    pool_views=[
+                        PoolView(pool_idx=0, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                    ],
+                )
+            ],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(base_address=0x200000, slot_bytes=100, num_slots=8),
+                        PhysicalPool(base_address=0x300000, slot_bytes=25, num_slots=8),
+                    ]
+                )
+            ],
+        )
+
+        assert btr.block_bytes_per_group(page_table) == [125]
+
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200
@@ -449,6 +496,24 @@ class TestFanInReserve:
     def test_reserve_oversize_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
         assert t.reserve(_recv_req([2]), num_writers=1) is False  # total 2000 > cap 500
+
+    def test_reserve_state_group_fanin_falls_back(self, monkeypatch):
+        # STATE groups (None bytes) with num_writers > 1 must disable bounce even
+        # when extra_bytes == 0: the representative sender may have no mamba
+        # overlap, but another PP sender might still append state fragments that
+        # were not reserved in the bounce region.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
+        # Two groups: PAGED (2 blocks x 100B) + STATE (1 slot ID, None bytes).
+        req = _recv_req([2, 1])
+        assert t.reserve(req, num_writers=2, extra_bytes=0) is False
+        assert req.bounce_dst_base is None
+
+    def test_reserve_state_group_single_writer_ok(self, monkeypatch):
+        # Single writer with STATE group is fine — no fan-in split concern.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
+        req = _recv_req([2, 1])
+        assert t.reserve(req, num_writers=1, extra_bytes=50) is True
+        assert req.bounce_dst_base is not None
 
     def test_fanin_scatters_ordered_by_src_base(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
@@ -641,6 +706,12 @@ def _k3_page_table() -> KVCachePageTable:
     (kv_extractor.py, both ``build_page_table`` and ``_build_page_table_v2``,
     append it after every attention group).
     """
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        MapperKind,
+    )
+
     attn = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=1,
@@ -648,24 +719,56 @@ def _k3_page_table() -> KVCachePageTable:
         local_layers=[LocalLayer(i, i) for i in range(24)],
         pool_views=[PoolView(pool_idx=0, buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE))],
     )
+    sorted_lids = list(range(_K3_KDA_LAYERS))
+    local_layers = [
+        LocalLayer(local_layer_id=i, global_layer_id=gl)
+        for i, gl in enumerate(range(24, 24 + _K3_KDA_LAYERS))
+    ]
+    conv_pool = PhysicalPool(0x200000, _K3_CONV_SLOT_BYTES, 8)
+    ssm_pool = PhysicalPool(0x300000, _K3_SSM_SLOT_BYTES, 8)
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, _K3_CONV_SLOT_BYTES) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=_K3_CONV_SLOT_BYTES,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, _K3_SSM_SLOT_BYTES) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=_K3_SSM_SLOT_BYTES,
+        ),
+    ]
     mamba = MambaLayerGroup(
-        pool_group_idx=1,  # dangling by construction: mamba pools live on the LG itself
-        mamba_layer_offsets={gl: i for i, gl in enumerate(range(24, 24 + _K3_KDA_LAYERS))},
-        conv_states=PhysicalPool(0x200000, _K3_CONV_SLOT_BYTES, 8),
-        ssm_states=PhysicalPool(0x300000, _K3_SSM_SLOT_BYTES, 8),
+        pool_group_idx=1,
+        local_layers=local_layers,
+        pool_views=pool_views,
         conv_section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,
         ssm_bytes_per_head=_K3_SSM_SLOT_BYTES // 4,
     )
     return KVCachePageTable(
         tokens_per_block=32,
         layer_groups=[attn, mamba],
-        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(0x100000, _K3_MLA_BLOCK_BYTES, 128)])],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(0x100000, _K3_MLA_BLOCK_BYTES, 128)]),
+            PhysicalPoolGroup(pools=[conv_pool, ssm_pool]),
+        ],
     )
 
 
-def _k3_rank_info():
-    # MambaPolicy only reads tp_size / tp_rank / attention.enable_attention_dp.
-    return SimpleNamespace(tp_size=1, tp_rank=0, attention=None)
+def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
+    # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
+    # attention.enable_attention_dp.
+    return SimpleNamespace(
+        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=None
+    )
 
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
@@ -691,11 +794,11 @@ class TestHybridK3Bounce:
         # the region covers the MLA KV blocks plus the appended KDA state
         assert t._recv_alloc.reserved_sizes == [67 * _K3_MLA_BLOCK_BYTES + _K3_KDA_PAYLOAD_BYTES]
 
-    def test_reserve_nonempty_group_with_unknown_size_still_falls_back(self, monkeypatch):
-        # Safety direction of the gate is preserved: a group that HAS blocks but no known slot
-        # size (None placeholder) still disables bounce for the request.
+    def test_reserve_nonempty_slot_group_with_unknown_size_skipped(self, monkeypatch):
+        # Non-attention groups (STATE-based) carry a slot index but their bytes
+        # are in extra_bytes — bounce skips them rather than rejecting.
         t = _make_transport(monkeypatch, block_bytes_per_group=[_K3_MLA_BLOCK_BYTES, None])
-        assert t.reserve(_recv_req([2, 1]), num_writers=1) is False
+        assert t.reserve(_recv_req([2, 1]), num_writers=1) is True
 
     def test_reserve_extra_bytes_counts_toward_min_bytes(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
@@ -709,49 +812,81 @@ class TestHybridK3Bounce:
         assert t.reserve(_recv_req([2]), num_writers=1, extra_bytes=400) is False  # 600 > 500
 
     def test_reserve_extra_bytes_fanin_falls_back(self, monkeypatch):
-        # Fan-in splits the region equally by writer; per-writer recurrent-state fragments can
-        # differ (PP stages hold different mamba layers), so state + fan-in falls back.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        assert t.reserve(_recv_req([2, 0]), num_writers=2, extra_bytes=64) is False
-        assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state -> fan-in fine
+        # Fan-in with a STATE group present falls back: per-writer recurrent-state
+        # fragments can differ (PP stages hold different mamba layers).
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
+        assert t.reserve(_recv_req([2, 1]), num_writers=2, extra_bytes=64) is False
+        assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state blocks -> fan-in fine
 
-    def test_mamba_payload_bytes_matches_k3_geometry(self):
-        # Matched-TP replicated KDA state: payload_bytes must reproduce the per-request
-        # per-rank number derived from K3's KDA geometry (constants above) exactly.
+    def test_receiver_payload_bytes_matches_k3_geometry(self):
         pt = _k3_page_table()
-        ri = _k3_rank_info()
-        got = MambaPolicy.payload_bytes(
-            sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
-        )
+        got = mamba_receiver_payload_bytes(pt, pt, dst_slot=3)
         assert got == _K3_KDA_PAYLOAD_BYTES
 
-    def test_mamba_payload_bytes_matches_collect_frags(self):
-        # payload_bytes mirrors the sender's collect_frags call: same sizes, slot-independent.
+    def test_receiver_payload_bytes_slot_independent(self):
         pt = _k3_page_table()
-        ri = _k3_rank_info()
-        _, _, sizes = MambaPolicy.collect_frags(
-            self_page_table=pt, peer_page_table=pt, src_slot=5, dst_slot=3, self_ri=ri, peer_ri=ri
-        )
-        got = MambaPolicy.payload_bytes(
-            sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
-        )
-        assert got == sum(sizes) > 0
+        got_3 = mamba_receiver_payload_bytes(pt, pt, dst_slot=3)
+        got_5 = mamba_receiver_payload_bytes(pt, pt, dst_slot=5)
+        assert got_3 == got_5 > 0
 
-    def test_mamba_payload_bytes_zero_without_slot_or_group(self):
+    def test_receiver_payload_bytes_zero_without_slot_or_group(self):
         pt = _k3_page_table()
-        ri = _k3_rank_info()
-        assert MambaPolicy.payload_bytes(pt, pt, dst_slot=None, sender_ri=ri, receiver_ri=ri) == 0
+        assert mamba_receiver_payload_bytes(pt, pt, dst_slot=None) == 0
         pure_attn = KVCachePageTable(
             tokens_per_block=32,
             layer_groups=[pt.layer_groups[0]],
             pool_groups=pt.pool_groups,
         )
-        assert (
-            MambaPolicy.payload_bytes(
-                pure_attn, pure_attn, dst_slot=3, sender_ri=ri, receiver_ri=ri
-            )
-            == 0
+        assert mamba_receiver_payload_bytes(pure_attn, pure_attn, dst_slot=3) == 0
+
+
+# --------------------------------------------------------------------------- #
+# MambaPolicy under decode-CP (helix): shard grid, pairing, receiver sizing
+# --------------------------------------------------------------------------- #
+class TestMambaHelixCP:
+    def test_mamba_tp_helix_grid_is_cp_minor(self):
+        # cp == 1 keeps the plain TP grid; cp > 1 flattens tp*cp CP-minor.
+        assert MambaPolicy._mamba_tp(_k3_rank_info()) == (1, 0)
+        assert MambaPolicy._mamba_tp(_k3_rank_info(cp_size=32, cp_rank=5)) == (32, 5)
+        assert MambaPolicy._mamba_tp(_k3_rank_info(tp_size=2, tp_rank=1, cp_size=4, cp_rank=3)) == (
+            8,
+            7,
         )
+
+    def test_equal_width_unpaired_sender_sends_nothing(self):
+        # Regression lock for the fan-in collapse: with equal shard widths the
+        # mapper is a whole-slot copy, so an unpaired sender must return zero
+        # bytes instead of overwriting the receiver slot with the wrong heads.
+        for sender_rank in range(2):
+            for gen_cp_rank in range(2):
+                sender_ri = _k3_rank_info(tp_size=2, tp_rank=sender_rank)
+                peer_ri = _k3_rank_info(cp_size=2, cp_rank=gen_cp_rank)
+                paired = MambaPolicy.is_paired(sender_ri, peer_ri)
+                if sender_rank == gen_cp_rank:
+                    assert paired
+                else:
+                    assert not paired
+
+    def test_narrow_to_wide_pairing_follows_covering_tree(self):
+        # Sender grid 2, receiver grid 4: receiver g pairs with sender g // 2.
+        for sender_rank in range(2):
+            for gen_cp_rank in range(4):
+                sender_ri = _k3_rank_info(tp_size=2, tp_rank=sender_rank)
+                peer_ri = _k3_rank_info(cp_size=4, cp_rank=gen_cp_rank)
+                paired = MambaPolicy.is_paired(sender_ri, peer_ri)
+                if gen_cp_rank // 2 == sender_rank:
+                    assert paired, (sender_rank, gen_cp_rank)
+                else:
+                    assert not paired, (sender_rank, gen_cp_rank)
+
+    def test_is_paired_unpaired_vs_paired(self):
+        # Unpaired: sender rank 0 is not paired with receiver cp_rank 1
+        sender_ri = _k3_rank_info(tp_size=2, tp_rank=0)
+        peer_ri = _k3_rank_info(cp_size=2, cp_rank=1)
+        assert not MambaPolicy.is_paired(sender_ri, peer_ri)
+        # Paired sender
+        paired_ri = _k3_rank_info(tp_size=2, tp_rank=1)
+        assert MambaPolicy.is_paired(paired_ri, peer_ri)
 
 
 # --------------------------------------------------------------------------- #

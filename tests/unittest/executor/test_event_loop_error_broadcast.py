@@ -17,7 +17,8 @@ import threading
 import pytest
 
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
+from tensorrt_llm.executor.worker import GenerationExecutorWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -91,6 +92,96 @@ def _make_helper(engine, num_pending: int = 1, ipc: bool = False):
     helper.enable_postprocprocess_parallel = False
     helper.temp_error_responses = _stdlib_queue.Queue()
     return helper
+
+
+class _ThreadStub:
+    """ManagedThread stand-in: ident set + not alive means "already exited"."""
+
+    def __init__(self, *, alive=False, ident=1):
+        self._alive = alive
+        self.ident = ident
+        self.starts = 0
+
+    def is_alive(self):
+        return self._alive
+
+    def start(self):
+        self.starts += 1
+
+
+class _StartThreadWorkerStub:
+    """Minimal stand-in for the worker start_thread() binds to.
+
+    It only reads self.engine, so a plain object avoids an uninitialized
+    GenerationExecutorWorker whose destructor would raise at collection time.
+    """
+
+    def __init__(self, event_loop_error=None, can_enqueue=True):
+        self.engine = _EngineStub(event_loop_error=event_loop_error)
+        self.engine.can_enqueue_requests = lambda: can_enqueue
+
+
+class TestStartThreadAfterExit:
+    """start_thread must surface an engine crash instead of restarting."""
+
+    def test_surfaces_engine_error_as_request_error(self):
+        original = RuntimeError("kv cache OOM")
+        worker = _StartThreadWorkerStub(event_loop_error=original)
+        thread = _ThreadStub()
+
+        with pytest.raises(RequestError) as excinfo:
+            GenerationExecutorWorker.start_thread(worker, thread)
+
+        # Chained, not re-raised: the caller still sees the real cause.
+        assert excinfo.value.__cause__ is original
+        assert "kv cache OOM" in str(excinfo.value)
+        assert thread.starts == 0
+
+    def test_repeated_calls_do_not_accumulate_traceback(self):
+        # start() runs on every submit(); re-raising the same object would grow
+        # its __traceback__ one frame per call.
+        original = RuntimeError("kv cache OOM")
+        worker = _StartThreadWorkerStub(event_loop_error=original)
+        thread = _ThreadStub()
+
+        raised = []
+        for _ in range(3):
+            with pytest.raises(RequestError) as excinfo:
+                GenerationExecutorWorker.start_thread(worker, thread)
+            raised.append(excinfo.value)
+
+        assert len({id(e) for e in raised}) == 3
+        assert all(e.__cause__ is original for e in raised)
+
+    def test_post_shutdown_exit_returns_quietly(self):
+        # The other exit path: shutdown() called ManagedThread.stop(), so
+        # stop_event ended run() and there is no error to report.
+        worker = _StartThreadWorkerStub(event_loop_error=None)
+        thread = _ThreadStub()
+
+        GenerationExecutorWorker.start_thread(worker, thread)
+
+        assert thread.starts == 0
+
+    def test_fresh_thread_is_started(self):
+        worker = _StartThreadWorkerStub(event_loop_error=None)
+        thread = _ThreadStub(ident=None)
+
+        GenerationExecutorWorker.start_thread(worker, thread)
+
+        assert thread.starts == 1
+
+    def test_does_not_start_when_enqueueing_is_disabled(self):
+        # The can_enqueue_requests() guard returns before the error check, so a
+        # stashed error must not surface either.
+        worker = _StartThreadWorkerStub(
+            event_loop_error=RuntimeError("should not surface"), can_enqueue=False
+        )
+        thread = _ThreadStub(ident=None)
+
+        GenerationExecutorWorker.start_thread(worker, thread)
+
+        assert thread.starts == 0
 
 
 class TestAwaitResponseHelperEventLoopError:

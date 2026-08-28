@@ -17,6 +17,7 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
+MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
@@ -165,6 +166,18 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     mm_data.clear()
     if mrope_deltas is not None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
+
+
+def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
+    """Drop raw encoder payloads while preserving cached MM embeddings.
+
+    Item-level encoder scheduling keeps the original request payload on CPU
+    and transfers only selected items to GPU. Once every item is encoded, the
+    raw modality dictionaries are no longer needed and must not be moved to
+    GPU by the subsequent LLM input-preparation path.
+    """
+    for modality in ("image", "video", "audio"):
+        mm_data.pop(modality, None)
 
 
 @dataclass
@@ -449,6 +462,7 @@ class MultimodalRuntimeData:
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
 })
 
 
@@ -1027,7 +1041,12 @@ def find_mm_token_lengths(
                     video_metadata = item.metadata
                     video_audio = item.audio
                     item = item.frames
-                assert isinstance(item, list), "Video must be a list of frames"
+                if isinstance(item, np.ndarray):
+                    item = list(item)
+                if not isinstance(item, list):
+                    raise ValueError(
+                        "Video must be decoded frames represented as a list "
+                        f"or stacked numpy array, got {type(item).__name__}")
                 call_kwargs = {"video": item}
                 if video_metadata is not None:
                     # Used by per-model overrides that need to account for
@@ -1067,6 +1086,7 @@ _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",
 })

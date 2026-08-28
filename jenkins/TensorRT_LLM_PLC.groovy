@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 @Library(['trtllm-jenkins-shared-lib@main']) _
 import groovy.json.JsonSlurper
 
@@ -36,7 +51,7 @@ def createKubernetesPodConfig()
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: pulse-container-scanner
-                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:6.2.1
+                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:stable
                     command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
@@ -132,8 +147,10 @@ def savePipelineScripts() {
     // Capture the pipeline's own version of the scan scripts before the workspace
     // is overwritten by checkoutSource() with params.ref. This ensures the script
     // logic always matches the Groovy that is actually running.
+    trtllm_utils.setupGitMirror()
     checkout scm
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
+    sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
 }
 
 def checkoutSource ()
@@ -191,7 +208,7 @@ def generateLockFiles(llmRepo, ref)
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
         sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
         sh "git config --global user.name \"TensorRT LLM\""
-        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
+        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 /tmp/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
@@ -200,6 +217,8 @@ def generateLockFiles(llmRepo, ref)
             echo "Running from specific commit '${ref}', skipping lock file push to branch"
         } else if (params.repoUrlKey == "github_fork") {
             echo "Running against a fork repo, skipping lock file push to branch"
+        } else if (params.scanMode == 'release') {
+            echo "Running in release mode, skipping lock file push to branch"
         } else {
             sh "git status"
             sh "git add security_scanning/"
@@ -237,7 +256,7 @@ def sonarScan()
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**,security_scanning/**"
         }
     }
 }
@@ -260,7 +279,9 @@ def pulseScanSourceCode(llmRepo, ref) {
             "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
             "PULSE_SCAN_OVERRIDE=false"
         ]) {
-            sh 'pulse scan --no-fail --exclude-detectors PIP,SETUPTOOLS --sbom .'
+            trtllm_utils.llmRetry(3, "pulse scan source code", {
+                sh 'pulse scan --no-fail --exclude-detectors PIP,SETUPTOOLS --sbom .'
+            })
         }
     }
     container("cpu") {
@@ -300,6 +321,36 @@ def pulseScanContainer(llmRepo, ref) {
     }
     container("pulse-container-scanner") {
         sh "apk add jq curl"
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'trtllm-artifactory-credentials',
+                usernameVariable: 'ARTIFACTORY_USER',
+                passwordVariable: 'ARTIFACTORY_PASSWORD'
+            ),
+            usernamePassword(
+                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                usernameVariable: 'GITLAB_REGISTRY_USER',
+                passwordVariable: 'GITLAB_REGISTRY_PASSWORD'
+            ),
+            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        ]) {
+            sh '''
+                set +x
+                mkdir -p /root/.docker
+                ARTIFACTORY_AUTH="$(printf '%s' "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')"
+                GITLAB_REGISTRY_AUTH="$(printf '%s' "${GITLAB_REGISTRY_USER}:${GITLAB_REGISTRY_PASSWORD}" | base64 | tr -d '\n')"
+                jq -n \
+                    --arg artifactoryAuth "${ARTIFACTORY_AUTH}" \
+                    --arg gitlabRegistry "${DEFAULT_GIT_URL}:5005" \
+                    --arg gitlabRegistryAuth "${GITLAB_REGISTRY_AUTH}" \
+                    '{auths: {
+                        "artifactory.nvidia.com": {auth: $artifactoryAuth},
+                        ($gitlabRegistry): {auth: $gitlabRegistryAuth}
+                    }}' > /root/.docker/config.json
+                unset ARTIFACTORY_AUTH GITLAB_REGISTRY_AUTH
+                set -x
+            '''
+        }
         def token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
         if (!token) {
             throw new Exception("Invalid token get")
@@ -313,10 +364,12 @@ def pulseScanContainer(llmRepo, ref) {
                 def outputDir = "scan_report/${key}"
                 sh "mkdir -p ${outputDir}"
                 echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
-                sh(
-                    script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
-                    label: "Scan ${entry.image}"
-                )
+                trtllm_utils.llmRetry(3, "pulse-cli scan ${entry.image}", {
+                    sh(
+                        script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
+                        label: "Scan ${entry.image}"
+                    )
+                })
             }
         }
     }
@@ -390,7 +443,7 @@ def processScanResults(ref) {
                             colWidths.corrected_license     = Math.max(colWidths.corrected_license,     entry.corrected_license.toString().length())
                             colWidths.is_nvidia_proprietary = Math.max(colWidths.is_nvidia_proprietary, entry.is_nvidia_proprietary.toString().length())
                         }
-                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 11}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
+                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 13}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
                         def rows = [sep,
                                     "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | ${'CORRECTED LICENSE'.padRight(colWidths.corrected_license)} | IS PERMISSIVE | ${'IS NV PROPRIETARY'.padRight(colWidths.is_nvidia_proprietary)} |",
                                     sep]
@@ -399,6 +452,10 @@ def processScanResults(ref) {
                         }
                         rows << sep
                         detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
+                        if (params.scanMode == "monitor") {
+                            echo detectedLicensesTable
+                            currentBuild.description = "⚠️ Non-permissive licenses detected — click 'Console Output' to review"
+                        }
                     }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
@@ -454,8 +511,8 @@ pipeline {
             steps {
                 script {
                     container("cpu") {
-                        savePipelineScripts()
                         installTools()
+                        savePipelineScripts()
                         checkoutSource()
                         validateRef()
                     }
@@ -515,6 +572,7 @@ pipeline {
                     if (detectedLicensesTable) {
                         echo detectedLicensesTable
                     }
+                    currentBuild.description = "⚠️ Manual approval required — click 'Console Output' to review licenses, then approve or abort"
                     withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
                         def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
                         writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]

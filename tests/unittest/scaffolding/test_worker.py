@@ -13,12 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-
-# isort: off
-from utils.llm_data import llm_models_root
-# isort: on
-
 import asyncio
 import os
 import sys
@@ -32,12 +26,12 @@ from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from llmapi.test_llm import get_model_path
+from utils.llm_data import llm_models_root
 
 
 @pytest.fixture(scope="module")
-def deepseek_distill_7b_path() -> Path:
-    model_dir = llm_models_root() / "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
-    return model_dir
+def trtllm_model_path():
+    return llm_models_root() / "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +42,6 @@ def default_prompt():
 
 @pytest.fixture(scope="module")
 def model_name():
-    #return "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
     return "gpt_oss/gpt-oss-20b"
 
 
@@ -74,11 +67,26 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
     remote_server.terminate()
 
 
+def create_trtllm_worker(model_path):
+    return TRTLLMWorker.init_with_new_llm(str(model_path), backend="pytorch")
+
+
 def create_trtoai_worker(model_name, async_client):
     return TRTOpenaiWorker(
         async_client=async_client,
         model=model_name,
     )
+
+
+def test_trtllm_worker_generation(default_prompt, trtllm_model_path):
+    worker = create_trtllm_worker(trtllm_model_path)
+    try:
+        task = GenerationTask.create_from_prompt(default_prompt)
+        task.max_tokens = 100
+        status = asyncio.run(worker.run_task(task))
+        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
+    finally:
+        worker.shutdown()
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -101,20 +109,5 @@ def test_trtoai_worker_chat(default_prompt, model_name, server):
         task.max_tokens = 100
         status = asyncio.run(worker.run_task(task))
         assert status == TaskStatus.SUCCESS, "Chat Task is not successful with TRTOpenaiWorker"
-    finally:
-        worker.shutdown()
-
-
-def create_trtllm_worker(model_path):
-    return TRTLLMWorker.init_with_new_llm(str(model_path), backend="pytorch")
-
-
-def test_trtllm_worker_generation(default_prompt, deepseek_distill_7b_path):
-    worker = create_trtllm_worker(deepseek_distill_7b_path)
-    try:
-        task = GenerationTask.create_from_prompt(default_prompt)
-        task.max_tokens = 100
-        status = asyncio.run(worker.run_task(task))
-        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
     finally:
         worker.shutdown()

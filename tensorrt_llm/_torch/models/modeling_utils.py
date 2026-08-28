@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
-                    TypeVar, Union)
+from typing import (Any, Dict, Generic, Iterator, List, Literal, Optional,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -17,8 +17,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -28,7 +28,7 @@ from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE
+from ..modules.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -37,11 +37,15 @@ from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
 
 
 @contextlib.contextmanager
-def timing(message: str):
-    start = time.time()
-    yield
-    end = time.time()
-    print(f"{message} -- {(end-start):.2f}s")
+def timing_metric(metric_name: str, metric_dict: dict[str,
+                                                      float]) -> Iterator[None]:
+    """Accumulate elapsed time under ``metric_name`` across invocations."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
+                                    time.perf_counter() - start)
 
 
 @dataclass
@@ -115,7 +119,10 @@ def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
 
     # bias
     if weight.ndim == 1:
-        return weight.repeat_interleave(reps)
+        assert weight.shape[0] % num_kv_heads == 0
+        size_per_kv_head = weight.shape[0] // num_kv_heads
+        return weight.reshape(num_kv_heads, size_per_kv_head).repeat_interleave(
+            reps, dim=0).reshape(-1)
 
     # weight and scale
     assert weight.shape[0] % num_kv_heads == 0
@@ -689,10 +696,17 @@ class DecoderModelForCausalLM(nn.Module,
     ) -> Optional[Literal["CPP", "PYTHON"]]:
         """Return the model's preferred KV-cache transceiver runtime.
 
-        Subclasses can override this to opt into a specific transceiver
-        implementation ('CPP' or 'PYTHON') that is adopted when the user
-        leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'. Return None to defer to the global default (C++).
+        Subclasses can override this to pin a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
+        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'; unsupported configurations then fail loudly at
+        transceiver creation rather than being rerouted. Return None to
+        defer to the global default: the Python transceiver, falling back to
+        C++ only for conditions decidable from the transceiver config itself
+        (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other
+        incompatibilities fail at transceiver creation. The effective
+        runtime for a no-preference model is therefore
+        deployment-dependent.
 
         Args:
             pretrained_config: the loaded HF pretrained config (may be None
@@ -703,9 +717,9 @@ class DecoderModelForCausalLM(nn.Module,
 
         This preference is intentionally kept out of the generic
         :meth:`get_model_defaults` deep-merge: it must not materialize a
-        ``cache_transceiver_config`` when disaggregated serving is disabled,
-        and it is only honored when the effective backend supports it (the
-        Python transceiver requires NIXL).
+        ``cache_transceiver_config`` when disaggregated serving is disabled.
+        Preferences are adopted only for the 'auto' setting; a 'PYTHON'
+        preference still requires NIXL when the transceiver is created.
         """
         return None
 
@@ -803,11 +817,40 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self,
-                     weights: Dict,
+                     weights: dict[str, torch.Tensor],
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: List[str] = [],
-                     params_map: Optional[Dict[str, str]] = None,
-                     allow_partial_loading: bool = False):
+                     skip_modules: list[str] = [],
+                     params_map: dict[str, str] | None = None,
+                     allow_partial_loading: bool = False) -> None:
+        """Load checkpoint weights into this model.
+
+        Basic function for an LLM class to load weights from a dict of weight
+        tensors.
+        The function walks the model's named modules, select matching tensors
+        from `weights`, and either call each module's `load_weights` method
+        if available, or copy tensors into parameters directly.
+        If `weight_mapper` is not None, uses it to perform custom weight mapping
+        before loading weights to each module; otherwise, perform hardcoded
+        weight fusion for some modules during loading.
+
+        Args:
+            weights: dict[str, Tensor], mapping from checkpoint/state-dict keys
+                to tensors. If the key string does not match LLM class's child
+                module names, you need to use `params_map` or `weight_mapper` to
+                remap them.
+            weight_mapper: Optional mapper initialized for this model and
+                checkpoint format. When provided, it controls model-specific key
+                filtering, fused-module mappings, special module handling, and
+                manual parameter copies.
+            skip_modules: list[str], skip modules which contain these substrings.
+                This is used for LLM classes who have some child modules (e.g.
+                speculative decoding modules) that should be loaded from a
+                different function later.
+            params_map: Optional regex replacement map applied before loading
+                to rename checkpoint keys into the model's expected key space.
+            allow_partial_loading: if true, accept `weights` as an incomplete
+                weight dict and update only the parameters present.
+        """
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
         # this method will be removed.
@@ -1170,6 +1213,48 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+def _get_load_weights_num_workers() -> Optional[int]:
+    """Return the per-rank module-loading worker limit, or None for the default.
+
+    Weight loading runs one ThreadPoolExecutor per rank, which without an
+    explicit limit defaults to as many as 32 workers (CPython's
+    ``min(32, cpu_count + 4)``; the count is the machine's, not the rank's
+    share of it). The limit is per rank, so four ranks on a node can have four
+    times that many module loads in flight. Each one holds its own host-side
+    working set while it stages and transforms a module's weights, and every
+    rank's is charged to the same host-memory cgroup -- which is how a large
+    checkpoint exhausts host memory while the GPUs are nowhere near full.
+
+    ``TLLM_LOAD_WEIGHTS_NUM_WORKERS`` bounds that overlap. Unset or blank keeps
+    the executor default; a positive integer trades loading parallelism for
+    host-memory headroom; anything else raises, so a typo cannot look like it
+    took effect. ``TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL`` takes precedence
+    and skips the pool entirely -- this variable is the range in between.
+
+    Set it when ranks share a constrained cgroup. Tune it against node
+    ``memory.peak`` and the slowest rank's init time, not per-process RSS,
+    which does not see shared page cache. ``4`` measured well on a four-rank
+    node but is a starting point, not a default; retune per checkpoint and
+    topology.
+    """
+    env_name = "TLLM_LOAD_WEIGHTS_NUM_WORKERS"
+    value = os.environ.get(env_name)
+    if value is None or not value.strip():
+        return None
+
+    try:
+        num_workers = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}") from error
+    if num_workers <= 0:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}")
+    logger.info(
+        f"Limiting concurrent module weight loading to {num_workers} workers")
+    return num_workers
+
+
 def run_concurrently(func,
                      args_list,
                      reduce_func=None,
@@ -1267,7 +1352,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             # and weights loading is done in the backend, so module name includes '.backend'.
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 name = '.'.join(names[:-1])
                 names = name.split('.')
 
@@ -1368,7 +1453,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
@@ -1388,79 +1476,87 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) > 0:
-            if weight_mapper.should_skip_module(name):
-                return
+        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
+                name):
+            return
 
+        names = name.split('.')
+
+        # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+        # Currently saved MoE weights don't include 'backend' in their names.
+        # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+        # and weights loading is done in the backend, so module name includes '.backend'.
+        # We need to use parent module name (without .backend) to match saved weight names.
+        # After MoE refactoring is fully complete, all paths will follow this branch.
+        if names[-1] == "backend" and is_moe_weight_owner(module):
+            name = '.'.join(names[:-1])
             names = name.split('.')
 
-            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
-            # Currently saved MoE weights don't include 'backend' in their names.
-            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
-            # and weights loading is done in the backend, so module name includes '.backend'.
-            # We need to use parent module name (without .backend) to match saved weight names.
-            # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
-                name = '.'.join(names[:-1])
-                names = name.split('.')
+        module_names_breakdown, module_name = names[:-1], names[-1]
 
-            module_names_breakdown, module_name = names[:-1], names[-1]
-
-            if weight_mapper.does_require_special_handling(module_name):
-                module_weights = weight_mapper.apply_callbacks(
+        # check if the module has non-default weight loading, like fusing some weight
+        # tensors together.
+        if weight_mapper.does_require_special_handling(module_name):
+            # Process the weights, e.g. duplicating kv heads to match query heads after
+            # slicing for tensor parallelism.
+            module_weights: list[dict[
+                str, torch.Tensor]] = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
-                module.load_weights(weights=module_weights,
-                                    allow_partial_loading=allow_partial_loading)
+            # Call module's custom `load_weights()` to process weight, e.g. fusing
+            # several GEMM matrices together
+            module.load_weights(weights=module_weights,
+                                allow_partial_loading=allow_partial_loading)
 
-                # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
-                if hasattr(weights, 'mark_consumed'):
-                    for src_name in weight_mapper._mapping.get(module_name, []):
-                        prefix = '.'.join(module_names_breakdown + [src_name])
-                        weights.mark_consumed(prefix)
+            # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
+            if hasattr(weights, 'mark_consumed'):
+                for src_name in weight_mapper.mapping.get(module_name, []):
+                    prefix = '.'.join(module_names_breakdown + [src_name])
+                    weights.mark_consumed(prefix)
+            return
+        module_weights: dict[str, torch.Tensor] = weight_mapper.filter_weights(
+            name, weights)
+        # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+        if not module_weights:
+            return
+        if weight_mapper.is_special_instance_module(module):
+            weight_mapper.handle_special_instance_module(
+                module,
+                module_name,
+                module_weights,
+                allow_partial_loading=allow_partial_loading)
+            # Handed the full subtree, like the `load_weights` case.
+            loaded_own_params = None
+        elif hasattr(module, 'load_weights'):
+            if "linear_attn.conv1d" in name:
+                module_weights['weight'] = module_weights['weight'].squeeze(
+                    dim=1)
+            args = inspect.getfullargspec(module.load_weights).args
+            if "allow_partial_loading" not in args:
+                assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
+                module.load_weights(weights=[module_weights])
             else:
-                module_weights = weight_mapper.filter_weights(name, weights)
-                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
-                if module_weights:
-                    if weight_mapper.is_special_instance_module(module):
-                        weight_mapper.handle_special_instance_module(
-                            module,
-                            module_name,
-                            module_weights,
-                            allow_partial_loading=allow_partial_loading)
-                        # Handed the full subtree, like the `load_weights` case.
-                        loaded_own_params = None
-                    elif hasattr(module, 'load_weights'):
-                        if "linear_attn.conv1d" in name:
-                            module_weights['weight'] = module_weights[
-                                'weight'].squeeze(dim=1)
-                        args = inspect.getfullargspec(module.load_weights).args
-                        if "allow_partial_loading" not in args:
-                            assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
-                            module.load_weights(weights=[module_weights])
-                        else:
-                            module.load_weights(
-                                weights=[module_weights],
-                                allow_partial_loading=allow_partial_loading)
-                        loaded_own_params = None
-                    else:
-                        loaded_own_params = []
-                        for n, p in module.named_parameters(recurse=False):
-                            weight_mapper.handle_manual_copy(
-                                module_name,
-                                module_weights,
-                                n,
-                                p,
-                                allow_partial_loading=allow_partial_loading)
-                            loaded_own_params.append(n)
+                module.load_weights(weights=[module_weights],
+                                    allow_partial_loading=allow_partial_loading)
+            loaded_own_params = None
+        else:
+            loaded_own_params = []
+            for n, p in module.named_parameters(recurse=False):
+                weight_mapper.handle_manual_copy(
+                    module_name,
+                    module_weights,
+                    n,
+                    p,
+                    allow_partial_loading=allow_partial_loading)
+                loaded_own_params.append(n)
 
-                    # Consume precisely what was loaded; see the matching
-                    # comment in `_load_weights_impl`.
-                    if hasattr(weights, 'mark_consumed'):
-                        if loaded_own_params is None:
-                            weights.mark_consumed(name)
-                        elif loaded_own_params:
-                            weights.mark_consumed_keys(
-                                f'{name}.{n}' for n in loaded_own_params)
+        # Consume precisely what was loaded; see the matching comment in
+        # `_load_weights_impl`.
+        if hasattr(weights, 'mark_consumed'):
+            if loaded_own_params is None:
+                weights.mark_consumed(name)
+            elif loaded_own_params:
+                weights.mark_consumed_keys(f'{name}.{n}'
+                                           for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
@@ -1493,4 +1589,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())

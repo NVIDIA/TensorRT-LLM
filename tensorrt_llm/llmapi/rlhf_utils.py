@@ -8,9 +8,9 @@ from typing import Iterator, Optional
 
 import torch
 
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import serialization
 from tensorrt_llm.logger import logger
 

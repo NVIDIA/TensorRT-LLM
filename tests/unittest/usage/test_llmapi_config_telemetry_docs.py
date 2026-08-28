@@ -21,6 +21,10 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]

@@ -1,14 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Optional, Type
+from typing import Dict, Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...model_config import ModelConfig
-from ...peft.lora.validation import check_moe_lora_supported
 from ...utils import ActivationType, ActType_TrtllmGen, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
@@ -20,255 +18,28 @@ from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
-from .fused_moe_wide_ep import WideEPMoE
+from .impl_base import MoEImplBase
 from .interface import MoE, MoEWeightLoadingMode
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
+from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE, MoEImplClass,
+                             derive_moe_layer_shapes, infer_swiglu_gptoss_style,
+                             resolve_moe_cls, resolve_moe_impl)
 from .routing import BaseMoeRoutingMethod
 
-WIDEEP_DEPRECATION_MESSAGE = (
-    "The WIDEEP MoE backend is deprecated and can no longer be selected. Wide "
-    "expert parallelism and EPLB are supported by the other backends: use "
-    "DEEPGEMM for FP8 block-scale checkpoints, or TRTLLM / CUTEDSL / CUTLASS "
-    "otherwise.")
-
-
-def _get_pretrained_megamoe_capability_args(
-        model_config: ModelConfig) -> Dict[str, Optional[object]]:
-    """Extract dtype / hidden / intermediate kwargs for MegaMoE
-    ``can_implement`` from ``model_config.pretrained_config``.
-
-    Both MegaMoE backends (``MEGAMOE_DEEPGEMM`` and ``MEGAMOE_CUTEDSL``)
-    perform the same pretrained-config probe before instantiating the
-    backend; centralising it keeps the probe and fallback logic
-    consistent across backends.
-    """
-    pretrained = model_config.pretrained_config
-    pretrained_dtype = (getattr(pretrained, "torch_dtype", torch.bfloat16)
-                        if pretrained is not None else torch.bfloat16)
-    pretrained_inter = None
-    if pretrained is not None:
-        pretrained_inter = getattr(pretrained, "moe_intermediate_size", None)
-        if pretrained_inter is None:
-            pretrained_inter = getattr(pretrained, "intermediate_size", None)
-    pretrained_hidden = (getattr(pretrained, "hidden_size", None)
-                         if pretrained is not None else None)
-    return dict(dtype_activation=pretrained_dtype,
-                hidden_size=pretrained_hidden,
-                intermediate_size=pretrained_inter)
-
-
-def get_moe_cls(
-    model_config: ModelConfig,
-    override_quant_config: Optional[QuantConfig] = None,
-    layer_idx: Optional[int] = None,
-) -> Type[MoE]:
-    moe_backend = model_config.moe_backend
-    quant_config = model_config.quant_config
-    if override_quant_config is not None:
-        quant_config = override_quant_config
-    layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
-    if moe_backend.upper() == "MARLIN":
-        # Marlin MoE is an Ada/Hopper NVFP4 W4A16 backend. Layers without
-        # NVFP4 quantization (e.g. deliberately-unquantized MTP draft layers in
-        # MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE, matching
-        # the CUTEDSL / DENSEGEMM / MEGAMOE_* fallback behavior below.
-        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            logger.warning(f"{layer_prefix}MarlinFusedMoE only supports NVFP4 "
-                           "quantization. Check out details in quant_config: "
-                           f"{quant_config}. Using CutlassFusedMoE instead.")
-            return CutlassFusedMoE
-        return MarlinFusedMoE
-    if moe_backend.upper() == "CUTLASS":
-        return CutlassFusedMoE
-    elif moe_backend.upper() == "VANILLA":
-        return VanillaMoE
-    elif moe_backend.upper() == "CUTEDSL":
-        has_w4a16_nvfp4 = (quant_config is not None
-                           and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4)
-        if quant_config is not None and (
-                quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4() or has_w4a16_nvfp4):
-            # On SM120 / SM121 + NVFP4/W4A16_NVFP4 the cuteDSL family member is the
-            # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
-            # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
-            # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
-            has_nvfp4 = (quant_config.quant_mode.has_nvfp4()
-                         and not has_w4a16_nvfp4)
-            if has_nvfp4 or has_w4a16_nvfp4:
-                from tensorrt_llm._utils import get_sm_version
-                sm_version = get_sm_version()
-                if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
-                    mapping = model_config.mapping
-                    if mapping.moe_ep_size > 1 or mapping.dp_size > 1:
-                        logger.warning(
-                            "CuteDslB12xFusedMoE does not support expert "
-                            "parallelism or attention-DP/all-to-all; selecting "
-                            "CutlassFusedMoE.")
-                        return CutlassFusedMoE
-                    try:
-                        import flashinfer  # noqa: F401
-                        logger.info(
-                            "Selecting CuteDslB12xFusedMoE for hybrid "
-                            "CUTLASS-prefill / FlashInfer NVFP4 MoE decode "
-                            "(SM%d + NVFP4).",
-                            sm_version,
-                        )
-                        return CuteDslB12xFusedMoE
-                    except ImportError:
-                        logger.warning(
-                            "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
-                            "but flashinfer is not importable; using %s.",
-                            sm_version,
-                            "CutlassFusedMoE"
-                            if has_w4a16_nvfp4 else "CuteDslFusedMoE",
-                        )
-                        if has_w4a16_nvfp4:
-                            return CutlassFusedMoE
-                elif has_w4a16_nvfp4:
-                    logger.warning(
-                        "CuteDslB12xFusedMoE requires SM120/121 for W4A16_NVFP4 "
-                        "(got SM%d). Using CutlassFusedMoE.",
-                        sm_version,
-                    )
-                    return CutlassFusedMoE
-            return CuteDslFusedMoE
-        else:
-            logger.warning(
-                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales, nvfp4, and w4a16_nvfp4. "
-                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
-            )
-            return CutlassFusedMoE
-    elif moe_backend.upper() == "DEEPGEMM":
-        return DeepGemmFusedMoE
-    elif moe_backend.upper() == "DENSEGEMM":
-        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            logger.warning(
-                f"{layer_prefix}DenseGEMMFusedMoE only supports nvfp4. "
-                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
-            )
-            return CutlassFusedMoE
-        # DenseGEMM CuTe DSL kernels only support SM100/SM103.
-        from tensorrt_llm._utils import get_sm_version
-        sm_version = get_sm_version()
-        if sm_version not in DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS:
-            logger.warning(
-                f"{layer_prefix}DenseGEMMFusedMoE only supports SM {DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS} "
-                f"(got SM {sm_version}). Using CutlassFusedMoE instead.")
-            return CutlassFusedMoE
-        return DenseGEMMFusedMoE
-    elif moe_backend.upper() == "TRTLLM":
-        has_quant = quant_config is not None and quant_config.quant_mode.has_any_quant(
-            exclude_kv_cache=True)
-        if has_quant and (quant_config.quant_mode.has_fp8_block_scales()
-                          or quant_config.quant_mode.has_nvfp4()
-                          or quant_config.quant_mode.has_w4a16_mxfp4()
-                          or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
-                          or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
-                          or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
-            return TRTLLMGenFusedMoE
-        if not has_quant and model_config.pretrained_config is not None and getattr(
-                model_config.pretrained_config, "torch_dtype",
-                None) == torch.bfloat16:
-            if TRTLLMGenFusedMoE._is_flashinfer_fused_moe_available():
-                return TRTLLMGenFusedMoE
-            raise RuntimeError(
-                "TRTLLMGenFusedMoE BF16 path requires FlashInfer fused MoE with "
-                "trtllm_bf16_moe support, but it is not available.")
-        else:
-            logger.warning(
-                f"{layer_prefix}TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, and w4a8_mxfp4_mxfp8. "
-                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
-            )
-            return CutlassFusedMoE
-    elif moe_backend.upper() == "WIDEEP":
-        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
-    elif moe_backend.upper() == "TRITON":
-        return TritonFusedMoE
-    elif moe_backend.upper() == "MEGAMOE_DEEPGEMM":
-        # MegaMoE (DeepGEMM): DeepGEMM fp8_fp4_mega_moe fused kernel for
-        # W4A8_MXFP4_MXFP8 weights. Falls back to CutlassFusedMoE whenever
-        # the env cannot serve the backend (wrong quant / SM family /
-        # missing DG symbols) so we never allocate MegaMoE-specific weight
-        # tensors we cannot use.
-        if quant_config is None or not quant_config.quant_mode.has_w4a8_mxfp4_mxfp8(
-        ):
-            logger.warning(
-                "MegaMoEDeepGemm only supports W4A8_MXFP4_MXFP8. "
-                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
-            )
-            return CutlassFusedMoE
-        ok, reason = MegaMoEDeepGemm.can_implement(
-            QuantAlgo.W4A8_MXFP4_MXFP8,
-            swiglu_gptoss_style=False,
-            **_get_pretrained_megamoe_capability_args(model_config),
-        )
-        if not ok:
-            logger.warning(
-                f"MegaMoEDeepGemm rejected current environment: {reason}. "
-                "Falling back to CutlassFusedMoE.")
-            return CutlassFusedMoE
-        return MegaMoEDeepGemm
-    elif moe_backend.upper() == "MEGAMOE_CUTEDSL":
-        # MegaMoE (CuteDSL): ported Sm100MegaMoEKernel fused
-        # dispatch+GEMM+activation+GEMM+combine kernel for NVFP4 weights on
-        # SM100-family GPUs. Same fall-back pattern as MEGAMOE_DEEPGEMM
-        # when the env cannot serve the backend.
-        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            logger.warning(
-                "MegaMoECuteDsl only supports NVFP4. "
-                f"Check out details in quant_config: {quant_config}. "
-                "Using CutlassFusedMoE instead.")
-            return CutlassFusedMoE
-        ok, reason = MegaMoECuteDsl.can_implement(
-            QuantAlgo.NVFP4,
-            swiglu_gptoss_style=False,
-            **_get_pretrained_megamoe_capability_args(model_config),
-        )
-        if not ok:
-            logger.warning(
-                f"MegaMoECuteDsl rejected current environment: {reason}. "
-                "Falling back to CutlassFusedMoE.")
-            return CutlassFusedMoE
-        return MegaMoECuteDsl
-    else:
-        raise ValueError(f"Unsupported moe backend: {moe_backend}")
-
-
-def resolve_moe_cls(
-    model_config: ModelConfig,
-    routing_method: BaseMoeRoutingMethod,
-    dtype: Optional[torch.dtype],
-    override_quant_config: Optional[QuantConfig] = None,
-    layer_idx: Optional[int] = None,
-) -> Type[MoE]:
-    moe_cls = get_moe_cls(model_config, override_quant_config, layer_idx)
-
-    effective_quant_config = override_quant_config or model_config.quant_config
-    has_quant = (effective_quant_config is not None
-                 and effective_quant_config.layer_quant_mode.has_any_quant(
-                     exclude_kv_cache=True))
-    if (moe_cls == TRTLLMGenFusedMoE and not has_quant):
-        moe_cls = CutlassFusedMoE
-
-    # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized
-    # base weights. Fail loudly here rather than at runtime if the user-selected
-    # backend cannot serve the LoRA request. Use the resolved class name, so a
-    # fallback to CutlassFusedMoE keeps LoRA supportable even when the user
-    # requested TRTLLM/CUTEDSL.
-    resolved_backend = "CUTLASS" if moe_cls is CutlassFusedMoE else model_config.moe_backend
-    check_moe_lora_supported(
-        moe_backend_name=resolved_backend,
-        lora_config=getattr(model_config, "lora_config", None),
-        quant_config=effective_quant_config,
-        layer_idx=layer_idx,
-    )
-
-    return moe_cls
+__all__ = [
+    "create_moe",
+    "create_moe_backend",
+    "infer_swiglu_gptoss_style",
+    "MoEImplClass",
+    "resolve_moe_cls",
+    "resolve_moe_impl",
+    "WIDEEP_DEPRECATION_MESSAGE",
+]
 
 
 def create_moe_backend(
-    moe_cls: Type[MoE],
+    moe_cls: MoEImplClass,
     routing_method: BaseMoeRoutingMethod,
     # TODO: remove num_experts, hidden_size, intermediate_size, dtype parameters
     # these parameters will be inferred from model_config.pretrained_config.
@@ -287,17 +58,26 @@ def create_moe_backend(
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
-    init_load_balancer: bool = True,
+    init_load_balancer: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
+    activation: Optional[str] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
-) -> MoE:
+) -> MoE | MoEImplBase | VanillaMoE:
     """
-    Create MoE backend instance with validation.
+    Create a MoE backend or a self-contained MoE layer.
+
+    Execution units (``MoEImplBase`` subclasses) are only ever constructed as
+    backends, so ``init_load_balancer`` defaults to ``False`` -- ``True`` asks
+    for a standalone layer and the impl constructor rejects it with a
+    ``TypeError``. The ``TritonFusedMoE`` and ``VanillaMoE`` branches are
+    complete layers and do not take the parameter at all.
 
     Args:
-        moe_cls: MoE backend class to instantiate
+        moe_cls: MoE backend or self-contained layer class to instantiate
         routing_method: Routing method for token-to-expert assignment
         num_experts: Total number of experts (if None, get from model_config.pretrained_config)
         hidden_size: Hidden dimension size (if None, get from model_config.pretrained_config)
@@ -315,34 +95,38 @@ def create_moe_backend(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
+        activation: Optional MegaMoE DeepGEMM activation name
+        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
+        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
 
     Returns:
-        MoE: MoE backend instance
+        A ``MoEImplBase`` execution unit, a self-contained ``MoE`` layer, or
+        ``VanillaMoE``.
     """
-    if moe_cls is WideEPMoE:
-        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
-
-    # Get parameters from pretrained_config if not explicitly provided
-    pretrained_config = model_config.pretrained_config
-    if num_experts is None:
-        assert pretrained_config is not None, "num_experts must be provided or model_config.pretrained_config must be set"
-        num_experts = pretrained_config.num_experts
-    if hidden_size is None:
-        assert pretrained_config is not None, "hidden_size must be provided or model_config.pretrained_config must be set"
-        hidden_size = pretrained_config.hidden_size
-    if intermediate_size is None:
-        assert pretrained_config is not None, "intermediate_size must be provided or model_config.pretrained_config must be set"
-        # For MoE models, prefer moe_intermediate_size if available
-        if hasattr(pretrained_config, 'moe_intermediate_size'):
-            intermediate_size = pretrained_config.moe_intermediate_size
-        else:
-            intermediate_size = pretrained_config.intermediate_size
-    if dtype is None and pretrained_config is not None and hasattr(
-            pretrained_config, 'torch_dtype'):
-        dtype = pretrained_config.torch_dtype
+    shapes = derive_moe_layer_shapes(
+        model_config,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        routing=routing_method,
+    )
+    num_experts = shapes.num_experts
+    hidden_size = shapes.hidden_size
+    intermediate_size = shapes.intermediate_size
+    dtype = shapes.dtype
+    assert num_experts is not None, (
+        "num_experts must be provided or model_config.pretrained_config must "
+        "expose num_experts / n_routed_experts / num_local_experts")
+    assert hidden_size is not None, (
+        "hidden_size must be provided or model_config.pretrained_config must be set"
+    )
+    assert intermediate_size is not None, (
+        "intermediate_size must be provided or model_config.pretrained_config "
+        "must expose moe_intermediate_size / intermediate_size")
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
@@ -410,6 +194,12 @@ def create_moe_backend(
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
         )
 
+    if any(value is not None
+           for value in (activation, situ_beta,
+                         situ_linear_beta)) and moe_cls is not MegaMoEDeepGemm:
+        raise ValueError("MegaMoE DeepGEMM activation options require "
+                         f"MegaMoEDeepGemm, got {moe_cls.__name__}")
+
     if any(value is not None for value in (trtllm_gen_activation_type,
                                            trtllm_gen_activation_alpha,
                                            trtllm_gen_activation_beta)):
@@ -457,8 +247,10 @@ def create_moe_backend(
             activation_type=activation_type,
         )
     elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
-        # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
-        # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
+        # Both are constructed through the narrower CuteDsl argument set (no
+        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
+        # CutlassFusedMoE.__init__, which does accept those four, so widening
+        # this branch would need the allow-lists above to admit b12x first.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -554,7 +346,12 @@ def create_moe_backend(
                                               if swiglu_limit is not None else
                                               swiglu_limit_scalar)
         else:
-            megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
+            megamoe_kwargs.update(
+                swiglu_limit_scalar=swiglu_limit_scalar,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
         return moe_cls(**megamoe_kwargs)
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
@@ -579,11 +376,14 @@ def create_moe(
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    activation: Optional[str] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
     communication_method: Optional[str] = None,
-) -> MoE:
+) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
 
@@ -606,35 +406,67 @@ def create_moe(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
+        activation: Optional MegaMoE DeepGEMM activation name
+        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
+        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
         communication_method: Optional ConfigurableMoE communication method
 
     Returns:
-        MoE: MoE instance
+        A complete MoE layer: a ``MoE`` (``ConfigurableMoE`` around an
+        execution unit, or ``TritonFusedMoE``), or ``VanillaMoE``. Never a bare
+        execution unit -- those only reach a model as ``ConfigurableMoE.backend``.
     """
-    # Get parameters from pretrained_config if not explicitly provided
-    pretrained_config = model_config.pretrained_config
-    if num_experts is None:
-        assert pretrained_config is not None, "num_experts must be provided or model_config.pretrained_config must be set"
-        num_experts = pretrained_config.num_experts
-    if hidden_size is None:
-        assert pretrained_config is not None, "hidden_size must be provided or model_config.pretrained_config must be set"
-        hidden_size = pretrained_config.hidden_size
-    if intermediate_size is None:
-        assert pretrained_config is not None, "intermediate_size must be provided or model_config.pretrained_config must be set"
-        # For MoE models, prefer moe_intermediate_size if available
-        if hasattr(pretrained_config, 'moe_intermediate_size'):
-            intermediate_size = pretrained_config.moe_intermediate_size
-        else:
-            intermediate_size = pretrained_config.intermediate_size
-    if dtype is None and pretrained_config is not None and hasattr(
-            pretrained_config, 'torch_dtype'):
-        dtype = pretrained_config.torch_dtype
+    shapes = derive_moe_layer_shapes(
+        model_config,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        routing=routing_method,
+    )
+    num_experts = shapes.num_experts
+    hidden_size = shapes.hidden_size
+    intermediate_size = shapes.intermediate_size
+    dtype = shapes.dtype
+    assert num_experts is not None, (
+        "num_experts must be provided or model_config.pretrained_config must "
+        "expose num_experts / n_routed_experts / num_local_experts")
+    assert hidden_size is not None, (
+        "hidden_size must be provided or model_config.pretrained_config must be set"
+    )
+    assert intermediate_size is not None, (
+        "intermediate_size must be provided or model_config.pretrained_config "
+        "must expose moe_intermediate_size / intermediate_size")
 
-    moe_cls = resolve_moe_cls(model_config, routing_method, dtype,
-                              override_quant_config, layer_idx)
+    # Pass the same shapes / activation package the layer will be built with.
+    moe_cls = resolve_moe_cls(
+        model_config,
+        override_quant_config=override_quant_config,
+        dtype=dtype,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        swiglu_gptoss_style=infer_swiglu_gptoss_style(
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            activation_type=activation_type,
+        ),
+        bias=bias,
+        activation_type=activation_type,
+        routing=routing_method,
+        layer_idx=layer_idx,
+    )
+    if (any(value is not None
+            for value in (activation, situ_beta, situ_linear_beta))
+            and moe_cls is not MegaMoEDeepGemm):
+        raise ValueError(
+            "MegaMoE DeepGEMM activation options require "
+            "MegaMoEDeepGemm without backend fallback, but resolved "
+            f"{moe_cls.__name__}.")
     if (any(value is not None for value in (trtllm_gen_activation_type,
                                             trtllm_gen_activation_alpha,
                                             trtllm_gen_activation_beta))
@@ -644,10 +476,13 @@ def create_moe(
             "TRTLLMGenFusedMoE without backend fallback, but resolved "
             f"{moe_cls.__name__}.")
 
-    if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                   CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
-                   MegaMoEDeepGemm, MegaMoECuteDsl, MarlinFusedMoE):
+    # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
+    # enough to be wrapped. Becoming *selectable* still needs the constructor
+    # branch in ``create_moe_backend`` above plus ``moe_resolution``'s
+    # ``IMPL_PRIORITY`` / ``BACKEND_FAMILY``.
+    if issubclass(moe_cls, MoEImplBase):
         return ConfigurableMoE(
+            moe_cls=moe_cls,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -666,13 +501,16 @@ def create_moe(
             swiglu_limit=swiglu_limit,
             swiglu_limit_scalar=swiglu_limit_scalar,
             activation_type=activation_type,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             trtllm_gen_activation_type=trtllm_gen_activation_type,
             trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             communication_method=communication_method,
         )
 
-    # WideEPMoE, TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
+    # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
     # and own their communication and forward paths.
     if communication_method is not None:
         raise ValueError("communication_method requires ConfigurableMoE.")
@@ -695,6 +533,9 @@ def create_moe(
         swiglu_limit=swiglu_limit,
         swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         trtllm_gen_activation_type=trtllm_gen_activation_type,
         trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
         trtllm_gen_activation_beta=trtllm_gen_activation_beta,

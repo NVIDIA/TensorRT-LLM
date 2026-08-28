@@ -276,9 +276,9 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     attn_out_latent = torch.randn(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
-    # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
-    # in-place, so clone before passing to preserve original for reference)
-    output = project_sparse_attn_output(mla, [attn_out_latent.clone()], position_ids)
+    # The non-fused MLA path stores attention output as a flattened 2D buffer.
+    # mla_rope_inplace modifies it in place, so preserve the 3D reference input.
+    output = project_sparse_attn_output(mla, [attn_out_latent.clone().flatten(1)], position_ids)
 
     # Calculate reference output
     if dtype_str == "bf16":
