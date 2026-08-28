@@ -696,10 +696,17 @@ class DecoderModelForCausalLM(nn.Module,
     ) -> Optional[Literal["CPP", "PYTHON"]]:
         """Return the model's preferred KV-cache transceiver runtime.
 
-        Subclasses can override this to opt into a specific transceiver
-        implementation ('CPP' or 'PYTHON') that is adopted when the user
-        leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'. Return None to defer to the global default (C++).
+        Subclasses can override this to pin a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
+        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'; unsupported configurations then fail loudly at
+        transceiver creation rather than being rerouted. Return None to
+        defer to the global default: the Python transceiver, falling back to
+        C++ only for conditions decidable from the transceiver config itself
+        (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other
+        incompatibilities fail at transceiver creation. The effective
+        runtime for a no-preference model is therefore
+        deployment-dependent.
 
         Args:
             pretrained_config: the loaded HF pretrained config (may be None
@@ -710,9 +717,9 @@ class DecoderModelForCausalLM(nn.Module,
 
         This preference is intentionally kept out of the generic
         :meth:`get_model_defaults` deep-merge: it must not materialize a
-        ``cache_transceiver_config`` when disaggregated serving is disabled,
-        and it is only honored when the effective backend supports it (the
-        Python transceiver requires NIXL).
+        ``cache_transceiver_config`` when disaggregated serving is disabled.
+        Preferences are adopted only for the 'auto' setting; a 'PYTHON'
+        preference still requires NIXL when the transceiver is created.
         """
         return None
 
