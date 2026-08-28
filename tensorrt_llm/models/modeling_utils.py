@@ -167,6 +167,40 @@ class QuantConfig(StrictBaseModel):
         "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness."
     )
 
+    # --- Kimi K3 FP8 weight-read knobs (opt-in decode-bandwidth optimization) ---
+    # Opt-in FP8 (e4m3, 128x128 block-scale) reads for selected replicated K3
+    # projections; lossy vs BF16, so off by default. ``None`` means unset;
+    # resolution (is_sm_100f() gate, deprecated-env fallback, per-knob defaults)
+    # lives in ``_torch/models/kimi_k3_knobs.py``. Per-knob detail on each field.
+    kimi_k3_fp8_weight_read: Optional[bool] = Field(
+        default=None,
+        description=
+        "Kimi K3: master FP8 block-scale weight read for the replicated MoE-layer "
+        "MLP/KDA/MLA projections (opt-in, additionally gated on is_sm_100f()). "
+        "None keeps the historical default (off).")
+    kimi_k3_fp8_weight_read_kda: Optional[bool] = Field(
+        default=None,
+        description=
+        "Kimi K3: read the KDA q/k/v/g/o projections at FP8 block-scale; narrows "
+        "an enabled master. None keeps the historical default (on).")
+    kimi_k3_fp8_weight_read_mla: Optional[bool] = Field(
+        default=None,
+        description=
+        "Kimi K3: read the MLA q_a/q_b/o/gate projections at FP8 block-scale; "
+        "narrows an enabled master. None keeps the historical default (on).")
+    kimi_k3_fp8_weight_read_gate_up: Optional[bool] = Field(
+        default=None,
+        description=
+        "Kimi K3: read the fused shared-expert gate_up_proj at FP8 block-scale; "
+        "narrows an enabled master. None follows the parallel layout (on under "
+        "attention DP, off otherwise).")
+    kimi_k3_kda_glue_fp8: Optional[bool] = Field(
+        default=None,
+        description=
+        "Kimi K3: rebuild the fused KDA decode-glue projection on top of the FP8 "
+        "modules; narrows an enabled FP8 KDA read. None keeps the historical "
+        "default (on).")
+
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
         quant_mode_list = [

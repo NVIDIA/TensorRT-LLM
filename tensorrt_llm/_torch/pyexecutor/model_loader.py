@@ -712,8 +712,9 @@ class ModelLoader:
 
                 _apply_to_buffers_only(model, allocate_buffer_on_cuda)
 
-                need_initialized_weights = load_format not in (LoadFormat.AUTO,
-                                                               LoadFormat.DUMMY)
+                need_initialized_weights = load_format not in (
+                    LoadFormat.AUTO, LoadFormat.DUMMY,
+                    LoadFormat.LAZY_SAFETENSORS)
 
                 def allocate_weights_on_cuda(t: torch.Tensor):
                     if t not in memo:
@@ -774,7 +775,13 @@ class ModelLoader:
             # prior to zero-copy mapping, then refreshes derived state after
             # real GMS tensors are bound.
             gms_post_load_handled = False
-            if load_format == LoadFormat.AUTO:
+            if load_format in (LoadFormat.AUTO, LoadFormat.LAZY_SAFETENSORS):
+                # LAZY_SAFETENSORS shares the AUTO disk-load path; it differs
+                # only in that the checkpoint weight loader opens shards lazily
+                # (streaming rank-local slices) instead of materializing the
+                # whole checkpoint. The load_lazily flag carries that choice
+                # down to HfWeightLoader so the shared loader dispatches on the
+                # resolved LoadFormat, not on any model name.
                 # Pass model= so format-specific loaders (e.g. MX) can
                 # write weights directly into parameter buffers via P2P.
                 # Generic loaders ignore model=; loaders that can consume a
@@ -784,6 +791,7 @@ class ModelLoader:
                     "model": model,
                     # Generic loaders ignore it; MXCheckpointLoader pops it.
                     "source_identity": self._source_identity,
+                    "load_lazily": load_format == LoadFormat.LAZY_SAFETENSORS,
                 }
                 if checkpoint_loader.checkpoint_format == "MX":
                     # If a separate draft model still needs a raw disk load,
@@ -1590,6 +1598,12 @@ class ModelLoader:
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         config.extra_attrs[
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
+        # Thread the Kimi K3 FP8 weight-read knobs onto the checkpoint-derived
+        # quant_config, which is built from hf_quant_config.json and does not
+        # otherwise carry the user's quant_config. A no-op for non-K3 runs.
+        # See _torch/models/kimi_k3_knobs.py.
+        from ..models.kimi_k3_knobs import carry_user_quant_knobs
+        carry_user_quant_knobs(self.llm_args.quant_config, config.quant_config)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

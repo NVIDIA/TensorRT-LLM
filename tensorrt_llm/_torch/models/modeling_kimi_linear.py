@@ -103,7 +103,6 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -121,6 +120,7 @@ from ..moe.fused_moe import ConfigurableMoE, create_moe
 from ..moe.fused_moe.interface import _compute_ep_partition
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..utils import ActivationType, ActType_TrtllmGen
+from .kimi_k3_knobs import resolve_fp8_weight_read_gates
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -142,60 +142,13 @@ if TYPE_CHECKING:
 # bounds. KIMI_K3_MLA_MAX_POSITIONS overrides the size for short-context
 # deployments.
 _KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
+# The FP8 block-scale weight-read knobs (master + KDA/MLA/gate_up/KDA-glue
+# sub-gates) live on ``QuantConfig`` and are resolved in ``kimi_k3_knobs``
+# (config value > deprecated env, warn-once > historical default).
 _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
     ".self_attn.mixer.k_b_proj_trans",
     ".self_attn.mixer.v_b_proj",
 )
-
-# Serve the replicated MoE-layer MLP projections (shared-expert gate/up/down
-# and the latent up/down projection) from an FP8 copy of their weights instead
-# of BF16. Under attention data-parallelism every rank re-reads these dense
-# weights in full on every decode step, so decode is bound by that HBM read;
-# an FP8 (e4m3) weight with 128x128 block scales roughly halves those bytes.
-# The MLA projections and the routed MXFP4 experts are left untouched (the KDA
-# q/k/v/g/o projections have their own switch below). The FP8 weight read is
-# lossy relative to BF16, so it is opt-in: set this to "1" to trade accuracy
-# for decode bandwidth. Default "0" keeps BF16, which is what the published
-# accuracy numbers are measured against.
-_KIMI_K3_FP8_WEIGHT_READ_ENV = "KIMI_K3_FP8_WEIGHT_READ"
-
-# Also read the KDA linear-attention q/k/v/g/o projections at FP8 block-scale.
-# These are the largest single replicated weight read (~61 GB/rank of the
-# ~109 GB BF16 read per decode step). They use the same FP8 path as the MLP
-# projections above but are gated separately: the recurrent linear-attention
-# core is more accuracy-sensitive than the feed-forward MLPs, so set this to
-# "0" to keep the KDA projections in BF16 while still reading the MLPs at FP8.
-# The master KIMI_K3_FP8_WEIGHT_READ switch and the SM100 gate still apply.
-_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV = "KIMI_K3_FP8_WEIGHT_READ_KDA"
-
-# Also read the MLA (full-attention) q_a/q_b/o and output-gate projections at
-# FP8 block-scale. These are the replicated attention weights the MLP pass and
-# the KDA pass above leave in BF16, and they are re-read in full by every rank
-# each decode step under attention data-parallelism. Two MLA projections are
-# deliberately kept in BF16: kv_a_proj_with_mqa outputs kv_lora_rank +
-# qk_rope_head_dim (576, not a multiple of 128, so no exact 128x128 block
-# scale), and kv_b_proj's weight is consumed directly (not through its forward)
-# by the absorbed-decode _kv_b_absorb_split to build the k/v absorb matrices,
-# which has no FP8 dequant path. The master KIMI_K3_FP8_WEIGHT_READ switch and
-# the SM100 gate still apply.
-_KIMI_K3_FP8_WEIGHT_READ_MLA_ENV = "KIMI_K3_FP8_WEIGHT_READ_MLA"
-
-# Expert override (prototype): set to "0" to drop the
-# KimiKDALinearAttention decode
-# fast path — fused qkvg and [f_a | b] projections, persistent conv staging,
-# and precomputed kernel-layout constants (``forward_decode``) — when the
-# KDA projections are read at FP8 block-scale. With the fast path kept (the
-# default on an enabled master), decode issues the loader's fused FP8
-# ``qkvg_proj`` GEMM for q/k/v/g plus one small BF16 GEMV for [f_a | b]
-# (``finalize_decode_weights_fp8``), so FP8 weight storage and the decode
-# glue savings coexist. Requires the FP8 KDA read to be active; no effect
-# otherwise. Default on ("0" disables).
-_KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
-
-# FP8 read for the fused shared-expert gate_up_proj. Default follows the
-# parallel layout (on under attention DP, off under TP — see the conversion
-# helper's comment); set 0/1 to force either.
-_KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
 
 
 class KimiK3MoEGate(nn.Module):
@@ -288,23 +241,6 @@ class KimiK3RMSNorm(nn.Module):
         variance = hidden_states_float.pow(2).mean(-1, keepdim=True)
         hidden_states_float = hidden_states_float * torch.rsqrt(variance + self.eps)
         return self.weight * hidden_states_float.to(input_dtype)
-
-
-def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
-    """Resolve the FP8 weight-read switches into (master, kda, kda_glue).
-
-    The master switch is opt-in: FP8 weight reads are lossy relative to BF16,
-    so a default run keeps BF16 and matches the published accuracy numbers.
-    The KDA and KDA-glue switches only narrow an already-enabled master, so
-    they stay default-on and are inert while the master is off.
-    """
-    fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "0") not in (
-        "",
-        "0",
-    )
-    kda_fp8 = fp8_weight_read and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
-    kda_glue_fp8 = kda_fp8 and os.environ.get(_KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
-    return fp8_weight_read, kda_fp8, kda_glue_fp8
 
 
 def _resolve_kimi_situ_betas(cfg: Any) -> tuple[float, float]:
@@ -2109,6 +2045,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
+        # - load_format=lazy_safetensors: the K3 checkpoint (~1.5 TB) must be
+        #   streamed shard-by-shard (rank-local slices only); eagerly loading
+        #   it into host RAM OOM-kills the job. Declaring the lazy LoadFormat
+        #   as the model default is how K3 opts into that path without any
+        #   model-name check in the shared weight loader, and without the user
+        #   having to set load_format. A user-set load_format still wins
+        #   (apply_model_defaults_to_llm_args honors explicit overrides).
         # - enable_block_reuse defaults off: reuse is supported as an
         #   explicit opt-in (routes to CppMambaHybridCacheManager with
         #   per-block KDA state snapshots); the default stays on the
@@ -2118,10 +2061,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   the fallback C++ path requires num_heads % 64 == 0, which K3's
         #   96 query heads violate.
         return {
+            "load_format": "lazy_safetensors",
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "tokens_per_block": 64,
-            }
+            },
         }
 
     @classmethod
@@ -2307,7 +2251,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         )
         # Keep each FP8_PB_WO checkpoint pair alongside the BF16
         # parameter only when the later weight-read conversion consumes it.
-        stash_ckpt_fp8 = _resolve_fp8_weight_read_gates()[0]
+        stash_ckpt_fp8 = resolve_fp8_weight_read_gates(
+            self.model_config.quant_config,
+            enable_attention_dp=self.model_config.mapping.enable_attention_dp,
+        ).master
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
         kda_tp_size, kda_tp_rank = 1, 0
@@ -2695,18 +2642,21 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # the bf16 wrapper fast path (finalize_decode_weights) is NOT built:
         # both fuse the same projections and the wrapper path — checked first
         # at decode — would bypass the FP8 modules entirely, leaving the FP8
-        # copies resident but inert. KIMI_K3_FP8_WEIGHT_READ_KDA=0 restores
-        # the bf16 wrapper fast path; KIMI_K3_KDA_GLUE_FP8=1 instead rebuilds
-        # the wrapper fast path on top of the FP8 modules after the
+        # copies resident but inert. quant_config.kimi_k3_fp8_weight_read_kda=0
+        # restores the bf16 wrapper fast path; kimi_k3_kda_glue_fp8=1 instead
+        # rebuilds the wrapper fast path on top of the FP8 modules after the
         # conversion (finalize_decode_weights_fp8), so neither is traded away.
-        fp8_weight_read, kda_fp8, kda_glue_fp8 = _resolve_fp8_weight_read_gates()
+        gates = resolve_fp8_weight_read_gates(
+            self.model_config.quant_config,
+            enable_attention_dp=self.model_config.mapping.enable_attention_dp,
+        )
 
         # Build the KDA fused projection views and decode kernel constants.
         # This must run after every KDA parameter is loaded and sharded.
         num_kda_fused = 0
         for layer in self.model.layers:
             if getattr(layer, "is_kda", False) and _has_weights(layer):
-                if not kda_fp8:
+                if not gates.kda:
                     layer.linear_attn.finalize_decode_weights()
                 num_kda_fused += int(
                     layer.linear_attn._qkvg_proj_weight is not None
@@ -2729,14 +2679,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # FP8 block-scale weight read for the replicated MoE-layer MLPs. The
         # DeepGEMM fp8_swap_ab_gemm kernel is Blackwell-only; keep BF16 on any
         # other SM or when explicitly disabled.
-        if fp8_weight_read:
-            gate_up_default = "1" if self.model_config.mapping.enable_attention_dp else "0"
+        if gates.master:
             n_fp8 = _convert_moe_mlps_to_fp8_weight_read(
                 self.model,
-                include_fused_gate_up=os.environ.get(
-                    _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV, gate_up_default
-                )
-                != "0",
+                include_fused_gate_up=gates.gate_up,
             )
             logger.info(
                 f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "
@@ -2746,14 +2692,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # weight read; convert them to the same FP8 block-scale read unless
             # kept in BF16 for accuracy (their own switch — the recurrent core
             # is the most precision-sensitive slice).
-            if os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0":
+            if gates.kda:
                 n_kda = _convert_kda_projections_to_fp8_weight_read(self.model)
                 logger.info(
                     f"Kimi K3: reading {n_kda} KDA q/k/v/g/o projections "
                     f"at FP8 block-scale (q/k/v/g fused into one prefill/decode/verify GEMM "
                     f"per layer)"
                 )
-                if kda_glue_fp8:
+                if gates.kda_glue:
                     # Rebuild the fused projection path on top of the FP8
                     # modules. This must run after the conversion above so
                     # fused FP8 qkvg_proj exists and only [f_a | b] is fused
@@ -2772,7 +2718,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # leave in BF16; convert them to the same FP8 block-scale read
             # (kv_a/kv_b stay BF16 — see the switch's comment) unless kept in
             # BF16 for accuracy.
-            if os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MLA_ENV, "1") != "0":
+            if gates.mla:
                 n_mla = _convert_mla_projections_to_fp8_weight_read(self.model)
                 logger.info(
                     f"Kimi K3: reading {n_mla} MLA q_a/q_b/o/g projections at FP8 block-scale"

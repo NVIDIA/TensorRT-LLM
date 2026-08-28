@@ -37,7 +37,7 @@ reuses everything numerically identical from the K2.5 implementation:
 """
 
 import copy
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,6 +76,9 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # ---------------------------------------------------------------------------
 # Native MoonViT3d Vision Encoder Components (K3 deltas)
@@ -458,6 +461,18 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     """
 
     _VISION_MODEL_CLS = KimiK3VisionModel
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> Dict[str, str]:
+        """Default this model to the lazy safetensors load format.
+
+        The K3 checkpoint (~1.5 TB) must be streamed shard-by-shard, so K3
+        declares the lazy ``LoadFormat`` as its default now that the shared
+        loader no longer sniffs K3 by model type. This wrapper subclasses HF
+        ``PreTrainedModel``, not the TRT-LLM base, so there is no inherited
+        ``get_model_defaults`` to extend. A user-set ``load_format`` still wins.
+        """
+        return {"load_format": "lazy_safetensors"}
 
     def __init__(
         self,
