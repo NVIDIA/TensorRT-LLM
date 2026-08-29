@@ -1202,8 +1202,17 @@ class PrimsTSFmha(PhasedFmha):
         if plan_state is None:
             raise RuntimeError("PrimTS decode wrapper has no compiled plan.")
         workspace_layout = plan_state.workspace_layout
-        control_offset = workspace_layout.split_kv_counter.byte_offset
-        decode_workspace[control_offset : workspace_layout.total_bytes].zero_()
+        # Only the fused global-memory reducer consumes the counter/control
+        # tail. Direct, cluster-reduced, and separately reduced plans either
+        # overwrite their scratch or do not read this span.
+        policy = dict(plan_state.policy)
+        requires_control_reset = bool(policy["use_split_kv"]) and not (
+            bool(policy["use_separate_reduction_kernel"])
+            or bool(policy["use_cluster_smem_reduction"])
+        )
+        if requires_control_reset:
+            control_offset = workspace_layout.split_kv_counter.byte_offset
+            decode_workspace[control_offset : workspace_layout.total_bytes].zero_()
         wrapper.run(
             query,
             (k_cache, v_cache),

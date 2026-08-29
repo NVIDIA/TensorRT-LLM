@@ -1013,13 +1013,33 @@ def test_context_wrapper_plans_once_and_reads_per_run_staged_metadata(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "use_split_kv",
+        "use_separate_reduction_kernel",
+        "use_cluster_smem_reduction",
+        "requires_control_reset",
+    ),
+    (
+        pytest.param(False, False, False, False, id="direct"),
+        pytest.param(True, False, False, True, id="fused-global-reduction"),
+        pytest.param(True, True, False, False, id="separate-reduction"),
+        pytest.param(True, False, True, False, id="cluster-smem-reduction"),
+    ),
+)
 def test_generation_wrapper_plans_once_and_reads_live_native_csr(
     monkeypatch: pytest.MonkeyPatch,
+    use_split_kv: bool,
+    use_separate_reduction_kernel: bool,
+    use_cluster_smem_reduction: bool,
+    requires_control_reset: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 120
+    fmha._decode_workspace_offset_bytes = 0
+    fmha._decode_workspace_required_bytes = 64
     fmha_workspace = torch.empty(0, dtype=torch.uint8)
     q_processed = torch.empty((2, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
     kv_pool = torch.empty((12, attn.num_kv_heads, 32, attn.head_dim), dtype=torch.bfloat16)
@@ -1048,14 +1068,17 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
     )
     wrapper = Mock()
     wrapper._plan_state = SimpleNamespace(
+        policy=(
+            ("use_split_kv", use_split_kv),
+            ("use_separate_reduction_kernel", use_separate_reduction_kernel),
+            ("use_cluster_smem_reduction", use_cluster_smem_reduction),
+        ),
         workspace_layout=SimpleNamespace(
             total_bytes=64,
             split_kv_counter=SimpleNamespace(byte_offset=32),
-        )
+        ),
     )
     wrapper_factory = Mock(return_value=wrapper)
-    fmha._decode_workspace_offset_bytes = 0
-    fmha._decode_workspace_required_bytes = 64
     monkeypatch.setattr(
         prims_ts_module.thop,
         "trtllm_gen_generation_preprocess",
@@ -1132,8 +1155,9 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
         32,
         128,
     )
-    assert plan_kwargs["workspace_buffer"].data_ptr() == params.workspace.data_ptr()
-    assert plan_kwargs["workspace_buffer"].numel() == 64
+    decode_workspace = plan_kwargs["workspace_buffer"]
+    assert decode_workspace.data_ptr() == params.workspace.data_ptr()
+    assert decode_workspace.numel() == 64
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
         "max_seq_len_q": 1,
         "packed_query": False,
@@ -1143,6 +1167,7 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
         "mask_type": "causal",
         "window_left": 15,
     }
+    assert fmha._decode_wrappers[2] is wrapper
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
@@ -1166,7 +1191,13 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["validate"] is False
     torch.testing.assert_close(params.workspace[:32], torch.full((32,), 7, dtype=torch.uint8))
-    assert torch.count_nonzero(params.workspace[32:]) == 0
+    if requires_control_reset:
+        assert torch.count_nonzero(params.workspace[32:]) == 0
+    else:
+        torch.testing.assert_close(
+            params.workspace[32:],
+            torch.full((32,), 7, dtype=torch.uint8),
+        )
     preprocess_args = generation_preprocess.call_args.args
     assert preprocess_args[15] == params.seq_offset
     assert preprocess_args[39] == total_num_blocks
@@ -1187,7 +1218,13 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
     )
     torch.testing.assert_close(run_args[2], torch.tensor([34, 65], dtype=torch.int32))
     torch.testing.assert_close(params.workspace[:32], torch.full((32,), 9, dtype=torch.uint8))
-    assert torch.count_nonzero(params.workspace[32:]) == 0
+    if requires_control_reset:
+        assert torch.count_nonzero(params.workspace[32:]) == 0
+    else:
+        torch.testing.assert_close(
+            params.workspace[32:],
+            torch.full((32,), 9, dtype=torch.uint8),
+        )
 
 
 def test_decode_layer_adapters_bind_the_same_shared_workspace(
