@@ -69,10 +69,7 @@ class VanillaAttentionMetadata(AttentionMetadata):
         self._layer_specific_cache_indices_manager: Optional[object] = None
         self._uses_layer_specific_cache_indices_cache: Optional[bool] = None
 
-    def _uses_layer_specific_cache_indices(self) -> bool:
-        manager = self.kv_cache_manager
-        if manager is None:
-            return False
+    def _uses_layer_specific_cache_indices(self, manager: object) -> bool:
         if (self._layer_specific_cache_indices_manager is manager
                 and self._uses_layer_specific_cache_indices_cache is not None):
             return self._uses_layer_specific_cache_indices_cache
@@ -95,15 +92,16 @@ class VanillaAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
-        if self.kv_cache_manager is None:
+        manager = self.kv_cache_manager
+        if manager is None:
             self.block_ids_per_seq = None
             return
         assert self.request_ids is not None
         # Metadata is shared across layers, so a layer-specific lookup must
         # happen when the attention layer executes.
         self.block_ids_per_seq = (
-            None if self._uses_layer_specific_cache_indices() else
-            self.kv_cache_manager.get_batch_cache_indices(self.request_ids))
+            None if self._uses_layer_specific_cache_indices(manager) else
+            manager.get_batch_cache_indices(self.request_ids))
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
