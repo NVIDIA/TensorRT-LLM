@@ -50,12 +50,14 @@ Enable: ``LlmArgs.enable_return_routed_experts`` (engine) +
 prefix caching, and the overlap scheduler all ON. CUTLASS / DeepGemm separated
 routing only; fused backends fail closed (``assert_capturable``).
 """
+
 import builtins
 import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
 # NeMo-RL contract: -1 => genuinely missing route (fail-closed). Final/padding
@@ -99,7 +101,9 @@ class RouteCopier:
     def __init__(self, device: torch.device, shape: Tuple[int, int, int], ring: int = 3) -> None:
         self._device = device
         self._stream = torch.cuda.Stream(device=device)
-        self._ring = [torch.empty(shape, dtype=torch.int32, pin_memory=True) for _ in range(ring)]
+        self._ring = [
+            torch.empty(shape, dtype=torch.int32, pin_memory=prefer_pinned()) for _ in range(ring)
+        ]
         self._done: List[Optional[torch.cuda.Event]] = [None] * ring  # per-slot D2H event
         self._pending: List[Tuple[int, list, int, torch.cuda.Event]] = []
         self._slot = 0
@@ -110,12 +114,12 @@ class RouteCopier:
             return
         cur = torch.cuda.current_stream(self._device)
         fwd_done = torch.cuda.Event()
-        fwd_done.record(cur)                      # forward finished writing buf
+        fwd_done.record(cur)  # forward finished writing buf
         slot = self._slot
         prev = self._done[slot]
         if prev is not None and not prev.query():  # ring slot still in flight — rare safety sync
             prev.synchronize()
-        self._stream.wait_event(fwd_done)          # side stream waits for the forward
+        self._stream.wait_event(fwd_done)  # side stream waits for the forward
         with torch.cuda.stream(self._stream):
             self._ring[slot][:n].copy_(buf[:n], non_blocking=True)
             d2h = torch.cuda.Event()
@@ -180,7 +184,8 @@ class RouteCapture:
                 raise RuntimeError(
                     "[R3] enable_return_routed_experts is not supported with "
                     f"pipeline parallelism (pp_size={pp}) or speculative decoding "
-                    f"(is_spec_decode={spec}); disable one of them or the feature.")
+                    f"(is_spec_decode={spec}); disable one of them or the feature."
+                )
         if _get_singleton() is not None:
             return  # idempotent: a second create() (draft + main model_engine)
             #          must not drop the store the capture hook is writing to.
@@ -278,8 +283,8 @@ class RouteCapture:
                 pyr._additional_generation_outputs.setdefault("routed_experts", [])
                 pyr.append_additional_generation_outputs("routed_experts", routes)
                 m._attached.add(rid)
-                m._populate_prefix(request, rid)   # store this req's blocks for reuse
-                m.free(rid)   # bound memory once safely attached
+                m._populate_prefix(request, rid)  # store this req's blocks for reuse
+                m.free(rid)  # bound memory once safely attached
         except Exception:
             pass
 
@@ -290,7 +295,7 @@ class RouteCapture:
         self._iter_id: Optional[int] = None
         # store[req_id][abs_pos] -> int16 [L, K]  (write-once per (req, pos))
         self._store: Dict[int, Dict[int, torch.Tensor]] = {}
-        self._gen_count: Dict[int, int] = {}      # decode-position fallback counter
+        self._gen_count: Dict[int, int] = {}  # decode-position fallback counter
         self._layout: Optional[List[Tuple[Optional[int], int]]] = None
         self._attached: set = set()
 
@@ -301,26 +306,26 @@ class RouteCapture:
         # requests); cleared on reset_prefix_cache. key = hash(tuple(tokens[:end]))
         # -> int16 [tokens_per_block, L, K].
         self._shared: Dict[int, torch.Tensor] = {}
-        self._tpb: int = 0                        # tokens_per_block (from V2 kv mgr)
-        self._readback_done: set = set()          # rids fully read back (once each)
-        self._pfx_hits: int = 0                   # diagnostics: blocks filled from cache
+        self._tpb: int = 0  # tokens_per_block (from V2 kv mgr)
+        self._readback_done: set = set()  # rids fully read back (once each)
+        self._pfx_hits: int = 0  # diagnostics: blocks filled from cache
         # incremental populate: a request's prompt-region blocks are pushed to the
         # SharedRouteCache as soon as they land in the store (finish_forward,
         # after drain) — NOT at request finish, which is too late for concurrent
         # siblings that hit the same prompt before the owner finishes.
-        self._req_toks: Dict[int, list] = {}      # rid -> prompt token list
-        self._req_plen: Dict[int, int] = {}       # rid -> prompt_len
-        self._req_hashes: Dict[int, list] = {}    # rid -> cumulative prefix hashes
-        self._pop_cursor: Dict[int, int] = {}     # rid -> next prompt pos to store
-        self._prefix_populated: set = set()       # rids whose prompt positions are all stored
-        self._had_context: bool = False           # this forward had prefill -> force-drain
+        self._req_toks: Dict[int, list] = {}  # rid -> prompt token list
+        self._req_plen: Dict[int, int] = {}  # rid -> prompt_len
+        self._req_hashes: Dict[int, list] = {}  # rid -> cumulative prefix hashes
+        self._pop_cursor: Dict[int, int] = {}  # rid -> next prompt pos to store
+        self._prefix_populated: set = set()  # rids whose prompt positions are all stored
+        self._had_context: bool = False  # this forward had prefill -> force-drain
 
         # device buffer + copier: allocated lazily on the first eager capture
         # (warmup runs an eager forward before graph capture — model is loaded
         # and we are NOT stream-capturing there, so allocation is legal).
         self._buf: Optional[torch.Tensor] = None
         self._copier: Optional[RouteCopier] = None
-        self._layer_pos: Dict[int, int] = {}      # global layer_idx -> [0, L)
+        self._layer_pos: Dict[int, int] = {}  # global layer_idx -> [0, L)
         self._L: int = 0
         self._K: int = 0
 
@@ -337,9 +342,11 @@ class RouteCapture:
             # runs an eager warmup before graph capture).
             if not getattr(self, "_warned_capture_alloc", False):
                 self._warned_capture_alloc = True
-                logger.warning("[R3] first MoE capture during graph capture with "
-                      "no buffer — routes for this graph key will be missing. "
-                      "Expected an eager warmup forward first.")
+                logger.warning(
+                    "[R3] first MoE capture during graph capture with "
+                    "no buffer — routes for this graph key will be missing. "
+                    "Expected an eager warmup forward first."
+                )
             return  # warmup eager allocates first
         # Read the MoE-layer registry via the CANONICAL context-local accessor
         # ``get_model_extra_attrs()`` — the exact source the MoE forward itself
@@ -351,6 +358,7 @@ class RouteCapture:
         moe = None
         try:
             from tensorrt_llm._torch.utils import get_model_extra_attrs
+
             attrs = get_model_extra_attrs()
             if attrs is not None:
                 moe = attrs.get("moe_layers")
@@ -373,11 +381,11 @@ class RouteCapture:
         # an inplace update to an inference tensor is disallowed. inference_mode
         # (False) makes them normal so the D2H copy is legal.
         with torch.inference_mode(False):
-            self._buf = torch.empty(max_tok, self._L, self._K,
-                                    dtype=torch.int32, device=tse.device)
+            self._buf = torch.empty(max_tok, self._L, self._K, dtype=torch.int32, device=tse.device)
             self._copier = RouteCopier(tse.device, (max_tok, self._L, self._K))
-        logger.debug(f"[R3] route buffer allocated: L={self._L} K={self._K} "
-              f"max_num_tokens={max_tok}")
+        logger.debug(
+            f"[R3] route buffer allocated: L={self._L} K={self._K} max_num_tokens={max_tok}"
+        )
 
     # ---- driven by py_executor, once per forward (via the static facade) ----
     def _prepare(self, scheduled_batch) -> None:
@@ -461,8 +469,7 @@ class RouteCapture:
             except Exception as e:
                 if not getattr(self, "_warned_stage", False):
                     self._warned_stage = True
-                    logger.warning(
-                        f"[R3] stage/commit failed (routes will be missing): {e}")
+                    logger.warning(f"[R3] stage/commit failed (routes will be missing): {e}")
         self._layout = None  # disarm between forwards (excludes stray/warmup calls)
 
     def _capture(self, layer_id: int, tse: torch.Tensor) -> None:
@@ -487,10 +494,10 @@ class RouteCapture:
         rows = host_rows.to(torch.int16)
         for r in range(min(rows.shape[0], len(layout))):
             rid, pos = layout[r]
-            if rid is None:      # dummy / padding row
+            if rid is None:  # dummy / padding row
                 continue
             per_req = self._store.setdefault(rid, {})
-            if pos not in per_req:            # write-once per (req, pos)
+            if pos not in per_req:  # write-once per (req, pos)
                 per_req[pos] = rows[r].clone()
 
     # ---- assemble on completion (production output path calls this) ----
@@ -501,7 +508,7 @@ class RouteCapture:
         pos_map = self._store.get(req_id)
         if not pos_map:
             return None
-        keep = max(pos_map)                          # positions [0, keep) = n-1 rows
+        keep = max(pos_map)  # positions [0, keep) = n-1 rows
         if keep <= 0:
             return None
         sample = next(iter(pos_map.values()))
@@ -511,8 +518,8 @@ class RouteCapture:
             row = pos_map.get(pos)
             if row is None:
                 raise ValueError(
-                    f"[R3] request {req_id} position {pos} missing (internal gap) "
-                    f"-> fail-closed")
+                    f"[R3] request {req_id} position {pos} missing (internal gap) -> fail-closed"
+                )
             out[pos] = row
         return out
 
@@ -566,14 +573,18 @@ class RouteCapture:
                 C = int(getattr(req, "prepopulated_prompt_len", 0) or 0)
                 if C > 0 and not getattr(self, "_hit_warned", False):
                     self._hit_warned = True
-                    logger.debug(f"[R3][pfx] prefix HIT seen: prepopulated={C} "
-                          f"cache_size={len(self._shared)}")
+                    logger.debug(
+                        f"[R3][pfx] prefix HIT seen: prepopulated={C} "
+                        f"cache_size={len(self._shared)}"
+                    )
                 if C <= 0:
                     self._readback_done.add(rid)
                     continue
                 hashes = self._hashes_for(
-                    rid, self._req_toks.get(rid) or self._safe_tokens(req),
-                    self._req_plen.get(rid) or int(getattr(req, "py_prompt_len", 0) or 0))
+                    rid,
+                    self._req_toks.get(rid) or self._safe_tokens(req),
+                    self._req_plen.get(rid) or int(getattr(req, "py_prompt_len", 0) or 0),
+                )
                 if not hashes:
                     continue
                 per_req = self._store.setdefault(rid, {})
@@ -583,14 +594,16 @@ class RouteCapture:
                         continue
                     row = self._shared.get(hashes[p])
                     if row is None:
-                        missing += 1                       # not populated yet — retry
+                        missing += 1  # not populated yet — retry
                         continue
-                    per_req[p] = row                        # reference, no copy
+                    per_req[p] = row  # reference, no copy
                     self._pfx_hits += 1
                     if not getattr(self, "_pfx_warned", False):
                         self._pfx_warned = True
-                        logger.debug("[R3] prefix-cache readback active: filled position "
-                              "from SharedRouteCache")
+                        logger.debug(
+                            "[R3] prefix-cache readback active: filled position "
+                            "from SharedRouteCache"
+                        )
                 if missing == 0:
                     self._readback_done.add(rid)
             except Exception:
@@ -610,14 +623,15 @@ class RouteCapture:
         while cur < n:
             row = pos_map.get(cur)
             if row is None:
-                break                                     # not captured yet — resume next step
+                break  # not captured yet — resume next step
             key = hashes[cur]
-            if key not in self._shared:                   # write-once
+            if key not in self._shared:  # write-once
                 self._shared[key] = row
                 if not getattr(self, "_pop_warned", False):
                     self._pop_warned = True
-                    logger.debug(f"[R3][pfx] populate: stored first position, "
-                          f"cache_size={len(self._shared)}")
+                    logger.debug(
+                        f"[R3][pfx] populate: stored first position, cache_size={len(self._shared)}"
+                    )
             cur += 1
         self._pop_cursor[rid] = cur
         if cur >= n:
@@ -670,4 +684,5 @@ def assert_capturable(moe_backend) -> None:
             f"[R3] router_replay requires separated routing, but MoE backend "
             f"{type(moe_backend).__name__} uses fused routing (top-k inside the "
             f"kernel). Use a separated-routing backend (CUTLASS is the default) or "
-            f"disable router_replay.")
+            f"disable router_replay."
+        )

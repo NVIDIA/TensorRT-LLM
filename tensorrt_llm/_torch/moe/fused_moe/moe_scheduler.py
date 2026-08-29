@@ -46,9 +46,9 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
-from tensorrt_llm._torch.route_capture import RouteCapture  # R3
 
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.route_capture import RouteCapture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 

@@ -54,7 +54,6 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
-from ..route_capture import RouteCapture
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -66,6 +65,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from ..route_capture import RouteCapture
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
@@ -470,7 +470,8 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
-            RouteCapture.create(rank=self.dist.rank, model_engine=self)  # R3 router-replay
+            RouteCapture.create(rank=self.dist.rank,
+                                model_engine=self)  # R3 router-replay
         self.llm_args = llm_args
         # Opt-in tiered sampling captured into the forward graph. Off by
         # default: it captures one extra graph per enabled tier, which costs
