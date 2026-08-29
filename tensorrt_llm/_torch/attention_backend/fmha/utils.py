@@ -13,11 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import torch
 
 from tensorrt_llm.bindings.internal import thop
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 
 
 @lru_cache(maxsize=128)
@@ -44,3 +49,16 @@ def get_trtllm_gen_context_workspace_size(
         fp8_context_fmha,
     )
     return int(layout["total_size"])
+
+
+@lru_cache(maxsize=None)
+def get_multi_processor_count_for_device(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def get_bmm1_scale(attn: "TrtllmAttention") -> float:
+    return 1.0 / (math.sqrt(attn.head_dim) * attn.q_scaling)
+
+
+def get_attention_chunk_size(attn: "TrtllmAttention") -> int:
+    return attn.attention_chunk_size if attn.attention_chunk_size is not None else 0

@@ -463,9 +463,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 = static_cast<size_t>(global_token_idx) * input_hidden_size + src_v_offset + hidden_idx_kv;
 
             VecType q, q_pair;
-            VecType k{}, v{}, k_pair{};
+            VecType k, v, k_pair;
             // key without position embedding
-            VecType k_wo_pos{};
+            VecType k_wo_pos;
 
             // load q,k,v and add bias
             if (valid_head_dim_idx)
@@ -477,6 +477,12 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                     k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
                     v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
                     k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                }
+                else
+                {
+                    // The rotary helpers update Q and K together. Reuse Q as the ignored K input.
+                    k = q;
+                    k_pair = q_pair;
                 }
 
                 if constexpr (ADD_BIAS)
@@ -888,16 +894,22 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             = static_cast<size_t>(bounded_global_token_idx) * input_hidden_size + src_v_offset + hidden_idx_kv;
 
         auto q = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx]);
-        VecT k{};
-        VecT v{};
+        VecT k;
+        VecT v;
         [[maybe_unused]] auto q_pair
             = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-        [[maybe_unused]] VecT k_pair{};
+        [[maybe_unused]] VecT k_pair;
         if (!params.q_only_input)
         {
             k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
             v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
             k_pair = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        }
+        else
+        {
+            // The rotary helpers update Q and K together. Reuse Q as the ignored K input.
+            k = q;
+            k_pair = q_pair;
         }
 
         // Bias should have been fused with QKV projection, but we keep the logic here for unit tests.

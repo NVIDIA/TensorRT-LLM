@@ -16,7 +16,6 @@
 """Triton custom-mask context attention for the TRT-LLM backend."""
 
 import math
-from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,7 +31,12 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .trtllm_gen_utils import get_trtllm_gen_context_workspace_size
+from .utils import (
+    get_attention_chunk_size,
+    get_bmm1_scale,
+    get_multi_processor_count_for_device,
+    get_trtllm_gen_context_workspace_size,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -113,6 +117,10 @@ class TritonCustomMaskFmha(PhasedFmha):
             return False, "Custom-mask cross attention is not supported."
         if metadata.kv_cache_block_offsets is None:
             return False, "Custom-mask TRT-LLM attention requires paged KV cache."
+        if metadata.kv_layout != "HND":
+            return False, "Custom-mask TRT-LLM attention requires HND KV-cache layout."
+        if getattr(metadata.kv_cache_manager, "enable_swa_scratch_reuse", False):
+            return False, "Custom-mask TRT-LLM attention does not support SWA scratch reuse."
         if self.attn.is_mla_enable:
             return False, "Custom-mask MLA is not supported."
         if not forward_args.is_fused_qkv or k is not None or v is not None:
@@ -139,11 +147,6 @@ class TritonCustomMaskFmha(PhasedFmha):
 
         return True, ""
 
-    @staticmethod
-    @lru_cache(maxsize=None)
-    def _get_multi_processor_count_for_device(device_index: int) -> int:
-        return torch.cuda.get_device_properties(device_index).multi_processor_count
-
     @classmethod
     def _get_multi_processor_count(cls, device: torch.device) -> int:
         device = torch.device(device)
@@ -152,15 +155,7 @@ class TritonCustomMaskFmha(PhasedFmha):
         device_index = device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        return cls._get_multi_processor_count_for_device(device_index)
-
-    @staticmethod
-    def _get_bmm1_scale(attn: "TrtllmAttention") -> float:
-        return 1.0 / (math.sqrt(attn.head_dim) * attn.q_scaling)
-
-    @staticmethod
-    def _get_attention_chunk_size(attn: "TrtllmAttention") -> int:
-        return attn.attention_chunk_size if attn.attention_chunk_size is not None else 0
+        return get_multi_processor_count_for_device(device_index)
 
     def prepare_workspace(
         self,
@@ -200,12 +195,12 @@ class TritonCustomMaskFmha(PhasedFmha):
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        bmm1_scale = self._get_bmm1_scale(attn)
-        attention_chunk_size = self._get_attention_chunk_size(attn)
+        bmm1_scale = get_bmm1_scale(attn)
+        attention_chunk_size = get_attention_chunk_size(attn)
 
         (
             q_processed,
-            kv_pool,
+            _,
             block_tables,
             _,
             _,
@@ -263,7 +258,7 @@ class TritonCustomMaskFmha(PhasedFmha):
             False,  # cross_attention
         )
 
-        if kv_pool is None or block_tables is None:
+        if block_tables is None:
             raise RuntimeError("Custom-mask TRT-LLM attention requires paged KV metadata.")
         if params.qkv_input is None or params.context_buf is None:
             raise RuntimeError(
@@ -300,6 +295,25 @@ class TritonCustomMaskFmha(PhasedFmha):
             - params.context_lengths[: params.batch_size]
         )
 
+        if meta.kv_cache_manager is None:
+            raise RuntimeError("Custom-mask TRT-LLM attention requires a KV cache manager.")
+        kv_cache = meta.kv_cache_manager.get_buffers(
+            attn.layer_idx,
+            kv_layout=meta.kv_layout,
+        )
+        if kv_cache is None:
+            raise RuntimeError("Custom-mask TRT-LLM attention requires a KV cache buffer.")
+
+        # TRTLLM block tables index a flat physical-page pool, while get_buffers()
+        # groups K and V into each logical page. Convert the physical K-page IDs
+        # to indices in that packed view using its actual storage strides.
+        physical_pages_per_logical_page = kv_cache.stride(0) // kv_cache.stride(1)
+        page_table_indices = torch.div(
+            block_tables[:, 0, :],
+            physical_pages_per_logical_page,
+            rounding_mode="floor",
+        ).reshape(-1)
+
         from ..triton_prefill import triton_prefill_with_custom_mask
 
         triton_prefill_with_custom_mask(
@@ -308,15 +322,12 @@ class TritonCustomMaskFmha(PhasedFmha):
             v=v_processed,
             output=params.context_buf,
             qo_indptr=cu_q_seqlens,
-            kv_cache=None,
+            kv_cache=kv_cache,
             prefix_lens=prefix_lens,
             page_table_indptr=page_table_indptr,
-            page_table_indices=block_tables[:, 0, :].reshape(-1),
+            page_table_indices=page_table_indices,
             page_size=params.tokens_per_block,
             custom_mask=fwd.attention_mask_data.flatten().contiguous(),
             sm_scale=bmm1_scale,
             window_left=window_left,
-            k_cache=kv_pool,
-            v_cache=kv_pool,
-            v_page_table_indices=block_tables[:, 1, :].reshape(-1),
         )

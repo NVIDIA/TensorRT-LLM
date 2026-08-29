@@ -60,7 +60,12 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase, _CuteDslMlaStagingKey
 from .phased import FmhaParams, PhasedFmha
-from .trtllm_gen_utils import get_trtllm_gen_context_workspace_size
+from .utils import (
+    get_attention_chunk_size,
+    get_bmm1_scale,
+    get_multi_processor_count_for_device,
+    get_trtllm_gen_context_workspace_size,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -569,14 +574,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return kv_cache_manager.dtype
         return None
 
-    @staticmethod
-    def _get_bmm1_scale(attn: "TrtllmAttention") -> float:
-        return 1.0 / (math.sqrt(attn.head_dim) * attn.q_scaling)
-
-    @staticmethod
-    def _get_attention_chunk_size(attn: "TrtllmAttention") -> int:
-        return attn.attention_chunk_size if attn.attention_chunk_size is not None else 0
-
     @classmethod
     def _check_mla_generation_support(
         cls,
@@ -856,11 +853,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    @staticmethod
-    @lru_cache(maxsize=None)
-    def _get_multi_processor_count_for_device(device_index: int) -> int:
-        return torch.cuda.get_device_properties(device_index).multi_processor_count
-
     def _get_multi_processor_count(self, device: torch.device) -> int:
         device = torch.device(device)
         if device.type != "cuda":
@@ -868,7 +860,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         device_index = device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        return self._get_multi_processor_count_for_device(device_index)
+        return get_multi_processor_count_for_device(device_index)
 
     def _use_fp8_context_fmha(
         self,
@@ -1051,8 +1043,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        bmm1_scale_static = self._get_bmm1_scale(attn)
-        attention_chunk_size = self._get_attention_chunk_size(attn)
+        bmm1_scale_static = get_bmm1_scale(attn)
+        attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         (
@@ -1209,8 +1201,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        bmm1_scale_static = self._get_bmm1_scale(attn)
-        attention_chunk_size = self._get_attention_chunk_size(attn)
+        bmm1_scale_static = get_bmm1_scale(attn)
+        attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.num_requests * meta.beam_width
@@ -1335,7 +1327,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise NotImplementedError(
                 "Sliding-window attention is not supported by MLA decode path."
             )
-        if self._get_attention_chunk_size(attn) != 0:
+        if get_attention_chunk_size(attn) != 0:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * meta.beam_width
