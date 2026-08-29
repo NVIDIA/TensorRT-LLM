@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -159,6 +159,25 @@ def get_text_model_config(
     text_cfg = get_text_config(cfg.pretrained_config)
     cfg = dataclasses.replace(cfg, pretrained_config=text_cfg)
     return cfg
+
+
+def _validate_sparse_attention_runtime_config(
+    model_config: "ModelConfig[PretrainedConfig]",
+) -> None:
+    """Require the runtime backend that owns M3's metadata and index cache.
+
+    Both dense and sparse M3 layers use that cache manager, independent of
+    checkpoint precision or GPU architecture. Backend-specific constraints,
+    such as MSA requiring SM100, are validated by the backend itself.
+    """
+    sparse_config = model_config.sparse_attention_config
+    if sparse_config is None or sparse_config.algorithm != "minimax_m3":
+        raise ValueError(
+            "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
+            "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
+            "Set the following in the LLM API configuration:\n"
+            "sparse_attention_config:\n  algorithm: minimax_m3"
+        )
 
 
 def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
@@ -963,6 +982,66 @@ class MiniMaxM3Attention(Attention):
         )
         return qkv
 
+    def _fused_fp8_index_qk_norm_rope(
+        self,
+        idx_qk: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Produce raw-E4M3 index-Q and insert index-K in one M3-only kernel.
+
+        This path is deliberately narrower than the general fused QK kernel:
+        it is enabled only for the MSA FP8-indexer configuration and the exact
+        M3 Gemma-RMSNorm + NeoX partial-RoPE geometry. The kernel rounds the
+        normalized/RoPE values through BF16 before E4M3 conversion, matching
+        the former fused-BF16-kernel followed by ``Tensor.to(E4M3)`` contract.
+        """
+        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            return None
+        if self.attn.indexer_kv_dtype != "fp8":
+            return None
+        if position_ids is None or idx_qk.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "MiniMax-M3 fused FP8 indexer requires BF16 activations and position_ids."
+            )
+        if (
+            self.rotary_emb is None
+            or self.pos_embd_params is None
+            or self.pos_embd_params.rope is None
+        ):
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires partial RoPE.")
+        if not self.pos_embd_params.is_neox:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires NeoX RoPE.")
+        if not self.use_gemma_norm:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires Gemma RMSNorm.")
+        if self.index_q_norm.variance_epsilon != self.index_k_norm.variance_epsilon:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires identical index Q/K "
+                "RMSNorm epsilon values because the kernel accepts one epsilon."
+            )
+
+        rotary_dim = int(self.pos_embd_params.rope.dim)
+        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+        if index_k_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
+                f"got {index_k_cache.dtype}."
+            )
+        num_tokens = int(idx_qk.shape[0])
+        return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
+            idx_qk.contiguous(),
+            index_k_cache,
+            attn_metadata.msa_out_cache_loc[:num_tokens],
+            self.sparse_num_index_heads,
+            self.sparse_index_dim,
+            rotary_dim,
+            self.index_q_norm.variance_epsilon,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+        ).flatten(1)
+
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
         """Whether the fused kernel is expected to run instead of the fallback.
 
@@ -1384,7 +1463,7 @@ class MiniMaxM3Attention(Attention):
         builds the forward_args the FMHA reads.
         """
         if self.is_sparse_attention_layer:
-            assert idx_q is not None and idx_k is not None
+            assert idx_q is not None
             # Publish the selected blocks so the FMHA runs the sparse path.
             kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
             forward_args = AttentionForwardArgs(
@@ -1478,6 +1557,10 @@ class MiniMaxM3Attention(Attention):
 
         def _index_norm_rope():
             idx_qk = self.index_qk_proj(hidden_states)
+            fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+            if fp8_idx_q is not None:
+                # Index-K was inserted directly into the paged side cache.
+                return fp8_idx_q, None
             fused_idx = self._fused_qk_norm_rope(
                 idx_qk,
                 position_ids,
@@ -1860,6 +1943,7 @@ class MiniMaxM3Model(DecoderModel):
     """M3 text decoder model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
+        _validate_sparse_attention_runtime_config(model_config)
         super().__init__(model_config)
         quant_config = model_config.quant_config
         if quant_config is None or (
@@ -2007,6 +2091,27 @@ def _fold_gemma_boundary_norm_weights(weights):
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax-M3.
+
+        Sparse attention already routes M3 to a V2-core manager
+        unconditionally; declaring the preference keeps
+        ``kv_cache_config.use_kv_cache_manager_v2`` consistent with the
+        manager actually in use.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config: Any = None) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        M3 runs a V2-core cache manager, which the C++ transceiver cannot
+        drive; the KV-transfer unit test exercises the Python transceiver
+        directly. This routes the fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config

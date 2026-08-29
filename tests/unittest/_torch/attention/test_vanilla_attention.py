@@ -35,6 +35,29 @@ class TestVanillaAttention(unittest.TestCase):
             request_ids=[11],
         )
 
+    def test_sparse_gqa_deduplicates_blocks(self):
+        result = VanillaAttention._single_token_sparse_attn_forward(
+            torch.zeros(1, 1),
+            torch.zeros(4, 1, 1),
+            torch.tensor([0.0, 0.0, 10.0, 10.0]).reshape(4, 1, 1),
+            torch.tensor([[0, 0, 1]], dtype=torch.int32),
+            indices_block_size=2,
+            qk_scale=1.0,
+        )
+
+        torch.testing.assert_close(result, torch.tensor([[5.0]]))
+
+    def test_selected_mla_attention_sink(self):
+        result = VanillaAttention._selected_mla_attention(
+            torch.zeros(1, 2),
+            torch.tensor([[2.0, 3.0]]),
+            value_dim=1,
+            scale=1.0,
+            attention_sink=torch.zeros(1),
+        )
+
+        torch.testing.assert_close(result, torch.tensor([[1.0]]))
+
     def test_kv_cache_manager_v2_sliding_window_eviction(self):
         device = torch.device("cuda")
         dtype = torch.bfloat16

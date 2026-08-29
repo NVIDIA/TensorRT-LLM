@@ -111,6 +111,29 @@ class AgentLayer(Module):
             return await self._invoke_persistent(content)
         return await self._invoke_once(content)
 
+    def reset_session(self) -> None:
+        """Drop the persistent session so the next call starts a fresh one.
+
+        The next ``forward``/``aforward`` builds a new client from the
+        same config — same system prompt, tools, and hooks, but no
+        conversation history. Lets a long-lived layer be re-scoped to
+        units of work (e.g. one session per work item) without rebuilding
+        the layer. No-op for stateless layers and before a session's
+        first turn.
+        """
+        if self._persistent_client is None:
+            return
+        if self._runner.started:
+            self._runner.call(self._drop_persistent_client)
+            return
+        anyio.run(self._drop_persistent_client)
+
+    async def areset_session(self) -> None:
+        """Async variant of :meth:`reset_session` for ``aforward`` callers."""
+        if self._persistent_client is None:
+            return
+        await self._drop_persistent_client()
+
     def _build_request(self, content: str) -> AgentRequest:
         if self.prompt_builder is None:
             return build_request(content, system_prompt=self.config.system_prompt)
@@ -156,10 +179,16 @@ class AgentLayer(Module):
         never reach the human. With it disallowed, the agent reaches for
         our ``ask_human`` MCP tool instead, whose handler reads the
         reply from stdin.
+
+        The layer's own ban and the config's are unioned, not chosen
+        between: a caller that passes ``disallowed_tools`` to keep an
+        untrusted input away from ``Bash`` must not silently lose that
+        ban by also enabling HITL.
         """
-        if self.config.human_input_enabled:
-            return ["AskUserQuestion"]
-        return None
+        banned = list(self.config.disallowed_tools)
+        if self.config.human_input_enabled and "AskUserQuestion" not in banned:
+            banned.append("AskUserQuestion")
+        return banned or None
 
     def _build_ask_human_tool(self):
         """Construct the ``ask_human`` MCP tool bound to this layer.
@@ -280,6 +309,7 @@ class AgentLayer(Module):
                 hooks=self.config.backend.hooks,
                 disallowed_tools=self._resolve_disallowed_tools(),
                 extra_mcp_servers=self.config.backend.extra_mcp_servers,
+                cwd=self.config.backend.cwd,
             ) as client:
                 yield backend, client
 
@@ -310,6 +340,7 @@ class AgentLayer(Module):
                     hooks=self.config.backend.hooks,
                     disallowed_tools=self._resolve_disallowed_tools(),
                     extra_mcp_servers=self.config.backend.extra_mcp_servers,
+                    cwd=self.config.backend.cwd,
                 )
             )
             self._persistent_client = client
@@ -333,29 +364,52 @@ class AgentLayer(Module):
         sink = logger.console
         result_text = ""
         usage: UsageInfo | None = None
+
+        def observe(kind: str, event: Any) -> None:
+            """Forward one event to the config's observer, if any.
+
+            Errors are swallowed on purpose. The observer is typically writing
+            progress somewhere a UI can poll; a full disk or a closed file there
+            must not take down the agent turn it is describing.
+            """
+            hook = self.config.on_activity
+            if hook is None:
+                return
+            try:
+                hook(kind, event)
+            except Exception:  # noqa: BLE001 - an observer cannot fail the run
+                pass
+
         async for event in client.send_message(request.content):
             if isinstance(event, ResultEvent):
                 result_text = event.text
                 usage = event.usage
             elif isinstance(event, ToolCallEvent):
+                observe("tool", event)
                 if self.config.print_activity:
                     print_tool_call(self.layer_name, event, sink)
             elif isinstance(event, ServerToolCallEvent):
+                observe("server_tool", event)
                 if self.config.print_activity:
                     print_server_tool_call(self.layer_name, event, sink)
             elif isinstance(event, ThinkingEvent):
+                observe("thinking", event)
                 if self.config.print_activity:
                     print_thinking(self.layer_name, event, sink)
             elif isinstance(event, AgentTextEvent):
+                observe("text", event)
                 if self.config.print_activity:
                     print_agent_text(self.layer_name, event, sink)
             elif isinstance(event, SessionInitEvent):
+                observe("session", event)
                 if self.config.print_activity:
                     print_session_init(self.layer_name, event, sink)
             elif isinstance(event, RateLimitWarningEvent):
+                observe("rate_limit", event)
                 if self.config.print_activity:
                     print_rate_limit(self.layer_name, event, sink)
             elif isinstance(event, CompactBoundaryEvent):
+                observe("compact", event)
                 if self.config.print_activity:
                     print_compact_boundary(self.layer_name, event, sink)
             else:
@@ -477,24 +531,20 @@ class AgentLayer(Module):
     # Session inspection helpers
     # ------------------------------------------------------------------
 
-    def fetch_session_init(self, ping: str = "ping") -> SessionInitEvent:
-        """Open a temporary client and capture the first SessionInitEvent.
+    def fetch_available_skills(self) -> list[str] | None:
+        """Open a temporary client and read the skills it can invoke.
 
-        Sends a minimal message so the backend bootstraps its session
-        (Claude Code only emits ``init`` while streaming a response;
-        Codex emits it from a cached value as soon as the turn starts),
-        reads the event stream until the init arrives, and aborts the
-        rest of the response. Returns the skills/plugins/agents the
-        backend actually loaded for a fresh session, or an empty event
-        if no init was seen.
+        Costs a client connection and **no model call**: both backends
+        can answer from the session the client already established (see
+        ``BackendClient.list_available_skills``), so nothing here sends a
+        turn. Returns ``None`` when the backend could not say — an
+        unreachable CLI, or one that answered with nothing usable — which
+        is not the same as an empty environment.
         """
 
-        async def run() -> SessionInitEvent:
+        async def run() -> list[str] | None:
             async with self._temporary_client(self.config.system_prompt) as (_, client):
-                async for event in client.send_message(ping):
-                    if isinstance(event, SessionInitEvent):
-                        return event
-            return SessionInitEvent()
+                return await client.list_available_skills()
 
         return anyio.run(run)
 
@@ -510,8 +560,9 @@ class AgentLayer(Module):
 
         Some backends only populate the breakdown after the session has
         streamed at least once; when the first query comes back empty we
-        bootstrap with a minimal ``ping`` turn (cf. ``fetch_session_init``)
-        and re-query.
+        bootstrap with a minimal ``ping`` turn and re-query. That makes
+        this the one inspection helper that can cost a turn —
+        ``fetch_available_skills`` never does.
         """
 
         async def run() -> UsageInfo | None:

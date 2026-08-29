@@ -109,6 +109,7 @@ class Flux2Pipeline(BasePipeline):
     Follows WAN pipeline pattern for DiffusionModelLoader integration.
     """
 
+    supports_image_edit = True
     derive_output_size_from_reference = True
 
     # Hidden state layers per text encoder type (auto-detected at load time)

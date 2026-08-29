@@ -4,9 +4,12 @@
 import asyncio
 import json
 import os
+import socket
 import subprocess
+import time
 
 import aiohttp
+import psutil
 
 try:
     import ray
@@ -78,11 +81,92 @@ def test_ray_disaggregated_serving_python(ray_example_root, llm_venv, tp_size):
     _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "PYTHON")
 
 
+DISAGG_SERVING_PORTS = (8000, 8001, 8002)
+
+IGNORED_PSUTIL_ERRORS = (psutil.NoSuchProcess, psutil.AccessDenied,
+                         psutil.ZombieProcess)
+
+
+def _cleanup_leftover_servers(ports: tuple = DISAGG_SERVING_PORTS,
+                              timeout: float = 120) -> None:
+    """Kill leaked disagg server processes and wait for their ports to free.
+
+    A passing test can still leave live trtllm-serve/orted subprocesses behind
+    (see nvbugs 6601574): the next test's servers then fail to bind the ports
+    and the proxy never comes up. SO_REUSEADDR only covers sockets left in
+    TIME_WAIT, not ports held by processes that are still alive.
+    """
+    patterns = ("trtllm-serve", "orted")
+    # Never kill our own process tree: importing tensorrt_llm initializes MPI,
+    # which attaches a singleton orted daemon to this very pytest process;
+    # killing it makes Open MPI abort the whole test session.
+    me = psutil.Process()
+    protected = {me.pid}
+    try:
+        protected.update(parent.pid for parent in me.parents())
+        protected.update(child.pid for child in me.children(recursive=True))
+    except IGNORED_PSUTIL_ERRORS:
+        pass
+
+    # Restrict the kill to stale processes: listeners on the disagg ports and
+    # orphans left behind after a previous test's process tree was torn down.
+    # This spares unrelated serving/MPI jobs on shared development machines.
+    try:
+        port_owners = {
+            conn.pid
+            for conn in psutil.net_connections(kind="tcp")
+            if conn.pid and conn.status == psutil.CONN_LISTEN and conn.laddr
+            and conn.laddr.port in ports
+        }
+    except IGNORED_PSUTIL_ERRORS:
+        port_owners = set()
+
+    victims = []
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            if proc.info["pid"] in protected:
+                continue
+            cmdline = " ".join(proc.info["cmdline"] or [])
+            if not any(pattern in cmdline for pattern in patterns):
+                continue
+            if proc.info["pid"] in port_owners or proc.info["ppid"] == 1:
+                victims.append(proc)
+        except IGNORED_PSUTIL_ERRORS:
+            pass
+
+    for proc in victims:
+        try:
+            children = proc.children(recursive=True)
+        except IGNORED_PSUTIL_ERRORS:
+            children = []
+        for target in [proc] + children:
+            try:
+                if target.pid not in protected:
+                    target.kill()
+            except IGNORED_PSUTIL_ERRORS:
+                pass
+
+    deadline = time.time() + timeout
+    for port in ports:
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("localhost", port), timeout=1):
+                    pass
+            except OSError:
+                break  # nothing is listening on this port anymore
+            time.sleep(2)
+        else:
+            raise RuntimeError(
+                f"Port {port} is still in use after {timeout}s of cleanup")
+
+
 def _run_ray_disaggregated_serving(ray_example_root, tp_size,
                                    transceiver_backend, transceiver_runtime):
 
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
+
+    _cleanup_leftover_servers()
 
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
@@ -118,12 +202,13 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
                 stderr=subprocess.PIPE,
                 env=env_copy,
         ):
-            assert wait_for_server("localhost", 8000, timeout_seconds=180), \
-                "Disaggregated server failed to start within 3 minutes"
+            assert wait_for_server("localhost", 8000, timeout_seconds=300), \
+                "Disaggregated server failed to start within 5 minutes"
 
             _run_completion_requests()
     finally:
         ray.shutdown()
+        _cleanup_leftover_servers()
 
 
 def _run_completion_requests():

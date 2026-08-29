@@ -26,6 +26,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import \
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -65,7 +66,6 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
@@ -457,13 +457,13 @@ def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
 
 @pytest.mark.cpu_only
 def test_dspark_requires_speculative_model():
-    # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
-    # unset speculative_model must fail fast at config validation instead of
-    # raising an opaque TypeError deep inside engine construction.
+    # Unset speculative_model means "load the draft from the target", as it
+    # does for MTP. /tmp/dummy_model carries no mtp.* draft weights, so that
+    # must fail fast at config validation instead of raising an opaque
+    # TypeError deep inside engine construction.
     spec_cfg = DSparkDecodingConfig(max_draft_len=5)
 
-    with pytest.raises(ValueError,
-                       match="requires speculative_config.speculative_model"):
+    with pytest.raises(ValueError, match="speculative_model is unset"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             skip_tokenizer_init=True,
@@ -704,11 +704,68 @@ class TestKvCacheManagerV2AutoResolution:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+    def test_registered_models_keep_v2_on_nixl(self):
+        """Models preferring V2 and the Python transceiver keep V2 on NIXL.
+
+        Both sentinels start at 'auto'; production resolves the transceiver
+        runtime first, then the KV cache manager. MiniMax-M2 is absent from
+        this list: it silently resolves to V1 on this route (its
+        disaggregated serving is unvalidated -- the missing preference is
+        deliberate).
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "GptOssForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "DeepseekV4ForCausalLM",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None, architecture
+
+            llm_args = TorchLlmArgs(
+                model="/tmp/dummy_model",
+                cache_transceiver_config=CacheTransceiverConfig(
+                    backend="NIXL", transceiver_runtime="auto"),
+            )
+            _resolve_transceiver_runtime_auto(llm_args, model_cls)
+            assert _resolve_kv_cache_manager_v2_auto(
+                llm_args, model_cls) is True, architecture
+            assert (llm_args.cache_transceiver_config.transceiver_runtime ==
+                    "PYTHON"), architecture
 
 
 @pytest.mark.cpu_only
@@ -1036,6 +1093,18 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
+
+    def test_disable_mm_encoder_disables_encoder_cache(self):
+        multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            checkpoint_format="HF",
+            disable_mm_encoder=True,
+            multimodal_config=multimodal_config,
+        )
+
+        assert args.multimodal_config.encoder_cache_max_bytes == 0
+        assert multimodal_config.encoder_cache_max_bytes == 1024**2
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -1967,7 +2036,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        (invariants 2 and 3) clamps out-of-range entries to the reachable ceiling
        and never invents sizes beyond this list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
-       `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
+       `max_batch_size * (max_seq_len - 1)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
@@ -2257,42 +2326,6 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         # Ceiling (128) was already in candidates, must not be duplicated.
         assert kept.count(128) == 1
         assert unrecordable == []
-
-    def test_piecewise_filter_subtracts_extra_decoding_steps(self):
-        """Subtract `num_extra_decoding_steps` from the ceiling.
-
-        Drafting loops consume extra decode steps; the filter must mirror
-        the `max_seq_len - 1 - num_extra_decoding_steps` constraint
-        applied when warmup requests are built. Candidates above the
-        reduced ceiling are clamped down to it; nothing is appended.
-        """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
-
-        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
-        # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
-            candidates,
-            max_num_tokens=128,
-            max_batch_size=1,
-            max_seq_len=128,
-            num_extra_decoding_steps=5,
-        )
-        assert kept[-1] == 120  # nothing above the 122 ceiling to clamp
-        assert 120 in kept
-        assert unrecordable == []
-        # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
-            candidates,
-            max_num_tokens=128,
-            max_batch_size=1,
-            max_seq_len=128,
-            num_extra_decoding_steps=9,
-        )
-        assert kept[-1] == 118
-        assert 100 in kept
-        assert 120 not in kept
-        assert unrecordable == [120]
 
     def test_piecewise_filter_does_not_double_append_ceiling(self):
         """Ceiling already present in candidates -> not duplicated."""
@@ -3741,7 +3774,7 @@ class _PreferPythonTransceiverModel:
 
 
 class _ArchSensitiveTransceiverModel:
-    """Fake shared implementation class with a per-checkpoint preference."""
+    """Fake shared implementation class with a per-checkpoint CPP opt-out."""
 
     @classmethod
     def get_model_defaults(cls, llm_args):
@@ -3751,7 +3784,7 @@ class _ArchSensitiveTransceiverModel:
     def get_preferred_transceiver_runtime(cls, pretrained_config=None):
         architectures = getattr(pretrained_config, "architectures", None) or []
         if architectures and architectures[0] == "ModelAForCausalLM":
-            return "PYTHON"
+            return "CPP"
         return None
 
 
@@ -3881,6 +3914,7 @@ class TestMambaSnapshotConfigResolution:
         assert warnings == []
 
 
+@pytest.mark.cpu_only
 class TestTransceiverRuntimeAutoResolution:
     """Tests for the transceiver_runtime 'auto' selection mechanism."""
 
@@ -3895,11 +3929,11 @@ class TestTransceiverRuntimeAutoResolution:
         cfg = CacheTransceiverConfig(backend="NIXL")
         assert cfg.transceiver_runtime == "auto"
 
-    def test_auto_no_model_preference_falls_back_to_none(self):
-        """'auto' with no model preference resolves to None (C++ transceiver)."""
+    def test_auto_no_model_preference_defaults_to_python(self) -> None:
+        """'auto' with no model preference resolves to the Python transceiver."""
         args = self._disagg_args()
         _resolve_transceiver_runtime_auto(args)
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     @pytest.mark.parametrize("explicit_auto", [False, True])
     def test_model_preference_adopted(self, explicit_auto):
@@ -3926,12 +3960,45 @@ class TestTransceiverRuntimeAutoResolution:
         assert args.cache_transceiver_config.transceiver_runtime == explicit_runtime
 
     @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
-    def test_python_preference_incompatible_backend_falls_back_to_cpp(
-            self, backend):
-        """Python transceiver requires NIXL; other backends fall back to C++."""
+    def test_no_preference_incompatible_backend_falls_back_to_cpp(
+            self, backend: str) -> None:
+        """Without a model preference, non-NIXL backends fall back to C++."""
+        args = self._disagg_args(backend=backend)
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
+    def test_python_preference_incompatible_backend_is_preserved(
+            self, backend: str) -> None:
+        """A model preference is adopted verbatim, never rerouted.
+
+        The incompatible backend then fails loudly at transceiver creation
+        instead of silently running a runtime the model did not ask for.
+        """
         args = self._disagg_args(backend=backend)
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    def test_python_preference_unsupported_config_is_preserved(self) -> None:
+        """Fallbacks apply only when the model expressed no preference."""
+        args = self._disagg_args(kv_transfer_timeout_ms=None)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    def test_context_parallelism_does_not_gate_resolution(self) -> None:
+        """Context parallelism is not a resolution-time gate.
+
+        Ctx (cp=1) and gen (cp>1, e.g. helix) servers must resolve to the
+        same runtime, and the Python transceiver supports helix CP.
+        Non-helix CP fails loudly at transceiver creation instead.
+        """
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            context_parallel_size=2,
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     def test_default_backend_resolves_to_nixl_and_adopts_preference(
             self, monkeypatch):
@@ -3951,9 +4018,14 @@ class TestTransceiverRuntimeAutoResolution:
         "backend_env",
         ["TRTLLM_USE_UCX_KVCACHE", "TRTLLM_USE_MPI_KVCACHE"],
     )
-    def test_default_backend_env_override_falls_back_to_v1_cpp(
-            self, monkeypatch, backend_env):
-        """An incompatible DEFAULT route falls back to the V1 C++ path."""
+    def test_default_backend_env_override_keeps_preference(
+            self, monkeypatch: pytest.MonkeyPatch, backend_env: str) -> None:
+        """A model preference survives an incompatible DEFAULT env route.
+
+        The runtime is adopted verbatim (creation fails loudly on the
+        non-NIXL backend); the V2 manager preference is still downgraded
+        because its gate requires PYTHON on NIXL.
+        """
         for env_var in (
                 "TRTLLM_USE_NIXL_KVCACHE",
                 "TRTLLM_USE_UCX_KVCACHE",
@@ -3967,7 +4039,7 @@ class TestTransceiverRuntimeAutoResolution:
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
         _resolve_kv_cache_manager_v2_auto(args, _PreferPythonTransceiverModel)
 
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     def test_disagg_disabled_is_noop(self):
@@ -3998,6 +4070,27 @@ class TestTransceiverRuntimeAutoResolution:
         args = self._disagg_args()
         with pytest.raises(ValueError, match="JAVA"):
             _resolve_transceiver_runtime_auto(args, _BadModel)
+
+    def test_model_cpp_opt_out_respected(self) -> None:
+        """A model returning 'CPP' opts out of the Python default."""
+
+        class _CppOptOutModel:
+
+            @classmethod
+            def get_preferred_transceiver_runtime(cls,
+                                                  pretrained_config: Any = None
+                                                  ) -> Literal["CPP"]:
+                return "CPP"
+
+        args = self._disagg_args()
+        _resolve_transceiver_runtime_auto(args, _CppOptOutModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "CPP"
+
+    def test_infinite_kv_transfer_timeout_falls_back_to_cpp(self) -> None:
+        """The Python transceiver requires a finite kv_transfer_timeout_ms."""
+        args = self._disagg_args(kv_transfer_timeout_ms=None)
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime is None
 
     @pytest.mark.parametrize("disagg_enabled", [False, True])
     @pytest.mark.parametrize("transceiver_defaults", [
@@ -4045,7 +4138,7 @@ class TestTransceiverRuntimeAutoResolution:
         args = self._disagg_args()
         ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", args,
                                                    None)
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     @staticmethod
@@ -4074,15 +4167,17 @@ class TestTransceiverRuntimeAutoResolution:
         assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     @pytest.mark.parametrize("arch,expected", [
-        ("ModelAForCausalLM", "PYTHON"),
-        ("ModelBForCausalLM", None),
+        ("ModelAForCausalLM", "CPP"),
+        ("ModelBForCausalLM", "PYTHON"),
     ])
     def test_shared_class_differentiates_per_architecture(
-            self, monkeypatch, arch, expected):
+            self, monkeypatch: pytest.MonkeyPatch, arch: str,
+            expected: str) -> None:
         """Shared implementation classes differentiate per checkpoint.
 
         The preference hook receives pretrained_config so one implementation
-        class can vary its answer by architecture.
+        class can opt a specific architecture out to 'CPP' while checkpoints
+        without an opt-out follow the global Python default.
         """
         from tensorrt_llm._torch.pyexecutor import \
             model_loader as model_loader_mod

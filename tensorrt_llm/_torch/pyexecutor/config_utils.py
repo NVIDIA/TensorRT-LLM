@@ -422,12 +422,11 @@ def extract_mamba_kv_cache_params(
         #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
         #   ssm state shape = [num_heads, head_dim, state_size]
         #            = [H, V, K] fp32 delta-rule recurrent state.
-        # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
-        # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
-        # window of `short_conv_kernel_size` columns.
+        # The pool stores the W - 1 raw inputs needed by the production
+        # causal-convolution kernels, where W is short_conv_kernel_size.
         lin = unwrap_kimi_text_config(config).linear_attn_config
         state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"] + 1
+        conv_kernel = lin["short_conv_kernel_size"]
         num_heads = lin["num_heads"]
         n_groups = lin["num_heads"]
         head_dim = lin["head_dim"]
@@ -637,8 +636,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
     elif is_qwen_image_bench_config(config_dict):
-        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            Qwen35ConfigCompat
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+            Qwen35ConfigCompat, _normalize_qwen35_quantization_config)
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
         # Keep the composite VLM config so the vision encoder and multimodal
@@ -647,6 +646,7 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
+        _normalize_qwen35_quantization_config(model_config)
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.

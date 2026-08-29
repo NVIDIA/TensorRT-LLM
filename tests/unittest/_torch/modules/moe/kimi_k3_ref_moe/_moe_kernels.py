@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Native TRTLLM-Gen SiTU MoE dispatch for the in-tree Kimi K3 sparse MoE block.
+"""Test-only native SiTU dispatch for the Kimi K3 sparse MoE reference.
 
 The K3 MoE block has two mutually exclusive kernel paths:
 
@@ -74,8 +74,8 @@ def get_moe_sm_version() -> int:
 
 
 def is_native_situ_supported() -> bool:
-    """Native SiTU cubins are Blackwell sm_100f (SM100/SM103) only."""
-    return get_moe_sm_version() in (100, 103)
+    """Native SiTU cubins are Blackwell sm_100f: the whole SM100 family."""
+    return 100 <= get_moe_sm_version() < 110
 
 
 def assert_native_situ_supported(
@@ -88,8 +88,10 @@ def assert_native_situ_supported(
     if not torch.cuda.is_available():
         raise RuntimeError("native SiTU MoE requires CUDA; no CUDA device is available")
     sm = get_moe_sm_version()
-    if sm not in (100, 103):
-        raise RuntimeError(f"native SiTU MoE requires SM100/SM103 (Blackwell); running on SM{sm}")
+    if not 100 <= sm < 110:
+        raise RuntimeError(
+            f"native SiTU MoE requires the SM100 (Blackwell) family; running on SM{sm}"
+        )
     if group_size != SCALING_VECTOR_SIZE:
         raise RuntimeError(
             f"native SiTU MoE requires MXFP4 group_size {SCALING_VECTOR_SIZE}, got {group_size}"
@@ -127,7 +129,7 @@ def pack_routed_expert_weights(
     """Pad + shuffle checkpoint MXFP4 expert weights into the TRTLLM-Gen layout.
 
     Inputs are the per-expert MXFP4 tensors as stored by
-    :class:`KimiK3RoutedExpertBank` (HF layout, group_size=32):
+    the test reference's routed expert bank (HF layout, group_size=32):
 
     * ``w1_packed``/``w3_packed``: ``uint8 [E, I, H // 2]`` (w1 = gate, w3 = up)
     * ``w1_scales``/``w3_scales``: ``uint8 [E, I, H // 32]`` (E8M0 biased exponents)

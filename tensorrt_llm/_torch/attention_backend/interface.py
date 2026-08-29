@@ -445,7 +445,6 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
             num_contexts: int = 0):
@@ -941,6 +940,12 @@ class AttentionForwardArgs:
 
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
     enable_dsv4_epilogue_fusion: bool = False
+
+    # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
+    # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
+    # paged write, so the caller drops its own RMSNorm and concat.
+    kv_norm_weight: Optional[torch.Tensor] = None
+    kv_norm_eps: float = 1e-6
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 BackendKind = Literal["claude-code", "codex"]
 SessionMode = Literal["stateless", "persistent"]
 
-CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL", "fable")
-CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.5")
+CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL", "claude-opus-5")
+CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol")
 
 
 @dataclass(frozen=True)
@@ -26,11 +27,20 @@ class BackendConfig:
     # Currently only the ``claude-code`` backend consumes this — values
     # are forwarded verbatim into ``ClaudeAgentOptions.mcp_servers``
     # alongside the in-process ``agent-tools`` server built from
-    # ``tools``. Typical use: wiring an HTTP MCP server (Glean, etc.)
-    # into a single agent's session via
-    # ``{"Glean": {"type": "http", "url": "..."}}``. Other backends
+    # ``tools``. Typical use: wiring an HTTP MCP server into a single
+    # agent's session via
+    # ``{"knowledge-base": {"type": "http", "url": "..."}}``. Other backends
     # accept and ignore the field.
     extra_mcp_servers: dict[str, Any] | None = None
+    # Working directory the backend runs the agent in. Forwarded to the
+    # SDK as the session ``cwd`` (Claude Code's
+    # ``ClaudeAgentOptions.cwd`` / Codex's ``ThreadStartParams.cwd``).
+    # ``None`` keeps the launching process's ``Path.cwd()``. Set this when
+    # an agent must operate on a repo other than the one the orchestrator
+    # runs from — e.g. cwd-bound slash commands like ``/code-review`` that
+    # diff the session cwd's git HEAD and must target the task's repo,
+    # not the framework repo.
+    cwd: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -71,3 +81,29 @@ class AgentLayerConfig:
     # Code's built-in ``AskUserQuestion`` so the agent's questions reach
     # the human via stdin instead of being silently auto-defaulted.
     human_input_enabled: bool = False
+    # Tool names this layer must not be able to call, on top of whatever
+    # the layer bans for its own reasons.
+    #
+    # Needed because the Claude Code backend runs with
+    # ``permission_mode="bypassPermissions"`` and the sandbox off — the
+    # right default for a layer whose whole job is to edit a checkout and
+    # run benchmarks, and the wrong one for a layer whose INPUT is
+    # untrusted. A layer that reads text a stranger pasted into a web form
+    # and only has to produce YAML should not also be able to run ``Bash``
+    # on the host: the paste would be a path to arbitrary execution.
+    #
+    # Names are the tool names the model sees (``Bash``, ``Write``,
+    # ``WebFetch``, ...). Empty means "no extra bans", which is the
+    # historical behaviour for every existing layer.
+    disallowed_tools: tuple[str, ...] = ()
+    # Called once per backend event as ``on_activity(kind, event)``, where
+    # ``kind`` is a short tag (``tool``, ``text``, ``thinking``, ...).
+    #
+    # Separate from ``print_activity``, which writes to a console. A layer
+    # driven by something with no console — a web request waiting on a
+    # spinner, a queue worker — needs the same events somewhere it can
+    # forward them from, and turning printing on would not give it that.
+    #
+    # Exceptions raised by the callback are swallowed: it is an observer,
+    # and an observer must not be able to fail the run it is watching.
+    on_activity: Any | None = None

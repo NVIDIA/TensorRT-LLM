@@ -25,12 +25,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
@@ -43,6 +39,26 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
 from .interface import _reject
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
+
+# These runners are defined inside cute_dsl_custom_ops' ``if
+# IS_CUTLASS_DSL_AVAILABLE:`` block, which has no else-branch, so importing them
+# unconditionally would break every importer of this file -- and create_moe
+# imports it eagerly under _torch.models, so that reaches all model startup
+# rather than just this backend. Guard the same way the sibling custom_ops
+# modules do, and leave the tuple empty when the DSL is absent: no CuteDSL
+# runner can be tuned in that case, so nothing can match it.
+_TILE_SIZE_CHECKED_RUNNERS: Tuple[type, ...] = ()
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ...custom_ops.cute_dsl_custom_ops import (
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmRunner,
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+    _TILE_SIZE_CHECKED_RUNNERS = (
+        Sm100BlockScaledContiguousGroupedGemmRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)
 
 
 @dataclass
@@ -326,13 +342,16 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if tile_size is None:
             return True
 
+        # Imported here rather than at module scope: these runners are defined
+        # inside cute_dsl_custom_ops' ``if IS_CUTLASS_DSL_AVAILABLE:`` block,
+        # which has no else-branch, so at module scope a missing cutlass DSL
+        # would break every importer of this file -- and create_moe imports it
+        # eagerly under _torch.models, so that reaches all model startup rather
+        # than just this backend. Reaching this line means a CuteDSL runner is
+        # already being tuned, so the DSL is installed.
+
         for runner, tactic in comb:
-            if isinstance(
-                    runner,
-                (Sm100BlockScaledContiguousGroupedGemmRunner,
-                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-                 Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
+            if isinstance(runner, _TILE_SIZE_CHECKED_RUNNERS):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
@@ -432,7 +451,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         swiglu_limit_scalar: Optional[float] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
