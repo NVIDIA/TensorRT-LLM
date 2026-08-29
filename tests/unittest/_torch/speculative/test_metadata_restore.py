@@ -41,6 +41,8 @@ def _make_metadata(*, is_cuda_graph: bool = False) -> TrtllmAttentionMetadata:
     metadata._seq_lens = torch.tensor([3, 1], dtype=torch.int32)
     metadata._seq_lens_cuda = metadata._seq_lens.cuda()
     metadata.kv_lens_cuda = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    metadata.host_request_types[:1].fill_(0)
+    metadata.host_request_types[1:2].fill_(1)
     metadata.on_update()
     return metadata
 
@@ -49,6 +51,7 @@ def _mutate_context_metadata(metadata: TrtllmAttentionMetadata) -> None:
     metadata._seq_lens.fill_(1)
     metadata._seq_lens_cuda.fill_(1)
     metadata.on_update()
+    metadata.host_request_types[: metadata.num_contexts].fill_(1)
     metadata.num_contexts = 0
     assert metadata.num_contexts == 0
     assert metadata.num_ctx_tokens == 0
@@ -62,18 +65,19 @@ def _assert_metadata_restored(metadata: TrtllmAttentionMetadata) -> None:
     assert metadata.num_ctx_tokens == 3
     assert metadata.num_generations == 1
     assert metadata.context_lens.tolist() == [3]
+    assert metadata.host_request_types[:2].tolist() == [0, 1]
 
 
 def _make_worker(worker_type: type[SpecWorkerBase]) -> SpecWorkerBase:
     worker = object.__new__(worker_type)
-    worker._saved_num_contexts = None
-    worker._saved_attn_metadata_id = None
+    SpecWorkerBase.__init__(worker)
     return worker
 
 
 def test_spec_worker_metadata_restore_preserves_context_metadata() -> None:
     metadata = _make_metadata()
     worker = _make_worker(Eagle3OneModelWorker)
+    original_host_request_types = metadata.host_request_types
 
     with pytest.raises(AssertionError, match="requires a paired prepare"):
         worker._restore_attn_metadata_from_spec_dec(metadata)
@@ -87,8 +91,9 @@ def test_spec_worker_metadata_restore_preserves_context_metadata() -> None:
     worker._restore_attn_metadata_from_spec_dec(metadata)
 
     _assert_metadata_restored(metadata)
+    assert metadata.host_request_types is original_host_request_types
     assert worker._saved_num_contexts is None
-    assert worker._saved_attn_metadata_id is None
+    assert worker._saved_attn_metadata is None
 
 
 def test_partial_prepare_restores_metadata() -> None:
@@ -102,7 +107,7 @@ def test_partial_prepare_restores_metadata() -> None:
     assert metadata._seq_lens is original_seq_lens
     assert not metadata.has_spec_dec_saved_state
     assert worker._saved_num_contexts is None
-    assert worker._saved_attn_metadata_id is None
+    assert worker._saved_attn_metadata is None
 
 
 def test_forward_failure_restores_metadata() -> None:
@@ -115,7 +120,7 @@ def test_forward_failure_restores_metadata() -> None:
         _assert_metadata_restored(metadata)
         assert not metadata.has_spec_dec_saved_state
         assert worker._saved_num_contexts is None
-        assert worker._saved_attn_metadata_id is None
+        assert worker._saved_attn_metadata is None
 
 
 @pytest.mark.parametrize(
@@ -152,7 +157,7 @@ def test_worker_specific_prepare_uses_base_metadata_lifecycle(
 
     _assert_metadata_restored(metadata)
     assert worker._saved_num_contexts is None
-    assert worker._saved_attn_metadata_id is None
+    assert worker._saved_attn_metadata is None
     assert metadata.kv_lens_cuda is original_kv_lens_tensor
     if restores_kv_lens:
         assert torch.equal(metadata.kv_lens_cuda, original_kv_lens)
