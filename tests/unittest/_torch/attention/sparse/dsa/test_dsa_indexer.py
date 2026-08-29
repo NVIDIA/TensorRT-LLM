@@ -309,7 +309,13 @@ def test_gvr_prior_writeback_uses_aux_stream():
         cache_manager.shutdown()
 
 
-def test_shared_topk_lifecycle():
+def test_shared_topk_lifecycle(monkeypatch):
+    # This test exercises the shared-topk buffer read/write lifecycle, not the
+    # cross-layer group-remap fan-out (covered by the test_group_remap_* tests).
+    # Keep the remap on the per-layer path so it flows through the patched
+    # transform below.
+    monkeypatch.setattr(dsa_backend, "_GROUP_REMAP", False)
+
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=1,
         index_head_dim=8,
@@ -363,6 +369,12 @@ def test_shared_topk_lifecycle():
         indexer=None,
         get_local_layer_idx=Mock(return_value=1),
     )
+    # sparse_attn_predict dispatches the local->global remap through the
+    # backend's own _remap_topk_to_global; bind the real method onto the stubs.
+    for backend in (full_backend, shared_backend):
+        backend._remap_topk_to_global = MethodType(
+            DSATrtllmAttention._remap_topk_to_global, backend
+        )
     metadata._num_ctx_tokens = context_topk.shape[0]
     metadata._num_tokens = context_topk.shape[0] + generation_topk.shape[0]
     backend_args = DSABackendForwardArgs(indexer_intermediates=[])
