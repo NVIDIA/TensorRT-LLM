@@ -69,9 +69,9 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (BaseResourceManager, KVCacheCompressionManager,
+                               KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -765,10 +765,8 @@ class KvCacheCreator:
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
                 # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    is_disagg=self._is_disagg)
+                draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+                    effective_draft_config, draft_kv_cache_config)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
                     draft_kv_cache_config)
@@ -1438,10 +1436,11 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
+        if self._mapping.enable_attention_dp and getattr(
+                self._kv_cache_manager_cls, "supports_shared_draft_layers",
+                True):
             logger.info(
-                "Attention DP is enabled, separate draft KV cache is not supported."
-            )
+                "Attention DP: draft layers share the target KV cache manager.")
             return False
 
         sparse_cfg = self._sparse_attention_config
@@ -1481,6 +1480,21 @@ class KvCacheCreator:
         if self._speculative_config.spec_dec_mode.is_external_drafter():
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
+
+    def _get_draft_kv_cache_manager_cls(
+            self, effective_draft_config: ModelConfig,
+            draft_kv_config: KvCacheConfig) -> type[BaseResourceManager]:
+        """Resolve the draft manager, preserving a target V2 lifecycle."""
+        draft_cls = get_kv_cache_manager_cls(
+            effective_draft_config,
+            draft_kv_config,
+            is_disagg=self._is_disagg,
+            cache_transceiver_config=self._cache_transceiver_config,
+        )
+        if self._is_kv_cache_manager_v2 and not issubclass(
+                draft_cls, KVCacheManagerV2):
+            draft_cls = KVCacheManagerV2
+        return draft_cls
 
     def _get_draft_max_attention_window(
         self,
@@ -1554,8 +1568,8 @@ class KvCacheCreator:
                 f"Derived draft KV cache max_attention_window for separate "
                 f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
-        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+        draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+            effective_draft_config, draft_kv_config)
         draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
@@ -1565,12 +1579,25 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        # Sparse targets can require a target-only page geometry. MiniMax-M3
+        # uses 128-token MSA pages while its dense Eagle3 draft manager uses
+        # the validated 32-token generation-kernel geometry.
+        draft_tokens_per_block = getattr(
+            self._kv_cache_manager_cls,
+            "draft_manager_tokens_per_block",
+            self._tokens_per_block,
+        )
+        if draft_tokens_per_block != self._tokens_per_block:
+            logger.info(
+                f"Draft KV cache manager uses tokens_per_block={draft_tokens_per_block} "
+                f"(target uses {self._tokens_per_block}).")
+            draft_kv_config.tokens_per_block = draft_tokens_per_block
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
-            tokens_per_block=self._tokens_per_block,
+            tokens_per_block=draft_tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,

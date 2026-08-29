@@ -2695,6 +2695,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                self._finalize_adp_dummy_allocation(can_queue)
                 if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
@@ -3444,6 +3445,16 @@ class PyExecutor:
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    def _free_adp_dummy_kv_resources(self, dummy_request: LlmRequest) -> None:
+        """Release target and independent draft KV allocated for an ADP dummy."""
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        try:
+            self.kv_cache_manager.free_resources(dummy_request)
+        finally:
+            if draft_kv_cache_manager is not None:
+                draft_kv_cache_manager.free_resources(dummy_request)
+
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
 
@@ -3475,7 +3486,7 @@ class PyExecutor:
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
-        self.kv_cache_manager.free_resources(dummy_request)
+        self._free_adp_dummy_kv_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -7066,28 +7077,50 @@ class PyExecutor:
                 key="attention_dp_dummy_insufficient_kv_capacity")
             return
 
-        if (not self._enable_adp_dummy_fixes
-                or self.kv_cache_transceiver is None):
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=dummy_request_ids,
-                token_nums=token_nums,
-                is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
-            llm_request.is_attention_dp_dummy = True
-            spec_resource_manager = self.resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(dummy_request_ids)
-            self.active_requests.append(llm_request)
-            return
+        # A separate one-model draft KV cache manager must see the same dummy
+        # request, otherwise its prepare_resources() lookup observes an
+        # unknown request id. MiniMax-M3 MSA always uses this separate dense
+        # Eagle3 manager, including under attention DP.
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
-        assert self._pending_adp_dummy_request is None
         has_live_adp_dummy = any(
             request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
             for request in self.active_requests)
         if has_live_adp_dummy:
+            return
+        assert self._pending_adp_dummy_request is None
+
+        if (not self._enable_adp_dummy_fixes
+                or self.kv_cache_transceiver is None):
+            try:
+                dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                    request_ids=dummy_request_ids,
+                    token_nums=token_nums,
+                    is_gen=self._adp_dummy_is_gen,
+                    prepare_resource=True,
+                    max_num_draft_tokens=self.max_total_draft_tokens,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                )
+            except (OutOfPagesError, NoFreeSlotsError):
+                dummy_requests = None
+            if not dummy_requests:
+                logger.warning("Cannot allocate ADP pad dummy; rank schedules "
+                               "an empty batch and the fleet will retry.")
+                return
+
+            dummy_request = dummy_requests[0]
+            spec_resource_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_resource_manager is not None:
+                try:
+                    spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                except NoFreeSlotsError:
+                    self._free_adp_dummy_kv_resources(dummy_request)
+                    return
+            dummy_request.is_attention_dp_dummy = True
+            self.active_requests.append(dummy_request)
+            self._pending_adp_dummy_request = dummy_request
             return
 
         try:
@@ -7097,8 +7130,9 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
-        except OutOfPagesError:
+        except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
         if not dummy_requests:
             logger.warning("Cannot allocate ADP pad dummy; rank schedules "
@@ -7112,7 +7146,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                self._free_adp_dummy_kv_resources(dummy_request)
                 return
 
         assert dummy_request is not None
@@ -7170,6 +7204,8 @@ class PyExecutor:
             return
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         try:
             # Degrade to an empty batch rather than propagate: the ranks have
             # yet to agree on can_queue, so a rank-local raise would strand the
@@ -7180,6 +7216,7 @@ class PyExecutor:
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -7197,7 +7234,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                self._free_adp_dummy_kv_resources(dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True

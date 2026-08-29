@@ -50,6 +50,50 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+@pytest.mark.parametrize(
+    ("is_cuda_graph", "is_capturing", "expected_fields"),
+    [
+        (False, False, ("_seq_lens", "_seq_lens_cuda")),
+        (True, False, ("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")),
+        (True, True, ("_seq_lens", "_seq_lens_cuda")),
+    ],
+    ids=["eager", "graph-warmup", "graph-capture"],
+)
+def test_eagle3_spec_dec_preserves_kv_lens_only_during_graph_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+    is_cuda_graph: bool,
+    is_capturing: bool,
+    expected_fields: tuple[str, ...],
+) -> None:
+    """Warmup restores KV lengths, while capture records their mutation."""
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+
+    metadata = SimpleNamespace(
+        prepare_for_spec_dec=MagicMock(),
+        num_seqs=2,
+        spec_decoding_packed_mask=None,
+        spec_decoding_position_offsets=None,
+        spec_decoding_generation_lengths=None,
+    )
+    worker = object.__new__(Eagle3OneModelWorker)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: is_capturing,
+    )
+
+    worker._prepare_attn_metadata_for_spec_dec(
+        metadata,
+        SimpleNamespace(is_cuda_graph=is_cuda_graph),
+    )
+
+    metadata.prepare_for_spec_dec.assert_called_once_with(*expected_fields)
+    assert worker._saved_packed_mask is None
+    assert worker._saved_position_offsets is None
+    assert worker._saved_position_offsets_cpp is None
+    assert worker._saved_generation_lengths is None
+
+
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     """Refresh DSA mappings after switching to the draft cache."""
     events = []

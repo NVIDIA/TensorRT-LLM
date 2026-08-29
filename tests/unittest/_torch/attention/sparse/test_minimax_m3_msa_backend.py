@@ -14,12 +14,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
 )
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
@@ -88,6 +92,167 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
     for sparse_index_dim in (0, -1):
         with pytest.raises(ValueError, match=r"greater than 0"):
             MiniMaxM3SparseAttentionConfig(sparse_index_dim=sparse_index_dim)
+
+
+def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads() -> None:
+    cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        indexer_kv_dtype="fp8",
+        fuse_qkv_index_projection=True,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+    )
+    sparse_params = cfg.to_sparse_params()
+    metadata_params = cfg.to_sparse_metadata_params()
+    mapping = SimpleNamespace(tp_size=2, enable_attention_dp=False)
+
+    assert sparse_params.fuse_qkv_index_projection is True
+    assert metadata_params.fuse_qkv_index_projection is True
+    assert metadata_params.sharded_head_counts(mapping) == (32, 2)
+    assert metadata_params.sharded_index_head_count(mapping) == 2
+
+    attention_dp_mapping = SimpleNamespace(tp_size=4, enable_attention_dp=True)
+    assert metadata_params.sharded_head_counts(attention_dp_mapping) == (64, 4)
+    assert metadata_params.sharded_index_head_count(attention_dp_mapping) == 4
+
+    kernel_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+        sparse_params,
+        num_q_heads=32,
+        num_kv_heads=2,
+        head_dim=128,
+    )
+    assert kernel_cfg.num_index_heads == 2
+
+    compatibility_cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        num_attention_heads=64,
+        num_key_value_heads=4,
+    )
+    compatibility_metadata = compatibility_cfg.to_sparse_metadata_params()
+    assert compatibility_metadata.sharded_index_head_count(mapping) == 4
+
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="triton",
+            fuse_qkv_index_projection=True,
+        )
+    with pytest.raises(ValueError, match=r"requires indexer_kv_dtype='fp8'"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="msa",
+            fuse_qkv_index_projection=True,
+        )
+
+
+def test_overlap_kv_correction_derives_slots_from_compact_page_table(monkeypatch) -> None:
+    """Decode correction stays device-only without a token-granular page map."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 2
+    metadata._msa_live_total_q = 3
+    metadata._msa_page_size = 128
+    metadata.kv_lens_cuda = torch.tensor([130, 257], dtype=torch.int32)
+    metadata.msa_q_batch_row = torch.tensor([0, 1, 1], dtype=torch.int32)
+    metadata.msa_q_intra = torch.tensor([0, 0, 1], dtype=torch.int32)
+    metadata.msa_qo_lens_dev = torch.tensor([1, 2], dtype=torch.int32)
+    metadata.msa_kv_page_starts = torch.tensor([0, 2], dtype=torch.int32)
+    metadata.msa_kv_page_counts = torch.tensor([2, 3], dtype=torch.int32)
+    metadata.msa_kv_indices = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
+    metadata.msa_out_cache_loc = torch.empty(3, dtype=torch.int32)
+    metadata.msa_n_valid_blocks = torch.empty(3, dtype=torch.int32)
+
+    def owner(rows: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            plan=(
+                False,
+                0,
+                rows,
+                {
+                    "kv_segment_lens": torch.zeros(rows, dtype=torch.int32),
+                    "qo_offset": torch.zeros(rows, dtype=torch.int32),
+                },
+                None,
+            )
+        )
+
+    metadata._msa_proxy_plan = owner(2)
+    metadata._msa_gqa_plan = owner(3)
+    metadata._msa_dense_plan = owner(2)
+
+    metadata.on_update_kv_lens()
+
+    torch.testing.assert_close(
+        metadata.msa_out_cache_loc,
+        torch.tensor([20 * 128 + 1, 40 * 128 + 127, 50 * 128], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.msa_n_valid_blocks, torch.tensor([2, 2, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata._msa_proxy_plan.plan[3]["kv_segment_lens"], metadata.kv_lens_cuda
+    )
+    torch.testing.assert_close(
+        metadata._msa_gqa_plan.plan[3]["kv_segment_lens"],
+        torch.tensor([130, 257, 257], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata._msa_dense_plan.plan[3]["qo_offset"],
+        torch.tensor([129, 255], dtype=torch.int32),
+    )
+
+
+def test_overlap_kv_correction_rebuilds_eager_plans(monkeypatch) -> None:
+    """Mixed/eager overlap correction rebuilds plans from corrected lengths."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 2
+    metadata._msa_live_total_q = 3
+    metadata._msa_proxy_plan = None
+    metadata.kv_lens_cuda = torch.tensor([129, 257], dtype=torch.int32)
+    rebuild_fields = Mock()
+    rebuild_plans = Mock()
+    monkeypatch.setattr(metadata, "_build_msa_fields", rebuild_fields)
+    monkeypatch.setattr(metadata, "_build_step_plans", rebuild_plans)
+
+    metadata.on_update_kv_lens()
+
+    torch.testing.assert_close(
+        metadata._msa_corrected_kv_lens_cpu,
+        torch.tensor([129, 257], dtype=torch.int32),
+    )
+    rebuild_fields.assert_called_once_with()
+    rebuild_plans.assert_called_once_with()
+
+
+def test_overlap_kv_correction_does_not_rebuild_during_capture(monkeypatch) -> None:
+    """A missing decode plan cannot introduce host work during graph capture."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 1
+    metadata._msa_live_total_q = 1
+    metadata._msa_proxy_plan = None
+    metadata._msa_corrected_kv_lens_cpu = None
+    metadata.kv_lens_cuda = torch.tensor([129], dtype=torch.int32)
+    rebuild_fields = Mock()
+    rebuild_plans = Mock()
+    monkeypatch.setattr(metadata, "_build_msa_fields", rebuild_fields)
+    monkeypatch.setattr(metadata, "_build_step_plans", rebuild_plans)
+
+    metadata.on_update_kv_lens()
+
+    assert metadata._msa_corrected_kv_lens_cpu is None
+    rebuild_fields.assert_not_called()
+    rebuild_plans.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -489,7 +654,7 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
 
     class FakeIndexer:
         def select_blocks(self, *args: object, **kwargs: object) -> torch.Tensor:
-            del args
+            captured["index_k_cache"] = args[1]
             captured["head_major_output"] = kwargs["head_major_output"]
             return torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
 
@@ -514,7 +679,7 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
 
         def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
             del layer_idx
-            self.idx_k_cache = idx_k
+            self.idx_k_cache.copy_(idx_k)
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
             del layer_idx
@@ -541,6 +706,65 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
 
     assert result.shape == (num_tokens, 1, 16)
     assert captured["head_major_output"] is expected_head_major
+    assert captured["index_k_cache"] is metadata.idx_k_cache
+
+
+@pytest.mark.parametrize("is_sparse", [False, True], ids=["dense", "sparse"])
+@pytest.mark.parametrize("use_decode_plan", [False, True], ids=["eager", "decode"])
+def test_forward_prepopulated_kv_dispatches_compact_q_without_cache_rewrite(
+    monkeypatch,
+    is_sparse: bool,
+    use_decode_plan: bool,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+
+    captured = {}
+
+    def fake_run_msa_paged_gqa(*args, **kwargs) -> None:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(msa_sparse_gqa, "run_msa_paged_gqa", fake_run_msa_paged_gqa)
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    q = torch.randn(3, 8)
+    output = torch.empty_like(q)
+    topk_indices = torch.zeros(3, 1, 16, dtype=torch.int32) if is_sparse else None
+    metadata = SimpleNamespace(
+        msa_decode_gqa_plan=("decode_sparse",) if use_decode_plan else None,
+        msa_eager_gqa_plan=("eager_sparse",),
+        msa_decode_dense_plan=("decode_dense",) if use_decode_plan else None,
+        msa_eager_dense_plan=("eager_dense",),
+    )
+    sparse_args = SparseBackendForwardArgs(topk_indices=topk_indices) if is_sparse else None
+
+    attention.forward_prepopulated_kv(
+        q,
+        metadata,
+        AttentionForwardArgs(output=output, sparse_backend_args=sparse_args),
+    )
+
+    args = captured["args"]
+    assert args[0] is attention
+    assert args[1] is q
+    assert args[2] is None
+    assert args[3] is None
+    assert args[4] is metadata
+    assert args[5] is output
+    assert captured["kwargs"]["kv_block_indexes"] is topk_indices
+    plan_kind = "sparse" if is_sparse else "dense"
+    plan_phase = "decode" if use_decode_plan else "eager"
+    assert captured["kwargs"]["plan"] == (f"{plan_phase}_{plan_kind}",)
+
+
+def test_forward_prepopulated_kv_requires_output_buffer() -> None:
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+
+    with pytest.raises(RuntimeError, match="requires an output buffer"):
+        attention.forward_prepopulated_kv(
+            torch.empty(1, 8),
+            SimpleNamespace(),
+            AttentionForwardArgs(output=None),
+        )
 
 
 @pytest.mark.parametrize(
@@ -608,6 +832,45 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed(
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
+
+
+def test_msa_scratch_sizing_covers_spec_verify_tokens() -> None:
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = None
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    metadata.msa_max_score = torch.zeros(4 * 16 * 2)
+
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
+        metadata._ensure_msa_decode_scratch_buffers(
+            num_index_heads=4,
+            max_batch=2,
+            capture_graph=False,
+            required_max_k_tiles=16,
+        )
+
+
+def test_per_token_valid_blocks_multi_token_decode() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        per_token_valid_blocks,
+    )
+
+    qo_lens = torch.tensor([4], dtype=torch.int32)
+    kv_lens = torch.tensor([10], dtype=torch.int32)
+    qo_offset = torch.tensor([6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo_lens, kv_lens, qo_offset, causal=True, block_size=2)
+    assert n_valid.tolist() == [4, 4, 5, 5]
+
+    qo_lens = torch.tensor([1, 3], dtype=torch.int32)
+    kv_lens = torch.tensor([9, 6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo_lens, kv_lens, kv_lens - qo_lens, causal=True, block_size=4)
+    assert n_valid.tolist() == [3, 1, 2, 2]
+
+
+def test_msa_target_requires_separate_32_token_draft_cache() -> None:
+    assert MiniMaxM3KVCacheManagerV2.supports_shared_draft_layers is False
+    assert MiniMaxM3KVCacheManagerV2.draft_manager_tokens_per_block == 32
 
 
 def _expand_slot_rows(block_ids: torch.Tensor, tokens_per_block: int) -> torch.Tensor:

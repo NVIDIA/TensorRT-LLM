@@ -31,6 +31,7 @@ from torch import nn
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -38,8 +39,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3DecoderLayer,
+    MiniMaxM3ForCausalLM,
     MiniMaxM3Model,
+    MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
+    _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
     _validate_sparse_attention_runtime_config,
@@ -50,6 +55,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     get_text_config,
     is_minimax_m3_vl_config,
 )
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
@@ -58,6 +64,8 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -92,6 +100,245 @@ def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
     )
 
     _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
+    sparse_config = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        indexer_kv_dtype="fp8",
+        fuse_qkv_index_projection=True,
+    )
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=sparse_config,
+    )
+    with pytest.raises(ValueError, match="requires an FP8 main KV cache"):
+        _validate_sparse_attention_runtime_config(model_config)
+
+    model_config.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_minimax_m3_uses_one_engine_speculative_base() -> None:
+    assert issubclass(MiniMaxM3ForCausalLM, SpecDecOneEngineForCausalLM)
+
+
+def test_setup_aliases_preserves_one_engine_draft_weight_loading() -> None:
+    loaded = []
+
+    class DraftModel:
+        shares_target_kv_cache = True
+
+        def load_weights_from_target_model(self, target) -> None:
+            loaded.append(target)
+
+    target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
+    layers = [
+        SimpleNamespace(input_layernorm=object()),
+        SimpleNamespace(input_layernorm=object()),
+    ]
+    final_norm = object()
+    object.__setattr__(target, "draft_model", DraftModel())
+    object.__setattr__(target, "model", SimpleNamespace(layers=layers, norm=final_norm))
+
+    target.setup_aliases()
+
+    assert loaded == [target]
+    assert layers[0].next_layer_layernorm is layers[1].input_layernorm
+    assert layers[1].next_layer_layernorm is final_norm
+
+
+def test_eagle_capture_precedes_next_layer_norm() -> None:
+    class CaptureMetadata:
+        def __init__(self) -> None:
+            self.captured = None
+
+        def is_layer_capture(self, layer_idx: int) -> bool:
+            return layer_idx == 25
+
+        def maybe_capture_hidden_states(self, layer_idx, hidden_states, residual) -> None:
+            self.captured = (layer_idx, hidden_states.clone(), residual.clone())
+
+    layer = SimpleNamespace(
+        layer_idx=25,
+        _apply_pre_feed_forward_norm=lambda hidden, residual: (hidden + 1, residual + 2),
+        block_sparse_moe=lambda hidden, unused_metadata, **unused_kwargs: hidden + 3,
+        _feed_forward_all_reduce_params=lambda: None,
+        _apply_next_layer_layernorm=lambda hidden, residual: (hidden + 10, residual + 20),
+    )
+    spec_metadata = CaptureMetadata()
+    hidden_states = torch.tensor([1.0])
+    residual = torch.tensor([2.0])
+
+    output, output_residual = MiniMaxM3DecoderLayer.forward_MoE(
+        layer,
+        hidden_states,
+        SimpleNamespace(),
+        residual,
+        spec_metadata,
+    )
+
+    assert spec_metadata.captured is not None
+    layer_idx, captured_hidden, captured_residual = spec_metadata.captured
+    assert layer_idx == 25
+    torch.testing.assert_close(captured_hidden, torch.tensor([5.0]))
+    torch.testing.assert_close(captured_residual, torch.tensor([4.0]))
+    torch.testing.assert_close(output, torch.tensor([15.0]))
+    torch.testing.assert_close(output_residual, torch.tensor([24.0]))
+
+
+def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> None:
+    class FakeAttentionLayer:
+        def __init__(self) -> None:
+            self.producer_shapes = None
+
+        def _fused_fp8_qkv_indexer_norm_rope_kv_insert(self, packed, position_ids, attn_metadata):
+            self.producer_shapes = (
+                tuple(packed.shape),
+                tuple(position_ids.shape),
+                attn_metadata.num_tokens,
+            )
+            return packed[:, :3].clone(), packed[:, :1].clone()
+
+        def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
+            assert k is None and v is None and idx_k is None
+            assert idx_q.shape == (attn_metadata.num_tokens, 1)
+            output.copy_(q)
+
+    metadata = SimpleNamespace(num_tokens=2)
+    layer = FakeAttentionLayer()
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (metadata, layer),
+    )
+    packed = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+    output = torch.full((4, 3), -1.0)
+
+    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+        None,
+        None,
+        None,
+        None,
+        None,
+        packed,
+        position_ids,
+        "3",
+        output,
+    )
+
+    assert layer.producer_shapes == ((2, 5), (1, 2), 2)
+    torch.testing.assert_close(output[:2], packed[:2, :3])
+    torch.testing.assert_close(output[2:], torch.full((2, 3), -1.0))
+
+
+def test_piecewise_projection_fake_preserves_padded_hidden_rows(monkeypatch) -> None:
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    projection.local_output_sizes = (3, 4)
+    layer = SimpleNamespace(qkv_proj=projection)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (SimpleNamespace(), layer),
+    )
+    hidden_states = torch.randn(256, 5)
+    position_ids = torch.arange(6).reshape(1, 6)
+
+    packed = modeling_minimaxm3._minimax_m3_qkv_index_proj_fake(hidden_states, position_ids, "3")
+
+    # The real GEMM projects every padded hidden row. Position IDs remain an
+    # input solely to carry the unpadded token symbol to the piecewise segment.
+    assert packed.shape == (hidden_states.shape[0], 7)
+
+
+def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch) -> None:
+    """Do not inherit a bucket-specialized token dimension from the GEMM output."""
+    packed = torch.randn(2, 7)
+    captured = {}
+
+    def fake_boundary(q, k, v, idx_q, idx_k, packed_arg, position_ids, layer_idx, output):
+        assert q is None and k is None and v is None
+        assert idx_q is None and idx_k is None
+        captured["packed"] = packed_arg
+        captured["position_ids"] = position_ids
+        captured["output_shape"] = tuple(output.shape)
+        output.zero_()
+
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=True,
+        qkv_proj=lambda hidden_states: packed,
+        register_to_config=True,
+        num_heads=1,
+        head_dim=3,
+        attn_activation_dtype=torch.float32,
+        layer_idx_str="3",
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (SimpleNamespace(), layer),
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "maybe_bcg_minimax_m3_attn_custom_op_inplace",
+        fake_boundary,
+    )
+    hidden_states = torch.randn(4, 5)
+    position_ids = torch.arange(6).reshape(1, 6)
+
+    result = MiniMaxM3Attention._sparse_forward(
+        layer,
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+    )
+
+    assert captured["packed"] is packed
+    assert captured["position_ids"] is position_ids
+    assert captured["output_shape"] == (position_ids.shape[-1], 3)
+    assert result.shape == (position_ids.shape[-1], 3)
+
+
+def test_msa_attention_core_routes_compact_q_to_prewritten_kv_entrypoint() -> None:
+    selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
+
+    class FakeMsaBackend:
+        def __init__(self) -> None:
+            self.prepopulated_call = None
+
+        def run_indexer(self, idx_q, idx_k, metadata):
+            assert idx_k is None
+            assert metadata is attn_metadata
+            return selected_blocks
+
+        def forward_prepopulated_kv(self, q, metadata, forward_args) -> None:
+            self.prepopulated_call = (q, metadata, forward_args)
+
+        def forward(self, *unused_args, **unused_kwargs) -> None:
+            raise AssertionError("compact Q must not enter TrtllmAttention.forward")
+
+    layer = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    backend = FakeMsaBackend()
+    layer.attn = backend
+    layer.is_sparse_attention_layer = True
+    q = torch.randn(2, 8)
+    idx_q = torch.randn(2, 4)
+    attn_metadata = SimpleNamespace()
+    output = torch.empty_like(q)
+
+    result = layer._msa_attention_core(q, None, None, idx_q, None, attn_metadata, output)
+
+    assert result is output
+    assert backend.prepopulated_call is not None
+    called_q, called_metadata, forward_args = backend.prepopulated_call
+    assert called_q is q
+    assert called_metadata is attn_metadata
+    assert forward_args.output is output
+    assert forward_args.sparse_backend_args.topk_indices is selected_blocks
 
 
 def test_model_init_validates_sparse_attention_runtime_config() -> None:
@@ -571,6 +818,56 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
         assert "attn_metadata" in msg or "kv_cache_manager" in msg, msg
     else:  # pragma: no cover
         raise AssertionError("sparse forward must raise RuntimeError when attn_metadata is None")
+
+
+def test_minimax_m3_five_way_projection_shard_geometry():
+    module = SimpleNamespace(
+        tp_size=2,
+        tp_rank=1,
+        total_num_kv_heads=4,
+        total_num_index_heads=4,
+    )
+    shard_geometry = MiniMaxM3QKVIndexerLinear._shard_geometry
+    assert shard_geometry(module, "q") == (2, 1)
+    assert shard_geometry(module, "k") == (2, 1)
+    assert shard_geometry(module, "v") == (2, 1)
+    assert shard_geometry(module, "index_q") == (2, 1)
+    assert shard_geometry(module, "index_k") == (1, 0)
+
+    # At TP8, each of four KV/index-Q heads is replicated on two ranks.
+    module.tp_size = 8
+    module.tp_rank = 5
+    assert shard_geometry(module, "k") == (4, 2)
+    assert shard_geometry(module, "index_q") == (4, 2)
+    assert shard_geometry(module, "index_k") == (1, 0)
+
+
+def test_minimax_m3_five_way_loader_returns_exact_generic_skip():
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    captured = {}
+    projection.load_five_way_weights = lambda shards: captured.update(shards)
+
+    model = nn.Module()
+    model.sparse = nn.Module()
+    model.sparse.qkv_proj = projection
+    weights = {
+        f"sparse.{name}_proj.weight": torch.empty(1)
+        for name in ("q", "k", "v", "index_q", "index_k")
+    }
+
+    loaded_modules = _load_qkv_index_proj_weights(model, weights)
+
+    assert loaded_modules == ["sparse.qkv_proj"]
+    assert set(captured) == {"q", "k", "v", "index_q", "index_k"}
+    assert all(set(shard) == {"weight"} for shard in captured.values())
+    assert weights == {}
+
+    mapper = MiniMaxM3HfWeightMapper()
+    mapper.add_skip_modules(loaded_modules)
+    mapper._model = SimpleNamespace(config=SimpleNamespace(tie_word_embeddings=False))
+    assert mapper.should_skip_module("sparse.qkv_proj")
+    assert not mapper.should_skip_module("dense.qkv_proj")
 
 
 @pytest.mark.gpu
