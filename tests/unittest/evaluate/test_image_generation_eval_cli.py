@@ -16,8 +16,8 @@ from tensorrt_llm.evaluate.visual_gen.evaluators import build_image_evaluator
 from tensorrt_llm.evaluate.visual_gen.generators import build_visual_generator
 from tensorrt_llm.evaluate.visual_gen.types import QwenImageBenchResult
 
-
 pytestmark = pytest.mark.cpu_only
+
 
 @dataclass
 class _FakeVisualGenOutput:
