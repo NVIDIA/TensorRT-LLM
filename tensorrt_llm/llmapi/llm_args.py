@@ -5269,13 +5269,6 @@ class GmsConfig(StrictBaseModel):
         return self
 
 
-class SamplerType(StrEnum):
-    """Enum for sampler type options."""
-    TRTLLMSampler = "TRTLLMSampler"
-    TorchSampler = "TorchSampler"
-    auto = "auto"
-
-
 class PrefillCudaGraphBackend(StrEnum):
     """CUDA graph implementation used for prefill requests."""
 
@@ -5485,17 +5478,6 @@ class TorchLlmArgs(BaseLlmArgs):
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
-
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.auto,
-        description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
-        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
-        status="deprecated",
-        deprecated=
-        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler.",
-        telemetry=TelemetryField.categorical('TRTLLMSampler', 'TorchSampler',
-                                             'auto'))
 
     sampler_force_async_worker: bool = Field(
         default=False,

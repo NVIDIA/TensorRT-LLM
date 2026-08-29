@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
@@ -24,7 +24,6 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
-from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -34,6 +33,9 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SamplerType,
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
     WaitingQueuePolicy)
+    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
+    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
+    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -72,8 +74,7 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
-                      TRTLLMSampler)
+from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
@@ -3346,11 +3347,8 @@ def instantiate_sampler(
     *,
     max_batch_size: int,
     max_beam_width: int,
-    max_seq_len: int,
     mm_encoder_only: bool,
     speculative_config: SpeculativeConfig,
-    decoding_config: trtllm.DecodingConfig,
-    kv_cache_config: KvCacheConfig,
     max_num_sequences: Optional[int] = None,
 ):
     enable_async_worker = (confidential_compute_enabled()
@@ -3368,8 +3366,6 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
     )
-    decoding_mode = get_decoding_mode(decoding_config=decoding_config,
-                                      max_beam_width=max_beam_width)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
@@ -3377,50 +3373,10 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
-        logger.warning(
-            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
-        )
-        logger.debug(f"DecodingMode: {decoding_mode.name}")
-        return TRTLLMSampler(engine.model,
-                             engine.dtype,
-                             mapping,
-                             decoding_mode,
-                             llm_args.disable_overlap_scheduler,
-                             max_seq_len=max_seq_len,
-                             max_batch_size=max_batch_size,
-                             max_beam_width=max_beam_width,
-                             decoding_config=decoding_config,
-                             kv_cache_config=kv_cache_config,
-                             enable_async_worker=enable_async_worker,
-                             max_num_sequences=max_num_sequences)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
     return TorchSampler(sampler_args)
-
-
-def get_decoding_mode(
-    decoding_config: trtllm.DecodingConfig,
-    max_beam_width: int,
-) -> DecodingMode:
-    '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
-    if decoding_config and decoding_config.decoding_mode and not decoding_config.decoding_mode.isAuto(
-    ):
-        decoding_mode = decoding_config.decoding_mode
-    elif max_beam_width == 1:
-        decoding_mode = DecodingMode.TopKTopP()
-    else:
-        decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when beam width is one
-    if max_beam_width == 1 and decoding_mode.isBeamSearch():
-        logger.warning(
-            "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
-        )
-        decoding_mode = DecodingMode.TopKTopP()
-
-    return decoding_mode
 
 
 _ATTN_MODULES = frozenset({
@@ -3593,7 +3549,7 @@ def _adjust_torch_mem_fraction():
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
 
 
-def validate_feature_combination(llm_args, model_engine, sampler_type):
+def validate_feature_combination(llm_args, model_engine):
     # Validate the flags for features' combination
     compression_config = llm_args.kv_cache_compression_config
     if compression_config is not None:
@@ -3616,8 +3572,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             "mtp",
             "eagle3_one_model",
             "eagle3_two_model",
-            "torch_sampler",
-            "trtllm_sampler",
             "kv_cache_reuse",
             "slide_window_attention",
             "guided_decoding",
@@ -3639,11 +3593,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             isinstance(llm_args.speculative_config, EagleDecodingConfig)
             and not llm_args.speculative_config.eagle3_one_model)
         feature_status[
-            "torch_sampler"] = sampler_type == SamplerType.TorchSampler
-        feature_status[
-            "trtllm_sampler"] = sampler_type == SamplerType.TRTLLMSampler
-
-        feature_status[
             "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
         feature_status["slide_window_attention"] = (
             hasattr(model_engine.model.model_config.pretrained_config,
@@ -3660,29 +3609,9 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
 
     feature_status: Dict[str, bool] = init_feature_status(llm_args)
 
-    ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
-
-    CONFLICT_RULES = [
-        {
-            "features": ["trtllm_sampler", "mtp"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler", feature2="mtp") +
-            " Please use sampler type auto instead."
-        },
-        {
-            "features": ["trtllm_sampler", "eagle3_one_model"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
-                                feature2="eagle3_one_model") +
-            " Please use sampler type auto instead."
-        },
-        {
-            "features": ["trtllm_sampler", "eagle3_two_model"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
-                                feature2="eagle3_two_model") +
-            " Please use sampler type auto instead."
-        },
+    # Kept as an extension point; there are currently no conflicting feature
+    # combinations to reject.
+    CONFLICT_RULES: list[dict[str, Any]] = [
         # Add new conflict rules here in the future
     ]
     for rule in CONFLICT_RULES:

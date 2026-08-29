@@ -90,7 +90,6 @@ speculative_config:
   speculative_model_dir: /config/models/eagle/
 cuda_graph_config:
   max_batch_size: 10
-sampler_type: TorchSampler
 moe_config:
   backend: TRTLLM
 EOF
@@ -99,7 +98,6 @@ EOF
 Notes:
 - Ensure your base model directory is `/config/models/gpt-oss-120b`.
 - Ensure your Eagle3 assets are present under `/config/models/eagle/`.
-- On older releases (pre-1.1.0), replace `sampler_type: TorchSampler` with `use_torch_sampler: true`.
 
 ### Launch the Server (Eagle3 Speculative Decoding)
 
