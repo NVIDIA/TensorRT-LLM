@@ -77,6 +77,7 @@ def _run_multi_gpu(world_size, test_fn):
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 class TestConstruction:
     def test_single_gpu_defaults(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -191,6 +192,7 @@ class TestConstruction:
             )
 
 
+@pytest.mark.cpu_only
 class TestFlattenCfgRanks:
     """flatten_cfg_ranks is pure layout arithmetic: one rank list per combined
     coordinate of every non-(cfg, ulysses) mesh dim, cfg outermost / ulysses
@@ -217,6 +219,7 @@ class TestFlattenCfgRanks:
         assert vgm.flatten_cfg_ranks() == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
+@pytest.mark.cpu_only
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -248,6 +251,7 @@ class TestSingleGPURanksAndGroups:
         assert vgm.attn2d_col_group is None
 
 
+@pytest.mark.cpu_only
 class TestToLlmMapping:
     def test_single_gpu(self):
         vgm = VisualGenMapping(world_size=1, rank=0)

@@ -20,9 +20,13 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pydantic import BaseModel, Field
 
 from tensorrt_llm.usage import usage_lib
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Console notification tests

@@ -11,6 +11,7 @@ from .gemma4_parser import Gemma4ToolParser
 from .glm4_parser import Glm4ToolParser
 from .glm47_parser import Glm47ToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
+from .kimi_k3_tool_parser import KimiK3ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
 from .minimax_m3_parser import MiniMaxM3ToolParser
 from .poolside_v1_parser import PoolsideV1ToolParser
@@ -29,6 +30,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "deepseek_v4": "deepseek_v4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k2",
+    "kimi_k3": "kimi_k3",
     "glm4": "glm4",
     "glm4_moe": "glm47",
     "glm4_moe_lite": "glm47",
@@ -58,6 +60,7 @@ class ToolParserFactory:
         "qwen3": Qwen3ToolParser,
         "qwen3_coder": Qwen3CoderToolParser,
         "kimi_k2": KimiK2ToolParser,
+        "kimi_k3": KimiK3ToolParser,
         "deepseek_v3": DeepSeekV3Parser,
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,

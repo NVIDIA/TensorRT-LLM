@@ -19,11 +19,132 @@ import sys
 from typing import Any
 
 
+class _TestBlock:
+    """Own a real radix-tree block and its real committed pages for a test."""
+
+    __slots__ = ("block", "pages")
+
+    def __init__(self, block: Any, pages: list[Any]) -> None:
+        self.block = block
+        self.pages = pages
+
+    def close(self) -> None:
+        for page in self.pages:
+            self.block.unlink_page(page.life_cycle, page)
+        self.pages.clear()
+
+    def __del__(self) -> None:
+        self.close()
+
+
 def _cpp_introspection_module() -> Any | None:
     package = sys.modules.get(__package__)
     if package is None:
         return None
     return getattr(package, "_cpp_introspection", None)
+
+
+def create_test_padding_cold_page_codec(
+    cold_page_bytes_by_layer: dict[int, int],
+) -> Any:
+    """Create the private native padding codec used by cold-tier end-to-end tests."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the test padding cold-page codec requires the C++ backend")
+    return cpp_introspection.create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
+
+
+def make_test_block(
+    manager: Any,
+    tokens: Any,
+    coverage_per_lc: list[int],
+    parent: Any = None,
+    reuse_scope: Any = None,
+) -> Any:
+    """Build a real block with real GPU pages at the requested lifecycle coverage."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.make_test_block(
+            manager, list(tokens), coverage_per_lc, parent, reuse_scope
+        )
+
+    from . import rawref
+    from ._block_radix_tree import ReuseScope, _add_or_get_existing
+    from ._common import GPU_LEVEL, PRIORITY_DEFAULT
+    from ._page import CommittedPage
+
+    token_list = list(tokens)
+    if not token_list:
+        raise ValueError("make_test_block requires at least one token")
+    if len(coverage_per_lc) != manager._life_cycles.size:
+        raise ValueError(
+            "coverage_per_lc length must match the manager lifecycle count "
+            f"({manager._life_cycles.size})"
+        )
+    if any(coverage < 0 or coverage > len(token_list) for coverage in coverage_per_lc):
+        raise ValueError("lifecycle coverage must be between zero and the block token count")
+
+    if parent is None:
+        parent_block = manager._radix_tree.add_or_get_existing(reuse_scope or ReuseScope())
+    else:
+        parent_block = parent.block
+    block = _add_or_get_existing(parent_block, token_list)
+    if block is None:
+        raise ValueError("make_test_block could not add the requested block")
+
+    counts = [int(coverage > 0) for coverage in coverage_per_lc]
+    slots = manager._storage.new_gpu_slots(counts)
+    pages = []
+    for life_cycle, coverage in enumerate(coverage_per_lc):
+        if coverage == 0:
+            continue
+        page = CommittedPage(
+            manager._storage,
+            block,
+            life_cycle,
+            GPU_LEVEL,
+            slots[life_cycle].pop(),
+            coverage,
+            PRIORITY_DEFAULT,
+        )
+        block.storage[life_cycle] = rawref.ref(page)
+        pages.append(page)
+    return _TestBlock(block, pages)
+
+
+def close_test_block(block: Any) -> None:
+    """Unlink and release a test block pages before its manager shuts down."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        block.close()
+        return
+    block.close()
+
+
+def test_block_key(block: Any) -> bytes:
+    """Return a test block real radix-tree key."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return bytes(cpp_introspection.test_block_key(block))
+    return bytes(block.block.key)
+
+
+def event_manager_add_stored_block(event_manager: Any, block: Any) -> None:
+    """Derive and enqueue stored events from a real test block."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        cpp_introspection.event_manager_add_stored_block(event_manager, block)
+        return
+    event_manager.add_stored_block_event_from_block(block.block)
+
+
+def event_manager_add_stored_life_cycle(event_manager: Any, block: Any, life_cycle_id: int) -> None:
+    """Derive and enqueue one lifecycle stored event from a real test block."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        cpp_introspection.event_manager_add_stored_life_cycle(event_manager, block, life_cycle_id)
+        return
+    event_manager.add_stored_life_cycle_event_from_block(block.block, life_cycle_id)
 
 
 def active_page_stats(kv_cache: Any) -> tuple[list[int], list[int]]:
@@ -316,12 +437,28 @@ def reuse_match_planned_drop_counts(
     return match.num_tokens, counts
 
 
-def pool_group_index(manager: Any, lc_id: int) -> int:
-    """Return the storage pool-group index for lifecycle ``lc_id``."""
+def pool_group_index(manager: Any, lc_id: int, cache_level: int = 0) -> int:
+    """Return a lifecycle storage pool-group index at ``cache_level``."""
     cpp_introspection = _cpp_introspection_module()
     if cpp_introspection is not None:
-        return cpp_introspection.pool_group_index(manager, lc_id)
+        return cpp_introspection.pool_group_index(manager, lc_id, cache_level)
+    # The Python backend currently uses the hot lifecycle grouping at every level.
     return manager._storage.get_pool_group_index(lc_id)
+
+
+def life_cycle_pool_group_indices(manager: Any, cache_level: int = 0) -> list[int]:
+    """Return the pool-group index of every lifecycle at ``cache_level``, indexed by lifecycle ID.
+
+    Cold levels group lifecycles by encoded cold-page size, so their pool-group indices and counts are
+    unrelated to the hot ones. Callers that aggregate level-specific data must translate through this
+    mapping rather than reusing hot pool-group indices.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(cpp_introspection.life_cycle_pool_group_indices(manager, cache_level))
+    # The Python backend currently uses the hot lifecycle grouping at every level.
+    storage = manager._storage
+    return [storage.get_pool_group_index(lc_id) for lc_id in range(storage.num_life_cycles)]
 
 
 def compute_slots_for_batch(
@@ -339,5 +476,7 @@ def compute_slots_for_batch(
             )
         )
     return list(
-        manager._storage._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+        manager._storage._compute_pool_group_slots_for_batch(
+            batch, tokens_per_block, swa_scratch_reuse
+        )
     )

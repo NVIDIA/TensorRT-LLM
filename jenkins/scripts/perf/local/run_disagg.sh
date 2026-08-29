@@ -82,8 +82,11 @@ else
 fi
 
 # ---------------- Sanity checks ----------------
+# "unspecified" is allowed: same convention as L0_Test.groovy / submit.py —
+# omit #SBATCH --partition and let SLURM use the cluster default (e.g. oci-hsg).
 if [[ "$partition" == "CHANGE_ME" ]]; then
     echo "ERROR: please set 'partition' in $config_file." >&2
+    echo "       Use a real SLURM partition name, or 'unspecified' for the cluster default." >&2
     exit 1
 fi
 if [[ ${#test_ids[@]} -eq 0 ]]; then
@@ -145,7 +148,8 @@ else
     fi
     image_source="resolved from \$image_var=${image_var} via current_image_tags.properties"
 fi
-# urm.nvidia.com/ → urm.nvidia.com# (enroot URI form). No-op if user already passed enroot form.
+# host/ → host# (enroot URI form). No-op if user already passed enroot form.
+image=${image//artifactory.nvidia.com\//artifactory.nvidia.com#}
 image=${image//urm.nvidia.com\//urm.nvidia.com#}
 
 echo "=== Configuration ==="

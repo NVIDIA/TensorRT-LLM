@@ -1,8 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,8 +31,11 @@ from utils.util import (skip_blackwell, skip_num_gpus_less_than,
                         skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+    DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor._util import \
     _derive_draft_max_attention_window
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
@@ -27,9 +46,72 @@ from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
-from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
+    """Refresh DSA mappings after switching to the draft cache."""
+    events = []
+    draft_manager = object.__new__(DSACacheManagerV2)
+
+    class _Metadata(DSAtrtllmAttentionMetadata):
+
+        def __init__(self):
+            self._seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
+            self._num_ctx_tokens = 0
+
+        def set_in_mtp_draft_loop(self, active):
+            pass
+
+        def set_mtp_num_accepted(self, value):
+            pass
+
+        def set_skip_topk(self, value):
+            pass
+
+        def on_update_kv_lens(self):
+            events.append("refresh")
+
+    metadata = _Metadata()
+
+    @contextmanager
+    def draft_context(attn_metadata, manager):
+        assert attn_metadata is metadata
+        assert manager is draft_manager
+        events.append("switch")
+        yield metadata
+
+    class _StopAfterFirstDraftForward(Exception):
+        pass
+
+    def run_draft_forward(*args, **kwargs):
+        events.append("forward")
+        raise _StopAfterFirstDraftForward
+
+    worker = SimpleNamespace(
+        is_mtp_eagle=True,
+        draft_kv_cache_context=draft_context,
+        _run_draft_forward=run_draft_forward,
+    )
+
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+
+    with pytest.raises(_StopAfterFirstDraftForward):
+        Eagle3OneModelWorker._forward_linear_draft_loop(
+            worker,
+            {"position_ids": torch.tensor([0], dtype=torch.int32)},
+            metadata,
+            SimpleNamespace(runtime_draft_len=1),
+            draft_model=object(),
+            draft_kv_cache_manager=draft_manager,
+            num_contexts=0,
+            batch_size=1,
+            num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
+            original_all_rank_num_tokens=None,
+        )
+
+    assert events == ["switch", "refresh", "forward"]
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
@@ -390,69 +472,35 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", True, False, False, False, False, False, False,
-            False
-        ],
-        [
-            True, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [False, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", False, False, False, False, True, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True, False],
-        [
-            False, "TRTLLM", False, False, False, False, False, True, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, True, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False, False],
-        [
-            True, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [
-            False, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False, False],
-        [
-            True, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
+        [True, "TRTLLM", True, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, False, False, False],
+        [False, "FLASHINFER", True, False, False, False, False, False, False],
+        [False, "TRTLLM", False, True, True, False, False, False, False],
+        [True, "TRTLLM", False, True, True, False, False, False, False],
+        [True, "TRTLLM", True, False, True, True, False, False, False],
+        [True, "TRTLLM", True, False, True, False, False, False, False],
+        [True, "TRTLLM", True, False, False, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, True, True, False],
+        [False, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False],
+        [True, "FLASHINFER", False, False, False, False, False, False, False],
+        [False, "FLASHINFER", False, False, False, False, False, False, False],
         # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, True, False, False, True],
+        [False, "TRTLLM", True, False, False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool, multi_batch: bool,
-                      attention_dp: bool, use_hf_speculative_model: bool):
+                      multi_batch: bool, attention_dp: bool,
+                      use_hf_speculative_model: bool):
     if not use_one_model:
         pytest.skip("Two model Eagle3 is deprecated")
 
@@ -504,7 +552,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=use_one_model,
     )
-    spec_config._allow_chain_drafter = use_chain_drafter
 
     # Create the LLM instance
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -696,108 +743,6 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     # test since it goes beyond the max seqlen. Thus, the text should be
     # _exactly_ the same, no need to use similarity scoring.
     assert generated_text_spec[0] == generated_text_ref[0]
-
-
-def test_deepseek_eagle3():
-    use_cuda_graph = True
-    attn_backend = "TRTLLM"
-    disable_overlap_scheduler = False
-    enable_block_reuse = False
-    use_one_model = False
-    enable_chunked_prefill = False
-
-    # Eagle3 one model works with overlap scheduler and block reuse.
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 150:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    eagle_config = {
-        'architectures': ['LlamaForCausalLMEagle3'],
-        'attention_bias': False,
-        'attention_dropout': 0.0,
-        'bos_token_id': 128000,
-        'eos_token_id': [128001, 128008, 128009],
-        'eagle_config': {
-            'use_aux_hidden_state': False,
-            'use_input_layernorm_in_first_layer': True,
-            'use_last_layernorm': True,
-            'use_mtp_layernorm': False
-        },
-        'head_dim': 128,
-        'hidden_act': 'silu',
-        'hidden_size': 2560,
-        'initializer_range': 0.02,
-        'intermediate_size': 16384,
-        'max_position_embeddings': 4096,
-        'mlp_bias': False,
-        'model_type': 'llama',
-        'num_attention_heads': 32,
-        'num_eagle_features': 1,
-        'num_hidden_layers': 1,
-        'num_key_value_heads': 8,
-        'pretraining_tp': 1,
-        'rms_norm_eps': 1e-05,
-        'rope_scaling': {
-            'factor': 8.0,
-            'high_freq_factor': 4.0,
-            'low_freq_factor': 1.0,
-            'original_max_position_embeddings': 8192,
-            'rope_type': 'llama3'
-        },
-        'rope_theta': 500000.0,
-        'tie_word_embeddings': False,
-        'torch_dtype': 'bfloat16',
-        'transformers_version': '4.52.4',
-        'use_cache': True,
-        'vocab_size': 129280,
-        'draft_vocab_size': 129280,
-    }
-    with tempfile.TemporaryDirectory() as temp_dir:
-        eagle_model_dir = Path(temp_dir)
-        config_path = eagle_model_dir / "config.json"
-        with config_path.open("w") as f:
-            json.dump(eagle_config, f, indent=2)
-        target_model_dir = f"{models_path}/DeepSeek-V3-Lite/nvfp4_moe_only"
-
-        # bs > 1 gives non-deterministic when doing IFB. There are slight chances
-        # that ref and spec does not match 100%
-        max_batch_size = 16
-        max_draft_len = 3
-        kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        max_tokens=8192)
-        cuda_graph_config = CudaGraphConfig(
-            batch_sizes=[1]) if use_cuda_graph else None
-
-        llm_common_config = dict(
-            model=target_model_dir,
-            attn_backend=attn_backend,
-            disable_overlap_scheduler=disable_overlap_scheduler,
-            cuda_graph_config=cuda_graph_config,
-            max_batch_size=max_batch_size,
-            max_num_tokens=4096,
-            max_seq_len=4096,
-            kv_cache_config=kv_cache_config,
-            enable_chunked_prefill=enable_chunked_prefill,
-        )
-
-        spec_config = Eagle3DecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=eagle_model_dir,
-            # Llama 3 does not support one model eagle.
-            eagle3_one_model=use_one_model,
-            eagle3_layers_to_capture={29},
-            load_format="dummy")
-
-        llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-        tok_ids = llm_spec.tokenizer.encode("The future of AI is")
-
-        sampling_params = SamplingParams(max_tokens=32, temperature=0)
-        for output in llm_spec.generate_async(tok_ids,
-                                              sampling_params,
-                                              streaming=True):
-            pass
 
 
 def test_deepseek_mla_eagle3():
@@ -1004,127 +949,6 @@ def test_multi_eagle3(use_one_model: bool):
                                               sampling_params,
                                               streaming=True):
             pass
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
-    """Test CUDA graph padding with 3 requests and max_batch_size=4.
-
-    This test verifies that when using CUDA graph with padding enabled,
-    the system properly reserves one additional slot for the padded dummy request.
-    Without this fix, there would be errors caused by no free slot.
-    """
-    attn_backend = "TRTLLM"
-    enable_block_reuse = False
-    use_one_model = False
-    enable_chunked_prefill = False
-
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    # Test with 3 requests and max_batch_size=4 to trigger padding
-    max_batch_size = 4
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=4096)
-    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
-                                        enable_padding=True)
-
-    llm_common_config = dict(
-        model=target_model_dir,
-        attn_backend=attn_backend,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        max_seq_len=2048,
-        enable_chunked_prefill=enable_chunked_prefill,
-    )
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
-    )
-
-    # Create the LLM instance
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-    prompts = [
-        "The capital of France is",
-        "The president of the United States is",
-        "The future of AI is",
-    ]
-
-    # Short generations keep all three requests within the KV cache budget so
-    # they run concurrently and batches of 3 actually pad up to the graph
-    # batch size 4. With long generations (2048 tokens against the 4096-token
-    # cache) the guaranteed-no-evict scheduler caps the batch at two requests,
-    # which exactly matches a graph batch size, so runtime padding (and the
-    # shared padding-dummy slot this test exists to cover) never engages.
-    # The overlap-scheduler variant must keep the long generations for now:
-    # padded draft batches trip a pre-existing shape mismatch in
-    # Eagle3SpecMetadata.prepare on the incremental-update path
-    # (hidden_states_read_indices sized without the padded requests).
-    max_tokens = 64 if disable_overlap_scheduler else 2048
-    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0)
-    llm_spec.generate(prompts, sampling_params)
-    llm_spec.shutdown()
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
-    """Test CDL sampling with 2 requests and max_batch_size=2."""
-    attn_backend = "TRTLLM"
-    enable_block_reuse = False
-    use_one_model = False
-    enable_chunked_prefill = False
-
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    max_batch_size = 1
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
-                                        enable_padding=True)
-
-    llm_common_config = dict(
-        model=target_model_dir,
-        attn_backend=attn_backend,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
-        enable_chunked_prefill=enable_chunked_prefill,
-    )
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
-    )
-
-    # Create the LLM instance
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-    prompts = ["The president of the United States is"]
-
-    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=0.9)
-    llm_spec.generate(prompts, sampling_params)
-    llm_spec.shutdown()
 
 
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],

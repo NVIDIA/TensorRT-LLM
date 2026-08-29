@@ -161,3 +161,69 @@ def strip_thinking_and_extract_mmmu_answer(text: str) -> str:
     answer extraction.
     """
     return extract_mmmu_answer(strip_thinking(text))
+
+
+# --- Kimi K3 channel-structured output ----------------------------------------
+#
+# Kimi K3 does NOT use Kimi K2.5's ``<think>...</think>`` markup. It emits a
+# channel-structured chat format whose reasoning block is terminated by
+# ``<|close|>think<|sep|>`` and whose final answer lives in an explicit response
+# channel::
+#
+#     <reasoning...><|close|>think<|sep|><|open|>response<|sep|>C<|close|>response<|sep|><|close|>message<|sep|>
+#
+# Because there is no ``</think>``, :func:`strip_thinking` returns the whole blob
+# and :func:`extract_mmmu_answer`'s cascade mis-scores it — the correct letter in
+# the response channel is discarded. On MMMU val this silently drops ~6-7 points
+# even though the model answered correctly. The extractor below reads the answer
+# straight from the response channel and reuses the shared MMMU cascade on just
+# that span.
+
+# Capture the content of a ``<|open|>response<|sep|> ... `` channel up to its
+# closing marker (or end-of-text when the output was truncated right after the
+# answer opened). DOTALL so multi-line channel content is captured.
+_KIMI_K3_RESPONSE_CHANNEL_RE = re.compile(
+    r"<\|open\|>\s*response\s*<\|sep\|>(.*?)"
+    r"(?:<\|close\|>\s*response|<\|close\|>\s*message|<\|open\|>|\Z)",
+    re.DOTALL,
+)
+
+# Residual Kimi special tokens of the form ``<|...|>`` to scrub from a channel
+# span before answer extraction.
+_KIMI_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
+
+
+def extract_kimi_k3_mmmu_answer(text: str) -> str:
+    r"""Extract an MMMU letter answer from Kimi K3 channel-structured output.
+
+    Kimi K3 wraps its final answer in an explicit response channel
+    (``<|open|>response<|sep|> ... <|close|>response<|sep|>``) and terminates
+    reasoning with ``<|close|>think<|sep|>`` rather than ``</think>``. This
+    extractor pulls the *last* response-channel span and reuses the shared
+    :func:`extract_mmmu_answer` cascade on just that span.
+
+    When no response channel is present — a short direct answer, or a thinking
+    trace truncated by ``finish_reason=length`` before the channel opened — it
+    falls back to :func:`strip_thinking_and_extract_mmmu_answer`, so Kimi K2.5's
+    behavior, short-answer handling, and truncated-output handling are all
+    unchanged. The K2.5 ``</think>`` path in :func:`strip_thinking` is not
+    touched.
+    """
+    if not text:
+        return ""
+    matches = _KIMI_K3_RESPONSE_CHANNEL_RE.findall(text)
+    # Prefer the most recent response channel whose content actually yields an
+    # answer. Guard on the *extraction* succeeding, not just the span being
+    # non-empty: a channel can hold content the cascade reduces to nothing
+    # (e.g. markdown-bold whitespace after Step-2 stripping), and returning ""
+    # would mask a recoverable answer in the reasoning text before the channel.
+    for span in reversed(matches):
+        cleaned = _KIMI_SPECIAL_TOKEN_RE.sub(" ", span).strip()
+        if not cleaned:
+            continue
+        answer = extract_mmmu_answer(cleaned)
+        if answer:
+            return answer
+    # No usable response channel: fall back to the K2.5 path, which also handles
+    # bare-letter direct answers and truncated thinking traces correctly.
+    return strip_thinking_and_extract_mmmu_answer(text)

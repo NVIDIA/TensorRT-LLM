@@ -36,14 +36,14 @@ from kv_transfer_harness import (
 
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCach
 # ---------------------------------------------------------------------------
 # Constants matching DeepseekV4CacheManager defaults
 # ---------------------------------------------------------------------------
-HEAD_DIM = 256  # Reduced from 512: test validates transfer, not attention correctness
+HEAD_DIM = 512
 INDEX_HEAD_DIM = 128
 WINDOW_SIZE = 128
 NUM_KV_HEADS = 1
@@ -78,6 +78,7 @@ def _create_deepseek_v4_manager(
     )
     max_num_tokens = MAX_SEQ_LEN * MAX_BATCH_SIZE
     kv_cache_config = KvCacheConfig(
+        dtype="fp8_ds_mla" if get_sm_version() == 90 else "auto",
         enable_block_reuse=False,
         max_tokens=max_num_tokens,
         event_buffer_max_size=0,

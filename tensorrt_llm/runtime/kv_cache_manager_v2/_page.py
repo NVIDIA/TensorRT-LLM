@@ -31,7 +31,6 @@ from ._common import (
     PageIndex,
     PageStatus,
     Priority,
-    TokenIdExt,
 )
 
 if TYPE_CHECKING:
@@ -131,8 +130,6 @@ class UncommittedPage(Page):
     kv_cache: rawref.ref["_KVCache"]
     ordinal: BlockOrdinal
     beam_index: BeamIndex
-
-    tokens: list[TokenIdExt] = field(default_factory=list)
 
     def is_committed(self) -> bool:
         return False

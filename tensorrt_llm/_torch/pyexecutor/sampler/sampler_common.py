@@ -12,19 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared building blocks for the sampler package.
+"""Shared infrastructure for the sampler package.
 
-The package's base layer: tensor helpers, the shared step/beam index constants,
-and the per-request queries that read an ``LlmRequest``'s sampling config into
-:class:`UtilsSamplingParams`. Imports nothing else from the package.
+The package's base layer: it imports nothing from its siblings, so anything
+here is safe for every other module to depend on. Holds what the feature
+modules (token bans, top-p decay, finish reasons, beam search, penalties,
+log-probs) build on:
+
+* the per-request queries that read an ``LlmRequest``'s sampling config into
+  :class:`UtilsSamplingParams`, plus the predicates over it
+  (``top_p_decay_active``, ``_request_sampling_params_cachable``);
+* the shared step/beam index constants and beam-width accessors;
+* tensor helpers (``int_tensor``, ``add_token``);
+* plain data types passed *between* modules that no single feature owns --
+  :class:`RequestSeeds` (seed manager -> strategy impls) and
+  :class:`_BatchedSamplingResult` (sampler -> log-probs).
+
+That last group follows the package's dependency rule: a type shared across
+features belongs here, so that a lower-layer module never has to import a
+higher-layer one to name it. A type owned by a single feature belongs with that
+feature instead -- the ``*Store`` classes all live in their own modules.
 
 Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, TypeAlias, TypeVar, cast
 
 import torch
+
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..llm_request import LlmRequest
 
@@ -54,6 +71,18 @@ class UtilsSamplingParams:
         top_p_min: Lower bound for the decayed runtime top-p.
         top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
             its initial value. A value < 0 never matches a token.
+        length_penalty: Beam-search length penalty exponent; scores are
+            normalized as cum_log_prob / length**length_penalty. 0 disables.
+        beam_search_diversity_rate: Beam-search diversity adjustment; adds
+            rate * source_beam_index to the candidate ranking score. 0 disables.
+        early_stopping: Beam-search stopping mode; see ``BeamSearchEarlyStop``.
+            ``TRUE`` (1, default) stops as soon as beam_width finished
+            candidates exist; ``FALSE`` (0) and ``NEVER`` (2) are the
+            exhaustive modes backed by the candidate-beams array. ``FALSE``
+            bounds a beam's best attainable score by its current score (assume
+            scores decrease monotonically with sequence length); ``NEVER``
+            places no upper bound on attainability for unfinished beams (assume
+            scores can increase with length, e.g. when length_penalty > 0).
     """
 
     temperature: Optional[float]
@@ -63,9 +92,15 @@ class UtilsSamplingParams:
     min_p: Optional[float] = None
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
+    # Rows the forward path allocated per request (static admission width).
+    # Equals beam_width_in unless the request uses a variable beam width array.
+    row_stride: Optional[int] = None
     top_p_decay: Optional[float] = None
     top_p_min: Optional[float] = None
     top_p_reset_ids: Optional[int] = None
+    length_penalty: Optional[float] = None
+    beam_search_diversity_rate: Optional[float] = None
+    early_stopping: Optional[int] = None
 
 
 def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
@@ -105,13 +140,23 @@ def _get_beam_width_out(request: LlmRequest) -> int:
 def _get_max_beam_width(request: LlmRequest) -> int:
     sampling_config = request.sampling_config
     max_beam_width = cast(int, sampling_config.beam_width)
-    if sampling_config.beam_width_array is not None:
-        max_beam_width = max(
-            max_beam_width,
-            cast(
-                int, torch.tensor(sampling_config.beam_width_array, dtype=torch.int32).max().item()
-            ),
-        )
+    # The array holds at most kMaxBeamWidthArrayLength (8) entries, so reduce it
+    # on the host. The C++ field is OptVec<vector<SizeType32>>, so it may arrive
+    # as [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength];
+    # unwrap the per-request row before reducing.
+    #
+    # Both `[]` and `[[]]` mean "no schedule" -- checkBeamWidthArray bounds only
+    # the array's length, so an empty one passes admission -- and must fall
+    # through to beam_width rather than reduce over nothing. Hence truthiness
+    # rather than `is not None`, and hence a second guard after the unwrap:
+    # the same two checks LlmRequest.get_beam_width_by_iter and
+    # PyExecutor._validate_request make.
+    beam_width_array = sampling_config.beam_width_array
+    if beam_width_array:
+        if isinstance(beam_width_array[0], (list, tuple)):
+            beam_width_array = beam_width_array[0]
+    if beam_width_array:
+        max_beam_width = max(max_beam_width, *map(int, beam_width_array))
     return max_beam_width
 
 
@@ -153,7 +198,15 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
+    # ModelEngine lays generation rows out at the static admission width; see
+    # the row_stride note in _beam_step_preprocess.
+    row_stride = 1 if request.is_context_init_state else request.py_beam_width
     use_beam_search = _get_max_beam_width(request) > 1
+    length_penalty = _unwrap_singleton(cast(Optional[list[float]], sampling_config.length_penalty))
+    beam_search_diversity_rate = _unwrap_singleton(
+        cast(Optional[list[float]], sampling_config.beam_search_diversity_rate)
+    )
+    early_stopping = _unwrap_singleton(cast(Optional[list[int]], sampling_config.early_stopping))
 
     return UtilsSamplingParams(
         temperature=temperature,
@@ -162,12 +215,87 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         min_p=min_p,
         beam_width_in=beam_width_in,
         beam_width_out=beam_width_out,
+        row_stride=row_stride,
         use_beam_search=use_beam_search,
         top_p_decay=top_p_decay,
         top_p_min=top_p_min,
         top_p_reset_ids=top_p_reset_ids,
+        length_penalty=length_penalty,
+        beam_search_diversity_rate=beam_search_diversity_rate,
+        early_stopping=early_stopping,
     )
 
 
 def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
     return not params.use_beam_search
+
+
+@dataclass(kw_only=True)
+class RequestSeeds:
+    """Per-request RNG state for user-specified ``SamplingParams.seed``.
+
+    Threaded alongside ``generator`` through the strategy impls and handed to
+    the flashinfer sampling ops as their stateless ``seed``/``offset`` pair.
+    Both tensors are int64 and 1-D with one entry per group row, matching the
+    per-row shape flashinfer documents; a row whose request did not specify a
+    seed carries the sampler's global seed, so unseeded requests keep their
+    previous behavior only in distribution, not token-for-token (see
+    ``_SeedManager``).
+
+    NB: the pinned flashinfer (0.6.15) accepts these per-row tensors but reads
+    only element 0 of each, separating rows by ``blockIdx.x``. The per-row
+    values below are therefore carried end-to-end but not yet honored for
+    batched requests; see the warning on ``_SeedManager`` and the upstream fix
+    at https://github.com/flashinfer-ai/flashinfer/pull/2345.
+
+    ``offset`` advances per request per sampling step, which is what makes a
+    seeded request's stream depend on how many tokens it has drawn rather than
+    on which batch it happened to land in.
+    """
+
+    seed: torch.Tensor
+    """Per-row Philox seed (int64, device)."""
+    offset: torch.Tensor
+    """Per-row Philox offset (int64, device)."""
+
+    def index_select(self, indices: torch.Tensor) -> "RequestSeeds":
+        """Narrow to a subset of rows, mirroring ``group_logit_indices``."""
+        return RequestSeeds(
+            seed=self.seed.index_select(0, indices),
+            offset=self.offset.index_select(0, indices),
+        )
+
+
+def top_p_decay_active(params: UtilsSamplingParams) -> bool:
+    """Whether dynamic top-p decay is active for a request.
+
+    Delegates to the single-source predicate on SamplingParams; note that
+    ``top_p_min`` / ``top_p_reset_ids`` alone do not activate dynamic behavior.
+    """
+    return SamplingParams.params_imply_top_p_decay_active(params.top_p_decay)
+
+
+@dataclass(kw_only=True, frozen=True)
+class _BatchedSamplingResult:
+    # Original request indices for all requests (permuted due to batching by strategy):
+    req_indices: torch.Tensor
+    # Next tokens for all requests:
+    next_tokens_cuda_int: torch.Tensor
+
+    # Processed and raw logprobs buffer. The tensor is sized to accommodate logprobs for all requests currently being
+    # processed by the sampler and slice(0, processed_logprobs_end) contains processed logprobs, ordered consistently
+    # with processed_logprobs_reqs_indices. Excludes beam search requests, which have a separate path for logprobs
+    # handling.
+    logprobs_cuda: torch.Tensor | None = None
+
+    # Requests requesting processed logprobs (incl. beam-search requests), same ordering as req_indices.
+    processed_logprobs_reqs_indices: list[int] = field(default_factory=list)
+    # Index of first unused row of logprobs_cuda
+    processed_logprobs_end: int = 0
+
+    # Requests requesting raw logprobs (incl. beam-search requests), ordered consistently with original
+    # (unpermuted) requests
+    raw_logprobs_reqs_indices: list[int] = field(default_factory=list)
+    # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices.
+    # Excludes beam search requests, which have a separate path for logprobs handling.
+    raw_logprobs_logit_indices_cuda: torch.Tensor | None = None

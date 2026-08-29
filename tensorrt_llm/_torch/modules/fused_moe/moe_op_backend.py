@@ -25,6 +25,8 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
+from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -332,6 +334,67 @@ class TRTLLMOpBackend(MoEOpBackend):
         use_dp=False,
     ):
         hidden_size = gemm1_weights.shape[-1] * 2
+        if gated_act_type == int(ActType_TrtllmGen.SiTu):
+            # Fused SiTu FC1 cubins exist for two input formats: NVFP4
+            # (group-16 scales, packed-FP4 activations) and MXFP4 (group-32
+            # scales, MXFP8 activations). Key off the gemm1 scale group size
+            # exactly as the op dispatch below does, so the diagnostics
+            # describe the path the request will actually take.
+            is_nvfp4 = (
+                gemm1_weights_scale is not None
+                and gemm1_weights_scale.shape[-1] == hidden_size // 16
+            )
+            is_mxfp4 = (
+                gemm1_weights_scale is not None
+                and gemm1_weights_scale.shape[-1] == hidden_size // 32
+            )
+            if is_nvfp4:
+                if hidden_states.dtype != torch.uint8 or hidden_states_scale is None:
+                    raise ValueError(
+                        "TRTLLM-Gen SiTu on NVFP4 expects packed-FP4 (uint8) "
+                        "activations with block scales, got "
+                        f"dtype={hidden_states.dtype}, "
+                        f"has_scale={hidden_states_scale is not None}."
+                    )
+                # The NVFP4 op takes no valid_hidden_size/valid_intermediate_size;
+                # padding is absorbed by the padded weight buffers and the
+                # caller slices the output back down.
+            elif is_mxfp4:
+                if hidden_states.dtype != torch.float8_e4m3fn or hidden_states_scale is None:
+                    raise ValueError(
+                        "TRTLLM-Gen SiTu on MXFP4 expects dynamically quantized "
+                        "MXFP8 activations with block scales, got "
+                        f"dtype={hidden_states.dtype}, "
+                        f"has_scale={hidden_states_scale is not None}."
+                    )
+                if valid_hidden_size is None or valid_intermediate_size is None:
+                    raise ValueError(
+                        "TRTLLM-Gen SiTu requires valid hidden and intermediate "
+                        "sizes for padded MXFP4 weights."
+                    )
+            else:
+                got = None if gemm1_weights_scale is None else tuple(gemm1_weights_scale.shape)
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires NVFP4 (group-16) or MXFP4 "
+                    f"(group-32) gemm1 weight scales for hidden_size={hidden_size}, "
+                    f"got gemm1_weights_scale shape {got}."
+                )
+            if gemm1_alpha is None or gemm1_beta is None:
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires per-local-expert alpha and beta tensors."
+                )
+            for name, value in (("gemm1_alpha", gemm1_alpha), ("gemm1_beta", gemm1_beta)):
+                if (
+                    value.dtype != torch.float32
+                    or not value.is_contiguous()
+                    or value.numel() != local_num_experts
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous float32 with {local_num_experts} elements."
+                    )
+            if gemm1_clamp_limit is not None:
+                raise ValueError("TRTLLM-Gen SiTu does not use gemm1_clamp_limit.")
+
         if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
             if (
                 gemm1_weights_scale is not None

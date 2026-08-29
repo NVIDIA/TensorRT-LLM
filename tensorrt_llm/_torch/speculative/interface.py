@@ -32,8 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -44,6 +43,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
+from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
@@ -117,9 +117,14 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
-    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
-    # model does not read the paged draft KV cache managed by attention metadata.
-    if spec_config.spec_dec_mode.is_dspark():
+    # The embedded DSpark draft owns a dedicated rolling-window cache in
+    # DSv4DSparkWorker and never reads the paged draft KV cache that attention
+    # metadata manages. A standalone DSpark drafter runs on DSparkWorker
+    # (DFlash lineage), which does read it, so it keeps the default -- hence a
+    # form check, not a mode check
+    # (see DSparkDecodingConfig.draft_is_embedded_in_target).
+    if (spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target):
         return False
     return spec_config._allow_separate_draft_kv_cache
 
@@ -127,9 +132,11 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
                                            draft_kv_cache_manager):
     """
-    Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
-    Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
-    batch. Call restore_attn_metadata_after_draft_replay after replay in a finally block.
+    Prepare attention metadata for a draft forward or CUDA graph replay when using a
+    separate draft KV cache. Swaps cache-layout-dependent buffers, refreshes FlashMLA
+    block IDs outside capture, and (for DSA) re-prepares indexer slot mappings
+    for the current batch.
+    Call restore_attn_metadata_after_draft_replay in a finally block.
     Returns saved state or None if no-op.
     """
     if draft_kv_cache_manager is None:
@@ -149,6 +156,18 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         'target_host_kv_cache_block_offsets':
         attn_metadata.host_kv_cache_block_offsets,
     }
+    if attn_metadata.enable_flash_mla:
+        if (attn_metadata.draft_block_ids_per_seq is None
+                or attn_metadata.draft_kv_block_ids_per_seq is None):
+            raise RuntimeError(
+                "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
+            )
+        saved['target_block_ids_per_seq'] = attn_metadata.block_ids_per_seq
+        saved[
+            'target_kv_block_ids_per_seq'] = attn_metadata.kv_block_ids_per_seq
+        attn_metadata.block_ids_per_seq = attn_metadata.draft_block_ids_per_seq
+        attn_metadata.kv_block_ids_per_seq = (
+            attn_metadata.draft_kv_block_ids_per_seq)
     attn_metadata.kv_cache_manager = draft_kv_cache_manager
     attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     attn_metadata.host_kv_cache_block_offsets = (
@@ -156,46 +175,11 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
-    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer)
-    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
-        m = attn_metadata
-        saved['saved_dsa_state'] = {
-            'host_indexer_k_cache_block_offsets':
-            m.host_indexer_k_cache_block_offsets.clone(),
-            'indexer_k_cache_block_offsets':
-            m.indexer_k_cache_block_offsets.clone(),
-            'host_slot_mapping_fp8':
-            m.host_slot_mapping_fp8.clone(),
-            'host_slot_mapping_scale':
-            m.host_slot_mapping_scale.clone(),
-            'slot_mapping_fp8':
-            m.slot_mapping_fp8.clone(),
-            'slot_mapping_scale':
-            m.slot_mapping_scale.clone(),
-        }
-        # Derive pool indices from the draft manager's encoded block
-        # offsets (via _get_pool_block_indices) instead of using raw block
-        # IDs.  With host cache offload, block IDs can exceed
-        # blocks_in_primary_pool after offload swaps (the block keeps its
-        # original high ID even though its memory now lives in the primary
-        # GPU pool).  Using raw block IDs as pool indices causes OOB access
-        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
-        # decodes memPoolBlockIndex from the C++ encoded offsets.
-        # Note: kv_cache_manager was already swapped to draft above (line 67).
-        pool_indices = m._get_pool_block_indices()
-        num_blocks = pool_indices.shape[1]
-        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
-            pool_indices)
-        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
-            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
-            non_blocking=True)
-        # Safety clamp: sanitize stale padding entries beyond num_seqs
-        # that may contain negative or out-of-range values, matching the
-        # regular DSA prepare() flow.
-        m.indexer_k_cache_block_offsets.clamp_(min=0)
-        Indexer.recompute_slot_mappings(m)
+    # Backends select any additional draft-forward state, such as native DSA
+    # indexer buffers or DeepSeek-V4 sparse tables and pool pointers.
+    backend_saved = attn_metadata.prepare_for_draft_forward()
+    if backend_saved is not None:
+        saved['saved_backend_state'] = backend_saved
     return saved
 
 
@@ -209,18 +193,16 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
     if attn_metadata.enable_flash_mla:
-        attn_metadata.prepare_flash_mla()
-    saved_dsa = saved_state.get('saved_dsa_state')
-    if saved_dsa is not None:
-        m = attn_metadata
-        m.host_indexer_k_cache_block_offsets.copy_(
-            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
-        m.indexer_k_cache_block_offsets.copy_(
-            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
-        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
-        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
-        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
-        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+        attn_metadata.block_ids_per_seq = saved_state[
+            'target_block_ids_per_seq']
+        attn_metadata.kv_block_ids_per_seq = saved_state[
+            'target_kv_block_ids_per_seq']
+        # Target and draft block-ID buffers are independent. Restoring only
+        # needs to invalidate the scheduler metadata; refreshing the unchanged
+        # target buffers would repeat request-specific H2D work.
+        attn_metadata._flash_mla_metadata_valid = False
+    attn_metadata.restore_after_draft_forward(
+        saved_state.get('saved_backend_state'))
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -418,31 +400,23 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         Args:
-            spec_resource_manager: the resource manager for the spec-dec mode.
             is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
-            use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
         use_case_1 = self.use_one_engine()
-        # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
-        # the target model (verification) or on the first draft for CDL based speculation.
-        use_case_2 = not self.use_one_engine() and (
-            not is_draft_model or
-            (spec_resource_manager is not None
-             and spec_resource_manager.is_first_draft
-             and use_chain_drafter)) and is_trtllm_attention
+        # For 2-model, only the target model (verification) processes multiple tokens at once.
+        use_case_2 = (not self.use_one_engine() and not is_draft_model
+                      and is_trtllm_attention)
 
         return use_case_1 or use_case_2
 
@@ -451,6 +425,13 @@ class SpeculativeDecodingMode(IntEnum):
         if name is None:
             return SpeculativeDecodingMode.NONE
         return SpeculativeDecodingMode[name.upper()]
+
+
+# Philox seed for requests that did not set ``SamplingParams.seed``. Fixed
+# rather than advanced per step so a run is reproducible: a request's stream is
+# separated from other rows' by the kernel's per-row subsequence and from its
+# own earlier steps by the offset, which leaves the seed free to be a constant.
+DEFAULT_SAMPLING_SEED = 42
 
 
 @dataclass
@@ -544,14 +525,36 @@ class SpecMetadata:
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
+    # Whether the occurrence penalties are enabled (deploy-time; from
+    # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
+    enable_penalty: bool = False
+    # Occurrence-penalty device state; None until prepare_penalty_buffers runs.
+    # See penalty_ops.PenaltyState for what each buffer holds and why the prompt is
+    # split from generated tokens.
+    penalty_state: Optional["penalty_ops.PenaltyState"] = None
+    # Whether any request in the current batch has a penalty. Diagnostic only: it
+    # must NOT gate the apply pass, because decode steps replay a CUDA graph
+    # captured during warmup, when the flag is necessarily False. Whether a row is
+    # actually penalized is decided on device by ``penalty_active``.
+    #
+    # Held in a list rather than a plain bool because create_cuda_graph_metadata
+    # shallow-copies this object and both views must observe the same value; same
+    # reasoning as _sampling_params_signature below.
+    _batch_uses_penalty: list = field(default_factory=lambda: [False],
+                                      repr=False)
+
+    @property
+    def batch_uses_penalty(self) -> bool:
+        return self._batch_uses_penalty[0]
+
+    @batch_uses_penalty.setter
+    def batch_uses_penalty(self, value: bool) -> None:
+        self._batch_uses_penalty[0] = value
+
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
-    # Whether top-k/top-p/temperature are globally disabled for the current batch.
-    skip_temperature: bool = False
-    skip_top_k: bool = False
-    skip_top_p: bool = False
     # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
     # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
     top_k_max: int = 0
@@ -559,6 +562,65 @@ class SpecMetadata:
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
     request_top_ps: Optional[torch.Tensor] = None
+    # Describe what the sampling-parameter buffers currently hold, so a step
+    # that reproduces them can skip the refill. Two entries because the two
+    # buffer groups depend on different things:
+    #   [0] request_* -- the per-request values, in batch order.
+    #   [1] the expanded per-token buffers, which additionally depend on each
+    #       request's token count (a context request contributing one row
+    #       instead of draft_len + 1 shifts every later request's offset).
+    # A context->generation transition therefore invalidates [1] while leaving
+    # [0] valid. See _sampling_params_buffers_need_update.
+    #
+    # Held in a list rather than plain fields because
+    # create_cuda_graph_metadata shallow-copies this object: the graph views
+    # and the eager view write the *same* tensors, so they must agree on what
+    # those tensors hold. Plain fields would give each view its own stale
+    # answer and let one skip a fill another view invalidated.
+    _sampling_params_signature: list = field(
+        default_factory=lambda: [None, None], repr=False)
+    # Per-row Philox state for user-specified ``SamplingParams.seed``, laid out
+    # to match the logits rows the sampling kernels consume.
+    #
+    # ``request_seeds`` carries the request's own seed (the engine-wide seed
+    # for unseeded requests). ``request_offsets`` carries how far that
+    # request's stream has advanced, which is what separates one step from the
+    # next: with a fixed user seed the offset is the only thing that changes,
+    # and taking it from the request's own progress -- rather than a global
+    # step counter -- keeps a seeded request reproducible regardless of which
+    # batch it lands in.
+    #
+    # NB: the pinned flashinfer reads only element 0 of each tensor, separating
+    # rows by blockIdx.x, so these per-row values are carried end-to-end but
+    # not yet honored per request. See
+    # https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    request_seeds: Optional[torch.Tensor] = None
+    request_offsets: Optional[torch.Tensor] = None
+    # Per-slot count of RNG windows already handed out, keyed by py_seq_slot.
+    #
+    # This deliberately does NOT read request.py_decoding_iter: the overlap
+    # scheduler runs _forward_step (where this is populated) before the
+    # previous batch's _update_requests, which is what increments that field.
+    # A request appearing in adjacent batches would therefore be seen at the
+    # same iteration twice and replay the same offset window. Counting the
+    # windows we hand out keeps the stream advancing once per sampling pass
+    # under either scheduler.
+    #
+    # Held in a dict so create_cuda_graph_metadata's copy.copy keeps graph and
+    # eager views sharing one counter; keyed by slot rather than batch position
+    # because batch composition shifts between iterations. Bounded by the slot
+    # pool, which SeqSlotManager frees and reuses on request completion.
+    #
+    # The counter is not reset when a slot is reused, so a new request on a
+    # recycled slot starts partway into its stream. That is still a disjoint
+    # region of it, so sampling stays correct; the cost is that a seeded
+    # request reproduces bit-exactly only for a given slot history.
+    _rng_window_counter: dict = field(default_factory=dict)
+    # The same state expanded to one entry per logits row, mirroring the
+    # temperatures / top_ks / top_ps layout, for the sampling calls that
+    # consume rows rather than requests.
+    seeds: Optional[torch.Tensor] = None
+    offsets: Optional[torch.Tensor] = None
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -604,6 +666,102 @@ class SpecMetadata:
     def __post_init__(self):
         pass
 
+    def _populate_request_rng_state(
+            self, requests: list["LlmRequest"],
+            per_request_normalized: list[tuple[float, int, float,
+                                               int]]) -> None:
+        """Fill the Philox seed/offset buffers for this batch.
+
+        A request's seed is fixed for its lifetime, so the offset is what has
+        to advance between steps -- otherwise every step of a seeded request
+        would draw the same numbers. Taking it from the request's own window
+        counter, rather than a global step counter, is what ties the stream to
+        how far that request has decoded instead of to when it was scheduled.
+
+        Both layouts are produced: ``request_*`` with one entry per request,
+        and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
+        temperatures / top_ks / top_ps layout), because the sampling calls
+        take one or the other.
+
+        A request that specified no seed gets ``DEFAULT_SAMPLING_SEED``. Its
+        stream is then separated from the other rows' by the kernel's per-row
+        subsequence and from its own earlier steps by the offset, so unseeded
+        requests still sample independently -- just reproducibly.
+        """
+        from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
+            request_random_seed
+
+        request_seeds = [
+            seed if (seed := request_random_seed(request)) is not None else
+            DEFAULT_SAMPLING_SEED for request in requests
+        ]
+        # Base of this step's Philox offset window. Each sampling pass owns
+        # max_draft_len + 1 consecutive offsets: the target sampler (or the
+        # rejection kernel, which is its alternative) takes the first, and
+        # draft step i takes base + 1 + i. Sizing the window by the static
+        # max_draft_len rather than the runtime one keeps a step's offsets
+        # disjoint from its neighbours' even when the draft length shrinks.
+        #
+        # The window index comes from _rng_window_counter, not from
+        # py_decoding_iter, which is still stale here under the overlap
+        # scheduler (see the field's comment).
+        window = self.max_draft_len + 1
+        request_offsets = []
+        for request in requests:
+            slot = request.py_seq_slot
+            # Dummy/padding requests (no slot) never have their output kept,
+            # so they share one counter rather than perturbing a real slot's.
+            step = self._rng_window_counter.get(slot, 0)
+            self._rng_window_counter[slot] = step + 1
+            request_offsets.append(step * window)
+        num_tokens_per_request = [n for *_, n in per_request_normalized]
+
+        flat_seeds: list[int] = []
+        flat_offsets: list[int] = []
+        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
+                                            num_tokens_per_request):
+            flat_seeds.extend(seed for _ in range(num_tokens))
+            flat_offsets.extend(offset for _ in range(num_tokens))
+
+        # A batch wider than the buffers would silently truncate the copies
+        # below, so assert rather than grow: CUDA graph batch sizes are already
+        # clamped to the executor's batch size (_filter_cuda_graph_batch_sizes),
+        # and graph padding refuses to cross it, so exceeding it here means the
+        # invariant broke upstream and should surface.
+        assert len(requests) <= self.max_num_requests, (
+            f"batch has {len(requests)} requests but max_num_requests is "
+            f"{self.max_num_requests}")
+        if (self.request_seeds is None
+                or self.request_seeds.numel() < self.max_num_requests):
+            self.request_seeds = torch.zeros(self.max_num_requests,
+                                             dtype=torch.int64,
+                                             device='cuda')
+            self.request_offsets = torch.zeros(self.max_num_requests,
+                                               dtype=torch.int64,
+                                               device='cuda')
+        if self.seeds is None or self.seeds.numel() < len(flat_seeds):
+            # Match the per-token buffers' capacity so a later batch with more
+            # rows does not reallocate mid-stream.
+            capacity = max(
+                len(flat_seeds),
+                self.temperatures.numel()
+                if self.temperatures is not None else 0)
+            self.seeds = torch.zeros(capacity, dtype=torch.int64, device='cuda')
+            self.offsets = torch.zeros(capacity,
+                                       dtype=torch.int64,
+                                       device='cuda')
+
+        def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            dst[:len(values)].copy_(torch.tensor(values,
+                                                 dtype=torch.int64,
+                                                 pin_memory=prefer_pinned()),
+                                    non_blocking=True)
+
+        _upload(self.request_seeds, request_seeds)
+        _upload(self.request_offsets, request_offsets)
+        _upload(self.seeds, flat_seeds)
+        _upload(self.offsets, flat_offsets)
+
     def prepare_rejection_sampling_buffers(self):
         """
         Allocate the slot-indexed buffers used by one-model rejection sampling.
@@ -645,6 +803,167 @@ class SpecMetadata:
                 (num_slot_rows, self.max_draft_len, self.vocab_size),
                 dtype=torch.float32,
                 device='cuda')
+
+    def prepare_penalty_buffers(self):
+        """Allocate the occurrence-penalty state. Idempotent; no-op when disabled.
+
+        Sized and indexed exactly like the rejection buffers -- see
+        ``prepare_rejection_sampling_buffers`` for why the slot pool is
+        ``num_seq_slots`` (not ``max_num_requests``) and why one scratch row is
+        appended for dummy/padding requests.
+        """
+        if not self.enable_penalty or self.vocab_size <= 0:
+            return
+        slot_capacity = self.num_seq_slots or self.max_num_requests
+        if slot_capacity <= 0:
+            return
+
+        if self.penalty_state is None:
+            self.penalty_state = penalty_ops.PenaltyState.create(
+                slot_capacity=slot_capacity, vocab_size=self.vocab_size)
+        # The scratch row padding requests route to. Normally published by
+        # prepare_rejection_sampling_buffers, which returns early when rejection
+        # sampling is off -- leaving it at 0, a live request's row -- so publish it
+        # here too. Both buffers append their scratch row at the same index, so the
+        # single value stays correct for either consumer.
+        self.dummy_slot_row = slot_capacity
+        if self.batch_slot_ids is None and self.max_num_requests > 0:
+            # Normally allocated by prepare_rejection_sampling_buffers; the penalties
+            # need the same row -> slot table even when rejection sampling is off.
+            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.long,
+                                              device='cuda')
+
+    @staticmethod
+    def _request_prompt_tokens(request):
+        """The request's prompt token ids, or None when they are unavailable.
+
+        Sliced to ``py_orig_prompt_len`` so only the prompt is taken, never tokens
+        the model has already generated -- those belong to the output counts.
+        """
+        get_tokens = getattr(request, "get_tokens", None)
+        if get_tokens is None:
+            return None
+        prompt_len = getattr(request, "py_orig_prompt_len", None)
+        tokens = get_tokens(0)
+        if prompt_len is not None:
+            tokens = tokens[:prompt_len]
+        if not len(tokens):
+            return None
+        return torch.tensor(tokens,
+                            dtype=torch.int64,
+                            pin_memory=prefer_pinned())
+
+    @staticmethod
+    def _penalty_value(sampling_config, name: str, default: float) -> float:
+        """Read one penalty parameter, which the C++ SamplingConfig holds as an
+        optional singleton list. Missing / empty / None all mean "not set"."""
+        if sampling_config is None:
+            return default
+        values = getattr(sampling_config, name, None)
+        if values is None:
+            return default
+        if isinstance(values, (list, tuple)):
+            if len(values) == 0 or values[0] is None:
+                return default
+            return float(values[0])
+        return float(values)
+
+    def _populate_penalty_params(self, requests):
+        """Write each request's penalty parameters into its slot row.
+
+        Only the rows of the requests in this batch are touched; a slot keeps its
+        values for the request's lifetime, and ``penalty_active`` is rewritten every
+        step so a slot whose new occupant has no penalties stops being penalized
+        (slot reuse would otherwise inherit the previous request's parameters).
+
+        Counts for a newly admitted slot are zeroed here as well, for the same
+        reason. Requests without a slot (CUDA-graph dummies) are skipped; their
+        rows keep the no-op defaults.
+        """
+        state = self.penalty_state
+        if not self.enable_penalty or state is None:
+            return
+
+        slots: list[int] = []
+        repetition: list[float] = []
+        presence: list[float] = []
+        frequency: list[float] = []
+        active: list[bool] = []
+        reset_slots: list[int] = []
+        seed_requests: list[tuple] = []
+        num_rows = state.counts.size(0)
+
+        for request in requests:
+            slot = getattr(request, "py_seq_slot", None)
+            # Live rows only: a negative slot would wrap onto another request's
+            # row, and the last row is the CUDA-graph padding scratch row.
+            if slot is None or not 0 <= slot < num_rows - 1:
+                continue
+            config = getattr(request, "sampling_config", None)
+            rep = self._penalty_value(config, "repetition_penalty", 1.0)
+            pre = self._penalty_value(config, "presence_penalty", 0.0)
+            freq = self._penalty_value(config, "frequency_penalty", 0.0)
+            ignore_len = int(
+                self._penalty_value(config, "prompt_ignore_length", 0.0))
+            slots.append(slot)
+            repetition.append(rep)
+            presence.append(pre)
+            frequency.append(freq)
+            active.append(rep != 1.0 or pre != 0.0 or freq != 0.0)
+            # A context request is starting its sequence: drop whatever the slot's
+            # previous occupant accumulated, then seed the prompt this one starts
+            # from. Only penalized requests are seeded -- reading the prompt costs a
+            # host-side copy that an unpenalized request would never consult.
+            #
+            # Gated on the LAST context chunk rather than merely on the context
+            # state: under chunked prefill ``is_context_init_state`` stays true for
+            # every chunk, so resetting on each one would repeatedly wipe the state
+            # the earlier chunks built and re-seed the prompt several times.
+            if getattr(request, "is_context_init_state", False) and getattr(
+                    request, "is_last_context_chunk", True):
+                reset_slots.append(slot)
+                if active[-1]:
+                    seed_requests.append((slot, request, ignore_len))
+
+        # Host-side gate for the apply pass: with no penalized request in the batch,
+        # the whole vocab-sized rewrite is a no-op worth skipping.
+        self.batch_uses_penalty = any(active)
+
+        if not slots:
+            return
+
+        slots_cuda = torch.tensor(slots,
+                                  dtype=torch.long,
+                                  pin_memory=prefer_pinned()).to(
+                                      'cuda', non_blocking=True)
+        params = torch.tensor([repetition, presence, frequency],
+                              dtype=torch.float32,
+                              pin_memory=prefer_pinned()).to('cuda',
+                                                             non_blocking=True)
+        state.repetition.index_copy_(0, slots_cuda, params[0])
+        state.presence.index_copy_(0, slots_cuda, params[1])
+        state.frequency.index_copy_(0, slots_cuda, params[2])
+        state.active.index_copy_(
+            0, slots_cuda,
+            torch.tensor(active, dtype=torch.bool,
+                         pin_memory=prefer_pinned()).to('cuda',
+                                                        non_blocking=True))
+        if reset_slots:
+            reset_cuda = torch.tensor(reset_slots,
+                                      dtype=torch.long,
+                                      pin_memory=prefer_pinned()).to(
+                                          'cuda', non_blocking=True)
+            state.counts.index_fill_(0, reset_cuda, 0)
+            # The prompt bitmask is per-sequence too: a reused slot must not inherit
+            # the previous occupant's prompt.
+            state.prompt_mask.index_fill_(0, reset_cuda, 0)
+
+        # Seeded after the reset above, or the clear would wipe what we just wrote.
+        for slot, request, ignore_len in seed_requests:
+            prompt = self._request_prompt_tokens(request)
+            if prompt is not None:
+                penalty_ops.seed_prompt(self, slot, prompt, ignore_len)
 
     def write_padding_onehot_draft_probs(self, padding_slot_ids, draft_len):
         """Write a one-hot draft-prob row (prob 1.0 at draft-vocab token id 0,
@@ -693,6 +1012,10 @@ class SpecMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
+        # NB: the shallow copy deliberately keeps sharing
+        # _sampling_params_signature with this object. Both views write the
+        # same sampling-parameter tensors, so the record of what those tensors
+        # hold has to be shared too.
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -717,7 +1040,7 @@ class SpecMetadata:
         """Single source of truth for one-engine sampling-param detection.
 
         Scans the batch's sampling configs and sets skip_*/is_all_greedy_sample
-        (honoring the warmup capture override). Returns
+        (honoring the group-synchronized value, see below). Returns
         ``(per_request_normalized, per_request_slot_ids)`` for buffer
         population. Does NOT allocate or fill GPU buffers, so it is safe to call
         before the CUDA graph key is built.
@@ -752,7 +1075,7 @@ class SpecMetadata:
             # decoding does not support min_p (there is no request_min_p buffer
             # nor min_p wiring in the sampling_batch_spec_dec_one_model*
             # kernels); a min_p request is rejected at admission by
-            # SpecSamplerBase.validate_request, so nothing reaching this scan
+            # SpecSampler.validate_request, so nothing reaching this scan
             # carries a min_p that would change its classification. The
             # two-model draft/target path honors min_p via _request_strategy.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
@@ -761,10 +1084,7 @@ class SpecMetadata:
                 top_p=top_p,
                 use_beam_search=False)
 
-            use_temperature = (not is_greedy
-                               and temperature not in (None, 0, 1))
             use_top_k = not is_greedy and top_k is not None and top_k > 0
-            use_top_p = not is_greedy and top_p is not None and top_p < 1.0
 
             normalized_temperature = (DISABLE_TEMP_VAL
                                       if is_greedy or temperature is None
@@ -777,17 +1097,11 @@ class SpecMetadata:
                 normalized_temperature,
                 normalized_top_k,
                 normalized_top_p,
-                use_temperature,
-                use_top_k,
-                use_top_p,
                 is_greedy,
             )
 
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, int]] = []
-        temperature_enabled = False
-        top_k_enabled = False
-        top_p_enabled = False
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
@@ -804,9 +1118,6 @@ class SpecMetadata:
                 temp_val,
                 tk_val,
                 tp_val,
-                use_temperature,
-                use_top_k,
-                use_top_p,
                 is_greedy,
             ) = _normalize_request_sampling_params(
                 temperature=temp_val,
@@ -814,9 +1125,6 @@ class SpecMetadata:
                 top_p=tp_val,
             )
 
-            temperature_enabled |= use_temperature
-            top_k_enabled |= use_top_k
-            top_p_enabled |= use_top_p
             has_non_greedy_requests |= not is_greedy
 
             per_request_normalized.append(
@@ -830,34 +1138,16 @@ class SpecMetadata:
                 request.py_seq_slot if request.
                 py_seq_slot is not None else self.dummy_slot_row)
 
-        self.skip_temperature = not temperature_enabled
-        self.skip_top_k = not top_k_enabled
-        self.skip_top_p = not top_p_enabled
         # Used in the CUDA graph key to pick the argmax / advanced variant.
-        # All-greedy iff EVERY request is greedy. Derived from per-request
-        # greediness, not from the skip_* filter flags (a non-greedy request may
-        # enable no filter, e.g. temperature=1.0 with top_k/top_p unset).
+        # All-greedy iff EVERY request is greedy -- note a non-greedy request
+        # may still enable no filter (e.g. temperature=1.0 with top_k/top_p
+        # unset), so this cannot be derived from which filters are in use.
         self.is_all_greedy_sample = not has_non_greedy_requests
 
-        # Warmup-time override: force the advanced-sampling path so the CUDA
-        # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
-        # warmup requests carry no sampling params, so substitute synthetic
-        # non-greedy scalars to populate the GPU buffers.
-        if getattr(self, '_force_non_greedy_for_capture', False):
-            self.skip_temperature = False
-            self.skip_top_k = False
-            self.skip_top_p = False
-            self.is_all_greedy_sample = False
-            per_request_normalized = [
-                (0.7, 50, 0.9, num_tokens)
-                for (_, _, _, num_tokens) in per_request_normalized
-            ]
-
-        # Apply the group-synchronized override last (semantics: see the
-        # ``group_all_greedy_sample`` field comment). Local contract: the
-        # synced value already incorporates any capture override, and rescans
-        # (e.g. populate after the graph key) must converge to it rather than
-        # resurrect the local value.
+        # Apply the group-synchronized value last (semantics: see the
+        # ``group_all_greedy_sample`` field comment). Local contract: rescans
+        # (e.g. populate after the graph key) must converge to the synced
+        # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
         return per_request_normalized, per_request_slot_ids
@@ -885,6 +1175,10 @@ class SpecMetadata:
         """
         if not self.spec_dec_mode.use_one_engine():
             return
+        # The synchronized group decision belongs to the previous iteration.
+        # Clear it before deriving this iteration's local flag; the caller
+        # immediately recomputes the group decision before graph-key lookup.
+        self.group_all_greedy_sample = None
         self._scan_one_model_sampling(requests)
 
     def populate_sampling_params_for_one_model(
@@ -903,6 +1197,8 @@ class SpecMetadata:
         # batch_slot_ids below; this runs earlier than prepare() in the
         # model-engine flow. No-op unless use_rejection_sampling is set.
         self.prepare_rejection_sampling_buffers()
+        # Likewise for the occurrence-penalty workspace. No-op unless enable_penalty.
+        self.prepare_penalty_buffers()
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
@@ -922,6 +1218,8 @@ class SpecMetadata:
 
         if self.temperatures is None or self.temperatures.numel(
         ) < required_flat_size:
+            # Fresh tensors hold none of the recorded values.
+            self.invalidate_sampling_params_cache()
             # Allocate once; the captured graph reads from these stable addresses.
             self.temperatures = torch.ones(required_flat_size,
                                            dtype=torch.float32,
@@ -942,16 +1240,25 @@ class SpecMetadata:
                                              dtype=torch.float32,
                                              device='cuda')
 
+        self._populate_request_rng_state(requests, per_request_normalized)
+
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
-        # draft-sampler time to scatter draft probs by slot.
-        if self.use_rejection_sampling and self.batch_slot_ids is not None:
+        # draft-sampler time to scatter draft probs by slot. The penalties need the
+        # same table to map logits rows back to their slot, so they enable it too.
+        if (self.use_rejection_sampling
+                or self.enable_penalty) and self.batch_slot_ids is not None:
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
                              pin_memory=prefer_pinned()),
                 non_blocking=True,
             )
+
+        # Penalties are independent of the greedy/advanced split -- they rewrite the
+        # logits before sampling, so an all-greedy batch is penalized too (its argmax
+        # is taken over the penalized logits). Filled before the early return below.
+        self._populate_penalty_params(requests)
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
@@ -960,53 +1267,125 @@ class SpecMetadata:
             return
 
         # Phase 2: build per-token / per-request lists and copy to GPU.
-        temperatures: list[float] = []
-        top_ks: list[int] = []
-        top_ps: list[float] = []
-        request_temperatures: list[float] = []
-        request_top_ks: list[int] = []
-        request_top_ps: list[float] = []
-        for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
-            request_temperatures.append(temp_val)
-            request_top_ks.append(tk_val)
-            request_top_ps.append(tp_val)
-            temperatures.extend(temp_val for _ in range(num_tokens))
-            top_ks.extend(tk_val for _ in range(num_tokens))
-            top_ps.extend(tp_val for _ in range(num_tokens))
+        #
+        # Sampling params are fixed for a request's lifetime, so a steady-state
+        # decode batch reproduces the buffers it already holds. Both the host
+        # expansion and the copies sit on the critical path ahead of the
+        # forward, so skip whichever group is already current.
+        need_update_sampler_param, need_update_expanded_sampler_param = (
+            self._sampling_params_buffers_need_update(per_request_normalized))
+        if not (need_update_sampler_param
+                or need_update_expanded_sampler_param):
+            return
 
-        self.temperatures[:len(temperatures)].copy_(torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                    non_blocking=True)
-        self.top_ks[:len(top_ks)].copy_(torch.tensor(
-            top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                        non_blocking=True)
-        self.top_ps[:len(top_ps)].copy_(torch.tensor(
-            top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                        non_blocking=True)
-        self.request_temperatures[:len(request_temperatures)].copy_(
-            torch.tensor(request_temperatures,
-                         dtype=torch.float32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True)
-        self.request_top_ks[:len(request_top_ks)].copy_(
-            torch.tensor(request_top_ks,
-                         dtype=torch.int32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True,
-        )
-        self.request_top_ps[:len(request_top_ps)].copy_(
-            torch.tensor(request_top_ps,
-                         dtype=torch.float32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True,
-        )
+        if need_update_sampler_param:
+            request_temperatures: list[float] = []
+            request_top_ks: list[int] = []
+            request_top_ps: list[float] = []
+            for temp_val, tk_val, tp_val, _ in per_request_normalized:
+                request_temperatures.append(temp_val)
+                request_top_ks.append(tk_val)
+                request_top_ps.append(tp_val)
 
-        # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
-        # encounter boolean-tensor indexing (dynamic size) or .item() calls.
-        # DISABLE_TOPK_VAL (INT32_MAX) is the sentinel for "top-k disabled".
-        _disable_topk = torch.iinfo(torch.int32).max
-        self.top_k_max = max(
-            (tk for tk in request_top_ks if 0 < tk < _disable_topk), default=0)
+            self.request_temperatures[:len(request_temperatures)].copy_(
+                torch.tensor(request_temperatures,
+                             dtype=torch.float32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True)
+            self.request_top_ks[:len(request_top_ks)].copy_(
+                torch.tensor(request_top_ks,
+                             dtype=torch.int32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+            self.request_top_ps[:len(request_top_ps)].copy_(
+                torch.tensor(request_top_ps,
+                             dtype=torch.float32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+
+            # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
+            # encounter boolean-tensor indexing (dynamic size) or .item()
+            # calls. DISABLE_TOPK_VAL (INT32_MAX) is the "top-k disabled"
+            # sentinel. Derived from the same values as the per-request
+            # buffers, so it is refreshed exactly when they are.
+            _disable_topk = torch.iinfo(torch.int32).max
+            self.top_k_max = max(
+                (tk for tk in request_top_ks if 0 < tk < _disable_topk),
+                default=0)
+
+        if need_update_expanded_sampler_param:
+            temperatures: list[float] = []
+            top_ks: list[int] = []
+            top_ps: list[float] = []
+            for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+                temperatures.extend(temp_val for _ in range(num_tokens))
+                top_ks.extend(tk_val for _ in range(num_tokens))
+                top_ps.extend(tp_val for _ in range(num_tokens))
+
+            self.temperatures[:len(temperatures)].copy_(torch.tensor(
+                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                        non_blocking=True)
+            self.top_ks[:len(top_ks)].copy_(torch.tensor(
+                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
+                                            non_blocking=True)
+            self.top_ps[:len(top_ps)].copy_(torch.tensor(
+                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                            non_blocking=True)
+
+    def _sampling_params_buffers_need_update(
+        self, per_request_normalized: list[tuple[float, int, float, int]]
+    ) -> tuple[bool, bool]:
+        """Report which sampling-parameter buffers this step has to refill.
+
+        Returns ``(need_update_sampler_param,
+        need_update_expanded_sampler_param)`` for the per-request buffers and
+        the expanded per-token buffers respectively, recording the new
+        signatures as a side effect.
+
+        Both signatures are built from ``per_request_normalized``, which every
+        consumer reads by batch position -- so its order already encodes the
+        batch ordering and a reshuffle changes the signature on its own. Slot
+        ids are deliberately absent: they index ``batch_slot_ids`` (copied
+        separately for the rejection path), never these buffers, so including
+        them would only force refills when a slot changes hands between
+        requests that happen to sample identically.
+
+        The expanded buffers additionally depend on each request's token count,
+        which sets their layout, so they can need a refill while the
+        per-request buffers stay valid -- a context request becoming a
+        generation request grows its span from one row to ``draft_len + 1`` and
+        shifts every later request. Whenever the per-request buffers need an
+        update the expanded ones do too.
+
+        ``top_k_max`` derives from the same values as the per-request buffers,
+        so it stays valid for as long as they do.
+        """
+        values = tuple((temp, top_k, top_p)
+                       for temp, top_k, top_p, _ in per_request_normalized)
+        num_tokens = tuple(n for *_, n in per_request_normalized)
+
+        request_signature = values
+        expanded_signature = (values, num_tokens)
+
+        need_update_sampler_param = (self._sampling_params_signature[0]
+                                     != request_signature)
+        need_update_expanded_sampler_param = (self._sampling_params_signature[1]
+                                              != expanded_signature)
+
+        self._sampling_params_signature[0] = request_signature
+        self._sampling_params_signature[1] = expanded_signature
+        return need_update_sampler_param, need_update_expanded_sampler_param
+
+    def invalidate_sampling_params_cache(self) -> None:
+        """Force the next populate call to refill both buffer groups.
+
+        Needed whenever the buffers stop reflecting the recorded signatures,
+        e.g. after reallocating them.
+        """
+        self._sampling_params_signature[0] = None
+        self._sampling_params_signature[1] = None
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1029,8 +1408,6 @@ class SpecWorkerBase(nn.Module, ABC):
             raise ImportError(
                 "Speculative decoding requires flashinfer>=0.6.4, please install "
                 "the version pinned in requirements.txt.")
-        self.seed: Optional[torch.Tensor] = None
-        self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
@@ -1405,6 +1782,48 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+    def _apply_occurrence_penalties(
+            self, logits: torch.Tensor, draft_tokens: torch.Tensor,
+            num_contexts: int, batch_size: int,
+            spec_metadata: SpecMetadata) -> torch.Tensor:
+        """Return the target logits acceptance should read, penalized.
+
+        No-op unless the deploy enabled the penalties and some request in the batch
+        actually uses one. ``logits`` must already be in the normalized
+        ``[ctx (1 row), gen (draft_len + 1 rows)]`` layout, i.e. after
+        ``_reshape_logits_for_accept`` -- which is what makes PARD's wider raw
+        layout fit the same mapping.
+
+        Returns the logits acceptance should read: a penalized copy when the
+        penalties apply, otherwise the caller's tensor unchanged.
+        """
+        if not getattr(spec_metadata, "enable_penalty", False):
+            return logits
+        # NB: deliberately NOT gated on batch_uses_penalty. Decode steps replay a
+        # captured CUDA graph, so a host-side skip decided at capture time would be
+        # baked in permanently -- and capture happens during warmup, when no real
+        # request is resident and the flag is False. The penalty pass must always be
+        # captured; whether it changes anything is decided on device by
+        # ``penalty_active``, which the replayed kernel re-reads every step.
+        draft_len = draft_tokens.shape[1] if draft_tokens.dim() > 1 else 0
+        mapping = penalty_ops.build_row_mapping(spec_metadata, num_contexts,
+                                                batch_size, draft_len,
+                                                draft_tokens, logits.device)
+        if mapping is None:
+            return logits
+        row_slots, intra_tokens, intra_valid = mapping
+        if row_slots.numel() != logits.shape[0]:
+            # The caller's row layout is not the one this mapping describes (tree
+            # modes); penalizing against it would charge the wrong request.
+            return logits
+        # Copy first: apply_penalties rewrites in place, and the caller keeps this
+        # tensor as the step's reported logits. Penalizing it directly would feed
+        # the penalized scores back to logprobs and to the next step's consumers.
+        penalized = logits.clone()
+        penalty_ops.apply_penalties(penalized, spec_metadata, row_slots,
+                                    intra_tokens, intra_valid)
+        return penalized
+
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
                              batch_size, spec_metadata):
         """
@@ -1414,7 +1833,20 @@ class SpecWorkerBase(nn.Module, ABC):
         first sampled target token via the base logic, and rejection sampling
         runs on the gen subset. Draft probs for the gen subset are gathered
         from the slot-indexed buffer by `py_seq_slot`.
+
+        Occurrence penalties are applied to the target logits first, so both the
+        strict and the rejection branch verify against the penalized distribution.
+        They are applied to a copy: the caller keeps a reference to this tensor and
+        returns it as the step's ``logits`` output (Eagle3's ``raw_logits``), which
+        feeds logprobs and other consumers that must see the model's own scores.
+        The draft distribution is deliberately left unpenalized: rejection sampling
+        stays unbiased either way (it only requires draft_probs to match how the
+        draft tokens were actually drawn), so this costs acceptance rate rather
+        than correctness.
         """
+        logits = self._apply_occurrence_penalties(logits, draft_tokens,
+                                                  num_contexts, batch_size,
+                                                  spec_metadata)
         num_gens = batch_size - num_contexts
         if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
             draft_len = draft_tokens.shape[1]
@@ -1433,11 +1865,35 @@ class SpecWorkerBase(nn.Module, ABC):
                     num_contexts:batch_size]
                 draft_probs = spec_metadata.draft_probs[
                     gen_slot_ids, :draft_len, :stored_vocab]
-                return self._sample_and_accept_draft_tokens_rejection(
+                accepted = self._sample_and_accept_draft_tokens_rejection(
                     logits, draft_tokens, draft_probs, num_contexts, batch_size,
                     spec_metadata)
-        return self._sample_and_accept_draft_tokens_base(
+                return self._commit_occurrence_counts(accepted, batch_size,
+                                                      spec_metadata)
+        accepted = self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+        return self._commit_occurrence_counts(accepted, batch_size,
+                                              spec_metadata)
+
+    def _commit_occurrence_counts(
+            self, accepted: tuple[torch.Tensor, torch.Tensor], batch_size: int,
+            spec_metadata: SpecMetadata) -> tuple[torch.Tensor, torch.Tensor]:
+        """Record the tokens this step accepted, so later steps penalize them.
+
+        Rejected speculative tokens never entered the sequence and are excluded by
+        ``num_accepted_tokens``. Passes ``accepted`` straight through so callers can
+        keep returning in one expression.
+        """
+        if not getattr(spec_metadata, "enable_penalty", False):
+            return accepted
+        accepted_tokens, num_accepted_tokens = accepted
+        slot_ids = spec_metadata.batch_slot_ids
+        if slot_ids is None:
+            return accepted
+        penalty_ops.update_penalty_counts(spec_metadata,
+                                          slot_ids[:batch_size].to(torch.int64),
+                                          accepted_tokens, num_accepted_tokens)
+        return accepted
 
     def _draft_logits_are_sharded(self, logits, spec_metadata):
         """Whether the draft logits are vocab-sharded and need a TP gather.
@@ -1523,18 +1979,24 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
-        self._update_advance_draft_sampling_seed(logits.device)
         eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
             spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+        # One row per request here, matching the request_* slices above.
+        # Slot 0 of the step's offset window belongs to the target sampler, so
+        # draft step i takes 1 + i. Callers that do not pass a draft_step run
+        # this sampler once per step and take the first draft slot.
+        seed, offset = self._rng_state_per_request(spec_metadata,
+                                                   end=batch_size,
+                                                   step_offset=1 +
+                                                   (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             draft_tokens, probs = (
-                sampling_batch_spec_dec_one_model_for_rejection(
-                    logits,
-                    temperatures,
-                    eff_top_ks,
-                    eff_top_ps,
-                    seed=self.seed,
-                    offset=self.offset))
+                sampling_batch_spec_dec_one_model_for_rejection(logits,
+                                                                temperatures,
+                                                                eff_top_ks,
+                                                                eff_top_ps,
+                                                                seed=seed,
+                                                                offset=offset))
             # Scatter probs into the slot-indexed buffer so each request's data
             # lands at its stable py_seq_slot row regardless of batch shifts.
             assert spec_metadata.batch_slot_ids is not None, (
@@ -1550,8 +2012,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                  temperatures,
                                                  eff_top_ks,
                                                  eff_top_ps,
-                                                 seed=self.seed,
-                                                 offset=self.offset)
+                                                 seed=seed,
+                                                 offset=offset)
 
         return draft_tokens.type(torch.int32)
 
@@ -1694,15 +2156,13 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_end = num_contexts + num_gen_logits
 
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
-            # Pass None instead of an all-disabled tensor so the C++ op can short-circuit
-            # on a host-side check rather than a `.item<bool>()` sync, which would break
-            # CUDA graph capture.
-            top_ks = (None if spec_metadata.skip_top_k else
-                      spec_metadata.top_ks[gen_start:gen_end])
-            top_ps = (None if spec_metadata.skip_top_p else
-                      spec_metadata.top_ps[gen_start:gen_end])
+            # A filter the mode disables becomes None, which lets the C++ op
+            # short-circuit on a host-side check rather than an
+            # `.item<bool>()` sync that would break CUDA graph capture.
             top_ks, top_ps = resolve_advanced_sampling_filters(
-                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+                spec_metadata.advanced_sampling_mode,
+                spec_metadata.top_ks[gen_start:gen_end],
+                spec_metadata.top_ps[gen_start:gen_end])
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
@@ -1758,22 +2218,17 @@ class SpecWorkerBase(nn.Module, ABC):
 
             full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
 
-            if self.seed is None:
-                self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-            if self.offset is None:
-                self.offset = torch.tensor([0],
-                                           dtype=torch.int64,
-                                           device=device)
-            self.seed += 1
-            self.seed %= 2**31
+            # One entry per gen request; slot 0 of the step's offset window.
+            seed, offset = self._rng_state_per_request(spec_metadata,
+                                                       num_contexts, batch_size)
 
             gen_accepted, gen_num_accepted = rejection_sampling_one_model(
                 draft_probs=full_draft_probs,
                 draft_token_ids=full_draft_tokens,
                 target_probs=target_probs,
                 deterministic=True,
-                seed=self.seed,
-                offset=self.offset,
+                seed=seed,
+                offset=offset,
             )
 
             if self.force_num_accepted_tokens != 0.0:
@@ -1794,15 +2249,50 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata=spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
-    def _update_advance_draft_sampling_seed(self, device):
-        """Increment the draft sampler's RNG seed for this draft-sampling call
-        (lazily initializing the seed/offset tensors on first use), so each call
-        samples with a fresh, deterministic seed."""
-        if self.seed is None:
-            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
-        self.seed += 1
-        self.seed %= (2**31)
+    def _rng_state_per_request(
+        self,
+        spec_metadata: SpecMetadata,
+        start: int = 0,
+        end: Optional[int] = None,
+        repeat: int = 1,
+        step_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Philox (seed, offset) laid out one entry per request row.
+
+        ``start`` / ``end`` select the request subset the caller samples (e.g.
+        the gen slice); ``repeat`` expands each request to the ``K`` rows a
+        block sampler flattens it into.
+
+        ``step_offset`` picks a slot inside this decoding step's offset window
+        (see ``_populate_request_rng_state``). The target sampler and the
+        rejection kernel leave it at 0; the draft loop passes ``1 +
+        draft_step`` so each of its launches draws a distinct stream -- with a
+        fixed user seed the offset is the only thing separating them, since
+        every draft launch restarts the kernel's per-row subsequence at 0.
+
+        """
+        seeds = spec_metadata.request_seeds[start:end]
+        offsets = spec_metadata.request_offsets[start:end]
+        if step_offset:
+            offsets = offsets + step_offset
+        if repeat > 1:
+            seeds = seeds.repeat_interleave(repeat)
+            offsets = offsets.repeat_interleave(repeat)
+        return seeds, offsets
+
+    def _rng_state_per_token(
+        self,
+        spec_metadata: SpecMetadata,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Philox (seed, offset) laid out one entry per logits row.
+
+        Mirrors how ``temperatures`` / ``top_ks`` / ``top_ps`` are sliced at
+        the same call sites.
+        """
+        return spec_metadata.seeds[:
+                                   num_tokens], spec_metadata.offsets[:
+                                                                      num_tokens]
 
     def _draft_sampler_greedy(self, logits: torch.Tensor):
         """
@@ -1930,20 +2420,26 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[
             num_contexts:batch_size].repeat_interleave(K)
 
-        self._update_advance_draft_sampling_seed(gen_logits.device)
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
         eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
             spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+        # A block sampler emits all K draft positions in one launch, so the
+        # kernel's per-row subsequence already separates them and they share
+        # the first draft slot of the step's offset window.
+        seed, offset = self._rng_state_per_request(spec_metadata,
+                                                   num_contexts,
+                                                   batch_size,
+                                                   repeat=K,
+                                                   step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
             flat_tokens, flat_probs = (
-                sampling_batch_spec_dec_one_model_for_rejection(
-                    flat_logits,
-                    temps,
-                    eff_top_ks,
-                    eff_top_ps,
-                    seed=self.seed,
-                    offset=self.offset))
+                sampling_batch_spec_dec_one_model_for_rejection(flat_logits,
+                                                                temps,
+                                                                eff_top_ks,
+                                                                eff_top_ps,
+                                                                seed=seed,
+                                                                offset=offset))
             # Scatter the K prob rows per gen request into its stable slot row.
             if spec_metadata.draft_probs is not None:
                 assert spec_metadata.batch_slot_ids is not None, (
@@ -1959,8 +2455,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                 temps,
                                                 eff_top_ks,
                                                 eff_top_ps,
-                                                seed=self.seed,
-                                                offset=self.offset)
+                                                seed=seed,
+                                                offset=offset)
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
@@ -2139,7 +2635,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         Select draft attention metadata for one-engine speculative decoding.
 
-        TRTLLM metadata temporarily swaps its manager and block offsets.
+        TRTLLM metadata temporarily swaps its manager and cache-layout-dependent
+        buffers, including DSA indexer offsets and slot mappings.
         FlashInfer uses an independently planned metadata view because its page
         tables and kernel wrappers are manager-specific.
         """
@@ -2158,35 +2655,16 @@ class SpecWorkerBase(nn.Module, ABC):
             yield attn_metadata
             return
 
-        # Check if draft KV cache block offsets are allocated
-        draft_block_offsets = getattr(attn_metadata,
-                                      'draft_kv_cache_block_offsets', None)
-        if draft_block_offsets is None:
-            # Draft KV cache block offsets not allocated, skip switching
+        saved_state = prepare_attn_metadata_for_draft_replay(
+            attn_metadata, draft_kv_cache_manager)
+        if saved_state is None:
             yield attn_metadata
             return
-
-        # Save main KV cache manager and block offsets
-        target_kv_cache_manager = attn_metadata.kv_cache_manager
-        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
-        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
-
-        # Switch to draft KV cache manager and its block offsets
-        attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
-        if attn_metadata.enable_flash_mla:
-            attn_metadata.prepare_flash_mla()
 
         try:
             yield attn_metadata
         finally:
-            # Restore main KV cache manager and block offsets
-            attn_metadata.kv_cache_manager = target_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
-            if attn_metadata.enable_flash_mla:
-                attn_metadata.prepare_flash_mla()
+            restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_tokens_for_batch(
         self,
@@ -2219,25 +2697,17 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
-            # Lazily initialize seed/offset tensors on correct device
-            if self.seed is None:
-                self.seed = torch.tensor([0],
-                                         dtype=torch.int64,
-                                         device=logits.device)
-                self.offset = torch.tensor([0],
-                                           dtype=torch.int64,
-                                           device=logits.device)
-            self.seed += 1
-            self.seed %= (2**31)
-
             eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
                 spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+            # One row per logits row here, the same slice the per-token
+            # sampling params above use.
+            seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
             sampled_tokens = sample_from_logits_op(logits,
                                                    temperatures,
                                                    eff_top_ks,
                                                    eff_top_ps,
-                                                   seed=self.seed,
-                                                   offset=self.offset)
+                                                   seed=seed,
+                                                   offset=offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 

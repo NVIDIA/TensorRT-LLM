@@ -369,6 +369,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
+                        "supports_image_edit": self.pipeline.supports_image_edit,
                     },
                 )
             )
@@ -418,6 +419,12 @@ class DiffusionExecutor:
                 ):
                     continue
                 setattr(params, field_name, default_value)
+                # Marks it as a pipeline default rather than caller intent, so
+                # request-dependent defaults stay re-resolvable; assigning the
+                # field re-marks it.
+                # Assumes model_fields_set is the live __pydantic_fields_set__, not a
+                # copy; TestDefaultMarksThroughRealPath fails loudly if that changes.
+                params.model_fields_set.discard(field_name)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
         specs = self.pipeline.extra_param_specs
@@ -528,19 +535,6 @@ def run_diffusion_worker(
                     f"The worker will run without NUMA pinning, which may impact "
                     f"performance."
                 )
-
-        # NCCL_NVLS_ENABLE=0 is required to prevent a hang on Blackwell when
-        # VSA (CuTeDSL) + Ulysses is active
-        if torch.cuda.is_available() and visual_gen_args is not None:
-            _attn = visual_gen_args.attention_config
-            _sa = getattr(_attn, "sparse_attention_config", None)
-            _is_vsa = (
-                getattr(_attn, "backend", "") == "CUTEDSL"
-                and getattr(_sa, "algorithm", "") == "vsa"
-            )
-            _has_ulysses = getattr(visual_gen_args.parallel_config, "ulysses_size", 1) > 1
-            if _is_vsa and _has_ulysses:
-                os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
@@ -673,6 +667,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
+        self.supports_image_edit: bool = False
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1028,6 +1023,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
+                        self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

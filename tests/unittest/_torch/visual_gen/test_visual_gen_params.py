@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _wan_mock(is_wan22_14b=False, is_wan22_5b=False, name_or_path="", num_heads=12):
     """Create a mock with attributes needed by WanPipeline/WanI2V properties."""
@@ -221,6 +223,18 @@ class TestPipelineDefaults:
         assert d["width"] == 1280
         assert d["num_inference_steps"] == 50
         assert d["guidance_scale"] == 5.0
+        assert d["num_frames"] == 121
+        assert d["frame_rate"] == 24.0
+
+    def test_fastwan_defaults(self):
+        """FastWan 2.2 TI2V-5B (DMD distilled): wan22-5b defaults, 3-step, CFG-free."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+
+        d = WanDMDPipeline.default_generation_params.fget(None)
+        assert d["height"] == 704
+        assert d["width"] == 1280
+        assert d["num_inference_steps"] == 3
+        assert d["guidance_scale"] == 1.0
         assert d["num_frames"] == 121
         assert d["frame_rate"] == 24.0
 
@@ -539,6 +553,22 @@ class TestVisualGenDefaultParams:
         assert params.width == 1280
         assert params.num_inference_steps == 50
         assert params.guidance_scale == 5.0
+        assert params.num_frames == 121
+        assert params.frame_rate == 24.0
+        assert params.extra_params is None
+
+    def test_fastwan_default_params(self):
+        """FastWan 2.2 TI2V-5B (DMD distilled): 3-step, CFG-free, no extra params."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+
+        vg = self._make_visual_gen(
+            WanDMDPipeline, _wan_mock(is_wan22_14b=False, is_wan22_5b=True, num_heads=24)
+        )
+        params = vg.default_params
+        assert params.height == 704
+        assert params.width == 1280
+        assert params.num_inference_steps == 3
+        assert params.guidance_scale == 1.0
         assert params.num_frames == 121
         assert params.frame_rate == 24.0
         assert params.extra_params is None
@@ -1062,6 +1092,45 @@ class TestRequestValidation:
         )
         req = self._make_request(extra_params={"boundary_ratio": None})
         self._merge_and_validate(executor, req)
+
+    def test_literal_extra_param_rejects_bad_value(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        req = self._make_request(extra_params={"action_mode": "not_a_mode"})
+        with pytest.raises(ValueError, match="expected one of"):
+            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+
+            validate_visual_gen_params(
+                req.params,
+                declared_defaults=None,
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
+    def test_literal_extra_param_accepts_numeric_choice(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+
+        req = self._make_request(extra_params={"action_resolution": 480})
+        validate_visual_gen_params(
+            req.params,
+            declared_defaults=None,
+            extra_param_specs=COSMOS3_EXTRA_SPECS,
+        )
+
+    def test_video_reference_must_be_bytes(self):
+        """A server-local path must not reach the worker: the ``video`` contract
+        is encoded bytes, so a string (or anything else) fails preflight."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        req = self._make_request(extra_params={"video": "/server/local/path.mp4"})
+        with pytest.raises(ValueError, match="expected type 'bytes'"):
+            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+
+            validate_visual_gen_params(
+                req.params,
+                declared_defaults=None,
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
 
 
 # =============================================================================

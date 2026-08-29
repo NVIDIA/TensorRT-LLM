@@ -24,7 +24,9 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -48,7 +50,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           MambaStateConfig, MoeConfig,
                                           MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
-                                          PeftCacheConfig, PybindMirror,
+                                          PeftCacheConfig,
+                                          PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
@@ -63,10 +66,26 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
+
+
+@pytest.mark.cpu_only
+def test_generation_config_mode_defaults_and_validation() -> None:
+    assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
+    assert (TorchLlmArgs(model=llama_model_path,
+                         generation_config="auto").generation_config == "auto")
+
+    with pytest.raises(ValidationError, match="generation_config"):
+        TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
+def test_generation_config_auto_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError,
+                       match="AutoDeploy does not support generation_config"):
+        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
 
 
 @pytest.mark.cpu_only
@@ -247,45 +266,17 @@ model_kwargs:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
 class TestEncoderRuntimeSizes:
-    """Cover encoder runtime size fields and fallback to LLM limits.
+    """Cover encoder runtime size fields.
 
-    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
-    knobs that size multimodal encoder AttentionMetadata; when unset they
-    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
-    PyTorch-backend only (the multimodal encoder profiling path), so they
-    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    `encoder_max_num_tokens` is the user-facing multimodal encoder scheduling
+    and AttentionMetadata budget. It is PyTorch-backend only, so it lives on
+    `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
     """
 
     def test_defaults_are_none(self, llm_args_cls):
         llm_args = llm_args_cls(model=llama_model_path)
         assert llm_args.encoder_max_batch_size is None
         assert llm_args.encoder_max_num_tokens is None
-
-    @pytest.mark.parametrize(
-        "kwargs, expected_runtime_sizes",
-        [
-            # Neither encoder knob set -- falls back to LLM limits.
-            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
-            # Only encoder_max_batch_size overrides.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_batch_size=512), (512, 2048)),
-            # Only encoder_max_num_tokens overrides.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_num_tokens=32768), (64, 32768)),
-            # Both encoder knobs override.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_batch_size=512,
-                  encoder_max_num_tokens=32768), (512, 32768)),
-        ],
-        ids=["fallback", "only_batch", "only_tokens", "both"],
-    )
-    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
-                                       expected_runtime_sizes):
-        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
-        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
 
     @pytest.mark.parametrize(
         "field_name, invalid_value",
@@ -300,6 +291,19 @@ class TestEncoderRuntimeSizes:
                                   invalid_value):
         with pytest.raises(ValidationError):
             llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
+class TestEagerEncoderSchedulingCompatibility:
+    """Args parsing defers capability-dependent EAGER checks until model load."""
+
+    def test_eager_feature_combinations_are_deferred_until_model_load(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            enable_attention_dp=True,
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+            multimodal_config=MultimodalConfig(
+                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
 
 @pytest.mark.cpu_only
@@ -453,13 +457,13 @@ def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
 
 @pytest.mark.cpu_only
 def test_dspark_requires_speculative_model():
-    # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
-    # unset speculative_model must fail fast at config validation instead of
-    # raising an opaque TypeError deep inside engine construction.
+    # Unset speculative_model means "load the draft from the target", as it
+    # does for MTP. /tmp/dummy_model carries no mtp.* draft weights, so that
+    # must fail fast at config validation instead of raising an opaque
+    # TypeError deep inside engine construction.
     spec_cfg = DSparkDecodingConfig(max_draft_len=5)
 
-    with pytest.raises(ValueError,
-                       match="requires speculative_config.speculative_model"):
+    with pytest.raises(ValueError, match="speculative_model is unset"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             skip_tokenizer_init=True,
@@ -504,84 +508,6 @@ class TestModelDefaults:
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
-
-    @pytest.mark.parametrize("explicit_auto", [False, True])
-    def test_kv_cache_manager_v2_auto_uses_model_default(self, explicit_auto):
-        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
-                           if explicit_auto else KvCacheConfig())
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
-                                kv_cache_config=kv_cache_config)
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
-
-    def test_kv_cache_manager_v2_auto_falls_back_to_false(self):
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
-
-        _resolve_kv_cache_manager_v2_auto(llm_args, {})
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
-
-    @pytest.mark.parametrize(
-        ("backend", "runtime"),
-        [
-            ("NIXL", "CPP"),
-            ("UCX", None),
-            ("MPI", None),
-        ],
-    )
-    def test_kv_cache_manager_v2_auto_falls_back_for_incompatible_disagg(
-            self, backend, runtime):
-        llm_args = TorchLlmArgs(
-            model="/tmp/dummy_model",
-            cache_transceiver_config=CacheTransceiverConfig(
-                backend=backend, transceiver_runtime=runtime),
-        )
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
-
-    def test_kv_cache_manager_v2_auto_keeps_python_nixl_model_default(self):
-        llm_args = TorchLlmArgs(
-            model="/tmp/dummy_model",
-            cache_transceiver_config=CacheTransceiverConfig(
-                backend="NIXL", transceiver_runtime="PYTHON"),
-        )
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
-
-    @pytest.mark.parametrize("user_setting", [False, True])
-    def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
-            self, user_setting):
-        llm_args = TorchLlmArgs(
-            model="/tmp/dummy_model",
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
-        model_defaults = {
-            "kv_cache_config": {
-                "use_kv_cache_manager_v2": not user_setting
-            }
-        }
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -678,6 +604,168 @@ class TestModelDefaults:
         # Check that the error message is helpful
         error_str = str(exc_info.value)
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
+
+
+@pytest.mark.cpu_only
+class TestKvCacheManagerV2AutoResolution:
+    """Test model preferences for the KV cache manager version."""
+
+    class _PreferV2:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V2"
+
+    class _PreferV1:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V1"
+
+    @pytest.mark.parametrize("explicit_auto", [False, True])
+    def test_auto_uses_model_preference(self, explicit_auto):
+        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
+                           if explicit_auto else KvCacheConfig())
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                kv_cache_config=kv_cache_config)
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_auto_without_preference_falls_back_to_v1(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        _resolve_kv_cache_manager_v2_auto(llm_args)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    @pytest.mark.parametrize(
+        ("backend", "runtime"),
+        [
+            ("NIXL", "CPP"),
+            ("UCX", None),
+            ("MPI", None),
+        ],
+    )
+    def test_auto_v2_falls_back_for_incompatible_disagg(self, backend, runtime):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime=runtime),
+        )
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    def test_auto_v2_keeps_python_nixl_preference(self):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"),
+        )
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    @pytest.mark.parametrize(("user_setting", "model_cls"), [
+        pytest.param(False, _PreferV2, id="explicit-v1"),
+        pytest.param(True, _PreferV1, id="explicit-v2"),
+    ])
+    def test_explicit_value_overrides_model_preference(self, user_setting,
+                                                       model_cls):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
+
+    def test_registered_models_prefer_v2(self):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "GptOssForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "MiniMaxM2ForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None
+            assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+    def test_registered_models_keep_v2_on_nixl(self):
+        """Models preferring V2 and the Python transceiver keep V2 on NIXL.
+
+        Both sentinels start at 'auto'; production resolves the transceiver
+        runtime first, then the KV cache manager. MiniMax-M2 is absent from
+        this list: it silently resolves to V1 on this route (its
+        disaggregated serving is unvalidated -- the missing preference is
+        deliberate).
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "GptOssForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "DeepseekV4ForCausalLM",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None, architecture
+
+            llm_args = TorchLlmArgs(
+                model="/tmp/dummy_model",
+                cache_transceiver_config=CacheTransceiverConfig(
+                    backend="NIXL", transceiver_runtime="auto"),
+            )
+            _resolve_transceiver_runtime_auto(llm_args, model_cls)
+            assert _resolve_kv_cache_manager_v2_auto(
+                llm_args, model_cls) is True, architecture
+            assert (llm_args.cache_transceiver_config.transceiver_runtime ==
+                    "PYTHON"), architecture
 
 
 @pytest.mark.cpu_only
@@ -1029,6 +1117,7 @@ class TestMultimodalConfig:
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
+        assert MultimodalConfig().encoder_scheduling_policy == "DEFAULT"
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -1037,7 +1126,20 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
+        assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
+
+    def test_disable_mm_encoder_disables_encoder_cache(self):
+        multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            checkpoint_format="HF",
+            disable_mm_encoder=True,
+            multimodal_config=multimodal_config,
+        )
+
+        assert args.multimodal_config.encoder_cache_max_bytes == 0
+        assert multimodal_config.encoder_cache_max_bytes == 1024**2
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -1066,6 +1168,12 @@ class TestMultimodalConfig:
                                 encoder_side_stream_max_ahead=2, ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
+
+    def test_torch_llm_args_with_eager_encoder_scheduling(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -1105,10 +1213,12 @@ class TestMultimodalConfig:
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
                 "encoder_cache_max_bytes": 0,
+                "encoder_scheduling_policy": "EAGER",
                 "video_pruning_rate": 0.5,
             },
         )
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
         assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):
@@ -1843,6 +1953,73 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.seq_lens == [8, 32]
         assert args.cuda_graph_config.max_seq_len == 32
 
+    def test_encoder_decoder_cuda_graph_user_interface(self):
+        encoder_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[16, 64],
+            seq_lens=[8, 32],
+            enable_padding=True,
+        )
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            cuda_graph_config=DecodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
+            ),
+            encoder_cuda_graph_config=encoder_config,
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert isinstance(args.encoder_cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.encoder_cuda_graph_config.batch_sizes == [1, 4]
+        assert args.enable_encoder_decoder_mixed_cuda_graph
+
+        disabled_args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=encoder_config,
+            enable_encoder_decoder_mixed_cuda_graph=False,
+        )
+
+        assert not disabled_args.enable_encoder_decoder_mixed_cuda_graph
+
+    def test_encoder_cuda_graph_config_validation(self):
+        invalid_cases = [
+            (
+                {
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        num_tokens=[16, 64],
+                        seq_lens=[8, 32],
+                        enable_padding=True,
+                    ),
+                },
+                "encoder_cuda_graph_config requires encoder_max_batch_size",
+            ),
+            (
+                {
+                    "encoder_max_batch_size":
+                    4,
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        enable_padding=True,
+                    ),
+                },
+                ("encoder_cuda_graph_config requires "
+                 "num_tokens/max_num_token and seq_lens/max_seq_len"),
+            ),
+        ]
+
+        for kwargs, error_match in invalid_cases:
+            with pytest.raises(ValidationError, match=error_match):
+                TorchLlmArgs(
+                    model=llama_model_path,
+                    **kwargs,
+                )
+
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -1886,15 +2063,15 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     Three invariants are exercised:
 
-    1. `TorchCompileConfig.capture_num_tokens` defaults to a fixed
-       powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
-       is True (and stays `None` otherwise). The fixed list keeps the
-       capture set small to bound startup time and CUDA graph memory;
-       the model-engine filter (invariants 2 and 3) clamps out-of-range
-       entries to the reachable ceiling and never invents sizes beyond
-       this list.
+    1. `TorchLlmArgs.prefill_capture_num_tokens` defaults to a fixed
+       powers-of-2 + 256-stride list when a prefill CUDA graph backend is
+       enabled. The deprecated `TorchCompileConfig.capture_num_tokens` stays
+       `None` unless explicitly set. The fixed list keeps the capture set small
+       to bound startup time and CUDA graph memory; the model-engine filter
+       (invariants 2 and 3) clamps out-of-range entries to the reachable ceiling
+       and never invents sizes beyond this list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
-       `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
+       `max_batch_size * (max_seq_len - 1)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
@@ -1908,18 +2085,151 @@ class TestPiecewiseCudaGraphCaptureDefaults:
     _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
         range(256, 3073, 256))
 
-    def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
-            self):
-        """Default capture set is the powers-of-2 + 256-stride list.
+    def test_prefill_capture_num_tokens_uses_plain_int_list(self):
+        annotation = TorchLlmArgs.model_fields[
+            "prefill_capture_num_tokens"].annotation
+        list_annotation = get_args(annotation)[0]
+        assert get_origin(list_annotation) is list
+        assert get_args(list_annotation) == (int, )
 
-        Keeps the capture set bounded (~20 entries) so server startup
-        time and CUDA graph memory stay predictable. The model engine
-        further filters and appends the reachable ceiling, so
-        out-of-range entries (e.g. > max_seq_len-1) are never recorded
-        and gap ISLs still get a graph.
-        """
+    def test_breakable_uses_default_capture_buckets(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
+        assert args.prefill_capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert args.torch_compile_config is None
+
+    def test_piecewise_new_config_enables_default_torch_compile(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+            prefill_capture_num_tokens=[512, 128, 512])
+        assert args.torch_compile_config == TorchCompileConfig()
+        assert args.prefill_capture_num_tokens == [512, 128, 512]
+
+    def test_legacy_piecewise_config_maps_to_new_fields(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            torch_compile_config=TorchCompileConfig(
+                                enable_piecewise_cuda_graph=True,
+                                capture_num_tokens=[128, 256]))
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        assert args.prefill_capture_num_tokens == [256, 128]
+
+    def test_explicit_new_buckets_with_legacy_piecewise_enable(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            prefill_capture_num_tokens=[128, 256],
+                            torch_compile_config=TorchCompileConfig(
+                                enable_piecewise_cuda_graph=True))
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        assert args.prefill_capture_num_tokens == [128, 256]
+
+    def test_explicit_legacy_and_new_config_conflicts(self):
+        with pytest.raises(ValueError, match="conflicts"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                torch_compile_config=TorchCompileConfig(
+                    enable_piecewise_cuda_graph=True))
+
+        with pytest.raises(ValueError, match="conflicts"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                prefill_capture_num_tokens=[128],
+                torch_compile_config=TorchCompileConfig(
+                    enable_piecewise_cuda_graph=True, capture_num_tokens=[256]))
+
+    def test_breakable_rejects_explicit_torch_compile(self):
+        with pytest.raises(ValueError, match="does not support"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                torch_compile_config=TorchCompileConfig())
+
+    def test_breakable_allows_speculative_decoding(self):
+        speculative_config = MTPDecodingConfig(max_draft_len=1)
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            speculative_config=speculative_config)
+        assert args.speculative_config == speculative_config
+
+    @pytest.mark.parametrize("lora_kwargs", [
+        {
+            "enable_lora": True
+        },
+        {
+            "lora_config": LoraConfig(lora_target_modules=["attn_q"])
+        },
+    ])
+    def test_breakable_rejects_lora(self, lora_kwargs):
+        with pytest.raises(ValueError, match="LoRA"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                **lora_kwargs,
+            )
+
+    def test_prefill_filter_sorts_dedupes_and_drops_nonpositive(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_prefill_capture_num_tokens
+
+        kept, unrecordable = _filter_prefill_capture_num_tokens(
+            [256, 0, -1, 128, 256],
+            max_num_tokens=512,
+            max_batch_size=1,
+            max_seq_len=513,
+        )
+        assert kept == [128, 256]
+        assert unrecordable == []
+
+    @pytest.mark.parametrize("backend", [
+        PrefillCudaGraphBackend.PIECEWISE,
+        PrefillCudaGraphBackend.BREAKABLE,
+    ])
+    def test_piecewise_and_breakable_use_identical_padding(self, backend):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.enable_attention_dp = False
+        engine.prefill_cuda_graph_backend = backend
+        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
+        assert engine._get_padding_params(129, 1, None) == (256, True, None)
+
+    def test_attention_dp_prefill_graph_uses_all_rank_decision(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        class FakeDist:
+
+            def __init__(self, decisions):
+                self.decisions = decisions
+
+            def tp_allgather(self, value):
+                del value
+                return self.decisions
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.enable_attention_dp = True
+        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
+        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+
+        all_rank_num_tokens = [1, 129, 1, 1]
+        engine.dist = FakeDist([True, True, True, True])
+        assert engine._get_padding_params(1, 0,
+                                          all_rank_num_tokens) == (256, True,
+                                                                   [256] * 4)
+
+        engine.dist = FakeDist([True, False, True, True])
+        assert engine._get_padding_params(
+            1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+
+    def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
+            self):
         config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
-        assert config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert config.capture_num_tokens is None
 
     def test_torch_compile_config_capture_num_tokens_stays_none_when_piecewise_disabled(
             self):
@@ -1940,12 +2250,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         # `validate_capture_num_tokens` dedupes and reverse-sorts.
         assert config.capture_num_tokens == sorted(set(user_list), reverse=True)
 
-    def test_torch_llm_args_capture_num_tokens_default_when_piecewise_enabled(
+    def test_torch_llm_args_prefill_buckets_default_when_piecewise_enabled(
             self):
-        """Same default applies when reached through `TorchLlmArgs` construction.
-
-        This is the path real users hit via `trtllm-serve` YAML.
-        """
         args = TorchLlmArgs(
             model=llama_model_path,
             max_batch_size=1,
@@ -1957,7 +2263,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             torch_compile_config=TorchCompileConfig(
                 enable_piecewise_cuda_graph=True),
         )
-        assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert args.prefill_capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert args.torch_compile_config.capture_num_tokens is None
 
     def test_piecewise_filter_never_invents_far_ceiling(self):
         """A ceiling far above the largest candidate is NOT added.
@@ -2054,42 +2361,6 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         # Ceiling (128) was already in candidates, must not be duplicated.
         assert kept.count(128) == 1
         assert unrecordable == []
-
-    def test_piecewise_filter_subtracts_extra_decoding_steps(self):
-        """Subtract `num_extra_decoding_steps` from the ceiling.
-
-        Drafting loops consume extra decode steps; the filter must mirror
-        the `max_seq_len - 1 - num_extra_decoding_steps` constraint
-        applied when warmup requests are built. Candidates above the
-        reduced ceiling are clamped down to it; nothing is appended.
-        """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
-
-        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
-        # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
-            candidates,
-            max_num_tokens=128,
-            max_batch_size=1,
-            max_seq_len=128,
-            num_extra_decoding_steps=5,
-        )
-        assert kept[-1] == 120  # nothing above the 122 ceiling to clamp
-        assert 120 in kept
-        assert unrecordable == []
-        # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
-            candidates,
-            max_num_tokens=128,
-            max_batch_size=1,
-            max_seq_len=128,
-            num_extra_decoding_steps=9,
-        )
-        assert kept[-1] == 118
-        assert 100 in kept
-        assert 120 not in kept
-        assert unrecordable == [120]
 
     def test_piecewise_filter_does_not_double_append_ceiling(self):
         """Ceiling already present in candidates -> not duplicated."""
@@ -2557,6 +2828,50 @@ class TestServeDefaults:
             explicit_cli_keys={"tensor_parallel_size"},
         )
         assert merged["tensor_parallel_size"] == 1
+
+    def test_serve_generation_config_cli_over_yaml_precedence(self,
+                                                              tmp_path) -> None:
+        """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
+        from unittest import mock
+
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("generation_config: auto\n", encoding="utf-8")
+
+        with (
+                mock.patch(
+                    "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                    return_value=False),
+                mock.patch("tensorrt_llm.commands.serve.device_count",
+                           return_value=1),
+                mock.patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=["dummy/model", "--config",
+                      str(config_path)],
+                standalone_mode=False,
+            )
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
+            mock_launch_server.reset_mock()
+            config_path.write_text("generation_config: trtllm\n",
+                                   encoding="utf-8")
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--config",
+                    str(config_path),
+                    "--generation-config",
+                    "auto",
+                ],
+                standalone_mode=False,
+            )
+
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
@@ -3076,7 +3391,6 @@ kv_cache_compression_config:
   beta: 17
   eviction_mode: per_head
   normalize_scores: false
-  model_path: /tmp/model
   calibration_path: /tmp/calibration.pt
 """)
 
@@ -3133,7 +3447,7 @@ class TestSkipSoftmaxAttentionConfig:
     @staticmethod
     def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
         sparse_params = config.to_sparse_params(**kwargs)
-        return sparse_params.scheduler.get_kernel_params()
+        return sparse_params.scheduler.get_runtime_params()
 
     def test_python_api_parses_skip_softmax_config(self):
         args = TorchLlmArgs(
@@ -3479,11 +3793,15 @@ class TestEnableLowLatencyHostDispatch:
 
 
 class _PreferPythonTransceiverModel:
-    """Fake model class opting into the Python transceiver."""
+    """Fake model class preferring Python transceiver and KV manager V2."""
 
     @classmethod
     def get_model_defaults(cls, llm_args):
         return {}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None):
@@ -3491,7 +3809,7 @@ class _PreferPythonTransceiverModel:
 
 
 class _ArchSensitiveTransceiverModel:
-    """Fake shared implementation class with a per-checkpoint preference."""
+    """Fake shared implementation class with a per-checkpoint CPP opt-out."""
 
     @classmethod
     def get_model_defaults(cls, llm_args):
@@ -3501,7 +3819,7 @@ class _ArchSensitiveTransceiverModel:
     def get_preferred_transceiver_runtime(cls, pretrained_config=None):
         architectures = getattr(pretrained_config, "architectures", None) or []
         if architectures and architectures[0] == "ModelAForCausalLM":
-            return "PYTHON"
+            return "CPP"
         return None
 
 
@@ -3601,6 +3919,11 @@ class TestMambaSnapshotConfigResolution:
             assert "no Mamba state snapshot policy" in warnings[0]
 
     def test_hybrid_fixed_snapshot_rejects_auto_resolved_v1(self, monkeypatch):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+
+        monkeypatch.setitem(MODEL_CLASS_MAPPING, "Qwen3NextForCausalLM",
+                            _NoModelDefaults)
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(
@@ -3626,6 +3949,7 @@ class TestMambaSnapshotConfigResolution:
         assert warnings == []
 
 
+@pytest.mark.cpu_only
 class TestTransceiverRuntimeAutoResolution:
     """Tests for the transceiver_runtime 'auto' selection mechanism."""
 
@@ -3640,11 +3964,11 @@ class TestTransceiverRuntimeAutoResolution:
         cfg = CacheTransceiverConfig(backend="NIXL")
         assert cfg.transceiver_runtime == "auto"
 
-    def test_auto_no_model_preference_falls_back_to_none(self):
-        """'auto' with no model preference resolves to None (C++ transceiver)."""
+    def test_auto_no_model_preference_defaults_to_python(self) -> None:
+        """'auto' with no model preference resolves to the Python transceiver."""
         args = self._disagg_args()
         _resolve_transceiver_runtime_auto(args)
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     @pytest.mark.parametrize("explicit_auto", [False, True])
     def test_model_preference_adopted(self, explicit_auto):
@@ -3652,6 +3976,14 @@ class TestTransceiverRuntimeAutoResolution:
         cfg_kwargs = {"transceiver_runtime": "auto"} if explicit_auto else {}
         args = self._disagg_args(**cfg_kwargs)
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("model_cls", [Gemma3ForCausalLM, LlamaForCausalLM])
+    def test_llama_and_gemma_model_preferences_adopted(self, model_cls):
+        """Llama and Gemma adopt Python when the runtime is left at auto."""
+        args = self._disagg_args()
+        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+        _resolve_transceiver_runtime_auto(args, model_cls)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     @pytest.mark.parametrize("explicit_runtime", ["CPP", "PYTHON", None])
@@ -3663,12 +3995,45 @@ class TestTransceiverRuntimeAutoResolution:
         assert args.cache_transceiver_config.transceiver_runtime == explicit_runtime
 
     @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
-    def test_python_preference_incompatible_backend_falls_back_to_cpp(
-            self, backend):
-        """Python transceiver requires NIXL; other backends fall back to C++."""
+    def test_no_preference_incompatible_backend_falls_back_to_cpp(
+            self, backend: str) -> None:
+        """Without a model preference, non-NIXL backends fall back to C++."""
+        args = self._disagg_args(backend=backend)
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
+    def test_python_preference_incompatible_backend_is_preserved(
+            self, backend: str) -> None:
+        """A model preference is adopted verbatim, never rerouted.
+
+        The incompatible backend then fails loudly at transceiver creation
+        instead of silently running a runtime the model did not ask for.
+        """
         args = self._disagg_args(backend=backend)
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    def test_python_preference_unsupported_config_is_preserved(self) -> None:
+        """Fallbacks apply only when the model expressed no preference."""
+        args = self._disagg_args(kv_transfer_timeout_ms=None)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    def test_context_parallelism_does_not_gate_resolution(self) -> None:
+        """Context parallelism is not a resolution-time gate.
+
+        Ctx (cp=1) and gen (cp>1, e.g. helix) servers must resolve to the
+        same runtime, and the Python transceiver supports helix CP.
+        Non-helix CP fails loudly at transceiver creation instead.
+        """
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            context_parallel_size=2,
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     def test_default_backend_resolves_to_nixl_and_adopts_preference(
             self, monkeypatch):
@@ -3688,9 +4053,14 @@ class TestTransceiverRuntimeAutoResolution:
         "backend_env",
         ["TRTLLM_USE_UCX_KVCACHE", "TRTLLM_USE_MPI_KVCACHE"],
     )
-    def test_default_backend_env_override_falls_back_to_v1_cpp(
-            self, monkeypatch, backend_env):
-        """An incompatible DEFAULT route falls back to the V1 C++ path."""
+    def test_default_backend_env_override_keeps_preference(
+            self, monkeypatch: pytest.MonkeyPatch, backend_env: str) -> None:
+        """A model preference survives an incompatible DEFAULT env route.
+
+        The runtime is adopted verbatim (creation fails loudly on the
+        non-NIXL backend); the V2 manager preference is still downgraded
+        because its gate requires PYTHON on NIXL.
+        """
         for env_var in (
                 "TRTLLM_USE_NIXL_KVCACHE",
                 "TRTLLM_USE_UCX_KVCACHE",
@@ -3700,15 +4070,11 @@ class TestTransceiverRuntimeAutoResolution:
             monkeypatch.delenv(env_var, raising=False)
         monkeypatch.setenv(backend_env, "1")
         args = self._disagg_args(backend="DEFAULT")
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-        apply_model_defaults_to_llm_args(args, model_defaults)
 
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
-        _resolve_kv_cache_manager_v2_auto(args,
-                                          model_defaults,
-                                          original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(args, _PreferPythonTransceiverModel)
 
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     def test_disagg_disabled_is_noop(self):
@@ -3739,6 +4105,27 @@ class TestTransceiverRuntimeAutoResolution:
         args = self._disagg_args()
         with pytest.raises(ValueError, match="JAVA"):
             _resolve_transceiver_runtime_auto(args, _BadModel)
+
+    def test_model_cpp_opt_out_respected(self) -> None:
+        """A model returning 'CPP' opts out of the Python default."""
+
+        class _CppOptOutModel:
+
+            @classmethod
+            def get_preferred_transceiver_runtime(cls,
+                                                  pretrained_config: Any = None
+                                                  ) -> Literal["CPP"]:
+                return "CPP"
+
+        args = self._disagg_args()
+        _resolve_transceiver_runtime_auto(args, _CppOptOutModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "CPP"
+
+    def test_infinite_kv_transfer_timeout_falls_back_to_cpp(self) -> None:
+        """The Python transceiver requires a finite kv_transfer_timeout_ms."""
+        args = self._disagg_args(kv_transfer_timeout_ms=None)
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime is None
 
     @pytest.mark.parametrize("disagg_enabled", [False, True])
     @pytest.mark.parametrize("transceiver_defaults", [
@@ -3786,7 +4173,8 @@ class TestTransceiverRuntimeAutoResolution:
         args = self._disagg_args()
         ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", args,
                                                    None)
-        assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     @staticmethod
     def _fake_checkpoint_loader(architectures):
@@ -3811,17 +4199,20 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     @pytest.mark.parametrize("arch,expected", [
-        ("ModelAForCausalLM", "PYTHON"),
-        ("ModelBForCausalLM", None),
+        ("ModelAForCausalLM", "CPP"),
+        ("ModelBForCausalLM", "PYTHON"),
     ])
     def test_shared_class_differentiates_per_architecture(
-            self, monkeypatch, arch, expected):
+            self, monkeypatch: pytest.MonkeyPatch, arch: str,
+            expected: str) -> None:
         """Shared implementation classes differentiate per checkpoint.
 
         The preference hook receives pretrained_config so one implementation
-        class can vary its answer by architecture.
+        class can opt a specific architecture out to 'CPP' while checkpoints
+        without an opt-out follow the global Python default.
         """
         from tensorrt_llm._torch.pyexecutor import \
             model_loader as model_loader_mod
@@ -3870,6 +4261,7 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     def test_model_loader_full_chain_aggregated_stays_none(self, monkeypatch):
         """Full chain in aggregated mode: no transceiver config appears."""
@@ -3911,13 +4303,11 @@ class TestTransceiverRuntimeAutoResolution:
             backend="UCX")._resolve_default_backend() == ("UCX", None)
 
 
-class TestDeepseekTransceiverPreference:
-    """Per-architecture preferred KV-cache transceiver runtime.
+class TestDeepseekRuntimePreferences:
+    """DeepSeek KV-cache manager and transceiver preferences.
 
-    DeepseekV3ForCausalLM and DeepseekV32ForCausalLM prefer the Python KV-cache
-    transceiver, while GlmMoeDsaForCausalLM (GLM 5.2) requires the C++ transceiver
-    because its per-layer masked DSA indexer k-cache pool is not supported by the
-    Python (v2) transceiver.
+    DeepseekV3ForCausalLM, DeepseekV32ForCausalLM, and GlmMoeDsaForCausalLM
+    prefer the Python KV-cache transceiver.
     """
 
     @staticmethod
@@ -3927,19 +4317,32 @@ class TestDeepseekTransceiverPreference:
         cfg.model_type = model_type
         return cfg
 
-    @pytest.mark.parametrize("architectures,model_type,expected", [
-        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "CPP"),
-        (["DeepseekV3ForCausalLM"], "deepseek_v3", "PYTHON"),
-        (["DeepseekV32ForCausalLM"], "deepseek_v32", "PYTHON"),
+    @pytest.mark.parametrize("architectures,model_type", [
+        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa"),
+        (["DeepseekV3ForCausalLM"], "deepseek_v3"),
+        (["DeepseekV32ForCausalLM"], "deepseek_v32"),
     ])
     def test_preference_per_architecture(self, architectures: list[str],
-                                         model_type: str,
-                                         expected: str) -> None:
-        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
-            DeepseekV3ForCausalLM
+                                         model_type: str) -> None:
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
         cfg = self._pretrained_config(architectures, model_type)
-        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
-            cfg) == expected
+        model_cls = get_registered_model_class(architectures[0])
+        assert model_cls is not None
+        assert model_cls.get_preferred_transceiver_runtime(cfg) == "PYTHON"
+
+    def test_glm_uses_independent_model_flavor(self) -> None:
+        """GLM can evolve independently from its DeepSeek implementation base."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+            DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM)
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        assert get_registered_model_class(
+            "DeepseekV3ForCausalLM") is DeepseekV3ForCausalLM
+        assert get_registered_model_class(
+            "GlmMoeDsaForCausalLM") is GlmMoeDsaForCausalLM
+        assert issubclass(GlmMoeDsaForCausalLM, DeepseekV3ForCausalLM)
 
     def test_prefers_python_without_config(self) -> None:
         """Preference is unconditional without a pretrained config."""

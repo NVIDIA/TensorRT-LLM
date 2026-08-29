@@ -306,10 +306,12 @@ inline int getSMVersion(bool queryRealSmArch = false)
     return sm;
 }
 
-inline bool isSM100Family()
+inline bool isSM100Family(std::optional<int> sm = std::nullopt)
 {
-    int const sm = getSMVersion();
-    return sm == 100 || sm == 103; // To be continued...
+    // Not value_or(): its argument is evaluated eagerly, so an explicit sm
+    // would still trigger a device query (which throws with no device present).
+    int smVersion = sm.has_value() ? *sm : getSMVersion();
+    return smVersion >= 100 && smVersion < 110;
 }
 
 /// @brief Detects whether the current device is an integrated GPU.

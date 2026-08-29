@@ -1,11 +1,14 @@
 import unittest
 
 import numpy as np
+import pytest
 import torch
 from mpi4py import MPI
 
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import \
     HostMoeTensorSharer
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestHostMoeTensorSharer(unittest.TestCase):
