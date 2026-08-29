@@ -43,6 +43,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
+  - unittest/_torch/visual_gen/sparse_attention/test_skip_softmax.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_flux_infer.py
@@ -76,6 +77,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
+  - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
@@ -97,6 +99,7 @@ l0_cpu:
   - unittest/llmapi/test_mpi_session.py ISOLATION
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
+  - unittest/llmapi/test_rl_control_auth.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
