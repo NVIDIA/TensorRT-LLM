@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2148,51 +2149,20 @@ class BatchPrefillPagedTSWrapper:
     packed ``[total_q, Hq, D]`` storage. Supported page sizes are 16, 32, 64,
     and 128. Dense plans with uniform snapshotted logical K lengths aligned to
     128 rows compile the request-local softmax K mask away.
-
-    Context attention needs no scratch workspace. An optional caller workspace
-    is retained only for API parity with decode wrappers and is never read or
-    written, so it may be shared across ordered or concurrent context launches.
     """
 
     @flashinfer_api
-    def __init__(
-        self,
-        kv_layout: Literal["HND"] = "HND",
-        *,
-        workspace_buffer: Optional[torch.Tensor] = None,
-    ) -> None:
+    def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
         """Create an unplanned paged-context wrapper.
 
         Args:
             kv_layout: K/V layout. Only ``"HND"`` is supported.
-            workspace_buffer: Optional caller-owned tensor retained for API
-                parity. Context kernels use zero bytes of it.
         """
 
-        if workspace_buffer is not None and not isinstance(
-            workspace_buffer, torch.Tensor
-        ):
-            raise TypeError("workspace_buffer must be a torch.Tensor or None")
         _validate_kv_layout(kv_layout)
         self._kv_layout = kv_layout
-        self._workspace_buffer = workspace_buffer
         self._live_metadata = False
         self._planned = False
-
-    @flashinfer_api
-    def reset_workspace_buffer(self, workspace_buffer: Optional[torch.Tensor]) -> None:
-        """Rebind the optional caller workspace without invalidating a plan.
-
-        Context attention derives no views from this tensor and never reads or
-        writes it. Rebinding therefore only changes the strong reference kept
-        for wrapper-API uniformity, including while an existing plan is cached.
-        """
-
-        if workspace_buffer is not None and not isinstance(
-            workspace_buffer, torch.Tensor
-        ):
-            raise TypeError("workspace_buffer must be a torch.Tensor or None")
-        self._workspace_buffer = workspace_buffer
 
     @flashinfer_api
     def plan(

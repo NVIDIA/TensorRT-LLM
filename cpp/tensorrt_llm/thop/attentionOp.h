@@ -217,11 +217,11 @@ public:
 
     static TrtllmGenContextWorkspaceLayout buildContextLayout(at::ScalarType qDtype, int64_t batchSize,
         int64_t numTokens, int64_t numHeads, int64_t headSize, int64_t rotaryEmbeddingDim, bool separateQKvInput,
-        bool fp8ContextFmha, bool skipTrtllmGenWorkspace = false);
+        bool fp8ContextFmha, bool skipWorkspace = false);
 
     static TrtllmGenGenerationWorkspaceLayout buildGenerationLayout(at::ScalarType qDtype, int64_t batchBeam,
         int64_t numTokens, int64_t numHeads, int64_t headSize, int64_t rotaryEmbeddingDim, int64_t numKvHeads,
-        int64_t maxBlocksPerSequence, bool useSparseAttention, bool skipTrtllmGenWorkspace = false);
+        int64_t maxBlocksPerSequence, bool useSparseAttention, bool skipWorkspace = false);
 
     static int64_t getContextWorkspaceSize(at::ScalarType qDtype, int64_t batchSize, int64_t numTokens,
         int64_t numHeads, int64_t headSize, int64_t rotaryEmbeddingDim, bool separateQKvInput, bool fp8ContextFmha);

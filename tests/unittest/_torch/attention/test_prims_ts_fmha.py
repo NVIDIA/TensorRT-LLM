@@ -252,8 +252,20 @@ def _support_result(
             "num_kv_cache_pools": 2,
             "use_kv_cache_v2": True,
         },
+        {
+            "attention_input_type": AttentionInputType.context_only,
+            "num_heads": 64,
+            "num_kv_heads": 1,
+        },
     ],
-    ids=["context", "mixed", "generation", "mla-generation", "v2-multi-pool"],
+    ids=[
+        "context",
+        "mixed",
+        "generation",
+        "mla-generation",
+        "v2-multi-pool",
+        "context-gqa-ratio-over-32",
+    ],
 )
 def test_supported_matrix(case: dict) -> None:
     supported, reason = _support_result(**case)
@@ -669,7 +681,9 @@ def test_v1_total_page_bound_excludes_slots_before_selected_layer(is_mla: bool) 
     fmha = PrimsTSFmha(attn)
     metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
-            impl=SimpleNamespace(),
+            impl=SimpleNamespace(
+                get_primary_pool_data=lambda _: torch.empty(64, dtype=torch.uint8)
+            ),
             blocks_in_primary_pool=64,
             num_local_layers=4,
         ),
@@ -913,7 +927,6 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     fmha.run_context(params)
 
     wrapper_factory.assert_called_once_with(kv_layout="HND")
-    wrapper.reset_workspace_buffer.assert_called_once_with(None)
     wrapper.plan_live.assert_called_once()
     plan_args = wrapper.plan_live.call_args.args
     plan_kwargs = wrapper.plan_live.call_args.kwargs
@@ -965,15 +978,14 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     )
     context_preprocess.assert_called_once()
     context_postprocess.assert_called_once()
-    assert context_preprocess.call_args.args[-1] is True
-    assert context_postprocess.call_args.args[-1] is True
+    assert context_preprocess.call_args.kwargs["skip_workspace"] is True
+    assert context_postprocess.call_args.kwargs["skip_workspace"] is True
 
     block_tables[:, 0].add_(1)
     cu_kv_seqlens.copy_(torch.tensor([0, 64, 97], dtype=torch.int32))
     fmha.run_context(params)
 
     wrapper_factory.assert_called_once_with(kv_layout="HND")
-    assert wrapper.reset_workspace_buffer.call_count == 2
     wrapper.plan_live.assert_called_once()
     assert wrapper.run.call_count == 2
     second_run_kwargs = wrapper.run.call_args.kwargs
@@ -1103,6 +1115,7 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
         tokens_per_block=32,
         kv_factor=2,
         total_num_blocks=total_num_blocks,
+        batch_size=2,
         num_requests=2,
     )
 
@@ -1157,7 +1170,7 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
     preprocess_args = generation_preprocess.call_args.args
     assert preprocess_args[15] == params.seq_offset
     assert preprocess_args[39] == total_num_blocks
-    assert preprocess_args[-1] is True
+    assert generation_preprocess.call_args.kwargs["skip_workspace"] is True
     get_page_index_upper_bound.assert_called_once()
 
     block_tables[:, 0].add_(20)
@@ -1199,6 +1212,7 @@ def test_decode_layer_adapters_bind_the_same_shared_workspace(
             paged_kv_indptr,
             paged_kv_indices,
             shared_workspace,
+            batch_size=2,
             num_qo_heads=8,
             num_kv_heads=2,
             head_dim=128,
@@ -1235,7 +1249,6 @@ def test_context_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     )
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
-    workspace = torch.empty(64, dtype=torch.uint8)
     k_cache = torch.empty((8, 2, 32, 128), dtype=torch.bfloat16)
     v_cache = torch.empty_like(k_cache)
 
@@ -1245,7 +1258,6 @@ def test_context_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
             q,
             k_cache,
             v_cache,
-            workspace,
             batch_size=batch_size,
             max_seq_len_q=128,
             max_seq_len_k=256,
@@ -1266,8 +1278,6 @@ def test_context_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     assert wrapper_factory.call_count == 2
     for wrapper in wrappers:
         wrapper.plan_live.assert_called_once()
-    assert wrappers[0].reset_workspace_buffer.call_count == 2
-    assert wrappers[1].reset_workspace_buffer.call_count == 1
     assert set(fmha._context_wrappers) == {1, 2}
 
 
@@ -1291,6 +1301,7 @@ def test_decode_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
             torch.arange(batch_size + 1, dtype=torch.int32).mul_(2),
             torch.arange(batch_size * 2, dtype=torch.int32),
             workspace,
+            batch_size=batch_size,
             num_qo_heads=8,
             num_kv_heads=2,
             head_dim=128,
@@ -1316,7 +1327,7 @@ def test_decode_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     assert set(fmha._decode_wrappers) == {1, 2}
 
 
-def test_workspace_allocation_change_invalidates_all_wrapper_caches() -> None:
+def test_workspace_allocation_change_invalidates_only_workspace_bound_wrappers() -> None:
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     first_workspace = torch.empty(32, dtype=torch.uint8)
@@ -1328,7 +1339,7 @@ def test_workspace_allocation_change_invalidates_all_wrapper_caches() -> None:
     second_workspace = torch.empty(64, dtype=torch.uint8)
     fmha._update_workspace_allocation(second_workspace)
 
-    assert fmha._context_wrappers == {}
+    assert set(fmha._context_wrappers) == {1}
     assert fmha._decode_wrappers == {}
     assert fmha._mla_decode_wrappers == {}
 
@@ -1345,6 +1356,7 @@ def _get_test_mla_wrapper(
         block_tables,
         seq_lens,
         workspace_buffer,
+        batch_size=int(block_tables.shape[0]),
         num_heads=4,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -1424,6 +1436,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_staged_metadata(
         tokens_per_block=32,
         kv_factor=1,
         total_num_blocks=20,
+        batch_size=2,
         num_requests=2,
     )
 
@@ -1655,6 +1668,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         tokens_per_block=32,
         kv_factor=1,
         total_num_blocks=total_num_blocks,
+        batch_size=2,
         num_requests=2,
     )
 
@@ -1871,11 +1885,11 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
         workspace,
     )
 
-    assert fmha._decode_workspace_offset_bytes == 256
+    assert fmha._decode_workspace_offset_bytes == 64
     assert fmha._decode_workspace_required_bytes == 48
-    assert workspace.numel() == 304
+    assert workspace.numel() == 112
     decode_workspace = fmha._get_decode_workspace(workspace)
-    assert decode_workspace.data_ptr() == workspace.data_ptr() + 256
+    assert decode_workspace.data_ptr() == workspace.data_ptr() + 64
     assert decode_workspace.numel() == 48
 
 
@@ -1933,7 +1947,7 @@ def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(
 
     assert context_layout.call_count == 2
     assert fmha._decode_wrappers[2] is cached_wrapper
-    assert fmha._decode_workspace_offset_bytes == 768
+    assert fmha._decode_workspace_offset_bytes == 960
     assert first_workspace.data_ptr() == second_workspace.data_ptr()
     assert first_workspace.numel() == second_workspace.numel() == 48
 
@@ -2105,6 +2119,7 @@ def test_phased_forward_routes_mixed_batch_to_context_and_generation(
     assert context_params.num_tokens == 3
     assert context_params.seq_offset == 0
     assert context_params.batch_size == 1
+    assert context_params.num_requests == 1
     assert context_params.attention_input is not None
     assert context_params.attention_input.shape[0] == 3
     assert context_params.context_buf is not None
@@ -2114,6 +2129,7 @@ def test_phased_forward_routes_mixed_batch_to_context_and_generation(
     generation_params = generation_calls[0]
     assert generation_params.num_tokens == 2
     assert generation_params.seq_offset == 1
+    assert generation_params.batch_size == 2
     assert generation_params.num_requests == 2
     assert generation_params.attention_input is not None
     assert generation_params.attention_input.shape[0] == 2

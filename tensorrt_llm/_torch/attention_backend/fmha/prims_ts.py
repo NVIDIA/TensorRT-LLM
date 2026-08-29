@@ -26,11 +26,11 @@ import torch
 from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.bindings import DataType
+from tensorrt_llm._utils import binding_to_torch_dtype, get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
@@ -50,11 +50,7 @@ if TYPE_CHECKING:
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
-_WORKSPACE_ALIGNMENT = 256
-
-
-def _align_workspace_offset(byte_offset: int) -> int:
-    return (byte_offset + _WORKSPACE_ALIGNMENT - 1) // _WORKSPACE_ALIGNMENT * _WORKSPACE_ALIGNMENT
+_WORKSPACE_ALIGNMENT = 32
 
 
 class PrimsTSFmha(PhasedFmha):
@@ -64,7 +60,7 @@ class PrimsTSFmha(PhasedFmha):
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
     SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
-    MAX_GQA_RATIO = 32
+    MAX_DECODE_GQA_RATIO = 32
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
@@ -90,42 +86,6 @@ class PrimsTSFmha(PhasedFmha):
         self._workspace_allocation: Optional[tuple[object, ...]] = None
         self._decode_workspace_offset_bytes: Optional[int] = None
         self._decode_workspace_required_bytes = 0
-
-    def _get_total_num_blocks(
-        self,
-        meta: "TrtllmAttentionMetadata",
-    ) -> int:
-        kv_cache_manager = meta.kv_cache_manager
-        if kv_cache_manager is not None:
-            get_page_index_upper_bound = getattr(
-                kv_cache_manager.impl, "get_page_index_upper_bound", None
-            )
-            # KVCacheManagerV2 exposes an already-flattened page-index bound.
-            # Applying the legacy layer/KV factor again would create a tensor
-            # view beyond the allocation owned by the cache manager.
-            if callable(get_page_index_upper_bound):
-                from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-
-                local_layer_idx = self.attn.local_layer_idx
-                if local_layer_idx is None:
-                    local_layer_idx = self.attn.get_local_layer_idx(meta)
-                return int(get_page_index_upper_bound(local_layer_idx, Role.KEY))
-        total_num_blocks = super()._get_total_num_blocks(meta)
-        if total_num_blocks == 0:
-            return 0
-
-        # KVCacheManagerV1 stores every layer and K/V slot in one interleaved
-        # allocation. The thop helper advances the returned pointer to this
-        # layer's first slot, so its from_blob extent must exclude the slots
-        # preceding that pointer. Multi-pool V1 is rejected by is_supported.
-        local_layer_idx = self.attn.local_layer_idx
-        if local_layer_idx is None:
-            local_layer_idx = self.attn.get_local_layer_idx(meta)
-        layer_idx_in_pool = int(meta.host_kv_cache_pool_mapping[local_layer_idx, 1])
-        remaining_blocks = total_num_blocks - layer_idx_in_pool * self.kv_factor
-        if remaining_blocks <= 0:
-            raise RuntimeError("PrimTS resolved an invalid V1 KV-cache pool extent.")
-        return remaining_blocks
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -367,12 +327,12 @@ class PrimsTSFmha(PhasedFmha):
         else:
             if attn.num_heads % attn.num_kv_heads != 0:
                 return False, "the query head count must be divisible by the KV head count."
-            if attn.num_heads // attn.num_kv_heads > self.MAX_GQA_RATIO:
-                return False, f"GQA ratio exceeds {self.MAX_GQA_RATIO}."
+            if has_generation and attn.num_heads // attn.num_kv_heads > self.MAX_DECODE_GQA_RATIO:
+                return False, f"decode GQA ratio exceeds {self.MAX_DECODE_GQA_RATIO}."
 
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"query dtype {q.dtype} is unsupported."
-        cache_dtype = self._get_cache_torch_dtype(meta)
+        cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
         if cache_dtype != q.dtype:
             return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if output.dtype != q.dtype:
@@ -445,17 +405,6 @@ class PrimsTSFmha(PhasedFmha):
         if not is_mla and self._get_kv_page_offset(attn, meta, 0) is None:
             return False, "the K-to-V page displacement could not be resolved."
         return True, ""
-
-    @staticmethod
-    def _get_cache_torch_dtype(meta: "TrtllmAttentionMetadata") -> Optional[torch.dtype]:
-        cache_dtype = meta.kv_cache_manager.dtype
-        if isinstance(cache_dtype, torch.dtype):
-            return cache_dtype
-        return {
-            DataType.HALF: torch.float16,
-            DataType.BF16: torch.bfloat16,
-            DataType.FP8: torch.float8_e4m3fn,
-        }.get(cache_dtype)
 
     def _get_kv_page_offset(
         self,
@@ -736,7 +685,7 @@ class PrimsTSFmha(PhasedFmha):
         return aligned_sequence_lengths
 
     def _update_workspace_allocation(self, workspace: torch.Tensor) -> None:
-        """Invalidate provisional plans when the shared workspace is reallocated."""
+        """Invalidate plans that retain views into a reallocated workspace."""
 
         storage = workspace.untyped_storage()
         allocation = (
@@ -750,7 +699,6 @@ class PrimsTSFmha(PhasedFmha):
         if allocation == self._workspace_allocation:
             return
         self._workspace_allocation = allocation
-        self._context_wrappers.clear()
         self._decode_wrappers.clear()
         self._mla_decode_wrappers.clear()
 
@@ -759,7 +707,6 @@ class PrimsTSFmha(PhasedFmha):
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        workspace_buffer: Optional[torch.Tensor],
         *,
         batch_size: int,
         max_seq_len_q: int,
@@ -773,7 +720,6 @@ class PrimsTSFmha(PhasedFmha):
     ) -> "BatchPrefillPagedTSWrapper":
         wrapper = self._context_wrappers.get(batch_size)
         if wrapper is not None:
-            wrapper.reset_workspace_buffer(workspace_buffer)
             return wrapper
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("PrimTS context must be planned before CUDA graph capture.")
@@ -782,7 +728,6 @@ class PrimsTSFmha(PhasedFmha):
         )
 
         wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
-        wrapper.reset_workspace_buffer(workspace_buffer)
         wrapper.plan_live(
             q,
             k_cache,
@@ -807,6 +752,7 @@ class PrimsTSFmha(PhasedFmha):
         paged_kv_indices: torch.Tensor,
         workspace_buffer: torch.Tensor,
         *,
+        batch_size: int,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -819,9 +765,10 @@ class PrimsTSFmha(PhasedFmha):
         mask_type: str,
         window_left: int,
     ) -> "BatchDecodePagedTSWrapper":
-        batch_size = int(paged_kv_indptr.numel()) - 1
         if batch_size <= 0:
             raise RuntimeError("PrimTS decode requires a positive batch size.")
+        if paged_kv_indptr.numel() != batch_size + 1:
+            raise RuntimeError("PrimTS decode indptr extent does not match the phase batch size.")
         wrapper = self._decode_wrappers.get(batch_size)
         if wrapper is not None:
             return wrapper
@@ -857,6 +804,7 @@ class PrimsTSFmha(PhasedFmha):
         seq_lens: torch.Tensor,
         workspace_buffer: torch.Tensor,
         *,
+        batch_size: int,
         num_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -868,9 +816,10 @@ class PrimsTSFmha(PhasedFmha):
         output_dtype: torch.dtype,
         mask_type: str,
     ) -> "BatchMLADecodePagedTSWrapper":
-        batch_size = int(block_tables.shape[0])
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
+        if block_tables.shape[0] != batch_size or seq_lens.numel() != batch_size:
+            raise RuntimeError("PrimTS MLA metadata extents do not match the phase batch size.")
         wrapper = self._mla_decode_wrappers.get(batch_size)
         if wrapper is not None:
             return wrapper
@@ -943,7 +892,7 @@ class PrimsTSFmha(PhasedFmha):
                 self.attn.rope_dim,
                 True,
                 False,
-                True,
+                skip_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(context_layout["total_size"])
@@ -964,7 +913,7 @@ class PrimsTSFmha(PhasedFmha):
                 self.attn.num_kv_heads,
                 0,
                 False,
-                True,
+                skip_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(generation_layout["total_size"])
@@ -978,7 +927,7 @@ class PrimsTSFmha(PhasedFmha):
                         "TRT-LLM QKV preprocessing workspace must be sized before "
                         "CUDA graph capture."
                     )
-                required_numel = math.ceil(required_preprocess_bytes / workspace.element_size())
+                required_numel = ceil_div(required_preprocess_bytes, workspace.element_size())
                 workspace.resize_((required_numel,))
             self._update_workspace_allocation(workspace)
             return
@@ -1045,7 +994,10 @@ class PrimsTSFmha(PhasedFmha):
             # while PrimTS runs. Keep PrimTS scratch in a separate aligned tail,
             # anchored to the final root allocation so cached batch profiles
             # retain a stable address across mixed-context layout changes.
-            decode_workspace_min_offset_bytes = _align_workspace_offset(required_preprocess_bytes)
+            # FlashInfer requires the caller workspace base to be 32-byte aligned.
+            decode_workspace_min_offset_bytes = pad_up(
+                required_preprocess_bytes, _WORKSPACE_ALIGNMENT
+            )
             required_workspace_bytes = decode_workspace_min_offset_bytes + required_bytes
         current_workspace_bytes = workspace.numel() * workspace.element_size()
         if current_workspace_bytes < required_workspace_bytes:
@@ -1053,7 +1005,7 @@ class PrimsTSFmha(PhasedFmha):
                 raise RuntimeError(
                     "PrimTS caller workspace must be sized before CUDA graph capture."
                 )
-            required_numel = math.ceil(required_workspace_bytes / workspace.element_size())
+            required_numel = ceil_div(required_workspace_bytes, workspace.element_size())
             workspace.resize_((required_numel,))
         if decode_workspace_min_offset_bytes is not None:
             current_workspace_bytes = workspace.numel() * workspace.element_size()
@@ -1166,10 +1118,11 @@ class PrimsTSFmha(PhasedFmha):
             True,
             fwd.cross_kv,
             False,
-            True,
+            skip_workspace=True,
         )
         if fmha_workspace.numel() != 0:
             raise RuntimeError("PrimTS context preprocessing returned an FMHA workspace.")
+        # The returned pool and block table share the THOP flat-page index ABI.
         if kv_pool is None or block_tables is None:
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
         kv_page_offset = self._get_kv_page_offset(attn, meta, params.seq_offset)
@@ -1190,7 +1143,6 @@ class PrimsTSFmha(PhasedFmha):
             q_processed,
             k_cache,
             v_cache,
-            None,
             batch_size=params.batch_size,
             max_seq_len_q=max_seq_len_q,
             max_seq_len_k=max_seq_len_k,
@@ -1250,7 +1202,7 @@ class PrimsTSFmha(PhasedFmha):
             False,
             attention_chunk_size,
             self._multi_processor_count,
-            True,
+            skip_workspace=True,
         )
 
     def run_generation(self, params: FmhaParams) -> None:
@@ -1265,7 +1217,7 @@ class PrimsTSFmha(PhasedFmha):
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        batch_size = params.num_requests * meta.beam_width
+        batch_size = params.batch_size
         attention_chunk_size = attn.attention_chunk_size or 0
         (
             q_processed,
@@ -1324,12 +1276,13 @@ class PrimsTSFmha(PhasedFmha):
             params.kv_factor,
             True,
             False,
-            True,
+            skip_workspace=True,
         )
         if fmha_workspace.numel() != 0:
             raise RuntimeError("PrimTS generation preprocessing returned an FMHA workspace.")
         if is_multi_token_gen:
             raise RuntimeError("PrimTS was selected for unsupported speculative decoding.")
+        # The returned pool and block table share the THOP flat-page index ABI.
         if kv_pool is None or block_tables is None:
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
         kv_page_offset = self._get_kv_page_offset(attn, meta, params.seq_offset)
@@ -1359,6 +1312,7 @@ class PrimsTSFmha(PhasedFmha):
             paged_kv_indptr,
             paged_kv_indices,
             decode_workspace,
+            batch_size=batch_size,
             num_qo_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim,
@@ -1407,7 +1361,7 @@ class PrimsTSFmha(PhasedFmha):
 
         attn = params.attn
         meta = params.meta
-        batch_size = params.num_requests * meta.beam_width
+        batch_size = params.batch_size
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,
             meta.host_kv_cache_pool_mapping,
@@ -1423,6 +1377,7 @@ class PrimsTSFmha(PhasedFmha):
             batch_size,
             params.qkv_input.dtype,
         )
+        # The returned pool and block table share the THOP flat-page index ABI.
         if kv_cache is None or block_tables is None:
             raise RuntimeError("TRT-LLM did not return PrimTS MLA KV metadata.")
         _, page_indices = self._make_fixed_stride_csr(
@@ -1458,6 +1413,7 @@ class PrimsTSFmha(PhasedFmha):
             dense_block_tables,
             seq_lens,
             caller_workspace,
+            batch_size=batch_size,
             num_heads=attn.num_heads,
             kv_lora_rank=int(attn.kv_lora_rank),
             qk_rope_head_dim=int(attn.qk_rope_head_dim),

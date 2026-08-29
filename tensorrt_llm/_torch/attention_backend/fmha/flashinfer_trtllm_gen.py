@@ -1257,7 +1257,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
-        batch_beam = params.num_requests * meta.beam_width
+        batch_beam = params.batch_size
         (
             q_processed,
             kv_pool,
@@ -1382,7 +1382,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if get_attention_chunk_size(attn) != 0:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
-        batch_beam = params.num_requests * meta.beam_width
+        batch_beam = params.batch_size
         if params.attention_input is None:
             raise RuntimeError("MLA generation requires attention_input.")
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
