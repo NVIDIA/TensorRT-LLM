@@ -93,8 +93,8 @@ class LocalityDomainResourceManager:
         self.initialized_devices: set[int] = set()
         # Thread-local storage for current locality domain ID
         self.current_locality_domain = threading.local()
-        # Thread-local storage for tracking if we're inside a mem_pool context
-        # This prevents nested use_mem_pool calls which cause "already recording to mempool_id" error
+        # Thread-local (device_id, locality_domain_id) of the mempool this thread is
+        # routed to; unset when routed to none.
         self.in_mem_pool_context = threading.local()
 
         # This hacky WAR is used to avoid crash during application exit.
@@ -132,8 +132,8 @@ class LocalityDomainResourceManager:
         # Reset thread-local storage
         if hasattr(self.current_locality_domain, "id"):
             delattr(self.current_locality_domain, "id")
-        if hasattr(self.in_mem_pool_context, "active"):
-            delattr(self.in_mem_pool_context, "active")
+        if hasattr(self.in_mem_pool_context, "active_pool_key"):
+            delattr(self.in_mem_pool_context, "active_pool_key")
 
     def __del__(self) -> None:
         self.cleanup()
@@ -258,28 +258,40 @@ def get_current_locality_domain() -> int | None:
 
 @contextmanager
 def optional_locality_domain_mem_pool(use_locality_domain: bool = True):
+    """Route this thread's allocations to the current locality domain's mempool.
+
+    A no-op when no locality domain is current. Nesting a different domain is
+    supported: the inner scope wins and unwinds to the enclosing one.
+
+    Concurrent entry into the same (device, locality domain) from more than one host
+    thread is not supported. The guard is thread-local because torch.cuda.use_mem_pool
+    routes per calling thread, so it cannot see another thread already holding the pool.
+    Partitioned execution runs on a single host thread with concurrency coming from the
+    per-domain CUDA streams, so no current caller does this; supporting one would need a
+    per-thread pool or a custom allocator filter.
+    """
     current_locality_domain = get_current_locality_domain()
     if not use_locality_domain or current_locality_domain is None:
         # No change on current allocator
         yield
     else:
         manager = get_locality_domain_resource_manager()
-        # Check if we're already in a mem_pool context to prevent nested calls
-        # PyTorch's use_mem_pool doesn't support re-entry and will raise
-        # "RuntimeError: beginAllocateToPool: already recording to mempool_id"
-        if getattr(manager.in_mem_pool_context, "active", False):
-            # Already in a mem_pool context, just yield without entering again
+        assert isinstance(current_locality_domain, int)
+        # use_mem_pool rejects re-entering the same pool but nests fine across
+        # pools, so track which pool is held rather than a bare "inside" flag.
+        pool_key = (torch.cuda.current_device(), current_locality_domain)
+        previous_pool_key = getattr(manager.in_mem_pool_context, "active_pool_key", None)
+        if previous_pool_key == pool_key:
             yield
         else:
-            # enter torch.cuda.use_mem_pool
-            assert isinstance(current_locality_domain, int)
             pool = get_locality_domain_mempool(current_locality_domain)
-            manager.in_mem_pool_context.active = True
+            manager.in_mem_pool_context.active_pool_key = pool_key
             try:
                 with torch.cuda.use_mem_pool(pool):
                     yield
             finally:
-                manager.in_mem_pool_context.active = False
+                # Restore so nested scopes unwind to the enclosing pool.
+                manager.in_mem_pool_context.active_pool_key = previous_pool_key
 
 
 @contextmanager

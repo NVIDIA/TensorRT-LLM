@@ -49,7 +49,9 @@ from tensorrt_llm._torch.locality_domain_utils import (
     initialize_locality_domain_resources,
     is_locality_domain_enabled,
     is_locality_domain_supported,
+    locality_domain_device,
     node_local_max_active_clusters,
+    optional_locality_domain_mem_pool,
 )
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
@@ -653,6 +655,97 @@ class TestLocalityDomainMempool:
             if "allocator" in str(e).lower() and "not available" in str(e).lower():
                 pytest.skip(f"LOCALITY_DOMAIN mempool not available: {e}")
             raise
+
+
+def _pool_allocated_bytes(pool):
+    """Total bytes currently allocated out of `pool`'s segments."""
+    return sum(segment["allocated_size"] for segment in pool.snapshot(include_traces=False))
+
+
+class TestLocalityDomainNestedMemPool:
+    """Nested optional_locality_domain_mem_pool scopes across locality domains."""
+
+    def test_nested_same_domain_does_not_reenter(self, check_locality_domain_support):
+        """Re-entering the same pool is skipped; use_mem_pool would reject it."""
+        manager = locality_domain_utils.get_locality_domain_resource_manager()
+        device_id = torch.cuda.current_device()
+
+        try:
+            with locality_domain_device(0):
+                with optional_locality_domain_mem_pool():
+                    assert manager.in_mem_pool_context.active_pool_key == (device_id, 0)
+                    with optional_locality_domain_mem_pool():
+                        assert manager.in_mem_pool_context.active_pool_key == (device_id, 0)
+        except RuntimeError as e:
+            if "allocator" in str(e).lower() and "not available" in str(e).lower():
+                pytest.skip(f"LOCALITY_DOMAIN mempool not available: {e}")
+            raise
+
+        assert getattr(manager.in_mem_pool_context, "active_pool_key", None) is None
+
+    def test_nested_other_domain_restores_outer_key(self, check_locality_domain_support):
+        """A nested scope for a different domain enters it and unwinds to the outer one."""
+        manager = locality_domain_utils.get_locality_domain_resource_manager()
+        device_id = torch.cuda.current_device()
+
+        try:
+            with locality_domain_device(0):
+                with optional_locality_domain_mem_pool():
+                    assert manager.in_mem_pool_context.active_pool_key == (device_id, 0)
+                    with locality_domain_device(1):
+                        with optional_locality_domain_mem_pool():
+                            assert manager.in_mem_pool_context.active_pool_key == (device_id, 1)
+                    assert manager.in_mem_pool_context.active_pool_key == (device_id, 0)
+        except RuntimeError as e:
+            if "allocator" in str(e).lower() and "not available" in str(e).lower():
+                pytest.skip(f"LOCALITY_DOMAIN mempool not available: {e}")
+            raise
+
+        assert getattr(manager.in_mem_pool_context, "active_pool_key", None) is None
+
+    def test_nested_other_domain_allocates_from_inner_pool(self, check_locality_domain_support):
+        """A nested domain's tensor comes from its own pool, not the enclosing one."""
+        try:
+            pool0 = get_locality_domain_mempool(0)
+            pool1 = get_locality_domain_mempool(1)
+        except RuntimeError as e:
+            if "allocator" in str(e).lower() and "not available" in str(e).lower():
+                pytest.skip(f"LOCALITY_DOMAIN mempool not available: {e}")
+            raise
+
+        with locality_domain_device(0):
+            with optional_locality_domain_mem_pool():
+                before0 = _pool_allocated_bytes(pool0)
+                before1 = _pool_allocated_bytes(pool1)
+                with locality_domain_device(1):
+                    with optional_locality_domain_mem_pool():
+                        inner = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+                after0 = _pool_allocated_bytes(pool0)
+                after1 = _pool_allocated_bytes(pool1)
+
+        assert after1 > before1, "nested domain 1 allocation did not land in domain 1's pool"
+        assert after0 == before0, "nested domain 1 allocation leaked into domain 0's pool"
+        del inner
+
+    def test_exception_restores_previous_key(self, check_locality_domain_support):
+        """An exception inside a nested scope must still unwind the key."""
+        manager = locality_domain_utils.get_locality_domain_resource_manager()
+        device_id = torch.cuda.current_device()
+
+        try:
+            with locality_domain_device(0):
+                with optional_locality_domain_mem_pool():
+                    with pytest.raises(ValueError, match="boom"):
+                        with locality_domain_device(1):
+                            with optional_locality_domain_mem_pool():
+                                raise ValueError("boom")
+                    assert manager.in_mem_pool_context.active_pool_key == (device_id, 0)
+        except RuntimeError as e:
+            if "allocator" in str(e).lower() and "not available" in str(e).lower():
+                pytest.skip(f"LOCALITY_DOMAIN mempool not available: {e}")
+            raise
+
+        assert getattr(manager.in_mem_pool_context, "active_pool_key", None) is None
 
 
 class TestLocalityDomainIntegration:
