@@ -24,7 +24,8 @@ from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 
 class _AttentionStub:
@@ -56,11 +57,8 @@ def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
         calls.append((local_layer_idx, role))
         return next(bounds)
 
-    manager = SimpleNamespace(
-        blocks_in_primary_pool=50_000_000,
-        impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound),
-        num_local_layers=36,
-    )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
     fmha._v1_total_num_blocks_cache = None
@@ -94,12 +92,8 @@ def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> No
         ],
         dtype=torch.int32,
     )
-    manager = SimpleNamespace(
-        blocks_in_primary_pool=50_000_000,
-        impl=SimpleNamespace(get_primary_pool_data=get_primary_pool_data),
-        num_local_layers=5,
-        num_pools=2,
-    )
+    manager = object.__new__(KVCacheManager)
+    manager.impl = SimpleNamespace(get_primary_pool_data=get_primary_pool_data)
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = kv_factor
     fmha._v1_total_num_blocks_cache = None
@@ -114,6 +108,17 @@ def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> No
     assert fmha._get_total_num_blocks(metadata) == expected
     assert fmha._get_total_num_blocks(metadata) == expected
     assert calls == [4]
+
+
+def test_phased_fmha_rejects_unknown_kv_cache_manager_type() -> None:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.kv_factor = 2
+    fmha._v1_total_num_blocks_cache = None
+    fmha._attn_ref = lambda: SimpleNamespace(local_layer_idx=0)
+    metadata = SimpleNamespace(kv_cache_manager=SimpleNamespace())
+
+    with pytest.raises(TypeError, match="Unsupported KV cache manager: SimpleNamespace"):
+        fmha._get_total_num_blocks(metadata)
 
 
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:

@@ -24,6 +24,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     CustomAttentionMask,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 from .interface import Fmha
 
@@ -94,16 +96,12 @@ class PhasedFmha(Fmha):
         if local_layer_idx is None:
             local_layer_idx = self.attn.get_local_layer_idx(meta)
 
-        get_page_index_upper_bound = getattr(
-            kv_cache_manager.impl, "get_page_index_upper_bound", None
-        )
-        if callable(get_page_index_upper_bound):
-            # Import lazily to avoid coupling attention-module import order to
-            # the Python KV-cache manager implementation.
-            from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            return int(kv_cache_manager.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY))
+        if not isinstance(kv_cache_manager, KVCacheManager):
+            raise TypeError(f"Unsupported KV cache manager: {type(kv_cache_manager).__name__}.")
 
-            return int(get_page_index_upper_bound(local_layer_idx, Role.KEY))
-
+        # KVCacheManager V1 compatibility path.
         cached_v1_extent = self._v1_total_num_blocks_cache
         if (
             cached_v1_extent is not None
