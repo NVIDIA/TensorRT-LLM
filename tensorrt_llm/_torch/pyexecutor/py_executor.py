@@ -62,12 +62,12 @@ from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
 from ..disaggregation.executor.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..route_capture import RouteCapture
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..moe.expert_statistic import ExpertStatistic
+from ..route_capture import RouteCapture
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
@@ -7966,7 +7966,10 @@ class PyExecutor:
         ExpertStatistic.set_iter(self.iter_counter)
         RouteCapture.set_iter(self.iter_counter)
         if not self.model_engine.is_warmup:
-            RouteCapture.prepare(scheduled_requests, getattr(getattr(self, 'kv_cache_manager', None), 'tokens_per_block', 0))
+            RouteCapture.prepare(
+                scheduled_requests,
+                getattr(getattr(self, 'kv_cache_manager', None),
+                        'tokens_per_block', 0))
 
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)

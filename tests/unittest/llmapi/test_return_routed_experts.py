@@ -13,19 +13,22 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end test for Router Replay (R3): enable_return_routed_experts on a real
-(small) MoE model and assert the per-token routing is returned with the right
-shape, including concurrent requests (mirrors the vLLM / SGLang feature tests)."""
+"""End-to-end test for Router Replay (R3).
+
+Runs enable_return_routed_experts on a real (small) MoE model and asserts the
+per-token routing is returned with the right shape, including concurrent requests
+(mirrors the vLLM / SGLang feature tests).
+"""
+
 import os
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import skip_gpu_memory_less_than_40gb
 
 from tensorrt_llm import LLM
 from tensorrt_llm.sampling_params import SamplingParams
-
-from utils.llm_data import llm_models_root
-from utils.util import skip_gpu_memory_less_than_40gb
 
 _MODEL = "Qwen1.5-MoE-A2.7B-Chat"  # small CUTLASS separated-routing MoE
 
@@ -53,19 +56,18 @@ def _check_routes(routes, prompt_len, gen_len):
 def test_return_routed_experts_shape_and_concurrency():
     llm = LLM(model=_model_dir(), enable_return_routed_experts=True)
     try:
-        sp = SamplingParams(max_tokens=16,
-                            temperature=0.0,
-                            return_routed_experts=True)
+        sp = SamplingParams(max_tokens=16, temperature=0.0, return_routed_experts=True)
         prompts = ["The capital of France is", "1 + 1 =", "Hello, my name is"]
         outputs = llm.generate(prompts, sp)
         assert len(outputs) == len(prompts)
         for req in outputs:
             out = req.outputs[0]
-            _check_routes(out.routed_experts,
-                          prompt_len=len(req.prompt_token_ids),
-                          gen_len=len(out.token_ids))
+            _check_routes(
+                out.routed_experts, prompt_len=len(req.prompt_token_ids), gen_len=len(out.token_ids)
+            )
     finally:
         llm.shutdown()
+
 
 # NOTE: per-request gating (returning routes only for requests whose
 # SamplingParams.return_routed_experts is True) is a follow-up: it needs the flag

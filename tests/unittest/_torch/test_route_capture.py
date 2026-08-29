@@ -19,6 +19,7 @@ These cover the pure-logic core (no GPU / no engine): the output-assembly
 contract, prefix-cache position keying + store/read-back round trip, fail-closed
 backend gating, and the opt-in config flags.
 """
+
 import pytest
 import torch
 
@@ -87,7 +88,6 @@ def test_prefix_store_and_readback_roundtrip():
 
 
 def test_assert_capturable_gates_on_separated_routing():
-
     class _Sep:
         def _supports_load_balancer(self):
             return True
@@ -103,12 +103,14 @@ def test_assert_capturable_gates_on_separated_routing():
 
 def test_sampling_params_return_routed_experts_flag():
     from tensorrt_llm.sampling_params import SamplingParams
+
     assert SamplingParams().return_routed_experts is False
     assert SamplingParams(return_routed_experts=True).return_routed_experts is True
 
 
 def test_llm_args_enable_flag_present_and_defaults_false():
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     fields = TorchLlmArgs.model_fields
     assert "enable_return_routed_experts" in fields
     assert fields["enable_return_routed_experts"].default is False
@@ -116,12 +118,12 @@ def test_llm_args_enable_flag_present_and_defaults_false():
 
 def test_completion_output_routed_experts_property():
     from tensorrt_llm.executor.result import CompletionOutput
+
     # None when not present.
     assert CompletionOutput(index=0).routed_experts is None
     # Surfaces the single whole-sequence tensor from the transport list.
     routes = torch.zeros((5, _L, _K), dtype=torch.int16)
-    out = CompletionOutput(
-        index=0, additional_generation_outputs={"routed_experts": [routes]})
+    out = CompletionOutput(index=0, additional_generation_outputs={"routed_experts": [routes]})
     assert out.routed_experts is not None
     assert out.routed_experts.shape == (5, _L, _K)
     assert torch.equal(out.routed_experts, routes)
