@@ -14,23 +14,29 @@
 # limitations under the License.
 
 import asyncio
+import ctypes
 import os
 import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from utils.spawn_process import SpawnProcessContext, spawn_process, wait_forever
+import torch
+import zmq
+from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
 from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
+from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 _THREADING_EVENT = threading.Event
+_COLD_SPAWN_TIMEOUT = 120.0
 
 
 def _pre_set_event() -> threading.Event:
@@ -40,11 +46,16 @@ def _pre_set_event() -> threading.Event:
 
 
 def _process_is_running(pid: int) -> bool:
+    state = _process_state(pid)
+    return state is not None and state != "Z"
+
+
+def _process_state(pid: int) -> str | None:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except FileNotFoundError:
-        return False
-    return stat.rsplit(")", maxsplit=1)[1].split()[0] != "Z"
+        return None
+    return stat.rsplit(")", maxsplit=1)[1].split()[0]
 
 
 def _wait_for_process_exit(pid: int, timeout: float = 10.0) -> None:
@@ -62,26 +73,75 @@ def _pause() -> None:
         signal.pause()
 
 
+def _exit_immediately(exitcode: int) -> None:
+    os._exit(exitcode)
+
+
+def _gpu_bound_worker(
+    rank: int,
+    parent_pid: int,
+    ready_queue,
+) -> None:
+    executor_module._start_coordinator_watchdog(parent_pid)
+    torch.cuda.set_device(rank)
+    # Keep a live CUDA allocation on each device while the parent injects a
+    # process failure. NCCL is intentionally not initialized here: killing a
+    # rank inside an active NCCL group can wedge NVIDIA UVM teardown and poison
+    # the shared CI node, which tests driver recovery rather than this client's
+    # worker-containment behavior.
+    allocation = torch.empty(1024, device=f"cuda:{rank}")
+    torch.cuda.synchronize(rank)
+    ready_queue.put(rank)
+    ready_queue.close()
+    ready_queue.join_thread()
+    assert allocation.is_cuda
+    _pause()
+
+
+def _supervised_pause_worker(parent_pid: int, ready_queue) -> None:
+    executor_module._start_coordinator_watchdog(parent_pid)
+    ready_queue.put(os.getpid())
+    ready_queue.close()
+    ready_queue.join_thread()
+    _pause()
+
+
 def _parent_bound_worker(
     parent_pid: int,
     lifecycle_context: SpawnProcessContext,
     **_kwargs,
 ) -> None:
-    blocked_signals = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-    if signal.SIGINT in blocked_signals or signal.SIGTERM in blocked_signals:
-        raise RuntimeError("worker inherited blocked termination signal")
-    executor_module._set_worker_parent_death_signal(parent_pid)
-    executor_module._start_parent_process_watchdog(parent_pid)
+    executor_module._start_coordinator_watchdog(parent_pid)
     lifecycle_context.send("worker", os.getpid())
     _pause()
 
 
-def _parent_death_worker(
+def _gil_holding_parent_bound_worker(
     parent_pid: int,
     lifecycle_context: SpawnProcessContext,
 ) -> None:
-    executor_module._set_worker_parent_death_signal(parent_pid)
+    executor_module._start_coordinator_watchdog(parent_pid)
     lifecycle_context.send("worker", os.getpid())
+    # Flush the message before blocking the Python interpreter in a native
+    # call that keeps the GIL. Only the C++ watchdog can run after this point.
+    lifecycle_context.close_sender()
+    pause = ctypes.PyDLL(None).pause
+    pause.argtypes = []
+    pause.restype = ctypes.c_int
+    pause()
+
+
+def _delayed_watchdog_worker(
+    parent_pid: int,
+    lifecycle_context: SpawnProcessContext,
+) -> None:
+    lifecycle_context.send("worker", os.getpid())
+    lifecycle_context.close_sender()
+    time.sleep(1.0)
+    try:
+        executor_module._start_coordinator_watchdog(parent_pid)
+    except RuntimeError:
+        return
     _pause()
 
 
@@ -90,148 +150,245 @@ def _lightweight_background(client: DiffusionRemoteClient) -> None:
     client.shutdown_event.wait()
 
 
-def _run_owned_worker_coordinator(
+def _run_temporary_constructor_coordinator(
     lifecycle_context: SpawnProcessContext,
-    fail_owner_wait_once: bool,
 ) -> None:
-    parent_pid = os.getpid()
     context = executor_module._get_mp_context("spawn")
-
-    if not fail_owner_wait_once:
-        args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
-        startup_error = []
-        clients = []
-        worker_target = partial(
-            _parent_bound_worker,
-            lifecycle_context=lifecycle_context,
-        )
-
-        def construct_client_from_temporary_thread() -> None:
-            try:
-                with (
-                    patch.object(
-                        executor_module,
-                        "_detect_external_launch",
-                        return_value=None,
-                    ),
-                    patch.object(
-                        executor_module,
-                        "find_free_port",
-                        # DiffusionRemoteClient requests the distributed master,
-                        # request ZMQ, and response ZMQ ports in this order. The
-                        # patched networking paths below never bind these ports;
-                        # fixed placeholders keep construction deterministic.
-                        side_effect=[29500, 29501, 29502],
-                    ),
-                    patch.object(
-                        executor_module,
-                        "get_ip_address",
-                        return_value="127.0.0.1",
-                    ),
-                    patch.object(
-                        executor_module,
-                        "_get_mp_context",
-                        return_value=context,
-                    ),
-                    patch.object(
-                        executor_module,
-                        "run_diffusion_worker",
-                        worker_target,
-                    ),
-                    patch.object(
-                        DiffusionRemoteClient,
-                        "_serve_forever_thread",
-                        _lightweight_background,
-                    ),
-                    patch.object(DiffusionRemoteClient, "_wait_ready"),
-                    patch.object(executor_module, "_register_atexit"),
-                ):
-                    clients.append(DiffusionRemoteClient(args=args))
-            except BaseException as error:
-                startup_error.append(error)
-
-        constructor = threading.Thread(target=construct_client_from_temporary_thread)
-        constructor.start()
-        constructor.join(timeout=30.0)
-        if constructor.is_alive() or startup_error or not clients:
-            raise RuntimeError(f"client startup failed: {startup_error!r}")
-        lifecycle_context.send("constructor")
-        _pause()
-
-    worker = context.Process(
-        target=_parent_bound_worker,
-        kwargs={
-            "parent_pid": parent_pid,
-            "lifecycle_context": lifecycle_context,
-        },
-    )
-    initial_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-    owner = executor_module._WorkerProcessOwner([worker], initial_signal_mask)
-    owner_wait_failed = threading.Event()
-    wait_for_release = owner._wait_for_release
-
-    def fail_once() -> None:
-        if not owner_wait_failed.is_set():
-            owner_wait_failed.set()
-            raise RuntimeError("injected owner wait failure")
-        wait_for_release()
-
-    owner._wait_for_release = fail_once
+    args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
     startup_error = []
+    clients = []
+    worker_target = partial(
+        _parent_bound_worker,
+        lifecycle_context=lifecycle_context,
+    )
 
-    def construct_from_temporary_thread() -> None:
+    def construct_client_from_temporary_thread() -> None:
         try:
-            owner.start()
-            owner.wait_for_spawn(timeout=30.0)
+            with (
+                patch.object(
+                    executor_module,
+                    "_detect_external_launch",
+                    return_value=None,
+                ),
+                patch.object(
+                    executor_module,
+                    "find_free_port",
+                    # DiffusionRemoteClient requests the distributed master,
+                    # request ZMQ, and response ZMQ ports in this order. The
+                    # patched networking paths below never bind these ports;
+                    # fixed placeholders keep construction deterministic.
+                    side_effect=[29500, 29501, 29502],
+                ),
+                patch.object(
+                    executor_module,
+                    "get_ip_address",
+                    return_value="127.0.0.1",
+                ),
+                patch.object(
+                    executor_module,
+                    "_get_mp_context",
+                    return_value=context,
+                ),
+                patch.object(
+                    executor_module,
+                    "run_diffusion_worker",
+                    worker_target,
+                ),
+                patch.object(
+                    DiffusionRemoteClient,
+                    "_serve_forever_thread",
+                    _lightweight_background,
+                ),
+                patch.object(DiffusionRemoteClient, "_wait_ready"),
+                patch.object(executor_module, "_register_atexit"),
+            ):
+                clients.append(DiffusionRemoteClient(args=args))
         except BaseException as error:
             startup_error.append(error)
 
-    constructor = threading.Thread(target=construct_from_temporary_thread)
+    constructor = threading.Thread(target=construct_client_from_temporary_thread)
     constructor.start()
     constructor.join(timeout=30.0)
-    if constructor.is_alive() or startup_error:
-        raise RuntimeError(f"owner startup failed: {startup_error!r}")
-    if not owner_wait_failed.wait(timeout=30.0):
-        raise RuntimeError("owner wait failure was not observed")
+    if constructor.is_alive() or startup_error or not clients:
+        raise RuntimeError(f"client startup failed: {startup_error!r}")
     lifecycle_context.send("constructor")
-    _pause()
-
-
-def _run_process_watchdog(
-    lifecycle_context: SpawnProcessContext,
-    watched_pid: int,
-) -> None:
-    watchdog = executor_module._start_parent_process_watchdog(watched_pid)
-    if watchdog is None:
-        raise RuntimeError("process watchdog did not start")
-    lifecycle_context.send("ready")
     _pause()
 
 
 def _run_parent_death_coordinator(
     lifecycle_context: SpawnProcessContext,
+    worker_target: Callable[..., None] = _parent_bound_worker,
 ) -> None:
     context = executor_module._get_mp_context("spawn")
     worker = context.Process(
-        target=_parent_death_worker,
+        target=worker_target,
         args=(os.getpid(), lifecycle_context),
     )
     worker.start()
     worker.join()
 
 
-def _assert_owned_worker_lifecycle(fail_owner_wait_once: bool) -> None:
+def _run_worker_containment_coordinator(
+    lifecycle_context: SpawnProcessContext,
+    worker_count: int,
+    begin_monitoring,
+) -> None:
+    context = executor_module._get_mp_context("spawn")
+    ready_queue = context.Queue()
+    workers = [
+        context.Process(
+            target=_supervised_pause_worker,
+            args=(os.getpid(), ready_queue),
+        )
+        for _ in range(worker_count)
+    ]
+    for worker in workers:
+        worker.start()
+
+    try:
+        ready_deadline = time.monotonic() + _COLD_SPAWN_TIMEOUT
+        worker_pids = [
+            ready_queue.get(timeout=max(0.0, ready_deadline - time.monotonic())) for _ in workers
+        ]
+        lifecycle_context.send("workers", worker_pids)
+
+        if not begin_monitoring.wait(timeout=30.0):
+            raise TimeoutError("parent did not release worker monitoring")
+
+        client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+        client.worker_processes = workers
+        client._worker_spawner = executor_module._WorkerProcessSpawner(workers)
+        client._ext_worker_thread = None
+        client._monitor_worker_liveness = True
+        client._worker_failure = None
+        client._shutdown_started = False
+        client.shutdown_event = threading.Event()
+        client.response_event = threading.Event()
+
+        containment_deadline = time.monotonic() + 10.0
+        while client._worker_failure is None and time.monotonic() < containment_deadline:
+            client._check_worker_liveness()
+            time.sleep(0.001)
+        if client._worker_failure is None:
+            raise TimeoutError("coordinator did not detect the killed workers")
+
+        lifecycle_context.send(
+            "contained",
+            {
+                "failure": client._worker_failure,
+                "exitcodes": [worker.exitcode for worker in workers],
+            },
+        )
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+            worker.join(timeout=10.0)
+        ready_queue.close()
+        ready_queue.join_thread()
+
+
+def _run_worker_watchdog_coordinator(
+    lifecycle_context: SpawnProcessContext,
+    worker_count: int,
+) -> None:
+    """Spawn supervised workers, then remain alive until the test kills us."""
+    context = executor_module._get_mp_context("spawn")
+    ready_queue = context.Queue()
+    workers = [
+        context.Process(
+            target=_supervised_pause_worker,
+            args=(os.getpid(), ready_queue),
+        )
+        for _ in range(worker_count)
+    ]
+    for worker in workers:
+        worker.start()
+
+    ready_deadline = time.monotonic() + _COLD_SPAWN_TIMEOUT
+    worker_pids = [
+        ready_queue.get(timeout=max(0.0, ready_deadline - time.monotonic())) for _ in workers
+    ]
+    ready_queue.close()
+    ready_queue.join_thread()
+    lifecycle_context.send("workers", worker_pids)
+    lifecycle_context.close_sender()
+    _pause()
+
+
+def _run_sigint_during_shutdown(lifecycle_context: SpawnProcessContext) -> None:
+    # Batch launchers may start the test process with SIGINT ignored or
+    # blocked. Establish the ordinary interactive Python disposition that
+    # this scenario is intended to exercise before creating helper threads.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+    context = executor_module._get_mp_context("spawn")
+    worker = context.Process(target=_pause)
+    worker.start()
+
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client._shutdown_lock = threading.Lock()
+    client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
+    client._shutdown_error = None
+    client._shutdown_thread = None
+    client.pending_requests = executor_module.queue.Queue()
+    client.background_thread = MagicMock()
+    client.background_thread.is_alive.return_value = False
+    client.shutdown_event = threading.Event()
+    client.worker_processes = [worker]
+    client._worker_spawner = None
+    client._ext_worker_thread = None
+
+    reap_started = threading.Event()
+    real_reap_worker_process = executor_module._reap_worker_process
+
+    def reap_worker_process(process) -> bool:
+        reap_started.set()
+        return real_reap_worker_process(process)
+
+    def interrupt_shutdown() -> None:
+        if not reap_started.wait(timeout=10.0):
+            return
+        os.kill(os.getpid(), signal.SIGINT)
+
+    interrupt_thread = threading.Thread(target=interrupt_shutdown, daemon=True)
+    try:
+        with patch.object(
+            executor_module,
+            "_reap_worker_process",
+            side_effect=reap_worker_process,
+        ):
+            interrupt_thread.start()
+            try:
+                client.shutdown()
+            except KeyboardInterrupt:
+                lifecycle_context.send(
+                    "shutdown",
+                    {
+                        "complete": client._shutdown_complete.is_set(),
+                        "worker_exitcode": worker.exitcode,
+                    },
+                )
+            else:
+                raise RuntimeError("SIGINT was not delivered after worker reap started")
+    finally:
+        interrupt_thread.join(timeout=10.0)
+        if worker.is_alive():
+            worker.kill()
+        worker.join(timeout=10.0)
+
+
+def _assert_temporary_constructor_worker_lifecycle() -> None:
     worker_pid = None
     try:
-        with spawn_process(
-            _run_owned_worker_coordinator,
-            fail_owner_wait_once,
-        ) as coordinator:
+        with spawn_process(_run_temporary_constructor_coordinator) as coordinator:
             messages = coordinator.receive_many("constructor", "worker")
             worker_pid = messages["worker"]
 
-            # The temporary constructor thread is gone. The dedicated process
-            # owner must keep the thread-scoped PDEATHSIG from firing.
+            # The temporary constructor thread is gone. The process-scoped
+            # watchdog must follow the coordinator rather than that thread.
             time.sleep(1.0)
             assert coordinator.is_alive
             assert _process_is_running(worker_pid)
@@ -244,71 +401,14 @@ def _assert_owned_worker_lifecycle(fail_owner_wait_once: bool) -> None:
             os.kill(worker_pid, signal.SIGKILL)
 
 
-def test_worker_parent_death_signal_uses_sigkill() -> None:
-    libc = MagicMock()
-    libc.prctl.return_value = 0
-
-    with (
-        patch.object(executor_module, "_load_libc", return_value=libc),
-        patch.object(executor_module, "_get_parent_process_id", return_value=123),
-        patch.object(executor_module, "_kill_process") as kill_process,
-    ):
-        executor_module._set_worker_parent_death_signal(123)
-
-    libc.prctl.assert_called_once_with(
-        executor_module._PR_SET_PDEATHSIG,
-        signal.SIGKILL,
-        0,
-        0,
-        0,
-    )
-    kill_process.assert_not_called()
-
-
-def test_worker_kills_itself_if_coordinator_exits_before_registration() -> None:
-    libc = MagicMock()
-    libc.prctl.return_value = 0
-
-    with (
-        patch.object(executor_module, "_load_libc", return_value=libc),
-        patch.object(executor_module, "_get_parent_process_id", return_value=456),
-        patch.object(executor_module, "_get_process_id", return_value=789),
-        patch.object(executor_module, "_kill_process") as kill_process,
-        pytest.raises(RuntimeError, match="coordinator exited before worker startup"),
-    ):
-        executor_module._set_worker_parent_death_signal(123)
-
-    kill_process.assert_called_once_with(789, signal.SIGKILL)
-
-
-@pytest.mark.skipif(
-    sys.platform != "linux" or not hasattr(os, "pidfd_open"),
-    reason="pidfd process monitoring is Linux-specific",
-)
-def test_process_watchdog_kills_worker_when_watched_process_exits() -> None:
-    with (
-        spawn_process(wait_forever) as watched,
-        spawn_process(_run_process_watchdog, watched.pid) as worker,
-    ):
-        watched.receive("ready")
-        worker.receive("ready")
-
-        watched.kill()
-        assert watched.wait() == -signal.SIGKILL
-        assert worker.wait() == -signal.SIGKILL
-
-
-def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
+def test_worker_starts_native_watchdog_before_initialization() -> None:
     class StopWorker(BaseException):
         pass
 
     events = []
 
-    def set_parent_death_signal(parent_pid):
-        events.append(("parent_death", parent_pid))
-
-    def start_parent_process_watchdog(parent_pid):
-        events.append(("process_watchdog", parent_pid))
+    def start_coordinator_watchdog(parent_pid):
+        events.append(("coordinator_watchdog", parent_pid))
 
     def set_log_level(log_level):
         events.append(("log_level", log_level))
@@ -317,13 +417,8 @@ def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
     with (
         patch.object(
             executor_module,
-            "_set_worker_parent_death_signal",
-            side_effect=set_parent_death_signal,
-        ),
-        patch.object(
-            executor_module,
-            "_start_parent_process_watchdog",
-            side_effect=start_parent_process_watchdog,
+            "_start_coordinator_watchdog",
+            side_effect=start_coordinator_watchdog,
         ),
         patch.object(executor_module.logger, "set_level", side_effect=set_log_level),
         pytest.raises(StopWorker),
@@ -340,13 +435,61 @@ def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
         )
 
     assert events == [
-        ("parent_death", 123),
-        ("process_watchdog", 123),
+        ("coordinator_watchdog", 123),
         ("log_level", "info"),
     ]
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-specific")
+def test_worker_watchdog_failure_is_fatal_before_initialization() -> None:
+    with (
+        patch.object(
+            executor_module,
+            "_start_coordinator_watchdog",
+            side_effect=RuntimeError("pidfd unavailable"),
+        ),
+        patch.object(executor_module.logger, "set_level") as set_log_level,
+        pytest.raises(RuntimeError, match="pidfd unavailable"),
+    ):
+        executor_module.run_diffusion_worker(
+            rank=0,
+            world_size=1,
+            master_addr="127.0.0.1",
+            master_port=29500,
+            request_queue_addr=None,
+            response_queue_addr=None,
+            visual_gen_args=MagicMock(),
+            parent_pid=123,
+        )
+
+    set_log_level.assert_not_called()
+
+
+def test_worker_failure_propagates_to_external_launcher() -> None:
+    with (
+        patch.object(
+            executor_module.logger,
+            "set_level",
+            side_effect=RuntimeError("worker initialization failed"),
+        ),
+        patch.object(executor_module.logger, "error") as log_error,
+        patch.object(executor_module.traceback, "print_exc") as print_exc,
+        pytest.raises(RuntimeError, match="worker initialization failed"),
+    ):
+        executor_module.run_diffusion_worker(
+            rank=1,
+            world_size=2,
+            master_addr="127.0.0.1",
+            master_port=29500,
+            request_queue_addr=None,
+            response_queue_addr=None,
+            visual_gen_args=MagicMock(),
+        )
+
+    log_error.assert_called_once_with("Worker failed: worker initialization failed")
+    print_exc.assert_called_once_with()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
 def test_worker_is_killed_when_coordinator_is_sigkilled() -> None:
     worker_pid = None
     try:
@@ -362,14 +505,115 @@ def test_worker_is_killed_when_coordinator_is_sigkilled() -> None:
             os.kill(worker_pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-specific")
-def test_temporary_constructor_thread_does_not_kill_owned_worker() -> None:
-    _assert_owned_worker_lifecycle(fail_owner_wait_once=False)
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+def test_native_watchdog_does_not_require_python_gil() -> None:
+    worker_pid = None
+    try:
+        with spawn_process(
+            _run_parent_death_coordinator,
+            _gil_holding_parent_bound_worker,
+        ) as coordinator:
+            worker_pid = coordinator.receive("worker")
+            time.sleep(0.5)
+
+            coordinator.kill()
+            assert coordinator.wait() == -signal.SIGKILL
+
+            _wait_for_process_exit(worker_pid)
+    finally:
+        if worker_pid is not None and _process_is_running(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-specific")
-def test_owner_wait_exception_does_not_kill_owned_worker() -> None:
-    _assert_owned_worker_lifecycle(fail_owner_wait_once=True)
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+def test_worker_exits_if_coordinator_dies_before_watchdog_registration() -> None:
+    worker_pid = None
+    try:
+        with spawn_process(
+            _run_parent_death_coordinator,
+            _delayed_watchdog_worker,
+        ) as coordinator:
+            worker_pid = coordinator.receive("worker")
+
+            coordinator.kill()
+            assert coordinator.wait() == -signal.SIGKILL
+
+            _wait_for_process_exit(worker_pid)
+    finally:
+        if worker_pid is not None and _process_is_running(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("killed_worker_count", [1, 2])
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+def test_sigkill_workers_contains_remaining_group(killed_worker_count: int) -> None:
+    context = executor_module._get_mp_context("spawn")
+    begin_monitoring = context.Event()
+    worker_pids = []
+    try:
+        with spawn_process(
+            _run_worker_containment_coordinator,
+            killed_worker_count + 1,
+            begin_monitoring,
+        ) as coordinator:
+            worker_pids = coordinator.receive("workers", timeout=_COLD_SPAWN_TIMEOUT)
+            killed_worker_pids = worker_pids[:killed_worker_count]
+            for worker_pid in killed_worker_pids:
+                os.kill(worker_pid, signal.SIGKILL)
+
+            death_deadline = time.monotonic() + 10.0
+            for worker_pid in killed_worker_pids:
+                while _process_state(worker_pid) != "Z" and time.monotonic() < death_deadline:
+                    time.sleep(0.01)
+                assert _process_state(worker_pid) == "Z"
+
+            begin_monitoring.set()
+            result = coordinator.receive("contained", timeout=30.0)
+            assert result["exitcodes"] == [-signal.SIGKILL] * len(worker_pids)
+            # is_alive() harvests child status through waitpid(WNOHANG). Two
+            # processes already visible as /proc zombies can become waitable
+            # on adjacent checks, so the coordinator may latch the first death
+            # and classify the second as a live rank to contain. The failure
+            # must name an injected death, never the untouched survivor.
+            assert any(
+                f"pid={worker_pid}, exitcode=-9" in result["failure"]
+                for worker_pid in killed_worker_pids
+            )
+            for worker_pid in worker_pids[killed_worker_count:]:
+                assert f"pid={worker_pid}" not in result["failure"]
+            assert coordinator.wait(timeout=30.0) == 0
+            for worker_pid in worker_pids:
+                _wait_for_process_exit(worker_pid)
+    finally:
+        begin_monitoring.set()
+        for worker_pid in worker_pids:
+            if _process_is_running(worker_pid):
+                os.kill(worker_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+def test_sigkill_worker_and_coordinator_kills_remaining_workers() -> None:
+    worker_pids = []
+    try:
+        with spawn_process(
+            _run_worker_watchdog_coordinator,
+            2,
+        ) as coordinator:
+            worker_pids = coordinator.receive("workers", timeout=_COLD_SPAWN_TIMEOUT)
+            os.kill(worker_pids[0], signal.SIGKILL)
+            coordinator.kill()
+            assert coordinator.wait(timeout=30.0) == -signal.SIGKILL
+            for worker_pid in worker_pids:
+                _wait_for_process_exit(worker_pid)
+    finally:
+        for worker_pid in worker_pids:
+            if _process_is_running(worker_pid):
+                os.kill(worker_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+def test_temporary_constructor_thread_does_not_kill_worker() -> None:
+    _assert_temporary_constructor_worker_lifecycle()
 
 
 def test_cleanup_is_registered_before_waiting_for_ready() -> None:
@@ -377,63 +621,62 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
     process = MagicMock()
     context = MagicMock()
     context.Process.return_value = process
-    owner = MagicMock()
+    spawner = MagicMock()
     args = MagicMock()
     args.parallel_config.n_workers = 1
-    previous_signal_mask = {signal.SIGHUP}
 
     with (
         patch.object(executor_module, "_detect_external_launch", return_value=None),
         patch.object(executor_module, "find_free_port", side_effect=[29500, 29501, 29502]),
         patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+        patch.object(executor_module, "_get_worker_ready_timeout", return_value=60.0),
         patch.object(executor_module, "_get_mp_context", return_value=context),
+        patch.object(executor_module, "_monotonic", side_effect=[100.0, 125.0]),
         patch.object(executor_module, "_Thread") as thread_class,
         patch.object(executor_module, "_Event", side_effect=_pre_set_event),
         patch.object(
             executor_module,
-            "_pthread_sigmask",
-            return_value=previous_signal_mask,
-        ),
-        patch.object(executor_module, "_WorkerProcessOwner", return_value=owner) as owner_class,
+            "_WorkerProcessSpawner",
+            return_value=spawner,
+        ) as spawner_class,
         patch.object(executor_module, "_register_atexit") as register,
         patch.object(DiffusionRemoteClient, "_wait_ready") as wait_ready,
     ):
         thread_class.return_value = MagicMock()
-        owner.start.side_effect = lambda: events.append("spawn")
+        spawner.start.side_effect = lambda: events.append("spawn")
         register.side_effect = lambda *args: events.append("register")
         wait_ready.side_effect = lambda: events.append("wait_ready")
 
         DiffusionRemoteClient(args=args)
 
     assert events == ["register", "spawn", "wait_ready"]
-    owner_class.assert_called_once_with([process], previous_signal_mask)
+    spawner_class.assert_called_once_with([process])
+    spawner.wait_for_spawn.assert_called_once_with(timeout=35.0)
 
 
-def test_owner_restores_signal_mask_before_spawning() -> None:
-    events = []
+def test_worker_spawner_exits_after_spawn_batch() -> None:
     process = MagicMock()
-    initial_signal_mask = {signal.SIGHUP}
+    spawner = executor_module._WorkerProcessSpawner([process])
 
-    def restore_signal_mask(how, mask) -> None:
-        events.append(("signal_mask", how, mask))
+    spawner.start()
+    assert spawner.wait_for_spawn(timeout=10.0)
+    spawner._thread.join(timeout=10.0)
 
-    process.start.side_effect = lambda: events.append(("process_start",))
-    with patch.object(
-        executor_module,
-        "_pthread_sigmask",
-        side_effect=restore_signal_mask,
-    ):
-        owner = executor_module._WorkerProcessOwner([process], initial_signal_mask)
-        owner.start()
-        try:
-            assert owner.wait_for_spawn(timeout=10.0)
-        finally:
-            owner.release_after_reap({id(process)})
+    assert not spawner._thread.is_alive()
+    process.start.assert_called_once_with()
 
-    assert events == [
-        ("signal_mask", signal.SIG_SETMASK, initial_signal_mask),
-        ("process_start",),
-    ]
+
+def test_worker_spawner_propagates_spawn_failure() -> None:
+    process = MagicMock()
+    process.start.side_effect = RuntimeError("spawn failed")
+    spawner = executor_module._WorkerProcessSpawner([process])
+
+    spawner.start()
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        spawner.wait_for_spawn(timeout=10.0)
+    spawner._thread.join(timeout=10.0)
+
+    assert not spawner._thread.is_alive()
 
 
 def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
@@ -451,8 +694,8 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
         first_process.pid = 123
 
     first_process.start.side_effect = start_first_process
-    owner = executor_module._WorkerProcessOwner([first_process, second_process], set())
-    owner.start()
+    spawner = executor_module._WorkerProcessSpawner([first_process, second_process])
+    spawner.start()
     assert start_entered.wait(timeout=10.0)
 
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
@@ -463,18 +706,20 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
     client.worker_processes = [first_process, second_process]
-    client._worker_owner = owner
+    client._worker_spawner = spawner
     client._ext_worker_thread = None
 
     shutdown_thread = threading.Thread(target=client.shutdown)
     shutdown_thread.start()
-    assert owner._spawn_cancelled.wait(timeout=10.0)
+    assert spawner._spawn_cancelled.wait(timeout=10.0)
     assert shutdown_thread.is_alive()
     first_process.join.assert_not_called()
 
     allow_start_to_finish.set()
     shutdown_thread.join(timeout=10.0)
     assert not shutdown_thread.is_alive()
+    spawner._thread.join(timeout=10.0)
+    assert not spawner._thread.is_alive()
 
     first_process.start.assert_called_once_with()
     second_process.start.assert_not_called()
@@ -482,7 +727,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     second_process.join.assert_not_called()
 
 
-def test_shutdown_bounds_inflight_spawn_and_owner_reaps_late_worker() -> None:
+def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
     spawn_blocked = threading.Event()
     release_spawn = threading.Event()
     started_process = MagicMock()
@@ -498,8 +743,8 @@ def test_shutdown_bounds_inflight_spawn_and_owner_reaps_late_worker() -> None:
         in_flight_process.pid = 456
 
     in_flight_process.start.side_effect = block_in_process_start
-    owner = executor_module._WorkerProcessOwner([started_process, in_flight_process], set())
-    owner.start()
+    spawner = executor_module._WorkerProcessSpawner([started_process, in_flight_process])
+    spawner.start()
     assert spawn_blocked.wait(timeout=10.0)
 
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
@@ -510,7 +755,7 @@ def test_shutdown_bounds_inflight_spawn_and_owner_reaps_late_worker() -> None:
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
     client.worker_processes = [started_process, in_flight_process]
-    client._worker_owner = owner
+    client._worker_spawner = spawner
     client._ext_worker_thread = None
 
     try:
@@ -531,9 +776,9 @@ def test_shutdown_bounds_inflight_spawn_and_owner_reaps_late_worker() -> None:
         )
     finally:
         release_spawn.set()
-        owner._thread.join(timeout=10.0)
+        spawner._thread.join(timeout=10.0)
 
-    assert not owner._thread.is_alive()
+    assert not spawner._thread.is_alive()
     in_flight_process.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
 
 
@@ -555,18 +800,300 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
     worker.join.assert_not_called()
 
 
+def test_worker_death_during_request_send_is_contained() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    dead_worker = MagicMock()
+    dead_worker.pid = 123
+    dead_worker.exitcode = -signal.SIGSEGV
+    dead_worker.is_alive.return_value = False
+    live_worker = MagicMock()
+    live_worker.pid = 456
+    live_worker.is_alive.return_value = True
+    client.worker_processes = [dead_worker, live_worker]
+    client._worker_spawner = MagicMock()
+    client._ext_worker_thread = None
+    client._monitor_worker_liveness = True
+    client._worker_failure = None
+    client._shutdown_started = False
+    client.shutdown_event = threading.Event()
+    client.response_event = MagicMock()
+    client.pending_requests = executor_module.queue.Queue()
+    request = SimpleNamespace(request_id=789)
+    client.pending_requests.put(request)
+    client._request_to_send = None
+    client.requests_ipc = MagicMock()
+    client.requests_ipc.put_nowait.side_effect = zmq.Again()
+    client._iter_stats = MagicMock()
+
+    client._process_requests()
+
+    assert client._worker_failure == (
+        "DiffusionClient: local worker processes exited: pid=123, exitcode=-11"
+    )
+    assert client._request_to_send is request
+    dead_worker.kill.assert_not_called()
+    live_worker.kill.assert_called_once_with()
+    client._worker_spawner.reap_started_processes.assert_called_once_with()
+    assert client.shutdown_event.is_set()
+    client.response_event.set.assert_called_once_with()
+    client._iter_stats.record_request_started.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="zombie state is observed through /proc")
+def test_worker_failure_reaps_dead_and_contained_processes() -> None:
+    context = executor_module._get_mp_context("spawn")
+    dead_worker = context.Process(target=_exit_immediately, args=(7,))
+    live_worker = context.Process(target=_pause)
+    dead_worker.start()
+    live_worker.start()
+    assert dead_worker.pid is not None
+
+    try:
+        # A spawn child imports the full test module before reaching its
+        # target. On a cold network filesystem that can take substantially
+        # longer than the lifecycle operation under test. Wait until the child
+        # has reached os._exit() before invoking the coordinator's liveness
+        # check, so cold import time is not charged to containment.
+        deadline = time.monotonic() + _COLD_SPAWN_TIMEOUT
+        while _process_state(dead_worker.pid) != "Z" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _process_state(dead_worker.pid) == "Z"
+
+        client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+        client.worker_processes = [dead_worker, live_worker]
+        client._worker_spawner = executor_module._WorkerProcessSpawner(client.worker_processes)
+        client._ext_worker_thread = None
+        client._monitor_worker_liveness = True
+        client._worker_failure = None
+        client._shutdown_started = False
+        client.shutdown_event = threading.Event()
+        client.response_event = threading.Event()
+
+        # A process can become observable as a zombie just before
+        # waitpid(WNOHANG), used by multiprocessing.Process.is_alive(), can
+        # harvest it. Production checks every event-loop tick, so exercise
+        # that same bounded retry behavior rather than assuming one tick.
+        deadline = time.monotonic() + 10.0
+        while client._worker_failure is None and time.monotonic() < deadline:
+            client._check_worker_liveness()
+            time.sleep(0.001)
+
+        assert client._worker_failure == (
+            f"DiffusionClient: local worker processes exited: pid={dead_worker.pid}, exitcode=7"
+        )
+        assert dead_worker.exitcode == 7
+        assert live_worker.exitcode == -signal.SIGKILL
+        assert _process_state(dead_worker.pid) is None
+        assert _process_state(live_worker.pid) is None
+    finally:
+        for worker in (dead_worker, live_worker):
+            if worker.is_alive():
+                worker.kill()
+            worker.join(timeout=10.0)
+
+
+def test_worker_failure_shutdown_does_not_wait_for_thread_timeout() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    dead_worker = MagicMock()
+    dead_worker.pid = 123
+    dead_worker.exitcode = -signal.SIGKILL
+    dead_worker.is_alive.return_value = False
+    client.worker_processes = [dead_worker]
+    client._worker_spawner = MagicMock()
+    client._ext_worker_thread = None
+    client._monitor_worker_liveness = True
+    client._worker_failure = None
+    client._shutdown_lock = threading.Lock()
+    client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
+    client._shutdown_error = None
+    client._shutdown_thread = None
+    client.pending_requests = executor_module.queue.Queue()
+    client.shutdown_event = threading.Event()
+    client.response_event = threading.Event()
+    client.event_loop_ready = threading.Event()
+    client._init_ipc = MagicMock(return_value=True)
+    client._cleanup_ipc = MagicMock()
+    client.background_thread = threading.Thread(target=client._serve_forever_thread)
+    client.background_thread.start()
+
+    assert client.shutdown_event.wait(timeout=10.0)
+    assert client._worker_failure == (
+        "DiffusionClient: local worker processes exited: pid=123, exitcode=-9"
+    )
+
+    with patch.object(executor_module, "THREAD_TIMEOUT", 1.0):
+        start_time = time.monotonic()
+        client.shutdown()
+        elapsed = time.monotonic() - start_time
+
+    assert elapsed < 1.0
+    assert not client.background_thread.is_alive()
+    client._cleanup_ipc.assert_called_once_with()
+
+
+@pytest.mark.gpu4
+@pytest.mark.skipif(sys.platform != "linux", reason="pidfd and /proc are Linux-specific")
+def test_sigkill_one_worker_contains_real_multi_gpu_group() -> None:
+    world_size = 4
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
+
+    context = executor_module._get_mp_context("spawn")
+    ready_queue = context.Queue()
+    parent_pid = os.getpid()
+    workers = [
+        context.Process(
+            target=_gpu_bound_worker,
+            args=(
+                rank,
+                parent_pid,
+                ready_queue,
+            ),
+        )
+        for rank in range(world_size)
+    ]
+    for worker in workers:
+        worker.start()
+
+    try:
+        ready_deadline = time.monotonic() + _COLD_SPAWN_TIMEOUT
+        ready_ranks = {
+            ready_queue.get(timeout=max(0.0, ready_deadline - time.monotonic()))
+            for _ in range(world_size)
+        }
+        assert ready_ranks == set(range(world_size))
+
+        failed_worker = workers[0]
+        assert failed_worker.pid is not None
+        os.kill(failed_worker.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10.0
+        while _process_state(failed_worker.pid) != "Z" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _process_state(failed_worker.pid) == "Z"
+
+        client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+        client.worker_processes = workers
+        client._worker_spawner = executor_module._WorkerProcessSpawner(workers)
+        client._ext_worker_thread = None
+        client._monitor_worker_liveness = True
+        client._worker_failure = None
+        client._shutdown_started = False
+        client.shutdown_event = threading.Event()
+        client.response_event = threading.Event()
+
+        deadline = time.monotonic() + 10.0
+        while client._worker_failure is None and time.monotonic() < deadline:
+            client._check_worker_liveness()
+            time.sleep(0.001)
+
+        assert client._worker_failure == (
+            f"DiffusionClient: local worker processes exited: pid={failed_worker.pid}, exitcode=-9"
+        )
+        assert failed_worker.exitcode == -signal.SIGKILL
+        for worker in workers[1:]:
+            assert worker.exitcode == -signal.SIGKILL
+        for worker in workers:
+            assert worker.pid is not None
+            assert _process_state(worker.pid) is None
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+            worker.join(timeout=10.0)
+        ready_queue.close()
+        ready_queue.join_thread()
+
+
+def test_worker_failure_completes_pending_response_with_error() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client.completed_responses = {}
+    client._worker_failure = "DiffusionClient: local worker process exited"
+
+    loop = asyncio.new_event_loop()
+    try:
+        client.lock = asyncio.Lock()
+        client.response_event = asyncio.Event()
+        response = loop.run_until_complete(client.await_responses(123))
+    finally:
+        loop.close()
+
+    assert response.request_id == 123
+    assert response.error_msg == client._worker_failure
+
+
+def test_worker_failure_result_remains_available_until_shutdown() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client._worker_failure = "DiffusionClient: local worker processes exited: pid=123, exitcode=-11"
+    client._shutdown_started = False
+    client.shutdown_event = threading.Event()
+    client.shutdown_event.set()
+    client.event_loop_ready = threading.Event()
+    client.completed_responses = {}
+    client._init_ipc = MagicMock(return_value=True)
+    client._cleanup_ipc = MagicMock()
+    client.background_thread = threading.Thread(target=client._serve_forever_thread)
+    client.background_thread.start()
+
+    try:
+        assert client.event_loop_ready.wait(timeout=10.0)
+        result = VisualGenResult(request_id=123, executor=client)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Generation failed: DiffusionClient: local worker processes exited: "
+            "pid=123, exitcode=-11",
+        ):
+            result.result(timeout=10.0)
+
+        assert client.background_thread.is_alive()
+    finally:
+        client._shutdown_started = True
+        client.background_thread.join(timeout=10.0)
+
+    assert not client.background_thread.is_alive()
+    client._cleanup_ipc.assert_called_once_with()
+
+
+def test_worker_failure_sync_response_does_not_require_event_loop() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client._worker_failure = "DiffusionClient: local worker processes exited: pid=123, exitcode=-11"
+    client._event_loop = asyncio.new_event_loop()
+    client._event_loop.close()
+
+    response = client.await_responses_sync(123)
+
+    assert response.request_id == 123
+    assert response.error_msg == client._worker_failure
+
+
+def test_wait_ready_reports_worker_monitor_failure() -> None:
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client._worker_failure = "DiffusionClient: local worker process exited"
+
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(RuntimeError, match="local worker process exited"):
+            loop.run_until_complete(client._wait_ready_async())
+    finally:
+        loop.close()
+
+
 def test_wait_ready_times_out_while_workers_are_alive() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client.completed_responses = {}
     client.worker_processes = [MagicMock()]
     client.worker_processes[0].is_alive.return_value = True
     client._ext_worker_thread = None
+    client._worker_failure = None
 
     loop = asyncio.new_event_loop()
     try:
         client.lock = asyncio.Lock()
         client.response_event = asyncio.Event()
         client._worker_ready_timeout = 0.0
+        client._worker_ready_start_time = time.monotonic()
+        client._worker_ready_deadline = client._worker_ready_start_time
 
         with pytest.raises(TimeoutError, match="did not become ready within 0s"):
             loop.run_until_complete(client._wait_ready_async())
@@ -680,7 +1207,7 @@ def test_concurrent_shutdown_waits_for_active_reap() -> None:
     worker.pid = 123
     worker.is_alive.return_value = False
     client.worker_processes = [worker]
-    client._worker_owner = None
+    client._worker_spawner = None
     client._ext_worker_thread = None
 
     first_shutdown = threading.Thread(target=client.shutdown)
@@ -703,38 +1230,12 @@ def test_concurrent_shutdown_waits_for_active_reap() -> None:
     worker.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
 
 
-def test_shutdown_defers_signals_until_workers_are_reaped() -> None:
-    class ShutdownTermination(BaseException):
-        pass
-
-    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
-    client._shutdown_lock = threading.Lock()
-    client._shutdown_started = False
-    client._shutdown_complete = threading.Event()
-    client.pending_requests = MagicMock()
-    client.background_thread = MagicMock()
-    client.background_thread.is_alive.return_value = False
-    worker = MagicMock()
-    worker.pid = 123
-    worker.is_alive.side_effect = [True, True]
-    client.worker_processes = [worker]
-    client._ext_worker_thread = None
-    previous_signal_mask = {signal.SIGHUP}
-
-    def pthread_sigmask(how, mask):
-        if how == signal.SIG_BLOCK:
-            assert tuple(mask) == executor_module._SHUTDOWN_SIGNALS
-            return previous_signal_mask
-        assert how == signal.SIG_SETMASK
-        assert mask == previous_signal_mask
-        worker.kill.assert_called_once_with()
-        assert worker.join.call_count == 3
-        raise ShutdownTermination
-
-    with patch.object(executor_module, "_pthread_sigmask", side_effect=pthread_sigmask):
-        with pytest.raises(ShutdownTermination):
-            client.shutdown()
-
-    assert client._shutdown_complete.is_set()
-    worker.terminate.assert_called_once_with()
-    worker.kill.assert_called_once_with()
+@pytest.mark.skipif(sys.platform != "linux", reason="signal delivery behavior is POSIX-specific")
+def test_shutdown_defers_sigint_until_worker_is_reaped() -> None:
+    with spawn_process(_run_sigint_during_shutdown) as scenario:
+        result = scenario.receive("shutdown", timeout=_COLD_SPAWN_TIMEOUT)
+        assert result == {
+            "complete": True,
+            "worker_exitcode": -signal.SIGTERM,
+        }
+        assert scenario.wait() == 0

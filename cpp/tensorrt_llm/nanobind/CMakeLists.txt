@@ -25,6 +25,7 @@ set(SRCS
     testing/kvCacheManagerTestUtilBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
+    visual_gen/coordinatorWatchdog.cpp
     ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 
@@ -67,6 +68,7 @@ target_link_libraries(
   PUBLIC ${SHARED_TARGET}
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
+         Threads::Threads
          torch_python
          ${CUDA_DRV_LIB}
          th_common

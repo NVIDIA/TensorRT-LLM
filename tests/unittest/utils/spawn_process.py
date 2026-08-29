@@ -36,6 +36,11 @@ class SpawnProcessContext:
         """Send a named value to the parent test process."""
         self._message_queue.put((name, value))
 
+    def close_sender(self) -> None:
+        """Flush sent messages before the child intentionally stops running Python."""
+        self._message_queue.close()
+        self._message_queue.join_thread()
+
 
 def _run_in_spawned_process(
     target: Callable[..., None],

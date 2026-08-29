@@ -50,6 +50,7 @@
 #include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
+#include "tensorrt_llm/nanobind/visual_gen/coordinatorWatchdog.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -141,6 +142,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
+
+    mInternal.def("start_coordinator_watchdog", &tensorrt_llm::nanobind::visual_gen::startCoordinatorWatchdog,
+        nb::arg("coordinator_pid"), "Terminate this process when its coordinator exits.");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
