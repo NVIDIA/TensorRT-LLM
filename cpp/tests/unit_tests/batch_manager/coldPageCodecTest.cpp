@@ -210,6 +210,8 @@ TEST(NativeColdPageCodecTest, ForwardsHostMemRegistrationToLosslessFallback)
     {
         GTEST_SKIP() << "HostMem registration requires a CUDA device";
     }
+    // HostMem pins through the CUDA driver API, which needs a current context.
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
 
     RecordingCodec codec{{0}};
     std::array descs{makeAttentionDesc(), makeLosslessDesc(kv::PoolGroupIndex{1}, kv::LayerGroupId{1})};
