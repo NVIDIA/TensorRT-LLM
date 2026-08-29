@@ -33,6 +33,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm.bindings import DataType
 
 from .common import (
     MiniMaxM3SparseConfig,
@@ -52,7 +53,7 @@ from .msa_utils import (
 )
 from .trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
-    uniform_subpages_per_slot,
+    uniform_dense_subpages_per_slot,
     write_subpage_block_table,
 )
 
@@ -302,6 +303,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are kept rather than one being derived at call time.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
+    # Device prefix sums consumed by MSA's NVFP4 CSR kernel. They include the
+    # leading zero and are graph-stable like the page table above.
+    msa_cu_q_lens: Optional[torch.Tensor] = None
+    msa_cu_kv_lens: Optional[torch.Tensor] = None
     # msa_block_table with each slot expanded into the K and V sub-pages the
     # trtllm-gen dense kernel indexes. _msa_subpages_per_slot is the expansion
     # factor, or 0 where the pool has no single one; see msa_subpage_rows.
@@ -367,6 +372,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_live_total_q = 0
         self._msa_page_size = 0
         self._msa_q_token_starts = (0,)
+        self._msa_max_q_len = 0
+        self._msa_max_kv_len_all = 0
+        self._msa_total_k = 0
+        self._msa_total_k_rows = 0
         self._create_msa_buffers()
 
     @property
@@ -508,17 +517,22 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv_cache_manager = self.kv_cache_manager
         if kv_cache_manager is None:
             return False
+        if getattr(kv_cache_manager, "uses_hybrid_nvfp4_kv_cache", False):
+            # The sparse NVFP4 plan is bypassed by Fan's direct CSR kernel;
+            # the only fmha/TRTLLM-Gen plan that can consume main K/V is the
+            # dense FP8 half of the hybrid cache.
+            return True
         try:
             buffers = kv_cache_manager.get_buffers(0, kv_layout="HND")
         except TypeError:
             buffers = kv_cache_manager.get_buffers(0)
-        except Exception:
+        if buffers is None:
             return False
+        return buffers[:, 0].dtype == torch.float8_e4m3fn
 
-        try:
-            return buffers[:, 0].dtype == torch.float8_e4m3fn
-        except Exception:
-            return False
+    def _msa_main_kv_is_nvfp4(self) -> bool:
+        """Whether the main paged K/V cache uses packed NVFP4 storage."""
+        return getattr(self.kv_cache_manager, "dtype", None) == DataType.NVFP4
 
     def _create_msa_buffers(self) -> None:
         """Allocate the CUDA-graph-stable MSA device buffers.
@@ -567,13 +581,31 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.msa_cu_q_lens = self.get_empty(
+            buffers,
+            (max_num_sequences + 1,),
+            cache_name="msa_cu_q_lens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.msa_cu_kv_lens = self.get_empty(
+            buffers,
+            (max_num_sequences + 1,),
+            cache_name="msa_cu_kv_lens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         # Resolved once here rather than per step: the factor is fixed by the
         # pool's layout for the life of the manager.
-        self._msa_subpages_per_slot = uniform_subpages_per_slot(kv_cache_manager)
+        self._msa_subpages_per_slot = uniform_dense_subpages_per_slot(kv_cache_manager)
         if self._msa_subpages_per_slot > 0:
             self.msa_subpage_block_table = self.get_empty(
                 buffers,
-                (max_num_sequences, 2, max_blocks_per_seq),
+                (
+                    max_num_sequences,
+                    2,
+                    max_blocks_per_seq,
+                ),
                 cache_name="msa_subpage_block_table",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -1047,6 +1079,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # listed stay valid and only the walk bound moves.
         if self.msa_seq_lens_cuda is not None:
             self.msa_seq_lens_cuda[:batch].copy_(kv_true)
+        if self.msa_cu_kv_lens is not None:
+            self.msa_cu_kv_lens[0].zero_()
+            torch.cumsum(kv_true.to(torch.int32), 0, out=self.msa_cu_kv_lens[1 : batch + 1])
 
         # Plan length mirrors. A plan is (has_mixed, split, batch, decode_sub,
         # prefill_sub), whose last two entries cover the plan's own rows
@@ -1387,6 +1422,31 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             maybe_pin_memory(block_ids_cpu.to(torch.int32)), non_blocking=True
         )
         self.msa_seq_lens_cuda[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
+        self.msa_qo_lens_dev[:batch_size].copy_(maybe_pin_memory(qo_lens_cpu), non_blocking=True)
+        self.msa_cu_q_lens[0].zero_()
+        self.msa_cu_kv_lens[0].zero_()
+        torch.cumsum(
+            self.msa_qo_lens_dev[:batch_size],
+            0,
+            out=self.msa_cu_q_lens[1 : batch_size + 1],
+        )
+        torch.cumsum(
+            self.msa_seq_lens_cuda[:batch_size],
+            0,
+            out=self.msa_cu_kv_lens[1 : batch_size + 1],
+        )
+        self._msa_max_q_len = int(qo_lens_cpu.max().item())
+        self._msa_max_kv_len_all = int(kv_lens_cpu.max().item())
+        self._msa_total_k = int(kv_lens_cpu.to(torch.int64).sum().item())
+        self._msa_total_k_rows = int(
+            torch.div(
+                kv_lens_cpu.to(torch.int64) + page_size - 1,
+                page_size,
+                rounding_mode="floor",
+            )
+            .sum()
+            .item()
+        )
         # Sub-page expansion for the trtllm-gen dense layers, staged once here
         # instead of once per layer. It runs outside capture and writes a
         # graph-stable buffer, so a replay reads what this step staged, exactly
@@ -1416,7 +1476,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             maybe_pin_memory(batch_row_cpu), non_blocking=True
         )
         self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
-        self.msa_qo_lens_dev[:batch_size].copy_(maybe_pin_memory(qo_lens_cpu), non_blocking=True)
         # Snapshot the staged lens as the upper bound on_update_kv_lens clamps
         # to. Device-to-device, so it stays sync-free.
         kv_lens_cuda = getattr(self, "kv_lens_cuda", None)
@@ -1456,6 +1515,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         k: torch.Tensor,
         v: torch.Tensor,
         idx_k: Optional[torch.Tensor] = None,
+        kv_scale_orig_quant: Optional[torch.Tensor] = None,
     ) -> None:
         """Write a layer's new-token K, V, and (sparse layers) index-K.
 
@@ -1466,35 +1526,66 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         Requires prepared metadata (msa_out_cache_loc filled), the same
         contract as the writes it replaces.
         """
-        from .msa_scatter import fused_write_layer_caches
+        from .msa_scatter import fused_write_layer_caches, fused_write_layer_caches_nvfp4
 
-        buffers = self.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
-        k_view, v_view = buffers[:, 0], buffers[:, 1]
         idx_cache = self.msa_idx_k_cache(layer_idx) if idx_k is not None else None
         num_tokens = int(k.shape[0])
         out_cache_loc = self.msa_out_cache_loc[:num_tokens]
-        if not fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
-            num_kv_heads = int(k_view.shape[1])
-            head_dim = int(k_view.shape[3])
-            write_kv_slots(
+        is_nvfp4_layer = getattr(self.kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(
+            layer_idx
+        )
+        if is_nvfp4_layer:
+            if kv_scale_orig_quant is None:
+                raise RuntimeError(
+                    "MiniMax-M3 NVFP4 cache write requires the layer's K/V quantization scales"
+                )
+            buffers = self.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+            k_view, v_view = buffers[:, 0], buffers[:, 1]
+            scale_buffers = self.kv_cache_manager.get_block_scale_buffers(
+                layer_idx, kv_layout="HND"
+            )
+            k_scale_view, v_scale_view = scale_buffers[:, 0], scale_buffers[:, 1]
+            if not fused_write_layer_caches_nvfp4(
                 k_view,
-                out_cache_loc,
-                k.reshape(num_tokens, num_kv_heads, head_dim),
-                layout="HND",
-            )
-            write_kv_slots(
                 v_view,
+                k_scale_view,
+                v_scale_view,
+                idx_cache,
                 out_cache_loc,
-                v.reshape(num_tokens, num_kv_heads, head_dim),
-                layout="HND",
-            )
-            if idx_k is not None:
+                k,
+                v,
+                idx_k,
+                kv_scale_orig_quant,
+            ):
+                raise RuntimeError(
+                    "MiniMax-M3 NVFP4 cache writer requires CUDA HND P128/P32 cache views, "
+                    "contiguous logical K/V rows, and FP32 K/V quantization scales"
+                )
+        else:
+            buffers = self.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+            k_view, v_view = buffers[:, 0], buffers[:, 1]
+            if not fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
+                num_kv_heads = int(k_view.shape[1])
+                head_dim = int(k_view.shape[3])
                 write_kv_slots(
-                    idx_cache,
+                    k_view,
                     out_cache_loc,
-                    idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
+                    k.reshape(num_tokens, num_kv_heads, head_dim),
                     layout="HND",
                 )
+                write_kv_slots(
+                    v_view,
+                    out_cache_loc,
+                    v.reshape(num_tokens, num_kv_heads, head_dim),
+                    layout="HND",
+                )
+                if idx_k is not None:
+                    write_kv_slots(
+                        idx_cache,
+                        out_cache_loc,
+                        idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
+                        layout="HND",
+                    )
         self._msa_prewritten_layer = layer_idx
 
     def msa_proxy_max_score_view(
@@ -1803,6 +1894,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             output,
             kv_block_indexes=kv_block_indexes,
             plan=plan,
+            kv_scale_orig_quant=forward_args.kv_scale_orig_quant,
+            kv_scale_quant_orig=forward_args.kv_scale_quant_orig,
         )
 
 

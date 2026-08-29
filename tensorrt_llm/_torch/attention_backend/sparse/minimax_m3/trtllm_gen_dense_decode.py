@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""trtllm-gen decode attention for MiniMax-M3's dense layers (0-2).
+"""trtllm-gen context and decode attention for MiniMax-M3 dense layers.
 
 Those layers attend the whole page table, so nothing about them needs MSA;
-they only run there because MsaSparseGqaFmha claims every M3 layer. MSA's
-kernel uses the context schedule, spending a 128-row Q tile on one decode
-token, while trtllm-gen has a generation tile scheduler for exactly this shape.
+they only run there because MsaSparseGqaFmha claims every M3 target layer.
+MSA's kernel uses the context schedule, spending a 128-row Q tile on one
+decode token, while trtllm-gen has generation scheduling for exactly this
+shape.
 
 FlashInferTrtllmGenFmha cannot be reused as-is. It reaches the pool through
 build_trtllm_gen_kv_cache_metadata, which assumes each layer contributes
@@ -21,13 +22,22 @@ point the generic path calls.
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from typing import Collection, Mapping, Optional, Protocol
 
 import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
+
+
+class _MiniMaxM3DenseKVCacheManager(Protocol):
+    """Cache-pool surface consumed by the dense TRTLLM-gen helpers."""
+
+    layer_offsets: Mapping[int, int]
+    sparse_layer_ids: Collection[int]
+
+    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str) -> tuple[torch.Tensor, int]: ...
 
 
 @functools.lru_cache(maxsize=None)
@@ -85,15 +95,36 @@ def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads
     return int(layout["trtllm_gen_workspace_size"])
 
 
+def _dense_kv_inputs(
+    q: torch.Tensor,
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
+    layer_idx: int,
+    *,
+    sm_scale: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    float,
+    float,
+]:
+    """Resolve direct TRTLLM-gen inputs for one M3 dense layer."""
+    kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
+    if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
+        q = q.to(torch.float8_e4m3fn)
+
+    return q, kv_pool, int(subpages_per_slot), sm_scale, 1.0
+
+
 def subpage_block_table(
-    block_table: torch.Tensor, subpages_per_slot: int, reserve: bool = False
+    block_table: torch.Tensor,
+    subpages_per_slot: int,
+    reserve: bool = False,
 ) -> torch.Tensor:
     """Expand a slot table into trtllm-gen's separate K and V page rows.
 
     uses_shared_paged_kv_idx is False for TensorRT-LLM, so the kernel takes
-    [batch, 2, max_blocks] and indexes K and V independently. Rooting the pool
-    at this layer's K (see get_kv_subpage_pool) puts slot s's K at
-    s * subpages_per_slot and its V one sub-page later.
+    [batch, 2, max_blocks] and indexes K and V independently.
 
     The result is a function of the slot table and that factor alone, so every
     dense layer of a step would compute the same one. prepare() therefore
@@ -113,14 +144,18 @@ def subpage_block_table(
 
 
 def write_subpage_block_table(
-    block_table: torch.Tensor, subpages_per_slot: int, out: torch.Tensor
+    block_table: torch.Tensor,
+    subpages_per_slot: int,
+    out: torch.Tensor,
 ) -> None:
     """Write the K and V sub-page rows of block_table into out."""
     torch.mul(block_table, subpages_per_slot, out=out[:, 0])
     torch.add(out[:, 0], 1, out=out[:, 1])
 
 
-def uniform_subpages_per_slot(kv_cache_manager) -> int:
+def uniform_subpages_per_slot(
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
+) -> int:
     """Sub-pages per slot when every layer of the pool agrees, else 0.
 
     The factor is a property of a layer group, so a single-group model has one
@@ -136,9 +171,29 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     return factors.pop() if len(factors) == 1 else 0
 
 
+def uniform_dense_subpages_per_slot(
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
+) -> int:
+    """Common dense slot stride, or 0 when dense layer groups disagree."""
+    get_pool = getattr(kv_cache_manager, "get_kv_subpage_pool", None)
+    layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
+    if get_pool is None or not layer_offsets:
+        return 0
+    dense_layers = [
+        layer_idx
+        for layer_idx in layer_offsets
+        if not getattr(kv_cache_manager, "sparse_layer_ids", ())
+        or layer_idx not in kv_cache_manager.sparse_layer_ids
+    ]
+    if not dense_layers:
+        return 0
+    strides = {int(get_pool(layer_idx, "HND")[1]) for layer_idx in dense_layers}
+    return strides.pop() if len(strides) == 1 else 0
+
+
 def minimax_m3_trtllm_gen_dense_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
-    kv_cache_manager,
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
     block_table: torch.Tensor,  # [batch, max_blocks] slot ids
     seq_lens: torch.Tensor,  # [batch] int32
@@ -171,14 +226,19 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,
     )
 
-    kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
+    (
+        q,
+        kv_pool,
+        subpages_per_slot,
+        bmm1_scale,
+        bmm2_scale,
+    ) = _dense_kv_inputs(
+        q,
+        kv_cache_manager,
+        layer_idx,
+        sm_scale=sm_scale,
+    )
     num_heads = int(q.shape[1])
-
-    # The kernel variant is picked from the Q dtype and shares one dtype across
-    # q/k/v, so an FP8 pool needs FP8 Q. M3 stores unscaled E4M3, so this is a
-    # plain cast and a no-op when the fused producer already emitted FP8.
-    if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-        q = q.to(torch.float8_e4m3fn)
 
     reserve = torch.cuda.is_current_stream_capturing()
     workspace = get_memory_buffers().get_buffer(
@@ -200,8 +260,8 @@ def minimax_m3_trtllm_gen_dense_decode(
         staged_subpage_table,  # block_tables
         seq_lens,  # seq_lens
         max_seq_len,  # max_seq_len
-        sm_scale,  # bmm1_scale
-        1.0,  # bmm2_scale
+        bmm1_scale,  # bmm1_scale
+        bmm2_scale,  # bmm2_scale
         -1,  # window_left: M3 dense layers are fully causal
         output,  # out
         None,  # sinks
@@ -209,7 +269,7 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,  # q_len_per_req
         None,  # max_q_len
         None,  # cum_seq_lens_q
-        None,  # kv_scale_pool: M3 stores unscaled E4M3
+        None,  # kv_scale_pool: dense layers use FP8/P128
         False,  # uses_shared_paged_kv_idx
     )
 
@@ -228,7 +288,9 @@ def _flashinfer_available() -> bool:
     return True
 
 
-def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
+def dense_decode_unsupported_reason(
+    kv_cache_manager: _MiniMaxM3DenseKVCacheManager, head_dim: int
+) -> Optional[str]:
     """Return None when the geometry is supported, else why it is not.
 
     Takes head_dim rather than a query tensor so prepare() can reach the same
@@ -247,6 +309,7 @@ __all__ = [
     "dense_decode_unsupported_reason",
     "minimax_m3_trtllm_gen_dense_decode",
     "subpage_block_table",
+    "uniform_dense_subpages_per_slot",
     "uniform_subpages_per_slot",
     "write_subpage_block_table",
 ]
