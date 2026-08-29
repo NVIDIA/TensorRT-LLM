@@ -20,6 +20,8 @@ from tensorrt_llm.evaluate.visual_gen.qwen_image_bench import (
     validate_generation_evaluation_request,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_extract_json_from_response_ignores_thinking_and_code_fence() -> None:
     response = """<think>reasoning</think>
