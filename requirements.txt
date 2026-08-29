@@ -82,7 +82,7 @@ blobfile
 openai-harmony==0.0.4
 nvidia-cutlass-dsl[cu13]==4.7.0; python_version >= "3.10" # required by PrimTS task-scheduled kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
-quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; supports CUTLASS DSL 4.7
+quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; only published release compatible with CUTLASS DSL 4.7
 jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr

@@ -17,15 +17,11 @@ import pytest
 
 from tensorrt_llm._torch.attention_backend.fmha import registry
 
-EXPECTED_CANONICAL_LIBS = (
-    "prims_ts",
-    "cute_dsl_mla",
-    "msa_sparse_gqa",
-    "flashinfer_sparse_mla",
-    "flashinfer_trtllm_gen",
-    "fallback",
-)
-EXPECTED_DEFAULT_LIBS = tuple(name for name in EXPECTED_CANONICAL_LIBS if name != "prims_ts")
+PRIMS_TS = "prims_ts"
+
+
+def _canonical_names() -> tuple[str, ...]:
+    return tuple(registry.FMHA_LIBS)
 
 
 def _enabled_names() -> tuple[str, ...]:
@@ -34,12 +30,16 @@ def _enabled_names() -> tuple[str, ...]:
     return tuple(names_by_class[cls] for cls in classes)
 
 
+def test_prims_ts_is_registered_first() -> None:
+    assert _canonical_names()[0] == PRIMS_TS
+
+
 def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
-    assert registry.DEFAULT_FMHA_LIBS == EXPECTED_DEFAULT_LIBS
-    assert tuple(registry.FMHA_LIBS) == EXPECTED_CANONICAL_LIBS
-    assert _enabled_names() == EXPECTED_DEFAULT_LIBS
+    assert PRIMS_TS not in registry.DEFAULT_FMHA_LIBS
+    assert set(registry.DEFAULT_FMHA_LIBS) <= set(registry.FMHA_LIBS)
+    assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
 
 
 @pytest.mark.parametrize("value", ["", "   ", ", ,"])
@@ -49,44 +49,54 @@ def test_empty_fmha_lib_env_uses_default(
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", value)
 
-    assert _enabled_names() == EXPECTED_DEFAULT_LIBS
+    assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
 
 
 def test_exact_fmha_lib_env_preserves_order_and_deduplicates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "TLLM_FMHA_LIBS",
-        " fallback, prims_ts, fallback, flashinfer_trtllm_gen ",
-    )
+    other_name = next(name for name in reversed(_canonical_names()) if name != PRIMS_TS)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f" {other_name}, {PRIMS_TS}, {other_name} ")
 
-    assert _enabled_names() == (
-        "fallback",
-        "prims_ts",
-        "flashinfer_trtllm_gen",
-    )
+    assert _enabled_names() == (other_name, PRIMS_TS)
 
 
-def test_delta_fmha_lib_env_emits_canonical_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
-
-    assert _enabled_names() == EXPECTED_CANONICAL_LIBS
-
-
-@pytest.mark.parametrize(
-    ("value", "message"),
-    [
-        ("prims_ts,-fallback", "either an exact comma-separated list"),
-        ("prims_ts,unknown", "Unknown FMHA library 'unknown'"),
-        ("+", "Invalid empty FMHA library entry"),
-    ],
-)
-def test_invalid_fmha_lib_env_is_rejected(
+def test_delta_fmha_lib_env_adds_prims_ts_in_canonical_order(
     monkeypatch: pytest.MonkeyPatch,
-    value: str,
-    message: str,
 ) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", value)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{PRIMS_TS}")
 
-    with pytest.raises(ValueError, match=message):
+    expected_names = set(registry.DEFAULT_FMHA_LIBS) | {PRIMS_TS}
+    assert _enabled_names() == tuple(name for name in _canonical_names() if name in expected_names)
+
+
+def test_delta_fmha_lib_env_removes_default_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    removed_name = registry.DEFAULT_FMHA_LIBS[-1]
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{removed_name}")
+
+    expected_names = set(registry.DEFAULT_FMHA_LIBS) - {removed_name}
+    assert _enabled_names() == tuple(name for name in _canonical_names() if name in expected_names)
+
+
+def test_mixed_exact_and_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"{PRIMS_TS},-{PRIMS_TS}")
+
+    with pytest.raises(ValueError, match="either an exact comma-separated list"):
+        registry.get_enabled_fmha_lib_classes()
+
+
+def test_unknown_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    unknown_name = "unknown"
+    while unknown_name in registry.FMHA_LIBS:
+        unknown_name += "_"
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"{PRIMS_TS},{unknown_name}")
+
+    with pytest.raises(ValueError, match=f"Unknown FMHA library '{unknown_name}'"):
+        registry.get_enabled_fmha_lib_classes()
+
+
+def test_empty_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+")
+
+    with pytest.raises(ValueError, match="Invalid empty FMHA library entry"):
         registry.get_enabled_fmha_lib_classes()

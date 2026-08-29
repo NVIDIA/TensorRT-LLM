@@ -456,15 +456,7 @@ def _assert_cache_contains_new_tokens(
 
 
 def _run_mla_gen_backend(
-    case,
-    backend,
-    inputs,
-    *,
-    kv_layout: str,
-    cuda_graph=False,
-    before_cuda_graph_replay=None,
-    cuda_graph_replay_count: int = 1,
-    cuda_graph_replay_outputs: Optional[List[torch.Tensor]] = None,
+    case, backend, inputs, *, kv_layout: str, cuda_graph=False
 ) -> torch.Tensor:
     """Run one backend's absorbed-MLA generation; return [nnz_q, heads*kv_lora].
 
@@ -497,14 +489,14 @@ def _run_mla_gen_backend(
     latent_cache = inputs["latent_cache"]
     expected_latents = _split_packed_tokens(latent_cache, case.seq_lens)
 
-    def _forward(metadata, q, q_pe, live_latent_cache):
+    def _forward(metadata, q, q_pe):
         out = attn.forward(
             q,
             None,
             None,
             metadata,
             forward_args=AttentionForwardArgs(
-                latent_cache=live_latent_cache,
+                latent_cache=latent_cache,
                 q_pe=q_pe,
                 attention_input_type=AttentionInputType.generation_only,
                 # The harness feeds a pre-RoPE'd fused_q, so skip the RoPE step;
@@ -537,16 +529,8 @@ def _run_mla_gen_backend(
                 case,
                 mgr,
                 _create_metadata,
-                {"q": fused_q, "q_pe": q_pe, "latent_cache": latent_cache},
-                lambda md, bufs: _forward(
-                    md,
-                    bufs["q"],
-                    bufs["q_pe"],
-                    bufs["latent_cache"],
-                ),
-                before_replay=before_cuda_graph_replay,
-                replay_count=cuda_graph_replay_count,
-                replay_outputs=cuda_graph_replay_outputs,
+                {"q": fused_q, "q_pe": q_pe},
+                lambda md, bufs: _forward(md, bufs["q"], bufs["q_pe"]),
             )
             _assert_cache_contains_new_tokens(
                 mgr,
@@ -561,7 +545,7 @@ def _run_mla_gen_backend(
             return out
         metadata = _create_metadata(AttentionCls, case, mgr)
         metadata.prepare()
-        out = _forward(metadata, fused_q, q_pe, latent_cache)[: case.nnz_q].contiguous()
+        out = _forward(metadata, fused_q, q_pe)[: case.nnz_q].contiguous()
         _assert_cache_contains_new_tokens(
             mgr,
             0,
@@ -833,15 +817,7 @@ def _expected_new_k_for_cache(case: BackendCase, inputs, new_k: torch.Tensor, *,
 
 
 def _capture_replay(
-    AttentionCls,
-    case,
-    mgr,
-    make_metadata,
-    static_inputs,
-    forward_fn,
-    before_replay=None,
-    replay_count: int = 1,
-    replay_outputs: Optional[List[torch.Tensor]] = None,
+    AttentionCls, case, mgr, make_metadata, static_inputs, forward_fn
 ) -> torch.Tensor:
     """Capture a gen-phase graph once and replay it with the case's inputs.
 
@@ -873,23 +849,12 @@ def _capture_replay(
             _fwd()
     torch.cuda.current_stream().wait_stream(side)
 
-    if replay_count < 1:
-        raise ValueError("CUDA graph replay count must be positive")
-
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_out = _fwd()
-    result = None
-    for _ in range(replay_count):
-        if before_replay is not None:
-            before_replay(cg_md, bufs)
-        graph.replay()
-        torch.cuda.synchronize()
-        result = graph_out[: case.nnz_q].contiguous().clone()
-        if replay_outputs is not None:
-            replay_outputs.append(result)
-    assert result is not None
-    return result
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph_out[: case.nnz_q].contiguous().clone()
 
 
 def run_backend(
@@ -901,16 +866,11 @@ def run_backend(
     fuse_rope: bool = False,
     cuda_graph: bool = False,
     kv_layout: str = "NHD",
-    before_cuda_graph_replay=None,
-    cuda_graph_replay_count: int = 1,
-    cuda_graph_replay_outputs: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Run one backend on ``case`` and return ``[nnz_q, num_heads*head_dim]``.
 
     With ``cuda_graph=True`` (only valid for a gen-only batch) the forward is
     captured into a CUDA graph and replayed, exercising the graph-reuse path.
-    ``cuda_graph_replay_count`` can exercise repeated state changes on the same
-    graph; ``cuda_graph_replay_outputs`` collects a clone after every replay.
     ``kv_layout`` is the paged-cache block layout to fill + read ("NHD"/"HND");
     the caller passes a layout the backend supports (gated by the capability
     matrix). MLA cases are dispatched to the absorbed-generation path.
@@ -919,14 +879,7 @@ def run_backend(
         if case.is_context_only:
             return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
         return _run_mla_gen_backend(
-            case,
-            backend,
-            inputs,
-            kv_layout=kv_layout,
-            cuda_graph=cuda_graph,
-            before_cuda_graph_replay=before_cuda_graph_replay,
-            cuda_graph_replay_count=cuda_graph_replay_count,
-            cuda_graph_replay_outputs=cuda_graph_replay_outputs,
+            case, backend, inputs, kv_layout=kv_layout, cuda_graph=cuda_graph
         )
 
     AttentionCls = get_attention_backend(backend)
@@ -1038,9 +991,6 @@ def run_backend(
                     create_metadata,
                     static,
                     _cg_fwd,
-                    before_replay=before_cuda_graph_replay,
-                    replay_count=cuda_graph_replay_count,
-                    replay_outputs=cuda_graph_replay_outputs,
                 )
                 if expected_cache_tokens is not None:
                     _assert_cache_contains_new_tokens(

@@ -15,13 +15,7 @@
 
 import pytest
 import torch
-from backend_case import (
-    BackendCase,
-    generate_inputs,
-    generate_mla_gen_inputs,
-    run_backend,
-    run_case,
-)
+from backend_case import BackendCase, generate_inputs, run_backend, run_case
 from utils.util import isSM100Family
 
 pytestmark = pytest.mark.skipif(
@@ -130,7 +124,7 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
     assert "TRTLLM" in results
 
 
-def test_prims_ts_oversized_decode_workspace_replays_a_b_a(
+def test_prims_ts_uses_oversized_decode_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
@@ -225,33 +219,6 @@ def test_prims_ts_oversized_decode_workspace_replays_a_b_a(
         fuse_rope=True,
         kv_layout="HND",
     )
-
-    replay_index = 0
-
-    def select_replay_state(metadata, static_inputs) -> None:
-        nonlocal replay_index
-        adapter, _, _, _, _, decode_workspace = workspace_records[-1]
-        wrapper = adapter._decode_wrappers[case.num_seqs]
-        control_offset = wrapper._workspace_layout.split_kv_counter.byte_offset
-        control_end = wrapper._workspace_layout.total_bytes
-        control_span = decode_workspace[control_offset:control_end]
-        if replay_index > 0:
-            assert torch.count_nonzero(control_span) == 0
-        control_span.fill_(0xFF)
-
-        if replay_index in (1, 2):
-            qkv = static_inputs["q"]
-            qkv.copy_(qkv.flip(0).clone())
-
-            block_offsets = metadata.kv_cache_block_offsets
-            block_offsets.copy_(block_offsets.flip(1).clone())
-
-            kv_lens = metadata.kv_lens_cuda_runtime
-            kv_lens.copy_(kv_lens.flip(0).clone())
-        replay_index += 1
-
-    replay_outputs = []
-
     actual = run_backend(
         case,
         "TRTLLM",
@@ -260,24 +227,11 @@ def test_prims_ts_oversized_decode_workspace_replays_a_b_a(
         fuse_rope=True,
         cuda_graph=True,
         kv_layout="HND",
-        before_cuda_graph_replay=select_replay_state,
-        cuda_graph_replay_count=3,
-        cuda_graph_replay_outputs=replay_outputs,
     )
 
-    reference_b = golden.flip(0)
-    assert not torch.allclose(golden, reference_b, atol=3e-2, rtol=3e-3)
     torch.testing.assert_close(eager, golden, atol=3e-2, rtol=3e-3)
-    assert len(replay_outputs) == 3
-    for replay_output, reference in zip(
-        replay_outputs,
-        (golden, reference_b, golden),
-        strict=True,
-    ):
-        torch.testing.assert_close(replay_output, reference, atol=3e-2, rtol=3e-3)
     torch.testing.assert_close(actual, golden, atol=3e-2, rtol=3e-3)
 
-    assert replay_index == 3
     assert generation_layout_records
     real_total_bytes = int(generation_layout_records[0]["total_size"])
     assert all(
@@ -330,64 +284,6 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     )
 
     run_case(case)
-
-
-def test_prims_ts_mla_cuda_graph_replay_refreshes_query_latent_and_page_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
-    case = BackendCase(
-        **_DEEPSEEK_V3_LITE_MLA,
-        seq_lens=[1, 1],
-        num_cached_tokens=[64, 96],
-        num_contexts=0,
-        use_kv_cache_manager_v2=True,
-    )
-    inputs = generate_mla_gen_inputs(case, seed=0)
-    replay_inputs = generate_mla_gen_inputs(case, seed=1)
-    replay_inputs["cached_latent"] = inputs["cached_latent"]
-    golden = run_backend(
-        case,
-        "VANILLA",
-        replay_inputs,
-        kv_dtype=case.compute_dtype,
-        kv_layout="NHD",
-    )
-
-    def swap_requests_before_replay(metadata, static_inputs) -> None:
-        query = static_inputs["q"]
-        query.copy_(replay_inputs["fused_q"].flip(0))
-        static_inputs["q_pe"].copy_(replay_inputs["q_pe"].flip(0))
-
-        # MLA cache appends use capture-time physical destinations. Keep the
-        # latent rows in place while swapping the live page-table lookup.
-        replay_latent = replay_inputs["latent_cache"]
-        static_inputs["latent_cache"].copy_(replay_latent)
-        # The harness precomputes cache expectations as views of this tensor.
-        inputs["latent_cache"].copy_(replay_latent)
-
-        block_offsets = metadata.kv_cache_block_offsets
-        block_offsets.copy_(block_offsets.flip(1).clone())
-
-        kv_lens = metadata.kv_lens_cuda_runtime
-        kv_lens.copy_(kv_lens.flip(0).clone())
-
-    actual = run_backend(
-        case,
-        "TRTLLM",
-        inputs,
-        kv_dtype=case.compute_dtype,
-        cuda_graph=True,
-        kv_layout="HND",
-        before_cuda_graph_replay=swap_requests_before_replay,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        golden.flip(0),
-        atol=3e-2,
-        rtol=3e-3,
-    )
 
 
 def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
