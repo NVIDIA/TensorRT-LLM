@@ -125,6 +125,7 @@ class CompletionOutput:
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
+        routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
     """
     index: int
     text: str = ""
