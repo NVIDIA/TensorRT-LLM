@@ -1038,8 +1038,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self._initialize_execution_state(seq_slot=seq_slot,
                                          orig_prompt_len=self.orig_prompt_len)
 
-        # TODO: remove this when use DynamicDecodeOp in pytorch flow.
-        # currently, keep py_stop_words_list as python list, rather than tensor.
+        # Keep py_stop_words_list as a python list, rather than a tensor.
         self.py_stop_words_list = stop_words_list
 
         self.py_logprobs_mode = LogprobMode(
