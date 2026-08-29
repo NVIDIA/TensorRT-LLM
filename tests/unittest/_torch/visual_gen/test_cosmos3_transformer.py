@@ -212,6 +212,7 @@ class TestCosmos3Unit:
         assert hasattr(model, "time_embedder")
         linear_names = [n for n, m in model.named_modules() if isinstance(m, Linear)]
         assert any("to_q" in n or "qkv_proj" in n for n in linear_names)
+        assert all(layer.cross_attention.multi_control_attn is None for layer in model.gen_layers)
 
     @pytest.mark.high_cuda_memory
     def test_sanity_forward(self, cosmos3_model_config):
@@ -267,6 +268,9 @@ class TestCosmos3Unit:
             * ((video_shape[2] + model.latent_patch_size - 1) // model.latent_patch_size)
         )
         assert layer_sequence_lengths == [3 * target_tokens] * len(model.gen_layers)
+        assert all(
+            layer.cross_attention.multi_control_attn is not None for layer in model.gen_layers
+        )
         _assert_finite_output(out.video, hs.shape)
 
     @pytest.mark.high_cuda_memory

@@ -681,18 +681,25 @@ class Cosmos3CrossAttention(Attention):
         eps = model_config.pretrained_config.rms_norm_eps
         self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
-        # Bare fallback for single-worker multi-control and unsupported context-parallel
-        # compositions. Pure Ulysses uses the normal wrapped attention backend below.
-        self.multi_control_attn = create_attention(
-            backend="VANILLA",
-            layer_idx=self.layer_idx,
-            num_heads=self.local_num_attention_heads,
-            head_dim=self.head_dim,
-            num_kv_heads=self.local_num_key_value_heads,
-            quant_config=self.quant_config,
-            dtype=self.dtype,
-            attention_config=model_config.attention,
-        )
+        # Lazy bare fallback for single-worker multi-control and unsupported
+        # context-parallel compositions. Pure Ulysses uses the normal wrapped
+        # attention backend and never constructs this fallback.
+        self._multi_control_attention_config = model_config.attention
+        self.multi_control_attn: Optional[AttentionBackend] = None
+
+    def _get_multi_control_attention(self) -> AttentionBackend:
+        if self.multi_control_attn is None:
+            self.multi_control_attn = create_attention(
+                backend="VANILLA",
+                layer_idx=self.layer_idx,
+                num_heads=self.local_num_attention_heads,
+                head_dim=self.head_dim,
+                num_kv_heads=self.local_num_key_value_heads,
+                quant_config=self.quant_config,
+                dtype=self.dtype,
+                attention_config=self._multi_control_attention_config,
+            )
+        return self.multi_control_attn
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
@@ -706,7 +713,7 @@ class Cosmos3CrossAttention(Attention):
         timestep: Optional[torch.Tensor],
         backend: Optional[AttentionBackend] = None,
     ) -> torch.Tensor:
-        active_backend = backend or self.multi_control_attn
+        active_backend = backend if backend is not None else self._get_multi_control_attention()
         layout = getattr(active_backend, "preferred_layout", AttentionTensorLayout.HND)
         if layout == AttentionTensorLayout.HND:
             q = q.transpose(1, 2)
