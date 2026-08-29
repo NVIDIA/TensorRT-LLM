@@ -319,14 +319,11 @@ the selected library.
 add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
 `TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta entries update the
 default membership and follow canonical registry order, while an exact list
-preserves the user-specified order. PrimTS follows the Triton custom-mask
-library in canonical order, so every request admitted by its request-level
-support check dispatches to it before the remaining default libraries when
-enabled. Each FMHA library exposes `is_available()` for module/static
-environment checks and `is_supported()` for per-forward request checks. For
-mixed non-MLA batches, the manager checks each active phase independently with
-`is_supported(..., phase=...)`; a phased library accepts only phases backed by
-its corresponding `run_*()` entry point.
+preserves the user-specified order. Each FMHA library exposes `is_available()`
+for module/static environment checks and `is_supported()` for per-forward
+request checks. For mixed non-MLA batches, the manager checks each active phase
+independently with `is_supported(..., phase=...)`; a phased library accepts only
+phases backed by its corresponding `run_*()` entry point.
 
 The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
 explicitly selects the MLA generation kernel inside
@@ -370,26 +367,12 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
-- `fmha/prims_ts.py` adapts TRT-LLM QKV preprocessing and paged-cache metadata
-  to the vendored PrimTS kernels. PrimTS is imported lazily and requires
-  CUTLASS DSL 4.7 or newer on SM100/SM103. The initial adapter admits
-  unquantized FP16/BF16 HND paged full attention and BF16 MLA generation;
-  cyclic/sliding-window caches, speculative decoding, and MLA context fall
-  through to the next library. Each layer caches one context, decode, and MLA
-  wrapper per observed execution batch size. A shared-workspace reallocation
-  invalidates those caches; after the final warmup allocation, each batch
-  profile is planned once and reused.
-  The complete `prims_ts` Python source tree is managed as the
-  `flashinfer-prims-ts` vendor. Its lock selects
-  [`flashinfer/attention/prims_ts` source](https://github.com/yuxianq/flashinfer/tree/b50dcbbd0d0b301e3d0ffbbf5fddaa594821ee43/flashinfer/attention/prims_ts)
-  from the `trtllm-prims-ts` branch of
-  [`yuxianq/flashinfer`](https://github.com/yuxianq/flashinfer) at commit
-  `b50dcbbd0d0b301e3d0ffbbf5fddaa594821ee43`, excludes the upstream README
-  files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
-  files retain FlashInfer's headers. Before editing this tree, read the
-  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
-  persistent patch for TRT-LLM-only adaptations, or export an upstream-worthy
-  destination change and pin its committed upstream revision.
+- `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
+  vendored PrimTS kernels. Before changing the managed source under
+  `attention_backend/prims_ts`, read the
+  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
+  upstream-worthy changes in FlashInfer and update the vendor lock; keep only
+  TRT-LLM-specific adaptations in the persistent patch.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA

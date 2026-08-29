@@ -1,39 +1,3 @@
-diff --git a/_block_sparse/compiler.py b/_block_sparse/compiler.py
-index 1afcdb5b89f1edf2e6018d0f933ec53da3185893..c91a0f9393af21a50757e92b8019a7a938502828 100644
---- a/_block_sparse/compiler.py
-+++ b/_block_sparse/compiler.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
-diff --git a/_block_sparse/config.py b/_block_sparse/config.py
-index 941b32348c118ca030c21f228238b3b47ce0150c..6ae8e0e2a51498cc5751dce19c262fbc61dda419 100644
---- a/_block_sparse/config.py
-+++ b/_block_sparse/config.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
-diff --git a/_block_sparse/plan.py b/_block_sparse/plan.py
-index 4824f07b667f0b0f8d9e95c2aa612619ebe7f791..da77552f1a0d704f21afb45c492e2fce33d159f9 100644
---- a/_block_sparse/plan.py
-+++ b/_block_sparse/plan.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
-diff --git a/_block_sparse/prepared.py b/_block_sparse/prepared.py
-index 091becbd33b893aa8c4627f29a93eabf961c6fc4..b84e71f857ebeeab986557f77f98f8211eeceb62 100644
---- a/_block_sparse/prepared.py
-+++ b/_block_sparse/prepared.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
 diff --git a/block_sparse.py b/block_sparse.py
 index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8f21e7e0e 100644
 --- a/block_sparse.py
@@ -72,15 +36,6 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8
  def block_sparse_attention_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
-diff --git a/context.py b/context.py
-index fdded4cbe7bf232c7a0abddb9bd4b737dd50fa25..dcc0fa5130a22f7e7e3623ff3d819e0d21ffcd0d 100644
---- a/context.py
-+++ b/context.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
 diff --git a/decode.py b/decode.py
 index b1adfbaab789a8fc274c47361cc4252b231ce77e..b5e1754f4a2ed822c617ef1a4d7a6b5f3dbefbf7 100644
 --- a/decode.py
