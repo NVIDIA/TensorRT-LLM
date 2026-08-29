@@ -1092,8 +1092,9 @@ class SpecWorkerBase(nn.Module, ABC):
                 "and restore_from_spec_dec; restoring attn metadata state.")
             if self._saved_num_contexts is None:
                 # A partial prepare or a legacy direct metadata save has no
-                # worker-side context state. Cleanup must still restore tensor
-                # ownership without masking the original forward exception.
+                # worker-side context state, so num_contexts cannot be
+                # recovered here. Cleanup must still restore tensor ownership
+                # without masking the original forward exception.
                 attn_metadata.restore_from_spec_dec()
                 attn_metadata.on_update()
             else:
