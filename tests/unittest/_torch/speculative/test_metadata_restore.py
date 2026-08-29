@@ -10,7 +10,6 @@ import torch
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.draft_target import DraftTargetOneModelWorker
-from tensorrt_llm._torch.speculative.drafting_loops import save_metadata_state
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 from tensorrt_llm._torch.speculative.pard import PARDWorker
@@ -23,13 +22,6 @@ class _FailingSpecWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return 1
 
-    def _forward_impl(self, *args: object, **kwargs: object) -> None:
-        attn_metadata = kwargs["attn_metadata"]
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        raise RuntimeError("simulated draft failure")
-
-
-class _FailingPairedSpecWorker(_FailingSpecWorker):
     def _forward_impl(self, *args: object, **kwargs: object) -> None:
         attn_metadata = kwargs["attn_metadata"]
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
@@ -72,28 +64,50 @@ def _assert_metadata_restored(metadata: TrtllmAttentionMetadata) -> None:
     assert metadata.context_lens.tolist() == [3]
 
 
+def _make_worker(worker_type: type[SpecWorkerBase]) -> SpecWorkerBase:
+    worker = object.__new__(worker_type)
+    worker._saved_num_contexts = None
+    worker._saved_attn_metadata_id = None
+    return worker
+
+
 def test_spec_worker_metadata_restore_preserves_context_metadata() -> None:
     metadata = _make_metadata()
-    worker = object.__new__(Eagle3OneModelWorker)
-    worker._saved_num_contexts = None
+    worker = _make_worker(Eagle3OneModelWorker)
 
     with pytest.raises(AssertionError, match="requires a paired prepare"):
         worker._restore_attn_metadata_from_spec_dec(metadata)
     worker._prepare_attn_metadata_for_spec_dec(metadata)
     with pytest.raises(AssertionError, match="prepare and restore calls must be paired"):
         worker._prepare_attn_metadata_for_spec_dec(metadata)
+    other_metadata = _make_metadata()
+    with pytest.raises(AssertionError, match="same object"):
+        worker._restore_attn_metadata_from_spec_dec(other_metadata)
     _mutate_context_metadata(metadata)
     worker._restore_attn_metadata_from_spec_dec(metadata)
 
     _assert_metadata_restored(metadata)
     assert worker._saved_num_contexts is None
+    assert worker._saved_attn_metadata_id is None
 
 
-@pytest.mark.parametrize("worker_type", [_FailingSpecWorker, _FailingPairedSpecWorker])
-def test_forward_failure_restores_metadata(worker_type: type[SpecWorkerBase]) -> None:
+def test_partial_prepare_restores_metadata() -> None:
     metadata = _make_metadata()
-    worker = object.__new__(worker_type)
-    worker._saved_num_contexts = None
+    original_seq_lens = metadata._seq_lens
+    worker = _make_worker(Eagle3OneModelWorker)
+
+    with pytest.raises(AttributeError):
+        worker._prepare_attn_metadata_for_spec_dec(metadata, "missing_field")
+
+    assert metadata._seq_lens is original_seq_lens
+    assert not metadata.has_spec_dec_saved_state
+    assert worker._saved_num_contexts is None
+    assert worker._saved_attn_metadata_id is None
+
+
+def test_forward_failure_restores_metadata() -> None:
+    metadata = _make_metadata()
+    worker = _make_worker(_FailingSpecWorker)
 
     for _ in range(2):
         with pytest.raises(RuntimeError, match="simulated draft failure"):
@@ -101,6 +115,7 @@ def test_forward_failure_restores_metadata(worker_type: type[SpecWorkerBase]) ->
         _assert_metadata_restored(metadata)
         assert not metadata.has_spec_dec_saved_state
         assert worker._saved_num_contexts is None
+        assert worker._saved_attn_metadata_id is None
 
 
 @pytest.mark.parametrize(
@@ -125,8 +140,7 @@ def test_worker_specific_prepare_uses_base_metadata_lifecycle(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: is_capturing)
     metadata = _make_metadata(is_cuda_graph=is_cuda_graph)
-    worker = object.__new__(worker_type)
-    worker._saved_num_contexts = None
+    worker = _make_worker(worker_type)
     spec_metadata = SimpleNamespace(is_cuda_graph=is_cuda_graph)
     original_kv_lens_tensor = metadata.kv_lens_cuda
     original_kv_lens = original_kv_lens_tensor.clone()
@@ -138,25 +152,9 @@ def test_worker_specific_prepare_uses_base_metadata_lifecycle(
 
     _assert_metadata_restored(metadata)
     assert worker._saved_num_contexts is None
+    assert worker._saved_attn_metadata_id is None
     assert metadata.kv_lens_cuda is original_kv_lens_tensor
     if restores_kv_lens:
         assert torch.equal(metadata.kv_lens_cuda, original_kv_lens)
     else:
         assert torch.equal(metadata.kv_lens_cuda, torch.full_like(original_kv_lens, 9))
-
-
-@pytest.mark.parametrize("is_cuda_graph", [False, True])
-def test_drafting_loop_metadata_restore_preserves_num_contexts(is_cuda_graph: bool) -> None:
-    metadata = _make_metadata(is_cuda_graph=is_cuda_graph)
-    spec_metadata = SimpleNamespace(is_cuda_graph=is_cuda_graph, num_tokens=4)
-    original_kv_lens = metadata.kv_lens_cuda.clone()
-
-    with save_metadata_state(metadata, spec_metadata):
-        metadata.kv_lens_cuda.fill_(9)
-        spec_metadata.num_tokens = 1
-        _mutate_context_metadata(metadata)
-
-    _assert_metadata_restored(metadata)
-    assert torch.equal(metadata.kv_lens_cuda, original_kv_lens)
-    if is_cuda_graph:
-        assert spec_metadata.num_tokens == 4

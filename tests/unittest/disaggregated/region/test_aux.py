@@ -3,7 +3,12 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBufferMeta, AuxSlot
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    AuxBufferMeta,
+    AuxSlot,
+    build_aux_transfer_layout,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -128,3 +133,55 @@ def test_fill_slot_unallocated_raises():
 
     with pytest.raises(ValueError, match="not currently allocated"):
         buf.fill_slot(0, mock_request)
+
+
+def test_aux_buffer_zero_max_draft_len_round_trip():
+    """AuxBuffer round-trips with max_draft_len=0.
+
+    A ctx server without speculative_config builds an AuxBuffer with
+    max_draft_len=0 (ctx/gen spec-config split). fill/get must round-trip
+    with an empty draft-token list.
+    """
+    buf = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=0, device="cpu")
+    slot = buf.alloc_slot()
+
+    mock_request = MagicMock()
+    mock_request.get_last_tokens.return_value = [42]
+    mock_request.py_draft_tokens = []
+    mock_request.prompt_len = 16
+    mock_request.cached_tokens = 0
+    mock_request.py_disaggregated_params = None
+
+    buf.fill_slot(slot.id, mock_request)
+    first_tokens, draft_tokens = buf.get_slot_tokens(slot.id)
+    assert first_tokens == [42]
+    assert draft_tokens == []
+
+    # The draft buffer's per-slot item size is 0.
+    assert buf.meta.item_sizes[1] == 0
+
+    # Overfilling draft tokens must be rejected, not silently truncated.
+    mock_request.py_draft_tokens = [1]
+    with pytest.raises(ValueError, match="exceeds `max_draft_len`"):
+        buf.fill_slot(slot.id, mock_request)
+
+
+def test_aux_transfer_layout_ctx_no_spec_gen_sa():
+    """Ctx/gen spec split: ctx max_draft_len=0, gen max_draft_len=2.
+
+    A ctx server without speculative_config publishes a zero-size draft-token
+    buffer while an SA/NGram gen server sizes it by max_draft_len. The
+    empty-source entry must be dropped from the transfer layout (nothing to
+    send), while the other buffers keep each side's own slot stride.
+    """
+    ctx = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=0, device="cpu")
+    gen = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=2, device="cpu")
+    layout = build_aux_transfer_layout(ctx.meta, gen.meta)
+
+    # Buffer order: [first_tokens, draft_tokens, token_counts, prompt_token_counts];
+    # the draft_tokens entry (index 1) is dropped.
+    expected_keep = [0, 2, 3]
+    np.testing.assert_array_equal(layout.src_item_sizes, ctx.meta.item_sizes[expected_keep])
+    np.testing.assert_array_equal(layout.dst_item_sizes, gen.meta.item_sizes[expected_keep])
+    np.testing.assert_array_equal(layout.src_base_ptrs, ctx.meta.ptrs[expected_keep])
+    np.testing.assert_array_equal(layout.dst_base_ptrs, gen.meta.ptrs[expected_keep])

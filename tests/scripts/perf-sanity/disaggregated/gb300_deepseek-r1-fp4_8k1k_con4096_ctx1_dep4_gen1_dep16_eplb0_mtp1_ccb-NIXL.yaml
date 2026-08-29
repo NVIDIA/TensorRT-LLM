@@ -35,7 +35,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1 TRTLLM_KV_TRANSFER_NUM_THREADS=4
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
@@ -63,8 +63,10 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-      transceiver_runtime: CPP
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+      kv_cache_bounce_size_mb: 2048
+      kv_transfer_timeout_ms: 600000
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: MTP
       num_nextn_predict_layers: 1
@@ -91,6 +93,8 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-      transceiver_runtime: CPP
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+      kv_cache_bounce_size_mb: 2048
+      kv_transfer_timeout_ms: 600000
+    disable_overlap_scheduler: false
     speculative_config: *id001

@@ -13,25 +13,177 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import itertools
+from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
-from ._cache_key import (  # noqa: F401
-    BlockKey,
-    Hasher,
-    TokenBlock,
-    gen_multimodal_cache_key_tokens,
-    reuse_scope_to_bytes,
-    sequence_to_blockchain_keys,
-)
-from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenIdExt
+from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
 from ._utils import TypedIndexList, filled_list, map_optional, typed_range, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._event_manager import KVCacheEventManager
     from ._page import CommittedPage
+
+
+BlockKey = bytes
+TokenBlock = list[TokenIdExt]
+
+_SHA256_DIGEST_SIZE = hashlib.sha256().digest_size
+_UINT_ITEM_SIZE = array("I").itemsize
+if _UINT_ITEM_SIZE != 4:
+    raise RuntimeError("Hasher requires a platform with 4-byte unsigned ints")
+
+
+# id_offset is usually vocab_size. Backend-neutral (depends only on _common); the
+# C++ backend exposes a native gen_multimodal_cache_key_tokens via nanobind instead.
+def gen_multimodal_cache_key_tokens(
+    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
+) -> list[TokenIdExt]:
+    """Create synthetic tokens used only when building multimodal KV-cache keys.
+
+    Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
+
+    Args:
+        id_offset: First synthetic id, usually ``vocab_size``, so generated ids cannot
+            collide with real token ids.
+        multi_modal_data_digest: Content digest of the multimodal item; must be exactly
+            ``_SHA256_DIGEST_SIZE`` bytes.
+        num_tokens: Number of synthetic tokens to generate. Must be positive.
+        token_offset: Item-local index of the first generated token. Must be non-negative;
+            only offset 0 carries the digest.
+
+    Returns:
+        The generated tokens, digest first when ``token_offset`` is 0.
+
+    Raises:
+        ValueError: If the digest length is wrong, ``num_tokens`` is not positive, or
+            ``token_offset`` is negative.
+    """
+    if len(multi_modal_data_digest) != _SHA256_DIGEST_SIZE:
+        raise ValueError(f"multi_modal_data_digest must have length {_SHA256_DIGEST_SIZE}")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if token_offset < 0:
+        raise ValueError("token_offset must be non-negative")
+    return [
+        multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
+        for i in range(num_tokens)
+    ]
+
+
+class Hasher:
+    """Incremental SHA-256 hasher used to derive block keys for the radix tree.
+
+    Accepts ints (encoded as 4 little-endian bytes each, matching the C++ backend's
+    4-byte ``TokenIdExt`` layout), raw ``bytes`` (multimodal content digests and
+    reuse-scope fields), or a sequence mixing the two. Both backends must produce
+    identical digests for the same logical input, so the encoding is part of the
+    on-disk/cross-process contract and cannot change unilaterally.
+
+    Args:
+        data: Optional initial value, hashed immediately as if passed to ``update``.
+    """
+
+    # SECURITY INVARIANT: the block-key hash MUST stay cryptographically
+    # collision-resistant and >= 256-bit. The radix tree is a globally shared,
+    # cross-request/cross-tenant cache index; prefix matches are decided purely by
+    # digest equality with NO re-check of the underlying tokens; and the hashed
+    # input (tokens, the user-supplied cache_salt, multimodal content bytes) is
+    # attacker-influenceable. A collision therefore silently reuses another
+    # request's KV blocks (cross-request corruption / data leak), and cache_salt
+    # tenant isolation relies entirely on this hash's collision resistance. Do NOT
+    # swap in a non-cryptographic hash (xxHash, HighwayHash, ...) or truncate below
+    # 256 bits without first adding a token-content equality check on match. The
+    # C++ backend (blockRadixTree) mirrors this with SHA-256 (CSHA256).
+    __slots__ = "_hasher"
+    _hasher: "hashlib._Hash"
+
+    def __init__(self, data: int | bytes | Sequence[int | bytes] | None = None) -> None:
+        self._hasher = hashlib.sha256()
+        if data is not None:
+            self.update(data)
+
+    def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
+        """Fold ``data`` into the running digest.
+
+        Args:
+            data: An int token id (0 <= id < 2**31), raw ``bytes``, or a sequence of
+                either. An all-int sequence takes a single-call fast path; a sequence
+                containing ``bytes`` (multimodal blocks) falls back to per-item hashing.
+
+        Returns:
+            This ``Hasher``, to allow chaining.
+        """
+        # This function is perf-critical. Expect compromised code quality.
+        if type(data) is int:
+            assert NDEBUG or (data >= 0 and data < (1 << 31))
+            self._hasher.update(data.to_bytes(4, "little"))
+        elif type(data) is bytes:
+            self._hasher.update(data)
+        else:
+            # Hash the whole token block in one C call instead of one per token.
+            # array("I", data).tobytes() packs each int as 4 native-endian bytes
+            # (unsigned int); all NVIDIA GPU host platforms (x86_64, aarch64/Grace)
+            # are little-endian so this is byte-identical to the per-token
+            # to_bytes(4, "little") loop AND to the C++ backend's 4-byte TokenIdExt
+            # layout (normal token = little-endian id, high tag bit clear). Falls
+            # back to that loop for multimodal blocks (which contain bytes items).
+            try:
+                self._hasher.update(array("I", data).tobytes())  # type: ignore
+            except (TypeError, OverflowError):
+                for item in data:  # type: ignore
+                    assert (
+                        NDEBUG
+                        or (type(item) is int and (0 <= item < (1 << 31)))
+                        or type(item) is bytes
+                    )
+                    self._hasher.update(item.to_bytes(4, "little") if (type(item) is int) else item)  # type: ignore
+        return self
+
+    @property
+    def digest(self) -> bytes:
+        return self._hasher.digest()
+
+
+def reuse_scope_to_bytes(reuse_scope: Iterable[int | None]) -> bytes:
+    """Serialize a reuse scope to its reuse-namespace bytes.
+
+    Backend-neutral: reads the scope's fields by iteration, so it works for both
+    the pure-Python ``ReuseScope`` NamedTuple and the C++ binding without relying
+    on a ``to_bytes()`` method. The layout mirrors the C++ ``emitReuseScopeBytes``:
+    a mask byte (one bit per field, set when the field is present) followed by one
+    little-endian ``uint64`` per present field (``signed=False``).
+    """
+    values = list(reuse_scope)
+    mask = sum((value is not None) << i for i, value in enumerate(values))
+    ret = mask.to_bytes((len(values) + 7) // 8, "little", signed=False)
+    for value in values:
+        if value is not None:
+            ret += int(value).to_bytes(8, "little", signed=False)
+    return ret
+
+
+def sequence_to_blockchain_keys(
+    tokens_per_block: int, reuse_scope: Iterable[int | None], tokens: Sequence[TokenIdExt]
+) -> Iterator[tuple[TokenBlock, BlockKey]]:
+    """Yield ``(token_block, key)`` pairs seeding a blockchain of KV-cache keys.
+
+    The first pair is the root (``[]``, reuse-scope digest); each subsequent pair
+    hashes one ``tokens_per_block`` chunk on top of the previous digest.
+    """
+    digest = Hasher(reuse_scope_to_bytes(reuse_scope)).digest
+    yield [], digest
+    iterator = iter(tokens)
+    while True:
+        token_block = list(itertools.islice(iterator, tokens_per_block))
+        if not token_block:
+            break
+        digest = Hasher(digest).update(token_block).digest
+        yield token_block, digest
 
 
 class ReuseScope(NamedTuple):
@@ -50,6 +202,10 @@ class ReuseMatch(NamedTuple):
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
+    # Internal diagnostic: the prefix the attention pages alone would support,
+    # i.e. before recurrent-state (SSM) snapshot availability shortened it.
+    # Equal to num_tokens when the model has no SSM life cycle.
+    num_tokens_before_hybrid_pruning: int = 0
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -90,10 +246,6 @@ def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
 def remove_subtree(root: "Block") -> None:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
-    # Each block's pages are reclaimed eagerly via _release_pages() while the
-    # StorageManager is still alive, rather than deferring to ~Block()/__del__().
-    # An external reference (e.g. a caller holding a matched Block) can keep a Block
-    # alive past StorageManager teardown, after which page.manager would be dangling.
     removed_block_hashes: list[BlockKey] = []
     tree = try_get_tree(root)
     event_manager = tree.event_manager if tree is not None else None
@@ -102,7 +254,6 @@ def remove_subtree(root: "Block") -> None:
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            block._release_pages()
             removed_block_hashes.append(block.key)
             if block._prev() is None:
                 assert block is root
@@ -355,11 +506,9 @@ class Block:
         Idempotent: afterwards ``storage`` holds no pages, so it is safe to call again
         from ``__del__``.
 
-        This must run during radix-tree teardown (``remove_subtree``/``clear``) rather
-        than being deferred to ``__del__``, so that page reclamation does not depend on
-        this ``Block`` object's destruction timing. An external reference can keep the
-        ``Block`` alive past ``StorageManager`` teardown, after which ``page.manager``
-        would be a dangling reference.
+        Cleanup is normally deferred to ``__del__``. An orphan block may remain
+        referenced by a live ``_KVCache`` and retain its pages until that cache closes;
+        every cache must close before ``StorageManager`` teardown.
         """
         for lc_idx in typed_range(self.num_life_cycles):
             page = self.get_page(lc_idx)
@@ -436,7 +585,13 @@ class Block:
         # But for simplicity, we leave it for now.
         curr = start
         while (
-            (isinstance(curr, Block) and curr.get_page(lc_idx) is None)
+            (
+                isinstance(curr, Block)
+                and all(
+                    curr.get_page(life_cycle) is None
+                    for life_cycle in typed_range(curr.num_life_cycles)
+                )
+            )
             and not curr.next
             and curr._prev() is not None
         ):
@@ -518,7 +673,7 @@ class BlockRadixTree:
     def clear(self) -> None:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
-        # ~Block() / __del__() handles page cleanup.
+        # Block.__del__() handles page cleanup when the last owner releases each block.
         # detach_next() auto-prunes empty RootBlocks from the tree.
         while self.next:
             root = next(iter(self.next.values()))
@@ -560,13 +715,18 @@ class BlockRadixTree:
                 block = partial_block
                 yield block, match_len
 
-    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
+    def _prune_match(
+        self, matched: list[tuple[Block, int]], ssm_lc_id: LifeCycleId | None
+    ) -> list[tuple[Block, int]]:
+        """Shorten `matched` to the prefix that is actually reusable.
+
+        Passing ssm_lc_id=None skips the recurrent-snapshot constraint and yields
+        the attention-only prefix (used for num_tokens_before_hybrid_pruning).
+        """
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
-        life_cycles = self._life_cycles
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        attn_life_cycles = list(self._life_cycles.attention_life_cycles())
 
         # Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
         # shorten the match to the coverage of a required page. Every retry strictly
@@ -628,13 +788,23 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        # Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
+        # the prefix the attention pages alone support. Only hybrid models pay for
+        # the second pass; without an SSM life cycle the two results are identical.
+        attn_only_tokens = (
+            self._num_matched_tokens(self._prune_match(list(raw_matched), None))
+            if ssm_lc_id is not None
+            else None
         )
+        matched = self._prune_match(raw_matched, ssm_lc_id)
+        num_tokens = self._num_matched_tokens(matched)
         return ReuseMatch(
             [block for block, _ in matched],
-            self._num_matched_tokens(matched),
+            num_tokens,
             len(tokens),
+            num_tokens if attn_only_tokens is None else attn_only_tokens,
         )
 
     def _check_sanity(self) -> bool:

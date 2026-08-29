@@ -104,7 +104,7 @@ def test_super_mtp_ssm_replay_smoke():
 
     Verifies that the full pipeline — transforms, cache manager init with replay buffers,
     and MTP inference — completes without error. The AD SSM custom ops are not directly
-    invoked at runtime in this configuration (Eagle3OneModelSampler drives its own forward
+    invoked at runtime in this configuration (SpecSampler drives its own forward
     loop); the replay kernel path is covered by test_flashinfer_extend_replay_calls_replay_kernel.
     Uses mamba_head_dim=64 and ssm_state_size=64 to satisfy FlashInfer constraints on the
     decode path (which IS called in this config).

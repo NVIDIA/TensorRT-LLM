@@ -27,6 +27,7 @@ import triton.language as tl
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.sampling_params import SamplingParams
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
@@ -124,6 +125,19 @@ class MambaRole:
 
     SSM_STATE = DataRole("ssm_state")
     CONV_STATE = DataRole("conv_state")
+
+
+def _mamba_effective_tp_size(mapping: Mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state pools.
+
+    Attention-DP replicates the state and takes precedence; helix
+    repurposes CP ranks as plain TP for recurrent-state layers.
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):
@@ -339,22 +353,54 @@ class PythonMambaCacheManager(BaseResourceManager):
                     kwargs[k] = v[layer]
             return type(self)(**kwargs)
 
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """Whether the Kimi K3 KDA fused-verify replay caches are
+            allocated. The base (non-speculative) state never has them; the
+            speculative state overrides this."""
+            return False
+
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens.
 
-        Supports two SSM update paths (only one set of tensors is allocated):
+        Supports three SSM update paths (only one set of tensors is
+        allocated):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
+        - KDA replay: per-slot draft-token caches consumed by the fused
+          ``trtllm::kda_mtp_decode`` verify kernel, which replays accepted
+          drafts and commits states in place (kda_conv_*, kda_*_cache)
         """
         _SHARED_FIELDS = frozenset({
             "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed"
         })
 
-        intermediate_conv_window: torch.Tensor  # always allocated
+        # Allocated for the legacy and Mamba2-replay paths; None for the
+        # KDA replay path (the kernel commits conv windows in place).
+        intermediate_conv_window: torch.Tensor | None = None
 
         # Legacy path: full intermediate SSM states at each step
         intermediate_ssm: torch.Tensor | None = None
+
+        # KDA replay path (fused multi-token verify, kimi_linear).
+        # Pool invariant under this path: `temporal` holds the state after
+        # the LAST GOLDEN token; the accepted drafts recorded in
+        # prev_num_accepted_tokens are pending in these caches and are
+        # replayed by the kernel at the start of the next verify round.
+        # Extended conv caches [layers, slots, dim, (W-1) + num_spec] fp32,
+        # dim-contiguous (stride(dim) == 1): columns [0, W-1) are the
+        # committed raw-input window, tail columns the pending drafts' raw
+        # inputs.
+        kda_conv_q: torch.Tensor | None = None
+        kda_conv_k: torch.Tensor | None = None
+        kda_conv_v: torch.Tensor | None = None
+        # Post-processed per-draft quantities for replay:
+        # [layers, slots, num_spec, 3, H*K] (q/k/gate), [.., num_spec, H*V],
+        # [.., num_spec, H] — all fp32.
+        kda_qkg_cache: torch.Tensor | None = None
+        kda_v_cache: torch.Tensor | None = None
+        kda_beta_cache: torch.Tensor | None = None
 
         # Replay path: compact double-buffered cache
         # prev_num_accepted_tokens: # accepted tokens (always >= 1 if drafting).
@@ -370,6 +416,26 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
+
+        @property
+        def has_kda_replay_caches(self) -> bool:
+            """True when the KDA fused-verify replay caches were allocated
+            (the fused ``trtllm::kda_mtp_decode`` verify path)."""
+            return self.kda_qkg_cache is not None
+
+        def commit_conv_window(self, slot_indices: torch.Tensor,
+                               conv_pool: torch.Tensor) -> None:
+            """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
+            from ..modules.kimi_kda._kda_kernels import \
+                copy_kda_replay_conv_window
+
+            copy_kda_replay_conv_window(
+                conv_pool,
+                self.kda_conv_q,
+                self.kda_conv_k,
+                self.kda_conv_v,
+                slot_indices,
+            )
 
     def __init__(
         self,
@@ -389,12 +455,27 @@ class PythonMambaCacheManager(BaseResourceManager):
         model_type: str = "nemotron_hybrid",
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
+        kda_replay_num_spec: Optional[int] = None,
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
         self._use_replay_state_update = use_replay_state_update
+        # KDA replay path (kimi_linear fused multi-token verify). Mutually
+        # exclusive with use_replay_state_update; requires speculative mode.
+        self._kda_replay_num_spec = kda_replay_num_spec
+        self._use_kda_replay_update = kda_replay_num_spec is not None
+        if self._use_kda_replay_update:
+            assert not use_replay_state_update, (
+                "kda_replay_num_spec and use_replay_state_update are "
+                "mutually exclusive")
+            assert speculative_num_draft_tokens is not None, (
+                "KDA replay caches require speculative decoding")
+            assert kda_replay_num_spec == speculative_num_draft_tokens, (
+                f"KDA replay cache width ({kda_replay_num_spec}) must match "
+                f"the draft length ({speculative_num_draft_tokens}): the "
+                "fused verify kernel is compiled with a static NUM_SPEC")
         self.replay_history_size: Optional[int] = None
         self.replay_step_width: Optional[int] = None
         # When True, allocate the per-slot Philox seed buffer even outside
@@ -409,7 +490,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        tp_size = _mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -483,13 +564,17 @@ class PythonMambaCacheManager(BaseResourceManager):
             T = speculative_num_draft_tokens + 1
             self.replay_step_width = T
 
-            # Conv intermediate cache — same for both paths
-            intermediate_conv_window_cache = torch.zeros(
-                size=(num_local_layers, self.spec_state_size, T) +
-                conv_state_shape,
-                dtype=dtype,
-                device=device,
-            )
+            # Conv intermediate cache — legacy and Mamba2-replay paths only.
+            # The KDA replay kernel commits conv windows in place, so the
+            # per-step window scratch is not needed.
+            intermediate_conv_window_cache = None
+            if not self._use_kda_replay_update:
+                intermediate_conv_window_cache = torch.zeros(
+                    size=(num_local_layers, self.spec_state_size, T) +
+                    conv_state_shape,
+                    dtype=dtype,
+                    device=device,
+                )
 
             # SSM speculative cache — path-specific tensors
             spec_kwargs = {}
@@ -497,7 +582,62 @@ class PythonMambaCacheManager(BaseResourceManager):
             # so the MTP path can still read it via layer_cache.
             if self._mamba_ssm_rand_seed is not None:
                 spec_kwargs['mamba_ssm_rand_seed'] = self._mamba_ssm_rand_seed
-            if self._use_replay_state_update:
+            if self._use_kda_replay_update:
+                # KDA replay caches for the fused multi-token verify kernel
+                # (trtllm::kda_mtp_decode). Per cache slot (persistent
+                # across rounds — the next round replays from them), unlike
+                # the batch-row-indexed intermediate buffers.
+                M = self._kda_replay_num_spec
+                # conv_dim covers the [q | k | v] short-conv sections; the
+                # kernel consumes them as three dim-contiguous caches.
+                assert conv_dim % 3 == 0, (
+                    "KDA replay caches expect the [q | k | v] conv-state "
+                    "sectioning (3 equal sections)")
+                section_dim = conv_dim // 3
+                # d_conv is KDA's convolution width; the live pool stores
+                # its W - 1 committed input columns.
+                w_kernel = d_conv
+                extended_s = w_kernel - 1 + M
+
+                def _dim_contiguous_conv_cache():
+                    return torch.zeros(num_local_layers,
+                                       max_batch_size,
+                                       extended_s,
+                                       section_dim,
+                                       dtype=torch.float32,
+                                       device=device).transpose(-1, -2)
+
+                spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
+                    max_batch_size, dtype=torch.int32, device=device)
+                spec_kwargs['kda_conv_q'] = _dim_contiguous_conv_cache()
+                spec_kwargs['kda_conv_k'] = _dim_contiguous_conv_cache()
+                spec_kwargs['kda_conv_v'] = _dim_contiguous_conv_cache()
+                spec_kwargs['kda_qkg_cache'] = torch.zeros(num_local_layers,
+                                                           max_batch_size,
+                                                           M,
+                                                           3,
+                                                           section_dim,
+                                                           dtype=torch.float32,
+                                                           device=device)
+                spec_kwargs['kda_v_cache'] = torch.zeros(num_local_layers,
+                                                         max_batch_size,
+                                                         M,
+                                                         section_dim,
+                                                         dtype=torch.float32,
+                                                         device=device)
+                spec_kwargs['kda_beta_cache'] = torch.zeros(num_local_layers,
+                                                            max_batch_size,
+                                                            M,
+                                                            nheads,
+                                                            dtype=torch.float32,
+                                                            device=device)
+                ssm_spec_cache = [
+                    spec_kwargs['kda_conv_q'], spec_kwargs['kda_conv_k'],
+                    spec_kwargs['kda_conv_v'], spec_kwargs['kda_qkg_cache'],
+                    spec_kwargs['kda_v_cache'], spec_kwargs['kda_beta_cache']
+                ]
+                spec_path_label = "kda-replay"
+            elif self._use_replay_state_update:
                 assert n_groups % tp_size == 0, \
                     "replay state update requires n_groups divisible by tp_size"
                 n_groups_per_rank = n_groups // tp_size
@@ -659,6 +799,10 @@ class PythonMambaCacheManager(BaseResourceManager):
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
                 self.mamba_cache.cache_buf_idx[block] = 0
+            elif (isinstance(self.mamba_cache, self.SpeculativeState)
+                  and self._use_kda_replay_update):
+                # Fresh request: no drafts pending in the replay caches.
+                self.mamba_cache.prev_num_accepted_tokens[block] = 0
             if self._mamba_ssm_rand_seed is not None:
                 # Deterministic per-slot rotation on fresh assignment.
                 # `block` is pulled from mamba_cache_free_blocks, which
@@ -669,6 +813,60 @@ class PythonMambaCacheManager(BaseResourceManager):
                     _compute_deterministic_mamba_seed(
                         self._seed_request_counter, block,
                         self._seed_rank_offset))
+
+    @torch.inference_mode()
+    def seed_kda_replay_caches_for_disagg_gen(self,
+                                              request_ids: List[int]) -> None:
+        """Seed the fused-verify KDA replay conv caches from the conv pool.
+
+        On a disaggregated generation server the ctx->gen transfer populates
+        only the base ``conv`` / ``temporal`` pools (see
+        ``disaggregation/resource/page.py``); the per-slot ``kda_conv_*``
+        replay caches consumed by ``trtllm::kda_mtp_decode`` are normally
+        seeded by a *local* prefill/decode via
+        ``_sync_kda_replay_conv_window`` and would otherwise hold zeros (or a
+        previous occupant's window) for a transferred request — corrupting
+        the recurrent state from the first verify step onward. Call this
+        after the state transfer completes, before the first generation
+        forward. Mirrors ``_sync_kda_replay_conv_window``: the conv pool row
+        stores the committed ``W - 1`` raw inputs directly. Pending-draft
+        scratch is cleared (no drafts are pending for a freshly transferred
+        request).
+        """
+        if not (self._use_kda_replay_update
+                and isinstance(self.mamba_cache, self.SpeculativeState)):
+            return
+        blocks = [
+            self.mamba_cache_index[rid] for rid in request_ids
+            if rid in self.mamba_cache_index
+        ]
+        if not blocks:
+            return
+        conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
+        idx = torch.tensor(sorted(set(blocks)),
+                           dtype=torch.long,
+                           device=conv.device)
+        d = conv.shape[2] // 3
+        committed = conv.shape[3]
+        cs = conv.index_select(1, idx)
+        for cache, section in (
+            (self.mamba_cache.kda_conv_q, cs[:, :, :d]),
+            (self.mamba_cache.kda_conv_k, cs[:, :, d:2 * d]),
+            (self.mamba_cache.kda_conv_v, cs[:, :, 2 * d:]),
+        ):
+            # cache: [L, slots, D, committed + num_spec]; zero the draft
+            # tail columns and seed the committed window in one copy.
+            seeded = torch.zeros(
+                (cache.shape[0], idx.numel()) + cache.shape[2:],
+                dtype=cache.dtype,
+                device=cache.device)
+            seeded[:, :, :, :committed] = section.to(cache.dtype)
+            cache.index_copy_(1, idx, seeded)
+        for buf in (self.mamba_cache.kda_qkg_cache,
+                    self.mamba_cache.kda_v_cache,
+                    self.mamba_cache.kda_beta_cache):
+            buf.index_fill_(1, idx, 0)
+        self.mamba_cache.prev_num_accepted_tokens[idx] = 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         requests = (scheduled_batch.context_requests +
@@ -708,6 +906,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                         and self._use_replay_state_update):
                     self.mamba_cache.prev_num_accepted_tokens[block] = 0
                     self.mamba_cache.cache_buf_idx[block] = 0
+                elif (isinstance(self.mamba_cache, self.SpeculativeState)
+                      and self._use_kda_replay_update):
+                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
                 continue
             if self._is_padding_sentinel(r):
                 block = self._padding_slot
@@ -723,6 +924,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
                 self.mamba_cache.cache_buf_idx[block] = 0
+            elif (isinstance(self.mamba_cache, self.SpeculativeState)
+                  and self._use_kda_replay_update):
+                self.mamba_cache.prev_num_accepted_tokens[block] = 0
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
@@ -869,7 +1073,8 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache = self.SpeculativeState(
                 conv=empty,
                 temporal=empty,
-                intermediate_conv_window=empty,
+                intermediate_conv_window=_drop(
+                    self.mamba_cache.intermediate_conv_window),
                 intermediate_ssm=_drop(self.mamba_cache.intermediate_ssm),
                 prev_num_accepted_tokens=_drop(
                     self.mamba_cache.prev_num_accepted_tokens),
@@ -879,6 +1084,12 @@ class PythonMambaCacheManager(BaseResourceManager):
                 old_B=_drop(self.mamba_cache.old_B),
                 old_dt=_drop(self.mamba_cache.old_dt),
                 old_dA_cumsum=_drop(self.mamba_cache.old_dA_cumsum),
+                kda_conv_q=_drop(self.mamba_cache.kda_conv_q),
+                kda_conv_k=_drop(self.mamba_cache.kda_conv_k),
+                kda_conv_v=_drop(self.mamba_cache.kda_conv_v),
+                kda_qkg_cache=_drop(self.mamba_cache.kda_qkg_cache),
+                kda_v_cache=_drop(self.mamba_cache.kda_v_cache),
+                kda_beta_cache=_drop(self.mamba_cache.kda_beta_cache),
             )
         else:
             self.mamba_cache = self.State(conv=empty, temporal=empty)
@@ -902,6 +1113,21 @@ class PythonMambaCacheManager(BaseResourceManager):
                               is not None else num_accepted_draft_tokens)
         state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
         src_state_indices = self.intermediate_state_indices[:num_gens]
+
+        if self._use_kda_replay_update:
+            # KDA replay: the fused verify kernel already committed the SSM
+            # state and conv windows (in place, after the golden token) and
+            # cached this round's drafts. All that remains is recording how
+            # many of those drafts the sampler accepted, so the next round's
+            # kernel launch replays exactly that prefix.
+            is_dummy_request = self._dummy_request_mask[
+                num_contexts:num_contexts + num_gens]
+            prev = self.mamba_cache.prev_num_accepted_tokens
+            current = prev[state_indices_d]
+            accepted = num_accepted_draft_tokens.to(torch.int32).clamp(min=0)
+            prev[state_indices_d] = torch.where(is_dummy_request, current,
+                                                accepted)
+            return
 
         if self._use_replay_state_update:
             is_dummy_request = self._dummy_request_mask[
@@ -956,6 +1182,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         model_type: str = "nemotron_hybrid",
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
+        kda_replay_num_spec: Optional[int] = None,
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
 
@@ -976,6 +1203,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
+            kda_replay_num_spec=kda_replay_num_spec,
         )
 
     def get_max_resource_count(self) -> int:
@@ -1013,6 +1241,10 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_conv_states(layer_idx)
+
+    def seed_kda_replay_caches_for_disagg_gen(self,
+                                              request_ids: List[int]) -> None:
+        self._impl.seed_kda_replay_caches_for_disagg_gen(request_ids)
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_ssm_states(layer_idx)
@@ -1386,6 +1618,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         max_seq_len: int,
         max_batch_size: int,
         mapping: Mapping,
+        max_num_tokens: int = 8192,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
@@ -1394,6 +1627,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         is_draft: bool = False,
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
+        kda_replay_num_spec: Optional[int] = None,
         # Per-pool configurations forwarded to the C++ KVCacheManager ctor.
         # Lets a single manager host pools with mixed shapes (e.g. Gemma4
         # hybrid attention). See KVCacheManager.__init__.
@@ -1404,6 +1638,15 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         assert not kv_cache_config.enable_block_reuse, (
             "mamba hybrid cache requires block reuse to be disabled in KV cache config"
         )
+
+        # Host-drafter spec modes (NGram) have no spec worker to call
+        # update_mamba_states; this manager promotes accepted states itself
+        # in update_resources. One-model modes (MTP/Eagle/DFlash) and the
+        # suffix-automaton worker promote from their spec workers and must
+        # NOT be promoted twice.
+        self._promote_states_in_update_resources = (
+            spec_config is not None
+            and getattr(spec_config, "decoding_type", None) == "NGram")
 
         pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
@@ -1427,6 +1670,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
+            kda_replay_num_spec=kda_replay_num_spec,
         )
 
         # initialize kv cache manager
@@ -1439,6 +1683,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
@@ -1472,6 +1717,63 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                          kv_cache_dtype_byte_size: float = None):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
+        self._maybe_promote_drafter_states(scheduled_batch, attn_metadata)
+
+    def _maybe_promote_drafter_states(self, scheduled_batch, attn_metadata):
+        """Commit accepted verification states for host-drafter spec modes.
+
+        One-model spec workers (MTP/Eagle/DFlash) and the suffix-automaton
+        worker call update_mamba_states themselves right after on-device
+        acceptance. Host-drafter modes (NGram) have no spec worker:
+        acceptance lands on the requests as
+        ``py_num_accepted_draft_tokens`` during sampler update, and this
+        hook — running right after, alongside the KV rewind — promotes the
+        accepted step's intermediate state into the live pools (or, on the
+        KDA replay path, records the accepted-draft count for the next
+        round's replay). Without it, the pools would keep the
+        pre-verification state and the next forward would resume from a
+        stale prefix.
+        """
+        if not self._promote_states_in_update_resources:
+            return
+        if not self.is_speculative() or attn_metadata is None:
+            return
+        gen_requests = scheduled_batch.generation_requests
+        if not gen_requests:
+            return
+        drafted = [
+            r for r in gen_requests
+            if r.py_draft_tokens is not None and len(r.py_draft_tokens) > 0
+        ]
+        if not drafted:
+            # Drafter skipped this step (e.g. speculation gated off): the
+            # forward ran the plain in-place decode path; nothing to promote.
+            return
+        assert len(drafted) == len(gen_requests), (
+            "mixed drafted/undrafted generation batch is not supported for "
+            "hybrid state promotion (drafts are padded to the static max)")
+        device = self._impl.mamba_cache.temporal.device
+        num_contexts = len(scheduled_batch.context_requests)
+        num_accepted = torch.tensor(
+            [0] * num_contexts +
+            [r.py_num_accepted_draft_tokens + 1 for r in gen_requests],
+            dtype=torch.int32,
+            device=device)
+        # Batch-ordered slots (contexts then gens), matching the ordering
+        # the forward used for the intermediate scratch buffers. Requests
+        # that finished this step were already freed by response handling
+        # (which runs before update_resources) and are gone from the index;
+        # their rows must stay in place for alignment, so redirect them to
+        # the reserved padding slot (a harmless scratch write).
+        slot_index = self.mamba_cache_index
+        padding_slot = self._impl._padding_slot
+        state_indices = torch.tensor([
+            slot_index.get(r.py_request_id, padding_slot)
+            for r in scheduled_batch.context_requests + gen_requests
+        ],
+                                     dtype=torch.int32,
+                                     device=device)
+        self.update_mamba_states(attn_metadata, num_accepted, state_indices)
 
 
 @triton.jit
@@ -1479,8 +1781,12 @@ def _promote_mamba_state_kernel(
     src_ptr,
     dst_ptr,
     src_idx_ptr,
-    acc_ptr,
+    accepted_position_source_ptr,
+    num_accepted_tokens_ptr,
     blk_ptr,
+    replay_pnat_ptr,
+    replay_cache_buf_idx_ptr,
+    dummy_request_mask_ptr,
     num_gens,
     count,
     src_s_layer,
@@ -1488,6 +1794,10 @@ def _promote_mamba_state_kernel(
     src_s_step,
     dst_s_layer,
     dst_s_block,
+    POSITION_SOURCE_IS_TOKEN_COUNT: tl.constexpr,
+    REPLAY_STEP_WIDTH: tl.constexpr,
+    REPLAY_HISTORY_SIZE: tl.constexpr,
+    UPDATE_REPLAY_BOOKKEEPING: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # One program copies a BLOCK-sized tile of the contiguous inner state for a
@@ -1497,8 +1807,31 @@ def _promote_mamba_state_kernel(
     layer = (pair // num_gens).to(tl.int64)
     g = pair % num_gens
     row = tl.load(src_idx_ptr + g).to(tl.int64)
-    acc = tl.load(acc_ptr + g).to(tl.int64)
+    accepted_position = tl.load(accepted_position_source_ptr + g)
+    if POSITION_SOURCE_IS_TOKEN_COUNT:
+        accepted_position -= 1
+    acc = accepted_position.to(tl.int64)
     blk = tl.load(blk_ptr + g).to(tl.int64)
+
+    # The replay metadata update is batch-scoped, so layer 0's first copy tile
+    # owns it. This folds PNAT and active-buffer maintenance into the existing
+    # accepted-convolution-state promotion launch.
+    if UPDATE_REPLAY_BOOKKEEPING:
+        if (layer == 0) & (tile == 0):
+            num_accepted_tokens = tl.load(num_accepted_tokens_ptr + g)
+            is_dummy_request = tl.load(dummy_request_mask_ptr + g)
+            pnat = tl.load(replay_pnat_ptr + blk)
+            cache_buf_idx = tl.load(replay_cache_buf_idx_ptr + blk)
+            wrote_checkpoint = pnat + REPLAY_STEP_WIDTH > REPLAY_HISTORY_SIZE
+            next_pnat = tl.where(wrote_checkpoint, num_accepted_tokens,
+                                 pnat + num_accepted_tokens)
+            next_cache_buf_idx = tl.where(wrote_checkpoint, 1 - cache_buf_idx,
+                                          cache_buf_idx)
+            tl.store(replay_pnat_ptr + blk, next_pnat, mask=~is_dummy_request)
+            tl.store(replay_cache_buf_idx_ptr + blk,
+                     next_cache_buf_idx,
+                     mask=~is_dummy_request)
+
     # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
     # int32 and would corrupt addresses / fault.
     src_base = layer * src_s_layer + row * src_s_row + acc * src_s_step
@@ -1509,12 +1842,20 @@ def _promote_mamba_state_kernel(
     tl.store(dst_ptr + dst_base + offs, v, mask=mask)
 
 
-def _promote_mamba_state_triton(dst: torch.Tensor,
-                                intermediate: torch.Tensor,
-                                src_state_indices: torch.Tensor,
-                                accepted_draft: torch.Tensor,
-                                dst_state_indices: torch.Tensor,
-                                BLOCK: int = 2048) -> None:
+def _promote_mamba_state_triton(
+        dst: torch.Tensor,
+        intermediate: torch.Tensor,
+        src_state_indices: torch.Tensor,
+        accepted_position_source: torch.Tensor,
+        dst_state_indices: torch.Tensor,
+        num_accepted_tokens: Optional[torch.Tensor] = None,
+        position_source_is_token_count: bool = False,
+        replay_pnat: Optional[torch.Tensor] = None,
+        replay_cache_buf_idx: Optional[torch.Tensor] = None,
+        dummy_request_mask: Optional[torch.Tensor] = None,
+        replay_step_width: int = 0,
+        replay_history_size: int = 0,
+        BLOCK: int = 2048) -> None:
     """Scatter each generation request's accepted draft-step recurrent state
     from the per-request intermediate buffer into the unified C++ pool view.
 
@@ -1527,11 +1868,28 @@ def _promote_mamba_state_triton(dst: torch.Tensor,
             (dtype-view mutation) and Inductor codegen (``XBLOCK`` on the uint8
             pool).
         intermediate: ``[num_layers, max_batch_size, T, *state_shape]`` dense.
-        src_state_indices, accepted_draft, dst_state_indices: ``[num_gens]`` int.
+        src_state_indices, accepted_position_source, dst_state_indices:
+            ``[num_gens]`` int.
+        num_accepted_tokens: ``[num_gens]`` accepted-token counts. Required
+            when replay bookkeeping is enabled.
+        position_source_is_token_count: Whether ``accepted_position_source``
+            contains accepted-token counts instead of zero-based intermediate
+            state positions. When true, the kernel subtracts one while
+            computing the source position.
+        replay_pnat, replay_cache_buf_idx, dummy_request_mask: Optional replay
+            metadata. When supplied together, the kernel advances PNAT and the
+            active history buffer while promoting the convolution state.
 
     For each gen ``g``::
 
-        dst[:, dst_state_indices[g]] = intermediate[:, src_state_indices[g], accepted_draft[g]]
+        accepted_position = (
+            accepted_position_source[g] - 1
+            if position_source_is_token_count
+            else accepted_position_source[g]
+        )
+        dst[:, dst_state_indices[g]] = intermediate[
+            :, src_state_indices[g], accepted_position
+        ]
 
     Pure gather->scatter copy; bandwidth-bound (~85% of HBM peak), one launch.
     """
@@ -1539,6 +1897,25 @@ def _promote_mamba_state_triton(dst: torch.Tensor,
     num_gens = src_state_indices.shape[0]
     if num_gens == 0:
         return
+    update_replay_bookkeeping = replay_pnat is not None
+    if update_replay_bookkeeping:
+        assert num_accepted_tokens is not None
+        assert replay_cache_buf_idx is not None
+        assert dummy_request_mask is not None
+        assert replay_step_width > 0
+        assert replay_history_size >= replay_step_width
+        assert replay_pnat.dtype == torch.int32
+        assert replay_cache_buf_idx.dtype == torch.int32
+        assert dummy_request_mask.dtype == torch.bool
+        assert dummy_request_mask.numel() >= num_gens
+    else:
+        # Compile-time-disabled pointer arguments still require tensors.
+        num_accepted_tokens = accepted_position_source
+        assert replay_cache_buf_idx is None
+        assert dummy_request_mask is None
+        replay_pnat = dst_state_indices
+        replay_cache_buf_idx = dst_state_indices
+        dummy_request_mask = dst_state_indices
     count = 1
     for s in dst.shape[2:]:
         count *= s
@@ -1552,8 +1929,12 @@ def _promote_mamba_state_triton(dst: torch.Tensor,
         intermediate,
         dst,
         src_state_indices,
-        accepted_draft,
+        accepted_position_source,
+        num_accepted_tokens,
         dst_state_indices,
+        replay_pnat,
+        replay_cache_buf_idx,
+        dummy_request_mask,
         num_gens,
         count,
         intermediate.stride(0),
@@ -1561,6 +1942,10 @@ def _promote_mamba_state_triton(dst: torch.Tensor,
         intermediate.stride(2),
         dst.stride(0),
         dst.stride(1),
+        POSITION_SOURCE_IS_TOKEN_COUNT=position_source_is_token_count,
+        REPLAY_STEP_WIDTH=replay_step_width,
+        REPLAY_HISTORY_SIZE=replay_history_size,
+        UPDATE_REPLAY_BOOKKEEPING=update_replay_bookkeeping,
         BLOCK=BLOCK,
     )
 
@@ -1846,6 +2231,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
+                **kwargs,
             )
             # PP ranks replay the same scheduling decisions, so a rank without
             # local Mamba layers must still publish the configured boundaries.
@@ -1857,7 +2243,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = _mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2142,12 +2528,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -2159,8 +2541,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests:
             self.requests.extend(requests)
@@ -2221,13 +2603,17 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        num_accepted_draft_tokens = (
-            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
-                torch.int32)
-        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
-        accepted_positions = (accepted_leaf_positions.to(torch.int32)
-                              if accepted_leaf_positions is not None else
-                              num_accepted_draft_tokens)
+        accepted_tokens = num_accepted_tokens[num_contexts:num_contexts +
+                                              num_gens]
+        # Dynamic tree supplies explicit tree-node leaf positions. Linear MTP
+        # passes accepted-token counts and lets the promotion kernel subtract
+        # one, avoiding a separate GPU subtraction/cast.
+        if accepted_leaf_positions is None:
+            accepted_position_source = accepted_tokens
+            position_source_is_token_count = True
+        else:
+            accepted_position_source = accepted_leaf_positions.to(torch.int32)
+            position_source_is_token_count = False
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
@@ -2251,29 +2637,40 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self._commit_gdn_cached_replay_history_layers(
                 attn_metadata, num_gens)
             assert self._dummy_request_mask is not None
-            is_dummy_request = self._dummy_request_mask[
-                num_contexts:num_contexts + num_gens]
-            replay_metadata = self.get_replay_state_update_metadata()
-            assert replay_metadata is not None
-            _advance_replay_state(
-                replay_metadata,
-                state_indices_d,
-                num_accepted_tokens[num_contexts:num_contexts + num_gens],
-                is_dummy_request,
-            )
         else:
             # Legacy: copy the accepted SSM state from the intermediate buffer.
-            _promote_mamba_state_triton(self.all_ssm_states,
-                                        self.intermediate_ssm_states,
-                                        src_state_indices, accepted_positions,
-                                        state_indices_d)
+            _promote_mamba_state_triton(
+                self.all_ssm_states,
+                self.intermediate_ssm_states,
+                src_state_indices,
+                accepted_position_source,
+                state_indices_d,
+                position_source_is_token_count=position_source_is_token_count)
 
         # Conv: both paths save all intermediate conv windows, carry over the
-        # accepted one.
-        _promote_mamba_state_triton(self.all_conv_states,
-                                    self.intermediate_conv_states,
-                                    src_state_indices, accepted_positions,
-                                    state_indices_d)
+        # accepted one. The replay path also advances PNAT and the active cache
+        # buffer in this same launch.
+        replay_dummy_request_mask = None
+        if self._use_replay_state_update:
+            replay_dummy_request_mask = self._dummy_request_mask[
+                num_contexts:num_contexts + num_gens]
+        _promote_mamba_state_triton(
+            self.all_conv_states,
+            self.intermediate_conv_states,
+            src_state_indices,
+            accepted_position_source,
+            state_indices_d,
+            num_accepted_tokens=accepted_tokens,
+            position_source_is_token_count=position_source_is_token_count,
+            replay_pnat=(self.prev_num_accepted_tokens
+                         if self._use_replay_state_update else None),
+            replay_cache_buf_idx=(self.cache_buf_idx
+                                  if self._use_replay_state_update else None),
+            dummy_request_mask=replay_dummy_request_mask,
+            replay_step_width=(self.replay_step_width
+                               if self._use_replay_state_update else 0),
+            replay_history_size=(self.replay_history_size
+                                 if self._use_replay_state_update else 0))
 
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
@@ -2391,9 +2788,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(
-            is_dummy if requests is
-            self.requests else [req.is_dummy for req in self.requests])
+        self._refresh_dummy_request_mask(is_dummy)
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
@@ -2512,6 +2907,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(
                 f"Unsupported convolution state layout: {conv_state_layout!r}")
+        if "model_type" in kwargs:
+            # The V1 managers select the conv-state layout by model_type; this
+            # class takes it explicitly. Silently absorbing model_type here
+            # means a caller's layout request would be dropped on the floor.
+            raise TypeError(
+                "MambaHybridCacheManagerV2 does not accept 'model_type' "
+                f"(got {kwargs['model_type']!r}); pass "
+                "conv_state_layout='x_b_c' or 'q_k_v' instead")
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -2529,6 +2932,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._mamba_layer_mask = list(mamba_layer_mask)
         self._use_replay_state_update = use_replay_state_update
+        self._use_gdn_cached_replay_all_layer_commit = (use_replay_state_update
+                                                        and conv_state_layout
+                                                        == "q_k_v")
+        self._gdn_cached_replay_state_descriptors: Optional[torch.Tensor] = None
+        self._gdn_cached_replay_state_strides: Optional[Tuple[int, int,
+                                                              int]] = None
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update else None)
@@ -2558,9 +2967,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if mamba_layer_mask[layer_idx]
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        self._use_gdn_cached_replay_all_layer_commit = (
+            self._use_gdn_cached_replay_all_layer_commit
+            and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            tp_size = _mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
@@ -2694,12 +3106,72 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "KV cache budget or allocate a larger Mamba pool_ratio.")
             self._setup_states()
             self._setup_replay_buffers(spec_config)
+            if self._use_gdn_cached_replay_all_layer_commit:
+                state_layout = ("affine"
+                                if self._gdn_cached_replay_state_strides
+                                is not None else "indirect")
+                logger.info_once(
+                    "Configured GDN cached replay commit mode for V2: "
+                    "small-batch fused, large-batch all-layer; "
+                    f"state layout: {state_layout}",
+                    key="gdn_cached_replay_v2_commit_mode_fused",
+                )
         else:
             self.ssm_layer_group_id = None
             self._ssm_page_index_scale = 1
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    @property
+    def use_gdn_cached_replay_all_layer_commit(self) -> bool:
+        return getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
+
+    def _commit_gdn_cached_replay_history_layers(
+        self,
+        attn_metadata: "AttentionMetadata",
+        num_decodes: int,
+    ) -> None:
+        """Advance all V2 GDN checkpoints through their state views."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+            commit_gdn_cached_replay_history_layers)
+
+        if (not getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
+                or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
+            return
+        if (not self.all_ssm_states
+                or (self._gdn_cached_replay_state_descriptors is None
+                    and self._gdn_cached_replay_state_strides is None)
+                or self.old_x is None or self.old_B is None
+                or self.old_dt is None or self.replay_history_size is None):
+            raise RuntimeError(
+                "GDN cached replay all-layer commit requires V2 replay state buffers."
+            )
+
+        mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.replay_num_decodes != num_decodes:
+            raise RuntimeError(
+                "GDN replay metadata contains "
+                f"{mamba_metadata.replay_num_decodes} decode requests, "
+                f"but state update received {num_decodes}.")
+        state_strides = self._gdn_cached_replay_state_strides
+        commit_gdn_cached_replay_history_layers(
+            ssm_states=self.all_ssm_states[0],
+            ssm_state_descriptors=(self._gdn_cached_replay_state_descriptors),
+            ssm_state_num_layers=(state_strides[0]
+                                  if state_strides is not None else None),
+            ssm_state_layer_stride=(state_strides[1]
+                                    if state_strides is not None else None),
+            ssm_state_slot_stride=(state_strides[2]
+                                   if state_strides is not None else None),
+            old_u=self.old_x,
+            old_k=self.old_B,
+            old_G=self.old_dt,
+            replay_work_items=mamba_metadata.replay_work_items[:num_decodes],
+            n_writes=mamba_metadata.replay_n_writes,
+            history_size=self.replay_history_size,
+        )
 
     @staticmethod
     def get_cache_size_per_token(model_config,
@@ -2972,6 +3444,49 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                    self.conv_state_dtype, self.conv_state_shape)
             for local_layer_idx in local_layer_ids
         ]
+        if self._use_gdn_cached_replay_all_layer_commit:
+            expected_inner_strides = (
+                self.ssm_state_shape[1] * self.ssm_state_shape[2],
+                self.ssm_state_shape[2],
+                1,
+            )
+            reference = self.all_ssm_states[0]
+            for state in self.all_ssm_states:
+                if (state.dtype != reference.dtype
+                        or state.device != reference.device
+                        or list(state.shape[1:]) != self.ssm_state_shape
+                        or state.stride()[1:] != expected_inner_strides):
+                    raise RuntimeError(
+                        "GDN cached replay requires V2 SSM layers with matching "
+                        "dtype, device, shape, and dense inner dimensions.")
+            pointers = [state.data_ptr() for state in self.all_ssm_states]
+            slot_stride = reference.stride(0)
+            layer_stride_bytes = (pointers[1] -
+                                  pointers[0] if len(pointers) > 1 else 0)
+            has_affine_layout = (
+                layer_stride_bytes % reference.element_size() == 0 and all(
+                    state.stride(0) == slot_stride
+                    for state in self.all_ssm_states)
+                and all(pointer == pointers[0] + layer * layer_stride_bytes
+                        for layer, pointer in enumerate(pointers)))
+            if has_affine_layout:
+                self._gdn_cached_replay_state_strides = (
+                    len(pointers),
+                    layer_stride_bytes // reference.element_size(),
+                    slot_stride,
+                )
+            else:
+                logger.warning_once(
+                    "V2 GDN state views are not affine; using indirect replay "
+                    "checkpoint addressing",
+                    key="gdn_cached_replay_v2_indirect_state_layout",
+                )
+                self._gdn_cached_replay_state_descriptors = torch.tensor(
+                    [(state.data_ptr(), state.stride(0))
+                     for state in self.all_ssm_states],
+                    dtype=torch.int64,
+                    device=reference.device,
+                )
 
     def _setup_replay_buffers(self, spec_config) -> None:
         cache_size = 0
@@ -3072,8 +3587,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        capture_sampling_params: Optional["SamplingParams"] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -3085,8 +3600,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
         )
         if requests and prepare_resource:
             self._setup_state_indices(requests)
@@ -3194,6 +3709,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
         if self._use_replay_state_update:
+            self._commit_gdn_cached_replay_history_layers(
+                attn_metadata, num_gens)
             assert self._dummy_request_mask is not None
             is_dummy_request = self._dummy_request_mask[
                 num_contexts:num_contexts + num_gens]
@@ -3301,6 +3818,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 kv_cache.enable_swa_scratch_reuse = False
 
     def shutdown(self):
+        self._gdn_cached_replay_state_descriptors = None
+        self._gdn_cached_replay_state_strides = None
         self.all_ssm_states = []
         self.all_conv_states = []
         self.intermediate_ssm_states = None

@@ -284,3 +284,30 @@ def test_update_quant_config_from_compressed_tensors_rejects_kv_cache_conflict()
                 }
             ),
         )
+
+
+def test_update_quant_config_from_compressed_tensors_mxfp4_with_fp8_kv_cache():
+    quant_config = QuantConfig()
+    update_quant_config_from_compressed_tensors(
+        quant_config,
+        _compressed_tensors_config(
+            weights={
+                "num_bits": 4,
+                "type": "float",
+                "strategy": "group",
+                "group_size": 32,
+            },
+            format="mxfp4-pack-quantized",
+            kv_cache_scheme={
+                "num_bits": 8,
+                "type": "float",
+            },
+            ignore=["lm_head"],
+        ),
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
+    assert quant_config.group_size == 32
+    # The MXFP4 branch returns early; kv_cache_scheme must still be honored.
+    assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert set(quant_config.exclude_modules) == {"lm_head"}

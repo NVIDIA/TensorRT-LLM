@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 LongBench v1 evaluation script with TensorRT-LLM and sparse attention.
 
@@ -35,6 +49,7 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.evaluate.lm_eval import _replace_fuzzywuzzy_with_rapidfuzz
 from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig,
                                  RocketSparseAttentionConfig)
@@ -138,8 +153,8 @@ def parse_arguments() -> argparse.Namespace:
                         type=str,
                         default='CUTLASS',
                         choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM',
+                            'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
@@ -566,10 +581,12 @@ def calculate_metrics(
     # Setup LongBench imports
     setup_longbench_imports(longbench_path)
 
-    # Import LongBench metrics
-    from metrics import (classification_score, code_sim_score, count_score,
-                         qa_f1_score, qa_f1_zh_score, retrieval_score,
-                         retrieval_zh_score, rouge_score, rouge_zh_score)
+    # LongBench still imports FuzzyWuzzy by name. Supply RapidFuzz while its
+    # metrics module loads so the example does not require FuzzyWuzzy.
+    with _replace_fuzzywuzzy_with_rapidfuzz():
+        from metrics import (classification_score, code_sim_score, count_score,
+                             qa_f1_score, qa_f1_zh_score, retrieval_score,
+                             retrieval_zh_score, rouge_score, rouge_zh_score)
 
     # Mapping of datasets to their metric functions (from LongBench)
     dataset2metric = {

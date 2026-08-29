@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import weakref
 from collections import namedtuple
@@ -10,6 +13,7 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -27,7 +31,8 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .sparse.params import SkipSoftmaxKernelParams, SparseMetadataParams
+from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
+                            SparseRuntimeParams)
 
 try:
     # Transformers v5
@@ -440,7 +445,6 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
             num_contexts: int = 0):
@@ -890,27 +894,6 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
-class SparsePrediction:
-    """Sparse KV / attention indices predicted by the framework backends.
-
-    RocketKV and DSA produce these from ``sparse_kv_predict`` /
-    ``sparse_attn_predict``, telling the attention op which KV tokens to keep
-    and which blocks to attend to. Backends that don't predict leave
-    ``AttentionForwardArgs.sparse_prediction`` at its default-constructed value
-    (all-``None`` / ``0`` fields).
-    """
-    sparse_kv_indices: Optional[torch.Tensor] = None
-    sparse_kv_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices: Optional[torch.Tensor] = None
-    sparse_attn_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices_block_size: int = 0
-    # DeepSeek-V4 sparse-MLA only: per-token compressed top-k lengths and the
-    # base pointer of the compressed KV cache pool (compress_ratio > 1).
-    sparse_mla_topk_lens: Optional[torch.Tensor] = None
-    compressed_kv_cache_pool_ptr: Optional[int] = None
-
-
-@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -958,22 +941,25 @@ class AttentionForwardArgs:
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
     enable_dsv4_epilogue_fusion: bool = False
 
+    # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
+    # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
+    # paged write, so the caller drops its own RMSNorm and concat.
+    kv_norm_weight: Optional[torch.Tensor] = None
+    kv_norm_eps: float = 1e-6
+
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
-
-    topk_indices: Optional[torch.Tensor] = None
 
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
 
-    sparse_prediction: SparsePrediction = field(
-        default_factory=SparsePrediction)
-    skip_softmax_kernel_params: SkipSoftmaxKernelParams = field(
-        default_factory=SkipSoftmaxKernelParams)
+    sparse_backend_args: Optional[SparseBackendForwardArgs] = None
+    sparse_runtime_params: SparseRuntimeParams = field(
+        default_factory=SparseRuntimeParams)
 
     @property
     def mask_type(self) -> int:
@@ -1089,6 +1075,21 @@ class AttentionBackend(Generic[TMetadata]):
     @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
+
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
+                                          mapping: Mapping) -> int:
+        """Per-token bytes to reserve for a workspace this backend stages whose size scales with a
+        runtime quantity the KV-cache estimator does not drive to its serving maximum while profiling
+        (e.g. ``total_kv_len``, inflated by KV-cache reuse). Default ``0`` -- correct for every backend
+        except fp8 context-MLA today.
+
+        A non-zero rate is reserved from the KV budget by the estimator, and the scheduler caps the
+        driving sum at what that reserve covers, so the declared buffer stays within its reservation
+        (buffers the backend does not declare are still unaccounted for). Keep the rate identical to the
+        runtime allocation's per-token cost. See ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
+        """
+        return 0
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

@@ -15,6 +15,7 @@
 
 """Single-GPU integration and accuracy tests for Cosmos3."""
 
+import contextlib
 import os
 from dataclasses import dataclass
 
@@ -35,6 +36,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _golden_media_path,
     _lpips_deterministic_algorithms,
     _lpips_model_path,
+    _lpips_pinned_fp32_matmul_precision,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
@@ -160,9 +162,14 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
-            with torch.no_grad():
+            # Pin fp32-matmul arithmetic: the goldens are cut and compared
+            # under "highest" so they reproduce on both PyPI and NGC torch.
+            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
+                    # The goldens were generated against an empty uncond branch,
+                    # so pin it rather than inheriting the video-mode default.
+                    negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
@@ -243,7 +250,22 @@ def _generate_cosmos3_feature_image(case, output_path):
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
         _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
-        with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):
+        # Pin fp32-matmul arithmetic only for the profiles whose goldens are
+        # re-baselined under it. NVFP4's golden is waived (nvbugs/6572800) and
+        # not re-cut here, so it keeps generating under the host default; pin
+        # it when that golden is re-cut. Note the NVFP4 profile reaches this
+        # same function inside a spawned process, so the guard has to be here
+        # rather than at the call site.
+        precision_context = (
+            contextlib.nullcontext()
+            if case.features.quantization == "NVFP4"
+            else _lpips_pinned_fp32_matmul_precision()
+        )
+        with (
+            _lpips_deterministic_algorithms(),
+            precision_context,
+            _fixed_nvfp4_quantization_backend(case.features),
+        ):
             args = _build_single_device_feature_args(
                 model_path,
                 case.features,
@@ -262,6 +284,9 @@ def _generate_cosmos3_feature_image(case, output_path):
                 _assert_feature_quantization_installed(pipeline, case.features)
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
+                    # The goldens were generated against an empty uncond branch,
+                    # so pin it rather than inheriting the video-mode default.
+                    negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
@@ -563,9 +588,18 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
+            # Deliberately NOT pinned with _lpips_pinned_fp32_matmul_precision:
+            # this golden is a diffusers cross-stack reference whose provenance
+            # records no fp32-matmul state, so whether pinning improves or
+            # degrades agreement is unknown. The test is skipped in CI anyway
+            # (checkpoint absent), and its golden is not re-cut here. Pin this
+            # path when the golden is re-cut and the flag can be recorded.
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_I2V_4STEP_LPIPS_PROMPT,
+                    # The goldens were generated against an empty uncond branch,
+                    # so pin it rather than inheriting the video-mode default.
+                    negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
                     image=image_path,
                     height=COSMOS3_LPIPS_HEIGHT,
@@ -636,3 +670,247 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
         "cosmos3_i2v_4step_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, COSMOS3_I2V_4STEP_LPIPS_THRESHOLD)
+
+
+def _write_cosmos3_edge_conditioning_image(path):
+    """Deterministic 832x480 conditioning image (Edge's native 480p 16:9)."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (832, 480))
+    draw = ImageDraw.Draw(image)
+    for y in range(480):
+        draw.line([(0, y), (832, y)], fill=(30, 60 + y // 6, 140))
+    draw.ellipse([320, 130, 520, 330], fill=(230, 120, 40), outline=(255, 255, 255), width=4)
+    draw.rectangle([60, 330, 260, 450], fill=(40, 160, 90))
+    image.save(path)
+
+
+def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the Edge checkpoint through the recommended invocation.
+
+    Validates the documented deployment for ``Cosmos3-Edge``: the example
+    script with a conditioning image and no config override (the Edge
+    defaults — 480p x 121 frames, 50 UniPC steps on the native flow schedule,
+    guidance 5.0, shift 3.0 — are the deployed shape). The run must produce a
+    video.
+    """
+    model_path = _lpips_model_path("Cosmos3-Edge")
+    _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_edge_i2v_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    image_path = os.path.join(out_dir, "conditioning.png")
+    _write_cosmos3_edge_conditioning_image(image_path)
+    output_path = os.path.join(out_dir, "cosmos3_edge_i2v_output.mp4")
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--prompt",
+            "The orange sphere slowly rises while the camera pans right across the scene",
+            "--image_path",
+            image_path,
+            "--output_path",
+            output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
+
+
+# Edge LPIPS gates compare against diffusers-main reference goldens with the
+# scheduler patched to the cosmos-framework native flow schedule; full
+# provenance in golden/visual_gen_lpips/cosmos3_edge_*.json. The I2V gate runs
+# 10 steps (cross-stack drift accumulates per step; the deployed 50-step shape
+# is covered by test_cosmos3_edge_i2v_example).
+COSMOS3_EDGE_LPIPS_SEED = 42
+COSMOS3_EDGE_LPIPS_FRAME_RATE = 24.0
+COSMOS3_EDGE_LPIPS_NUM_FRAMES = 29
+COSMOS3_EDGE_T2V_LPIPS_PROMPT = "A red ball rolls across a wooden floor, casting a soft shadow."
+COSMOS3_EDGE_T2V_LPIPS_STEPS = 50
+COSMOS3_EDGE_T2V_LPIPS_THRESHOLD = 0.1
+COSMOS3_EDGE_I2V_LPIPS_PROMPT = (
+    "The orange sphere slowly rises while the camera pans right across the scene"
+)
+COSMOS3_EDGE_I2V_LPIPS_STEPS = 10
+COSMOS3_EDGE_I2V_LPIPS_THRESHOLD = 0.13
+COSMOS3_EDGE_T2I_LPIPS_PROMPT = (
+    "A ceramic teapot pouring steaming tea into a cup, morning window light"
+)
+COSMOS3_EDGE_T2I_LPIPS_STEPS = 50
+COSMOS3_EDGE_T2I_LPIPS_THRESHOLD = 0.05
+
+
+def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
+    """Run the Cosmos3-Edge pipeline and return the PipelineOutput.
+
+    VANILLA attention, compile-off; guardrails disabled for the run.
+    """
+    guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
+    previous_guardrails_env = os.environ.get(guardrails_env_key)
+    os.environ[guardrails_env_key] = "1"
+    try:
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.visual_gen.args import (
+            AttentionConfig,
+            CompilationConfig,
+            TorchCompileConfig,
+            VisualGenArgs,
+        )
+
+        model_path = _lpips_model_path("Cosmos3-Edge")
+        _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+        _disable_inductor_compile_worker_quiesce()
+        args = VisualGenArgs(
+            model=model_path,
+            compilation_config=CompilationConfig(skip_warmup=True),
+            torch_compile_config=TorchCompileConfig(enable=False),
+            attention_config=AttentionConfig(backend="VANILLA"),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            # The goldens were generated against an empty uncond branch, so pin it
+            # here rather than inheriting the video-mode default negative prompt.
+            forward_kwargs.setdefault("negative_prompt", "")
+            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
+                result = pipeline.forward(
+                    seed=COSMOS3_EDGE_LPIPS_SEED,
+                    use_guardrails=False,
+                    **forward_kwargs,
+                )
+            if result is not None:
+                if result.video is not None:
+                    result.video = result.video.detach().cpu()
+                if result.image is not None:
+                    result.image = result.image.detach().cpu()
+            return result
+        finally:
+            del pipeline
+            _cleanup_cuda()
+    finally:
+        if previous_guardrails_env is None:
+            os.environ.pop(guardrails_env_key, None)
+        else:
+            os.environ[guardrails_env_key] = previous_guardrails_env
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_t2v_lpips_against_golden(_visual_gen_deps, request, tmp_path):
+    generated_path = tmp_path / "cosmos3_edge_t2v_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path, "cosmos3_edge_t2v_lpips_golden_video.mp4", "Cosmos3-Edge T2V LPIPS golden video"
+    )
+    result = _run_cosmos3_edge_lpips_pipeline(
+        prompt=COSMOS3_EDGE_T2V_LPIPS_PROMPT,
+        height=480,
+        width=832,
+        num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,
+        num_inference_steps=COSMOS3_EDGE_T2V_LPIPS_STEPS,
+        guidance_scale=5.0,
+        frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
+    )
+    assert result is not None and result.video is not None, "Edge T2V produced no video"
+    _save_lpips_video_mp4(result.video, generated_path, frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_edge_t2v",
+        "video",
+        COSMOS3_EDGE_T2V_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_EDGE_T2V_LPIPS_THRESHOLD,
+        generated_path,
+        "cosmos3_edge_t2v_lpips_golden_video.mp4",
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_EDGE_T2V_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_path):
+    generated_path = tmp_path / "cosmos3_edge_i2v_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path, "cosmos3_edge_i2v_lpips_golden_video.mp4", "Cosmos3-Edge I2V LPIPS golden video"
+    )
+    image_path = tmp_path / "cosmos3_edge_i2v_conditioning.png"
+    _write_cosmos3_edge_conditioning_image(str(image_path))
+    result = _run_cosmos3_edge_lpips_pipeline(
+        prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
+        image=str(image_path),
+        height=480,
+        width=832,
+        num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,
+        num_inference_steps=COSMOS3_EDGE_I2V_LPIPS_STEPS,
+        guidance_scale=5.0,
+        frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
+    )
+    assert result is not None and result.video is not None, "Edge I2V produced no video"
+    _save_lpips_video_mp4(result.video, generated_path, frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_edge_i2v",
+        "video",
+        COSMOS3_EDGE_I2V_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_EDGE_I2V_LPIPS_THRESHOLD,
+        generated_path,
+        "cosmos3_edge_i2v_lpips_golden_video.mp4",
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_EDGE_I2V_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
+    from tensorrt_llm.media.encoding import save_image
+
+    generated_path = tmp_path / "cosmos3_edge_t2i_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path, "cosmos3_edge_t2i_lpips_golden.png", "Cosmos3-Edge T2I LPIPS golden image"
+    )
+    result = _run_cosmos3_edge_lpips_pipeline(
+        prompt=COSMOS3_EDGE_T2I_LPIPS_PROMPT,
+        height=640,
+        width=640,
+        num_inference_steps=COSMOS3_EDGE_T2I_LPIPS_STEPS,
+        guidance_scale=4.0,
+        output_type="image",
+    )
+    assert result is not None and result.image is not None, "Edge T2I produced no image"
+    save_image(result.image[0], str(generated_path))
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_edge_t2i",
+        "image",
+        COSMOS3_EDGE_T2I_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_EDGE_T2I_LPIPS_THRESHOLD,
+        generated_path,
+        "cosmos3_edge_t2i_lpips_golden.png",
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_EDGE_T2I_LPIPS_THRESHOLD)

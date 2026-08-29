@@ -21,14 +21,19 @@ world of size 2 (TP=2). All processes share the same physical GPU.
 Requires: 1 GPU, mpirun, mpi4py, tensorrt_llm.
 """
 
+import ast
 import json
 import os
+import pickle
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+import types
+from pathlib import Path
+from typing import Any, Iterable, Optional, Sequence
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -51,6 +56,118 @@ REPORT_SCRIPT = os.path.join(CTT_DIR, "report.py")
 _LOG_TAIL_CHARS = 16 * 1024
 _PROCESS_TIMEOUT_SECONDS = 120
 _TERMINATE_GRACE_SECONDS = 5
+
+
+def _load_driver_subset(
+    module_name: str,
+    selected_names: set[str],
+    stubs: dict[str, Any],
+) -> types.ModuleType:
+    """Execute selected driver definitions with injected runtime stand-ins."""
+    source = Path(DRIVER_SCRIPT).read_text()
+    tree = ast.parse(source, filename=DRIVER_SCRIPT)
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in selected_names
+    ]
+    module = types.ModuleType(module_name)
+    module.__dict__.update(stubs)
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), DRIVER_SCRIPT, "exec"),
+        module.__dict__,
+    )
+    missing = selected_names - set(module.__dict__)
+    assert not missing, f"{module_name}: driver definitions not loaded: {sorted(missing)}"
+    return module
+
+
+def _load_driver_ownership_helpers() -> types.ModuleType:
+    """Load pure ownership helpers without importing GPU/MPI runtime modules."""
+    selected_names = {
+        "_Timeout",
+        "_TransferError",
+        "_FatalTransferError",
+        "_request_ids",
+        "_context_completion_error",
+        "_gen_completion_error",
+        "_can_release_sequence",
+        "_release_sequence_if_safe",
+        "_validate_context_completion",
+        "_validate_python_gen_completion",
+        "_first_reason",
+        "_exchange_release_decision",
+        "_hard_abort_process",
+    }
+    return _load_driver_subset(
+        "cache_transceiver_harness_ownership",
+        selected_names,
+        {
+            "Any": Any,
+            "Iterable": Iterable,
+            "Optional": Optional,
+            "Sequence": Sequence,
+            "MPI": types.SimpleNamespace(MIN="MIN"),
+            "LlmRequestState": types.SimpleNamespace(
+                DISAGG_GENERATION_TRANS_COMPLETE="gen_complete",
+                DISAGG_TRANS_ERROR="error",
+            ),
+            "free_sequence": MagicMock(),
+            "os": os,
+            "pickle": pickle,
+            "signal": signal,
+        },
+    )
+
+
+OWNERSHIP = _load_driver_ownership_helpers()
+
+
+def _load_driver_request_flow() -> types.ModuleType:
+    """Load the request flow with local stand-ins for GPU/MPI dependencies."""
+    selected_names = {
+        "_Timeout",
+        "_TransferError",
+        "_FatalTransferError",
+        "_request_ids",
+        "_context_completion_error",
+        "_gen_completion_error",
+        "_can_release_sequence",
+        "_release_sequence_if_safe",
+        "_validate_context_completion",
+        "_validate_python_gen_completion",
+        "_first_reason",
+        "_exchange_release_decision",
+        "_wait_gen_complete",
+        "run_one_request",
+    }
+    return _load_driver_subset(
+        "cache_transceiver_harness_request_flow",
+        selected_names,
+        {
+            "Any": Any,
+            "Iterable": Iterable,
+            "Optional": Optional,
+            "Sequence": Sequence,
+            "MPI": types.SimpleNamespace(MAX="MAX", MIN="MIN"),
+            "LlmRequest": Any,
+            "LlmRequestState": types.SimpleNamespace(
+                DISAGG_GENERATION_TRANS_COMPLETE="gen_complete",
+                DISAGG_TRANS_ERROR="error",
+            ),
+            "add_sequence": MagicMock(),
+            "fill_request": MagicMock(),
+            "free_sequence": MagicMock(),
+            "make_request": MagicMock(),
+            "pickle": pickle,
+            "tensorrt_llm": types.SimpleNamespace(logger=MagicMock()),
+            "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(synchronize=MagicMock())),
+            "verify_request": MagicMock(),
+        },
+    )
+
+
+REQUEST_FLOW = _load_driver_request_flow()
 
 
 def _find_free_port():
@@ -158,6 +275,380 @@ class TestProcessHelpers:
             call(proc.pid, signal.SIGKILL),
         ]
         proc.wait.assert_not_called()
+
+
+class _FakeDecisionComm:
+    def __init__(self, *, reduced: Optional[int] = None) -> None:
+        self.reduced = reduced
+        self.abort_calls = []
+
+    def allreduce(self, value, op=None):
+        del op
+        return value if self.reduced is None else self.reduced
+
+    def gather(self, value, root=0):
+        del root
+        return [value]
+
+    def bcast(self, value, root=0):
+        del root
+        return value
+
+    def Abort(self, code):
+        self.abort_calls.append(code)
+
+
+class _FakeDecisionSocket:
+    def __init__(self, *responses) -> None:
+        self.responses = list(responses)
+        self.sent = []
+
+    def send(self, payload) -> None:
+        self.sent.append(pickle.loads(payload))
+
+    def recv(self):
+        return pickle.dumps(self.responses.pop(0))
+
+
+class _FakeRunSocket:
+    def __init__(self, responses, events) -> None:
+        self.responses = list(responses)
+        self.events = events
+        self.sent = []
+        self.recv_count = 0
+
+    def send(self, payload) -> None:
+        self.sent.append(payload if payload == b"go" else pickle.loads(payload))
+
+    def recv(self):
+        self.recv_count += 1
+        if self.recv_count == 2:
+            self.events.append("peer_ack")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, bytes):
+            return response
+        return pickle.dumps(response)
+
+
+class _FakeGenTransceiver:
+    def __init__(self, status, events, receive_error=None) -> None:
+        self.status = status
+        self.events = events
+        self.receive_error = receive_error
+
+    def request_and_receive_async(self, req) -> None:
+        del req
+        if self.receive_error is not None:
+            raise self.receive_error
+
+    def check_gen_transfer_status(self, timeout):
+        assert timeout is None
+        self.events.append("block_all")
+        if isinstance(self.status, BaseException):
+            raise self.status
+        return self.status
+
+
+class _FakeContextTransceiver:
+    def __init__(self, send_error) -> None:
+        self.send_error = send_error
+
+    def respond_and_send_async(self, req) -> None:
+        del req
+        raise self.send_error
+
+
+def _run_gen_request(
+    status,
+    state,
+    *,
+    final_response=("COMPLETE", ""),
+    receive_error=None,
+    synchronize_error=None,
+):
+    events = []
+    req = types.SimpleNamespace(py_request_id=7, state=state)
+    comm = _FakeDecisionComm()
+    sock = _FakeRunSocket(
+        [("OK", types.SimpleNamespace()), final_response],
+        events,
+    )
+    xcvr = _FakeGenTransceiver(status, events, receive_error=receive_error)
+
+    REQUEST_FLOW.make_request.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.make_request.return_value = req
+    REQUEST_FLOW.add_sequence.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.add_sequence.return_value = "handle"
+    REQUEST_FLOW.fill_request.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.free_sequence.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.free_sequence.side_effect = lambda *args: events.append("free")
+    REQUEST_FLOW.verify_request.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.verify_request.return_value = True
+    REQUEST_FLOW.torch.cuda.synchronize.reset_mock(return_value=True, side_effect=True)
+
+    def synchronize():
+        events.append("cuda_sync")
+        if synchronize_error is not None:
+            raise synchronize_error
+
+    REQUEST_FLOW.torch.cuda.synchronize.side_effect = synchronize
+    result = REQUEST_FLOW.run_one_request(
+        "gen",
+        comm,
+        "manager",
+        xcvr,
+        "PYTHON",
+        True,
+        2,
+        7,
+        16,
+        0,
+        sock,
+    )
+    return result, events, sock
+
+
+def _run_ctx_request(send_error):
+    events = []
+    req = types.SimpleNamespace(
+        py_request_id=7,
+        state="in_progress",
+        context_phase_params=types.SimpleNamespace(),
+    )
+    comm = _FakeDecisionComm()
+    sock = _FakeRunSocket([b"go"], events)
+    xcvr = _FakeContextTransceiver(send_error)
+
+    REQUEST_FLOW.make_request.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.make_request.return_value = req
+    REQUEST_FLOW.add_sequence.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.add_sequence.return_value = "handle"
+    REQUEST_FLOW.fill_request.reset_mock(return_value=True, side_effect=True)
+    REQUEST_FLOW.free_sequence.reset_mock(return_value=True, side_effect=True)
+    return REQUEST_FLOW.run_one_request(
+        "ctx",
+        comm,
+        "manager",
+        xcvr,
+        "PYTHON",
+        True,
+        2,
+        7,
+        16,
+        0,
+        sock,
+    )
+
+
+class TestRequestTransferOwnershipFlow:
+    @pytest.mark.parametrize(
+        ("status", "state"),
+        [
+            (([], [], []), "gen_complete"),
+            (([], [7], []), "error"),
+            (([], [], [7]), "in_progress"),
+            (([7], [], []), "in_progress"),
+        ],
+        ids=("missing", "failed", "cancelled", "nonterminal"),
+    )
+    def test_python_gen_unproven_completion_never_frees(self, status, state):
+        with pytest.raises(REQUEST_FLOW._FatalTransferError):
+            _run_gen_request(status, state, final_response=("FATAL", "gen unsafe"))
+
+        REQUEST_FLOW.free_sequence.assert_not_called()
+
+    def test_cuda_synchronize_error_before_release_handshake_never_frees(self):
+        with pytest.raises(REQUEST_FLOW._FatalTransferError):
+            _run_gen_request(
+                ([7], [], []),
+                "gen_complete",
+                final_response=("FATAL", "gen cuda synchronize failed"),
+                synchronize_error=RuntimeError("CUDA synchronize failed"),
+            )
+
+        REQUEST_FLOW.free_sequence.assert_not_called()
+
+    def test_gen_partial_dispatch_setup_error_is_fatal_and_never_frees(self):
+        with pytest.raises(REQUEST_FLOW._FatalTransferError, match="partial gen dispatch"):
+            _run_gen_request(
+                ([7], [], []),
+                "gen_complete",
+                receive_error=RuntimeError("partial gen dispatch"),
+            )
+
+        REQUEST_FLOW.free_sequence.assert_not_called()
+
+    def test_ctx_partial_dispatch_setup_error_is_fatal_and_never_frees(self):
+        with pytest.raises(REQUEST_FLOW._FatalTransferError, match="partial ctx dispatch"):
+            _run_ctx_request(RuntimeError("partial ctx dispatch"))
+
+        REQUEST_FLOW.free_sequence.assert_not_called()
+
+    @pytest.mark.parametrize("operation", ("receive", "block_all", "cuda_sync"))
+    def test_timeout_from_caught_driver_operation_propagates(self, operation):
+        timeout = REQUEST_FLOW._Timeout("cell deadline expired")
+        kwargs = {}
+        status = ([7], [], [])
+        if operation == "receive":
+            kwargs["receive_error"] = timeout
+        elif operation == "block_all":
+            status = timeout
+        else:
+            kwargs["synchronize_error"] = timeout
+
+        with pytest.raises(REQUEST_FLOW._Timeout, match="cell deadline expired"):
+            _run_gen_request(status, "gen_complete", **kwargs)
+
+        REQUEST_FLOW.free_sequence.assert_not_called()
+
+    def test_gen_frees_only_after_completion_sync_and_both_role_ack(self):
+        result, events, sock = _run_gen_request(([7], [], []), "gen_complete")
+
+        assert result is True
+        assert events == ["block_all", "cuda_sync", "peer_ack", "free"]
+        assert sock.sent == [b"go", ("COMPLETE", "")]
+        REQUEST_FLOW.free_sequence.assert_called_once_with(
+            "manager",
+            REQUEST_FLOW.make_request.return_value,
+            "handle",
+            True,
+        )
+
+    def test_context_fatal_ack_never_frees_completed_gen_sequence(self):
+        with pytest.raises(REQUEST_FLOW._FatalTransferError, match="ctx unsafe"):
+            _run_gen_request(
+                ([7], [], []),
+                "gen_complete",
+                final_response=("FATAL", "ctx unsafe"),
+            )
+
+        REQUEST_FLOW.free_sequence.assert_not_called()
+
+
+class TestTransferOwnershipHelpers:
+    def test_context_requires_exact_completed_request(self):
+        assert OWNERSHIP._context_completion_error(7, [7], [], "in_progress", "error") is None
+        assert "failed" in OWNERSHIP._context_completion_error(7, [], [7], "error", "error")
+        assert "without completing" in OWNERSHIP._context_completion_error(
+            7, [8], [], "in_progress", "error"
+        )
+
+    @pytest.mark.parametrize(
+        ("completed", "failed", "cancelled", "state", "expected"),
+        [
+            ([7], [], [], "gen_complete", None),
+            ([], [7], [], "error", "failed"),
+            ([], [], [types.SimpleNamespace(py_request_id=7)], "in_progress", "cancelled"),
+            ([], [], [], "in_progress", "without completing"),
+            ([7], [], [], "in_progress", "nonterminal"),
+        ],
+    )
+    def test_generation_requires_completed_terminal_request(
+        self, completed, failed, cancelled, state, expected
+    ):
+        error = OWNERSHIP._gen_completion_error(
+            7,
+            completed,
+            failed,
+            cancelled,
+            state,
+            "gen_complete",
+            "error",
+        )
+        if expected is None:
+            assert error is None
+        else:
+            assert expected in error
+
+    @pytest.mark.parametrize(
+        ("started", "completed", "should_release"),
+        [
+            (False, False, True),
+            (True, False, False),
+            (True, True, True),
+        ],
+    )
+    def test_release_sequence_requires_quiescence(self, started, completed, should_release):
+        OWNERSHIP.free_sequence.reset_mock()
+        released = OWNERSHIP._release_sequence_if_safe(
+            "manager",
+            types.SimpleNamespace(py_request_id=7),
+            "handle",
+            True,
+            transfer_may_have_started=started,
+            transfer_completed=completed,
+        )
+
+        assert released is should_release
+        assert OWNERSHIP.free_sequence.call_count == int(should_release)
+
+    def test_gen_release_handshake_requires_context_acknowledgement(self):
+        socket = _FakeDecisionSocket(("COMPLETE", ""))
+
+        safe, reason = OWNERSHIP._exchange_release_decision(
+            "gen", _FakeDecisionComm(), True, socket, True
+        )
+
+        assert safe and reason == ""
+        assert socket.sent == [("COMPLETE", "")]
+
+    def test_context_release_handshake_propagates_local_timeout(self):
+        socket = _FakeDecisionSocket(("COMPLETE", ""))
+
+        safe, reason = OWNERSHIP._exchange_release_decision(
+            "ctx",
+            _FakeDecisionComm(reduced=0),
+            True,
+            socket,
+            False,
+            "sender deadline expired",
+        )
+
+        assert not safe
+        assert reason == "sender deadline expired"
+        assert socket.sent == [("FATAL", "sender deadline expired")]
+
+    def test_release_handshake_rejects_invalid_peer_status(self):
+        socket = _FakeDecisionSocket(("UNKNOWN", ""))
+
+        safe, reason = OWNERSHIP._exchange_release_decision(
+            "gen", _FakeDecisionComm(), True, socket, True
+        )
+
+        assert not safe
+        assert "invalid" in reason
+
+    def test_context_release_handshake_sends_invalid_peer_verdict(self):
+        socket = _FakeDecisionSocket(("UNKNOWN", ""))
+
+        safe, reason = OWNERSHIP._exchange_release_decision(
+            "ctx", _FakeDecisionComm(), True, socket, True
+        )
+
+        expected = "invalid gen peer release status: 'UNKNOWN'"
+        assert not safe
+        assert reason == expected
+        assert socket.sent == [("FATAL", expected)]
+
+    def test_release_handshake_preserves_timeout(self):
+        socket = _FakeDecisionSocket()
+        socket.recv = MagicMock(side_effect=OWNERSHIP._Timeout("release deadline expired"))
+
+        with pytest.raises(OWNERSHIP._Timeout, match="release deadline expired"):
+            OWNERSHIP._exchange_release_decision("gen", _FakeDecisionComm(), True, socket, True)
+
+    def test_hard_abort_falls_back_to_sigkill(self, monkeypatch):
+        comm = _FakeDecisionComm()
+        kill = MagicMock()
+        monkeypatch.setattr(OWNERSHIP.os, "kill", kill)
+
+        with pytest.raises(RuntimeError, match="SIGKILL unexpectedly returned"):
+            OWNERSHIP._hard_abort_process(comm)
+
+        assert comm.abort_calls == [137]
+        kill.assert_called_once_with(os.getpid(), signal.SIGKILL)
 
 
 def _build_config(work_dir: str) -> dict:

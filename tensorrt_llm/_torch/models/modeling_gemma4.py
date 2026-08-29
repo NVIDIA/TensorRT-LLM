@@ -14,9 +14,10 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import copy
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -58,10 +60,16 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
+from .modeling_speculative import (
+    _SPECULATIVE_POSITION_HEADROOM,
+    SpecDecOneEngineForCausalLM,
+    _slice_spec_position_ids,
+)
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -73,6 +81,17 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+def _gemma4_rope_max_positions(model_config: ModelConfig) -> int:
+    """Size RoPE for transient speculative positions beyond max_seq_len."""
+    max_positions = model_config.pretrained_config.max_position_embeddings
+    spec_config = model_config.spec_config
+    if spec_config is not None:
+        # Overlap can have one pending verification width, while the current target and shared,
+        # Q-only assistant consume the next one.
+        max_positions += 2 * spec_config.tokens_per_gen_step
+    return max_positions
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +242,7 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
-        rope_params.max_positions = config.max_position_embeddings
+        rope_params.max_positions = _gemma4_rope_max_positions(model_config)
         if is_sliding:
             # Sliding: default RoPE, theta=10K, full rotation
             rope_config = (
@@ -328,14 +347,10 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # Use trtllm-gen for ALL layers.  trtllm-gen has pre-compiled cubins
-        # for both H256+SWA and H512 across all supported dtypes.
-        # For FP8 KV cache (NVFP4), Q is also cast to FP8 in the FlashInfer
-        # backend so that QkvE4m3OBfloat16 context cubins can be used
-        # (context cubins require same Q/KV dtype; decode cubins support
-        # mixed dtypes natively).  Uniform backend avoids workspace
-        # corruption between different wrapper types under CUDA graphs.
-        self.attn.flashinfer_backend = "trtllm-gen"
+        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
+        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
+        # multimodal custom masks then use FlashInfer's native mask planning.
+        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -1228,6 +1243,8 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    build_mtp_draft_model_from_config = True
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -1250,7 +1267,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
         FlashInfer backend is required for hybrid attention (per-layer
@@ -1260,6 +1277,23 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         return {
             "attn_backend": "FLASHINFER",
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Gemma4's VSWA layout.
+
+        Hybrid-attention checkpoints (per-layer head_dim) are routed to V2
+        unconditionally regardless of this preference.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.
@@ -1305,11 +1339,10 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """Build context mask with causal + bidirectional for MM tokens.
 
         Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) are True for
-          all rows. SWA window enforcement is delegated to the kernel's
-          window_left clip. Bidirectional MM across the prefix/extend
-          boundary is NOT supported here; callers must ensure chunk
-          boundaries do not split a multimodal block.
+        - The first `prefix_len` columns (cached/paged history) apply the
+          sliding window using absolute token positions. Bidirectional MM
+          across the prefix/extend boundary is NOT supported here; callers
+          must ensure chunk boundaries do not split a multimodal block.
         - The last `extend_len` columns follow the original causal +
           (optional) sliding window + MM-bidirectional logic.
         """
@@ -1326,9 +1359,19 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
 
         if prefix_len > 0:
-            prefix_block = torch.ones(
-                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-            )
+            if (
+                effective_sliding_window is not None
+                and effective_sliding_window < prefix_len + extend_len
+            ):
+                query_pos = prefix_len + pos
+                prefix_pos = torch.arange(prefix_len, device=device)
+                prefix_block = (
+                    prefix_pos.unsqueeze(0) > query_pos.unsqueeze(1) - effective_sliding_window
+                )
+            else:
+                prefix_block = torch.ones(
+                    extend_len, prefix_len, dtype=causal_mask.dtype, device=device
+                )
             causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
 
         return causal_mask
@@ -1579,9 +1622,16 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
 
     def __init__(self, model_config: ModelConfig):
         assistant_config = model_config.pretrained_config
+        assistant_text_config = copy.deepcopy(assistant_config.text_config)
+        # The assistant is deliberately built without `spec_config` to avoid recursive speculative
+        # initialization. Carry only its fixed physical position headroom through the internal model
+        # attributes instead.
+        assistant_text_config.max_position_embeddings += model_config.extra_attrs.get(
+            _SPECULATIVE_POSITION_HEADROOM, 0
+        )
         text_model_config = dataclasses.replace(
             model_config,
-            pretrained_config=assistant_config.text_config,
+            pretrained_config=assistant_text_config,
             spec_config=None,
         )
         super().__init__(

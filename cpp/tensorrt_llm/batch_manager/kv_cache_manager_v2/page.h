@@ -130,7 +130,6 @@ public:
     KvCache* kvCache;
     BlockOrdinal ordinal;
     BeamIndex beamIndex;
-    std::vector<TokenIdExt> tokens;
 
     UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc, CacheLevel level, BeamIndex bi = kDefaultBeamIndex);
 

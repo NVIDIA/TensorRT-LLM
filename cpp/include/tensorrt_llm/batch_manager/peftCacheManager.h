@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@
 
 #include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -125,6 +127,11 @@ public:
 
     [[nodiscard]] bool isTaskCachedDevice(uint64_t const taskId) const;
 
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const;
+
+    //! Configure the homogeneous LoRA weight dtype before inserting an adapter.
+    void configureDataType(tensorrt_llm::DataType dataType);
+
     void resetDeviceCache() override;
 
     void markRequestDone(LlmRequest const& llmReq, bool pause = false) override;
@@ -157,6 +164,15 @@ public:
     void prefetchLoraWeights(std::string const& modelDir, runtime::BufferManager const& bufferManager);
 
 private:
+    static std::pair<uint64_t, uint64_t> getMaxNumSlots(PeftCacheManagerConfig const& config,
+        tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
+        std::optional<uint64_t> deviceCacheByteBudget);
+
+    static std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConfig> getPageManagerConfig(
+        PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig, tensorrt_llm::DataType dataType,
+        std::optional<uint64_t> deviceCacheByteBudget);
+
     std::unique_ptr<runtime::LoraCache> mHostLoraCache;
     std::unique_ptr<runtime::LoraCache> mDeviceLoraCache;
 
@@ -174,6 +190,11 @@ private:
 
     runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
+    PeftCacheManagerConfig mConfig;
+    std::optional<uint64_t> mDeviceCacheByteBudget;
+
+    mutable std::mutex mDataTypeMutex;
+    std::optional<tensorrt_llm::DataType> mDataType;
 
     int mDevice{-1};
 };

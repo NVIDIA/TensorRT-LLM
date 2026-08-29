@@ -29,8 +29,8 @@ There are multiple MOE backends inside TensorRT LLM, not all of them supporting 
 | H100/H200 | FP8 | CUTLASS |
 | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
 | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
-| GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
-| GB200 NVL72 EP>8 | FP8 | WIDEEP without EPLB |
+| GB200 NVL72 EP>8 | NVFP4 |  CUTEDSL |
+| GB200 NVL72 EP>8 | FP8 | DEEPGEMM |
 
 The default moe backend is `CUTLASS`, so for the combination which is not supported by `CUTLASS`, one must set the `moe_config.backend` explicitly to run the model.
 
@@ -207,7 +207,7 @@ See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/ref
 Add the following fields to the YAML configuration file `/tmp/config.yml` to enable wide EP:
 ```yaml
 moe_config:
-    backend: WIDEEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer:  # configure online EP balancer
       num_slots: 288

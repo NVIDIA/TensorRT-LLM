@@ -8,7 +8,7 @@
   * The main sparse GQA runs through the registered MsaSparseGqaFmha.
   * The indexer calls fmha_sm100 directly to produce the per-query selected
     block indices, which the model layer threads through
-    forward_args.topk_indices.
+    forward_args.sparse_backend_args.
   * MiniMaxM3MsaSparseAttentionMetadata subclasses TrtllmAttentionMetadata and
     stores its per-forward MSA tensors in CUDA-graph-stable buffers.
     The buffers are allocated once in __post_init__ via
@@ -32,6 +32,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
 
 from .common import (
@@ -265,12 +266,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
-        """Per-request query length (host int32), from the base seq_lens."""
+        """Per-request query length (host int32), from the base seq_lens.
+
+        Pinned where pinning helps, as with the other two length properties:
+        the planners stage them to the device with non-blocking copies, which
+        degrade to a synchronous staging copy from pageable memory.
+        """
         seq_lens = self.seq_lens
         if seq_lens is None:
             return None
         out = seq_lens[: self.num_seqs]
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_kv_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -279,7 +287,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if self.seq_lens is None or kv_lens is None:
             return None
         out = kv_lens[: self.num_seqs]
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_qo_offset_cpu(self) -> Optional[torch.Tensor]:
@@ -288,7 +298,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv = self.msa_kv_lens_cpu
         if qo is None or kv is None:
             return None
-        return kv - qo
+        return maybe_pin_memory(kv - qo)
 
     @property
     def msa_decode_proxy_plan(self) -> Optional[tuple]:
@@ -678,14 +688,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
         # (num_cached) and decode (kv_len - 1 with qo_len 1).
-        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+        mapping = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
         )
-        kv_indices = build_kv_page_indices(req_to_token, slot_ids, kv_lens_cpu, page_size)
+        out_cache_loc = mapping.out_cache_loc
+        # The page table comes from the same host block ids the mapping was
+        # built from, so it costs no device work.
+        kv_indices = build_kv_page_indices(mapping.block_ids_cpu, kv_lens_cpu, page_size)
 
         total_new_tokens = int(out_cache_loc.shape[0])
         total_pages = int(kv_indices.shape[0])
@@ -776,6 +789,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             head_dim=head_dim,
         )
         self.disable_index_value = bool(sparse_params.disable_index_value)
+        self.indexer_kv_dtype = str(sparse_params.indexer_kv_dtype)
         self._validate_msa_preconditions()
         self.indexer = MsaIndexer(self.m3_config)
 
@@ -809,7 +823,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     def run_indexer(
         self,
         idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_k: Optional[torch.Tensor],
         metadata,
         *,
         idx_sm_scale: Optional[float] = None,
@@ -817,18 +831,48 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         """Write the index-K cache and return the selected block indices.
 
         The model layer runs this before forward and threads the result through
-        forward_args.topk_indices. Returns [total_q, num_kv_heads, topk].
+        forward_args.sparse_backend_args. Returns [total_q, num_kv_heads, topk].
         Decode uses the prebuilt graph-safe proxy plan; prefill and mixed
         batches use the prebuilt eager proxy plan.
         """
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
+        # Preserve split column views without allowing an implicit copy. The
+        # scorer and cache writer below both honor their source strides.
+        head_major_output = (
+            int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
+        )
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
-        idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
-
-        metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
+        configured_for_fp8 = self.indexer_kv_dtype == "fp8"
+        expected_cache_dtype = torch.float8_e4m3fn if configured_for_fp8 else torch.bfloat16
+        if idx_k_cache.dtype != expected_cache_dtype:
+            raise ValueError(
+                "MiniMax-M3 index-K cache dtype does not match indexer_kv_dtype="
+                f"{self.indexer_kv_dtype!r}: expected {expected_cache_dtype}, "
+                f"got {idx_k_cache.dtype}."
+            )
+        if configured_for_fp8:
+            if idx_q_view.dtype != torch.float8_e4m3fn or idx_k is not None:
+                raise ValueError(
+                    "The MiniMax-M3 FP8 indexer requires fused FP8 index-Q and "
+                    "an already-populated index-K cache (live index-K must be None)."
+                )
+        else:
+            if idx_q_view.dtype != torch.bfloat16 or idx_k is None or idx_k.dtype != torch.bfloat16:
+                live_k_dtype = None if idx_k is None else idx_k.dtype
+                raise ValueError(
+                    "The MiniMax-M3 BF16 indexer requires BF16 index-Q and a live "
+                    f"BF16 index-K tensor; got Q={idx_q_view.dtype}, K={live_k_dtype}."
+                )
+            idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
+            metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+        # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
+        # index Q/K are cast directly and the proxy accumulates their QK scores
+        # in FP32. Block ordering is invariant to the omitted positive scale.
+        # The fused production path arrives here with E4M3 Q and an already
+        # populated cache; the BF16 path writes its live K above.
 
         # One selection path. Decode passes the graph-safe proxy plan plus the
         # proxy scratch shaped to the live query count. Prefill and mixed batches
@@ -861,6 +905,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
+            head_major_output=head_major_output,
         )
 
     def sparse_attn_predict(
@@ -870,10 +915,11 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         metadata,
         forward_args: "AttentionForwardArgs",
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # The model layer runs run_indexer and passes the selected block
-        # indices through forward_args.topk_indices. Publish them as the
-        # sparse attention indices MsaSparseGqaFmha reads.
-        return forward_args.topk_indices, None
+        # The model layer runs run_indexer and passes the selected blocks
+        # through the sparse backend payload.
+        sparse_backend_args = forward_args.sparse_backend_args
+        topk_indices = sparse_backend_args.topk_indices if sparse_backend_args is not None else None
+        return topk_indices, None
 
     def sparse_kv_predict(
         self,

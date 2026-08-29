@@ -1,16 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, Optional
 
 import torch
 
 from ...._utils import nvtx_range
 from ....logger import logger
-from ....lora_manager import LoraManager, LoraModelConfig
 from ...attention_backend.interface import AttentionMetadata
 from ...pyexecutor.resource_manager import PeftCacheManager
 from ...pyexecutor.scheduler import ScheduledRequests
 from .adapter_slot_manager import AdapterSlotManager
 from .cuda_graph_lora_params import CudaGraphLoraParams
 from .layer import LoraLayer
+from .manager import LoraManager, LoraModelConfig
 
 
 class CudaGraphLoraManager:
@@ -29,6 +44,7 @@ class CudaGraphLoraManager:
         max_lora_rank: int,
         model: torch.nn.Module,
         lora_model_config: Optional[LoraModelConfig],
+        overlap_lora_and_base: bool = False,
         device: str = "cuda",
         max_tokens_per_seq: int = 1,
     ):
@@ -41,6 +57,7 @@ class CudaGraphLoraManager:
             max_lora_rank: Maximum LoRA rank across all layers
             model: Model to get layerwise LoRA info
             lora_model_config: LoRA model configuration
+            overlap_lora_and_base: Whether to overlap LoRA and base model computations.
             device: Device to allocate tensors on
             max_tokens_per_seq: Maximum number of tokens per sequence (>1 for spec decode)
         """
@@ -52,6 +69,7 @@ class CudaGraphLoraManager:
         self.max_tokens_per_seq = max_tokens_per_seq
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
+        self.lora_aux_stream = torch.cuda.Stream(device=device) if overlap_lora_and_base else None
         lora_target_modules = lora_model_config.lora_target_modules
         self.target_modules_ids: Optional[tuple[int, ...]] = (
             tuple(map(LoraManager.LORA_MODULE_IDS.__getitem__, lora_target_modules))
@@ -209,6 +227,17 @@ class CudaGraphLoraManager:
             "prompt_lens_cpu": attn_metadata.prompt_lens_cpu,
             "num_seqs": attn_metadata.num_seqs,
             "use_cuda_graph_mode": True,  # Flag to indicate new mode
+            "data_type": peft_cache_manager.data_type,
+            "lora_aux_stream": self.lora_aux_stream,
         }
 
         return lora_params
+
+    def prepare_base_only_batch(
+        self,
+        peft_cache_manager: Optional[PeftCacheManager],
+    ) -> None:
+        """Maintain PEFT cache state for a base-only CUDA graph iteration."""
+        if peft_cache_manager is not None:
+            peft_cache_manager.get_and_reset_batch_peft_table()
+            self.adapter_slot_manager.remove_evicted_slots_in_cpp(peft_cache_manager)

@@ -194,6 +194,7 @@ def _set_seed():
     torch.manual_seed(42)
 
 
+@pytest.mark.cpu_only
 def test_hf_reference_available():
     if HF_CLASSES is None:
         pytest.skip("transformers gemma3n reference classes are unavailable")
@@ -289,6 +290,7 @@ def test_gemma3n_decoder_layer_equivalence():
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Decoder layer: ")
 
 
+@pytest.mark.cpu_only
 @torch.no_grad()
 def test_gemma3n_full_model_equivalence():
     if HF_CLASSES is None:
@@ -310,6 +312,7 @@ def test_gemma3n_full_model_equivalence():
     assert_rmse_close(custom_out.logits, hf_out.logits, rmse_ratio_tol=0.05, msg="Full model: ")
 
 
+@pytest.mark.cpu_only
 @torch.no_grad()
 def test_gemma3n_conditional_wrapper_equivalence():
     if HF_CLASSES is None:
@@ -335,6 +338,7 @@ def test_gemma3n_conditional_wrapper_equivalence():
     assert_rmse_close(wrapper_out.logits, hf_out.logits, rmse_ratio_tol=0.05, msg="Wrapper: ")
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_conditional_wrapper_load_hook_drops_unsupported_tower_weights():
     config = _small_full_config()
     wrapper = Gemma3nForConditionalGeneration(config)
@@ -348,12 +352,14 @@ def test_gemma3n_conditional_wrapper_load_hook_drops_unsupported_tower_weights()
     assert unexpected == []
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_conditional_wrapper_ignores_hf_init_kwargs():
     config = _small_full_config()
     wrapper = Gemma3nForConditionalGeneration(config, use_cache=False)
     assert isinstance(wrapper, Gemma3nForConditionalGeneration)
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_reduced_layer_load_hook_slices_per_layer_weights():
     source_model = Gemma3nForCausalLM(_extended_text_config(5))
     target_model = Gemma3nForCausalLM(_small_text_config())
@@ -364,11 +370,13 @@ def test_gemma3n_reduced_layer_load_hook_slices_per_layer_weights():
     assert "model.layers.3.self_attn.q_proj.weight" in unexpected
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_causal_lm_ties_lm_head_to_input_embeddings():
     model = Gemma3nForCausalLM(_small_text_config())
     assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_conditional_lm_ties_lm_head_to_input_embeddings():
     model = Gemma3nForConditionalGeneration(_small_full_config())
     assert (
@@ -376,6 +384,7 @@ def test_gemma3n_conditional_lm_ties_lm_head_to_input_embeddings():
     )
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_shared_kv_layer_metadata_matches_config():
     model = Gemma3nForCausalLM(_shared_kv_text_config())
     layer_expectations = [
@@ -392,6 +401,7 @@ def test_gemma3n_shared_kv_layer_metadata_matches_config():
         assert layer.self_attn.kv_shared_layer_index == source_idx
 
 
+@pytest.mark.cpu_only
 def test_gemma3n_export_uses_shared_kv_attention_for_shared_layers():
     config = _shared_kv_text_config()
     model = Gemma3nForCausalLM(config).eval()

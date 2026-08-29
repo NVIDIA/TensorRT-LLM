@@ -3,6 +3,7 @@ import torch
 from utils.util import woq_assert_near_eq, woq_groupwise_gt_matmul
 
 import tensorrt_llm
+import tensorrt_llm.quantization.functional
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
     FinegrainedMixedDtypeGemm
 from tensorrt_llm._utils import get_sm_version

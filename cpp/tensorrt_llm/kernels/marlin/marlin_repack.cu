@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -323,8 +323,8 @@ void gptq_marlin_repack_dispatch(uint32_t const* b_q_weight_ptr, uint32_t const*
     int size_k, int size_n, int num_bits, bool has_perm, bool is_a_8bit, cudaStream_t stream)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
-    TLLM_CHECK_WITH_INFO(isMarlinNvfp4SmSupported(sm),
-        "Marlin NVFP4 repack is only supported on Ada (SM89) and Hopper (SM90-99); current SM = %d", sm);
+    TLLM_CHECK_WITH_INFO(isMarlinNvfp4DenseSmSupported(sm),
+        "Marlin NVFP4 repack is only supported on SM89, SM90-99, and SM120/121; current SM = %d", sm);
 
     int blocks;
     int dev;

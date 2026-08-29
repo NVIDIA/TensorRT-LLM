@@ -31,7 +31,7 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -45,6 +45,7 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
@@ -52,7 +53,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -61,6 +62,7 @@ from ..distributed import (
     MoEAllReduceParams,
     allgather,
 )
+from ..mmap_utils import pageout_file_backed_regions
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -68,15 +70,14 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
-    MoE,
     MoEWeightLoadingMode,
     TritonFusedMoE,
     TRTLLMGenFusedMoE,
     create_moe,
-    get_moe_cls,
+    is_moe_weight_owner,
+    resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -460,6 +461,11 @@ def _remap_deepseek_v4_checkpoint_keys(
             return
         tensor = _maybe_view_deepseek_v4_routed_moe_tensor(model_key, tensor, routed_moe_scale_name)
         out[model_key] = tensor
+        # Hopper's W4A16 MXFP4 loader consumes the legacy suffix, while the
+        # Blackwell loaders consume the canonical suffix. Both keys reference
+        # the same packed E8M0 scale tensor.
+        if ".mlp.experts." in model_key and model_key.endswith(".weight_scale"):
+            out[f"{model_key}_inv"] = tensor
 
     for k, v in weights.items():
         # Top-level keys that don't go through the layer/mtp branches.
@@ -575,11 +581,12 @@ class DeepseekV4WeightLoader:
         # presence of any top-level "layers." key; HF-style checkpoints use
         # "model.layers." and skip this branch.
         if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
-            weights = _remap_deepseek_v4_checkpoint_keys(
+            remapped_weights = _remap_deepseek_v4_checkpoint_keys(
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
             )
+            weights = ConsumableWeightsDict.take_ownership(weights, remapped_weights)
             # Synthesize defaults (with correct shape pulled from the model)
             # for parameters the model has but the V4 checkpoint omits. We do
             # this in one place vs scattering zero-fills through the per-
@@ -836,6 +843,21 @@ class DeepseekV4WeightLoader:
         params_map = {"gate_up_proj": ["gate_proj", "up_proj"]}
         all_named_modules = dict(self.model.named_modules())
 
+        can_mark_consumed = isinstance(weights, ConsumableWeightsDict)
+        ckpt_num_nextn_predict_layers = getattr(
+            self.config, "_ckpt_num_nextn_predict_layers", None
+        ) or getattr(self.config, "num_nextn_predict_layers", None)
+        model_nextn_predict_layers = getattr(self.config, "num_nextn_predict_layers", None) or 0
+        has_shared_mtp_weights = (
+            model_nextn_predict_layers > (ckpt_num_nextn_predict_layers or 0) > 0
+        )
+        pageout_eplb_weights = getattr(self.model_config, "moe_load_balancer", None) is not None
+
+        def pageout_previous_moe_layer() -> None:
+            """Release file-backed pages after the previous MoE layer load."""
+            torch.cuda.synchronize()
+            pageout_file_backed_regions(".safetensors", mode="dontneed")
+
         def load_flat_hc_weights(module, names: List[str]) -> bool:
             """Load mHC / HCHead from flat ckpt keys: ``<stem>_{fn,base,scale}``.
 
@@ -860,6 +882,12 @@ class DeepseekV4WeightLoader:
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if name.startswith("draft_model"):
                 continue
+            if pageout_eplb_weights and name.endswith("experts.backend"):
+                # Static EPLB permutes experts across the checkpoint, causing
+                # every EP rank to fault pages from many safetensors shards.
+                # Bound the resident file cache at one MoE layer instead of
+                # allowing it to accumulate for the entire checkpoint.
+                pageout_previous_moe_layer()
             names = name.split(".")
             parent_module_name = ".".join(names[:-1])
 
@@ -879,13 +907,16 @@ class DeepseekV4WeightLoader:
             elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
+                is_shared_mtp_layer = False
                 if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
+                    is_shared_mtp_layer = has_shared_mtp_weights
                     mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
                     names[2] = str(
                         mtp_layer_idx % self.config.num_nextn_predict_layers
                         + self.config.num_hidden_layers
                     )
                     name = ".".join(names)
+                mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
                     dequant_kv_b_proj = (
@@ -945,6 +976,8 @@ class DeepseekV4WeightLoader:
                                 .view(*attn_module.v_b_proj_dequant.shape)
                                 .to(attn_module.v_b_proj_dequant.dtype)
                             )
+                    if mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = (
                         self.model_config.get_quant_config().layer_quant_mode.has_nvfp4()
@@ -1077,6 +1110,11 @@ class DeepseekV4WeightLoader:
                         # For DeepseekV32: kv_a_proj_with_mqa is oversized
                         # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0 : fused_a.shape[0]].copy_(fused_a)
+                    if mark_consumed:
+                        parent_prefix = ".".join(names[:-1])
+                        weights.mark_consumed(f"{parent_prefix}.kv_a_proj_with_mqa")
+                        if not is_lite:
+                            weights.mark_consumed(f"{parent_prefix}.q_a_proj")
                 elif names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -1084,6 +1122,9 @@ class DeepseekV4WeightLoader:
                             filter_weights(".".join(names[:-1] + [new_name]), weights)
                         )
                     module.load_weights(weights=module_weights)
+                    if mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed(".".join(names[:-1] + [src_name]))
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(
@@ -1095,7 +1136,9 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                    if mark_consumed:
+                        weights.mark_consumed(name)
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -1113,6 +1156,8 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
+                    if mark_consumed:
+                        weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     if f"{name}.o_a_proj" in weights:
                         load_o_a_proj(name, module)
@@ -1364,9 +1409,6 @@ class DeepseekV4Attention(MLA):
             reduce_output=reduce_output,
         )
 
-        self.indexer = getattr(self.mqa, "indexer", None)
-        self.compressor = getattr(self.mqa, "compressor", None)
-
 
 class DeepseekV4Gate(nn.Module):
     def __init__(
@@ -1507,15 +1549,26 @@ class DeepseekV4MoE(nn.Module):
         moe_swiglu_limit = None
         if swiglu_limit is not None:
             # `create_moe` only accepts swiglu_limit for these MoE classes;
-            # resolve via get_moe_cls so backend-string fallbacks (e.g.
-            # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
-            # unsupported quant) are handled correctly.
-            moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            # ask the resolver rather than the backend string so that a
+            # degradation (e.g. TRTLLM/CUTEDSL/DENSEGEMM dropping back to
+            # CutlassFusedMoE on unsupported quant) is accounted for here too.
+            moe_cls = resolve_moe_cls(
+                model_config,
+                override_quant_config=experts_quant_config,
+                dtype=dtype,
+                # Same routing object as create_moe below.
+                routing=self.gate.routing_method,
+                # create_moe below passes no bias and no swiglu alpha/beta, so
+                # it resolves with the plain SwiGLU package. Say so here too:
+                # leaving this unknown lets gates abstain that create_moe
+                # rejects, and the two calls would pick different backends.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            )
             supports_swiglu_limit = moe_cls in (
                 CutlassFusedMoE,
                 TritonFusedMoE,
                 TRTLLMGenFusedMoE,
-                WideEPMoE,
                 DeepGemmFusedMoE,
             )
             # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
@@ -1523,8 +1576,7 @@ class DeepseekV4MoE(nn.Module):
             # swiglu_limit is supplied; drop the limit there until the cubin
             # gains a no-bias clamp variant. MXFP4 variants are unaffected.
             kernel_requires_bias_for_swiglu_limit = (
-                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
-                and experts_quant_config.quant_mode.has_nvfp4()
+                moe_cls is TRTLLMGenFusedMoE and experts_quant_config.quant_mode.has_nvfp4()
             )
             # DeepSeek-V4 supplies a uniform scalar limit. The TRTLLM-Gen FP8
             # path consumes it directly and rejects the redundant tensor.
@@ -1690,7 +1742,6 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
@@ -2539,13 +2590,35 @@ class DeepseekV4Model(DecoderModel):
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        return {
-            "kv_cache_config": {
-                "tokens_per_block": 128,
-                "use_kv_cache_manager_v2": True,
-                "enable_swa_scratch_reuse": True,
-            }
+        kv_cache_defaults = {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
         }
+        if get_sm_version() == 90:
+            kv_cache_defaults["dtype"] = "fp8_ds_mla"
+        elif llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
+            kv_cache_defaults["tokens_per_block"] = 256
+        return {"kv_cache_config": kv_cache_defaults}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for DeepSeek-V4."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        DeepSeek-V4 runs DeepseekV4CacheManager, a KVCacheManagerV2
+        subclass that the C++ transceiver cannot drive; the disaggregated
+        tests pin NIXL + PYTHON for the same reason. This routes the
+        fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)

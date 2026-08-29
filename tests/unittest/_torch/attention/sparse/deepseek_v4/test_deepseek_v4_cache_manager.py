@@ -21,7 +21,7 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -97,6 +97,7 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager._max_draft_len = 0
     manager._max_num_tokens = 1024
@@ -131,6 +132,7 @@ def test_needed_resource_uses_context_swa_scratch_slope():
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager.tokens_per_block = 128
     manager.num_extra_kv_tokens = 0
