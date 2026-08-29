@@ -51,7 +51,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_binding
+from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -545,7 +545,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         sm = get_sm_version()
-        if not is_sm_100f(sm):
+        if sm not in (100, 103):
             logger.debug(
                 f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
             )
