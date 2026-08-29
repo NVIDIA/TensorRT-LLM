@@ -37,6 +37,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 
 
@@ -98,6 +100,20 @@ class _Attention:
         )
         self.rotary_inv_freq = None
         self.rotary_cos_sin = None
+
+
+def _make_v1_manager(**attributes: object) -> KVCacheManager:
+    manager = object.__new__(KVCacheManager)
+    for name, value in attributes.items():
+        setattr(manager, name, value)
+    return manager
+
+
+def _make_v2_manager(**attributes: object) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    for name, value in attributes.items():
+        setattr(manager, name, value)
+    return manager
 
 
 def _support_result(
@@ -178,6 +194,21 @@ def _support_result(
     else:
         num_contexts, num_generations, num_ctx_tokens = 1, 1, 3
         kv_lens = [3, 128]
+    if use_kv_cache_v2:
+        kv_cache_manager = _make_v2_manager(
+            dtype=kv_dtype,
+            impl=SimpleNamespace(get_page_index_upper_bound=lambda *args: 128),
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            num_local_layers=1,
+            num_pools=num_kv_cache_pools,
+        )
+    else:
+        kv_cache_manager = _make_v1_manager(
+            dtype=kv_dtype,
+            impl=SimpleNamespace(),
+            num_local_layers=1,
+            num_pools=num_kv_cache_pools,
+        )
     metadata = SimpleNamespace(
         helix_position_offsets=None,
         num_sparse_topk=0,
@@ -188,17 +219,7 @@ def _support_result(
         kv_cache_block_offsets=torch.empty(1) if has_paged_cache else None,
         host_kv_cache_pool_pointers=torch.empty(1),
         host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(
-            dtype=kv_dtype,
-            impl=(
-                SimpleNamespace(get_page_index_upper_bound=lambda *args: 128)
-                if use_kv_cache_v2
-                else SimpleNamespace()
-            ),
-            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
-            num_local_layers=1,
-            num_pools=num_kv_cache_pools,
-        ),
+        kv_cache_manager=kv_cache_manager,
         is_cross=is_cross,
         beam_width=beam_width,
         tokens_per_block=tokens_per_block,
@@ -663,10 +684,8 @@ def test_v2_total_page_bound_is_not_expanded() -> None:
     fmha = PrimsTSFmha(attn)
     get_page_index_upper_bound = Mock(return_value=4096)
     metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound),
-            blocks_in_primary_pool=4096,
-            num_local_layers=24,
+        kv_cache_manager=_make_v2_manager(
+            impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
         )
     )
 
@@ -680,12 +699,10 @@ def test_v1_total_page_bound_excludes_slots_before_selected_layer(is_mla: bool) 
     attn.local_layer_idx = 3
     fmha = PrimsTSFmha(attn)
     metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_make_v1_manager(
             impl=SimpleNamespace(
                 get_primary_pool_data=lambda _: torch.empty(64, dtype=torch.uint8)
             ),
-            blocks_in_primary_pool=64,
-            num_local_layers=4,
         ),
         host_kv_cache_pool_mapping=torch.tensor(
             [[0, 0], [0, 1], [0, 2], [0, 3]], dtype=torch.int32
@@ -700,7 +717,7 @@ def test_kv_page_offset_uses_v2_manager_displacement() -> None:
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_make_v2_manager(
             impl=SimpleNamespace(get_page_index_upper_bound=lambda *args: 128),
             kv_offset=torch.tensor([0, 128]),
         ),
@@ -718,7 +735,7 @@ def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
         dtype=torch.int32,
     )
     metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_make_v1_manager(
             impl=SimpleNamespace(),
             host_kv_cache_block_offsets=host_offsets,
         ),
@@ -885,7 +902,7 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
         kv_cache_block_offsets=torch.empty((3, 2, 4), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_make_v1_manager(
             impl=SimpleNamespace(),
             host_kv_cache_block_offsets=host_block_offsets,
         ),
@@ -1080,7 +1097,7 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
         kv_cache_block_offsets=torch.empty((2, 2, 4), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_make_v2_manager(
             impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound),
             kv_offset=torch.tensor([6], dtype=torch.int32),
         ),
@@ -1637,7 +1654,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_make_v2_manager(
             impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
         ),
     )

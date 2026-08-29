@@ -26,6 +26,8 @@ import torch
 from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import binding_to_torch_dtype, get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -205,13 +207,10 @@ class PrimsTSFmha(PhasedFmha):
         if meta.kv_layout != "HND":
             return False, "only HND KV-cache layout is supported."
         kv_cache_manager = meta.kv_cache_manager
-        get_page_index_upper_bound = getattr(
-            kv_cache_manager.impl, "get_page_index_upper_bound", None
-        )
-        if callable(get_page_index_upper_bound):
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
             if kv_cache_manager.enable_swa_scratch_reuse:
                 return False, "KVCacheManagerV2 SWA scratch reuse is not supported."
-        else:
+        elif isinstance(kv_cache_manager, KVCacheManager):
             if kv_cache_manager.num_pools != 1:
                 return False, "KVCacheManagerV1 with multiple memory pools is not supported."
             pool_mapping = meta.host_kv_cache_pool_mapping
@@ -229,6 +228,8 @@ class PrimsTSFmha(PhasedFmha):
             layer_idx_in_pool = int(pool_mapping[local_layer_idx, 1])
             if pool_index != 0 or not 0 <= layer_idx_in_pool < num_local_layers:
                 return False, "KVCacheManagerV1 has an invalid layer-to-pool mapping."
+        else:
+            return False, f"unsupported KV cache manager {type(kv_cache_manager).__name__}."
 
         output = fwd.output
         if output is None:
@@ -424,35 +425,38 @@ class PrimsTSFmha(PhasedFmha):
         if cached is not None:
             return cached
 
-        get_page_index_upper_bound = getattr(manager.impl, "get_page_index_upper_bound", None)
-        if callable(get_page_index_upper_bound):
+        if isinstance(manager, KVCacheManagerV2):
             kv_offsets = manager.kv_offset
             kv_offset = int(kv_offsets[pool_index])
             if kv_offset > 0:
                 self._kv_page_offset_cache[cache_key] = kv_offset
                 return kv_offset
-
-        host_block_offsets = manager.host_kv_cache_block_offsets
-        if host_block_offsets is None or host_block_offsets.ndim != 4:
-            return None
-        if pool_index >= host_block_offsets.shape[0]:
             return None
 
-        rows = host_block_offsets[pool_index]
-        if 0 <= seq_offset < rows.shape[0]:
-            row_deltas = rows[seq_offset, 1] - rows[seq_offset, 0]
-            positive = row_deltas[row_deltas > 0]
-            if positive.numel() > 0:
-                kv_offset = int(positive[0])
-                self._kv_page_offset_cache[cache_key] = kv_offset
-                return kv_offset
-        all_deltas = rows[:, 1] - rows[:, 0]
-        positive = all_deltas[all_deltas > 0]
-        if positive.numel() == 0:
-            return None
-        kv_offset = int(positive[0])
-        self._kv_page_offset_cache[cache_key] = kv_offset
-        return kv_offset
+        if isinstance(manager, KVCacheManager):
+            host_block_offsets = manager.host_kv_cache_block_offsets
+            if host_block_offsets is None or host_block_offsets.ndim != 4:
+                return None
+            if pool_index >= host_block_offsets.shape[0]:
+                return None
+
+            rows = host_block_offsets[pool_index]
+            if 0 <= seq_offset < rows.shape[0]:
+                row_deltas = rows[seq_offset, 1] - rows[seq_offset, 0]
+                positive = row_deltas[row_deltas > 0]
+                if positive.numel() > 0:
+                    kv_offset = int(positive[0])
+                    self._kv_page_offset_cache[cache_key] = kv_offset
+                    return kv_offset
+            all_deltas = rows[:, 1] - rows[:, 0]
+            positive = all_deltas[all_deltas > 0]
+            if positive.numel() == 0:
+                return None
+            kv_offset = int(positive[0])
+            self._kv_page_offset_cache[cache_key] = kv_offset
+            return kv_offset
+
+        raise TypeError(f"Unsupported KV cache manager: {type(manager).__name__}.")
 
     def _ensure_metadata_buffers(
         self,
