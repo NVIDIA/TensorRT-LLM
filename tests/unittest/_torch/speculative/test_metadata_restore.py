@@ -12,6 +12,7 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.draft_target import DraftTargetOneModelWorker
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.mtp_dynamic_tree import MTPEagleDynamicTreeWorker
 from tensorrt_llm._torch.speculative.pard import PARDWorker
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -121,6 +122,60 @@ def test_forward_failure_restores_metadata() -> None:
         assert not metadata.has_spec_dec_saved_state
         assert worker._saved_num_contexts is None
         assert worker._saved_attn_metadata is None
+
+
+@pytest.mark.parametrize(
+    ("worker_type", "restores_kv_lens"),
+    [
+        (Eagle3OneModelWorker, False),
+        (MTPEagleDynamicTreeWorker, True),
+    ],
+)
+def test_eagle_and_mtp_restore_preserves_worker_specific_state(
+    worker_type: type[SpecWorkerBase], restores_kv_lens: bool
+) -> None:
+    metadata = _make_metadata()
+    metadata.spec_decoding_packed_mask = torch.tensor(
+        [[1, 2], [3, 4]], dtype=torch.int32, device="cuda"
+    )
+    metadata.spec_decoding_position_offsets = torch.tensor([5, 6], dtype=torch.int32, device="cuda")
+    metadata.spec_decoding_position_offsets_cpp = object()
+    metadata.spec_decoding_generation_lengths = torch.tensor(
+        [7, 8], dtype=torch.int32, device="cuda"
+    )
+    worker = _make_worker(worker_type)
+    saved_fields = {
+        "spec_decoding_packed_mask": metadata.spec_decoding_packed_mask.clone(),
+        "spec_decoding_position_offsets": (metadata.spec_decoding_position_offsets.clone()),
+        "spec_decoding_generation_lengths": (metadata.spec_decoding_generation_lengths.clone()),
+    }
+    original_position_offsets_cpp = metadata.spec_decoding_position_offsets_cpp
+    original_kv_lens = metadata.kv_lens_cuda.clone()
+
+    worker._prepare_attn_metadata_for_spec_dec(metadata)
+    metadata.spec_decoding_packed_mask.zero_()
+    metadata.spec_decoding_position_offsets.zero_()
+    metadata.spec_decoding_position_offsets_cpp = None
+    metadata.spec_decoding_generation_lengths.zero_()
+    metadata.kv_lens_cuda.fill_(9)
+    _mutate_context_metadata(metadata)
+    worker._restore_attn_metadata_from_spec_dec(metadata)
+
+    _assert_metadata_restored(metadata)
+    assert worker._saved_num_contexts is None
+    assert worker._saved_attn_metadata is None
+    assert worker._saved_packed_mask is None
+    assert worker._saved_position_offsets is None
+    assert worker._saved_position_offsets_cpp is None
+    assert worker._saved_generation_lengths is None
+    for field, expected in saved_fields.items():
+        assert torch.equal(getattr(metadata, field), expected)
+    assert metadata.spec_decoding_position_offsets_cpp is original_position_offsets_cpp
+    if restores_kv_lens:
+        assert worker._saved_kv_lens_cuda is None
+        assert torch.equal(metadata.kv_lens_cuda, original_kv_lens)
+    else:
+        assert torch.equal(metadata.kv_lens_cuda, torch.full_like(original_kv_lens, 9))
 
 
 @pytest.mark.parametrize(
