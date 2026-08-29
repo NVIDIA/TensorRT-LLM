@@ -124,11 +124,14 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
     assert "TRTLLM" in results
 
 
-def test_prims_ts_uses_oversized_decode_workspace(
+def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
     from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention_backend.prims_ts import (
+        get_prims_ts_batch_decode_workspace_size,
+    )
 
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     case = BackendCase(
@@ -148,7 +151,7 @@ def test_prims_ts_uses_oversized_decode_workspace(
     )
 
     max_kv_len = 128
-    prims_workspace_bytes = prims_ts_module._get_prims_decode_workspace_size(
+    prims_workspace_bytes = get_prims_ts_batch_decode_workspace_size(
         case.num_seqs,
         case.num_heads,
         case.num_kv_heads,
@@ -168,20 +171,15 @@ def test_prims_ts_uses_oversized_decode_workspace(
     original_generation_layout = prims_ts_module.thop.get_trtllm_gen_generation_workspace_layout
     generation_layout_records = []
 
-    def force_oversized_tail_threshold(*args, **kwargs):
-        real_layout = original_generation_layout(*args, **kwargs)
-        generation_layout_records.append(dict(real_layout))
-        forced_layout = dict(real_layout)
-        # Supported single-token PrimTS plans currently fit in the fixed TRT-LLM
-        # slab. Lower only its advertised capacity to exercise the tail while
-        # preserving the real THOP total layout, preprocessing, and kernel launch.
-        forced_layout["trtllm_gen_workspace_size"] = prims_workspace_bytes - 1
-        return forced_layout
+    def record_compact_layout(*args, **kwargs):
+        layout = original_generation_layout(*args, **kwargs)
+        generation_layout_records.append((args, kwargs, dict(layout)))
+        return layout
 
     monkeypatch.setattr(
         prims_ts_module.thop,
         "get_trtllm_gen_generation_workspace_layout",
-        force_oversized_tail_threshold,
+        record_compact_layout,
     )
 
     original_get_decode_workspace = PrimsTSFmha._get_decode_workspace
@@ -190,20 +188,13 @@ def test_prims_ts_uses_oversized_decode_workspace(
     def record_decode_workspace(
         self: PrimsTSFmha,
         root_workspace: torch.Tensor,
-        thop_fmha_workspace: torch.Tensor,
     ) -> torch.Tensor:
-        decode_workspace = original_get_decode_workspace(
-            self,
-            root_workspace,
-            thop_fmha_workspace,
-        )
+        decode_workspace = original_get_decode_workspace(self, root_workspace)
         workspace_records.append(
             (
                 self,
                 root_workspace.data_ptr(),
                 root_workspace.numel() * root_workspace.element_size(),
-                thop_fmha_workspace.data_ptr(),
-                thop_fmha_workspace.numel() * thop_fmha_workspace.element_size(),
                 decode_workspace,
             )
         )
@@ -233,26 +224,24 @@ def test_prims_ts_uses_oversized_decode_workspace(
     torch.testing.assert_close(actual, golden, atol=3e-2, rtol=3e-3)
 
     assert generation_layout_records
-    real_total_bytes = int(generation_layout_records[0]["total_size"])
+    compact_preprocess_bytes = int(generation_layout_records[0][2]["total_size"])
+    assert all(args[-1] is True for args, _kwargs, _layout in generation_layout_records)
     assert all(
-        int(layout["trtllm_gen_workspace_size"]) >= prims_workspace_bytes
-        for layout in generation_layout_records
+        int(layout["trtllm_gen_workspace_size"]) == 0
+        for _args, _kwargs, layout in generation_layout_records
     )
 
     records_by_adapter = {}
-    for adapter, root_ptr, root_bytes, thop_ptr, thop_bytes, decode_workspace in workspace_records:
+    for adapter, root_ptr, root_bytes, decode_workspace in workspace_records:
         byte_offset = adapter._decode_workspace_offset_bytes
         required_bytes = adapter._decode_workspace_required_bytes
         assert byte_offset is not None
         assert byte_offset % 256 == 0
-        assert byte_offset >= real_total_bytes
+        assert byte_offset >= compact_preprocess_bytes
         assert required_bytes == prims_workspace_bytes
         assert root_bytes >= byte_offset + required_bytes
         assert decode_workspace.data_ptr() == root_ptr + byte_offset
         assert decode_workspace.numel() * decode_workspace.element_size() == required_bytes
-        decode_end = decode_workspace.data_ptr() + required_bytes
-        thop_end = thop_ptr + thop_bytes
-        assert decode_workspace.data_ptr() >= thop_end or decode_end <= thop_ptr
         wrapper = adapter._decode_wrappers[case.num_seqs]
         assert wrapper._workspace_buffer.data_ptr() == decode_workspace.data_ptr()
         records_by_adapter.setdefault(adapter, []).append((root_ptr, decode_workspace.data_ptr()))
@@ -262,7 +251,7 @@ def test_prims_ts_uses_oversized_decode_workspace(
         assert len({root_ptr for root_ptr, _ in records}) == 1
         assert len({decode_ptr for _, decode_ptr in records}) == 1
 
-    captured_adapter, _, _, _, _, captured_workspace = workspace_records[-1]
+    captured_adapter, _, _, captured_workspace = workspace_records[-1]
     captured_wrapper = captured_adapter._decode_wrappers[case.num_seqs]
     control_offset = captured_wrapper._workspace_layout.split_kv_counter.byte_offset
     control_end = captured_wrapper._workspace_layout.total_bytes

@@ -199,10 +199,12 @@ ContextWorkspaceRawViews makeContextWorkspaceRawViews(
     {
         fmhaBmm2Scale = workspaceView.tensor(layout.fmhaBmm2ScaleOffset, layout.fmhaBmm2ScaleSize, at::kFloat);
     }
+    auto const trtllmGenWorkspace = layout.trtllmGenWorkspaceSize == 0
+        ? torch::empty({0}, byteOptions)
+        : workspaceView.tensor(layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, 1, byteOptions);
 
     return ContextWorkspaceRawViews{
-        .trtllmGenWorkspace
-        = workspaceView.tensor(layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, 1, byteOptions),
+        .trtllmGenWorkspace = trtllmGenWorkspace,
         .cuQSeqlens = workspaceView.tensor(layout.cuQSeqlensOffset, layout.cuSeqlensSize, sizeof(int32_t), intOptions),
         .cuKvSeqlens
         = workspaceView.tensor(layout.cuKvSeqlensOffset, layout.cuSeqlensSize, sizeof(int32_t), intOptions),
@@ -236,10 +238,12 @@ GenerationWorkspaceRawViews makeGenerationWorkspaceRawViews(
     auto const byteOptions = workspaceView.options(at::kByte);
     auto const qBufOptions = workspaceView.options(layout.qBufScalarType);
     auto const qBufItemSize = static_cast<int64_t>(c10::elementSize(layout.qBufScalarType));
+    auto const trtllmGenWorkspace = layout.trtllmGenWorkspaceSize == 0
+        ? torch::empty({0}, byteOptions)
+        : workspaceView.tensor(layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, 1, byteOptions);
 
     return GenerationWorkspaceRawViews{
-        .trtllmGenWorkspace
-        = workspaceView.tensor(layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, 1, byteOptions),
+        .trtllmGenWorkspace = trtllmGenWorkspace,
         .qBuf = workspaceView.tensor(layout.qBufOffset, layout.qBufSize, qBufItemSize, qBufOptions),
         .bmm1Scale = workspaceView.tensor(layout.bmm1ScaleOffset, layout.bmm1ScaleSize, at::kFloat),
         .bmm2Scale = workspaceView.tensor(layout.bmm2ScaleOffset, layout.bmm2ScaleSize, at::kFloat),
@@ -274,7 +278,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     int64_t const attention_chunk_size, bool const fp8_context_fmha, bool const paged_context_fmha,
     bool const is_mla_enable, int64_t const multi_processor_count, int64_t const total_num_blocks,
     int64_t const kv_factor, bool const need_build_kv_cache_metadata, std::optional<torch::Tensor> cross_kv,
-    bool const cross_attention)
+    bool const cross_attention, bool const skip_trtllm_gen_workspace)
 {
     (void) bmm2_scale;
     TORCH_CHECK(host_kv_cache_pool_pointers.has_value(), "host_kv_cache_pool_pointers is required.");
@@ -292,8 +296,8 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         = cross_attention ? max_past_kv_length : cyclic_attention_window_size;
     auto const views = [&]
     {
-        auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(
-            qkvScalarType, batch_size, num_tokens, num_heads, head_size, rotary_embedding_dim, true, fp8_context_fmha);
+        auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(qkvScalarType, batch_size, num_tokens,
+            num_heads, head_size, rotary_embedding_dim, true, fp8_context_fmha, skip_trtllm_gen_workspace);
         return makeContextWorkspaceRawViews(workspace, layout, separateQKvOutput);
     }();
     auto const& ptrs = views.ptrs;
@@ -475,7 +479,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     double const rotary_embedding_base, int64_t const rotary_embedding_scale_type, double const rotary_embedding_scale,
     int64_t const rotary_embedding_max_positions, int64_t const position_embedding_type, double const bmm1_scale,
     bool const fp8_context_fmha, bool const paged_context_fmha, bool const is_mla_enable,
-    int64_t const attention_chunk_size, int64_t const multi_processor_count)
+    int64_t const attention_chunk_size, int64_t const multi_processor_count, bool const skip_trtllm_gen_workspace)
 {
     (void) mask_type;
     if (isQOnlyInput(qkv_input, num_heads, head_size))
@@ -488,8 +492,8 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha;
     auto const ptrs = [&]
     {
-        auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(
-            qkvScalarType, batch_size, num_tokens, num_heads, head_size, rotary_embedding_dim, true, fp8_context_fmha);
+        auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(qkvScalarType, batch_size, num_tokens,
+            num_heads, head_size, rotary_embedding_dim, true, fp8_context_fmha, skip_trtllm_gen_workspace);
         WorkspaceAccessor const workspaceView{workspace};
         return makeContextWorkspaceRawPointers(workspaceView, layout);
     }();
@@ -600,7 +604,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     int64_t const position_embedding_type, double const bmm1_scale, double const bmm2_scale,
     bool const fp8_context_fmha, int64_t const predicted_tokens_per_seq, int64_t const attention_chunk_size,
     int64_t const multi_processor_count, int64_t const total_num_blocks, int64_t const kv_factor,
-    bool const need_build_kv_cache_metadata, bool const cross_attention)
+    bool const need_build_kv_cache_metadata, bool const cross_attention, bool const skip_trtllm_gen_workspace)
 {
     TORCH_CHECK(host_kv_cache_pool_pointers.has_value(), "host_kv_cache_pool_pointers is required.");
     TORCH_CHECK(host_kv_cache_pool_mapping.has_value(), "host_kv_cache_pool_mapping is required.");
@@ -619,8 +623,8 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         = cross_attention ? max_past_kv_length : cyclic_attention_window_size;
     auto const views = [&]
     {
-        auto const layout = TrtllmAttentionWorkspaceManager::buildGenerationLayout(
-            qkvScalarType, batch_beam, num_tokens, num_heads, head_size, rotary_embedding_dim, num_kv_heads, 0, false);
+        auto const layout = TrtllmAttentionWorkspaceManager::buildGenerationLayout(qkvScalarType, batch_beam,
+            num_tokens, num_heads, head_size, rotary_embedding_dim, num_kv_heads, 0, false, skip_trtllm_gen_workspace);
         return makeGenerationWorkspaceRawViews(workspace, layout);
     }();
 
