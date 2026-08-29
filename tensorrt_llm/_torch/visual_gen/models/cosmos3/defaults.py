@@ -22,7 +22,6 @@ from typing import Any, Dict, Iterable, TypedDict
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     COSMOS3_ACTION_RESOLUTIONS,
-    DEFAULT_ACTION_VIEW_POINT,
     EMBODIMENT_TO_DOMAIN_ID,
     normalize_action_resolution,
     resolve_raw_action_dim,
@@ -335,8 +334,96 @@ COSMOS3_ACTION_PARAMS = {
     "frame_rate": 24.0,
 }
 
+# Released policy checkpoints carry a ``policy`` block in checkpoint.json.
+# The block owns checkpoint-specific horizon/rate/domain values; the remaining
+# recipe facts are keyed by that domain below.
+COSMOS3_POLICY_SAMPLING_PARAMS = {
+    "num_inference_steps": 4,
+    "guidance_scale": 3.0,
+    # Apply CFG only to the first, highest-noise UniPC step.
+    "guidance_interval": (960.0, 1001.0),
+}
+
+
+class Cosmos3PolicyDomainPreset(TypedDict, total=False):
+    """Policy-only representation facts not carried by checkpoint.json."""
+
+    num_inference_steps: int
+    guidance_scale: float
+    guidance_interval: tuple[float, float]
+    raw_action_dim: int
+    action_resolution: int
+    use_state: bool
+
+
+COSMOS3_POLICY_DOMAIN_PRESETS: dict[str, Cosmos3PolicyDomainPreset] = {
+    # DROID Policy is joint_pos: seven joints plus one gripper channel. The
+    # current 8-D state is a clean leading action row and is not returned as a
+    # predicted command.
+    "droid_lerobot": {
+        **COSMOS3_POLICY_SAMPLING_PARAMS,
+        "raw_action_dim": 8,
+        "action_resolution": 480,
+        "use_state": True,
+    },
+}
+
 COSMOS3_GENERATION_DEFAULTS[("qwen3", "action")] = COSMOS3_ACTION_PARAMS
 COSMOS3_GENERATION_DEFAULTS[("nemotron_dense", "action")] = COSMOS3_ACTION_PARAMS
+
+
+def resolve_checkpoint_policy_defaults(policy: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize a checkpoint.json ``policy`` block into pipeline defaults."""
+    if policy is None:
+        return {}
+    if not isinstance(policy, Mapping):
+        raise ValueError("Cosmos3 checkpoint.json 'policy' must be a JSON object.")
+
+    defaults: dict[str, Any] = {}
+    domain_name = policy.get("domain_name")
+    if domain_name is not None:
+        domain_name = str(domain_name).strip().lower()
+        if not domain_name:
+            raise ValueError("Cosmos3 checkpoint policy domain_name must not be empty.")
+        defaults["domain_name"] = domain_name
+        defaults.update(COSMOS3_POLICY_DOMAIN_PRESETS.get(domain_name, {}))
+
+    if policy.get("action_chunk_size") is not None:
+        action_chunk_size = int(policy["action_chunk_size"])
+        if action_chunk_size <= 0:
+            raise ValueError(
+                "Cosmos3 checkpoint policy action_chunk_size must be positive, "
+                f"got {action_chunk_size}."
+            )
+        defaults["action_chunk_size"] = action_chunk_size
+
+    if policy.get("conditioning_fps") is not None:
+        conditioning_fps = float(policy["conditioning_fps"])
+        if conditioning_fps <= 0.0:
+            raise ValueError(
+                "Cosmos3 checkpoint policy conditioning_fps must be positive, "
+                f"got {conditioning_fps}."
+            )
+        defaults["frame_rate"] = conditioning_fps
+        defaults["action_fps"] = conditioning_fps
+
+    if policy.get("raw_action_dim") is not None:
+        raw_action_dim = int(policy["raw_action_dim"])
+        if raw_action_dim <= 0:
+            raise ValueError(
+                f"Cosmos3 checkpoint policy raw_action_dim must be positive, got {raw_action_dim}."
+            )
+        defaults["raw_action_dim"] = raw_action_dim
+
+    if policy.get("action_resolution") is not None:
+        defaults["action_resolution"] = normalize_action_resolution(policy["action_resolution"])
+
+    if policy.get("use_state") is not None:
+        if not isinstance(policy["use_state"], bool):
+            raise ValueError("Cosmos3 checkpoint policy use_state must be a boolean.")
+        defaults["use_state"] = policy["use_state"]
+
+    return defaults
 
 
 class Cosmos3DomainPreset(TypedDict, total=False):
@@ -479,6 +566,8 @@ def resolve_domain_action_config(
     action_resolution: int | None = None,
     frame_rate: float | None = None,
     action_fps: float | None = None,
+    use_state: bool | None = None,
+    checkpoint_policy_defaults: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge user action params with domain presets and generic fallbacks.
 
@@ -488,9 +577,40 @@ def resolve_domain_action_config(
     ``warnings`` when it differs from the preset. ``num_frames`` is derived as
     ``action_chunk_size + 1`` and is never a preset field.
     """
+    checkpoint_policy_defaults = dict(checkpoint_policy_defaults or {})
+    checkpoint_domain = checkpoint_policy_defaults.get("domain_name")
+    warnings: list[str] = []
+
+    if checkpoint_domain is not None:
+        checkpoint_domain = str(checkpoint_domain).strip().lower()
+        explicit_domain_name = (
+            str(domain_name).strip().lower()
+            if domain_name is not None and str(domain_name).strip()
+            else None
+        )
+        checkpoint_domain_id = EMBODIMENT_TO_DOMAIN_ID.get(checkpoint_domain)
+        domain_id_matches = domain_id is not None and checkpoint_domain_id == int(domain_id)
+        if explicit_domain_name is None and (domain_id is None or domain_id_matches):
+            domain_name = checkpoint_domain
+        elif explicit_domain_name != checkpoint_domain:
+            warnings.append(
+                f"Cosmos3 domain_name={domain_name!r}, domain_id={domain_id!r} overrides "
+                f"checkpoint policy domain_name={checkpoint_domain!r}; checkpoint domain "
+                "representation defaults will not be applied."
+            )
+
+    policy_domain_matches = checkpoint_domain is not None and (
+        (domain_name is not None and str(domain_name).strip().lower() == checkpoint_domain)
+        or (
+            domain_name is None
+            and domain_id is not None
+            and EMBODIMENT_TO_DOMAIN_ID.get(checkpoint_domain) == int(domain_id)
+        )
+    )
+    policy_defaults = checkpoint_policy_defaults if policy_domain_matches else {}
+
     preset_key = canonical_domain_preset_key(domain_name, domain_id)
     preset = COSMOS3_DOMAIN_PRESETS.get(preset_key) if preset_key else None
-    warnings: list[str] = []
 
     domain_requested = (domain_name is not None and str(domain_name).strip() != "") or (
         domain_id is not None and str(domain_id).strip() not in {"", "0"}
@@ -508,7 +628,9 @@ def resolve_domain_action_config(
         *,
         fallback: Any = None,
     ) -> Any:
-        recommended = preset.get(field) if preset else None
+        recommended = policy_defaults.get(field)
+        if recommended is None:
+            recommended = preset.get(field) if preset else None
         if current is not None:
             if recommended is not None and current != recommended:
                 warnings.append(
@@ -523,16 +645,19 @@ def resolve_domain_action_config(
     # The action width is canonical per embodiment, so it comes from the
     # embodiment table rather than the (alias-shared) sampling preset.
     canonical_raw_action_dim = resolve_raw_action_dim(domain_name=domain_name, domain_id=domain_id)
+    recommended_raw_action_dim = policy_defaults.get("raw_action_dim", canonical_raw_action_dim)
     if raw_action_dim is not None:
-        if canonical_raw_action_dim is not None and int(raw_action_dim) != canonical_raw_action_dim:
+        if recommended_raw_action_dim is not None and int(raw_action_dim) != int(
+            recommended_raw_action_dim
+        ):
             warnings.append(
-                f"Cosmos3 raw_action_dim={raw_action_dim} differs from the canonical width "
-                f"{canonical_raw_action_dim} for domain_name={domain_name!r}."
+                f"Cosmos3 raw_action_dim={raw_action_dim} differs from the recommended width "
+                f"{recommended_raw_action_dim} for domain_name={domain_name!r}."
             )
         resolved_raw_action_dim = raw_action_dim
     else:
-        resolved_raw_action_dim = canonical_raw_action_dim
-        if domain_requested and canonical_raw_action_dim is None:
+        resolved_raw_action_dim = recommended_raw_action_dim
+        if domain_requested and recommended_raw_action_dim is None:
             warnings.append(
                 "Cosmos3 has no canonical action width for "
                 f"domain_name={domain_name!r}, domain_id={domain_id!r}; "
@@ -561,8 +686,21 @@ def resolve_domain_action_config(
     # an overridden action_chunk_size.
     resolved_num_frames = int(resolved_chunk) + 1
     resolved_action_fps = (
-        float(action_fps) if action_fps is not None else float(resolved_frame_rate)
+        float(action_fps)
+        if action_fps is not None
+        else float(policy_defaults.get("action_fps", resolved_frame_rate))
     )
+    recommended_use_state = bool(policy_defaults.get("use_state", False))
+    resolved_use_state = recommended_use_state if use_state is None else bool(use_state)
+    if (
+        use_state is not None
+        and "use_state" in policy_defaults
+        and resolved_use_state != recommended_use_state
+    ):
+        warnings.append(
+            f"Cosmos3 use_state={resolved_use_state} differs from checkpoint policy "
+            f"default {recommended_use_state}."
+        )
     if resolved_raw_action_dim is not None and int(resolved_raw_action_dim) <= 0:
         raise ValueError(f"Cosmos3 raw_action_dim must be positive, got {resolved_raw_action_dim}.")
     if int(resolved_chunk) <= 0:
@@ -575,11 +713,13 @@ def resolve_domain_action_config(
         raise ValueError(f"Cosmos3 num_frames must be positive, got {resolved_num_frames}.")
 
     return {
+        "domain_name": domain_name,
         "raw_action_dim": resolved_raw_action_dim,
         "action_chunk_size": int(resolved_chunk),
         "action_resolution": resolved_resolution,
         "frame_rate": float(resolved_frame_rate),
         "action_fps": resolved_action_fps,
+        "use_state": resolved_use_state,
         "num_frames": int(resolved_num_frames),
         "preset_key": preset_key,
         "warnings": warnings,
@@ -702,7 +842,18 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "action": ExtraParamSchema(
         type="list",
         default=None,
-        description="Action trajectory [T, D] for forward_dynamics mode.",
+        description=(
+            "Action trajectory [T, D] for forward_dynamics, or the current model-space "
+            "state [D]/[1, D] for policy mode when use_state is true."
+        ),
+    ),
+    "use_state": ExtraParamSchema(
+        type="bool",
+        default=None,
+        description=(
+            "Condition policy generation on the current state supplied in action. "
+            "Defaults from checkpoint policy metadata when available."
+        ),
     ),
     "action_resolution": ExtraParamSchema(
         type="Literal[256, 480, 704, 720]",
@@ -713,14 +864,6 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         ),
         # No range: the buckets are not an interval, and validation stops at the
         # literal check anyway.
-    ),
-    "view_point": ExtraParamSchema(
-        type="Literal['ego_view', 'third_person_view', 'wrist_view', 'concat_view']",
-        default=DEFAULT_ACTION_VIEW_POINT,
-        description=(
-            "Camera perspective for action generation. Fills the trained action caption's "
-            "cinematography.framing field."
-        ),
     ),
     "action_fps": ExtraParamSchema(
         type="float",

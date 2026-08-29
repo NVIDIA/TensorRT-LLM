@@ -32,6 +32,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_EDGE_T2I_PARAMS,
     COSMOS3_EDGE_VIDEO_PARAMS,
     COSMOS3_GENERATION_DEFAULTS,
+    COSMOS3_POLICY_SAMPLING_PARAMS,
+    resolve_checkpoint_policy_defaults,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
@@ -238,6 +240,11 @@ class TestArchRecipe:
     def test_qwen3_resolves_without_backbone_type(self):
         cfg = SimpleNamespace(hidden_act="silu", qk_norm_for_text=True)
         assert resolve_arch_recipe(cfg) is QWEN3_RECIPE
+
+    def test_edge_export_resolves_from_complete_signature_without_backbone_type(self):
+        cfg = _reduced_edge_config()
+        cfg.backbone_type = None
+        assert resolve_arch_recipe(cfg) is NEMOTRON_DENSE_RECIPE
 
     def test_unknown_backbone_raises(self):
         cfg = _reduced_edge_config()
@@ -798,7 +805,26 @@ class TestEdgeDefaults:
         assert qwen3.default_warmup_num_frames == [189]
 
     def test_hf_id_registered(self):
-        assert "nvidia/Cosmos3-Edge" in PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"].hf_ids
+        hf_ids = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"].hf_ids
+        assert "nvidia/Cosmos3-Edge" in hf_ids
+        assert "nvidia/Cosmos3-Edge-Policy-DROID" in hf_ids
+
+    def test_policy_manifest_overrides_action_sampling_only(self):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+
+        action = pipeline._mode_params("action")
+
+        assert action["num_inference_steps"] == 4
+        assert action["guidance_scale"] == 3.0
+        assert action["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
+        assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
 
     def test_none_params_resolve_from_edge_tables(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)

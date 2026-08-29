@@ -50,11 +50,10 @@ from tensorrt_llm.media.decoding import decode_video_reference_window, video_str
 
 from .action import (
     ACTION_MODE_INVERSE_DYNAMICS,
-    DEFAULT_ACTION_VIEW_POINT,
+    ACTION_MODE_POLICY,
     action_reference_frame_step,
     action_reference_size,
     action_start_frame_offset,
-    build_action_json_prompt,
     build_vision_condition_mask,
     normalize_action_mode,
     pil_to_rgb,
@@ -71,6 +70,7 @@ from .defaults import (
     COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
+    resolve_checkpoint_policy_defaults,
     resolve_domain_action_config,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
@@ -247,6 +247,7 @@ def _load_reference_image(path: str):
         "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Text2Image-4Step",
         "nvidia/Cosmos3-Edge",
+        "nvidia/Cosmos3-Edge-Policy-DROID",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
@@ -254,10 +255,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):
         primary_pretrained_config = pipeline_config.primary_pretrained_config
         self.audio_gen = False
-        # Checkpoint fact vs runtime capability: the checkpoint may ship
-        # action weights, but action generation is not implemented here.
+        # Checkpoint fact vs runtime capability: action generation is enabled
+        # only when the transformer config declares and loads its action heads.
         self.has_action_weights = False
         self.action_gen = False
+        self.checkpoint_policy_defaults: dict[str, Any] = {}
         # Pre-load placeholder; load_standard_components derives the real
         # policy from the checkpoint's scheduler via from_scheduler().
         self.sampling = Cosmos3SamplingPolicy()
@@ -286,7 +288,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     def _mode_params(self, mode: str) -> dict:
         """Generation default table for this checkpoint family and request mode."""
-        return COSMOS3_GENERATION_DEFAULTS[(self.family, mode)]
+        params = COSMOS3_GENERATION_DEFAULTS[(self.family, mode)]
+        checkpoint_policy_defaults = getattr(self, "checkpoint_policy_defaults", {})
+        if mode == "action" and checkpoint_policy_defaults:
+            sampling_keys = {"num_inference_steps", "guidance_scale", "guidance_interval"}
+            return {
+                **params,
+                **{
+                    key: value
+                    for key, value in checkpoint_policy_defaults.items()
+                    if key in sampling_keys
+                },
+            }
+        return params
 
     def _resolve_generation_params(self, mode: str, **values) -> dict:
         """Fill None values: sampling-policy overrides win, then the mode
@@ -380,6 +394,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.use_native_flow_schedule = bool(
                 model_index.get("use_native_flow_schedule", self.use_native_flow_schedule)
             )
+
+        checkpoint_metadata_path = os.path.join(checkpoint_dir, "checkpoint.json")
+        if os.path.exists(checkpoint_metadata_path):
+            with open(checkpoint_metadata_path) as f:
+                checkpoint_metadata = json.load(f)
+            self.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+                checkpoint_metadata.get("policy")
+            )
+            if self.checkpoint_policy_defaults:
+                logger.info(
+                    f"Loaded Cosmos3 checkpoint policy defaults: {self.checkpoint_policy_defaults}"
+                )
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")
@@ -658,7 +684,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             return value if field_name in specified else None
 
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
-        is_action = extra_params.get("action_mode") is not None
+        action_mode = extra_params.get("action_mode")
+        if action_mode is None and getattr(self, "checkpoint_policy_defaults", {}):
+            # A checkpoint with a policy manifest has one supported action
+            # workflow, so callers need not restate it on every request.
+            action_mode = ACTION_MODE_POLICY
+        is_action = normalize_action_mode(action_mode) is not None
         if is_action:
             # Action resolves its whole recipe in forward() -- the canvas from
             # the resolution bucket, the frame rate from the embodiment, the
@@ -752,15 +783,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
             flow_shift=extra_params.get("flow_shift"),
-            action_mode=extra_params.get("action_mode"),
+            action_mode=action_mode,
             domain_name=extra_params.get("domain_name"),
             domain_id=extra_params.get("domain_id"),
             raw_action_dim=extra_params.get("raw_action_dim"),
             action_chunk_size=extra_params.get("action_chunk_size"),
             action=extra_params.get("action"),
+            use_state=extra_params.get("use_state"),
             action_resolution=extra_params.get("action_resolution"),
             action_fps=extra_params.get("action_fps"),
-            view_point=extra_params.get("view_point", DEFAULT_ACTION_VIEW_POINT),
             transfer_config=transfer_config,
         )
 
@@ -1282,6 +1313,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         raw_action_dim: Optional[int],
         generator: torch.Generator,
         action_input: Any = None,
+        use_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         return prepare_action_latents(
             mode=mode,
@@ -1292,6 +1324,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             device=self.device,
             dtype=self.dtype,
             action_input=action_input,
+            use_state=use_state,
         )
 
     # =========================================================================
@@ -1362,9 +1395,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         raw_action_dim: Optional[int] = None,
         action_chunk_size: Optional[int] = None,
         action: Any = None,
+        use_state: Optional[bool] = None,
         action_resolution: Optional[int] = None,
         action_fps: Optional[float] = None,
-        view_point: Optional[str] = DEFAULT_ACTION_VIEW_POINT,
         transfer_config: Optional[Cosmos3TransferConfig] = None,
     ):
         """Run one generation. ``infer()`` is the resolved entry point.
@@ -1406,6 +1439,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         mode_params = self._mode_params(output_type)
         if do_action:
+            mode_params = self._mode_params("action")
             # The embodiment resolves the canvas, clip length and frame rate
             # below; only the sampling recipe and the text budget come from
             # tables (distilled overrides still win inside the resolver).
@@ -1510,6 +1544,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # num_frames is derived from the action chunk, never taken from the
             # request: both references fix it at chunk_size + 1 (diffusers
             # rejects a caller-supplied num_frames for action runs outright).
+            checkpoint_policy_defaults = (
+                getattr(self, "checkpoint_policy_defaults", {})
+                if normalized_action_mode == ACTION_MODE_POLICY
+                else {}
+            )
             action_cfg = resolve_domain_action_config(
                 domain_name=domain_name,
                 domain_id=domain_id,
@@ -1518,6 +1557,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 action_resolution=action_resolution,
                 frame_rate=frame_rate,
                 action_fps=action_fps,
+                use_state=use_state,
+                checkpoint_policy_defaults=checkpoint_policy_defaults,
             )
             if self.rank == 0:
                 for warning in action_cfg["warnings"]:
@@ -1530,15 +1571,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         f"action_resolution={action_cfg['action_resolution']}, "
                         f"frame_rate={action_cfg['frame_rate']:.1f}, "
                         f"action_fps={action_cfg['action_fps']:.1f}, "
+                        f"use_state={action_cfg['use_state']}, "
                         f"num_frames={action_cfg['num_frames']}"
                     )
 
+            domain_name = action_cfg["domain_name"]
             raw_action_dim = action_cfg["raw_action_dim"]
             action_chunk_size = action_cfg["action_chunk_size"]
             action_resolution = action_cfg["action_resolution"]
             num_frames = action_cfg["num_frames"]
             frame_rate = action_cfg["frame_rate"]
             resolved_action_fps = action_cfg["action_fps"]
+            use_state = action_cfg["use_state"]
+            guidance_interval = mode_params.get("guidance_interval")
             enable_audio = False
 
         # Flow shift is a mode table fact unless the request overrides it, and
@@ -1696,24 +1741,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         if negative_prompt is None:
-            negative_prompt = default_negative_prompt(output_type)
+            # Policy training uses the empty unconditional caption. Video's
+            # quality negative prompt is a different workflow and changes the
+            # one CFG step materially.
+            negative_prompt = "" if do_action else default_negative_prompt(output_type)
 
-        if do_action:
-            # Action checkpoints were trained on a structured JSON caption that
-            # already carries duration/fps/resolution/aspect_ratio, so the flat
-            # templates are skipped here and the negative prompt stays verbatim.
-            prompt = [
-                build_action_json_prompt(
-                    p,
-                    view_point=view_point,
-                    num_frames=num_frames,
-                    frame_rate=frame_rate,
-                    height=height,
-                    width=width,
-                )
-                for p in prompt
-            ]
-        else:
+        if not do_action:
             # Positive prompt: forward duration/resolution templates.  T2I has no
             # duration concept (single image) and uses the image-flavored
             # resolution template.
@@ -1757,6 +1790,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 )
                 for p in prompt
             ]
+        # Action prompts are request-owned. Released policy models were trained
+        # on structured JSON, but the pipeline neither requires nor synthesizes
+        # that representation: callers may send the trained JSON string or any
+        # other text they intentionally want the model to consume.
         logger.info(f"Prompt with metadata: '{prompt}'")
 
         prompt = prompt[0]
@@ -1780,6 +1817,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action_condition_latents = None
         action_domain_id = None
         action_frame_offset = 1
+        action_state_rows = 0
         resolved_raw_action_dim = raw_action_dim
 
         if do_action:
@@ -1798,8 +1836,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     f"Cosmos3 action domain_id must be in [0, {num_domains}), "
                     f"got {action_domain_id}."
                 )
+            action_state_rows = 1 if use_state else 0
             action_frame_offset = action_start_frame_offset(
-                normalized_action_mode, action_chunk_size, num_frames
+                normalized_action_mode,
+                action_chunk_size + action_state_rows,
+                num_frames,
             )
 
             if normalized_action_mode == ACTION_MODE_INVERSE_DYNAMICS:
@@ -1896,6 +1937,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 raw_action_dim=raw_action_dim,
                 generator=generator,
                 action_input=action,
+                use_state=bool(use_state),
             )
         elif image is not None:
             prepare_error: Optional[Exception] = None
@@ -2214,7 +2256,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 # Sliced to the embodiment's real width, so the trailing dim is
                 # raw_action_dim; the mode and embodiment are the caller's own
                 # request and are not echoed back.
-                action=action_latents[:, :, :resolved_raw_action_dim].float().cpu()
+                action=action_latents[:, action_state_rows:, :resolved_raw_action_dim].float().cpu()
                 if do_action and action_latents is not None
                 else None,
             )

@@ -80,6 +80,29 @@ class TestPromptAcceptsTextOrPath:
         assert enable_audio is True
         assert output_type == "image"
 
+    def test_nested_structured_prompt_is_serialized_at_request_boundary(self, tmp_path):
+        """The client transports model-specific JSON; the pipeline does not create it."""
+        caption = {
+            "cinematography": {"framing": "concatenated robot camera views"},
+            "actions": [{"time": "0:00-0:02", "description": "Pick up the cup."}],
+            "fps": 15.0,
+        }
+        path = tmp_path / "policy.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "prompt": caption,
+                    "vision_path": "observation.png",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        prompt, image, _, _ = _resolve(prompt=str(path))
+
+        assert json.loads(prompt) == caption
+        assert image == "observation.png"
+
     def test_plain_text_file(self, tmp_path):
         path = tmp_path / "prompt.txt"
         path.write_text("  the camera pans right  \n", encoding="utf-8")
@@ -135,6 +158,12 @@ class TestPromptFileIsStrict:
         path = tmp_path / "list.json"
         path.write_text("[1, 2]", encoding="utf-8")
         with pytest.raises(ValueError, match="JSON object or text"):
+            cosmos3.load_prompt_file(str(path))
+
+    def test_nested_prompt_array_raises(self, tmp_path):
+        path = tmp_path / "list-prompt.json"
+        path.write_text(json.dumps({"prompt": ["not", "caption"]}), encoding="utf-8")
+        with pytest.raises(ValueError, match="must be text or a JSON object"):
             cosmos3.load_prompt_file(str(path))
 
     def test_no_prompt_source_raises(self):
@@ -208,7 +237,9 @@ class TestNegativePromptFile:
 class TestShippedPromptFiles:
     """The files this README tells users to pass must actually load."""
 
-    @pytest.mark.parametrize("name", ["t2v", "t2i", "i2v", "v2v", "t2av"])
+    @pytest.mark.parametrize(
+        "name", ["t2v", "t2i", "i2v", "v2v", "t2av", "action_edge_policy_droid"]
+    )
     def test_bundled_prompt_files_load(self, name):
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         assert data["prompt"]

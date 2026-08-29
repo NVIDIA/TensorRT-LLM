@@ -7,8 +7,6 @@ Run:
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_action.py -v
 """
 
-import json
-
 import numpy as np
 import PIL.Image
 import pytest
@@ -16,15 +14,11 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     ACTION_ASPECT_RATIO_LABELS,
-    ACTION_VIEWPOINT_TEMPLATES,
-    DEFAULT_ACTION_VIEW_POINT,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
     VIDEO_RES_SIZE_INFO,
-    action_aspect_ratio_label,
     action_reference_frame_step,
     action_reference_size,
-    build_action_json_prompt,
     find_closest_target_size,
     normalize_action_resolution,
     prepare_action_latents,
@@ -37,7 +31,9 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_DOMAIN_PRESET_ALIASES,
     COSMOS3_DOMAIN_PRESETS,
     COSMOS3_EXTRA_SPECS,
+    COSMOS3_POLICY_SAMPLING_PARAMS,
     get_domain_preset,
+    resolve_checkpoint_policy_defaults,
     resolve_domain_action_config,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
@@ -221,6 +217,61 @@ class TestDomainActionPresets:
             normalize_action_resolution(1080)
 
 
+class TestCheckpointPolicyDefaults:
+    METADATA = {
+        "action_chunk_size": 32,
+        "conditioning_fps": 15.0,
+        "domain_name": "droid_lerobot",
+    }
+
+    def test_edge_policy_metadata_resolves_reference_recipe(self):
+        policy = resolve_checkpoint_policy_defaults(self.METADATA)
+        assert policy == {
+            **COSMOS3_POLICY_SAMPLING_PARAMS,
+            "domain_name": "droid_lerobot",
+            "raw_action_dim": 8,
+            "action_resolution": 480,
+            "use_state": True,
+            "action_chunk_size": 32,
+            "frame_rate": 15.0,
+            "action_fps": 15.0,
+        }
+
+        cfg = resolve_domain_action_config(checkpoint_policy_defaults=policy)
+        assert cfg["domain_name"] == "droid_lerobot"
+        assert cfg["raw_action_dim"] == 8
+        assert cfg["action_chunk_size"] == 32
+        assert cfg["num_frames"] == 33
+        assert cfg["frame_rate"] == 15.0
+        assert cfg["action_fps"] == 15.0
+        assert cfg["use_state"] is True
+        assert cfg["warnings"] == []
+
+    def test_explicit_non_policy_domain_does_not_inherit_droid_width(self):
+        policy = resolve_checkpoint_policy_defaults(self.METADATA)
+        cfg = resolve_domain_action_config(
+            domain_name="bridge_orig_lerobot",
+            checkpoint_policy_defaults=policy,
+        )
+        assert cfg["raw_action_dim"] == 10
+        assert cfg["action_chunk_size"] == 16
+        assert cfg["use_state"] is False
+        assert any("overrides checkpoint policy" in warning for warning in cfg["warnings"])
+
+    @pytest.mark.parametrize(
+        "metadata,error",
+        [
+            ({"action_chunk_size": 0}, "action_chunk_size"),
+            ({"conditioning_fps": 0}, "conditioning_fps"),
+            ({"domain_name": ""}, "domain_name"),
+            ({"use_state": "yes"}, "use_state"),
+        ],
+    )
+    def test_invalid_checkpoint_policy_metadata_raises(self, metadata, error):
+        with pytest.raises(ValueError, match=error):
+            resolve_checkpoint_policy_defaults(metadata)
+
+
 class TestActionReferenceSize:
     """Canvas selection needs the source size, not a decoded frame."""
 
@@ -315,143 +366,6 @@ class TestActionReferenceFrameStep:
     )
     def test_step_from_rates(self, source_frame_rate, target_frame_rate, expected):
         assert action_reference_frame_step(source_frame_rate, target_frame_rate) == expected
-
-
-class TestActionJsonPrompt:
-    """The trained action caption: structured JSON, not the flat video templates."""
-
-    BRIDGE = dict(num_frames=17, frame_rate=5.0, height=480, width=832)
-
-    def test_matches_trained_shape(self):
-        payload = json.loads(
-            build_action_json_prompt(
-                "Pick up the pear and place it in the bag",
-                view_point="ego_view",
-                **self.BRIDGE,
-            )
-        )
-        assert payload == {
-            "cinematography": {
-                "framing": (
-                    "This video is captured from a first-person perspective looking at the scene."
-                )
-            },
-            "actions": [
-                {
-                    "time": "0:00-0:03",
-                    "description": "Pick up the pear and place it in the bag.",
-                }
-            ],
-            "duration": "3s",
-            "fps": 5.0,
-            "resolution": {"H": 480, "W": 832},
-            "aspect_ratio": "16,9",
-        }
-
-    def test_key_order_is_preserved(self):
-        """Field order is part of the trained caption format."""
-        text = build_action_json_prompt("Do a thing", view_point="ego_view", **self.BRIDGE)
-        assert list(json.loads(text).keys()) == [
-            "cinematography",
-            "actions",
-            "duration",
-            "fps",
-            "resolution",
-            "aspect_ratio",
-        ]
-
-    @pytest.mark.parametrize("view_point", sorted(ACTION_VIEWPOINT_TEMPLATES))
-    def test_every_viewpoint_emits_its_trained_sentence(self, view_point):
-        payload = json.loads(
-            build_action_json_prompt("Do a thing", view_point=view_point, **self.BRIDGE)
-        )
-        assert payload["cinematography"]["framing"] == ACTION_VIEWPOINT_TEMPLATES[view_point]
-
-    def test_default_view_point_is_known(self):
-        assert DEFAULT_ACTION_VIEW_POINT in ACTION_VIEWPOINT_TEMPLATES
-
-    @pytest.mark.parametrize("view_point", [None, "sideways_view"])
-    def test_unknown_or_missing_view_point_drops_framing(self, view_point):
-        payload = json.loads(
-            build_action_json_prompt("Do a thing", view_point=view_point, **self.BRIDGE)
-        )
-        assert "cinematography" not in payload
-        assert list(payload.keys())[0] == "actions"
-
-    @pytest.mark.parametrize(
-        "description,expected",
-        [
-            ("Pick up the pear", "Pick up the pear."),
-            ("Pick up the pear.", "Pick up the pear."),
-            ("Is it a pear?", "Is it a pear?"),
-            ("Grab it!", "Grab it!"),
-            ("  padded  ", "padded."),
-            ("", ""),
-        ],
-    )
-    def test_description_is_terminated_once(self, description, expected):
-        payload = json.loads(build_action_json_prompt(description, view_point=None, **self.BRIDGE))
-        assert payload["actions"][0]["description"] == expected
-
-    @pytest.mark.parametrize(
-        "num_frames,frame_rate,duration,time_range",
-        [
-            (17, 5.0, "3s", "0:00-0:03"),  # bridge: 3.4s truncates, rounds to 3
-            (17, 24.0, "0s", "0:00-0:01"),  # 0.708s truncates to 0, rounds to 1
-            (61, 10.0, "6s", "0:00-0:06"),  # av preset
-            (241, 2.0, "120s", "0:00-2:00"),  # crosses the minute boundary
-        ],
-    )
-    def test_duration_truncates_while_time_range_rounds(
-        self, num_frames, frame_rate, duration, time_range
-    ):
-        payload = json.loads(
-            build_action_json_prompt(
-                "Do a thing",
-                view_point=None,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                height=480,
-                width=832,
-            )
-        )
-        assert payload["duration"] == duration
-        assert payload["actions"][0]["time"] == time_range
-        assert payload["fps"] == float(frame_rate)
-
-    @pytest.mark.parametrize("action_resolution", sorted(VIDEO_RES_SIZE_INFO))
-    def test_aspect_label_matches_the_bucket_it_came_from(self, action_resolution):
-        """Every canvas is a bucket entry, so its label must round-trip."""
-        for label, (width, height) in VIDEO_RES_SIZE_INFO[action_resolution].items():
-            assert action_aspect_ratio_label(height, width) == label
-
-    def test_aspect_label_is_not_a_reduced_fraction(self):
-        """832x480 reduces to 26,15 but the trained label is 16,9."""
-        assert action_aspect_ratio_label(480, 832) == "16,9"
-
-    def test_resolution_is_reported_as_the_padded_canvas(self):
-        payload = json.loads(build_action_json_prompt("Do a thing", view_point=None, **self.BRIDGE))
-        assert payload["resolution"] == {"H": 480, "W": 832}
-
-    def test_zero_frame_rate_does_not_raise(self):
-        payload = json.loads(
-            build_action_json_prompt(
-                "Do a thing",
-                view_point=None,
-                num_frames=17,
-                frame_rate=0.0,
-                height=480,
-                width=832,
-            )
-        )
-        assert payload["duration"] == "0s"
-        assert payload["actions"][0]["time"] == "0:00-0:00"
-
-    def test_view_point_spec_defaults_to_ego_view(self):
-        spec = COSMOS3_EXTRA_SPECS["view_point"]
-        assert spec.default == DEFAULT_ACTION_VIEW_POINT
-        for view_point in ACTION_VIEWPOINT_TEMPLATES:
-            assert repr(view_point) in spec.type
 
 
 def _reference_scaled_positions(
@@ -739,6 +653,41 @@ class TestPrepareActionLatents:
                 device=torch.device("cpu"),
                 dtype=torch.float32,
                 action_input=[[0.0, 1.0], [2.0, 3.0]],
+            )
+
+    def test_policy_state_is_a_clean_leading_row(self):
+        state = [0.1, 0.2]
+        latents, velocity_mask, clean, raw_dim = self._prepare(
+            "policy",
+            raw_action_dim=2,
+            action_input=state,
+            use_state=True,
+        )
+        assert raw_dim == 2
+        assert latents.shape == (1, self.CHUNK + 1, self.ACTION_DIM)
+        assert velocity_mask.shape == (1, self.CHUNK + 1, 1)
+        assert torch.all(velocity_mask[:, 0] == 0.0)
+        assert torch.all(velocity_mask[:, 1:] == 1.0)
+        torch.testing.assert_close(clean[0, 0, :2], torch.tensor(state))
+        torch.testing.assert_close(latents[:, 0], clean[:, 0])
+        assert torch.any(latents[:, 1:, :2] != 0.0)
+
+    def test_policy_state_width_must_match_raw_action_dim(self):
+        with pytest.raises(ValueError, match="current state width"):
+            self._prepare(
+                "policy",
+                raw_action_dim=3,
+                action_input=[0.1, 0.2],
+                use_state=True,
+            )
+
+    def test_use_state_rejects_non_policy_modes(self):
+        with pytest.raises(ValueError, match="only for policy"):
+            self._prepare(
+                "inverse_dynamics",
+                raw_action_dim=2,
+                action_input=[0.1, 0.2],
+                use_state=True,
             )
 
 
