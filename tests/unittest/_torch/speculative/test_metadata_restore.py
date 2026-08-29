@@ -47,8 +47,8 @@ def _make_metadata(*, is_cuda_graph: bool = False) -> TrtllmAttentionMetadata:
         is_cuda_graph=is_cuda_graph,
     )
     metadata._seq_lens = torch.tensor([3, 1], dtype=torch.int32)
-    metadata._seq_lens_cuda = metadata._seq_lens.clone()
-    metadata.kv_lens_cuda = torch.tensor([3, 1], dtype=torch.int32)
+    metadata._seq_lens_cuda = metadata._seq_lens.cuda()
+    metadata.kv_lens_cuda = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
     metadata.on_update()
     return metadata
 
