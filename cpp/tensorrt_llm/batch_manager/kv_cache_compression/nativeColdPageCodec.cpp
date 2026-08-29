@@ -93,8 +93,8 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             for (auto const& variant : gpuDesc.slotDesc.variants)
             {
                 auto resolved = resolveLifecycle(gpuDesc, variant);
-                auto const providerLayerCount = std::count_if(resolved.layers.begin(), resolved.layers.end(),
-                    [this](auto const& layer) { return mLayerIds.count(layer.first) != 0U; });
+                auto const providerLayerCount = static_cast<std::size_t>(std::count_if(resolved.layers.begin(),
+                    resolved.layers.end(), [this](auto const& layer) { return mLayerIds.count(layer.first) != 0U; }));
 
                 LayerGroupState state;
                 if (providerLayerCount == 0U)
