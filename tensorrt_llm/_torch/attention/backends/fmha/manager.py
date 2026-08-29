@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     CustomAttentionMask,
@@ -41,7 +41,7 @@ from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.trtllm import (
+    from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )

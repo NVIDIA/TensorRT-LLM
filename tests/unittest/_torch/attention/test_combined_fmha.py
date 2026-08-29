@@ -140,7 +140,7 @@ def test_flashinfer_context_fallback_scope(
     is_fused_qkv: bool,
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
         lambda: sm_version,
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
@@ -225,7 +225,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     sm_version: int,
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
         lambda: sm_version,
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)

@@ -22,16 +22,16 @@ import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
 
-from tensorrt_llm._torch.attention_backend.fmha import manager as fmha_manager
-from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
-from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention_backend.fmha.manager import FmhaManager
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
+from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 

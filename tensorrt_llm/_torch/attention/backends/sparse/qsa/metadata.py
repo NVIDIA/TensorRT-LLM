@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 from .cache_manager import QSAMambaHybridCacheManagerV2
 from .constants import QSA_KEY_ROLE_INDEX

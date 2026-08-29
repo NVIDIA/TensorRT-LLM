@@ -389,7 +389,7 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
 
 def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
     """Whether chunked prefill bounds the selected backend's runtime workspace."""
-    from ..attention_backend.utils import get_attention_backend
+    from ..attention.backends.utils import get_attention_backend
 
     return get_attention_backend(
         model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(

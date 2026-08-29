@@ -23,7 +23,7 @@ from .metadata import QSAAttentionMetadata
 from .params import QSASparseParams
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.modules.attention import Attention
+    from tensorrt_llm._torch.attention.attention import Attention
 
 
 _DEFAULT_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024

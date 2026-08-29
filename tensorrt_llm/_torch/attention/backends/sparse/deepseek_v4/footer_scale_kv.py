@@ -23,7 +23,7 @@ from .kernels import deepseek_v4_local_to_global_indices
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
     from .metadata import DeepseekV4TrtllmAttentionMetadata
 

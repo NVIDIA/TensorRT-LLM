@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
@@ -24,7 +24,7 @@ from .constants import (
 from .params import QSASparseParams
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.modules.attention import Attention
+    from tensorrt_llm._torch.attention.attention import Attention
 
     from .metadata import QSAAttentionMetadata
 

@@ -115,7 +115,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if self.disabled_until_timestep is not None:
             return self.disabled_until_timestep
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
         )
 

@@ -506,7 +506,7 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
     )
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
         return_value=100,
     ):
         indexer = create_indexer(sparse_config)

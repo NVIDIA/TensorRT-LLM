@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TRT-LLM backend wrapper for QSA sparse metadata."""
 
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 from .metadata import QSAAttentionMetadata
 

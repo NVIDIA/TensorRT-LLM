@@ -83,7 +83,7 @@ _TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
     # backend while llm_args is defining its public configuration models.
-    from tensorrt_llm._torch.attention_backend.sparse.qsa import (
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import (
         QSASparseMetadataParams, QSASparseParams)
     from tensorrt_llm._torch.virtual_memory import \
         RestoreMode as _VirtualMemoryRestoreMode
@@ -797,7 +797,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             f"QSA requires {checkpoint_name!r} in the checkpoint config")
 
     def to_sparse_params(self, **kwargs: object) -> "QSASparseParams":
-        from tensorrt_llm._torch.attention_backend.sparse.qsa import \
+        from tensorrt_llm._torch.attention.backends.sparse.qsa import \
             QSASparseParams
 
         pretrained_config = kwargs.get("pretrained_config")
@@ -824,7 +824,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
     def to_sparse_metadata_params(
             self, **kwargs: object) -> "QSASparseMetadataParams":
-        from tensorrt_llm._torch.attention_backend.sparse.qsa import \
+        from tensorrt_llm._torch.attention.backends.sparse.qsa import \
             QSASparseMetadataParams
 
         params = self.to_sparse_params(**kwargs)

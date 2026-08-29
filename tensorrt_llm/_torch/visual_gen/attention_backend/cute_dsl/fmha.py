@@ -25,7 +25,7 @@ from typing import Any, NamedTuple, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 

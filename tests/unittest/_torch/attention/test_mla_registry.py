@@ -157,11 +157,11 @@ def test_output_gate_override_rejected_with_sparse_hooks() -> None:
     config = ModelConfig(skip_create_weights_in_init=True)
     with (
         patch(
-            "tensorrt_llm._torch.modules.mla.create_attention",
+            "tensorrt_llm._torch.attention.mla.create_attention",
             side_effect=lambda *args, **kwargs: _FakeAttention(),
         ),
         patch(
-            "tensorrt_llm._torch.modules.mla.get_sparse_mla_hooks",
+            "tensorrt_llm._torch.attention.mla.get_sparse_mla_hooks",
             return_value=Mock(),
         ),
         pytest.raises(NotImplementedError, match="_apply_output_gate"),

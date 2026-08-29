@@ -929,7 +929,7 @@ class CompressorWrapper:
         # of the architecture-specific attention layout. Keep that coverage on
         # H100 without selecting the Hopper-required footer-scale cache.
         with mock.patch(
-            "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager.get_sm_version",
             return_value=100,
         ):
             cache_manager = DeepseekV4CacheManager(
