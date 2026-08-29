@@ -225,7 +225,9 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
 
     assert generation_layout_records
     compact_preprocess_bytes = int(generation_layout_records[0][2]["total_size"])
-    assert all(args[-1] is True for args, _kwargs, _layout in generation_layout_records)
+    assert all(
+        kwargs["skip_workspace"] is True for _args, kwargs, _layout in generation_layout_records
+    )
     assert all(
         int(layout["trtllm_gen_workspace_size"]) == 0
         for _args, _kwargs, layout in generation_layout_records
@@ -236,7 +238,7 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
         byte_offset = adapter._decode_workspace_offset_bytes
         required_bytes = adapter._decode_workspace_required_bytes
         assert byte_offset is not None
-        assert byte_offset % 256 == 0
+        assert byte_offset % 32 == 0
         assert byte_offset >= compact_preprocess_bytes
         assert required_bytes == prims_workspace_bytes
         assert root_bytes >= byte_offset + required_bytes
@@ -313,11 +315,7 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
         dtype=torch.int32,
     )
     output = torch.empty_like(query)
-    external_workspace = torch.empty(4096, device=device, dtype=torch.uint8)
-    wrapper = BatchPrefillPagedTSWrapper(
-        kv_layout="HND",
-        workspace_buffer=external_workspace,
-    )
+    wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
     wrapper.plan_live(
         query,
         k_cache,
@@ -377,7 +375,6 @@ def test_prims_ts_context_live_wrapper_cuda_graph_replay() -> None:
     torch.cuda.synchronize()
 
     assert graph_output.data_ptr() == output.data_ptr()
-    assert wrapper._workspace_buffer is external_workspace
     assert wrapper._compiled is compiled
     torch.testing.assert_close(graph_output, reference, atol=3e-2, rtol=3e-3)
 

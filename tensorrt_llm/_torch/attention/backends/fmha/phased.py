@@ -56,9 +56,9 @@ class FmhaParams:
     tokens_per_block: int = 64
     kv_factor: int = 0
     total_num_blocks: int = 0
-    # Context-only fields
+    # Number of sequence rows in the active phase.
     batch_size: int = 0
-    # Generation-only fields
+    # Number of logical requests in the active phase.
     num_requests: int = 0
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
@@ -80,6 +80,7 @@ class PhasedFmha(Fmha):
         self.context_out_head_size = (
             attn.v_head_dim if attn.is_mla_enable and attn.v_head_dim else attn.head_dim
         )
+        self._v1_total_num_blocks_cache: Optional[tuple[object, int, int]] = None
 
     def _get_total_num_blocks(
         self,
@@ -89,26 +90,53 @@ class PhasedFmha(Fmha):
         if kv_cache_manager is None:
             return 0
 
-        get_page_index_upper_bound = getattr(
-            getattr(kv_cache_manager, "impl", None),
-            "get_page_index_upper_bound",
-            None,
-        )
-        if get_page_index_upper_bound is not None:
-            # KVCacheManagerV2 exposes an already-flattened page-index bound,
-            # unlike the legacy logical block count.
-            return int(kv_cache_manager.blocks_in_primary_pool)
+        local_layer_idx = self.attn.local_layer_idx
+        if local_layer_idx is None:
+            local_layer_idx = self.attn.get_local_layer_idx(meta)
 
-        blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
-        if blocks_in_primary_pool is None:
-            blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
-            if blocks_per_window:
-                blocks_in_primary_pool = max(
-                    int(primary) for primary, _ in blocks_per_window.values()
-                )
-        if blocks_in_primary_pool is None:
-            return 0
-        return int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * self.kv_factor
+        get_page_index_upper_bound = getattr(
+            kv_cache_manager.impl, "get_page_index_upper_bound", None
+        )
+        if callable(get_page_index_upper_bound):
+            # Import lazily to avoid coupling attention-module import order to
+            # the Python KV-cache manager implementation.
+            from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+
+            return int(get_page_index_upper_bound(local_layer_idx, Role.KEY))
+
+        cached_v1_extent = self._v1_total_num_blocks_cache
+        if (
+            cached_v1_extent is not None
+            and cached_v1_extent[0] is kv_cache_manager
+            and cached_v1_extent[1] == local_layer_idx
+        ):
+            return cached_v1_extent[2]
+
+        pool_mapping = meta.host_kv_cache_pool_mapping
+        if pool_mapping is None or pool_mapping.ndim != 2 or pool_mapping.shape[1] < 2:
+            raise RuntimeError("KV-cache pool mapping must have shape [num_layers, >=2].")
+        if not 0 <= local_layer_idx < pool_mapping.shape[0]:
+            raise RuntimeError(
+                f"Local layer index {local_layer_idx} is outside the KV-cache pool mapping."
+            )
+
+        pool_index = int(pool_mapping[local_layer_idx, 0])
+        layer_index_in_pool = int(pool_mapping[local_layer_idx, 1])
+        layers_in_pool = int((pool_mapping[:, 0] == pool_index).sum())
+        if not 0 <= layer_index_in_pool < layers_in_pool:
+            raise RuntimeError(
+                f"Layer index {layer_index_in_pool} is outside KV-cache pool {pool_index} "
+                f"with {layers_in_pool} layers."
+            )
+
+        blocks_in_pool = int(kv_cache_manager.impl.get_primary_pool_data(local_layer_idx).shape[0])
+        total_num_blocks = (blocks_in_pool * layers_in_pool - layer_index_in_pool) * self.kv_factor
+        self._v1_total_num_blocks_cache = (
+            kv_cache_manager,
+            local_layer_idx,
+            total_num_blocks,
+        )
+        return total_num_blocks
 
     def prepare_workspace(
         self,
@@ -223,6 +251,7 @@ class PhasedFmha(Fmha):
             params.seq_offset = seq_offset
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
+            params.num_requests = num_seqs
             if attn.is_mla_enable:
                 self.run_mla_context(params)
             else:
@@ -264,6 +293,7 @@ class PhasedFmha(Fmha):
             params.num_tokens = num_gen_tokens
             params.seq_offset = seq_offset
             params.input_seq_length = input_seq_length
+            params.batch_size = num_seqs
             params.num_requests = num_seqs // metadata.beam_width
             params.spec_decoding_generation_lengths = spec_gen_lengths
             params.spec_decoding_position_offsets = spec_pos_offsets

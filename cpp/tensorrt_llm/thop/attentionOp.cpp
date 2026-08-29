@@ -134,8 +134,7 @@ std::optional<at::Tensor> TrtllmAttentionWorkspaceManager::makeWorkspaceView(
 
 TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLayout(at::ScalarType const qDtype,
     int64_t const batchSize, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
-    int64_t const rotaryEmbeddingDim, bool const separateQKvInput, bool const fp8ContextFmha,
-    bool const skipTrtllmGenWorkspace)
+    int64_t const rotaryEmbeddingDim, bool const separateQKvInput, bool const fp8ContextFmha, bool const skipWorkspace)
 {
     auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
     auto const localHiddenUnitsQo = numHeads * headSize;
@@ -149,7 +148,7 @@ TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLay
     auto const fmhaBmm2ScaleSize = fp8ContextFmha ? static_cast<int64_t>(sizeof(float)) : 0;
 
     tensorrt_llm::common::op::AttentionContextWorkspaceSizes workspaceSizes{};
-    workspaceSizes.cublasWorkspace = skipTrtllmGenWorkspace ? 0 : kTrtllmGenWorkspaceSize;
+    workspaceSizes.cublasWorkspace = skipWorkspace ? 0 : kTrtllmGenWorkspaceSize;
     workspaceSizes.cuQSeqlens = cuSeqlensSize;
     workspaceSizes.cuKvSeqlens = cuSeqlensSize;
     workspaceSizes.cuMaskRows = cuSeqlensSize;
@@ -172,7 +171,7 @@ TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLay
         .fmhaTileCounterOffset = exportOffset(layout.fmhaTileCounter),
         .fmhaBmm1ScaleOffset = exportOffset(layout.fmhaBmm1Scale),
         .fmhaBmm2ScaleOffset = exportOffset(layout.fmhaBmm2Scale),
-        .trtllmGenWorkspaceSize = skipTrtllmGenWorkspace ? 0 : kTrtllmGenWorkspaceSize,
+        .trtllmGenWorkspaceSize = skipWorkspace ? 0 : kTrtllmGenWorkspaceSize,
         .cuSeqlensSize = cuSeqlensSize,
         .rotaryInvFreqSize = rotaryInvFreqSize,
         .qBufSize = qBufSize,
@@ -188,7 +187,7 @@ TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLay
 TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerationLayout(at::ScalarType const qDtype,
     int64_t const batchBeam, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
     int64_t const rotaryEmbeddingDim, int64_t const numKvHeads, int64_t const maxBlocksPerSequence,
-    bool const useSparseAttention, bool const skipTrtllmGenWorkspace)
+    bool const useSparseAttention, bool const skipWorkspace)
 {
     auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
     auto const cuSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + 1);
@@ -214,7 +213,7 @@ TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerat
     workspaceSizes.kernelWorkspace = qBufSize;
     auto const xqaLayout = AttentionWorkspaceManager::buildXqaLayout(workspaceSizes, kWorkspaceAlignment);
     auto const trtllmGenWorkspaceOffset = static_cast<int64_t>(xqaLayout.totalSize);
-    auto const trtllmGenWorkspaceSize = skipTrtllmGenWorkspace ? 0 : kTrtllmGenWorkspaceSize;
+    auto const trtllmGenWorkspaceSize = skipWorkspace ? 0 : kTrtllmGenWorkspaceSize;
     auto const totalSize = xqaLayout.totalSize
         + tensorrt_llm::common::alignSize(static_cast<size_t>(trtllmGenWorkspaceSize), kWorkspaceAlignment);
 

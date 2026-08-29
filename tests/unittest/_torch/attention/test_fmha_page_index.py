@@ -11,18 +11,23 @@ from typing import TypeAlias
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha import (
+    flashinfer_trtllm_gen as flashinfer_trtllm_gen_module,
+)
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
     _get_multi_ctas_kv_counter_size,
 )
 from tensorrt_llm._torch.attention.backends.fmha.interface import _CuteDslMlaStagingKey
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 
 
 class _AttentionStub:
@@ -32,6 +37,7 @@ class _AttentionStub:
         is_mla_enable: bool,
         has_fp8_kv_cache: bool,
         flashinfer_mla_backend: str | None = None,
+        local_layer_idx: int = 0,
     ) -> None:
         self.is_mla_enable = is_mla_enable
         self.has_fp8_kv_cache = has_fp8_kv_cache
@@ -39,33 +45,78 @@ class _AttentionStub:
         self.kv_lora_rank = 512 if is_mla_enable else None
         self.head_dim = 576
         self.v_head_dim = 512 if is_mla_enable else None
+        self.local_layer_idx = local_layer_idx
 
 
 _MlaBackendPolicy: TypeAlias = Callable[[str, SimpleNamespace, int], str]
 
 
-def _get_total_num_blocks(manager: SimpleNamespace, kv_factor: int = 2) -> int:
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha.kv_factor = kv_factor
-    return fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=manager))
-
-
 def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
+    calls: list[tuple[int, object]] = []
+    bounds = iter((97, 101))
+
+    def get_page_index_upper_bound(local_layer_idx: int, role: object) -> int:
+        calls.append((local_layer_idx, role))
+        return next(bounds)
+
     manager = SimpleNamespace(
         blocks_in_primary_pool=50_000_000,
-        impl=SimpleNamespace(get_page_index_upper_bound=lambda *_: 50_000_000),
+        impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound),
         num_local_layers=36,
     )
-    assert _get_total_num_blocks(manager) == 50_000_000
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.kv_factor = 2
+    fmha._v1_total_num_blocks_cache = None
+    attn = SimpleNamespace(local_layer_idx=7)
+    fmha._attn_ref = lambda: attn
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        host_kv_cache_pool_mapping=None,
+    )
+
+    assert fmha._get_total_num_blocks(metadata) == 97
+    assert fmha._get_total_num_blocks(metadata) == 101
+    assert calls == [(7, Role.KEY), (7, Role.KEY)]
 
 
-def test_flashinfer_preserves_legacy_pool_scaling() -> None:
+@pytest.mark.parametrize("kv_factor", [1, 2])
+def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> None:
+    calls: list[int] = []
+
+    def get_primary_pool_data(local_layer_idx: int) -> SimpleNamespace:
+        calls.append(local_layer_idx)
+        return SimpleNamespace(shape=(1024,))
+
+    pool_mapping = torch.tensor(
+        [
+            [0, 0],
+            [1, 0],
+            [0, 1],
+            [1, 1],
+            [0, 2],
+        ],
+        dtype=torch.int32,
+    )
     manager = SimpleNamespace(
-        blocks_in_primary_pool=1024,
-        impl=SimpleNamespace(),
-        num_local_layers=36,
+        blocks_in_primary_pool=50_000_000,
+        impl=SimpleNamespace(get_primary_pool_data=get_primary_pool_data),
+        num_local_layers=5,
+        num_pools=2,
     )
-    assert _get_total_num_blocks(manager, kv_factor=2) == 1024 * 36 * 2
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.kv_factor = kv_factor
+    fmha._v1_total_num_blocks_cache = None
+    attn = SimpleNamespace(local_layer_idx=4)
+    fmha._attn_ref = lambda: attn
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        host_kv_cache_pool_mapping=pool_mapping,
+    )
+
+    expected = (1024 * 3 - 2) * kv_factor
+    assert fmha._get_total_num_blocks(metadata) == expected
+    assert fmha._get_total_num_blocks(metadata) == expected
+    assert calls == [4]
 
 
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
@@ -128,6 +179,106 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
             forward_args=SimpleNamespace(),
             workspace=SimpleNamespace(),
         )
+
+
+def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-attention padding can make active rows irrecoverable from requests and beam width."""
+    batch_size = 3
+    preprocess_calls: list[tuple[object, ...]] = []
+
+    def generation_preprocess(*args: object) -> tuple[object, ...]:
+        preprocess_calls.append(args)
+        return (
+            torch.empty((batch_size, 2, 4)),
+            torch.empty(1),
+            torch.empty((batch_size, 1), dtype=torch.int32),
+            None,
+            None,
+            None,
+            torch.empty(0, dtype=torch.uint8),
+            None,
+            1,
+            1,
+            -1,
+            False,
+        )
+
+    decode_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module.thop,
+        "trtllm_gen_generation_preprocess",
+        generation_preprocess,
+    )
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(
+                trtllm_batch_decode_with_kv_cache=lambda **kwargs: decode_calls.append(kwargs)
+            )
+        ),
+        raising=False,
+    )
+
+    attn = SimpleNamespace(
+        local_layer_idx=0,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        quant_mode=0,
+        predicted_tokens_per_seq=1,
+        position_embedding_type=0,
+        rotary_inv_freq=None,
+        rotary_cos_sin=None,
+        rope_params=SimpleNamespace(dim=0, theta=1.0, scale_type=0, scale=1.0, max_positions=1),
+    )
+    metadata = SimpleNamespace(
+        beam_width=2,
+        kv_cache_block_offsets=torch.empty(0),
+        host_kv_cache_pool_pointers=torch.empty(0),
+        host_kv_cache_pool_mapping=torch.empty(0),
+        num_contexts=2,
+    )
+    output = torch.empty((batch_size, 2, 4))
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.mixed,
+    )
+    params = FmhaParams(
+        attn=attn,
+        meta=metadata,
+        fwd=forward_args,
+        workspace=torch.empty(0, dtype=torch.uint8),
+        qkv_input=torch.empty((batch_size, 2, 4)),
+        context_buf=output,
+        sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
+        input_seq_length=1,
+        num_tokens=batch_size,
+        seq_offset=2,
+        tokens_per_block=32,
+        kv_factor=2,
+        total_num_blocks=8,
+        batch_size=batch_size,
+        num_requests=1,
+        is_cross=True,
+    )
+    fmha = SimpleNamespace(
+        _layout="HND",
+        _enable_pdl=False,
+        USE_SHARED_PAGED_KV_IDX=False,
+        _multi_processor_count=1,
+        _get_bmm1_scale=lambda _attn: 1.0,
+        _get_attention_chunk_size=lambda _attn: 0,
+        _use_fp8_context_fmha=lambda _output, _input_type: False,
+        _get_multi_ctas_kv_counter_buffer=lambda: None,
+    )
+
+    FlashInferTrtllmGenFmha.run_generation(fmha, params)
+
+    assert preprocess_calls[0][24] == batch_size
+    assert len(decode_calls) == 1
 
 
 def test_flashinfer_cute_dsl_mla_backend_rejects_fp8_kv_cache() -> None:
