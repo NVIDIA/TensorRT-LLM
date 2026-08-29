@@ -584,7 +584,7 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, *, msg: str) ->
 
 
 class _RejectReplicatedMultiControlBackend:
-    def forward(self, **_kwargs):
+    def forward(self, **_kwargs: object) -> None:
         raise AssertionError("multi-control bypassed the Ulysses attention backend")
 
 
@@ -599,9 +599,9 @@ def _record_multi_control_ulysses_layout(
     for layer in model.gen_layers:
         layer.cross_attention.multi_control_attn = _RejectReplicatedMultiControlBackend()
 
-    sequence_lengths = []
+    sequence_lengths: list[int] = []
 
-    def _record_sequence_length(_module, args):
+    def _record_sequence_length(_module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
         sequence_lengths.append(args[0].shape[1])
 
     handle = model.gen_layers[0].register_forward_pre_hook(_record_sequence_length)
@@ -694,7 +694,7 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
-def _logic_cosmos3_multi_control_ulysses_vs_single_gpu(rank, world_size):
+def _logic_cosmos3_multi_control_ulysses_vs_single_gpu(rank: int, world_size: int) -> None:
     ref_model, ulysses_model, _, device = _build_ref_and_parallel(ulysses_size=world_size)
     text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
     sequence_lengths, hook = _record_multi_control_ulysses_layout(ulysses_model, world_size)
@@ -802,7 +802,7 @@ def _logic_cosmos3_tp_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
-def _logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu(rank, world_size):
+def _logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu(rank: int, world_size: int) -> None:
     tp_size = 2
     ulysses_size = 2
     ref_model, combined_model, _, device = _build_ref_and_parallel(
@@ -943,7 +943,7 @@ class TestCosmos3TransformerParallel:
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
 
-    def test_multi_control_ulysses2_vs_single_gpu(self):
+    def test_multi_control_ulysses2_vs_single_gpu(self) -> None:
         """Multi-control shards the generator sequence and attention heads with Ulysses."""
         self._skip_if_unavailable()
         run_test_in_distributed(
@@ -979,7 +979,7 @@ class TestCosmos3TransformerParallel:
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_tp_ulysses_vs_single_gpu)
 
     @pytest.mark.gpu4
-    def test_multi_control_tp2_ulysses2_vs_single_gpu(self):
+    def test_multi_control_tp2_ulysses2_vs_single_gpu(self) -> None:
         self._skip_if_unavailable()
         run_test_in_distributed(
             world_size=4, test_fn=_logic_cosmos3_multi_control_tp_ulysses_vs_single_gpu

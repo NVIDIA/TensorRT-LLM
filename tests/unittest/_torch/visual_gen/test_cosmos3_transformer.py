@@ -233,7 +233,7 @@ class TestCosmos3Unit:
         _assert_finite_output(out.video, hs.shape)
 
     @pytest.mark.high_cuda_memory
-    def test_sanity_forward_multi_control(self, cosmos3_model_config):
+    def test_sanity_forward_multi_control(self, cosmos3_model_config: DiffusionModelConfig) -> None:
         cfg = cosmos3_model_config.pretrained_config
         model = _build_random_weight_model(cosmos3_model_config)
         hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
@@ -804,12 +804,22 @@ class TestCosmos3TransformerCheckpoint:
 # --- CPU-only coverage: checkpoint config schema compatibility ---
 
 
+_AttentionCall = dict[str, torch.Tensor]
+
+
 class _RecordingMultiControlBackend:
-    def __init__(self, control_ids=(1, 2)):
-        self.calls = []
+    def __init__(self, control_ids: tuple[int, ...] = (1, 2)) -> None:
+        self.calls: list[_AttentionCall] = []
         self.control_ids = iter(control_ids)
 
-    def forward(self, *, q, k, v, **_kwargs):
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **_kwargs: object,
+    ) -> torch.Tensor:
         self.calls.append({"q": q.clone(), "k": k.clone(), "v": v.clone()})
         control_id = next(self.control_ids)
         result = torch.empty_like(q)
@@ -819,11 +829,16 @@ class _RecordingMultiControlBackend:
 
 
 class _FailingMultiControlBackend:
-    def forward(self, **_kwargs):
+    def forward(self, **_kwargs: object) -> None:
         raise AssertionError("single-control fast path used multi-control attention")
 
 
-def _mock_cross_attention(backend, *, num_attention_heads=2, head_dim=2) -> Cosmos3CrossAttention:
+def _mock_cross_attention(
+    backend: _RecordingMultiControlBackend | _FailingMultiControlBackend,
+    *,
+    num_attention_heads: int = 2,
+    head_dim: int = 2,
+) -> Cosmos3CrossAttention:
     attention = Cosmos3CrossAttention.__new__(Cosmos3CrossAttention)
     torch.nn.Module.__init__(attention)
     attention.local_num_attention_heads = num_attention_heads
@@ -834,7 +849,7 @@ def _mock_cross_attention(backend, *, num_attention_heads=2, head_dim=2) -> Cosm
 
 
 class TestCosmos3MultiControlAttention:
-    def test_ulysses_rank_segments_preserve_global_ranges(self):
+    def test_ulysses_rank_segments_preserve_global_ranges(self) -> None:
         # Post-A2A KV is rank-packed as [text_0, gen_0, text_1, gen_1].
         packed = torch.arange(10.0).reshape(1, 10, 1, 1)
         segments = Cosmos3CrossAttention._ulysses_rank_segments(
@@ -851,7 +866,7 @@ class TestCosmos3MultiControlAttention:
             torch.cat(segments, dim=1).flatten(), torch.tensor([4.0, 7.0, 8.0])
         )
 
-    def _run_two_controls(self):
+    def _run_two_controls(self) -> tuple[torch.Tensor, list[_AttentionCall]]:
         backend = _RecordingMultiControlBackend()
         attention = _mock_cross_attention(backend)
         q = torch.arange(1.0, 13.0).reshape(1, 3, 2, 2)
@@ -872,13 +887,13 @@ class TestCosmos3MultiControlAttention:
         )
         return output, backend.calls
 
-    def test_uniform_target_equation(self):
+    def test_uniform_target_equation(self) -> None:
         output, calls = self._run_two_controls()
         assert len(calls) == 2
         expected = torch.tensor([[[101.0] * 4, [102.0] * 4, [20.0] * 4]])
         torch.testing.assert_close(output, expected)
 
-    def test_control_attention_isolation(self):
+    def test_control_attention_isolation(self) -> None:
         _, calls = self._run_two_controls()
         expected_q = [
             torch.tensor([[[[1.0, 2.0], [9.0, 10.0]], [[3.0, 4.0], [11.0, 12.0]]]]),
@@ -925,7 +940,7 @@ class TestCosmos3MultiControlAttention:
             torch.testing.assert_close(call["k"], key)
             torch.testing.assert_close(call["v"], value)
 
-    def test_per_batch_text_lengths(self):
+    def test_per_batch_text_lengths(self) -> None:
         backend = _RecordingMultiControlBackend(control_ids=(1, 1, 2, 2))
         attention = _mock_cross_attention(backend)
         q = torch.arange(1.0, 25.0).reshape(2, 3, 2, 2)
@@ -952,7 +967,7 @@ class TestCosmos3MultiControlAttention:
         expected = torch.tensor([[[101.0] * 4, [102.0] * 4, [20.0] * 4]] * 2)
         torch.testing.assert_close(output, expected)
 
-    def test_control_weight_defaults_and_normalization(self):
+    def test_control_weight_defaults_and_normalization(self) -> None:
         assert _normalize_control_weights(2, None) == (0.5, 0.5)
         assert _normalize_control_weights(2, [1.0, 3.0]) == (0.25, 0.75)
 
@@ -966,20 +981,25 @@ class TestCosmos3MultiControlAttention:
             ([0.0, 0.0], "positive sum"),
         ],
     )
-    def test_rejects_invalid_control_weights(self, weights, match):
+    def test_rejects_invalid_control_weights(self, weights: list[float], match: str) -> None:
         with pytest.raises(ValueError, match=match):
             _normalize_control_weights(2, weights)
 
-    def test_single_control_uses_existing_attention_path(self):
+    def test_single_control_uses_existing_attention_path(self) -> None:
         attention = _mock_cross_attention(
             _FailingMultiControlBackend(), num_attention_heads=1, head_dim=1
         )
         q = torch.ones(1, 1, 1)
         attention.get_qkv = lambda _hidden_states: (q, q, q)
         attention.apply_qk_norm = lambda query, key: (query, key)
-        calls = []
+        calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-        def _existing_attention(query, key, value, **_kwargs):
+        def _existing_attention(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            **_kwargs: object,
+        ) -> torch.Tensor:
             calls.append((query.clone(), key.clone(), value.clone()))
             return query.flatten(2)
 
