@@ -424,23 +424,18 @@ class PythonMambaCacheManager(BaseResourceManager):
             return self.kda_qkg_cache is not None
 
         def commit_conv_window(self, slot_indices: torch.Tensor,
-                               conv_q: torch.Tensor, conv_k: torch.Tensor,
-                               conv_v: torch.Tensor, conv_size: int) -> None:
-            """Seed the KDA replay conv caches' committed window from freshly
-            advanced FLA conv windows.
+                               conv_pool: torch.Tensor) -> None:
+            """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
+            from ..modules.kimi_kda._kda_kernels import \
+                copy_kda_replay_conv_window
 
-            The committed window (columns ``[0, W-1)`` of ``kda_conv_*``) must
-            hold the last ``W-1`` raw conv inputs whenever another path
-            (prefill, plain decode) advances the base conv pool. The FLA
-            window's oldest column drops out of every future convolution, so
-            columns ``[1, W)`` of the FLA window map 1:1 onto the committed
-            window. Keeping the invariant here, next to the field definitions,
-            is the reason this lives on the state rather than in the caller."""
-            for cache, window in ((self.kda_conv_q, conv_q),
-                                  (self.kda_conv_k, conv_k), (self.kda_conv_v,
-                                                              conv_v)):
-                cache[:, :, :conv_size - 1].index_copy_(
-                    0, slot_indices, window[:, :, 1:].to(cache.dtype))
+            copy_kda_replay_conv_window(
+                conv_pool,
+                self.kda_conv_q,
+                self.kda_conv_k,
+                self.kda_conv_v,
+                slot_indices,
+            )
 
     def __init__(
         self,
@@ -599,10 +594,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                     "KDA replay caches expect the [q | k | v] conv-state "
                     "sectioning (3 equal sections)")
                 section_dim = conv_dim // 3
-                # d_conv is short_conv_kernel_size + 1 for kimi_linear (the
-                # pool trick that stores the full FLA window); the kernel's
-                # conv width is the FLA window size.
-                w_kernel = d_conv - 1
+                # d_conv is KDA's convolution width; the live pool stores
+                # its W - 1 committed input columns.
+                w_kernel = d_conv
                 extended_s = w_kernel - 1 + M
 
                 def _dim_contiguous_conv_cache():
@@ -835,9 +829,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         the recurrent state from the first verify step onward. Call this
         after the state transfer completes, before the first generation
         forward. Mirrors ``_sync_kda_replay_conv_window``: the conv pool row
-        stores the full FLA window (width W); its last ``W - 1`` columns are
-        the committed window of the replay caches. Pending-draft scratch is
-        cleared (no drafts are pending for a freshly transferred request).
+        stores the committed ``W - 1`` raw inputs directly. Pending-draft
+        scratch is cleared (no drafts are pending for a freshly transferred
+        request).
         """
         if not (self._use_kda_replay_update
                 and isinstance(self.mamba_cache, self.SpeculativeState)):
@@ -848,12 +842,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         ]
         if not blocks:
             return
-        conv = self.mamba_cache.conv  # [L, slots, 3D, W]
+        conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
         idx = torch.tensor(sorted(set(blocks)),
                            dtype=torch.long,
                            device=conv.device)
         d = conv.shape[2] // 3
-        committed = conv.shape[3] - 1  # W - 1
+        committed = conv.shape[3]
         cs = conv.index_select(1, idx)
         for cache, section in (
             (self.mamba_cache.kda_conv_q, cs[:, :, :d]),
@@ -866,7 +860,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 (cache.shape[0], idx.numel()) + cache.shape[2:],
                 dtype=cache.dtype,
                 device=cache.device)
-            seeded[:, :, :, :committed] = section[:, :, :, 1:].to(cache.dtype)
+            seeded[:, :, :, :committed] = section.to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
         for buf in (self.mamba_cache.kda_qkg_cache,
                     self.mamba_cache.kda_v_cache,

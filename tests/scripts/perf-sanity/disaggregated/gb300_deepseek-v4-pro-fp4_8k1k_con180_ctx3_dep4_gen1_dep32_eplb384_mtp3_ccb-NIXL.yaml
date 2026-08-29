@@ -41,6 +41,9 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
+# Keep this stage as explicit coverage while the precheck is globally opt-in.
+cache_transceiver_precheck:
+  enabled: true
 worker_config:
   gen:
     print_iter_log: true
@@ -67,7 +70,7 @@ worker_config:
       load_balancer: tests/scripts/perf-sanity/disaggregated/deepseek-v4-pro-eplb/moe_load_balancer_gen_ep32_slots384.yaml
     cache_transceiver_config:
       max_tokens_in_buffer: 8192
-      kv_transfer_timeout_ms: 600000
+      kv_transfer_timeout_ms: 60000
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
@@ -98,7 +101,7 @@ worker_config:
       load_balancer: tests/scripts/perf-sanity/disaggregated/deepseek-v4-pro-eplb/moe_load_balancer_ctx_ep4_384.yaml
     cache_transceiver_config:
       max_tokens_in_buffer: 8192
-      kv_transfer_timeout_ms: 600000
+      kv_transfer_timeout_ms: 60000
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false

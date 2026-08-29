@@ -130,7 +130,7 @@ COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
-COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt constraints.txt LICENSE README.md ./
+COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt requirements-openengine.txt constraints.txt LICENSE README.md ./
 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel

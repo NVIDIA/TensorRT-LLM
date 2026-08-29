@@ -19,7 +19,7 @@ Synthetic loopback coverage of the KDA recurrent-state transfer path:
 * KDA slot layout, mapped onto the Mamba cache-manager parametrization the
   way ``_util.py`` does for ``kimi_linear`` (params come from
   ``extract_mamba_kv_cache_params`` UNSCALED — global head counts):
-    - short-conv slot  ``[3*H*hd, W]``  **bf16** (qwen3_next ``[Q|K|V]``
+    - short-conv slot  ``[3*H*hd, W-1]``  **bf16** (qwen3_next ``[Q|K|V]``
       3-section layout, all sections equal width),
     - delta-rule slot  ``[H, hd, hd]``  **fp32**  (``state_size == head_dim``),
     - TP semantics: the manager itself gates on the mapping
@@ -80,7 +80,8 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 NUM_KDA_LAYERS = 4
 KDA_NUM_HEADS = 4  # H
 KDA_HEAD_DIM = 32  # hd; KDA state_size == head_dim
-KDA_W = 3  # short_conv_kernel_size; manager d_conv = W + 1
+KDA_W = 3  # short_conv_kernel_size
+KDA_CONV_STATE_WIDTH = KDA_W - 1
 CONV_DTYPE = torch.bfloat16
 SSM_DTYPE = torch.float32
 MAX_BATCH_SIZE = 4
@@ -95,7 +96,7 @@ _ATTN_MASK = [True] + [False] * NUM_KDA_LAYERS
 # Global (TP-aggregated) per-layer slot byte sizes. Per-rank slot bytes are
 # these divided by tp_size when attention-DP is off (head-sharded state) and
 # equal to these under attention-DP (replicated state).
-CONV_SLOT_BYTES = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+CONV_SLOT_BYTES = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_CONV_STATE_WIDTH * CONV_DTYPE.itemsize
 SSM_SLOT_BYTES = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
 
 
@@ -206,7 +207,10 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         # Shapes/dtypes of the backing tensors are KDA-shaped.
         assert conv.dtype == CONV_DTYPE
         assert ssm.dtype == SSM_DTYPE
-        assert tuple(conv.shape[2:]) == (3 * KDA_NUM_HEADS * KDA_HEAD_DIM, KDA_W)
+        assert tuple(conv.shape[2:]) == (
+            3 * KDA_NUM_HEADS * KDA_HEAD_DIM,
+            KDA_CONV_STATE_WIDTH,
+        )
         assert tuple(ssm.shape[2:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
 
         # Both pool_views present with correct roles and byte sizes.
@@ -431,7 +435,7 @@ def _synthetic_rank_info(tp: int, adp: bool):
 def test_kda_peer_validation_synthetic_cpu(ctx, gen, ok):
     """CPU-only reject/accept matrix for the global-size guard (no CUDA manager)."""
     full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-    full_conv = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+    full_conv = CONV_SLOT_BYTES
 
     def build(cfg):
         tp, adp, denom = cfg
@@ -460,7 +464,7 @@ def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
     validation as long as the per-slot size invariants hold.
     """
     full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-    full_conv = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+    full_conv = CONV_SLOT_BYTES
     ctx_ri = _synthetic_rank_info(2, False)
     gen_ri = _synthetic_rank_info(2, False)
 
@@ -498,7 +502,7 @@ def _shard_kda_ssm(full_ssm: torch.Tensor, tp: int, rank: int) -> torch.Tensor:
 
 
 def _shard_kda_conv(full_conv: torch.Tensor, tp: int, rank: int) -> torch.Tensor:
-    """Per-section shard of the [3*H*hd, W] conv state (identity for tp=1).
+    """Per-section shard of the [3*H*hd, W-1] conv state (identity for tp=1).
 
     qwen3_next [Q | K | V] sectioning with three equal H*hd sections; each
     section is sharded independently across tp, like the manager's
@@ -520,9 +524,11 @@ def _generate_ground_truth(num_requests: int, seed: int = 20260722):
             if not is_kda:
                 continue
             layers[i] = {
-                "conv": torch.rand(3 * KDA_NUM_HEADS * KDA_HEAD_DIM, KDA_W, generator=gen).to(
-                    CONV_DTYPE
-                ),
+                "conv": torch.rand(
+                    3 * KDA_NUM_HEADS * KDA_HEAD_DIM,
+                    KDA_CONV_STATE_WIDTH,
+                    generator=gen,
+                ).to(CONV_DTYPE),
                 "ssm": torch.rand(
                     KDA_NUM_HEADS,
                     KDA_HEAD_DIM,
