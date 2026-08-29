@@ -43,7 +43,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     double bmm1_scale, double bmm2_scale, int64_t attention_chunk_size, bool fp8_context_fmha, bool paged_context_fmha,
     bool is_mla_enable, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
     bool need_build_kv_cache_metadata, std::optional<torch::Tensor> cross_kv = std::nullopt,
-    bool cross_attention = false);
+    bool cross_attention = false, bool skip_trtllm_gen_workspace = false);
 
 void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     torch::Tensor context_lengths, std::optional<torch::Tensor> kv_cache_block_offsets,
@@ -56,7 +56,8 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     int64_t input_seq_length, int64_t max_past_kv_length, int64_t rotary_embedding_dim, double rotary_embedding_base,
     int64_t rotary_embedding_scale_type, double rotary_embedding_scale, int64_t rotary_embedding_max_positions,
     int64_t position_embedding_type, double bmm1_scale, bool fp8_context_fmha, bool paged_context_fmha,
-    bool is_mla_enable, int64_t attention_chunk_size, int64_t multi_processor_count);
+    bool is_mla_enable, int64_t attention_chunk_size, int64_t multi_processor_count,
+    bool skip_trtllm_gen_workspace = false);
 
 std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor,
     at::Tensor, at::Tensor, std::optional<at::Tensor>, int64_t, int64_t, int64_t, bool>
@@ -74,7 +75,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
     double bmm1_scale, double bmm2_scale, bool fp8_context_fmha, int64_t predicted_tokens_per_seq,
     int64_t attention_chunk_size, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
-    bool need_build_kv_cache_metadata, bool cross_attention = false);
+    bool need_build_kv_cache_metadata, bool cross_attention = false, bool skip_trtllm_gen_workspace = false);
 
 } // namespace torch_ext
 
