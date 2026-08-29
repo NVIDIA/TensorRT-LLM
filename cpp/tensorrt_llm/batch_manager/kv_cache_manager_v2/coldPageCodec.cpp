@@ -55,7 +55,12 @@ public:
         TypedVec<PoolIndex, PoolCopyPlan> copyPlans;
     };
 
-    void registerHostMem(HostMem const* memory)
+    [[nodiscard]] bool needsHostMemRegistration() const noexcept override
+    {
+        return HostMem::shouldUseChunkedRegistration();
+    }
+
+    void registerHostMem(HostMem const* memory) override
     {
         TLLM_CHECK(
             memory != nullptr && std::find(mHostMemories.begin(), mHostMemories.end(), memory) == mHostMemories.end());
@@ -335,15 +340,12 @@ namespace detail
 
 bool needsHostMemRegistration(IKvCacheColdPageCodec const& codec) noexcept
 {
-    return HostMem::shouldUseChunkedRegistration()
-        && dynamic_cast<ConcatKvCacheColdPageCodec const*>(&codec) != nullptr;
+    return codec.needsHostMemRegistration();
 }
 
 void registerHostMem(IKvCacheColdPageCodec& codec, HostMem const* memory)
 {
-    auto* concatCodec = dynamic_cast<ConcatKvCacheColdPageCodec*>(&codec);
-    TLLM_CHECK(concatCodec != nullptr);
-    concatCodec->registerHostMem(memory);
+    codec.registerHostMem(memory);
 }
 
 } // namespace detail
@@ -354,6 +356,16 @@ IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
 LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
 {
     return layerGroupId;
+}
+
+bool IKvCacheColdPageCodec::needsHostMemRegistration() const noexcept
+{
+    return false;
+}
+
+void IKvCacheColdPageCodec::registerHostMem(HostMem const* /*memory*/)
+{
+    TLLM_CHECK_WITH_INFO(false, "This cold-page codec does not accept HostMem registration");
 }
 
 std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec()

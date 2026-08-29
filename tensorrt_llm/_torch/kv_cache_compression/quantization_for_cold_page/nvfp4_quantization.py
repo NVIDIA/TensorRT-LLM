@@ -370,8 +370,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         num_pages: int,
         stream: int,
     ) -> None:
+        from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
         metadata = codec_state.lifecycle_metadata[lifecycle_index]
-        torch.ops.trtllm.nvfp4_cold_page_encode(
+        native.nvfp4_cold_page_encode(
             page_indices,
             num_pages,
             metadata.wide.data_ptr(),
@@ -394,8 +396,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         num_pages: int,
         stream: int,
     ) -> None:
+        from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
         metadata = codec_state.lifecycle_metadata[lifecycle_index]
-        torch.ops.trtllm.nvfp4_cold_page_decode(
+        native.nvfp4_cold_page_decode(
             page_indices,
             num_pages,
             metadata.wide.data_ptr(),

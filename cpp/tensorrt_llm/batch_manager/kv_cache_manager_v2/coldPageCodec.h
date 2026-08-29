@@ -106,6 +106,14 @@ public:
     //! PageIndexLocation::kBadLocation on failure or for an unknown layer group.
     [[nodiscard]] virtual PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept = 0;
 
+    //! Returns whether this codec needs HostMem spans for the batched-copy registration-boundary workaround.
+    //! Defaults to false.
+    [[nodiscard]] virtual bool needsHostMemRegistration() const noexcept;
+
+    //! Registers one KVCM-owned HostMem span (non-owning). Wrapper codecs must forward both methods to their
+    //! inner codec.
+    virtual void registerHostMem(HostMem const* memory);
+
     //! Encodes hot pages into cold pages.
     //!
     //! The cold base pointer is GPU-accessible. The index-array location is selected by queryPageIndexLocation(). Host
@@ -131,7 +139,7 @@ public:
 namespace detail
 {
 
-//! Returns whether the default codec needs HostMem spans for the batched-copy registration-boundary workaround.
+//! Returns whether the codec needs HostMem spans for the batched-copy registration-boundary workaround.
 [[nodiscard]] bool needsHostMemRegistration(IKvCacheColdPageCodec const& codec) noexcept;
 
 //! Registers KVCM-owned pinned memory after needsHostMemRegistration() returns true.

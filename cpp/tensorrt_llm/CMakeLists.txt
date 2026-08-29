@@ -144,7 +144,6 @@ add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
 add_subdirectory(runtime)
-add_subdirectory(kv_cache_compression)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
@@ -200,7 +199,6 @@ set(TRTLLM_LINK_LIBS
     cute_dsl_src
     layers_src
     runtime_src
-    kv_cache_compression_src
     compressorKernels_src
     mhcKernels_src
     userbuffers_src

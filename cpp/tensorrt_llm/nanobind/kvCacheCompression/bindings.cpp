@@ -17,7 +17,8 @@
  */
 
 #include "bindings.h"
-#include "tensorrt_llm/kv_cache_compression/nativeColdPageCodec.h"
+#include "tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h"
+#include "tensorrt_llm/kernels/nvfp4ColdPageKernels.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/map.h>
@@ -163,6 +164,43 @@ void initBindings(nb::module_& module)
         [](nb::handle provider, nb::handle codecState) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
         { return std::make_unique<PythonColdPageCodec>(provider, codecState); },
         nb::arg("provider"), nb::arg("codec_state"));
+
+    // The Python provider traffics in raw KVCM addresses, so the launcher trampolines take scalar integers.
+    module.def("nvfp4_cold_page_encode",
+        [](std::int64_t pageIndices, std::int64_t numPages, std::int64_t wide, std::int64_t integers,
+            std::int64_t scales, std::int64_t numBuffers, std::int64_t maxHalfGroupsPerTile, std::int64_t coldPageBytes,
+            std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream)
+        {
+            tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
+                reinterpret_cast<void const*>(static_cast<std::uintptr_t>(pageIndices)),
+                static_cast<std::size_t>(numPages),
+                reinterpret_cast<std::int64_t const*>(static_cast<std::uintptr_t>(wide)),
+                reinterpret_cast<std::int32_t const*>(static_cast<std::uintptr_t>(integers)),
+                reinterpret_cast<float const*>(static_cast<std::uintptr_t>(scales)),
+                static_cast<std::uint32_t>(numBuffers), static_cast<std::uint32_t>(maxHalfGroupsPerTile),
+                static_cast<std::size_t>(coldPageBytes),
+                static_cast<tensorrt_llm::kernels::Nvfp4ColdPageRuntimeType>(runtimeType),
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(coldBase)),
+                reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(stream)));
+        });
+
+    module.def("nvfp4_cold_page_decode",
+        [](std::int64_t pageIndices, std::int64_t numPages, std::int64_t wide, std::int64_t integers,
+            std::int64_t scales, std::int64_t numBuffers, std::int64_t maxHalfGroupsPerTile, std::int64_t coldPageBytes,
+            std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream)
+        {
+            tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
+                reinterpret_cast<void const*>(static_cast<std::uintptr_t>(pageIndices)),
+                static_cast<std::size_t>(numPages),
+                reinterpret_cast<std::int64_t const*>(static_cast<std::uintptr_t>(wide)),
+                reinterpret_cast<std::int32_t const*>(static_cast<std::uintptr_t>(integers)),
+                reinterpret_cast<float const*>(static_cast<std::uintptr_t>(scales)),
+                static_cast<std::uint32_t>(numBuffers), static_cast<std::uint32_t>(maxHalfGroupsPerTile),
+                static_cast<std::size_t>(coldPageBytes),
+                static_cast<tensorrt_llm::kernels::Nvfp4ColdPageRuntimeType>(runtimeType),
+                reinterpret_cast<void const*>(static_cast<std::uintptr_t>(coldBase)),
+                reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(stream)));
+        });
 }
 
 } // namespace tensorrt_llm::nanobind::kv_cache_compression

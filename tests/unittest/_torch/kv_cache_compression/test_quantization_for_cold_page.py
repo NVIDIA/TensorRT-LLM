@@ -78,6 +78,8 @@ def _native() -> tuple[SimpleNamespace, MagicMock]:
         ColdPageLifecycleProperties=lambda: SimpleNamespace(),
         ColdPageIndexLocation=SimpleNamespace(HOST="host"),
         create_python_cold_page_codec=MagicMock(return_value=codec),
+        nvfp4_cold_page_encode=MagicMock(),
+        nvfp4_cold_page_decode=MagicMock(),
     )
     return module, codec
 
@@ -328,14 +330,12 @@ def test_provider_creates_independent_state_per_kv_cache_manager() -> None:
     assert target_state.layer_ids == draft_state.layer_ids == (0,)
 
 
-def test_provider_forwards_a_4096_page_batch_through_one_custom_op_call() -> None:
+def test_provider_forwards_a_4096_page_batch_through_one_native_call() -> None:
     native, _ = _native()
+    encode = native.nvfp4_cold_page_encode
+    decode = native.nvfp4_cold_page_decode
 
-    with (
-        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
-        patch.object(torch.ops.trtllm, "nvfp4_cold_page_encode", create=True) as encode,
-        patch.object(torch.ops.trtllm, "nvfp4_cold_page_decode", create=True) as decode,
-    ):
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
             _cache_config((0, "attention")),
             runtime_dtype=DataType.BF16,

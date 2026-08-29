@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "tensorrt_llm/kv_cache_compression/nativeColdPageCodec.h"
+#include "tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h"
+
+#include "kv_cache_manager_v2/utils/hostMem.h"
 
 #include <gtest/gtest.h>
 
@@ -187,6 +189,34 @@ TEST(NativeColdPageCodecTest, UnownedLifecycleUsesLosslessFallback)
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 777U);
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{1}), 96U);
     EXPECT_EQ(codec.queryPageIndexLocation(kv::LayerGroupId{1}), kv::PageIndexLocation::kHost);
+}
+
+TEST(NativeColdPageCodecTest, MirrorsLosslessFallbackHostMemRegistrationCapability)
+{
+    RecordingCodec codec{{0}};
+    EXPECT_FALSE(codec.needsHostMemRegistration());
+
+    std::array descs{makeAttentionDesc(), makeLosslessDesc(kv::PoolGroupIndex{1}, kv::LayerGroupId{1})};
+    ASSERT_TRUE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
+    auto const defaultCodec = kv::createDefaultKvCacheColdPageCodec();
+    EXPECT_EQ(codec.needsHostMemRegistration(), defaultCodec->needsHostMemRegistration());
+    EXPECT_EQ(kv::detail::needsHostMemRegistration(codec), codec.needsHostMemRegistration());
+}
+
+TEST(NativeColdPageCodecTest, ForwardsHostMemRegistrationToLosslessFallback)
+{
+    int deviceCount = 0;
+    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0)
+    {
+        GTEST_SKIP() << "HostMem registration requires a CUDA device";
+    }
+
+    RecordingCodec codec{{0}};
+    std::array descs{makeAttentionDesc(), makeLosslessDesc(kv::PoolGroupIndex{1}, kv::LayerGroupId{1})};
+    ASSERT_TRUE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
+
+    kv::HostMem hostMem{4096};
+    kv::detail::registerHostMem(codec, &hostMem);
 }
 
 TEST(NativeColdPageCodecTest, RejectsMixedMissingAndDuplicateLifecycleMappings)

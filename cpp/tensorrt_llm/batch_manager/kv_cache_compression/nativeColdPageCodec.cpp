@@ -16,8 +16,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kv_cache_compression/nativeColdPageCodec.h"
+#include "tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
@@ -185,6 +186,17 @@ kv::PageIndexLocation NativeColdPageCodec::queryPageIndexLocation(kv::LayerGroup
 {
     auto const* state = findLayerGroup(layerGroupId);
     return state == nullptr ? kv::PageIndexLocation::kBadLocation : state->pageIndexLocation;
+}
+
+bool NativeColdPageCodec::needsHostMemRegistration() const noexcept
+{
+    return mLosslessCodec != nullptr && mLosslessCodec->needsHostMemRegistration();
+}
+
+void NativeColdPageCodec::registerHostMem(kv::HostMem const* memory)
+{
+    TLLM_CHECK(mLosslessCodec != nullptr);
+    mLosslessCodec->registerHostMem(memory);
 }
 
 bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
