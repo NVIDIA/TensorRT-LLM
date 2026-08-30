@@ -95,39 +95,6 @@ ensure_cuda_driver_stub() {
 
 ensure_cuda_driver_stub
 
-# ============================================================================
-# TEMPORARY PROBE - REMOVE BEFORE MERGING (DLFW 26.08 upgrade)
-#
-# On the 26.08 image this CPU build pod completes MPI_Init but fails EVERY
-# communicator-creation call with MPI_ERR_OTHER: Split_type with the portable
-# MPI_COMM_TYPE_SHARED fails exactly like the OMPI-specific HOST type, with and
-# without torch loaded, while the same container on a SLURM node succeeds.
-# `local_comm` is now built lazily so the import no longer depends on this, but
-# we still want to know whether plain Comm.Dup/Comm.Split are broken too: if
-# they are, this MPI stack cannot create communicators in a K8s pod at all,
-# which would matter for any CI stage that really uses MPI.
-# Never fails the build.
-# ============================================================================
-echo "=== [TEMP] communicator-creation probe ============================"
-OMPI_MCA_coll_base_verbose=10 python3 - <<'MPIPROBE' 2>&1 | tail -40 | sed 's/^/[TEMP] /' || true
-from mpi4py import MPI
-
-print("size:", MPI.COMM_WORLD.Get_size())
-cases = (
-    ("COMM_WORLD.Dup()", lambda: MPI.COMM_WORLD.Dup()),
-    ("COMM_WORLD.Split(0,0)", lambda: MPI.COMM_WORLD.Split(0, 0)),
-    ("COMM_SELF.Dup()", lambda: MPI.COMM_SELF.Dup()),
-    ("COMM_WORLD.Create_group",
-     lambda: MPI.COMM_WORLD.Create_group(MPI.COMM_WORLD.Get_group())),
-)
-for name, fn in cases:
-    try:
-        print(f"  {name:24s} -> OK   size={fn().Get_size()}")
-    except Exception as exc:                             # noqa: BLE001
-        print(f"  {name:24s} -> FAIL {type(exc).__name__}: {exc}")
-MPIPROBE
-echo "=== [TEMP] end probe =============================================="
-
 # What the gate below does and does not establish.
 #
 # `import tensorrt_llm.bindings` is one coarse check standing in for several
