@@ -37,7 +37,7 @@ def test_launch_server_rejects_nonpositive_port_without_disagg(port: int) -> Non
         ]
         sock = mock_socket.socket.return_value.__enter__.return_value
 
-        with pytest.raises(ValueError, match="Port must be specified"):
+        with pytest.raises(ValueError, match="Port must be a positive integer"):
             launch_server(
                 host="localhost",
                 port=port,
