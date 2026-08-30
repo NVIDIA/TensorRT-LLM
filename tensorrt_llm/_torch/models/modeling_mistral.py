@@ -376,11 +376,8 @@ class MistralPixtralEncoderContract:
     """
 
     def _has_vision_encoder(self) -> bool:
-        """Whether this checkpoint carries a Pixtral vision encoder.
-
-        ``MistralConfigLoader`` synthesizes ``vision_config`` only for vision
-        checkpoints, so its absence makes the geometry below meaningless.
-        """
+        """``MistralConfigLoader`` synthesizes ``vision_config`` only for vision
+        checkpoints, so its absence makes the geometry below meaningless."""
         return getattr(self.config, "vision_config", None) is not None
 
     # ------------------------------------------------------------------

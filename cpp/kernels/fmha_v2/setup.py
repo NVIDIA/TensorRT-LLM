@@ -6894,24 +6894,15 @@ def enumerate_kernels():
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
-                  # Clip/SigLip support.
+                  # Vision encoder support: Clip/SigLip (80), Gemma3 VL (72) and Pixtral VL
+                  # (Mistral-Large-3's vision encoder is 1664/16 -> 104). sm100 is absent from
+                  # the general clause above, so a head dim missing here gets no kernel at all:
+                  # FmhaDispatcher then falls back to unfused MHA, whose quadratic
+                  # qk_buf/qk_buf_float terms in AttentionOp::getWorkspaceSizeForContext size
+                  # the workspace in TiB.
                   or  (kspec.sm           == 100
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                  and kspec.head_size     == 80
-                  and kspec.head_size_v   == 0
-                  and kspec.sage_block_sizes is None
-                  and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
-                  # Gemma3 VL (72) and Pixtral VL (Mistral-Large-3's vision encoder is
-                  # 1664/16 -> 104) support. sm100 is absent from the general clause above, so a
-                  # head dim with no clause here gets no kernel at all: FmhaDispatcher then falls
-                  # back to unfused MHA, whose quadratic qk_buf/qk_buf_float terms in
-                  # AttentionOp::getWorkspaceSizeForContext size the workspace in TiB.
-                  or  (kspec.sm           == 100
-                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                  and kspec.head_size     in [72, 104]
+                  and kspec.head_size     in [72, 80, 104]
                   and kspec.head_size_v   == 0
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
