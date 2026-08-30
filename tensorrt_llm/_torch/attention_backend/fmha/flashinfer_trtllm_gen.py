@@ -740,6 +740,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 "regresses TTFT due to per-layer host overhead."
             )
 
+        if (
+            has_context_phase
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and meta.num_contexts > 0
+            and get_sm_version() == 103
+        ):
+            # NVBugs 6641268 and 6668773: on SM103, the FlashInfer
+            # TRTLLM-Gen persistent context path can read unused paged-KV tail
+            # elements, so stale values can corrupt valid FP16/BF16 output.
+            return False, (
+                "FP16/BF16 context attention uses the fallback FMHA on SM103 "
+                "because the FlashInfer TRTLLM-Gen persistent context path can "
+                "read unused paged-KV cache tails."
+            )
+
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax

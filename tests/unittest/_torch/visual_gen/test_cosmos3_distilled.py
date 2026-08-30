@@ -414,6 +414,54 @@ class TestInferModeResolution:
         assert got["num_inference_steps"] == 20
         assert got["width"] == COSMOS3_T2I_PARAMS["width"]
 
+    def test_action_keeps_every_mode_field_unset(self):
+        """Action resolves its own canvas, steps, guidance and frame rate from
+        the embodiment preset. Filling them from the video table here would run
+        every action request at 720p, 35 steps and guidance 6 (CFG on)."""
+        req = _fake_request("video", extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        for field in ("height", "width", "num_inference_steps", "guidance_scale", "frame_rate"):
+            assert got[field] is None, field
+
+    def test_video_keeps_its_materialised_frame_rate(self):
+        """Only action drops it: the serve layer derives num_frames from
+        seconds x frame_rate, so the video default has to stay materialised."""
+        got = self._captured_forward_kwargs(_bare_pipeline(), _fake_request("video"))
+        assert got["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+
+    def test_action_keeps_an_explicit_frame_rate(self):
+        """Dropping the materialised default is what lets the embodiment preset
+        win; dropping a caller's own value would make it unsettable."""
+        req = _fake_request("video", frame_rate=30.0, extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["frame_rate"] == 30.0
+
+    def test_action_honors_an_explicit_frame_rate_equal_to_the_video_default(self):
+        """The collision case: 24.0 is both a legal caller choice and the
+        materialized video default. Value equality reads it as unset and hands
+        back the embodiment preset; provenance keeps the caller's 24."""
+        req = _fake_request("video", frame_rate=24.0, extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["frame_rate"] == 24.0
+
+    def test_action_drops_a_frame_rate_the_caller_never_set(self):
+        req = _fake_request("video", extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["frame_rate"] is None
+
+    def test_action_honors_explicit_values_equal_to_their_defaults(self):
+        """Same hazard for the other mode-dependent fields."""
+        req = _fake_request(
+            "video",
+            height=COSMOS3_720P_PARAMS["height"],
+            guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
+            extra_params={"action_mode": "policy"},
+        )
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["height"] == COSMOS3_720P_PARAMS["height"]
+        assert got["guidance_scale"] == COSMOS3_720P_PARAMS["guidance_scale"]
+        assert got["width"] is None
+
     def test_distilled_merged_defaults_pass_through(self):
         req = _fake_request("image", num_inference_steps=4, guidance_scale=1.0)
         got = self._captured_forward_kwargs(_bare_pipeline(sampling=_distilled_policy()), req)
@@ -766,9 +814,10 @@ class TestDistilledConditioningAnchor:
 
         latents = torch.arange(48, dtype=torch.float32).reshape(1, 4, 3, 2, 2)
         untouched = latents[:, :, 1:].clone()
-        returned = post_step_fn(latents)
+        returned, extra = post_step_fn(latents, None)
 
         assert returned is latents, "must write in place, not copy"
+        assert extra is None, "extra-stream latents pass through untouched"
         assert torch.all(latents[:, :, 0:1] == self.CLEAN)
         assert torch.equal(latents[:, :, 1:], untouched)
 
@@ -782,7 +831,7 @@ class TestDistilledConditioningAnchor:
         latents = torch.zeros(1, 4, 3, 2, 2, dtype=torch.float32)
 
         with pytest.raises(RuntimeError, match="must match the denoised latents"):
-            post_step_fn(latents)
+            post_step_fn(latents, None)
 
     def test_anchor_accepts_matching_dtype(self):
         pipeline = _bare_pipeline(sampling=_distilled_policy())
@@ -791,7 +840,7 @@ class TestDistilledConditioningAnchor:
         )
         latents = torch.zeros(1, 4, 3, 2, 2, dtype=torch.bfloat16)
 
-        post_step_fn(latents)
+        post_step_fn(latents, None)
         assert torch.all(latents[:, :, 0:1] == self.CLEAN)
 
     def _run_denoise(self, with_anchor: bool):
@@ -922,7 +971,7 @@ class TestForwardConditioningWiring:
         post_step_fn = captured["post_step_fn"]
         assert post_step_fn is not None
         latents = torch.zeros(1, 4, self.T_LAT, self.H_LAT, self.W_LAT)
-        post_step_fn(latents)
+        post_step_fn(latents, None)
         assert torch.all(latents[:, :, 0:1] == self.CLEAN)
         assert torch.all(latents[:, :, 1:] == 0.0)
 

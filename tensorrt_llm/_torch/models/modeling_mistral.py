@@ -833,17 +833,25 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self.llm = llm_class(llm_model_config)
         self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
 
-        # NOTE: current `modelopt` does not support quantizing the vision portion.
-        # NOTE: attn_backend: Pixtral head size not always divisible by 128
-        vision_model_config = self._get_sub_model_config(model_config_cp,
-                                                         "vision_config",
-                                                         attn_backend="TRTLLM",
-                                                         quant_config=None)
+        self._vision_tower = None
+        self._multi_modal_projector = None
+        if not model_config.disable_mm_encoder:
+            # NOTE: current `modelopt` does not support quantizing the vision portion.
+            # NOTE: attn_backend: Pixtral head size not always divisible by 128
+            vision_model_config = self._get_sub_model_config(
+                model_config_cp,
+                "vision_config",
+                attn_backend="TRTLLM",
+                quant_config=None)
 
-        self._vision_tower = modeling_pixtral.PixtralVisionModel(
-            vision_model_config)
-        self._multi_modal_projector = Mistral3MultiModalProjector(
-            model_config).eval()
+            self._vision_tower = modeling_pixtral.PixtralVisionModel(
+                vision_model_config)
+            self._multi_modal_projector = Mistral3MultiModalProjector(
+                model_config).eval()
+        else:
+            logger.info(
+                f"{type(self).__name__}: multimodal encoder disabled "
+                "(disable_mm_encoder=True); serving text-only requests.")
         self._post_config()
 
     # This is necessary because the executor looks at
@@ -864,6 +872,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         else:
             self.llm.load_weights(llm_weights)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
+
+        if self._vision_tower is None:
+            return
 
         vit_weights = filter_weights(weights=weights, prefix="vision_tower")
         logger.debug(f"Loading weights for {type(self._vision_tower)}")
@@ -924,6 +935,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
+        if (self._vision_tower is None or self._multi_modal_projector is None):
+            raise ValueError(
+                "Raw multimodal inputs require a local multimodal encoder.")
         mm_embeds = self._vision_forward(list(multimodal_params))
         return mm_embeds[0]
 

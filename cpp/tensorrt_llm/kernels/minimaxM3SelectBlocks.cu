@@ -1,5 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021 NAVER Corp. Authored by CLOVA.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +16,11 @@
  * limitations under the License.
  */
 
+// The histogram select in the second half of this file is derived from
+// TRT-LLM's own kernels/indexerTopK.cu (topKPerRowJob and its helpers), which
+// carries the NAVER/CLOVA copyright above; see the comment on that section for
+// what this port changes.
+
 #include "tensorrt_llm/kernels/minimaxM3SelectBlocks.h"
 
 #include "tensorrt_llm/kernels/moeTopKFuncs.cuh"
@@ -22,6 +28,8 @@
 #include <cmath>
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <cub/cub.cuh>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -41,6 +49,21 @@ constexpr int kSmallMaxBlocks = 128;
 constexpr float kInitScore = 1.0e30F;
 constexpr float kLocalScore = 1.0e29F;
 constexpr uint32_t kFullWarpMask = 0xFFFFFFFFU;
+
+// Apply the init / local forcing to a raw score. Local forcing wins where the
+// two ranges overlap, matching the second torch.where in the PyTorch reference.
+__forceinline__ __device__ float applyForcing(float raw, int32_t block, int32_t initBlocks, int64_t localStart)
+{
+    if (block >= localStart)
+    {
+        return kLocalScore;
+    }
+    if (block < initBlocks)
+    {
+        return kInitScore;
+    }
+    return raw;
+}
 
 __forceinline__ __device__ bool candidateGreater(
     uint32_t lhsScoreKey, int32_t lhsBlockId, uint32_t rhsScoreKey, int32_t rhsBlockId)
@@ -433,78 +456,467 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
     }
 }
 
-template <bool HeadMajorOutput>
-__global__ void minimaxM3SelectBlocksKernel(float const* __restrict__ scores, int64_t headStride, int64_t blockStride,
-    int64_t queryStride, int32_t const* __restrict__ nValidBlocks, int32_t* __restrict__ output, int32_t numKvHeads,
-    int32_t numBlocks, int32_t totalQueries, int32_t initBlocks, int32_t localBlocks)
+// =============================================================================
+// Histogram (radix) select, for rows too long for the bitonic paths
+// =============================================================================
+//
+// The bitonic paths above stop at 128 blocks because that is the widest row
+// four register slots per lane can hold across a warp. Wider rows come here.
+//
+// This replaced a kernel that gave each row one warp and walked it 32 blocks at
+// a time, maintaining a 16-deep sorted array in registers, so its cost grew
+// with the row width times the insertion depth. The histogram select instead
+// makes a small number of whole-CTA passes over the row.
+//
+// Measured on a B200 under CUDA graph replay, full rows, per selector call: the
+// histogram is flat at ~6 us from 32 blocks all the way to 4096 for batches up
+// to 128 rows, while the warp-strided kernel it replaced grew from ~10 us at
+// 160 blocks to ~140 us at 8192. The histogram is ahead from 160 blocks up at
+// every row count from 1 to 2048, and at 128 blocks and below the bitonic paths
+// beat it by up to 2x on the widest batches, so 128 is both the structural and
+// the measured place to switch.
+//
+// The algorithm is TRT-LLM's own indexerTopK (kernels/indexerTopK.cu,
+// topKPerRowJob): a step-0 fp16 histogram as a fast first cut, then up to three
+// exact fp32 refinement steps over whatever landed in the threshold bin,
+// finished by an insertion sort over the staged boundary candidates. The
+// single-block-per-row, non-merging shape used here matches the port in
+// 3rdparty/MSA (python/fmha_sm100/csrc/include/sparse_topk_select.cuh).
+//
+// Differences from both, all forced by this op's contract:
+//   - The row is read through blockStride instead of being transposed to a
+//     contiguous workspace first, so there is no transpose kernel and no
+//     workspace. blockStride == 1 still takes a float4 path.
+//   - rowEnd is per row (nValidBlocks[query]) rather than a scalar, so a mixed
+//     length decode batch needs neither -inf padding nor a uniform bound.
+//   - Scores are forced to init / local sentinels on the fly, at every read.
+//   - The boundary insertion sort breaks ties by smaller block index rather
+//     than by staging slot, which makes the result deterministic and matches
+//     the tie-break of the bitonic paths and of the torch.topk reference.
+//   - Selected blocks whose forced score is -inf are emitted as -1, and the
+//     output is sorted ascending by block index.
+
+// The number of boundary candidates that can be staged for the final sort.
+// A threshold bin wider than this forces another refinement step.
+constexpr int kNumFinalItems = 2048;
+
+// Maps float bits to an unsigned key that orders descending, so a smaller key
+// is a larger score and NaN sorts above +inf. This is the descending form of
+// the key torch.topk uses on CUDA, so the two agree on every bit pattern,
+// including NaN payloads and signed zeros. The radix bins are slices of this
+// key and the boundary sort compares it whole.
+__forceinline__ __device__ uint32_t orderedScoreKey(float x)
 {
-    auto const warp = cg::tiled_partition<kWarpSize>(cg::this_thread_block());
-    int32_t const warpInBlock = threadIdx.x / kWarpSize;
-    int32_t const outputRow = blockIdx.x * kWarpsPerBlock + warpInBlock;
-    int32_t const numOutputRows = totalQueries * numKvHeads;
-    if (outputRow >= numOutputRows)
+    uint32_t const bits = __float_as_uint(x);
+    return (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+}
+
+// Radix bin extraction. kNumBins picks the bin width: 2048 gives 11-bit bins
+// (indexerTopK's canonical config, and the only width whose step 3 is exact),
+// 1024 gives 10-bit bins. Bin 0 holds the largest values.
+template <int step, int kNumBins>
+__forceinline__ __device__ uint32_t extractBinIdx(float x)
+{
+    static_assert(kNumBins == 1024 || kNumBins == 2048);
+    constexpr int kBinBits = kNumBins == 2048 ? 11 : 10;
+    if constexpr (step == 0)
     {
+        // Step 0 bins an fp16 cast, so it needs the same transform at fp16 width.
+        uint16_t bits = __half_as_ushort(__float2half(x));
+        bits = (bits & 0x8000) ? bits : ~bits & 0x7fff;
+        return bits >> (16 - kBinBits);
+    }
+    else
+    {
+        uint32_t const bits = orderedScoreKey(x);
+        if constexpr (step == 1)
+        {
+            return bits >> (32 - kBinBits);
+        }
+        else if constexpr (step == 2)
+        {
+            return (bits >> (32 - 2 * kBinBits)) & (kNumBins - 1);
+        }
+        else
+        {
+            return (bits >> (32 - 2 * kBinBits - 10)) & 0x3ff;
+        }
+    }
+}
+
+template <int shift>
+__forceinline__ __device__ bool isPartialMatch(float x, uint32_t pattern)
+{
+    if constexpr (shift == 0)
+    {
+        return true;
+    }
+    return (orderedScoreKey(x) ^ pattern) >> shift == 0;
+}
+
+// Reads one row of scores, applying the init / local forcing, and hands each
+// (score, block) pair to f. blockStride == 1 goes through float4 loads.
+template <typename Func>
+__device__ void forEachScore(float const* __restrict__ rowBase, int64_t blockStride, int32_t rowEnd, int32_t initBlocks,
+    int64_t localStart, int numThreads, Func f)
+{
+    auto forced = [&](float raw, int32_t block) { f(applyForcing(raw, block, initBlocks, localStart), block); };
+
+    if (blockStride != 1)
+    {
+        for (int32_t block = static_cast<int32_t>(threadIdx.x); block < rowEnd; block += numThreads)
+        {
+            forced(rowBase[block * blockStride], block);
+        }
         return;
     }
 
+    constexpr int kItemsPerVec = 4;
+    // Lead-in scalars until the row base is float4 aligned. There are fewer
+    // than kItemsPerVec of them, and fewer than kItemsPerVec in the tail, so
+    // both edges are one guarded call per thread rather than a loop.
+    int32_t skipCnt = (reinterpret_cast<size_t>(rowBase) % sizeof(float4))
+        ? static_cast<int32_t>((sizeof(float4) - reinterpret_cast<size_t>(rowBase) % sizeof(float4)) / sizeof(float))
+        : 0;
+    skipCnt = min(skipCnt, rowEnd);
+    float4 const* rowVec = reinterpret_cast<float4 const*>(rowBase + skipCnt);
+    int32_t const numVec = (rowEnd - skipCnt) / kItemsPerVec;
+
+    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < numVec; i += numThreads)
+    {
+        float4 const wide = rowVec[i];
+        float const values[kItemsPerVec] = {wide.x, wide.y, wide.z, wide.w};
+        int32_t const block = skipCnt + i * kItemsPerVec;
+#pragma unroll
+        for (int j = 0; j < kItemsPerVec; ++j)
+        {
+            forced(values[j], block + j);
+        }
+    }
+
+    static_assert(kWarpSize >= kItemsPerVec);
+    int32_t const threadRank = static_cast<int32_t>(threadIdx.x);
+    if (threadRank < skipCnt)
+    {
+        forced(rowBase[threadRank], threadRank);
+    }
+    int32_t const tailBlock = skipCnt + numVec * kItemsPerVec + threadRank;
+    if (tailBlock < rowEnd)
+    {
+        forced(rowBase[tailBlock], tailBlock);
+    }
+}
+
+// One refinement step. Returns true if the threshold bin overflowed the staging
+// buffer and the caller must refine further.
+template <int step, int kNumThreadsPerBlock, int kNumBins, typename SmemFinalType>
+__device__ bool processHistogramStep(float const* __restrict__ rowBase, int64_t blockStride, int32_t rowEnd,
+    int32_t initBlocks, int64_t localStart, uint32_t& logitPattern, int& thresholdBinIdx, int32_t* smemOutput,
+    int* smemThresholdBinIdx, int* smemFinalDstIdx, int* smemFinalBinSize, int* smemFoundTopKValues,
+    SmemFinalType& smemFinal)
+{
+    // Step 0 is only an fp16 approximation. If it could not resolve the top-k
+    // the fp32 radix restarts from scratch, so discard what step 0 emitted
+    // rather than double-counting entries that pass both thresholds.
+    if constexpr (step == 1)
+    {
+        if (threadIdx.x == 0)
+        {
+            smemFoundTopKValues[0] = 0;
+            smemFinalDstIdx[0] = 0;
+        }
+    }
+
+    for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock)
+    {
+        smemFinal.histo.data[idx] = 0;
+    }
+    __syncthreads();
+
+    constexpr int kBinBits = kNumBins == 2048 ? 11 : 10;
+    constexpr int kPatternShift = step < 2 ? 0 : step == 2 ? 32 - kBinBits : 32 - 2 * kBinBits;
+    if constexpr (step == 2)
+    {
+        logitPattern = static_cast<uint32_t>(thresholdBinIdx & (kNumBins - 1)) << kPatternShift;
+    }
+    else if constexpr (step == 3)
+    {
+        logitPattern |= static_cast<uint32_t>(thresholdBinIdx & (kNumBins - 1)) << kPatternShift;
+    }
+
+    forEachScore(rowBase, blockStride, rowEnd, initBlocks, localStart, kNumThreadsPerBlock,
+        [&](float score, int32_t /* block */)
+        {
+            if (isPartialMatch<kPatternShift>(score, logitPattern))
+            {
+                atomicAdd(&smemFinal.histo.data[extractBinIdx<step, kNumBins>(score)], 1);
+            }
+        });
+    __syncthreads();
+
+    // Scan the histogram to find the bin the top-k boundary falls into.
+    int lastValue = smemFoundTopKValues[0];
+    for (int round = 0; round < kNumBins / kNumThreadsPerBlock; ++round)
+    {
+        int const idx = static_cast<int>(threadIdx.x) + kNumThreadsPerBlock * round;
+        int const binCount = smemFinal.histo.data[idx];
+        __syncthreads();
+
+        int prefixSum{0}, totalSum{0};
+        using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+        Scan(smemFinal.histo.scan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+        prefixSum += lastValue;
+        totalSum += lastValue;
+        smemFinal.histo.data[idx] = prefixSum;
+        __syncthreads();
+
+        bool foundThreshold = false;
+        if (prefixSum < kTopK)
+        {
+            int const nextPrefixSum
+                = static_cast<int>(threadIdx.x) == kNumThreadsPerBlock - 1 ? totalSum : smemFinal.histo.data[idx + 1];
+            if (nextPrefixSum >= kTopK)
+            {
+                smemThresholdBinIdx[0] = idx;
+                smemFinalBinSize[0] = nextPrefixSum - prefixSum;
+                foundThreshold = true;
+            }
+        }
+
+        if (__syncthreads_or(foundThreshold))
+        {
+            break;
+        }
+        lastValue = totalSum;
+    }
+    __syncthreads();
+
+    thresholdBinIdx = smemThresholdBinIdx[0];
+
+    forEachScore(rowBase, blockStride, rowEnd, initBlocks, localStart, kNumThreadsPerBlock,
+        [&](float score, int32_t block)
+        {
+            if (!isPartialMatch<kPatternShift>(score, logitPattern))
+            {
+                return;
+            }
+            uint32_t const binIdx = extractBinIdx<step, kNumBins>(score);
+            if (binIdx < thresholdBinIdx)
+            {
+                // Strictly above the boundary, so it is in the top-k outright.
+                // The threshold bin is picked so fewer than kTopK elements can
+                // land here; the guard only keeps a malformed threshold from
+                // running off the end of smemOutput.
+                int const dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
+                if (dstIdx < kTopK)
+                {
+                    smemOutput[dstIdx] = block;
+                }
+            }
+            if constexpr (step < 3)
+            {
+                if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems)
+                {
+                    int const dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+                    smemFinal.items.logits[dstIdx] = score;
+                    smemFinal.items.indices[dstIdx] = block;
+                }
+            }
+            else if (binIdx == thresholdBinIdx)
+            {
+                // Everything left in the threshold bin shares all 32 bits, so
+                // the remaining slots are filled in whatever order the atomics
+                // resolve. Reaching here needs more than kNumFinalItems
+                // bit-identical scores in one row, which the ties the caller
+                // can actually produce (the init / local sentinels) never hit.
+                int const dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
+                if (dstIdx < kTopK)
+                {
+                    smemOutput[dstIdx] = block;
+                }
+            }
+        });
+    __syncthreads();
+
+    return smemFinalBinSize[0] > kNumFinalItems;
+}
+
+// Ascending 32-element bitonic sort, one key per lane. Lanes with no real data
+// pass ~0u, which sorts to the tail.
+__forceinline__ __device__ void warpBitonicSortAsc32(uint32_t& key, uint32_t lane)
+{
+#pragma unroll
+    for (int size = 2; size <= kWarpSize; size *= 2)
+    {
+#pragma unroll
+        for (int stride = size / 2; stride > 0; stride /= 2)
+        {
+            uint32_t const partner = __shfl_xor_sync(kFullWarpMask, key, stride);
+            bool const ascending = (lane & size) == 0;
+            bool const isLower = (lane & stride) == 0;
+            if (isLower == ascending)
+            {
+                key = min(key, partner);
+            }
+            else
+            {
+                key = max(key, partner);
+            }
+        }
+    }
+}
+
+template <int kNumThreadsPerBlock, int kNumBins, bool HeadMajorOutput>
+__global__ __launch_bounds__(kNumThreadsPerBlock) void minimaxM3SelectBlocksHistogramKernel(
+    float const* __restrict__ scores, int64_t headStride, int64_t blockStride, int64_t queryStride,
+    int32_t const* __restrict__ nValidBlocks, int32_t* __restrict__ output, int32_t numKvHeads, int32_t numBlocks,
+    int32_t totalQueries, int32_t initBlocks, int32_t localBlocks)
+{
+    static_assert(kNumBins % kNumThreadsPerBlock == 0);
+    static_assert(kNumFinalItems >= kTopK);
+
+    using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+
+    struct FinalItems
+    {
+        int indices[kNumFinalItems];
+        float logits[kNumFinalItems];
+    };
+
+    struct Histogram
+    {
+        typename Scan::TempStorage scan;
+        int data[kNumBins];
+    };
+
+    __shared__ union
+    {
+        FinalItems items;
+        Histogram histo;
+    } smemFinal;
+
+    __shared__ int32_t smemOutput[kTopK];
+    __shared__ int smemThresholdBinIdx[1];
+    __shared__ int smemFinalDstIdx[1];
+    __shared__ int smemFinalBinSize[1];
+    __shared__ int smemFoundTopKValues[1];
+
+    int32_t const outputRow = blockIdx.x;
     int32_t const query = outputRow / numKvHeads;
     int32_t const kvHead = outputRow % numKvHeads;
     int32_t const rawValidBlocks = nValidBlocks[query];
     int32_t const validBlocks = max(0, min(rawValidBlocks, numBlocks));
     int64_t const localStart
         = max(static_cast<int64_t>(rawValidBlocks) - static_cast<int64_t>(localBlocks), static_cast<int64_t>(0));
+    float const* __restrict__ rowBase
+        = scores + static_cast<int64_t>(kvHead) * headStride + static_cast<int64_t>(query) * queryStride;
 
-    using RedType = reduce_topk::TopKRedType<float>;
-    RedType localTopK[kTopK];
-#pragma unroll
-    for (int32_t rank = 0; rank < kTopK; ++rank)
+    for (int i = threadIdx.x; i < kTopK; i += kNumThreadsPerBlock)
     {
-        localTopK[rank] = RedType{-INFINITY, RedType::kMaxIdx};
+        smemOutput[i] = -1;
     }
-
-    for (int32_t block = warp.thread_rank(); block < validBlocks; block += kWarpSize)
+    if (threadIdx.x == 0)
     {
-        int64_t const offset = static_cast<int64_t>(kvHead) * headStride + static_cast<int64_t>(block) * blockStride
-            + static_cast<int64_t>(query) * queryStride;
-        float score = scores[offset];
-        if (block < initBlocks)
+        smemFinalDstIdx[0] = 0;
+        smemFoundTopKValues[0] = 0;
+    }
+    __syncthreads();
+
+    if (validBlocks > kTopK)
+    {
+        int thresholdBinIdx = -1;
+        uint32_t logitPattern = 0;
+        bool continueToNextStep = processHistogramStep<0, kNumThreadsPerBlock, kNumBins>(rowBase, blockStride,
+            validBlocks, initBlocks, localStart, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+            smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal);
+        if (continueToNextStep)
         {
-            score = kInitScore;
+            continueToNextStep = processHistogramStep<1, kNumThreadsPerBlock, kNumBins>(rowBase, blockStride,
+                validBlocks, initBlocks, localStart, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+                smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal);
         }
-        // Match the PyTorch reference's second torch.where: local forcing
-        // overwrites init forcing if the two ranges overlap.
-        if (block >= localStart)
+        if (continueToNextStep)
         {
-            score = kLocalScore;
+            continueToNextStep = processHistogramStep<2, kNumThreadsPerBlock, kNumBins>(rowBase, blockStride,
+                validBlocks, initBlocks, localStart, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+                smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal);
+        }
+        if (continueToNextStep)
+        {
+            processHistogramStep<3, kNumThreadsPerBlock, kNumBins>(rowBase, blockStride, validBlocks, initBlocks,
+                localStart, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
+                smemFinalBinSize, smemFoundTopKValues, smemFinal);
         }
 
-        RedType const candidate{score, block};
-        if (candidate.compValIdx > localTopK[kTopK - 1].compValIdx)
+        if (!continueToNextStep)
         {
-            int32_t insertion = kTopK - 1;
-#pragma unroll
-            for (int32_t rank = kTopK - 2; rank >= 0; --rank)
+            // The threshold bin fit the staging buffer: rank the staged
+            // boundary candidates and emit the slots the steps above did not
+            // fill. Ranking on the ordered key keeps this consistent with the
+            // bins that got the candidates here, and gives NaN a rank at all.
+            // Every float comparison against NaN is false, so ranking on the
+            // float would send a whole NaN threshold bin to one output slot
+            // and leave the other slots unwritten.
+            int const baseIdx = smemFoundTopKValues[0];
+            int const finalCount = smemFinalDstIdx[0];
+            for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock)
             {
-                if (candidate.compValIdx > localTopK[rank].compValIdx)
+                uint32_t const key = orderedScoreKey(smemFinal.items.logits[i]);
+                int const block = smemFinal.items.indices[i];
+                int outIndex = 0;
+                for (int j = 0; j < finalCount; ++j)
                 {
-                    localTopK[rank + 1] = localTopK[rank];
-                    insertion = rank;
+                    uint32_t const otherKey = orderedScoreKey(smemFinal.items.logits[j]);
+                    if (key > otherKey || (key == otherKey && block > smemFinal.items.indices[j]))
+                    {
+                        ++outIndex;
+                    }
+                }
+                if (outIndex + baseIdx < kTopK)
+                {
+                    smemOutput[outIndex + baseIdx] = block;
                 }
             }
-            localTopK[insertion] = candidate;
+            __syncthreads();
+        }
+    }
+    else
+    {
+        // Every valid block is selected; the tail stays at the -1 fill.
+        for (int i = threadIdx.x; i < validBlocks; i += kNumThreadsPerBlock)
+        {
+            smemOutput[i] = i;
         }
     }
 
-    float localScores[kTopK];
-    int32_t localIndices[kTopK];
-#pragma unroll
-    for (int32_t rank = 0; rank < kTopK; ++rank)
-    {
-        RedType::unpack(localScores[rank], localIndices[rank], localTopK[rank].compValIdx);
-    }
+    __syncthreads();
 
-    selectFromCandidates<HeadMajorOutput>(
-        warp, localScores, localIndices, output, query, kvHead, totalQueries, numKvHeads, numBlocks);
+    // One warp finishes: re-read each selected score so that a block forced to
+    // nothing better than -inf is dropped (the reference emits -1 for those),
+    // then sort ascending by block index with -1 padding at the tail.
+    if (threadIdx.x >= kWarpSize)
+    {
+        return;
+    }
+    uint32_t const lane = threadIdx.x;
+    uint32_t key = ~0U;
+    if (lane < kTopK)
+    {
+        int32_t const block = smemOutput[lane];
+        if (block >= 0
+            && applyForcing(rowBase[static_cast<int64_t>(block) * blockStride], block, initBlocks, localStart)
+                != -INFINITY)
+        {
+            key = static_cast<uint32_t>(block);
+        }
+    }
+    warpBitonicSortAsc32(key, lane);
+    if (lane < kTopK)
+    {
+        output[outputOffset<HeadMajorOutput>(query, kvHead, totalQueries, numKvHeads, static_cast<int32_t>(lane))]
+            = key == ~0U ? -1 : static_cast<int32_t>(key);
+    }
 }
 
 template <bool HeadMajorOutput>
@@ -517,6 +929,16 @@ void launchMinimaxM3SelectBlocks(float const* scores, int64_t headStride, int64_
     {
         return;
     }
+    if (numBlocks > kSmallMaxBlocks)
+    {
+        constexpr int kHistogramThreads = 512;
+        constexpr int kHistogramBins = 2048;
+        minimaxM3SelectBlocksHistogramKernel<kHistogramThreads, kHistogramBins, HeadMajorOutput>
+            <<<numOutputRows, kHistogramThreads, 0, stream>>>(scores, headStride, blockStride, queryStride,
+                nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks, localBlocks);
+        return;
+    }
+
     int32_t const gridSize = (numOutputRows + kWarpsPerBlock - 1) / kWarpsPerBlock;
     if (numBlocks <= kWarpSize)
     {
@@ -530,15 +952,9 @@ void launchMinimaxM3SelectBlocks(float const* scores, int64_t headStride, int64_
             blockStride, queryStride, nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks,
             localBlocks);
     }
-    else if (numBlocks <= kSmallMaxBlocks)
-    {
-        minimaxM3SelectBlocks128Kernel<HeadMajorOutput><<<gridSize, kThreadsPerBlock, 0, stream>>>(scores, headStride,
-            blockStride, queryStride, nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks,
-            localBlocks);
-    }
     else
     {
-        minimaxM3SelectBlocksKernel<HeadMajorOutput><<<gridSize, kThreadsPerBlock, 0, stream>>>(scores, headStride,
+        minimaxM3SelectBlocks128Kernel<HeadMajorOutput><<<gridSize, kThreadsPerBlock, 0, stream>>>(scores, headStride,
             blockStride, queryStride, nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks,
             localBlocks);
     }

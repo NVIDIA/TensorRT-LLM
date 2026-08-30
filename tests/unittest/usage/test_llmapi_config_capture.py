@@ -85,7 +85,7 @@ def test_collect_llm_api_config_allows_approved_string_converters_only():
     # Path, which is dropped because it is not an allowlisted scalar, while
     # union_backend's allowlisted str is captured. No production telemetry field
     # is Union[str, Path]; the only real Union allowlist fields are
-    # Union[str, Enum] (sampler_type, load_format). See CR-E (declined).
+    # Union[str, Enum] (load_format). See CR-E (declined).
     class _StringConfig(StrictBaseModel):
         backend: Optional[str] = Field(
             default="pytorch",
@@ -144,7 +144,7 @@ def test_sanitize_allowlist_is_value_fail_closed_for_non_scalars():
     (bool/int/float/str) or None. Excluding Union-with-Any/Path from allowlist
     eligibility at the type level is therefore unnecessary for safety, and a
     coarse rule would also break legitimate Union[str, Enum] allowlist fields
-    such as sampler_type and load_format (verified captured elsewhere).
+    such as load_format (verified captured elsewhere).
     """
     from tensorrt_llm.usage import llmapi_config
 
@@ -624,20 +624,6 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
     assert meta["captured_field_count"] == 1
     assert meta["excluded_field_count"] == 0
     assert meta["unsafe_excluded"] is False
-
-
-def test_collect_llm_api_config_captures_sampler_type_categorical():
-    """sampler_type is a bounded Union[str, SamplerType] categorical allowlist."""
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        sampler_type="TorchSampler",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["sampler_type"] == "TorchSampler"
-    assert meta["capture_succeeded"] is True
 
 
 def test_collect_llm_api_config_captures_transceiver_runtime_categorical():

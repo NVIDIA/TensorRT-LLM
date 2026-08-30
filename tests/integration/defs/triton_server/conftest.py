@@ -373,19 +373,6 @@ def blip2_opt_model_root():
 
 
 @pytest.fixture(scope="session")
-def llava_onevision_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_onevision_model_root = os.path.join(models_root,
-                                              "llava-onevision-qwen2-7b-ov-hf")
-
-    assert os.path.exists(
-        llava_onevision_model_root
-    ), f"{llava_onevision_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_onevision_model_root
-
-
-@pytest.fixture(scope="session")
 def test_video_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"

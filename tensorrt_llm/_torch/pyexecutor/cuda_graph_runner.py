@@ -15,9 +15,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
-from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
+from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -527,37 +527,6 @@ class CUDAGraphRunner:
         else:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
-
-    def clear_capture_only_spec_state(self) -> int:
-        """Clear capture-scoped state from every cached graph SpecMetadata.
-
-        ``create_cuda_graph_metadata`` shallow-copies the live SpecMetadata, so a
-        copy made while ``_run_capture_pass(force_non_greedy=True)`` is active
-        inherits ``_force_non_greedy_for_capture=True``. That copy is cached here
-        and reseated as the live spec_metadata on every later replay of its graph,
-        while the capture pass clears the flag on the base object only. Without
-        this cleanup the copies keep the flag forever and
-        ``_scan_one_model_sampling`` rewrites EVERY serving request's sampling
-        params to the synthetic capture values (temperature 0.7 / top_k 50 /
-        top_p 0.9), silently ignoring what the client asked for.
-
-        The flag must NOT be cleared at copy time instead: it is load-bearing
-        *during* capture. It is what makes the pass-2 populate scan non-greedy on
-        parameter-less warmup requests, so that the advanced-sampling branch (not
-        the argmax fast path, and with the top-k/top-p kernels present) is the one
-        recorded into the graph. Clearing it here -- after the pass has captured
-        every graph -- keeps capture correct and serving clean.
-
-        Returns the number of cached metadata objects cleared.
-        """
-        cleared = 0
-        for stored in self.graph_metadata.values():
-            spec_metadata = stored.get("spec_metadata")
-            if spec_metadata is not None and getattr(
-                    spec_metadata, "_force_non_greedy_for_capture", False):
-                spec_metadata._force_non_greedy_for_capture = False
-                cleared += 1
-        return cleared
 
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs

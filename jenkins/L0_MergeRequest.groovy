@@ -505,6 +505,22 @@ def preparation(pipeline, testFilter, globalVars)
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
+        stage("Upload Build Info") {
+            try {
+                def branch = globalVars[BUILD_BRANCH]
+                def buildInfo = "commit=${env.gitlabCommit}\n" +
+                    "branch=${branch}\n" +
+                    "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                    "jenkins_url=${env.BUILD_URL}"
+                writeFile file: 'build_info.txt', text: buildInfo
+                trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+                pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo "Upload Build Info failed: ${e.toString()}"
+            }
+        }
         stage("Merge Test Waive List") {
             if (testFilter[INFRA_DRY_RUN]) {
                 echo "Skipping Merge Test Waive List for the infrastructure dry run."
@@ -661,6 +677,15 @@ def getGitlabMRChangedFile(pipeline, function, filePath="") {
                 rawDataList.each { rawData ->
                     result += [rawData.get("old_path"), rawData.get("new_path")]
                 }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("old_path"), rawData.get("new_path")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("diff") }
+                }
             }
             if (!rawDataList) { break }
         }
@@ -707,6 +732,15 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 }
                 rawDataList.each { rawData ->
                     result += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+                }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("filename"), rawData.get("previous_filename")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") }
                 }
             }
             if (!rawDataList) { break }
@@ -907,11 +941,18 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             returnStdout: true,
         ).trim()
         def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+        def filesNeedingDiff = changedFiles.findAll { filePath ->
+            _cbtsMatchesAnyPattern(filePath, needsDiffFor)
+        }
         def diffs = [:]
-        for (f in changedFiles) {
-            if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
+        if (filesNeedingDiff) {
+            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+            def fileChanges = githubPrApiUrl != null
+                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
-                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f) ?: ""
+                [(filePath): fileChanges[filePath] ?: ""]
             }
         }
 
@@ -996,7 +1037,7 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        // artifact.py resolves, downloads and unpacks; paths come back
+        // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
@@ -1234,6 +1275,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
+        "requirements.txt",
+        "security_scanning/pyproject.toml",
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
@@ -1242,7 +1285,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/distributed/",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
-        "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
@@ -1313,6 +1356,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/_torch/multi_gpu/",
+        "tests/unittest/_torch/moe/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
@@ -1759,7 +1803,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
     // Infra-scoped fail-fast (parent half). A downstream sub-job returns UNSTABLE
     // when it saw only infra aborts and no genuine test/build failure (see
-    // runBranchesWithInfraDefer in L0_Test.groovy). That is incomplete coverage,
+    // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
     // not a failure: throwing here is exactly what trips the per-arch failFast and
     // cancels the healthy sibling architecture, so do NOT throw. Mark the build
     // UNSTABLE (visible + re-runnable) and let the sibling finish. FAILURE and
@@ -1868,13 +1912,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // Nightly publishes the PackageSanityCheck wheel, while this
                 // build still provides the source tar consumed by test runners.
                 def testStageName = "[Build-x86_64] Remote Run"
+                def buildInfraIncomplete = false
                 stage(testStageName) {
                     def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-                    launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    // launchJob returns UNSTABLE (without throwing) when the build
+                    // sub-job was infra-incomplete: only infra aborts, no genuine
+                    // build failure (see runBranchesWithInfraDefer in Build.groovy).
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    buildInfraIncomplete = (buildStatus == "UNSTABLE")
                 }
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
@@ -1892,6 +1941,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
                     launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
+                    return
+                }
+
+                // Build was infra-incomplete (UNSTABLE): the wheel/tar this arch's
+                // test sub-jobs would consume was never produced, so launching them
+                // can only fail on a missing artifact. Skip them WITHOUT throwing --
+                // throwing is exactly what trips the arch-level failFast and cancels
+                // the healthy sibling architecture and its consumers. Keep the build
+                // UNSTABLE (already set by launchJob); do NOT escalate to FAILURE.
+                // Unlike the single-GPU-infra-incomplete policy below, post-merge
+                // skips too: with no artifact there is no signal to be had.
+                if (buildInfraIncomplete) {
+                    stage("[Test-x86_64] Blocked - build infra-incomplete") {
+                        echo "x86_64 build was infra-incomplete (UNSTABLE); skipping x86_64 test sub-jobs (no artifact to test). Build stays UNSTABLE."
+                    }
                     return
                 }
 
@@ -2030,11 +2094,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // see x86 track above for the rationale.
 
                 def testStageName = "[Build-SBSA] Remote Run"
+                def buildInfraIncomplete = false
                 stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
-                    launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    // launchJob returns UNSTABLE (without throwing) when the build
+                    // sub-job was infra-incomplete: only infra aborts, no genuine
+                    // build failure (see runBranchesWithInfraDefer in Build.groovy).
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    buildInfraIncomplete = (buildStatus == "UNSTABLE")
                 }
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
@@ -2075,6 +2144,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
                     }
+                }
+
+                // Build was infra-incomplete (UNSTABLE): the wheel/tar this arch's
+                // test sub-jobs would consume was never produced, so launching them
+                // can only fail on a missing artifact. Skip them WITHOUT throwing --
+                // throwing is exactly what trips the arch-level failFast and cancels
+                // the healthy sibling architecture and its consumers. Keep the build
+                // UNSTABLE (already set by launchJob); do NOT escalate to FAILURE.
+                // Unlike the single-GPU-infra-incomplete policy below, post-merge
+                // skips too: with no artifact there is no signal to be had.
+                if (buildInfraIncomplete) {
+                    stage("[Test-SBSA] Blocked - build infra-incomplete") {
+                        echo "SBSA build was infra-incomplete (UNSTABLE); skipping SBSA test sub-jobs (no artifact to test). Build stays UNSTABLE."
+                    }
+                    return
                 }
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
@@ -2233,6 +2317,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'wait_success_seconds': "",
                             ]
                         }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
+                        }
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2300,6 +2387,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
+                        }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
                         }
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2428,20 +2518,6 @@ pipeline {
         }
         always {
             script {
-                stage("Upload Build Info") {
-                    try {
-                        def branch = globalVars[BUILD_BRANCH]
-                        def buildInfo = "commit=${env.gitlabCommit}\n" +
-                            "branch=${branch}\n" +
-                            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
-                            "jenkins_url=${env.BUILD_URL}"
-                        writeFile file: 'build_info.txt', text: buildInfo
-                        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-                        echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
-                    } catch (Exception e) {
-                        echo "Upload Build Info failed: ${e.toString()}"
-                    }
-                }
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter, globalVars)
                 }

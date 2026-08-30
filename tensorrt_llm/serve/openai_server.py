@@ -22,7 +22,7 @@ from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, List, Optional, Union)
 
 import uvicorn
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -72,14 +72,15 @@ from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionMessageParam, ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatMessage, CompletionRequest, CompletionResponse,
-    CompletionResponseChoice, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse, ImageEditRequest,
-    ImageGenerationRequest, ImageGenerationResponse, ImageObject,
-    MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    ChatCompletionToolsParam, ChatMessage, CompletionRequest,
+    CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
+    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
+    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
+    ResponseFormat, ResponsesRequest, ResponsesResponse, StreamOptions,
+    TokenizeRequest, TokenizeResponse, UpdateWeightsRequest, UsageInfo,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
@@ -101,6 +102,8 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -206,6 +209,183 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "build that relays 'resolved_thinking'.")
 
 
+def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
+    """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
+
+    Kimi's API pins top_p, the penalties, and n, and bounds temperature to
+    [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
+    generate. top_p unset or the OpenAI-default 1.0 is coerced to the pinned
+    0.95 instead of rejected. Off by default so existing K3 deployments keep
+    accepting the requests they accept today (review feedback); a Kimi
+    Vendor Verifier certification run must opt in with
+    TRTLLM_KIMI_PARAM_POLICY=1.
+    """
+    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
+        return
+    if request.top_p is None or request.top_p == 1.0:
+        # Kimi pins top_p at 0.95. None would fall back to 1.0 in
+        # to_sampling_params; an explicit 1.0 is the OpenAI SDK default many
+        # clients send unconditionally — coerce both to the pinned value
+        # rather than rejecting (review feedback).
+        request.top_p = 0.95
+    if request.temperature is not None and not (0.0 <= request.temperature <=
+                                                1.0):
+        raise ValueError("temperature must be within [0, 1] for this model; "
+                         f"got {request.temperature}.")
+    if request.top_p is not None and request.top_p != 0.95:
+        raise ValueError(
+            f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
+    if request.presence_penalty:
+        raise ValueError("presence_penalty is fixed at 0 for this model; "
+                         f"got {request.presence_penalty}.")
+    if request.frequency_penalty:
+        raise ValueError("frequency_penalty is fixed at 0 for this model; "
+                         f"got {request.frequency_penalty}.")
+    if request.n != 1:
+        raise ValueError(f"n is fixed at 1 for this model; got {request.n}.")
+
+
+# Valid function-tool name: no leading digit, word chars/dash only, at most
+# 256 chars (Kimi Vendor Verifier contract for message-level tools).
+_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
+
+
+def _dynamic_tool_dicts(
+        messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
+    """Collect message-level (dynamic) tool declarations from system messages."""
+    tools: list[dict] = []
+    for msg in messages or []:
+        if isinstance(
+                msg, dict) and msg.get("role") == "system" and msg.get("tools"):
+            tools.extend(msg["tools"])
+    return tools
+
+
+def _validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
+    """Validate message-level (dynamic) tool declarations for kimi_k3.
+
+    Kimi-style dynamic tools ride on system messages. Enforce the contract
+    checked by the Kimi Vendor Verifier: system-only carrier, empty content,
+    function-typed tools with valid unique names (unique also against
+    request-level tools). Only called for kimi_k3 deployments; other models
+    keep ignoring the key as before.
+    """
+    seen_names = set()
+    for tool in request.tools or []:
+        seen_names.add(tool.function.name)
+    for message in request.messages or []:
+        # A null tools key is treated as absent (some SDKs serialize
+        # optional fields as null); only declared tools are validated.
+        if not isinstance(message, dict) or message.get("tools") is None:
+            continue
+        if message.get("role") != "system":
+            raise ValueError(
+                "Message-level `tools` are only allowed on system messages.")
+        if message.get("content"):
+            raise ValueError(
+                "A system message carrying `tools` must have empty content.")
+        message_tools = message["tools"]
+        if not isinstance(message_tools, list):
+            raise ValueError("Message-level `tools` must be an array.")
+        for tool in message_tools:
+            if not isinstance(tool, dict):
+                raise ValueError("Each message-level tool must be an object.")
+            if tool.get("type") != "function":
+                raise ValueError(f"Unsupported message-level tool type: "
+                                 f"{tool.get('type')!r}.")
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                raise ValueError(
+                    "Message-level tools must carry a `function` object.")
+            name = function.get("name")
+            if not isinstance(name,
+                              str) or not _DYNAMIC_TOOL_NAME_RE.match(name):
+                raise ValueError(f"Invalid message-level tool name: {name!r}.")
+            if name in seen_names:
+                raise ValueError(f"Duplicate tool name: {name!r}.")
+            seen_names.add(name)
+
+
+def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
+                                model_type: Optional[str]) -> None:
+    """Apply Kimi/Moonshot API semantics to a chat request for kimi_k3.
+
+    The kimi_k3 checkpoint template natively renders control messages for
+    thinking effort, tool_choice, and response_format, but only reads them
+    from chat-template kwargs. Derive those kwargs from the request-level
+    fields so the OpenAI-style API surface drives the template; explicit
+    client-supplied `chat_template_kwargs` win over derived values. The
+    merged kwargs also steer the kimi_k3 reasoning parser's initial channel,
+    the guided-decoding structural tag, and the thinking-budget logits
+    processor downstream.
+
+    Kimi's API also reports usage in the final streaming chunk without the
+    client opting in, so default `stream_options` for streaming requests.
+    """
+    if model_type != "kimi_k3":
+        return
+    _validate_kimi_dynamic_tools(request)
+    _enforce_kimi_param_policy(request)
+    if request.stream and request.stream_options is None:
+        # StreamOptions defaults: include_usage=True, continuous off.
+        request.stream_options = StreamOptions()
+    derived: dict[str, Any] = {}
+    if request.thinking is not None:
+        enabled = request.thinking.type != "disabled"
+        derived["thinking"] = enabled
+        if enabled and request.thinking.effort is not None:
+            derived["thinking_effort"] = request.thinking.effort
+    if ("reasoning_effort" in request.model_fields_set
+            and request.reasoning_effort is not None
+            and "thinking_effort" not in derived and
+        (request.thinking is None or request.thinking.type != "disabled")):
+        # Kimi semantics: an explicit thinking.effort wins, and an explicit
+        # thinking object also wins the on/off axis — reasoning_effort only
+        # supplies the effort when thinking.effort is absent, and
+        # reasoning_effort="none" only disables thinking when no thinking
+        # object was sent. No effort is ever derived for an explicitly
+        # disabled request. (KVV test_reasoning_effort_ignored_when_effort_
+        # present / test_reasoning_effort_effective_when_effort_absent.)
+        effort = getattr(request.reasoning_effort, "value",
+                         request.reasoning_effort).lower()
+        if effort == "none":
+            if request.thinking is None:
+                derived["thinking"] = False
+        elif effort in ("low", "high", "max"):
+            derived["thinking_effort"] = effort
+        # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
+        # leave the template default.
+    if ("tool_choice" in request.model_fields_set
+            and (request.tools or _dynamic_tool_dicts(request.messages))
+            and request.tool_choice in ("required", "none")):
+        derived["tool_choice"] = request.tool_choice
+    response_format = request.response_format
+    if response_format is not None and response_format.type in ("json_object",
+                                                                "json_schema"):
+        derived["response_format"] = response_format.type
+        if response_format.type == "json_schema":
+            # Kimi requires the OpenAI wrapper shape: {name, schema[, strict]}.
+            json_schema = response_format.json_schema
+            if not isinstance(json_schema, dict) or not isinstance(
+                    json_schema.get("name"), str) or not json_schema["name"]:
+                raise ValueError(
+                    "response_format.json_schema requires a non-empty "
+                    "`name` string.")
+            if not isinstance(json_schema.get("schema"), dict):
+                raise ValueError(
+                    "response_format.json_schema requires a `schema` object.")
+            if "strict" in json_schema and not isinstance(
+                    json_schema["strict"], bool):
+                raise ValueError(
+                    "response_format.json_schema.strict must be a boolean.")
+            derived["response_schema"] = json_schema["schema"]
+    if derived:
+        request.chat_template_kwargs = {
+            **derived,
+            **(request.chat_template_kwargs or {}),
+        }
+
+
 def _configure_parser_special_token_decoding(
         sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
         tool_parser_name: Optional[str], has_tools: bool) -> None:
@@ -267,6 +447,14 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
         return None
 
     parser = tool_parser_cls()
+    # Parsers whose wire format can't be expressed through structure_info
+    # triples (kimi_k3 XTML) provide a complete format themselves.
+    custom_format = parser.build_strict_structural_tag_format(tools)
+    if custom_format is not None:
+        resp_format = ResponseFormat(type="structural_tag",
+                                     format=custom_format)
+        return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
+            by_alias=True, exclude_none=True))
     if not parser.supports_structural_tag():
         logger.warning(
             "Tool parser '%s' does not support structural tags, "
@@ -306,6 +494,88 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     resp_format = ResponseFormat(type="structural_tag", format=stag_format)
     return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
         by_alias=True, exclude_none=True))
+
+
+def _parser_extracts_forced_tool_calls(tool_parser_name) -> bool:
+    """Whether this parser extracts forced calls from its own markup.
+
+    Mirrors ``_forced_choice_uses_tool_parser`` in postprocess_handlers: those
+    parsers emit native markup on a forced call and the post-processor parses
+    it, so the request must not be constrained (or rejected) here.
+    """
+    if not tool_parser_name:
+        return False
+    parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    return bool(parser_cls
+                and getattr(parser_cls, "extracts_forced_tool_calls", False))
+
+
+def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
+    r"""Build the begin-prefix and guided-decoding params for a named tool_choice.
+
+    OpenAI / Azure spec: ``tool_choice={"type":"function","function":{"name":"X"}}``
+    must force the model to emit exactly one tool call to function ``X``.
+
+    Unlike the strict-tools path (which relies on xgrammar's *triggered*
+    structural tags and is therefore non-mandatory by design), this path
+    forces the call by:
+
+    1. Asking the caller to prepend ``begin_prefix`` (e.g.
+       ``<tool_call>\n{"name":"X", "arguments":``) to the rendered prompt
+       so the model starts generation *already inside* the tool call.
+    2. Constraining what follows with a plain JSON-schema (or json-object)
+       guided-decoding mode so the arguments are guaranteed to be valid
+       against ``tool.function.parameters``.
+
+    The caller is then responsible for synthesizing the resulting
+    ``tool_calls`` entry — the raw model output is the JSON arguments
+    string of the forced function call.
+
+    Raises:
+        ValueError: if ``tools`` is empty, ``tool_parser_name`` is unset, the
+            parser is not registered, the parser does not support structural
+            tags, or ``forced_tool_name`` is not in ``tools``.
+    """
+    if not tools:
+        raise ValueError("tool_choice requires a named function "
+                         f"'{forced_tool_name}' but no tools were provided.")
+    if not tool_parser_name:
+        raise ValueError(
+            "tool_choice with a named function requires a tool parser "
+            "to be configured on the server (use --tool_parser).")
+
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    if tool_parser_cls is None:
+        raise ValueError(
+            f"Tool parser '{tool_parser_name}' is not registered; cannot "
+            f"force tool_choice to function '{forced_tool_name}'.")
+
+    parser = tool_parser_cls()
+    if not parser.supports_structural_tag():
+        raise ValueError(
+            f"Tool parser '{tool_parser_name}' does not support structural "
+            "tags, which are required to honor tool_choice with a named "
+            "function.")
+
+    forced_tool = next(
+        (t for t in tools if t.function.name == forced_tool_name), None)
+    if forced_tool is None:
+        available = sorted(t.function.name for t in tools if t.function.name)
+        raise ValueError(
+            f"tool_choice requested function '{forced_tool_name}' which is "
+            f"not present in `tools`. Available functions: {available}.")
+
+    info = parser.structure_info()(forced_tool.function.name)
+    begin_prefix = info.begin
+
+    if forced_tool.function.parameters:
+        guided = GuidedDecodingParams(json=forced_tool.function.parameters)
+    else:
+        # No parameters declared — still require a JSON object (typically ``{}``)
+        # so the synthesized ``arguments`` field is well-formed JSON.
+        guided = GuidedDecodingParams(json_object=True)
+
+    return begin_prefix, guided
 
 
 def _normalize_image_output(image) -> list:
@@ -370,7 +640,16 @@ class OpenAIServer(_VideoRoutesMixin):
             embedding_max_queue_size: int = 2048,
             input_processor_workers: int = 8,
             media_load_workers: int = 8,
-            internal_disagg_auth_key: Optional[str] = None):
+            internal_disagg_auth_key: Optional[str] = None,
+            enable_rl_control_endpoints: bool = False,
+            rl_control_api_key: Optional[str] = None):
+        if enable_rl_control_endpoints and not rl_control_api_key:
+            raise ValueError(
+                "rl_control_api_key is required when RL control endpoints are enabled"
+            )
+        if enable_rl_control_endpoints and not isinstance(generator, AsyncLLM):
+            raise ValueError("RL control endpoints require AsyncLLM")
+
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
@@ -395,6 +674,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self._enable_rl_control_endpoints = enable_rl_control_endpoints
+        self._rl_control_api_key = rl_control_api_key
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -1035,16 +1316,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.tokenize,
                                methods=["POST"])
 
-        # RL-only endpoints
-        self.app.add_api_route("/release_memory",
-                               self.release_memory,
-                               methods=["POST"])
-        self.app.add_api_route("/resume_memory",
-                               self.resume_memory,
-                               methods=["POST"])
-        self.app.add_api_route("/update_weights",
-                               self.update_weights,
-                               methods=["POST"])
+        self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
@@ -1085,16 +1357,33 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
-        # RL-only endpoints
+
+    async def _require_rl_control_auth(self, raw_request: Request) -> None:
+        body = await raw_request.body()
+        try:
+            validate_rl_control_request(self._rl_control_api_key, body,
+                                        raw_request.headers)
+        except ValueError as e:
+            raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED,
+                                detail=str(e)) from e
+
+    def _register_rl_control_routes(self) -> None:
+        if not self._enable_rl_control_endpoints:
+            return
+
+        dependencies = [Depends(self._require_rl_control_auth)]
         self.app.add_api_route("/release_memory",
                                self.release_memory,
-                               methods=["POST"])
+                               methods=["POST"],
+                               dependencies=dependencies)
         self.app.add_api_route("/resume_memory",
                                self.resume_memory,
-                               methods=["POST"])
+                               methods=["POST"],
+                               dependencies=dependencies)
         self.app.add_api_route("/update_weights",
                                self.update_weights,
-                               methods=["POST"])
+                               methods=["POST"],
+                               dependencies=dependencies)
 
     def _init_embedding_batcher(self):
         """Create the encode dynamic batcher for the embedding server.
@@ -1591,9 +1880,23 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
+            model_type = resolve_top_level_model_type(self.model_config)
+            is_kimi_k3 = model_type == "kimi_k3"
+            _apply_kimi_chat_extensions(request, model_type)
+            if request.tool_choice == "required" and not is_kimi_k3:
+                # Schema-accepting "required" everywhere but enforcing it only
+                # for kimi_k3 would silently degrade to "auto" elsewhere;
+                # reject loudly for models that cannot honor it.
+                raise ValueError(
+                    "tool_choice='required' is not supported for this model.")
             conversation: List[ConversationMessage] = []
+            # exclude_none for kimi_k3: pydantic-injected null defaults
+            # (strict, description, parameters) would otherwise leak into the
+            # rendered tool-declare JSON and skew prompt-token parity. Other
+            # models keep their historical rendering.
             tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
+                tool.model_dump(exclude_none=is_kimi_k3)
+                for tool in request.tools
             ]
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -1615,22 +1918,179 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
+            # Resolve a named tool_choice (OpenAI spec / Azure compat):
+            #   tool_choice = {"type": "function", "function": {"name": "X"}}
+            # forces the model to call exactly function X. We honor this by
+            # (a) prefix-injecting the tool parser's ``begin`` string into the
+            # rendered chat prompt so the model starts generation already inside
+            # a tool call, and (b) constraining the generated arguments with
+            # plain JSON-schema guided decoding. The post-processor then
+            # synthesizes the resulting ``tool_calls`` entry. Unlike the
+            # ``triggered_tags`` structural-tag path used for ``strict`` tools,
+            # this path is mandatory by construction — the model cannot escape
+            # the tool call.
+            forced_tool_name = None
+            forced_tool_begin_prefix = None
+            if isinstance(request.tool_choice,
+                          ChatCompletionNamedToolChoiceParam):
+                if not request.tools:
+                    return self.create_error_response(
+                        message=("tool_choice with a named function requires "
+                                 "`tools` to be set."),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.BAD_REQUEST)
+                if (request.prompt_token_ids is not None
+                        or request.prompt_token_ids_b64):
+                    # Tokenizing and concatenating the ``begin_prefix`` onto a
+                    # pre-tokenized prompt correctly across all tokenizers is
+                    # fragile (token-boundary issues with special tokens).
+                    # Reject the combination explicitly until there is a
+                    # demonstrated use case.
+                    #
+                    # ``prompt_token_ids_b64`` must be checked here too: it is
+                    # only decoded into ``prompt_token_ids`` further below, so
+                    # testing ``prompt_token_ids`` alone lets a base64 request
+                    # through to the pre-tokenized branch, where the begin
+                    # prefix is never appended.
+                    return self.create_error_response(
+                        message=("tool_choice with a named function is not "
+                                 "supported alongside `prompt_token_ids`; pass "
+                                 "`messages` instead."),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.BAD_REQUEST)
+                if sampling_params.guided_decoding is not None:
+                    # A named tool_choice is mandatory by construction: the
+                    # begin prefix plus a JSON-schema constraint force the
+                    # model into exactly this call. That cannot coexist with a
+                    # client-supplied guided-decoding mode (``response_format``
+                    # and friends), which constrains the assistant *content*
+                    # instead. Honouring only one of them silently would either
+                    # ignore an explicit instruction or emit a tool call whose
+                    # arguments are unconstrained text, so reject instead.
+                    return self.create_error_response(
+                        message=("tool_choice with a named function cannot be "
+                                 "combined with `response_format` or other "
+                                 "guided-decoding settings."),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.BAD_REQUEST)
+                if (self.generator.args.guided_decoding_backend is None
+                        and not _parser_extracts_forced_tool_calls(
+                            self.tool_parser)):
+                    # Parsers that extract forced calls from their own markup
+                    # need no grammar, so this only applies to the constrained
+                    # path below.
+                    #
+                    # The forced path is only mandatory because a JSON-schema
+                    # grammar constrains what follows the begin prefix. With no
+                    # guided-decoding backend configured that grammar is never
+                    # built and the per-request params are silently dropped, so
+                    # the prefix alone would be left "forcing" the call: the
+                    # model completes the arguments, closes the tool-call
+                    # object itself and keeps generating, and the whole tail
+                    # ends up reported as ``function.arguments``. Fail loudly
+                    # instead of returning a tool call whose arguments are
+                    # unconstrained text.
+                    return self.create_error_response(
+                        message=(
+                            "tool_choice with a named function requires the "
+                            "server to be started with a guided decoding "
+                            "backend (set `guided_decoding_backend` to "
+                            "'xgrammar' or 'llguidance')."),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.BAD_REQUEST)
+                forced_tool_name = request.tool_choice.function.name
+
             reasoning_parser_name = self.generator.args.reasoning_parser
+            # Message-level (dynamic) tools are a Kimi API extension; only
+            # kimi_k3 templates render them, so other models keep ignoring
+            # the key entirely.
+            dynamic_tools = _dynamic_tool_dicts(
+                request.messages) if is_kimi_k3 else []
+            dynamic_tool_params: List[ChatCompletionToolsParam] = []
+            if dynamic_tools:
+                try:
+                    dynamic_tool_params = [
+                        ChatCompletionToolsParam.model_validate(tool)
+                        for tool in dynamic_tools
+                    ]
+                except ValidationError as e:
+                    raise ValueError(
+                        f"Invalid message-level tool declaration: {e}") from e
             _configure_parser_special_token_decoding(
                 sampling_params,
                 reasoning_parser_name=reasoning_parser_name,
                 tool_parser_name=self.tool_parser,
-                has_tools=bool(request.tools))
-            if self.tool_parser and request.tools:
+                has_tools=bool(request.tools) or bool(dynamic_tools))
+            all_tools = (request.tools or []) + dynamic_tool_params
+            if self.tool_parser and all_tools:
                 # When strict=True on any tool, apply constrained decoding
                 # via structural tags (only if response_format doesn't already
-                # set guided decoding).
+                # set guided decoding). Dynamic tools must be in the grammar
+                # too, or their calls would be masked out.
                 if sampling_params.guided_decoding is None:
-                    strict_guided = _build_tool_strict_guided_decoding_params(
-                        request.tools, self.tool_parser)
-                    if strict_guided is not None:
-                        sampling_params.guided_decoding = strict_guided
+                    if (forced_tool_name is not None
+                            and _parser_extracts_forced_tool_calls(
+                                self.tool_parser)):
+                        # This parser handles forced calls by extracting them
+                        # from its own native markup (see
+                        # ``BaseToolParser.extracts_forced_tool_calls``), so
+                        # there is no grammar to build and none is needed. Leave
+                        # the prompt and sampling params alone; the
+                        # post-processor runs the parser and takes the call from
+                        # there. Falling through to the grammar path below would
+                        # reject these parsers outright, because none of them
+                        # supports structural tags.
+                        pass
+                    elif forced_tool_name is not None:
+                        # Forced-call path: build the begin-prefix + JSON-schema
+                        # guided decoding. The prefix is injected into the
+                        # prompt after ``apply_chat_template`` below.
+                        try:
+                            forced_tool_begin_prefix, forced_guided = (
+                                _build_forced_tool_call_decoding(
+                                    request.tools, self.tool_parser,
+                                    forced_tool_name))
+                        except ValueError as e:
+                            return self.create_error_response(
+                                message=str(e),
+                                err_type="BadRequestError",
+                                status_code=HTTPStatus.BAD_REQUEST)
+                        sampling_params.guided_decoding = forced_guided
+                    else:
+                        # Strict-tools path: structural tags with the existing
+                        # ``triggered_tags`` semantics. Engages only when at
+                        # least one tool has ``strict=True``.
+                        strict_guided = _build_tool_strict_guided_decoding_params(
+                            all_tools, self.tool_parser)
+                        if strict_guided is not None:
+                            sampling_params.guided_decoding = strict_guided
+            elif forced_tool_name is not None:
+                # tools were provided but the server has no tool_parser configured.
+                return self.create_error_response(
+                    message=("tool_choice with a named function requires the "
+                             "server to be started with --tool_parser."),
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.BAD_REQUEST)
             postproc_args = ChatPostprocArgs.from_request(request)
+            if (is_kimi_k3 and request.add_generation_prompt
+                    and request.prompt_token_ids is None
+                    and request.prompt_token_ids_b64 is None
+                    and request.chat_template is None
+                    and self.chat_template is None):
+                # Kimi's prompt-token accounting excludes the trailing 3-token
+                # generation channel opener (<|open|>think|response<|sep|>);
+                # the model still sees the full rendered prompt. b64-relayed
+                # token ids (decoded later) must behave like plain
+                # prompt_token_ids: no rendering here, so no stub to exclude.
+                # The offset presumes the checkpoint's native K3 renderer; an
+                # explicit request- or server-level chat template may end
+                # differently, so report unadjusted usage for those.
+                postproc_args.num_prompt_tokens_offset = 3
+            if dynamic_tool_params:
+                # The tool parser must see dynamic tools to recognize their
+                # calls in the model output.
+                postproc_args.tools = (postproc_args.tools
+                                       or []) + dynamic_tool_params
             self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -1679,7 +2139,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
                 if isinstance(prompt, str):
+                    # Captured before the forced-tool prefix is appended:
+                    # resolve_prefilled_thinking() inspects what the chat
+                    # template rendered, and the prefix is not part of it.
                     rendered_prompt = prompt
+                if forced_tool_begin_prefix is not None:
+                    # Force the model to start generation inside the tool call.
+                    # See ``_build_forced_tool_call_decoding`` for details.
+                    prompt = prompt + forced_tool_begin_prefix
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -2173,6 +2640,23 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
+            # Named tool_choice (forced function call) is not yet supported on
+            # the harmony / GPT-OSS path; return a clear 4xx pointing to the
+            # follow-up sub-task rather than silently falling back to "auto".
+            # See TRTLLM-12758 (and its harmony follow-up).
+            if isinstance(request.tool_choice,
+                          ChatCompletionNamedToolChoiceParam):
+                return self.create_error_response(
+                    message=("tool_choice with a named function is not yet "
+                             "supported for harmony / GPT-OSS models. Tracking "
+                             "follow-up: harmony sub-task of TRTLLM-12758."),
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.BAD_REQUEST)
+            if request.tool_choice == "required":
+                # The harmony path treats unknown tool_choice values like
+                # "auto"; reject instead of silently degrading.
+                raise ValueError(
+                    "tool_choice='required' is not supported for this model.")
             # Initialize HarmonyAdapter
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
@@ -2290,6 +2774,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
+                    num_prompt_tokens=args.num_prompt_tokens,
                 )
 
             await self._extract_metrics(promise, raw_request)
@@ -2326,6 +2811,18 @@ class OpenAIServer(_VideoRoutesMixin):
                     err_type="InvalidRequestError",
                     message=("'previous_response_id' requires response "
                              "storage, which is disabled on this server."),
+                )
+
+            # Same reasoning for the web_search server tool. Dropping it lets
+            # the model answer from memory while the client believes a live
+            # search was folded in - a wrong answer it cannot detect. A 400
+            # is recoverable: drop the tool and retry.
+            web_search_error = web_search_rejection_reason(request.tools)
+            if web_search_error is not None:
+                return self.create_error_response(
+                    err_type="InvalidRequestError",
+                    message=(f"'web_search' cannot be honoured: "
+                             f"{web_search_error}."),
                 )
 
             # Get prev response
@@ -2394,6 +2891,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            if not self.postproc_worker_enabled:
+                # The executor records this on the postprocessing arguments,
+                # but only for the requests whose postprocessing it owns. The
+                # streamed response is assembled here instead, and it needs
+                # the prompt length to report usage.
+                postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if self.postproc_worker_enabled and request.store:
                 logger.warning(
