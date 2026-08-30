@@ -34,9 +34,11 @@ namespace
 // as 72 and 104 (Pixtral-family vision encoders) have no valid trtllm-gen kernel and must run
 // on fmha v2, whose SM100 tiled kernels cover them (fmha_v2/setup.py maps sm=100 to sm_mma=80,
 // and build_wheel.py generates that family with ENABLE_SM100).
-bool trtllmGenSupportsHeadDim(int headDim)
+bool trtllmGenSupportsHeadDim(MHARunnerFixedParams const& fixedParams)
 {
-    return headDim <= 64 || headDim % 16 == 0;
+    // A zero headSizeV means "same as headSize", matching FusedMHARunnerV2's normalization.
+    int const headDimV = fixedParams.headSizeV != 0 ? fixedParams.headSizeV : fixedParams.headSize;
+    return headDimV <= 64 || headDimV % 16 == 0;
 }
 
 } // namespace
@@ -67,8 +69,7 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
     // Head sizes trtllm-gen has no kernel for fall back to fmha v2.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family()
-          && trtllmGenSupportsHeadDim(fixedParams.headSizeV != 0 ? fixedParams.headSizeV : fixedParams.headSize))
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && trtllmGenSupportsHeadDim(fixedParams))
     , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
 {
     if (mUseTllmGen)
