@@ -2941,6 +2941,7 @@ class TestPendingTransferResponseFlush:
             scheduled_batch, None, None)
         executor._process_previous_batch.assert_called_once_with()
         executor._flush_pending_transfer_responses.assert_called_once_with()
+        assert executor.previous_batch is None
 
     def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
         """The overlap loop must not drop a buffered response on clean exit."""
