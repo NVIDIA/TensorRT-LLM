@@ -533,6 +533,41 @@ def pollSlurm(pipeline, remote, String jobId, String label)
         }
         return true
     }
+    // The waitUntil wall-clock (what Blue Ocean shows for this stage) lumps SLURM
+    // queue wait + actual run time together -- Jenkins can't see inside the
+    // scheduler. Split them from sacct so an oversubscribed cluster (long queue)
+    // is distinguishable from a genuinely slow job. Diagnostic only.
+    logSlurmJobTiming(pipeline, remote, jobId, label)
+}
+
+// Best-effort SLURM timing breakdown for a COMPLETED job: queue wait
+// (Start-Submit) vs run time (End-Start). Emitted as a single [TIMING] line so
+// runs are easy to grep/compare across regions and clusters. NEVER fails the
+// caller -- timing is diagnostic, so any sacct/date hiccup is swallowed.
+def logSlurmJobTiming(pipeline, remote, String jobId, String label)
+{
+    try {
+        def script = """
+            set -o pipefail
+            row=\$(sacct -j ${jobId} --format=Submit,Start,End -Pn --allocations | head -1)
+            sub=\$(echo "\$row" | cut -d'|' -f1)
+            beg=\$(echo "\$row" | cut -d'|' -f2)
+            end=\$(echo "\$row" | cut -d'|' -f3)
+            ss=\$(date -d "\$sub" +%s 2>/dev/null || echo "")
+            bs=\$(date -d "\$beg" +%s 2>/dev/null || echo "")
+            es=\$(date -d "\$end" +%s 2>/dev/null || echo "")
+            if [ -n "\$ss" ] && [ -n "\$bs" ] && [ -n "\$es" ]; then
+                echo "queue=\$((bs-ss))s run=\$((es-bs))s total=\$((es-ss))s"
+            else
+                echo "unavailable (\$row)"
+            fi
+        """.stripIndent()
+        def t = Utils.exec(pipeline, returnStdout: true, numRetries: 1, timeout: false,
+            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(script))).trim()
+        pipeline.echo("[TIMING] ${label} job ${jobId}: ${t}")
+    } catch (Throwable e) {
+        pipeline.echo("[TIMING] ${label} job ${jobId}: timing unavailable (${e.message})")
+    }
 }
 
 // ---------------------------------------------------------------------------
