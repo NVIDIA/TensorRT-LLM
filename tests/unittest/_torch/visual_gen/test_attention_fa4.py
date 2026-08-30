@@ -1,14 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical parity for FlashAttn4Attention's key_padding_mask.
+"""Numerical parity for the FlashAttn4 attention backend.
 
 FA4 is used for LTX-2 audio self-attn and a2v cross-attn when the user picks
-``attention.backend: FA4``. Under Ulysses, audio is padded so T_a is divisible
-by ulysses_size, and padded K columns must produce zero attention
-contribution. FA4's cute interface accepts
-``seqused_k`` per-batch valid lengths; this test verifies that translating a
-True-prefix bool mask to ``seqused_k`` yields output identical to running FA4
-on the unpadded K/V (within bf16 tolerance).
+``attention.backend: FA4``.
+
+**key_padding_mask**: under Ulysses, audio is padded so T_a is divisible by
+ulysses_size, and padded K columns must produce zero attention contribution.
+FA4's cute interface accepts ``seqused_k`` per-batch valid lengths; these tests
+verify that translating a True-prefix bool mask to ``seqused_k`` yields output
+identical to running FA4 on the unpadded K/V (within bf16 tolerance).
+
+**split-KV**: ``FlashAttn4Attention`` passes ``num_splits=0``, so FA4's heuristic
+picks the split count, and any count above 1 selects a separate split-KV kernel
+that the CuTe DSL compiles at first use. The mask tests above use K/V short enough
+that the heuristic returns 1 (it short-circuits at ``num_n_blocks <= 4``), so the
+split-KV kernel needs its own longer-K/V shape to be covered at all.
 
 Requires CUDA (FA4 is GPU-only).
 """
@@ -135,6 +142,53 @@ def test_self_attn_pad_junk_values_dont_affect_valid_output():
         rtol=1e-5,
         atol=1e-5,
         msg="FA4 pad fill leaked into valid-row output — mask is not fully suppressing pads",
+    )
+
+
+@pytest.mark.parametrize("num_splits", [0, 8], ids=["auto", "forced"])
+def test_split_kv_matches_no_split(num_splits):
+    """Splitting K/V must not change FA4's output. Fails to compile on CUTLASS DSL < 4.6.2."""
+    torch.manual_seed(0)
+    device = "cuda"
+    # S_kv must stay well above FA4's `num_n_blocks <= 4` short-circuit for the
+    # `auto` case to reach the split-KV kernel; the short S_q keeps occupancy low
+    # enough that the heuristic prefers splitting, which is the LTX-2 cross-attn shape.
+    B, S_q, S_kv, H, d_h = 1, 64, 4096, 8, 128
+    q, k, v = (
+        torch.randn(B, s, H, d_h, dtype=torch.bfloat16, device=device) for s in (S_q, S_kv, S_kv)
+    )
+
+    def fa4(splits):
+        out, _, *_ = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            seqused_k=None,
+            softmax_scale=d_h**-0.5,
+            causal=False,
+            window_size_left=None,
+            window_size_right=None,
+            learnable_sink=None,
+            softcap=0.0,
+            pack_gqa=None,
+            mask_mod=None,
+            block_sparse_tensors=None,
+            return_lse=True,
+            num_splits=splits,
+        )
+        return out
+
+    # num_splits=1 is the same kernel without the split-KV path, so it is the reference the
+    # split result has to reproduce; an SDPA reference would instead tie this test to
+    # whichever SDPA backend torch dispatches.
+    # 1e-2 is what test_ring_attention uses for FA4 against a reference; measured gap here is
+    # 1-2 bf16 ULP (9.8e-4 worst over 20 seeds x both split modes).
+    torch.testing.assert_close(
+        fa4(num_splits),
+        fa4(1),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"FA4 num_splits={num_splits} diverges from the non-split result",
     )
 
 
