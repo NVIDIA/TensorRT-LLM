@@ -120,7 +120,7 @@ def _make_pools(B, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     d = H * K
     conv_pool = (
-        torch.randn(B, 3 * d, W, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+        torch.randn(B, 3 * d, W - 1, generator=gen, device="cuda", dtype=torch.float32) * 0.5
     ).to(torch.bfloat16)
     ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda", dtype=torch.float32)
     ssm_pool *= torch.linspace(0.5, 1.5, K, device="cuda").view(1, 1, K, 1)
@@ -130,13 +130,13 @@ def _make_pools(B, seed):
 def _make_fused_layer_cache(B, conv_pool):
     """Replay caches shaped like PythonMambaCacheManager's KDA allocation,
     with the committed conv window seeded from the base pool (the prefill
-    seeding contract: FLA window columns [1, W) -> committed columns)."""
+    seeding contract: the base pool stores committed columns directly)."""
     d = H * K
     S = W - 1 + M
 
     def _conv_cache(section):
         cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d, 1:].float()
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
         return cache
 
     return SimpleNamespace(
@@ -147,6 +147,7 @@ def _make_fused_layer_cache(B, conv_pool):
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
         kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
+        has_kda_replay_caches=True,
         intermediate_conv_window=None,
         intermediate_ssm=None,
     )
@@ -156,8 +157,9 @@ def _make_seq_layer_cache(B):
     d = H * K
     return SimpleNamespace(
         kda_qkg_cache=None,
+        has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
-            B, M + 1, 3 * d, W, device="cuda", dtype=torch.bfloat16
+            B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
         intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda", dtype=torch.float32),
     )

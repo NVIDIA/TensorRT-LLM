@@ -18,6 +18,9 @@
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+# Common CUDA architectures for FP8/FP16/BF16 GEMM kernels
+set(CUTLASS_COMMON_ARCHS 89 90 100f 120f)
+
 # The Python executable will only be defined if building with Torch support. If
 # not, we need to find it here.
 if(NOT Python3_EXECUTABLE)
@@ -76,15 +79,17 @@ function(process_target target_name enable_hopper enable_blackwell)
   if(${enable_blackwell}
      AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "107" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
          ))
 
     target_compile_options(${target_name}
                            PRIVATE "-DCUTLASS_ENABLE_GDC_FOR_SM100=1")
-    # Both 100 and 103 support these kernels
+    # SM100 family (100, 103, 107) support these kernels
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "107" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
       # build time improvement
       target_compile_definitions(${target_name}
@@ -205,12 +210,12 @@ add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
-set_cuda_architectures(fb_gemm_src 89 90 100f 120f)
+set_cuda_architectures(fb_gemm_src ${CUTLASS_COMMON_ARCHS})
 # add_instantiations(fb_gemm_src
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f 120f)
+set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
@@ -264,7 +269,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   process_target(_moe_gemm_fp4 false true)
 
   add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})
-  set_cuda_architectures(_moe_gemm_fp8 89 90 100f 120f)
+  set_cuda_architectures(_moe_gemm_fp8 ${CUTLASS_COMMON_ARCHS})
   process_target(_moe_gemm_fp8 true true)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
