@@ -28,10 +28,10 @@ from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)

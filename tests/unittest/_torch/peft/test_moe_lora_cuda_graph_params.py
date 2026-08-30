@@ -24,7 +24,7 @@ CUDA at construction, so these require a GPU, but no weights and no
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 

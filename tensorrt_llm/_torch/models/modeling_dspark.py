@@ -755,7 +755,7 @@ def _active_moe_load_balancer():
     which ``MoE._init_load_balancer`` consumes ``model_config.moe_load_balancer``.
     Gating every DSpark EPLB check on it keeps the non-EPLB path untouched.
     """
-    from ..modules.fused_moe.moe_load_balancer import get_moe_load_balancer
+    from ..moe.fused_moe.moe_load_balancer import get_moe_load_balancer
 
     return get_moe_load_balancer()
 

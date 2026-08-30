@@ -2118,7 +2118,7 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
+        from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),

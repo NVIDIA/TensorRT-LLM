@@ -56,7 +56,6 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
-from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -66,9 +65,10 @@ from ..models.modeling_multimodal_mixin import (MultimodalEncoderContractError,
                                                 _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
-from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
-                                                   MoeLoadBalancerIterContext)
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+from ..moe.expert_statistic import ExpertStatistic
+from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+                                               MoeLoadBalancerIterContext)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -2011,7 +2011,7 @@ class PyTorchModelEngine(ModelEngine):
         # MegaMoE tuning resources are shared across layers, so only the engine
         # can release them after its full autotune warmup and before graph
         # capture. Later eviction could invalidate a captured workspace pointer.
-        from ..custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
+        from ..moe.custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
         release_megamoe_scratch = getattr(_megamoe_op,
                                           "release_megamoe_profiling_scratch",
                                           None)
