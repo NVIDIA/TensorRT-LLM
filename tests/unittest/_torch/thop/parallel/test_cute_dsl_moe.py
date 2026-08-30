@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 from utils.util import check_accuracy
@@ -447,14 +450,25 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
 
     num_non_exiting_tiles = torch.tensor([num_valid_tiles], dtype=torch.int32, device="cuda")
     tile_idx_to_group_idx = torch.empty(max_num_tiles, dtype=torch.int32)
+    tile_idx_to_mn_limit = torch.empty(max_num_tiles, dtype=torch.int32)
+    valid_row_mask = torch.zeros(max_num_permuted_tokens, dtype=torch.bool)
     # Note: Fill -2e9 for invalid tiles.
     tile_idx_to_group_idx.fill_(-2e9)
+    tile_idx_to_mn_limit.fill_(-2e9)
     tile_idx = 0
+    permuted_row = 0
     for expert_idx in range(num_local_experts):
+        expert_m = num_tokens_per_expert[expert_idx].item()
+        expert_m_limit = permuted_row + expert_m
+        valid_row_mask[permuted_row:expert_m_limit] = True
         for i in range(num_tiles_per_expert[expert_idx].item()):
             tile_idx_to_group_idx[tile_idx] = expert_idx
+            tile_idx_to_mn_limit[tile_idx] = expert_m_limit
             tile_idx += 1
+        permuted_row += num_tiles_per_expert[expert_idx].item() * tile_size
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
+    tile_idx_to_mn_limit = tile_idx_to_mn_limit.cuda()
+    valid_row_mask = valid_row_mask.cuda()
 
     a = torch.randint(
         -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
@@ -483,6 +497,7 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
         b_sf,
         alpha,
         tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         num_experts=num_experts,
         top_k=top_k,
@@ -504,7 +519,7 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    torch.testing.assert_close(c[:num_valid_permuted_tokens], c_ref[:num_valid_permuted_tokens])
+    torch.testing.assert_close(c[valid_row_mask], c_ref[valid_row_mask])
 
 
 @pytest.mark.skipif(

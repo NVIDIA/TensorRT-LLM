@@ -713,6 +713,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
                 alpha=weight_view.fc2_global_scale,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,
                 top_k=effective_top_k,
