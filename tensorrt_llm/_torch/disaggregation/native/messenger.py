@@ -1,6 +1,21 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
+from uuid import uuid4
 
 import zmq
 
@@ -83,7 +98,11 @@ class ZMQMessenger(MessengerInterface):
             raise ValueError(
                 f"Invalid mode '{mode}'. Allowed modes are {list(self.SOCKET_MODES.keys())}"
             )
-        self._context = zmq.Context()
+        # A context is thread-safe and owns a native I/O thread. Reuse the
+        # process singleton while keeping every socket confined to its owning
+        # thread; high-fanout disaggregated transfers can otherwise create
+        # hundreds of contexts and native threads per process.
+        self._context = zmq.Context.instance()
         self._mode = mode
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
         self._endpoint: Optional[str] = None
@@ -110,7 +129,9 @@ class ZMQMessenger(MessengerInterface):
     def _initialize_control_sockets(self) -> None:
         self._control_socket = self._context.socket(zmq.PAIR)
         self._internal_socket = self._context.socket(zmq.PAIR)
-        inproc_endpoint = "inproc://stop_listener"
+        # inproc endpoints share the context namespace, so each messenger
+        # needs a distinct endpoint now that the context is process-wide.
+        inproc_endpoint = f"inproc://stop_listener-{uuid4().hex}"
         self._control_socket.bind(inproc_endpoint)
         self._internal_socket.connect(inproc_endpoint)
 
@@ -201,11 +222,8 @@ class ZMQMessenger(MessengerInterface):
             _close_socket(self._internal_socket)
             _close_socket(self._control_socket)
 
-            try:
-                if not self._context.closed:
-                    self._context.term()
-            except Exception as e:
-                logger.error(f"Error terminating ZMQ context: {e}")
+            # The process-wide context outlives every individual messenger.
+            # Terminating it here would invalidate unrelated live sockets.
 
     @property
     def endpoint(self) -> str:

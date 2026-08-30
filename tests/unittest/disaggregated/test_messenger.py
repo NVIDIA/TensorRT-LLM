@@ -1,6 +1,21 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import socket
 import time
 import unittest
+from threading import Lock, Thread
 
 import pytest
 from parameterized import parameterized
@@ -140,6 +155,46 @@ def test_zmq_messenger_double_start_listener(dynamic_endpoint):
     with pytest.raises(RuntimeError, match="Listener already running"):
         messenger.start_listener(lambda msgs: None)
     messenger.stop()
+
+
+def test_zmq_messengers_share_process_context(dynamic_endpoint):
+    first = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+    second = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+
+    try:
+        assert first._context is second._context
+        first.stop()
+        assert not second._context.closed
+    finally:
+        first.stop()
+        second.stop()
+
+
+def test_zmq_messenger_parallel_creation_uses_one_context(dynamic_endpoint):
+    contexts = []
+    errors = []
+    lock = Lock()
+
+    def create_and_stop() -> None:
+        try:
+            messenger = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+            with lock:
+                contexts.append(messenger._context)
+            messenger.stop()
+        except BaseException as error:
+            with lock:
+                errors.append(error)
+
+    threads = [Thread(target=create_and_stop) for _ in range(32)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(contexts) == len(threads)
+    assert len({id(context) for context in contexts}) == 1
 
 
 if __name__ == "__main__":
