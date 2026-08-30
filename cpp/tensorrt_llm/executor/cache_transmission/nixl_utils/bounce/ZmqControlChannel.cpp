@@ -24,6 +24,8 @@
 
 #include <array>
 #include <chrono>
+#include <exception>
+#include <future>
 #include <utility>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
@@ -36,6 +38,9 @@ namespace
 // bytes), so this bounds a stalled peer's queue to a few MB while sitting far above any legitimate
 // in-flight burst (per-request chunk cap times concurrent flows), so drops indicate peer stall.
 constexpr int kSendHwm = 1 << 16;
+// Bound the application-side command queue as well. Otherwise a stalled outbound thread could
+// consume unbounded host memory before the DEALER's own high-water mark is reached.
+constexpr std::size_t kCommandHwm = 1 << 16;
 } // namespace
 
 ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bindAddr)
@@ -63,9 +68,22 @@ ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bi
     }
     mRouter.bind(bindAddr);
     mEndpoint = mRouter.get(zmq::sockopt::last_endpoint);
+    mOutboundThread = std::thread(&ZmqControlChannel::outboundLoop, this);
 }
 
-ZmqControlChannel::~ZmqControlChannel() = default;
+ZmqControlChannel::~ZmqControlChannel()
+{
+    {
+        std::lock_guard<std::mutex> lk(mQueueMu);
+        mStopping = true;
+        mOutbound.push_back({OutboundOp::kStop});
+    }
+    mQueueCv.notify_one();
+    if (mOutboundThread.joinable())
+    {
+        mOutboundThread.join();
+    }
+}
 
 std::string ZmqControlChannel::localEndpoint() const
 {
@@ -74,76 +92,143 @@ std::string ZmqControlChannel::localEndpoint() const
 
 bool ZmqControlChannel::addPeer(std::string const& peer, std::string const& endpoint)
 {
-    std::lock_guard<std::mutex> lk(mMu);
-    if (mDealers.find(peer) != mDealers.end())
+    auto done = std::make_shared<std::promise<bool>>();
+    auto result = done->get_future();
     {
-        return true; // idempotent
+        std::lock_guard<std::mutex> lk(mQueueMu);
+        if (mStopping)
+        {
+            TLLM_THROW("ZmqControlChannel(%s): cannot add peer %s during shutdown", mSelfName.c_str(), peer.c_str());
+        }
+        mOutbound.push_back({OutboundOp::kAddPeer, peer, endpoint, std::move(done), {}});
     }
-    if (endpoint.empty())
-    {
-        TLLM_THROW("ZmqControlChannel(%s): peer %s requires a non-empty endpoint", mSelfName.c_str(), peer.c_str());
-    }
-    try
-    {
-        zmq::socket_t dealer(mCtx, zmq::socket_type::dealer);
-        dealer.set(zmq::sockopt::routing_id, mSelfName); // so peer's ROUTER sees us by name
-        dealer.set(zmq::sockopt::linger, 0);
-        dealer.set(zmq::sockopt::sndhwm, kSendHwm);      // bound the queue; full -> sendTo drops (never blocks)
-        // Enable IPv6 unconditionally (off by default in zmq) so a DEALER can connect to an IPv6 peer
-        // endpoint; harmless when the endpoint is IPv4. Mirrors ucx_utils' connect socket.
-        dealer.set(zmq::sockopt::ipv6, 1);
-        dealer.connect(endpoint);
-        mDealers.emplace(peer, std::move(dealer));
-        return true;
-    }
-    catch (zmq::error_t const& e)
-    {
-        TLLM_THROW(
-            "ZmqControlChannel(%s): peer %s has an invalid endpoint: %s", mSelfName.c_str(), peer.c_str(), e.what());
-    }
+    mQueueCv.notify_one();
+    return result.get();
 }
 
 void ZmqControlChannel::removePeer(std::string const& peer)
 {
-    std::lock_guard<std::mutex> lk(mMu);
-    // Erasing closes the DEALER (linger=0 -> no block on close); idempotent if `peer` is unknown.
-    // sendTo() holds mMu while looking up the dealer, so the close can never race a concurrent send.
-    mDealers.erase(peer);
+    auto done = std::make_shared<std::promise<void>>();
+    auto result = done->get_future();
+    {
+        std::lock_guard<std::mutex> lk(mQueueMu);
+        if (mStopping)
+        {
+            return;
+        }
+        mOutbound.push_back({OutboundOp::kRemovePeer, peer, {}, {}, std::move(done)});
+    }
+    mQueueCv.notify_one();
+    result.get();
 }
 
 void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
 {
-    // Starts BEFORE the lock: exposes cross-thread contention (IO thread vs scatter-worker ACKs)
-    // plus the message copy + enqueue cost. Large spans here mean the control channel itself is
-    // the bottleneck (message too big, or a stalled peer backing up the DEALER queue).
-    BounceNvtxScope sendScope(kNvtxZmqSend, "zmqSend bytes=%zu", blob.size());
-    std::lock_guard<std::mutex> lk(mMu);
-    auto it = mDealers.find(peer);
-    if (it == mDealers.end())
     {
-        TLLM_LOG_WARNING(
-            "ZmqControlChannel(%s): sendTo unknown peer %s (call addPeer first)", mSelfName.c_str(), peer.c_str());
-        return;
-    }
-    zmq::message_t msg(blob.data(), blob.size());
-    try
-    {
-        // DEALER -> peer ROUTER; the peer receives [our routing id, blob]. NON-BLOCKING: this runs on
-        // the IO thread (and under mMu, which also gates submit()), so a blocking send to a stalled /
-        // unreachable peer whose queue is full (kSendHwm + TCP buffers) would wedge the whole reactor
-        // — exactly the hang the design forbids. With dontwait a full queue returns an empty result
-        // (EAGAIN) instead; we DROP the message. A dropped control message degrades the affected
-        // request to a request-timeout FAILURE rather than blocking this thread.
-        auto const sent = it->second.send(msg, zmq::send_flags::dontwait);
-        if (!sent.has_value())
+        std::lock_guard<std::mutex> lk(mQueueMu);
+        if (mStopping)
         {
-            TLLM_LOG_WARNING("ZmqControlChannel(%s): send to %s dropped (queue full / peer stalled)", mSelfName.c_str(),
-                peer.c_str());
+            return;
         }
+        if (mOutbound.size() >= kCommandHwm)
+        {
+            if (!mQueueFullWarned.exchange(true))
+            {
+                TLLM_LOG_WARNING(
+                    "ZmqControlChannel(%s): outbound command queue full; dropping sends", mSelfName.c_str());
+            }
+            return;
+        }
+        mOutbound.push_back({OutboundOp::kSend, peer, blob, {}, {}});
     }
-    catch (zmq::error_t const& e)
+    mQueueCv.notify_one();
+}
+
+void ZmqControlChannel::outboundLoop()
+{
+    while (true)
     {
-        TLLM_LOG_WARNING("ZmqControlChannel(%s): send to %s failed: %s", mSelfName.c_str(), peer.c_str(), e.what());
+        OutboundCommand cmd;
+        {
+            std::unique_lock<std::mutex> lk(mQueueMu);
+            mQueueCv.wait(lk, [this] { return !mOutbound.empty(); });
+            cmd = std::move(mOutbound.front());
+            mOutbound.pop_front();
+        }
+
+        if (cmd.op == OutboundOp::kStop)
+        {
+            mDealers.clear();
+            return;
+        }
+        if (cmd.op == OutboundOp::kAddPeer)
+        {
+            try
+            {
+                if (mDealers.find(cmd.peer) == mDealers.end())
+                {
+                    if (cmd.payload.empty())
+                    {
+                        TLLM_THROW("ZmqControlChannel(%s): peer %s requires a non-empty endpoint", mSelfName.c_str(),
+                            cmd.peer.c_str());
+                    }
+                    zmq::socket_t dealer(mCtx, zmq::socket_type::dealer);
+                    dealer.set(zmq::sockopt::routing_id, mSelfName);
+                    dealer.set(zmq::sockopt::linger, 0);
+                    dealer.set(zmq::sockopt::sndhwm, kSendHwm);
+                    dealer.set(zmq::sockopt::ipv6, 1);
+                    dealer.connect(cmd.payload);
+                    mDealers.emplace(cmd.peer, std::move(dealer));
+                }
+                cmd.addDone->set_value(true);
+            }
+            catch (...)
+            {
+                cmd.addDone->set_exception(std::current_exception());
+            }
+            continue;
+        }
+        if (cmd.op == OutboundOp::kRemovePeer)
+        {
+            try
+            {
+                // Erasing closes the DEALER on the same thread that created and used it.
+                mDealers.erase(cmd.peer);
+                cmd.removeDone->set_value();
+            }
+            catch (...)
+            {
+                cmd.removeDone->set_exception(std::current_exception());
+            }
+            continue;
+        }
+
+        BounceNvtxScope sendScope(kNvtxZmqSend, "zmqSend bytes=%zu", cmd.payload.size());
+        auto it = mDealers.find(cmd.peer);
+        if (it == mDealers.end())
+        {
+            TLLM_LOG_WARNING("ZmqControlChannel(%s): sendTo unknown peer %s (call addPeer first)", mSelfName.c_str(),
+                cmd.peer.c_str());
+            continue;
+        }
+        zmq::message_t msg(cmd.payload.data(), cmd.payload.size());
+        try
+        {
+            // DEALER -> peer ROUTER; the peer receives [our routing id, blob]. NON-BLOCKING: a
+            // full or stalled peer queue drops this message, allowing request timeout to fail only
+            // the affected transfer instead of wedging the sole outbound owner.
+            auto const sent = it->second.send(msg, zmq::send_flags::dontwait);
+            if (!sent.has_value())
+            {
+                TLLM_LOG_WARNING("ZmqControlChannel(%s): send to %s dropped (queue full / peer stalled)",
+                    mSelfName.c_str(), cmd.peer.c_str());
+            }
+        }
+        catch (zmq::error_t const& e)
+        {
+            TLLM_LOG_WARNING(
+                "ZmqControlChannel(%s): send to %s failed: %s", mSelfName.c_str(), cmd.peer.c_str(), e.what());
+        }
     }
 }
 

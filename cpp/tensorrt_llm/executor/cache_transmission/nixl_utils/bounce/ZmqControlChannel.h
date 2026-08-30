@@ -21,8 +21,13 @@
 
 #include <zmq.hpp>
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
@@ -48,12 +53,13 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   and registered with addPeer() before the first sendTo().
 //
 // Threading
-//   The ROUTER is touched only by the reactor thread (recv). DEALERs (+ the dealer
-//   map) are guarded by mMu so app threads and the reactor can sendTo()/addPeer()
-//   concurrently. zmq sockets are not thread-safe; the mutex provides the required
-//   serialization + memory fence for the dealer sockets, and the ROUTER is never
-//   shared. recv() polls the ROUTER with a timeout so the reactor can interleave
-//   getXferStatus polling.
+//   The ROUTER is touched only by the reactor thread (recv). Every DEALER is created,
+//   used and destroyed by ONE dedicated outbound thread. Public addPeer/removePeer
+//   calls enqueue synchronous commands; sendTo is fire-and-forget and only enqueues
+//   the blob. This is stricter than merely serializing calls with a mutex: DEALER is
+//   not a thread-safe zmq socket type, so using one from several application threads
+//   is undefined even when the calls do not overlap. recv() polls the ROUTER with a
+//   timeout so the reactor can interleave getXferStatus polling.
 // ============================================================================
 class ZmqControlChannel : public ControlChannel
 {
@@ -71,13 +77,40 @@ public:
     [[nodiscard]] bool recv(std::string& outPeer, std::string& outBlob, int timeoutMs) override;
 
 private:
+    enum class OutboundOp
+    {
+        kAddPeer,
+        kRemovePeer,
+        kSend,
+        kStop,
+    };
+
+    struct OutboundCommand
+    {
+        OutboundOp op{};
+        std::string peer;
+        std::string payload;
+        std::shared_ptr<std::promise<bool>> addDone;
+        std::shared_ptr<std::promise<void>> removeDone;
+    };
+
+    void outboundLoop();
+
     std::string mSelfName;
     zmq::context_t mCtx;
-    zmq::socket_t mRouter;                                   // receive-only (reactor thread)
-    std::string mEndpoint;                                   // resolved bound endpoint
+    zmq::socket_t mRouter; // receive-only (reactor thread)
+    std::string mEndpoint; // resolved bound endpoint
 
-    mutable std::mutex mMu;                                  // guards mDealers + dealer sends
-    std::unordered_map<std::string, zmq::socket_t> mDealers; // peer -> send-only DEALER
+    std::mutex mQueueMu;
+    std::condition_variable mQueueCv;
+    std::deque<OutboundCommand> mOutbound;
+    bool mStopping{false};
+    std::atomic<bool> mQueueFullWarned{false};
+
+    // Outbound-thread-only. The thread clears this map before it exits so every DEALER is also
+    // destroyed by its sole owning thread.
+    std::unordered_map<std::string, zmq::socket_t> mDealers;
+    std::thread mOutboundThread;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce
