@@ -426,7 +426,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         def commit_conv_window(self, slot_indices: torch.Tensor,
                                conv_pool: torch.Tensor) -> None:
             """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
-            from ..modules.kimi_kda._kda_kernels import \
+            from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import \
                 copy_kda_replay_conv_window
 
             copy_kda_replay_conv_window(
