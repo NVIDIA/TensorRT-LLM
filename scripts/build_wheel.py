@@ -321,17 +321,15 @@ def _fmha_generation_is_stale(project_dir, fmha_v2_cu_dir: Path) -> bool:
     """Whether the generated FMHA sources predate the generator that emits them.
 
     setup.py decides which (arch, head size, layout) kernels exist at all, so
-    editing it changes the output set. Without this check the stamp alone keeps
-    an incremental build serving the previously generated kernels, and a newly
-    added head size silently never gets compiled.
+    editing it changes the output set; the stamp alone would keep an incremental
+    build serving the previously generated kernels.
     """
     stamp = _fmha_generation_stamp(fmha_v2_cu_dir)
     if not stamp.exists():
         return True
     generator = project_dir / "cpp/kernels/fmha_v2/setup.py"
-    if not generator.is_file():
-        return False
-    return generator.stat().st_mtime > stamp.stat().st_mtime
+    return (generator.is_file()
+            and generator.stat().st_mtime > stamp.stat().st_mtime)
 
 
 def get_fmha_gen_dirs(project_dir, gen_root=None):
@@ -1026,6 +1024,12 @@ def main(*,
     if (clean or generate_fmha
             or _fmha_generation_is_stale(project_dir, fmha_v2_cu_dir)):
         generate_fmha_cu(project_dir, venv_python, fmha_gen_root)
+        # The kernel sources are picked up by file(GLOB) at configure time, so a
+        # regenerated set that adds or drops a kernel needs a reconfigure. Reusing
+        # the cached list compiles the old kernels while the generated dispatch
+        # table references the new ones, which fails at link with undefined
+        # run_fmha_v2_* symbols.
+        configure_cmake = True
 
     if out_of_tree:
         cmake_def_args.append(f"-DTRTLLM_FMHA_GEN_DIR={fmha_gen_root}")

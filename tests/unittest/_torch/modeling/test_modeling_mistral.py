@@ -724,20 +724,6 @@ def _make_dummy_processor(
     return instance
 
 
-def _make_text_only_native_processor():
-    """A mistral-native processor for a checkpoint with no vision encoder.
-
-    ``MistralNativeInputProcessor`` serves every ``checkpoint_format="mistral"``
-    checkpoint, so `adapt_config_dict` leaves `vision_config` unset for the
-    text-only / MoE / mamba / audio shapes. Deliberately stubs *nothing* beyond
-    that config: the encoder geometry must not be reached at all, so dropping
-    the guard surfaces as an `AttributeError` rather than a soft assertion.
-    """
-    instance = MistralNativeInputProcessor.__new__(MistralNativeInputProcessor)
-    instance._config = SimpleNamespace()
-    return instance
-
-
 def test_dummy_mm_max_tokens_per_item_is_image_only():
     proc = _make_dummy_processor(patch_size=14, image_size=1540)
     demand = proc.get_mm_max_tokens_per_item()
@@ -895,12 +881,17 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
 
 
 # The native processor is shared by every `checkpoint_format="mistral"`
-# checkpoint, including the text-only / MoE / mamba / audio shapes that carry no
-# `vision_config` at all. Those must keep the base class's neutral behaviour
-# rather than raising `AttributeError` out of the encoder geometry -- the engine
-# calls `get_mm_max_tokens_per_item` unconditionally.
+# checkpoint, including the text-only / MoE / mamba / audio shapes for which
+# `adapt_config_dict` leaves `vision_config` unset. Those must keep the base
+# class's neutral behaviour rather than raising `AttributeError` out of the
+# encoder geometry -- the engine calls `get_mm_max_tokens_per_item`
+# unconditionally.
 def test_text_only_native_checkpoint_reports_no_encoder_geometry():
-    proc = _make_text_only_native_processor()
+    # Deliberately stubs *nothing* beyond the config: the encoder geometry must
+    # not be reached at all, so dropping a guard surfaces as an `AttributeError`
+    # rather than as a soft assertion.
+    proc = MistralNativeInputProcessor.__new__(MistralNativeInputProcessor)
+    proc._config = SimpleNamespace()
 
     assert proc.get_mm_max_tokens_per_item() == {}
     assert proc.get_max_mm_encoder_output_embeddings(8192) is None
