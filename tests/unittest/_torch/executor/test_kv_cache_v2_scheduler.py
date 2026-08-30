@@ -1185,6 +1185,187 @@ class TestPEFT:
         assert len(out2.context_requests) == 1
 
 
+class TestPeftSuspendResume:
+    """Regression tests for #18407: KV-suspending a generation request must
+    pause its PEFT/LoRA adapter ownership, and resuming it must re-register
+    that ownership, since resumed generation requests never pass through
+    PeftCacheManager.prepare_resources()'s context-admission path.
+    """
+
+    def test_self_eviction_pauses_peft_ownership(self):
+        """Sole gen request self-evicts (alloc fails, no victim available):
+        mark_request_done(A, pause=True) must fire exactly once."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req_a = make_gen_request(0, lora_task_id="adapter-a")
+
+        out = sched.schedule_request([req_a], set())
+
+        assert ids(out.paused_requests) == [0]
+        peft.mark_request_done.assert_called_once_with(req_a, pause=True)
+        peft.add_request_peft.assert_not_called()
+
+    def test_victim_eviction_pauses_peft_ownership(self):
+        """A (adapter A) is evicted as a victim to free pages for B (adapter
+        B); mark_request_done(A, pause=True) must fire exactly once so B can
+        use the PEFT cache."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] != 1  # B's first attempt fails, retry (after evicting A) succeeds
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req_b = make_gen_request(0, lora_task_id="adapter-b")
+        req_a = make_gen_request(99, lora_task_id="adapter-a")  # started, at tail -> evictable
+
+        out = sched.schedule_request([req_b, req_a], set())
+
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == [99]
+        peft.mark_request_done.assert_called_once_with(req_a, pause=True)
+
+    def test_resume_reregisters_peft_ownership_once(self):
+        """A resumes after a prior suspension: add_request_peft(A, True)
+        must fire exactly once before A is returned as scheduled, and must
+        not fire again on later steady-state iterations while A stays
+        active."""
+        mgr = make_kv_cache_manager()
+        mgr.kv_cache_map[0].is_active = False  # A was previously suspended
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req_a = make_gen_request(0, lora_task_id="adapter-a")
+
+        out = sched.schedule_request([req_a], set())
+
+        assert ids(out.generation_requests) == [0]
+        peft.add_request_peft.assert_called_once_with(req_a, True)
+        peft.mark_request_done.assert_not_called()
+
+        # Steady state: the cache is active on later iterations (as the real
+        # KVCacheManagerV2.resume() would leave it), so no redundant re-registration.
+        mgr.kv_cache_map[0].is_active = True
+        out2 = sched.schedule_request([req_a], set())
+
+        assert ids(out2.generation_requests) == [0]
+        peft.add_request_peft.assert_called_once_with(req_a, True)  # still just once
+
+    def test_suspend_without_peft_manager_does_not_crash(self):
+        """No LoRA config at all (peft_cache_manager=None): self-eviction
+        must behave exactly as before this fix -- no AttributeError from an
+        unguarded self.peft_cache_manager access."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, peft_cache_manager=None, max_num_tokens=100)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.paused_requests) == [0]
+
+    def test_resume_without_peft_manager_does_not_crash(self):
+        """Same as above, for the resume path."""
+        mgr = make_kv_cache_manager()
+        mgr.kv_cache_map[0].is_active = False
+        sched = make_scheduler(mgr, peft_cache_manager=None, max_num_tokens=100)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == [0]
+
+    def test_suspend_with_peft_manager_no_lora_task_id(self):
+        """Request has no adapter; the call to mark_request_done is still
+        made (the C++ layer no-ops for lora_task_id=None, see
+        PeftCacheManager::markRequestDone), so no per-request lora_task_id
+        check is needed in the scheduler itself."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req = make_gen_request(0, lora_task_id=None)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.paused_requests) == [0]
+        peft.mark_request_done.assert_called_once_with(req, pause=True)
+
+    def test_suspend_never_started_context_request_does_not_pause_peft(self):
+        """A context request suspended (e.g. cross-context admission failure
+        in _try_schedule_context_full/_chunked) before ever completing its
+        first chunk has never been through PeftCacheManager.prepare_resources
+        -> add_request_peft(): it holds no PEFT ownership, so pausing it
+        would register a phantom entry that could pin a shared adapter's
+        host-cache slot after its real holders finish. mark_request_done
+        must NOT be called for it."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req = make_ctx_request(0, 100, lora_task_id="adapter-a", is_first_context_chunk=True)
+
+        sched._suspend_request(req)
+
+        peft.mark_request_done.assert_not_called()
+
+    def test_suspend_already_started_context_request_pauses_peft(self):
+        """A non-first-chunk context request suspended mid-chunking WAS
+        already admitted (and PEFT-registered) via an earlier chunk's
+        prepare_resources() call, so it does own PEFT state that must be
+        paused, exactly like a suspended generation request."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req = make_ctx_request(0, 100, lora_task_id="adapter-a", is_first_context_chunk=False)
+
+        sched._suspend_request(req)
+
+        peft.mark_request_done.assert_called_once_with(req, pause=True)
+
+    def test_repeated_suspend_resume_cycle_keeps_peft_calls_one_to_one(self):
+        """running -> suspended -> resumed -> suspended -> resumed: each
+        transition must produce exactly one new PEFT call, with no
+        duplicate registration or leaked state across cycles."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=10)
+        sched = make_scheduler(mgr, peft_cache_manager=peft, max_num_tokens=100)
+        req_a = make_gen_request(0, lora_task_id="adapter-a")
+
+        # Cycle 0: running normally (already active) -> no suspend/resume calls.
+        out = sched.schedule_request([req_a], set())
+        assert ids(out.generation_requests) == [0]
+        peft.mark_request_done.assert_not_called()
+        peft.add_request_peft.assert_not_called()
+
+        # Cycle 1: suspend (alloc fails, no victim -> self-evict).
+        mgr.try_allocate_generation.side_effect = lambda req: False
+        out = sched.schedule_request([req_a], set())
+        assert ids(out.paused_requests) == [0]
+        assert peft.mark_request_done.call_count == 1
+        peft.mark_request_done.assert_called_with(req_a, pause=True)
+
+        # Cycle 2: resume (KV cache becomes active again).
+        mgr.kv_cache_map[0].is_active = False
+        mgr.try_allocate_generation.side_effect = lambda req: True
+        out = sched.schedule_request([req_a], set())
+        assert ids(out.generation_requests) == [0]
+        assert peft.add_request_peft.call_count == 1
+
+        # Cycle 3: suspend again.
+        mgr.kv_cache_map[0].is_active = True
+        mgr.try_allocate_generation.side_effect = lambda req: False
+        out = sched.schedule_request([req_a], set())
+        assert ids(out.paused_requests) == [0]
+        assert peft.mark_request_done.call_count == 2
+
+        # Cycle 4: resume again.
+        mgr.kv_cache_map[0].is_active = False
+        mgr.try_allocate_generation.side_effect = lambda req: True
+        out = sched.schedule_request([req_a], set())
+        assert ids(out.generation_requests) == [0]
+        assert peft.add_request_peft.call_count == 2
+
+
 # ===========================================================================
 # Encoder Requests
 # ===========================================================================
