@@ -1686,6 +1686,29 @@ class DisaggTestCmds(NamedTuple):
                     "the port is kernel-assigned and reported back via --report_addr, and "
                     "the server urls are discovered at runtime."
                 )
+            # Distinct from the above: these keys override nothing, but they put
+            # trtllm-serve into fleet mode, which it refuses to combine with the
+            # port-0 + --report_addr discovery this harness depends on (see
+            # tensorrt_llm/commands/serve.py, "single self-contained
+            # disaggregated server"). A fleet hands one port to N SO_REUSEPORT
+            # workers; with port 0 each would get a *different* kernel-assigned
+            # port, so the reported address would serve 1/N of requests.
+            # Rejected here so the cause is named at config time instead of
+            # surfacing ~30s later as "DISAGG_SERVER server exited unexpectedly
+            # with code 2", which points nowhere near this key.
+            fleet_keys = sorted(
+                {"num_workers", "disagg_coordinator_url"} & set(self.server_config_extra)
+            )
+            if fleet_keys and (
+                self.server_config_extra.get("num_workers", 1) > 1
+                or self.server_config_extra.get("disagg_coordinator_url")
+            ):
+                raise RuntimeError(
+                    f"server_config_extra sets {fleet_keys}, which selects a disaggregated "
+                    "server fleet. perf-sanity binds port 0 and discovers the address via "
+                    "--report_addr, and trtllm-serve rejects that combination. Remove the "
+                    "key, or teach the harness to bind a fixed port first."
+                )
             server_config.update(copy.deepcopy(self.server_config_extra))
 
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")

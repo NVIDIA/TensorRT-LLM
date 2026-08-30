@@ -49,7 +49,6 @@ server_config_extra:
   gen_strip_message_history: true
   gen_tokids_ctxbytes: true
   server_keep_alive_timeout: 3600
-  num_workers: 4
 worker_config:
   gen:
     print_iter_log: true
