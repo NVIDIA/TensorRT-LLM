@@ -4,8 +4,8 @@ from utils.util import check_accuracy
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
-from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
+from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import (
     ActivationType,
     is_gated_activation,

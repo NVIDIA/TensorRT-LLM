@@ -109,8 +109,8 @@ l0_b200:
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
-  - unittest/_torch/modules/moe/test_kimi_k3_mlp.py
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py
+  - unittest/_torch/moe/test_kimi_k3_mlp.py
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
@@ -131,34 +131,34 @@ l0_b200:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
-  - unittest/_torch/modules/test_moe_load_balancer.py
-  - unittest/_torch/modules/test_moe_routing.py
-  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
-  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
+  - unittest/_torch/moe/test_moe_load_balancer.py
+  - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/modules/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
-  - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
+  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
+  - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
+  - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
+  - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
+  - unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
+  - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
@@ -433,12 +433,12 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ---- non-quantized (quant=None) moved to post-merge ----
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"

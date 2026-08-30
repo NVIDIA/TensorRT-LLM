@@ -41,9 +41,9 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
-from ..modules.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
+from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+                                               maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
