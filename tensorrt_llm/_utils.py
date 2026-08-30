@@ -437,13 +437,14 @@ _local_comm = None
 
 
 def local_mpi_comm():
-    # Split lazily instead of at import time. Creating a communicator needs a
-    # working MPI runtime, and `import tensorrt_llm` must not require one:
-    # CPU-only build containers can complete MPI_Init (MPI_Get_library_version
-    # and Comm.Get_size both work) and still fail *every* communicator-creation
-    # call with MPI_ERR_OTHER — including the portable MPI_COMM_TYPE_SHARED —
-    # which turned the import itself into a hard error. Every consumer of this
-    # communicator is already lazy, so nothing needs it before first use.
+    # Split lazily instead of at import time. Splitting needs an MPI runtime
+    # that supports it, and `import tensorrt_llm` must not require one: a
+    # CPU-only build container can complete MPI_Init and handle Comm.Dup,
+    # Comm.Split and Create_group, yet still fail Split_type with
+    # MPI_ERR_OTHER — for the portable MPI_COMM_TYPE_SHARED just as much as for
+    # OMPI_COMM_TYPE_HOST — which turned the import itself into a hard error.
+    # Every consumer of this communicator is already lazy, so nothing needs it
+    # before first use.
     global _local_comm
     if _local_comm is None:
         _local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
