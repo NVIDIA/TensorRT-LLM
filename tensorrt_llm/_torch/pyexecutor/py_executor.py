@@ -5116,6 +5116,7 @@ class PyExecutor:
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
+                forward_failed = False
                 if can_queue:
 
                     # The generation requests that do not have batch_idx
