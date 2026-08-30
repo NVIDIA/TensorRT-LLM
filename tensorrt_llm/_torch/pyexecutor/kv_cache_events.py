@@ -351,13 +351,13 @@ class ZmqEventPublisher(EventPublisher):
     @staticmethod
     def offset_endpoint_port(endpoint: str | None, data_parallel_rank: int) -> str | None:
         """Apply the base-port-plus-rank endpoint convention (each rank binds base_port + rank)."""
-        if not endpoint or data_parallel_rank == 0:
+        if not endpoint:
             return endpoint
         # Match the scheme with startswith so detection agrees with
         # _socket_setup (substring tests misclassify hosts like "ipc-host").
         # ipc/inproc have no port; give each rank a distinct suffix instead.
         if endpoint.startswith(("inproc://", "ipc://")):
-            return f"{endpoint}_dp{data_parallel_rank}"
+            return endpoint if data_parallel_rank == 0 else f"{endpoint}_dp{data_parallel_rank}"
         if endpoint.startswith("tcp://"):
             host_port = endpoint[len("tcp://") :]
             if ":" not in host_port:
@@ -371,6 +371,8 @@ class ZmqEventPublisher(EventPublisher):
                 raise ValueError(
                     f"TCP KV event endpoint must have a port in [1, 65535]: {endpoint!r}"
                 )
+            if data_parallel_rank == 0:
+                return endpoint
             base_port = int(port_text)
             new_port = base_port + data_parallel_rank
             if new_port > 65_535:
