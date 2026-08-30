@@ -15,13 +15,19 @@
 
 ``cpp/kernels/fmha_v2/setup.py::enumerate_kernels`` decides which FMHA kernels
 get compiled. Its general clause admits ``sm in [80, 86, 89, 90, 120]`` -- sm100
-is deliberately absent and is served only by narrow per-model clauses. A vision
-encoder whose head dim has no such clause therefore silently gets *no* kernel:
-``FmhaDispatcher`` logs "Fall back to unfused MHA", ``mEnableContextFMHA`` goes
-false, and the quadratic ``qk_buf``/``qk_buf_float`` terms in
-``AttentionOp::getWorkspaceSizeForContext`` size the attention workspace at
-multiple TiB -- surfacing as an implausible OOM rather than as a missing kernel
-(https://nvbugs/6665906).
+is deliberately absent and is served only for ``VISION_ENCODER_HEAD_SIZES``. A
+vision encoder whose head dim is missing from that list therefore silently gets
+*no* kernel, and ``selected_mask_types`` independently decides whether the
+kernel that does exist keeps the ``PADDING`` mask variant the encoder asks for.
+Both gates failed in turn for head dim 104 (https://nvbugs/6665906):
+
+* no kernel at all -> ``FmhaDispatcher`` falls back to unfused MHA, and the
+  quadratic ``qk_buf``/``qk_buf_float`` terms in
+  ``AttentionOp::getWorkspaceSizeForContext`` size the attention workspace at
+  multiple TiB, surfacing as an implausible OOM rather than a missing kernel.
+* kernel without the padding mask -> the lookup in
+  ``fused_multihead_attention_v2.cpp`` is an exact hash match with no fallback,
+  so every rank aborts with "FMHA kernels are not found with these parameters".
 
 Nothing else in the tree ties a model's head dim to that allowlist, so this test
 asserts the coverage directly. It enumerates the generator in-process (no
@@ -34,7 +40,7 @@ import tempfile
 
 import pytest
 
-_FMHA_V2_DIR = pathlib.Path(__file__).resolve().parents[4] / "cpp" / "kernels" / "fmha_v2"
+_SETUP_PY = pathlib.Path(__file__).resolve().parents[4] / "cpp" / "kernels" / "fmha_v2" / "setup.py"
 
 # Head dims that sm100 vision encoders depend on, and the model that needs each.
 _SM100_REQUIRED_HEAD_SIZES = {
@@ -51,20 +57,21 @@ def sm100_specs():
     ``enumerate_kernels`` hands its result to ``generate_files``, so replacing
     that function captures the spec list without emitting or compiling anything.
     It does still ``mkdir`` ``./generated`` relative to the cwd, hence the
-    scratch directory.
+    scratch directory. The env matches what ``build_wheel.py`` exports, since
+    both ``ENABLE_SM100`` (which gates sm100 enumeration) and ``GENERATE_CUBIN``
+    (which turns on the mask-variant pruning) change the result.
     """
-    setup_py = _FMHA_V2_DIR / "setup.py"
-    if not setup_py.is_file():
-        pytest.skip(f"fmha_v2 generator not present at {setup_py}")
+    if not _SETUP_PY.is_file():
+        pytest.skip(f"fmha_v2 generator not present at {_SETUP_PY}")
 
-    spec = importlib.util.spec_from_file_location("fmha_v2_setup", setup_py)
+    spec = importlib.util.spec_from_file_location("fmha_v2_setup", _SETUP_PY)
     module = importlib.util.module_from_spec(spec)
     captured = []
 
     with pytest.MonkeyPatch.context() as patch, tempfile.TemporaryDirectory() as scratch:
         patch.chdir(scratch)
-        # The only switch gating sm100 enumeration; build_wheel.py sets it too.
         patch.setenv("ENABLE_SM100", "1")
+        patch.setenv("GENERATE_CUBIN", "1")
         spec.loader.exec_module(module)
         module.generate_files = captured.extend
         module.enumerate_kernels()
@@ -76,8 +83,8 @@ def sm100_specs():
 @pytest.mark.parametrize(
     "head_size", sorted(_SM100_REQUIRED_HEAD_SIZES), ids=lambda hs: f"head_dim_{hs}"
 )
-def test_sm100_generates_required_vision_head_size(head_size, sm100_specs):
-    """Each required head dim must have the kernel the encoder actually asks for.
+def test_sm100_vision_head_size_has_a_padding_mask_kernel(head_size, sm100_specs):
+    """Each required head dim must get the kernel the encoder actually asks for.
 
     ``PixtralAttention`` runs bf16 context attention over packed QKV with no KV
     cache, which is what the dispatcher's failed lookup reported (``dataType =
@@ -85,6 +92,10 @@ def test_sm100_generates_required_vision_head_size(head_size, sm100_specs):
     rather than bare head-size membership is what makes the test bite: a clause
     generating only, say, the separate-Q-K-V layout would look like coverage
     while leaving the reported failure in place.
+
+    The two asserts are the two gates, in the order they fail: existing at all,
+    then keeping the ``PADDING`` mask variant (flag 0 of ``selected_mask_types``)
+    that a ViT needs, having no causal structure over a padded batch.
     """
     module, specs = sm100_specs
     # One spec per (dtype, layout, tiling) combination, so just assert nonempty.
@@ -99,8 +110,24 @@ def test_sm100_generates_required_vision_head_size(head_size, sm100_specs):
     assert matching, (
         f"No sm100 bf16 packed-QKV fmha v2 kernel is generated for head_size={head_size}, "
         f"needed by {_SM100_REQUIRED_HEAD_SIZES[head_size]}. Without it the dispatcher falls "
-        f"back to unfused MHA and the attention workspace is sized in TiB. Add a clause for "
-        f"this head size to the specs_names filter in "
-        f"cpp/kernels/fmha_v2/setup.py::enumerate_kernels. Generated sm100 head sizes: "
-        f"{sorted({kspec.head_size for kspec in specs})}"
+        f"back to unfused MHA and the attention workspace is sized in TiB. Add this head size "
+        f"to VISION_ENCODER_HEAD_SIZES in cpp/kernels/fmha_v2/setup.py. Generated sm100 head "
+        f"sizes: {sorted({kspec.head_size for kspec in specs})}"
     )
+
+    assert any(module.selected_mask_types(kspec)[0] == "1" for kspec in matching), (
+        f"Every sm100 bf16 packed-QKV kernel for head_size={head_size} "
+        f"({_SM100_REQUIRED_HEAD_SIZES[head_size]}) is compiled with the padding mask "
+        f"disabled, so the encoder's mask=PADDING lookup finds no kernel and aborts. Add this "
+        f"head size to PACKED_QKV_PADDING_MASK_HEAD_SIZES in cpp/kernels/fmha_v2/setup.py."
+    )
+
+
+def test_required_head_sizes_match_the_generators_vision_list(sm100_specs):
+    """This file's required set must track the generator's own vision list.
+
+    Keeps a newly supported vision head size from being added to the generator
+    without also declaring the model that needs it here.
+    """
+    module, _ = sm100_specs
+    assert set(_SM100_REQUIRED_HEAD_SIZES) == set(module.VISION_ENCODER_HEAD_SIZES)

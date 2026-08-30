@@ -30,10 +30,9 @@ namespace
 
 // The trtllm-gen epilogue copies TMEM->SMEM in 16-element atoms over a tile of
 // gcd(headDimV, 128b/dtypeQ) elements, and KernelTraits asserts the atom fits the tile. For
-// headDimV > 64 that gcd only reaches 16 when headDimV is a multiple of 16, so head sizes such
-// as 72 and 104 (Pixtral-family vision encoders) have no valid trtllm-gen kernel and must run
-// on fmha v2, whose SM100 tiled kernels cover them (fmha_v2/setup.py maps sm=100 to sm_mma=80,
-// and build_wheel.py generates that family with ENABLE_SM100).
+// headDimV > 64 that gcd only reaches 16 when headDimV is a multiple of 16, so head dims such as
+// 72 and 104 (Pixtral-family vision encoders) have no trtllm-gen kernel and must run on fmha v2,
+// whose SM100 kernels cover them (see VISION_ENCODER_HEAD_SIZES in fmha_v2/setup.py).
 bool trtllmGenSupportsHeadDim(MHARunnerFixedParams const& fixedParams)
 {
     // A zero headSizeV means "same as headSize", matching FusedMHARunnerV2's normalization.

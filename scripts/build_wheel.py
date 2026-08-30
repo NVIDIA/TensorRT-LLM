@@ -317,6 +317,10 @@ def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
     return fmha_v2_cu_dir / ".generation_complete"
 
 
+def _fmha_v2_dir(project_dir) -> Path:
+    return project_dir / "cpp/kernels/fmha_v2"
+
+
 def _fmha_generation_is_stale(project_dir, fmha_v2_cu_dir: Path) -> bool:
     """Whether the generated FMHA sources predate the generator that emits them.
 
@@ -327,7 +331,7 @@ def _fmha_generation_is_stale(project_dir, fmha_v2_cu_dir: Path) -> bool:
     stamp = _fmha_generation_stamp(fmha_v2_cu_dir)
     if not stamp.exists():
         return True
-    generator = project_dir / "cpp/kernels/fmha_v2/setup.py"
+    generator = _fmha_v2_dir(project_dir) / "setup.py"
     return (generator.is_file()
             and generator.stat().st_mtime > stamp.stat().st_mtime)
 
@@ -350,7 +354,7 @@ def generate_fmha_cu(project_dir, venv_python, gen_root=None):
     cubin_dir.mkdir(parents=True, exist_ok=True)
     _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
-    fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    fmha_v2_dir = _fmha_v2_dir(project_dir)
     if gen_root is not None:
         # The generator writes ./generated, ./temp and ./obj relative to its
         # own directory; run it from a scratch copy so a (possibly read-only)
