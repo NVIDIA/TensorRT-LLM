@@ -679,12 +679,12 @@ def route_streaming(
 _VARLEN_CACHE = {}
 
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
+def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hf=False):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr)
+    key = (num_rows, npad, k, n_env, next_n, cr, bool(hf))
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -699,7 +699,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     plan_free = route(num_rows, n_eff, npad, k)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift, hf=hf
         )
         lc = ("reg_clus", fn, n_eff)
         _VARLEN_CACHE[key] = lc
@@ -713,7 +713,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
         fn = dev.get_compiled__reg(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift, hf=hf
         )
         rt_f = plan_free["rt"]
         lc = (
@@ -739,6 +739,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
+            hf=hf,
         )
         lc = (
             "clus",
@@ -754,7 +755,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hf=hf)
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -1234,7 +1235,7 @@ def run_ws(
 
 def run_varlen(
     logits: torch.Tensor,
-    pre_idx: torch.Tensor,
+    pre_idx: torch.Tensor | None,
     kv_lens: torch.Tensor,
     indices: torch.Tensor,
     next_n: int = 1,
@@ -1257,6 +1258,12 @@ def run_varlen(
       compress_ratio`` valid entries (cr 1 = DSv3.2, 4 = DSv4 Flash/Pro);
       ``pre_idx`` ``[batch, k]`` is REQUEST-level raw prev-step top-K,
       shared by a request's ``next_n`` rows (offset-free hint contract);
+      ``pre_idx=None`` selects HINT-FREE mode: the bracket is derived from
+      the current row itself (register families: min/max fold of the first
+      k row values, in registers / a coalesced first-k sample; streaming
+      families never consume the hint on the accept path), ``k`` comes from
+      ``indices.shape[1]``, engine "auto" only — exactness is unchanged by
+      contract;
       per-row ``n_r <= k`` takes the short path (identity + ``-1`` tail).
 
     ENGINES: ``engine="auto"`` (default) launches the per-row IN-KERNEL
@@ -1306,7 +1313,9 @@ def run_varlen(
     batch = num_rows // nn
     if kv_lens.shape[0] != batch:
         raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
-    if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
+    if pre_idx is not None and (
+        len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch
+    ):
         raise RuntimeError(
             f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
         )
@@ -1330,18 +1339,21 @@ def run_varlen(
         # batch-dim check is CRITICAL: the kernel grid comes from
         # logits.shape[0], so a short indices/values tensor would be written
         # out of bounds).
-        if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
+        hf = pre_idx is None
+        if not (logits.is_cuda and indices.is_cuda and (hf or pre_idx.is_cuda)):
             raise RuntimeError("all tensors must be CUDA")
-        if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:
+        if logits.dtype is not _F32 or indices.dtype is not _I32 or (
+            not hf and pre_idx.dtype is not _I32
+        ):
             raise RuntimeError("logits must be float32; pre_idx/indices int32")
         if len(indices.shape) != 2 or indices.shape[0] != num_rows:
             raise RuntimeError(
                 f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
             )
-        k = pre_idx.shape[1]
+        k = indices.shape[1] if hf else pre_idx.shape[1]
         if indices.shape[1] < k:
             raise RuntimeError(f"indices width {indices.shape[1]} < k={k}")
-        if not (pre_idx.is_contiguous() and indices.is_contiguous() and kv_lens.is_contiguous()):
+        if not ((hf or pre_idx.is_contiguous()) and indices.is_contiguous() and kv_lens.is_contiguous()):
             raise RuntimeError("pre_idx/indices/kv_lens must be contiguous")
         # logits: accept row-major views with a wider row stride (the DSL
         # paged-MQA logits arena is 256-aligned and column-sliced — a legal
@@ -1390,7 +1402,7 @@ def run_varlen(
             # R increment (bounded plans, bounded _VARLEN_CACHE)
             n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr)
+        key = (num_rows, npad, k, n_env, nn, cr, hf)
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -1398,26 +1410,28 @@ def run_varlen(
                     "varlen launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
+            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hf=hf)
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
         vals = values
         if vals is not None and vals.shape[1] != k:
             vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
+        # hf engines never read the pre slot; alias the out tensor in
+        pre_arg = idx if hf else pre_idx
         if lc[0] == "reg_clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
-            lc[1](lg, pre_idx, kv_lens, idx, lc[2])
+            lc[1](lg, pre_arg, kv_lens, idx, lc[2])
         elif lc[0] == "reg":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, CMP, QC, smem)
-            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
         elif lc[0] == "clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
             #                SCAP, CMP, dead DYN x5)
-            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
         else:
             _, fn, pre, tail = lc
-            fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
+            fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
         if vals is not None:
             idx64 = idx.to(torch.int64)
             vals.copy_(lg.gather(1, idx64.clamp_min(0)))
@@ -1425,6 +1439,8 @@ def run_varlen(
         return
     if engine != "reference":
         raise RuntimeError(f"engine must be 'auto' or 'reference', got {engine!r}")
+    if pre_idx is None:
+        raise RuntimeError("hint-free (pre_idx=None) is auto-engine only")
 
     # ---- reference engine (differential oracle): b=1 host loop --------------
     if _is_capturing():

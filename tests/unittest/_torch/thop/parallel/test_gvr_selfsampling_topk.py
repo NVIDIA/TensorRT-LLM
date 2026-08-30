@@ -228,7 +228,7 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
-def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="auto"):
+def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="auto", hint_free=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
     batch, rows = len(kv), len(kv) * next_n
@@ -238,10 +238,14 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
     logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
     for r in range(rows):
         logits[r, n_r[r] :] = 3e38  # poison beyond each row's OWN n_r
-    pre_idx = torch.empty((batch, top_k), dtype=torch.int32, device=_DEV)
-    for q in range(batch):
-        nmin = max(min(n_r[q * next_n : (q + 1) * next_n]), 1)
-        pre_idx[q] = torch.randint(0, nmin, (top_k,), generator=gen, dtype=torch.int32, device=_DEV)
+    pre_idx = None
+    if not hint_free:
+        pre_idx = torch.empty((batch, top_k), dtype=torch.int32, device=_DEV)
+        for q in range(batch):
+            nmin = max(min(n_r[q * next_n : (q + 1) * next_n]), 1)
+            pre_idx[q] = torch.randint(
+                0, nmin, (top_k,), generator=gen, dtype=torch.int32, device=_DEV
+            )
     indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     values = (
         torch.full((rows, top_k), 7.0, dtype=torch.float32, device=_DEV) if with_values else None
@@ -299,6 +303,32 @@ def test_selfsampling_topk_varlen(kv, next_n, cr, top_k, engine):
     MTP window formula, request-level hints, per-row short path — on BOTH the
     per-row in-kernel engine ("auto") and the b=1 reference loop."""
     _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "kv,next_n,cr,top_k",
+    [
+        ([33000, 8200, 300], 1, 1, 512),
+        ([131075, 32800, 2000], 1, 4, 512),
+        ([9000, 5001], 2, 1, 512),
+        ([65540], 4, 4, 1024),
+        ([40000, 7003], 3, 4, 512),
+    ],
+    ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4", "cr4_mtp3"],
+)
+def test_selfsampling_topk_varlen_hint_free(kv, next_n, cr, top_k):
+    """pre_idx=None (hint-free): the bracket comes from the current row
+    itself; exactness must be identical to the hinted contract."""
+    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr, hint_free=True)
+
+
+def test_selfsampling_topk_varlen_hint_free_reference_rejected():
+    """The b=1 reference loop needs a hint tensor; pre_idx=None must raise."""
+    kv_lens = torch.tensor([9000], dtype=torch.int32, device=_DEV)
+    logits = torch.randn((1, 9024), dtype=torch.float32, device=_DEV)
+    indices = torch.full((1, 512), -7, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="auto-engine only"):
+        ss_host.run_varlen(logits, None, kv_lens, indices, engine="reference")
 
 
 def test_selfsampling_topk_varlen_engine_matches_reference():
