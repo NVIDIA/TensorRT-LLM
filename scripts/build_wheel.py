@@ -317,6 +317,23 @@ def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
     return fmha_v2_cu_dir / ".generation_complete"
 
 
+def _fmha_generation_is_stale(project_dir, fmha_v2_cu_dir: Path) -> bool:
+    """Whether the generated FMHA sources predate the generator that emits them.
+
+    setup.py decides which (arch, head size, layout) kernels exist at all, so
+    editing it changes the output set. Without this check the stamp alone keeps
+    an incremental build serving the previously generated kernels, and a newly
+    added head size silently never gets compiled.
+    """
+    stamp = _fmha_generation_stamp(fmha_v2_cu_dir)
+    if not stamp.exists():
+        return True
+    generator = project_dir / "cpp/kernels/fmha_v2/setup.py"
+    if not generator.is_file():
+        return False
+    return generator.stat().st_mtime > stamp.stat().st_mtime
+
+
 def get_fmha_gen_dirs(project_dir, gen_root=None):
     """Return (fmha_v2_cu_dir, cubin_dir) for generated FMHA sources.
 
@@ -1007,7 +1024,7 @@ def main(*,
     fmha_gen_root = build_root / "fmha-gen" if out_of_tree else None
     fmha_v2_cu_dir, _ = get_fmha_gen_dirs(project_dir, fmha_gen_root)
     if (clean or generate_fmha
-            or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
+            or _fmha_generation_is_stale(project_dir, fmha_v2_cu_dir)):
         generate_fmha_cu(project_dir, venv_python, fmha_gen_root)
 
     if out_of_tree:
