@@ -696,6 +696,65 @@ private:
             }
 #endif
 
+            // FIRST, ask the PACKAGE where it is -- not pip where it is recorded.
+            //
+            // `pip show` answers from an install record, and the record can disagree with the
+            // module the running interpreter actually imported:
+            //   * a stale record survives `pip uninstall` when the files it names are already
+            //     gone ("Can't uninstall 'tensorrt_llm'. No files were found to uninstall.")
+            //     and keeps being reported afterwards;
+            //   * `pip` on PATH can belong to a different environment than this process;
+            //   * "Editable project location" is preferred below and never cross-checked
+            //     against "Location", so when the editable path is wrong the correct one is
+            //     not tried at all.
+            //
+            // Observed: a wheel installed into dist-packages, its headers present at
+            // <dist-packages>/tensorrt_llm/include/trtllm_gen_kernels/fmha, `pip show`
+            // reporting a source tree that had since been removed, and this assertion firing
+            // while the files were on disk in the package being executed.
+            //
+            // __file__ of the imported module cannot disagree with what is imported, so it is
+            // tried first and the pip path below is left exactly as it was as the fallback.
+            {
+                char const* modCmd = "python3 -c \"import tensorrt_llm, os; "
+                                     "print(os.path.dirname(tensorrt_llm.__file__))\" 2>/dev/null";
+#ifdef _MSC_VER
+                FILE* modPipe = _popen(modCmd, "r");
+#else
+                FILE* modPipe = popen(modCmd, "r");
+#endif
+                if (modPipe)
+                {
+                    std::array<char, 512> modBuf;
+                    std::string modDir;
+                    while (fgets(modBuf.data(), modBuf.size(), modPipe) != nullptr)
+                    {
+                        modDir += modBuf.data();
+                    }
+#ifdef _MSC_VER
+                    _pclose(modPipe);
+#else
+                    pclose(modPipe);
+#endif
+                    modDir.erase(0, modDir.find_first_not_of(" \n\r\t"));
+                    auto endPos = modDir.find_last_not_of(" \n\r\t");
+                    if (endPos != std::string::npos)
+                    {
+                        modDir.erase(endPos + 1);
+                    }
+                    if (!modDir.empty())
+                    {
+                        auto fromModule = std::filesystem::path(modDir) / "include"
+                            / "trtllm_gen_kernels" / "fmha";
+                        if (std::filesystem::exists(fromModule))
+                        {
+                            execPathStr = (fromModule / "numb").string();
+                            return execPathStr;
+                        }
+                    }
+                }
+            }
+
             // Always use pip show to find installation location at runtime
             char const* cmd = "pip show tensorrt_llm 2>/dev/null";
 
