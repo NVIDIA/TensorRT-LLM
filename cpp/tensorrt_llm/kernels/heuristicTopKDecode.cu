@@ -171,11 +171,14 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // runtime topK via switch, so all 6 must be available at link time.
 // Trailing `int` is the compressRatio parameter (1 = V3.2, 4 = V4 indexer).
 //
-// Parameter `__restrict__` qualifiers must match the kernel definition
-// exactly — with a Clang host compiler (`-ccbin=clang++`), an explicit
-// instantiation whose pointer parameters lack `__restrict__` no longer
-// matches the generated `__wrapper__device_stub_*` declaration, surfacing as
-// "no function template matches function template specialization".
+// The parameter list must repeat the kernel definition's spelling verbatim —
+// both `__restrict__` and any top-level `const` on a by-value parameter.
+// cudafe1 rewrites every parameter into a reference when it emits
+// `__wrapper__device_stub_*`, so qualifiers that overload resolution would
+// normally ignore become part of the signature it has to match. With a Clang
+// host compiler (`-ccbin=clang++`) a mismatch surfaces as "no function
+// template matches function template specialization". The scalars below are
+// deliberately unqualified because the definition declares them that way.
 template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(__nv_bfloat16 const* __restrict__,
     int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
     int, int, int);
