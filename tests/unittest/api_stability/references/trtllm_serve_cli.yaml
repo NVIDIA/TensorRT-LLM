@@ -193,6 +193,15 @@ commands:
         is_flag: true
         flags:
         - "--grpc"
+      grpc_protocol:
+        type: Choice(['openengine', 'smg'])
+        default: smg
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--grpc-protocol"
       host:
         type: str
         default: localhost

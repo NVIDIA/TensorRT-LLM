@@ -951,6 +951,13 @@
       "path": "load_format"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.cuda_graph_specialize_lora"
+    },
+    {
       "allowed_values": [
         "hf",
         "nemo"
@@ -1446,17 +1453,6 @@
       "converter": "",
       "kind": "value",
       "path": "sampler_force_async_worker"
-    },
-    {
-      "allowed_values": [
-        "TRTLLMSampler",
-        "TorchSampler",
-        "auto"
-      ],
-      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]",
-      "converter": "allowlist",
-      "kind": "categorical",
-      "path": "sampler_type"
     },
     {
       "allowed_values": [

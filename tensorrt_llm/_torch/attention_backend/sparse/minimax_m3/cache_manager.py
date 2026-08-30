@@ -31,7 +31,12 @@ import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    binding_to_torch_dtype,
+    convert_to_torch_tensor,
+    prefer_pinned,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
@@ -454,20 +459,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         Drops the base's final ``i // num_local_layers`` step (paired
         with the base ``index_scales`` multiplication that's also
         bypassed here). Pads with ``0`` to preserve shape.
+
+        The rows are written through a numpy view of a single zero-filled,
+        pinned result, so the attention metadata builders ship it to the device
+        in one asynchronous copy.
         """
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-        block_ids_per_seq_tensors = [
-            torch.tensor(
-                [i if i != BAD_PAGE_INDEX else 0 for i in sublist],
-                dtype=torch.int,
-            )
-            for sublist in block_ids_per_seq
-        ]
-        padded_tensor = torch.nn.utils.rnn.pad_sequence(
-            block_ids_per_seq_tensors,
-            batch_first=True,
-            padding_value=0,
+        batch = len(block_ids_per_seq)
+        max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
+        padded_tensor = torch.zeros(
+            (batch, max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
         )
+        rows = padded_tensor.numpy()
+        for row, block_ids in zip(rows, block_ids_per_seq):
+            row[: len(block_ids)] = block_ids
+        # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
+        rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor
 
 

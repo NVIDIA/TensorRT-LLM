@@ -32,8 +32,8 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
-  - unittest/_torch/modules/test_moe_load_balancer.py
-  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/moe/test_moe_load_balancer.py
+  - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Kimi K3 speculative decoding: exact kernel-level verify parity (random
@@ -51,7 +51,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
-  - unittest/_torch/modules/moe/test_moe_backend.py -k "kimi_k3_shape"
+  - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=True]

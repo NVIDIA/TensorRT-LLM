@@ -19,7 +19,7 @@ Synthetic loopback coverage of the KDA recurrent-state transfer path:
 * KDA slot layout, mapped onto the Mamba cache-manager parametrization the
   way ``_util.py`` does for ``kimi_linear`` (params come from
   ``extract_mamba_kv_cache_params`` UNSCALED — global head counts):
-    - short-conv slot  ``[3*H*hd, W]``  **bf16** (qwen3_next ``[Q|K|V]``
+    - short-conv slot  ``[3*H*hd, W-1]``  **bf16** (qwen3_next ``[Q|K|V]``
       3-section layout, all sections equal width),
     - delta-rule slot  ``[H, hd, hd]``  **fp32**  (``state_size == head_dim``),
     - TP semantics: the manager itself gates on the mapping
@@ -45,7 +45,7 @@ Synthetic loopback coverage of the KDA recurrent-state transfer path:
 
 import uuid
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import List
 
 import pytest
 import torch
@@ -55,7 +55,10 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+    MambaPolicy,
+    mamba_receiver_payload_bytes,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -77,7 +80,8 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 NUM_KDA_LAYERS = 4
 KDA_NUM_HEADS = 4  # H
 KDA_HEAD_DIM = 32  # hd; KDA state_size == head_dim
-KDA_W = 3  # short_conv_kernel_size; manager d_conv = W + 1
+KDA_W = 3  # short_conv_kernel_size
+KDA_CONV_STATE_WIDTH = KDA_W - 1
 CONV_DTYPE = torch.bfloat16
 SSM_DTYPE = torch.float32
 MAX_BATCH_SIZE = 4
@@ -92,7 +96,7 @@ _ATTN_MASK = [True] + [False] * NUM_KDA_LAYERS
 # Global (TP-aggregated) per-layer slot byte sizes. Per-rank slot bytes are
 # these divided by tp_size when attention-DP is off (head-sharded state) and
 # equal to these under attention-DP (replicated state).
-CONV_SLOT_BYTES = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+CONV_SLOT_BYTES = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_CONV_STATE_WIDTH * CONV_DTYPE.itemsize
 SSM_SLOT_BYTES = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
 
 
@@ -184,56 +188,14 @@ def _get_mamba_layer_group(page_table) -> MambaLayerGroup:
     return mlgs[0]
 
 
-def _layer_slot_start(pool, local_layer_idx: int, slot: int) -> int:
-    return pool.base_address + (local_layer_idx * pool.num_slots + slot) * pool.slot_bytes
-
-
-def _assert_frags_tile_slots(frags, mlg: MambaLayerGroup, slot: int):
-    """Assert (ptr, size) frags exactly tile every layer's slot bytes."""
-    ptrs, sizes = frags
-    covered: Dict[int, List[tuple]] = {}
-    for ptr, size in zip(ptrs, sizes):
-        pool = None
-        for cand in (mlg.conv_states, mlg.ssm_states):
-            lo = cand.base_address
-            hi = lo + len(mlg.mamba_layer_offsets) * cand.num_slots * cand.slot_bytes
-            if lo <= ptr < hi:
-                pool = cand
-                break
-        assert pool is not None, f"frag ptr {ptr} outside both mamba pools"
-        rel = ptr - pool.base_address
-        layer = rel // (pool.num_slots * pool.slot_bytes)
-        in_layer = rel - layer * pool.num_slots * pool.slot_bytes
-        frag_slot = in_layer // pool.slot_bytes
-        off = in_layer - frag_slot * pool.slot_bytes
-        assert frag_slot == slot, f"frag targets slot {frag_slot}, expected {slot}"
-        assert off + size <= pool.slot_bytes, (
-            f"frag [{off}, {off + size}) exceeds slot_bytes {pool.slot_bytes}"
-        )
-        covered.setdefault((id(pool), int(layer)), []).append((off, off + size))
-
-    # Exact tiling per (pool, layer): sorted intervals must be contiguous
-    # from 0 to slot_bytes with no overlap.
-    n_layers = len(mlg.mamba_layer_offsets)
-    for pool in (mlg.conv_states, mlg.ssm_states):
-        for layer in range(n_layers):
-            intervals = sorted(covered.get((id(pool), layer), []))
-            assert intervals, f"layer {layer} of pool not covered"
-            pos = 0
-            for lo, hi in intervals:
-                assert lo == pos, f"gap/overlap at byte {pos} (next frag at {lo})"
-                pos = hi
-            assert pos == pool.slot_bytes, (
-                f"layer {layer}: covered {pos} of {pool.slot_bytes} slot bytes"
-            )
-
-
 # ---------------------------------------------------------------------------
 # Descriptor-level tests (no NIXL transfer)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("enable_attention_dp", [True, False], ids=["adp_on", "adp_off_tp1"])
 def test_kda_layer_group_descriptors(enable_attention_dp):
     """V2 page table must describe BOTH KDA slots with exact byte extents."""
+    from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
     mgr = _create_kda_managers(1, enable_attention_dp=enable_attention_dp)[0]
     try:
         pt = build_page_table_from_manager(mgr)
@@ -245,41 +207,38 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         # Shapes/dtypes of the backing tensors are KDA-shaped.
         assert conv.dtype == CONV_DTYPE
         assert ssm.dtype == SSM_DTYPE
-        assert tuple(conv.shape[2:]) == (3 * KDA_NUM_HEADS * KDA_HEAD_DIM, KDA_W)
+        assert tuple(conv.shape[2:]) == (
+            3 * KDA_NUM_HEADS * KDA_HEAD_DIM,
+            KDA_CONV_STATE_WIDTH,
+        )
         assert tuple(ssm.shape[2:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
 
-        # Both pools present, byte-exact (bf16 conv, fp32 delta).
-        assert mlg.conv_states is not None and mlg.ssm_states is not None
-        assert mlg.conv_states.base_address == conv.data_ptr()
-        assert mlg.ssm_states.base_address == ssm.data_ptr()
-        assert mlg.conv_states.slot_bytes == CONV_SLOT_BYTES
-        assert mlg.ssm_states.slot_bytes == SSM_SLOT_BYTES
-        assert mlg.conv_states.num_slots == conv.shape[1]
-        assert mlg.ssm_states.num_slots == ssm.shape[1]
+        # Both pool_views present with correct roles and byte sizes.
+        conv_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE), None)
+        ssm_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE), None)
+        assert conv_pv is not None and ssm_pv is not None
+        assert conv_pv.bytes_per_layer == CONV_SLOT_BYTES
+        assert ssm_pv.bytes_per_layer == SSM_SLOT_BYTES
 
         # qwen3_next 3-sectioning: equal sections summing to the conv slot.
         assert mlg.conv_section_bytes == [CONV_SLOT_BYTES // 3] * 3
-        assert sum(mlg.conv_section_bytes) == mlg.conv_states.slot_bytes
+        assert sum(mlg.conv_section_bytes) == conv_pv.bytes_per_layer
         assert mlg.ssm_bytes_per_head == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-        assert mlg.ssm_states.slot_bytes // mlg.ssm_bytes_per_head == KDA_NUM_HEADS
+        assert ssm_pv.bytes_per_layer // mlg.ssm_bytes_per_head == KDA_NUM_HEADS
 
-        # Layer offsets cover exactly the KDA layers.
-        assert sorted(mlg.mamba_layer_offsets.keys()) == [i for i, m in enumerate(_KDA_MASK) if m]
+        # local_layers cover exactly the KDA layers (by global_layer_id).
+        assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
+            i for i, m in enumerate(_KDA_MASK) if m
+        ]
 
-        # Matched-parallelism frags: 2 pools x layers, full-slot, exact tiling.
-        ri = RankInfo.from_kv_cache_manager("kda_test", mgr, device_id=0)
-        src_slot, dst_slot = 0, 1
-        src_frags, dst_frags, sizes = MambaPolicy.build_mamba_frags(
-            mlg, mlg, src_slot, dst_slot, ri, ri
+        # Matched-parallelism payload: receiver_payload_bytes must equal
+        # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
+        payload = mamba_receiver_payload_bytes(
+            sender_page_table=pt,
+            receiver_page_table=pt,
+            dst_slot=1,
         )
-        assert len(src_frags) == len(dst_frags) == len(sizes) == 2 * NUM_KDA_LAYERS
-        _assert_frags_tile_slots((src_frags, sizes), mlg, src_slot)
-        _assert_frags_tile_slots((dst_frags, sizes), mlg, dst_slot)
-
-        # Full-slot copies at the expected per-layer addresses.
-        for glid, lid in sorted(mlg.mamba_layer_offsets.items()):
-            assert _layer_slot_start(mlg.conv_states, lid, src_slot) in src_frags
-            assert _layer_slot_start(mlg.ssm_states, lid, src_slot) in src_frags
+        assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()
 
@@ -301,12 +260,26 @@ def test_kda_hetero_tp_sharded_accepted():
         gen_pt = build_page_table_from_manager(gen_mgr)
 
         # Production per-rank slots are the global sizes divided by tp.
+        from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
         ctx_mlg = _get_mamba_layer_group(ctx_pt)
         gen_mlg = _get_mamba_layer_group(gen_pt)
-        assert ctx_mlg.conv_states.slot_bytes == CONV_SLOT_BYTES // 2
-        assert ctx_mlg.ssm_states.slot_bytes == SSM_SLOT_BYTES // 2
-        assert gen_mlg.conv_states.slot_bytes == CONV_SLOT_BYTES // 4
-        assert gen_mlg.ssm_states.slot_bytes == SSM_SLOT_BYTES // 4
+        ctx_conv_bpl = next(
+            pv.bytes_per_layer for pv in ctx_mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE
+        )
+        ctx_ssm_bpl = next(
+            pv.bytes_per_layer for pv in ctx_mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE
+        )
+        gen_conv_bpl = next(
+            pv.bytes_per_layer for pv in gen_mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE
+        )
+        gen_ssm_bpl = next(
+            pv.bytes_per_layer for pv in gen_mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE
+        )
+        assert ctx_conv_bpl == CONV_SLOT_BYTES // 2
+        assert ctx_ssm_bpl == SSM_SLOT_BYTES // 2
+        assert gen_conv_bpl == CONV_SLOT_BYTES // 4
+        assert gen_ssm_bpl == SSM_SLOT_BYTES // 4
 
         ctx_ri = RankInfo.from_kv_cache_manager("kda_ctx", ctx_mgr, device_id=0)
         gen_ri = RankInfo.from_kv_cache_manager("kda_gen", gen_mgr, device_id=0)
@@ -352,19 +325,60 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
 
 def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_ids=None):
     """MambaLayerGroup-only page table with fake addresses (no CUDA needed)."""
-    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, PhysicalPool
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        KVCachePageTable,
+        LocalLayer,
+        MapperKind,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
 
     if layer_ids is None:
         layer_ids = range(1, NUM_KDA_LAYERS + 1)
+    local_layers = [
+        LocalLayer(local_layer_id=i, global_layer_id=glid) for i, glid in enumerate(layer_ids)
+    ]
+    sorted_lids = [ll.local_layer_id for ll in local_layers]
+    conv_pool = PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8)
+    ssm_pool = PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8)
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_slot_bytes,
+        ),
+    ]
     mlg = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets={glid: i for i, glid in enumerate(layer_ids)},
-        conv_states=PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8),
-        ssm_states=PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8),
+        local_layers=local_layers,
+        pool_views=pool_views,
         conv_section_bytes=[conv_slot_bytes // 3] * 3,
         ssm_bytes_per_head=KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize,
     )
-    return KVCachePageTable(tokens_per_block=8, layer_groups=[mlg], pool_groups=[])
+    return KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[mlg],
+        pool_groups=[PhysicalPoolGroup(pools=[conv_pool, ssm_pool])],
+    )
 
 
 def _synthetic_rank_info(tp: int, adp: bool):
@@ -421,7 +435,7 @@ def _synthetic_rank_info(tp: int, adp: bool):
 def test_kda_peer_validation_synthetic_cpu(ctx, gen, ok):
     """CPU-only reject/accept matrix for the global-size guard (no CUDA manager)."""
     full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-    full_conv = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+    full_conv = CONV_SLOT_BYTES
 
     def build(cfg):
         tp, adp, denom = cfg
@@ -450,7 +464,7 @@ def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
     validation as long as the per-slot size invariants hold.
     """
     full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-    full_conv = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+    full_conv = CONV_SLOT_BYTES
     ctx_ri = _synthetic_rank_info(2, False)
     gen_ri = _synthetic_rank_info(2, False)
 
@@ -488,7 +502,7 @@ def _shard_kda_ssm(full_ssm: torch.Tensor, tp: int, rank: int) -> torch.Tensor:
 
 
 def _shard_kda_conv(full_conv: torch.Tensor, tp: int, rank: int) -> torch.Tensor:
-    """Per-section shard of the [3*H*hd, W] conv state (identity for tp=1).
+    """Per-section shard of the [3*H*hd, W-1] conv state (identity for tp=1).
 
     qwen3_next [Q | K | V] sectioning with three equal H*hd sections; each
     section is sharded independently across tp, like the manager's
@@ -510,9 +524,11 @@ def _generate_ground_truth(num_requests: int, seed: int = 20260722):
             if not is_kda:
                 continue
             layers[i] = {
-                "conv": torch.rand(3 * KDA_NUM_HEADS * KDA_HEAD_DIM, KDA_W, generator=gen).to(
-                    CONV_DTYPE
-                ),
+                "conv": torch.rand(
+                    3 * KDA_NUM_HEADS * KDA_HEAD_DIM,
+                    KDA_CONV_STATE_WIDTH,
+                    generator=gen,
+                ).to(CONV_DTYPE),
                 "ssm": torch.rand(
                     KDA_NUM_HEADS,
                     KDA_HEAD_DIM,

@@ -13,7 +13,6 @@ is strictly unchanged from the inlined version.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import time
@@ -21,7 +20,7 @@ import traceback
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -31,7 +30,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
-from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
+from tensorrt_llm.serve.visual_gen_metrics import (
+    build_visual_gen_server_timings,
+    build_visual_gen_timing_headers,
+)
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
 
 if TYPE_CHECKING:
@@ -54,6 +56,42 @@ def _video_content_type(suffix: str) -> str:
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
 
 
+def _resolve_tensor_only_format(fmt, extra_params, extra_param_specs):
+    """Resolve ``format`` for a request whose result an encoder cannot carry.
+
+    A pipeline marks such parameters with ``requires_tensor_output`` on their
+    :class:`ExtraParamSchema` (Cosmos3 does so for ``action_mode``: a predicted
+    trajectory has no representation in a video container). The rule keeps this
+    route model-agnostic -- it reads the declaration, never the parameter's
+    meaning:
+
+    * ``auto`` resolves to ``safetensors``, so the default request returns
+      everything it generated instead of silently dropping a modality;
+    * an explicit tensor format passes through;
+    * an explicit encoder format is a contradiction the caller stated -- two
+      incompatible things in one request -- so it is rejected rather than
+      guessed at.
+    """
+    if not extra_params or not extra_param_specs:
+        return fmt
+    triggered = sorted(
+        key
+        for key, spec in extra_param_specs.items()
+        if getattr(spec, "requires_tensor_output", False) and extra_params.get(key) is not None
+    )
+    if not triggered:
+        return fmt
+    if is_tensor_format(fmt):
+        return fmt
+    if fmt == "auto":
+        return _DEFAULT_TENSOR_FORMAT
+    raise ValueError(
+        f"format={fmt!r} cannot carry the result of {', '.join(triggered)}: a "
+        f"video container holds only video. Use format='safetensors' or 'pt', "
+        f"or omit format so 'auto' selects a payload that carries everything."
+    )
+
+
 def _preflight_encoder_format(fmt):
     """Pre-flight an encoder format string before any GPU work.
 
@@ -72,18 +110,18 @@ def _preflight_encoder_format(fmt):
         raise ValueError(str(exc)) from exc
 
 
-def _b64_json_video_response(video_id: str, fmt: str, path: Path) -> JSONResponse:
-    """Build the OpenAI-style ``{id, format, b64_json}`` envelope.
+_DEFAULT_TENSOR_FORMAT = "safetensors"
 
-    Reads bytes from a saved video file on disk and base64-inlines them.
+
+def _path_json_video_response(
+    video_id: str, path: Union[str, Path], headers: Optional[dict[str, str]] = None
+) -> JSONResponse:
+    """Build the ``{id, output_path}`` path-transport envelope.
+
+    Returns the server-side output path so a co-located client reads the file
+    directly. ``headers`` (Server-Timing metrics) are attached to the response.
     """
-    return JSONResponse(
-        content={
-            "id": video_id,
-            "format": fmt,
-            "b64_json": base64.b64encode(path.read_bytes()).decode("utf-8"),
-        }
-    )
+    return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
 class _VideoRoutesMixin:
@@ -104,6 +142,9 @@ class _VideoRoutesMixin:
         - JSON: Send VideoGenerationRequest as application/json
         - Multipart: Send form fields + optional input_reference file
         """
+        # Stamp request arrival for the Server-Timing ``total`` (full server
+        # time, incl. request parsing) before any work.
+        request_received = time.perf_counter()
         try:
             # Client-side ValueErrors from content-type parsing, request
             # translation, encoder-format preflight, parameter validation,
@@ -113,6 +154,9 @@ class _VideoRoutesMixin:
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
+                path_error = self._reject_disabled_path(request.response_format)
+                if path_error is not None:
+                    return path_error
                 video_id = f"video_{uuid.uuid4().hex}"
                 params = parse_visual_gen_params(
                     request,
@@ -120,7 +164,10 @@ class _VideoRoutesMixin:
                     self.generator,
                     media_storage_path=str(self.media_storage_path),
                 )
-                resolved_encoder_fmt = _preflight_encoder_format(request.format)
+                request_format = _resolve_tensor_only_format(
+                    request.format, request.extra_params, self.generator.extra_param_specs
+                )
+                resolved_encoder_fmt = _preflight_encoder_format(request_format)
                 logger.info(
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -148,8 +195,8 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            if is_tensor_format(request.format):
-                ext = f".{request.format}"
+            if is_tensor_format(request_format):
+                ext = f".{request_format}"
                 media_type = "application/octet-stream"
                 # Match the encoder-format path: persist one file per batch
                 # item, ship the first as the route's primary download
@@ -159,16 +206,22 @@ class _VideoRoutesMixin:
                 tensor_paths = [
                     self.media_storage_path / f"{video_id}_{i}{ext}" for i in range(batch_size)
                 ]
-                saved_paths = output.save(tensor_paths, format=request.format)
+                saved_paths = output.save(tensor_paths, format=request_format)
                 target = saved_paths[0]
                 latency = time.perf_counter() - sync_video_start
                 logger.info(
                     f"Video {video_id} serialized as tensor: latency={latency:.3f}s "
                     f"generation={getattr(output.metrics, 'generation', 0.0):.3f}s"
                 )
-                if request.response_format == "b64_json":
-                    return _b64_json_video_response(video_id, request.format, target)
-                return FileResponse(str(target), media_type=media_type, filename=target.name)
+                total = time.perf_counter() - request_received
+                headers = build_visual_gen_timing_headers(
+                    build_visual_gen_server_timings(output.metrics, total=total)
+                )
+                if request.response_format == "path":
+                    return _path_json_video_response(video_id, target, headers)
+                return FileResponse(
+                    str(target), media_type=media_type, filename=target.name, headers=headers
+                )
 
             # Encoder formats: one file per item; ship the first item as
             # the route's primary download (OpenAI sync video API does
@@ -199,16 +252,17 @@ class _VideoRoutesMixin:
                 f"latency={latency:.3f}s generation={generation:.3f}s "
                 f"denoise={denoise:.3f}s"
             )
-            headers = build_visual_gen_timing_headers(metrics)
+            total = time.perf_counter() - request_received
+            headers = build_visual_gen_timing_headers(
+                build_visual_gen_server_timings(metrics, total=total)
+            )
 
             # TODO(TRTLLM-11579): the OpenAI Videos API does not yet define a
             # multi-file response, so we return only the first video as a file
             # download while persisting all of them to disk.
             actual_path = saved_paths[0]
-            if request.response_format == "b64_json":
-                return _b64_json_video_response(
-                    video_id, actual_path.suffix.lstrip("."), actual_path
-                )
+            if request.response_format == "path":
+                return _path_json_video_response(video_id, actual_path, headers)
             return FileResponse(
                 str(actual_path),
                 media_type=_video_content_type(actual_path.suffix),
@@ -322,9 +376,16 @@ class _VideoRoutesMixin:
         - JSON: Send VideoGenerationRequest as application/json
         - Multipart: Send form fields + optional input_reference file
         """
+        # Stamp request arrival for the Server-Timing ``total`` (full server
+        # time, POST arrival -> job completed); the background task reads it
+        # back off the job to compute ``total``.
+        request_received = time.perf_counter()
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
+            path_error = self._reject_disabled_path(request.response_format)
+            if path_error is not None:
+                return path_error
 
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(
@@ -342,7 +403,10 @@ class _VideoRoutesMixin:
                 declared_defaults=self.generator.executor.default_generation_params,
                 extra_param_specs=self.generator.executor.extra_param_specs,
             )
-            _preflight_encoder_format(request.format)
+            request_format = _resolve_tensor_only_format(
+                request.format, request.extra_params, self.generator.extra_param_specs
+            )
+            _preflight_encoder_format(request_format)
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
@@ -359,6 +423,7 @@ class _VideoRoutesMixin:
                 fps=params.frame_rate,
                 size=f"{params.width}x{params.height}",
                 response_format=request.response_format,
+                request_started=request_received,
             )
             await VIDEO_STORE.upsert(video_id, video_job)
 
@@ -368,6 +433,7 @@ class _VideoRoutesMixin:
                     video_id=video_id,
                     request=request,
                     params=params,
+                    request_format=request_format,
                 )
             )
             self.video_gen_tasks[video_id] = task
@@ -393,10 +459,21 @@ class _VideoRoutesMixin:
         video_id: str,
         request: VideoGenerationRequest,
         params: VisualGenParams,
+        request_format: str,
     ):
-        """Background task to generate video and save to storage."""
+        """Background task to generate video and save to storage.
+
+        ``request_format`` is the format already resolved by the route (see
+        :func:`_resolve_tensor_only_format`), not ``request.format``: the
+        resolution happens before the job is queued so a rejected request never
+        becomes a background task.
+        """
         try:
             background_start = time.perf_counter()
+            job = await VIDEO_STORE.get(video_id)
+            if job:
+                job.status = "generating"
+                await VIDEO_STORE.upsert(video_id, job)
             future = self.generator.generate_async(inputs=request.prompt, params=params)
             output = await future
 
@@ -410,25 +487,40 @@ class _VideoRoutesMixin:
                     await VIDEO_STORE.upsert(video_id, job)
                 return
 
-            if is_tensor_format(request.format):
+            # Generation finished, postprocessing starts: expose the transition
+            # so clients can measure pure generation time on their side.
+            job = await VIDEO_STORE.get(video_id)
+            if job:
+                job.status = "postprocessing"
+                await VIDEO_STORE.upsert(video_id, job)
+
+            if is_tensor_format(request_format):
                 # One tensor file per batch item, mirroring the encoder
                 # path; the async job records all paths on
                 # ``output_paths`` so subsequent GETs can find each item.
                 batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
                 tensor_paths = [
-                    self.media_storage_path / f"{video_id}_{i}.{request.format}"
+                    self.media_storage_path / f"{video_id}_{i}.{request_format}"
                     for i in range(batch_size)
                 ]
-                saved_paths = output.save(tensor_paths, format=request.format)
+                saved_paths = output.save(tensor_paths, format=request_format)
             else:
-                resolved_fmt, _ = resolve_video_format(request.format)
+                resolved_fmt, _ = resolve_video_format(request_format)
                 batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
                 paths_in = [self.media_storage_path / f"{video_id}_{i}" for i in range(batch_size)]
-                saved_paths = output.save(
-                    paths_in,
+                _save_kwargs = dict(
                     format=resolved_fmt,
                     frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
                 )
+                if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
+                    # Offload the blocking encode to a thread so the event loop
+                    # stays responsive during ``postprocessing`` — pollers can
+                    # observe the state and other requests progress meanwhile.
+                    saved_paths = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: output.save(paths_in, **_save_kwargs)
+                    )
+                else:
+                    saved_paths = output.save(paths_in, **_save_kwargs)
             latency = time.perf_counter() - background_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0
@@ -442,12 +534,19 @@ class _VideoRoutesMixin:
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
-                # TODO: Expose VisualGen timing metrics for async jobs once the
-                # OpenAI video job metadata contract includes server timings.
                 # Store the first path on output_path for single-video
                 # compatibility, and the full list on output_paths.
                 job.output_path = str(saved_paths[0])
                 job.output_paths = [str(p) for p in saved_paths]
+                # Timings dict for the /content Server-Timing header (excluded
+                # from the status wire). ``total`` spans POST arrival ->
+                # completion.
+                total = (
+                    time.perf_counter() - job.request_started
+                    if job.request_started is not None
+                    else None
+                )
+                job.timing_metrics = build_visual_gen_server_timings(metrics, total=total)
                 await VIDEO_STORE.upsert(video_id, job)
 
         except Exception as e:
@@ -473,6 +572,8 @@ class _VideoRoutesMixin:
             response = VideoJobList(
                 data=video_jobs,
             )
+            # output_path/output_paths are Field(exclude=True) on VideoJob, so
+            # model_dump() drops them from every listed job automatically.
             return JSONResponse(content=response.model_dump())
 
         except Exception as e:
@@ -508,6 +609,9 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
 
+            # Status-only: output_path/output_paths are Field(exclude=True) on
+            # VideoJob, so model_dump() drops them automatically (no path leak);
+            # the fields stay on the job for /content resolution + delete.
             return JSONResponse(content=job.model_dump())
 
         except Exception as e:
@@ -568,13 +672,15 @@ class _VideoRoutesMixin:
 
             if video_path and os.path.exists(video_path):
                 suffix = video_path.suffix.lstrip(".")
+                # Same Server-Timing header as the sync route, rebuilt from the
+                # timings the background task stored on the job.
+                headers = build_visual_gen_timing_headers(job.timing_metrics)
                 # When the original ``POST /v1/videos`` requested
-                # ``response_format="b64_json"``, return the bytes
-                # as a base64 envelope so the async transport
-                # matches what the sync route does for the same
-                # ``response_format``.
-                if job.response_format == "b64_json":
-                    return _b64_json_video_response(video_id, suffix, video_path)
+                # ``response_format="path"``, return the server-side output
+                # path as JSON instead of the bytes; the sync route honors
+                # the same ``response_format`` value.
+                if job.response_format == "path":
+                    return _path_json_video_response(video_id, video_path, headers)
                 if is_tensor_format(suffix):
                     media_type = "application/octet-stream"
                 else:
@@ -583,6 +689,7 @@ class _VideoRoutesMixin:
                     video_path,
                     media_type=media_type,
                     filename=video_path.name,
+                    headers=headers,
                 )
             else:
                 return self.create_error_response(

@@ -85,7 +85,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py`, `tensorrt_llm/_torch/modules/mla.py`, or `tensorrt_llm/_torch/attention_backend/`** |
-| `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -167,7 +167,6 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline
 - `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
-- `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 

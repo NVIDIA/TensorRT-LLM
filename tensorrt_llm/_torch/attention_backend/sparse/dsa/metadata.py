@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -339,6 +341,80 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=_INDEXER_LOGITS_DTYPE,
             num_sms=self.num_sms,
         )
+
+    def warmup_selfsampling_topk(
+        self, next_n: int, batch_sizes: Optional[List[int]] = None
+    ) -> None:
+        """Pre-compile the self-sampling GVR varlen engine during warmup.
+
+        Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
+        by the exact row count AND the logits row stride: rows cover the
+        small eager batches plus every configured CUDA-graph batch size, and
+        the stride mirrors what the active paged-MQA producer emits, so the
+        warmed keys are the ones dispatch actually looks up. Batches outside
+        this set still compile lazily on first touch. The helper enumerates
+        one representative row per distinct engine compile key, so large
+        batch lists warm in bounded time and memory. No-op unless the opt-in
+        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        """
+        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
+            return
+        # same hardware gates as the dispatch flag (indexer __init__): never
+        # compile these kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+            return
+        if not self.enable_gvr_topk or self.kv_cache_manager is None:
+            return
+        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not top_k or int(top_k) not in (512, 1024, 2048):
+            return
+        cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
+        if cr not in (1, 4):
+            return
+        try:
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                gvr_topk_decode_self_sampling_host as _ss_host,
+            )
+        except ImportError:
+            return
+        nn = int(next_n)
+        # warm the small row counts eager mixed batches commonly produce;
+        # larger eager row counts lazy-JIT on first touch, and CUDA-graph
+        # geometries are covered through ``batch_sizes`` below
+        eager_warm_rows = 32
+        rows = set(range(nn, eager_warm_rows + 1, nn)) or {nn}
+        for bs in batch_sizes or ():
+            rows.add(int(bs) * nn)
+        msl_c = int(self.get_indexer_max_seq_len())
+        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+            # mirror the DSL paged-MQA arena stride (rows round up to 256
+            # elements). A drift here only degrades warmup to unused keys —
+            # dispatch still lazy-JITs the true key outside capture.
+            row_stride = (msl_c + 255) // 256 * 256
+        else:
+            # DeepGEMM emits exact-width rows; a non-float4 width falls
+            # through at the dispatch format gate, so there is nothing to warm
+            row_stride = msl_c
+            if row_stride % 4:
+                return
+        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
+        # is compressed — same multiply-back as the dispatch seam)
+        try:
+            _ss_host.warmup_varlen(
+                int(top_k),
+                msl_c * cr,
+                compress_ratio=cr,
+                next_n=int(next_n),
+                num_rows_list=tuple(sorted(rows)),
+                row_stride=row_stride,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # warmup is best-effort: the dispatch works without it (engines
+            # JIT lazily outside capture), so do not fail engine init
+            logger.warning(
+                "self-sampling GVR warmup ran out of memory; varlen engines "
+                "will JIT-compile lazily on first touch instead."
+            )
 
     def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
@@ -851,7 +927,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: bool = False,
         spec_metadata: Optional["SpecMetadata"] = None,
         spec_tree_manager: Optional["SpecTreeManager"] = None,
         num_contexts: int = 0,
@@ -864,7 +939,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped,
             spec_metadata,
             spec_tree_manager,
             num_contexts=num_contexts,

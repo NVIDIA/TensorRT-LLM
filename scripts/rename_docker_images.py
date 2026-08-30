@@ -234,7 +234,9 @@ def rename_images(*,
         dst_image = replace_text_between_dashes(
             f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}", 3, stage)
 
-        run_shell_command(f"docker pull {src_image}", dry_run)
+        platform = "linux/arm64" if "SBSA" in dst_key else "linux/amd64"
+        run_shell_command(f"docker pull --platform {platform} {src_image}",
+                          dry_run)
         run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
         run_shell_command(f"docker push {dst_image}", dry_run)
         find_and_replace_in_files(current_tags_path.parent,

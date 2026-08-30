@@ -8,7 +8,6 @@ import torch
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.logger import logger
 
-from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -92,14 +91,7 @@ class ModelDrafter(Drafter):
         self.sampler = sampler
         self.guided_decoder = guided_decoder
 
-        self.use_static_draft_loop = draft_model_engine.model_is_wrapped
-        if self.use_static_draft_loop:
-            # TODO: enable sampling/guided decoding on static draft loop
-            assert guided_decoder is None
-            assert spec_config._allow_greedy_draft_tokens
-            assert spec_config.draft_len_schedule is None
-
-        # Create accumulator for draft tokens in non-CDL mode
+        # Create accumulator for draft tokens
         self.draft_tokens_accumulator: Dict[int, List[int]] = {}
 
         # Initialize draft latency tracking for specDecodingStats
@@ -176,47 +168,6 @@ class ModelDrafter(Drafter):
             input_tokens) - num_accepted_tokens - 1
         return new_request
 
-    def _get_previous_draft_request(
-            self, request: LlmRequest) -> Optional[LlmRequest]:
-        """Get the previous draft request for the given request."""
-        if self.previous_draft_batch is None:
-            return None
-        for req in self.previous_draft_batch.all_requests():
-            if req.py_request_id == request.py_request_id:
-                return req
-        return None
-
-    def _create_accepted_tokens_request_for_trtllm_attn(
-            self, request: LlmRequest, input_tokens: Any,
-            num_accepted_tokens: int) -> LlmRequest:
-        """
-        Create a chunked context request for accepted tokens.
-        Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
-        """
-        # Pad input_tokens to max_draft_len
-        # We use max_draft_len instead of max_total_draft_tokens here,
-        # because at most max_draft_len draft tokens are accepted.
-        input_tokens.extend(
-            0 for _ in range(self.max_draft_len - num_accepted_tokens))
-
-        # Reuse the previous draft request if it exists.
-        # This can reduce host overhead significantly.
-        draft_request = self._get_previous_draft_request(request)
-        if draft_request is not None:
-            generated_tokens = input_tokens[draft_request.py_prompt_len:]
-            draft_request.set_generated_tokens([generated_tokens])
-        else:
-            draft_request = self._create_draft_request(request, input_tokens)
-
-        draft_request.state = LlmRequestState.GENERATION_IN_PROGRESS
-        draft_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
-        draft_request.py_is_first_draft = True
-        # For tree decoding, we need to store the accepted tokens indices for these requests,
-        # which will be used to update the hidden_states_read_indices.
-        draft_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
-
-        return draft_request
-
     def _create_draft_request_for_request(
             self, request: LlmRequest) -> Optional[LlmRequest]:
         """Create a draft request based on the original request state."""
@@ -227,9 +178,6 @@ class ModelDrafter(Drafter):
                                               request,
                                               self.disable_overlap_scheduler)
 
-        is_eagle_style = self.spec_config.spec_dec_mode.is_eagle3(
-        ) or self.spec_config.spec_dec_mode.is_mtp_eagle()
-
         # First time seeing this request - context request
         num_overlap_tokens = 0 if self.disable_overlap_scheduler else 1
         if request.max_beam_num_tokens - 1 + num_overlap_tokens == request.py_prompt_len:
@@ -239,12 +187,6 @@ class ModelDrafter(Drafter):
             if self.disable_overlap_scheduler:
                 assert num_draft_tokens == 0
             return self._create_context_request(request, input_tokens)
-
-        # For TRTLLM attention backend, we need to create a generation request for both no tokens accepted and tokens accepted
-        elif issubclass(self.draft_model_engine.attn_backend, TrtllmAttention
-                        ) and self.use_static_draft_loop and is_eagle_style:
-            return self._create_accepted_tokens_request_for_trtllm_attn(
-                request, input_tokens, num_accepted_tokens)
 
         # No tokens accepted - generation request. This only applies to speculation algorithms
         # that need to recompute KV cache for accepted tokens like eagle3.
@@ -290,11 +232,10 @@ class ModelDrafter(Drafter):
             ScheduledRequests: The prepared draft batch
         """
         try:
-            for req in scheduled_requests.all_requests():
-                draft_model = self.draft_model_engine.model.draft_model if self.use_static_draft_loop else self.draft_model_engine.model
-                if hasattr(draft_model.model, "d2t"):
+            draft_model = self.draft_model_engine.model
+            if hasattr(draft_model.model, "d2t"):
+                for req in scheduled_requests.all_requests():
                     req.d2t = draft_model.model.d2t.data
-                req.py_draft_use_greedy_sampling = self.use_static_draft_loop
 
             draft_batch = ScheduledRequests()
 
@@ -353,8 +294,6 @@ class ModelDrafter(Drafter):
         """Check if CUDA graph should be disabled for the current forward pass."""
         if not is_first_draft_token:
             return False
-        if self.use_static_draft_loop:
-            return False
         return self.spec_config.spec_dec_mode.needs_kv_cache_recompute()
 
     @nvtx_range("forward_draft_model")
@@ -383,10 +322,7 @@ class ModelDrafter(Drafter):
                 num_accepted_tokens_device=num_accepted_tokens_device,
                 req_id_to_old_request=self.req_id_to_old_request)
 
-        # Handle d2t data if available. Static drafting loops should incorporate d2t
-        # in their implementations.
-        if not self.use_static_draft_loop and hasattr(
-                self.draft_model_engine.model.model, 'd2t'):
+        if hasattr(self.draft_model_engine.model.model, 'd2t'):
             outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
         return outputs
@@ -585,13 +521,13 @@ class ModelDrafter(Drafter):
 
         draft_indices = []
         target_indices = []
-        for req_idx, request in enumerate(draft_batch.all_requests()):
+        for request in draft_batch.all_requests():
             target_req = self.req_id_to_old_request[request.py_request_id]
             if target_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 # Skip prefill requests
                 continue
             # Get the index of the draft/target tokens in the device tensor
-            draft_idx = req_idx if self.use_static_draft_loop else request.py_seq_slot
+            draft_idx = request.py_seq_slot
             target_idx = target_req.py_seq_slot
             draft_indices.append(draft_idx)
             target_indices.append(target_idx)
@@ -662,41 +598,6 @@ class ModelDrafter(Drafter):
         self.draft_seq_slot_manager.prepare_resources(draft_batch)
         return draft_batch
 
-    def process_static_draft_outputs(self, outputs: dict[str, torch.Tensor]
-                                     | tuple[torch.Tensor, SampleState],
-                                     draft_batch: ScheduledRequests) -> None:
-        """
-        Process outputs from static draft loop, update target requests, and clean up resources.
-
-        Args:
-            outputs: The outputs from the draft model
-            draft_batch: The draft batch that was processed
-        """
-
-        if isinstance(outputs, dict):
-            draft_tokens_host = outputs["new_draft_tokens"].cpu()
-            draft_logits = outputs["draft_logits"]
-        else:
-            draft_logits = outputs[0]
-            draft_tokens_host = outputs[1].host.new_tokens
-            outputs[1].sampler_event.synchronize()
-
-        for req_idx, req in enumerate(draft_batch.all_requests()):
-            target_model_req = self.req_id_to_old_request[req.py_request_id]
-            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
-                # Chunked prefill request in progress; no need to append draft tokens
-                continue
-            target_model_req.py_draft_tokens = []
-            py_draft_logits = []
-            for token_idx in range(self.max_total_draft_tokens):
-                target_model_req.py_draft_tokens.append(
-                    draft_tokens_host[token_idx][req_idx])
-                py_draft_logits.append(draft_logits[token_idx][req_idx])
-
-            # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
-            if self.disable_overlap_scheduler:
-                target_model_req.py_draft_logits = torch.stack(py_draft_logits)
-
     def process_dynamic_draft_outputs(
             self,
             outputs: Any,
@@ -766,18 +667,14 @@ class ModelDrafter(Drafter):
         current_req_id_to_old_request = self.req_id_to_old_request
 
         # Set req_id_to_old_request for the previous batch,
-        # this will be used in process_static_draft_outputs and process_dynamic_draft_outputs
+        # this will be used in process_dynamic_draft_outputs
         self.req_id_to_old_request = {
             req.py_request_id: req
             for req in self.previous_scheduled_batch.all_requests()
         }
 
-        if self.use_static_draft_loop:
-            self.process_static_draft_outputs(self.previous_draft_outputs,
-                                              self.previous_draft_batch)
-        elif self.previous_draft_outputs is not None:
-            self.process_dynamic_draft_outputs(self.previous_draft_outputs,
-                                               cleanup_resources=False)
+        self.process_dynamic_draft_outputs(self.previous_draft_outputs,
+                                           cleanup_resources=False)
 
         self.req_id_to_old_request = current_req_id_to_old_request
 
@@ -905,36 +802,7 @@ class ModelDrafter(Drafter):
         self._process_previous_draft_results(resource_manager)
 
         num_draft_reqs = len(draft_batch.all_requests())
-        if self.use_static_draft_loop:
-            # Only update target inputs, cleanup will be done in executor loop
-            self._update_draft_tokens_for_target_inputs(
-                target_inputs,
-                outputs["new_draft_tokens"],
-                draft_position=0,
-                draft_length=self.max_draft_len,
-                draft_batch=draft_batch)
 
-            new_tokens_host = outputs["new_draft_tokens"].to(device='cpu',
-                                                             non_blocking=True)
-            sampler_event = torch.cuda.Event()
-            sampler_event.record()
-
-            sample_state = SampleState(
-                requests=draft_batch.all_requests(),
-                device=SampleStateTensors(
-                    new_tokens=outputs["new_draft_tokens"]),
-                host=SampleStateTensors(new_tokens=new_tokens_host),
-                sampler_event=sampler_event)
-
-            # Store current batch for processing in next iteration
-            self.previous_draft_batch = draft_batch
-            self.previous_draft_outputs = (outputs["draft_logits"],
-                                           sample_state)
-            self.previous_scheduled_batch = scheduled_batch
-
-            return
-
-        # Handle guided decoder and sampling for non-static loop
         if self.guided_decoder is not None:
             self.guided_decoder.add_batch(draft_batch)
             self.guided_decoder.execute(outputs['logits'],
@@ -1000,22 +868,10 @@ class ModelDrafter(Drafter):
             self.update_cur_draft_layer_idx(
                 0, resource_manager
             )  # Update the current draft layer index in the resource manager.
-            # Initial forward pass. May do the complete drafting loop
-            # if use_static_draft_loop is set.
+            # Initial forward pass.
             outputs = self.forward_draft_model(draft_batch,
                                                resource_manager,
                                                is_first_draft_token=True)
-
-            if self.use_static_draft_loop:
-                self.process_static_draft_outputs(outputs, draft_batch)
-                # Clean up draft_seq_slot_manager resources
-                for req in draft_batch.all_requests():
-                    self.draft_seq_slot_manager.free_resources(req)
-                # Record draft latency before returning
-                draft_end_time = time.time()
-                self.last_draft_latency_ms = (draft_end_time -
-                                              draft_start_time) * 1e3
-                return
 
             if self.guided_decoder is not None:
                 self.guided_decoder.add_batch(draft_batch)

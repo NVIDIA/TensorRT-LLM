@@ -38,6 +38,7 @@ import os
 import unittest
 from copy import deepcopy
 from typing import Dict, List, Type
+from unittest import mock
 
 import pytest
 import torch
@@ -1422,19 +1423,13 @@ class TestGemma4InputProcessor(unittest.TestCase):
         """Video input bypasses HF Gemma4Processor and yields per-frame
         pixel_values + expanded video soft tokens in input_ids.
         """
-        import numpy as np
-        from PIL import Image
-
         from tensorrt_llm.sampling_params import SamplingParams
 
         proc = self._make_processor()
         if not hasattr(proc._processor, "video_processor"):
             self.skipTest("Processor has no video_processor")
 
-        frames = [
-            Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
-            for _ in range(32)
-        ]
+        frames = [torch.randint(0, 256, (3, 180, 320), dtype=torch.uint8) for _ in range(40)]
         VideoData = type("VideoData", (), {})
         vd = VideoData()
         vd.frames = frames
@@ -1456,6 +1451,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
             "multi_modal_data": {"video": [vd]},
         }
         sp = SamplingParams(max_tokens=10)
+        predicted_video_tokens = proc.get_num_tokens_per_video(video=frames)
         input_ids, mm_data = proc(inputs, sp)
 
         self.assertIsNotNone(mm_data)
@@ -1463,15 +1459,48 @@ class TestGemma4InputProcessor(unittest.TestCase):
         video_data = mm_data["multimodal_data"]["video"]
         self.assertIn("pixel_values", video_data)
         self.assertEqual(video_data["pixel_values"].dim(), 3)
-        self.assertEqual(video_data["pixel_values"].shape[0], 32)
+        self.assertEqual(video_data["pixel_values"].shape[0], len(frames))
 
         video_token_id = self._video_token_id()
         if video_token_id is not None:
+            actual_video_tokens = sum(1 for t in input_ids if t == video_token_id)
             self.assertGreater(
-                sum(1 for t in input_ids if t == video_token_id),
+                actual_video_tokens,
                 0,
                 "Expected video soft tokens in expanded input_ids",
             )
+            self.assertEqual(
+                predicted_video_tokens,
+                actual_video_tokens,
+                "Expected one timestamp and soft-token block per supplied frame",
+            )
+
+    def test_video_token_prediction_for_non_square_pil_frames(self):
+        """Video token prediction pools non-square PIL patch grids per dimension."""
+        from PIL import Image
+
+        proc = self._make_processor()
+        if not hasattr(proc._processor, "video_processor"):
+            self.skipTest("Processor has no video_processor")
+
+        video_processor = proc._processor.video_processor
+        patch_size = int(video_processor.patch_size)
+        pooling_kernel_size = int(video_processor.pooling_kernel_size)
+        patch_grid_height = 2 * pooling_kernel_size + 1
+        patch_grid_width = 3 * pooling_kernel_size + 1
+        height = patch_grid_height * patch_size
+        width = patch_grid_width * patch_size
+        frames = [Image.new("RGB", (width, height)) for _ in range(2)]
+
+        expected_tokens_per_frame = (patch_grid_height // pooling_kernel_size) * (
+            patch_grid_width // pooling_kernel_size
+        )
+        # Use the real video processor, but disable resizing temporarily: its resize path produces
+        # pooling-aligned dimensions, while the regression requires a non-divisible patch grid.
+        with mock.patch.object(video_processor, "do_resize", False):
+            predicted_video_tokens = proc.get_num_tokens_per_video(video=frames)
+
+        self.assertEqual(predicted_video_tokens, len(frames) * expected_tokens_per_frame)
 
     def _video_token_id(self):
         return getattr(self.config, "video_token_id", None)

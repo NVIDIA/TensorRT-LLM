@@ -33,8 +33,6 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
-from tensorrt_llm._torch.disaggregation.resource import page
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
@@ -280,45 +278,74 @@ def _zero_mamba_states(manager):
         manager.get_ssm_states(layer_idx).zero_()
 
 
-def test_mamba_policy_layer_major_v1_ptrs():
-    pool = page.PhysicalPool(base_address=100, slot_bytes=10, num_slots=8)
-
-    ptrs = peer.MambaPolicy._build_layer_ptrs(
-        pool=pool,
-        layer_offsets={1: 0, 2: 1},
-        overlapping_layers=[1, 2],
-        slot=3,
+def test_mamba_receiver_payload_bytes_matched_tp():
+    """mamba_receiver_payload_bytes returns correct size for matched-TP page tables."""
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+        mamba_receiver_payload_bytes,
+    )
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        KVCachePageTable,
+        LocalLayer,
+        MambaLayerGroup,
+        MapperKind,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
     )
 
-    np.testing.assert_array_equal(ptrs, [130, 210])
+    conv_slot_bytes = 1024
+    ssm_slot_bytes = 2048
+    sorted_lids = [0, 1]
 
+    conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=8)
+    ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=8)
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_slot_bytes,
+        ),
+    ]
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
+    ]
 
-def test_mamba_policy_slot_major_interleaved_role_ptrs():
-    """Layer/role offsets remain inside each coalesced V2 physical slot."""
-    state_bytes = 64
-    physical_slot_bytes = 4 * state_bytes
-    conv_pool = page.PhysicalPool(
-        base_address=1000 + state_bytes,
-        slot_bytes=state_bytes,
-        num_slots=8,
-        slot_stride_bytes=physical_slot_bytes,
-        layer_stride_bytes=2 * state_bytes,
+    mlg = MambaLayerGroup(
+        pool_group_idx=1,
+        local_layers=local_layers,
+        pool_views=pool_views,
+        conv_section_bytes=[512, 256, 256],
+        ssm_bytes_per_head=64,
     )
-
-    ptrs = peer.MambaPolicy._build_layer_ptrs(
-        pool=conv_pool,
-        layer_offsets={1: 0, 2: 1},
-        overlapping_layers=[1, 2],
-        slot=3,
-    )
-
-    np.testing.assert_array_equal(
-        ptrs,
-        [
-            1000 + state_bytes + 3 * physical_slot_bytes,
-            1000 + 3 * state_bytes + 3 * physical_slot_bytes,
+    pt = KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[mlg],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[]),  # idx 0 placeholder
+            PhysicalPoolGroup(pools=[conv_pool, ssm_pool]),
         ],
     )
+
+    got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
+    # Full per-rank slot bytes for 2 layers x (conv + ssm)
+    assert got == 2 * (conv_slot_bytes + ssm_slot_bytes)
 
 
 # ---------------------------------------------------------------------------

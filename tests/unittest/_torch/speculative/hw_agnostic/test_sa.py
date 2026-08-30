@@ -446,7 +446,7 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
     window seeded from the (transferred) conv pool, draft tail columns and
     pending-draft scratch cleared, other slots untouched."""
 
-    L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3  # committed = W - 1 = 3
+    L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3
 
     def _make_manager(self, use_kda_replay=True):
         from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -461,7 +461,7 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
 
         cache = _FakeSpecState()
         torch.manual_seed(0)
-        cache.conv = torch.randn(L, SLOTS, 3 * D, W)
+        cache.conv = torch.randn(L, SLOTS, 3 * D, committed)
         cache.kda_conv_q = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_k = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_v = torch.full((L, SLOTS, D, committed + M), 7.0)
@@ -490,7 +490,7 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
                 (cache.kda_conv_v, 2 * d, 3 * d),
             ):
                 torch.testing.assert_close(
-                    kda[:, slot, :, :committed], conv_before[:, slot, lo:hi, 1:].to(kda.dtype)
+                    kda[:, slot, :, :committed], conv_before[:, slot, lo:hi].to(kda.dtype)
                 )
                 assert (kda[:, slot, :, committed:] == 0).all()
             assert (cache.kda_qkg_cache[:, slot] == 0).all()
