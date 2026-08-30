@@ -626,9 +626,8 @@ def launch_server(
     # port == 0 lets the kernel pick the port; the caller then needs a way
     # to learn it, either by service discovery or by report_addr. Validate
     # before getaddrinfo, which rejects negative ports with its own error.
-    if not (port > 0 or
-            (port == 0 and
-             (disagg_cluster_config is not None or report_addr))):
+    if not (port > 0 or (port == 0 and
+                         (disagg_cluster_config is not None or report_addr))):
         raise ValueError(
             "Port must be a positive integer, or 0 to let the kernel pick "
             "one when disagg cluster config or --report_addr is provided")
