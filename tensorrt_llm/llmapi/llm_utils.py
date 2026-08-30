@@ -38,6 +38,7 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
 from .mpi_session import MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+from . import llmman
 from .utils import download_hf_model, print_traceback_on_error
 
 
@@ -404,6 +405,17 @@ class CachedModelLoader:
 
         Also updates the model_obj.model_dir with the local model dir.
         """
+        if model_obj.is_oci_model:
+            # A CNCF ModelPack artifact is pulled through an llmman daemon.
+            # Done per node, exactly as the HuggingFace path is, so every node
+            # ends up with the model in its own local store rather than
+            # assuming a shared filesystem.
+            model_dirs = self._submit_to_all_workers(
+                CachedModelLoader._node_resolve_oci_model,
+                model=model_obj.model)
+            model_dir = next((d for d in model_dirs if d is not None), None)
+            model_obj.model_dir = model_dir
+            return model_dir
         if model_obj.is_hub_model:
             model_dirs = self._submit_to_all_workers(
                 CachedModelLoader._node_download_hf_model,
@@ -447,6 +459,14 @@ class CachedModelLoader:
         self.model_loader._update_from_hf_quant_config()
 
         return None, self._hf_model_dir
+
+    @print_traceback_on_error
+    @staticmethod
+    def _node_resolve_oci_model(model: str) -> Optional[Path]:
+        if local_mpi_rank() == 0:
+            return Path(llmman.resolve_model(model))
+        else:
+            return None
 
     @print_traceback_on_error
     @staticmethod
