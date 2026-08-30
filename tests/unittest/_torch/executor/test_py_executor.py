@@ -2888,6 +2888,10 @@ class TestPendingTransferResponseFlush:
         PyExecutor._executor_loop(executor)
 
         executor._forward_step.assert_called_once_with(scheduled_batch)
+        executor._handle_kv_transfer_timeouts_synced.assert_called_once_with()
+        executor._flush_iter_stats_synced.assert_called_once_with()
+        executor._kv_connector_terminate_requests.assert_called_once_with()
+        assert executor.iter_counter == 1
         executor._flush_pending_transfer_responses.assert_called_once_with()
 
     def test_overlap_forward_error_preserves_previous_batch_processing(
@@ -2915,6 +2919,13 @@ class TestPendingTransferResponseFlush:
         executor._finalize_adp_dummy_allocation = Mock()
         executor._commit_kv_cache_stats = Mock()
         executor._forward_step = Mock(return_value=None)
+        executor.previous_batch = types.SimpleNamespace(
+            scheduled_requests=types.SimpleNamespace(all_requests=Mock(return_value=[])),
+            sample_state=Mock(),
+        )
+        executor._update_requests = Mock()
+        executor._send_kv_async = Mock()
+        executor._process_previous_batch = Mock()
         executor._kv_connector_terminate_requests = Mock()
         executor._handle_kv_transfer_timeouts_synced = Mock()
         executor._flush_iter_stats_synced = Mock()
@@ -2928,6 +2939,7 @@ class TestPendingTransferResponseFlush:
 
         executor._forward_step.assert_called_once_with(
             scheduled_batch, None, None)
+        executor._process_previous_batch.assert_called_once_with()
         executor._flush_pending_transfer_responses.assert_called_once_with()
 
     def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):

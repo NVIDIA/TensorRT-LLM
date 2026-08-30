@@ -4335,6 +4335,15 @@ class PyExecutor:
                     # not pass that sentinel to the sampler; the next loop
                     # iteration can continue serving remaining requests.
                     if batch_outputs is None:
+                        # Preserve the per-iteration cleanup and synchronized
+                        # drains below. In particular, ADP ranks must all
+                        # enter the response/statistics collectives even when
+                        # this rank's forward was absorbed.
+                        self._handle_kv_transfer_timeouts_synced()
+                        self._flush_pending_transfer_responses()
+                        self._flush_iter_stats_synced()
+                        self._kv_connector_terminate_requests()
+                        self.iter_counter += 1
                         continue
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
