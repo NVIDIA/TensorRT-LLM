@@ -385,15 +385,22 @@ def submitProfileGen(pipeline)
             fetch_verified "$URL" "$DEST" gzip -t
         '''.stripIndent()
         // Stage llvm-bolt into the shared ${ws}/builds/llvm (the per-node instrument
-        // hook via BOLT_LLVM_DIR and the merge job both reuse it). Fetched in
-        // parallel via fetch_verified() -- GitHub's release CDN supports byte
-        // ranges, so the ~15-min single-stream pull becomes a fast parallel one.
+        // hook via BOLT_LLVM_DIR and the merge job both reuse it). The GitHub
+        // download is amortized by a PERSISTENT version-keyed cache on lustre:
+        // llvm-bolt is pinned + immutable, so -- unlike the per-commit build tarball
+        // -- it's safe to cache forever. Pull from GitHub once per version/arch,
+        // then every later run just does a local lustre extract from the cached
+        // .tar.xz (no WAN). The one-time fetch reuses fetch_verified().
         def llvmArch = (TARGET_ARCH == AARCH64_TRIPLE) ? "ARM64" : "X64"
         def llvmVer  = "21.1.5"   // keep in sync with internal/slurm_merge.sh LLVM_BOLT_VERSION
         def llvmTb   = "LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz"
+        // Cache lives OUTSIDE the bolt-ci retention root (purged at depth 4 after 7
+        // days) so the per-run workspace reaper can't delete it.
+        def llvmCacheDir = "${scratch}/users/svc_tensorrt/bolt-cache/llvm"
         def llvmStage = """
             LLVM_URL='https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}'
-            LLVM_DEST='/tmp/${llvmTb}'
+            LLVM_CACHE_DIR='${llvmCacheDir}'
+            LLVM_CACHE_TB='${llvmCacheDir}/${llvmTb}'
             LLVM_DIR='${ws}/builds/llvm'
             PARTS=16
         """.stripIndent() + boltFetchLib + '''
@@ -401,10 +408,19 @@ def submitProfileGen(pipeline)
             if [ -x "$LLVM_DIR/bin/llvm-bolt" ]; then
                 echo '[INFO] llvm-bolt already staged this run'
             else
-                mkdir -p "$LLVM_DIR"
-                fetch_verified "$LLVM_URL" "$LLVM_DEST" _verify_txz
-                tar -xJf "$LLVM_DEST" -C "$LLVM_DIR" --strip-components=1
-                rm -f "$LLVM_DEST"
+                mkdir -p "$LLVM_DIR" "$LLVM_CACHE_DIR"
+                if [ -f "$LLVM_CACHE_TB" ] && tar -tJf "$LLVM_CACHE_TB" >/dev/null 2>&1; then
+                    echo "[INFO] llvm-bolt cache HIT: $LLVM_CACHE_TB"
+                else
+                    echo "[INFO] llvm-bolt cache MISS; one-time parallel fetch from GitHub"
+                    tmp=$(mktemp "$LLVM_CACHE_DIR/.llvm.XXXXXX")
+                    fetch_verified "$LLVM_URL" "$tmp" _verify_txz
+                    # Atomic publish on the same FS: concurrent first-runs may both
+                    # fetch, but rename is atomic so readers never see a partial file.
+                    mv -f "$tmp" "$LLVM_CACHE_TB"
+                fi
+                echo "[INFO] extracting llvm-bolt from cache -> $LLVM_DIR"
+                tar -xJf "$LLVM_CACHE_TB" -C "$LLVM_DIR" --strip-components=1
             fi
         '''.stripIndent()
 
@@ -412,9 +428,9 @@ def submitProfileGen(pipeline)
         // durations. Kept sequential rather than a second parallel{} block: Blue
         // Ocean renders only one parallel per declarative stage, so a parallel
         // bootstrap (a second parallel alongside the collect fan-out) dropped later
-        // stages from the UI. The real win (parallel chunked downloads) lives INSIDE
-        // these stages; only the tarball<->llvm overlap is lost, which is marginal
-        // now that both are parallel-chunked.
+        // stages from the UI. The real transfer wins (parallel chunked downloads +
+        // the llvm cache) live INSIDE these stages; only the tarball<->llvm overlap
+        // is lost -- marginal, especially on a cache HIT (a quick local extract).
         // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the scripts.
         stage("Bootstrap: download tarball") {
             Utils.exec(pipeline, timeout: false, numRetries: 2,
