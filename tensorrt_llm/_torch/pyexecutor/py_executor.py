@@ -82,7 +82,8 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          MultimodalEncoderRequestError, get_draft_token_length,
+                          MultimodalEncoderRequestError,
+                          get_draft_token_length,
                           initialize_multimodal_encoder_request,
                           is_multimodal_encoder_ready)
 from .mamba_cache_manager import (BaseMambaCacheManager,
@@ -4329,6 +4330,13 @@ class PyExecutor:
                             self.dwdp_manager.prefetch_first_layers()
                         batch_outputs = self._forward_step(scheduled_batch)
 
+                    # _forward_step handles request-scoped forward errors and
+                    # returns None after failing the affected requests.  Do
+                    # not pass that sentinel to the sampler; the next loop
+                    # iteration can continue serving remaining requests.
+                    if batch_outputs is None:
+                        continue
+
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
                     guided_decoder_failed_requests = None
@@ -5183,6 +5191,14 @@ class PyExecutor:
                         batch_outputs = self._forward_step(
                             scheduled_batch, previous_tensors_device,
                             num_accepted_tokens_device)
+
+                    # The previous batch still needs to complete below, but
+                    # there is no current sample state to publish when
+                    # forward failed.  Mark this batch as not queueable so
+                    # the overlap lifecycle skips current-batch sampling while
+                    # preserving previous-batch processing.
+                    if batch_outputs is None:
+                        can_queue = False
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 

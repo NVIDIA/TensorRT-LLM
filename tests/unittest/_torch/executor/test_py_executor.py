@@ -2855,6 +2855,81 @@ class TestPendingTransferResponseFlush:
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
+    def test_forward_error_skips_sampling_and_continues(self, monkeypatch):
+        """A failed forward must not dereference its None sentinel."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[],
+            paused_requests=[],
+            generation_requests=[],
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)])
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        executor._terminate_requests = Mock()
+        executor._pause_requests = Mock()
+        executor._can_queue = Mock(return_value=(True, True))
+        executor._handle_dynamic_draft_len = Mock()
+        executor.resource_manager = Mock()
+        executor.kv_connector_manager = None
+        executor.kv_cache_transceiver = None
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor._commit_kv_cache_stats = Mock()
+        executor._forward_step = Mock(return_value=None)
+        executor._kv_connector_terminate_requests = Mock()
+        executor._handle_kv_transfer_timeouts_synced = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._pace_idle_disagg_loop = Mock()
+        executor._enqueue_responses = Mock()
+        executor.perf_manager = MagicMock()
+        executor.perf_manager.record_perf_events.return_value.__enter__.return_value = Mock()
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        executor._forward_step.assert_called_once_with(scheduled_batch)
+        executor._flush_pending_transfer_responses.assert_called_once_with()
+
+    def test_overlap_forward_error_preserves_previous_batch_processing(
+            self, monkeypatch):
+        """Overlap mode must skip only the failed current batch."""
+        executor = self._make_executor_loop_stub()
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[],
+            paused_requests=[],
+            generation_requests=[],
+            context_requests=[],
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)])
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        executor._terminate_requests = Mock()
+        executor._pause_requests = Mock()
+        executor._can_queue = Mock(return_value=(True, True))
+        executor._handle_dynamic_draft_len = Mock()
+        executor.resource_manager = Mock()
+        executor.kv_connector_manager = None
+        executor.kv_cache_transceiver = None
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor._commit_kv_cache_stats = Mock()
+        executor._forward_step = Mock(return_value=None)
+        executor._kv_connector_terminate_requests = Mock()
+        executor._handle_kv_transfer_timeouts_synced = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._pace_idle_disagg_loop = Mock()
+        executor._enqueue_responses = Mock()
+        executor.perf_manager = MagicMock()
+        executor.perf_manager.record_perf_events.return_value.__enter__.return_value = Mock()
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        executor._forward_step.assert_called_once_with(
+            scheduled_batch, None, None)
+        executor._flush_pending_transfer_responses.assert_called_once_with()
+
     def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
         """The overlap loop must not drop a buffered response on clean exit."""
         executor = self._make_executor_loop_stub()
