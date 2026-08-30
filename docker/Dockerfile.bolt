@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Minimal overlay: extends an ALREADY-BUILT TensorRT-LLM image (any stage:
+# devel / release / ngc-*) and bakes in the merged LLVM BOLT profile bundle so
+# developers -- internal AND external -- can reproduce a BOLT'd build from source
+# offline, without needing internal Artifactory access. This is a single thin
+# COPY layer; there is NO recompile and NO change to the underlying image.
+#
+# The bundle is the output of the BoltProfileGen job (per-library
+# `<lib>.yaml` / `<lib>.fdata` + `manifest.json`), fetched into the build context
+# by scripts/bolt/internal/artifactory.sh (see jenkins/BuildDockerImage.groovy).
+# Apply it to a from-source build with scripts/bolt/apply_bolt.py --profiles
+# $TRTLLM_BOLT_PROFILES ... (llvm-bolt is NOT shipped in the image -- install it
+# the same way CI does; see docker/README.md "Reproduce a BOLT'd build").
+#
+# NOTE: the bundle is architecture-specific (e.g. aarch64-linux-gnu). By design it
+# is baked into every image variant regardless of arch; on an arch with no
+# matching profiles the files are simply inert (apply is a no-op for absent libs).
+
+ARG BOLT_BASE_IMAGE
+FROM ${BOLT_BASE_IMAGE}
+
+# Directory, RELATIVE TO THE BUILD CONTEXT, holding the extracted merged bundle.
+ARG BOLT_BUNDLE_DIR=bolt_bundle
+# Commit/ref the promoted bundle was generated from (provenance: it is the
+# "latest promoted" bundle, not necessarily this image's exact commit).
+ARG BOLT_PROFILES_REF=unknown
+
+COPY ${BOLT_BUNDLE_DIR}/ /opt/tensorrt_llm/bolt/profiles/
+
+ENV TRTLLM_BOLT_PROFILES=/opt/tensorrt_llm/bolt/profiles
+LABEL com.nvidia.trtllm.bolt-profiles-ref="${BOLT_PROFILES_REF}"

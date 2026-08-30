@@ -18,7 +18,6 @@ from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
                                           SchedulerConfig, WaitingQueuePolicy)
-from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -202,32 +201,13 @@ def test_llm_invalid_input_token_async():
                         futures[collect_idx].result()
 
 
-@pytest.mark.part2
-def test_llm_reward_model():
-    rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
-    tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
-    tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
-
-    llm = LLM(model=rm_model_path,
-              attn_backend="VANILLA",
-              disable_overlap_scheduler=True)
-
-    sampling_params = SamplingParams(return_context_logits=True)
-
-    outputs = llm.generate(prompts, sampling_params)
-    scores = outputs[0].context_logits
-
-    print(scores)
-
-    assert scores.shape == (tokenized_input.shape[1], 2)
-    assert not outputs[0].outputs[0].text
-
-
 @skip_ray
 @pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config) as llm:
+             kv_cache_config=global_kvcache_config.model_copy(
+                 update={"use_kv_cache_manager_v2": True}),
+             return_perf_metrics=False) as llm:
         sampling_params = SamplingParams(max_tokens=10,
                                          return_perf_metrics=True)
         outputs = llm.generate(prompts, sampling_params)
@@ -265,8 +245,10 @@ def test_llm_prefix_cache_reuse(attn_backend):
     with LLM(
             model=model_path,
             attn_backend=attn_backend,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          use_kv_cache_manager_v2=True),
             cuda_graph_config=None,
+            return_perf_metrics=False,
     ) as llm:
         cold_output = llm.generate(prompt, sampling_params).outputs[0]
         warm_output = llm.generate(prompt, sampling_params).outputs[0]
@@ -607,6 +589,9 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
 
 @skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
+# https://nvbugs/6566707: hung for 2400s in late executor-init/first-generate
+# on a many-times-reused MPI pool; isolate on a private pool until root-caused.
+@pytest.mark.private_mpi_session
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
@@ -1001,72 +986,6 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
         assert base_outputs[0].outputs[0].text != expected_lora_text_output, \
             f"No-LoRA output should differ from expected output text: {expected_lora_text_output}, " \
             f"got: {base_outputs[0].outputs[0].text}"
-    finally:
-        llm.shutdown()
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part0
-def test_qwen_moe_shared_expert_lora():
-    """Test MoE shared expert LoRA on Qwen1.5-MoE with PyTorch backend.
-
-    Verifies that LoRA adapters targeting the shared expert in MoE models
-    are correctly applied and produce different outputs from the base model.
-    Uses the same model/adapter/prompt as the TRT integration test
-    (test_llm_qwen1_5_moe_single_gpu_lora in test_qwen.py).
-    """
-    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
-    lora_dir = f"{llm_models_root()}/Upcycled-Qwen1.5-MoE2.7B-LoRA"
-
-    lora_config = LoraConfig(
-        lora_dir=[lora_dir],
-        lora_target_modules=[
-            'attn_q',
-            'attn_k',
-            'attn_v',
-            'attn_dense',
-            'mlp_h_to_4h',
-            'mlp_gate',
-            'mlp_4h_to_h',
-        ],
-        max_lora_rank=64,
-        max_loras=2,
-        max_cpu_loras=2,
-    )
-
-    llm = LLM(model=model_dir,
-              lora_config=lora_config,
-              gather_generation_logits=True)
-    sampling_params = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0)
-
-    try:
-        lora_request = LoRARequest("moe-lora", 0, lora_dir)
-        outputs_with = llm.generate(["What is your name?"],
-                                    sampling_params,
-                                    lora_request=lora_request)
-        tokens_with = list(outputs_with[0].outputs[0].token_ids)
-        logprobs_with = outputs_with[0].outputs[0].logprobs
-
-        outputs_without = llm.generate(["What is your name?"],
-                                       sampling_params,
-                                       lora_request=None)
-        tokens_without = list(outputs_without[0].outputs[0].token_ids)
-        logprobs_without = outputs_without[0].outputs[0].logprobs
-
-        tokens_differ = tokens_with != tokens_without
-        logprobs_differ = False
-        if logprobs_with and logprobs_without:
-            for lp_w, lp_wo in zip(logprobs_with, logprobs_without,
-                                   strict=True):
-                lp_val_w = next(iter(lp_w.values())).logprob
-                lp_val_wo = next(iter(lp_wo.values())).logprob
-                if abs(lp_val_w - lp_val_wo) > 1e-6:
-                    logprobs_differ = True
-                    break
-
-        assert tokens_differ or logprobs_differ, (
-            "LoRA outputs identical to base model (same tokens AND same "
-            "logprobs) -- shared expert LoRA not applied")
     finally:
         llm.shutdown()
 

@@ -8,8 +8,10 @@
 # GB300); a DEP8 ctx would need ~273 GiB/rank for weights alone
 # (extrapolated from the 1.5 TB checkpoint), which does not leave
 # activation headroom on GB300 (288 GiB) and cannot fit GB200 (186 GiB).
-# Ctx/gen parallelism must match: heterogeneous ctx/gen TP is rejected
-# for K3's replicated KDA recurrent state.
+# Keep ctx/gen parallelism matched: heterogeneous ctx/gen TP passes
+# peer validation (the KDA recurrent state is head-sharded with
+# attention-DP off) but only matched DEP16=DEP16 is validated
+# end-to-end.
 #
 # Hard K3 constraints baked in: no chunked prefill, no KV block reuse
 # (KDA state), tokens_per_block=64 (MLA latent layout), and
