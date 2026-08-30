@@ -626,10 +626,12 @@ def launch_server(
     # port == 0 lets the kernel pick the port; the caller then needs a way
     # to learn it, either by service discovery or by report_addr. Validate
     # before getaddrinfo, which rejects negative ports with its own error.
-    if not (port > 0 or disagg_cluster_config is not None or report_addr):
+    if not (port > 0 or
+            (port == 0 and
+             (disagg_cluster_config is not None or report_addr))):
         raise ValueError(
-            "Port must be specified (--port > 0) unless disagg cluster "
-            "config or --report_addr is provided")
+            "Port must be a positive integer, or 0 to let the kernel pick "
+            "one when disagg cluster config or --report_addr is provided")
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
@@ -867,14 +869,6 @@ def launch_visual_gen_server(
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
-    # port == 0 lets the kernel pick the port; the caller then needs a way
-    # to learn it, either by service discovery or by report_addr. Validate
-    # before getaddrinfo, which rejects negative ports with its own error.
-    if not (port > 0 or disagg_cluster_config is not None or report_addr):
-        raise ValueError(
-            "Port must be specified (--port > 0) unless disagg cluster "
-            "config or --report_addr is provided")
-
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
