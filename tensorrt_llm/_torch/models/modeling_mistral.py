@@ -379,8 +379,7 @@ class MistralPixtralEncoderContract:
         """Whether this checkpoint carries a Pixtral vision encoder.
 
         ``MistralConfigLoader`` synthesizes ``vision_config`` only for vision
-        checkpoints, so its absence means the encoder geometry below is
-        meaningless for this checkpoint.
+        checkpoints, so its absence makes the geometry below meaningless.
         """
         return getattr(self.config, "vision_config", None) is not None
 
@@ -696,8 +695,7 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
     """Input processor for Mistral VLM checkpoints in mistral-native format.
 
     Unlike the HF frontend, this one serves *every* mistral-native checkpoint
-    (text-only, MoE, mamba, audio and vision), which is why the inherited
-    encoder contract self-gates on the presence of a vision encoder.
+    (text-only, MoE, mamba, audio and vision).
     """
 
     def __init__(

@@ -36,12 +36,12 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
-def make_pixtral_vision_config():
+def make_pixtral_vision_config(hidden_size=1024):
     # Values taken from:
     # https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/blob/main/config.json
     return model_config_lib.ModelConfig(
         pretrained_config=transformers.PixtralVisionConfig(
-            hidden_size=1024,
+            hidden_size=hidden_size,
             num_attention_heads=16,
             dtype=torch.bfloat16,
             hidden_act="silu",
@@ -77,10 +77,16 @@ def init_hf_model(cls, config, dtype, device):
 
 @torch.no_grad()
 @pytest.mark.usefixtures("set_seed")
-def test_pixtral_vision_model_vs_hf():
+# ``hidden_size=1664`` over 16 heads is Mistral-Large-3-675B's vision encoder, whose
+# head_dim of 104 is >64 and not a multiple of 16. trtllm-gen has no epilogue tile for
+# that shape, so ``FmhaDispatcher`` must route it to fmha v2; when it did not, the
+# KernelTraits assertion aborted every rank (https://nvbugs/6665906). 1024/16 -> 104's
+# power-of-two counterpart keeps the original coverage.
+@pytest.mark.parametrize("hidden_size", [1024, 1664], ids=["head_dim_64", "head_dim_104"])
+def test_pixtral_vision_model_vs_hf(hidden_size):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    pixtral_vision_config = make_pixtral_vision_config()
+    pixtral_vision_config = make_pixtral_vision_config(hidden_size=hidden_size)
     pretrained_config = pixtral_vision_config.pretrained_config
 
     pixtral_model = (
