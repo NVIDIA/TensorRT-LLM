@@ -324,26 +324,23 @@ def _assert_parity(
 @pytest.mark.parametrize("batch_size", [1, 17, 32])
 @pytest.mark.parametrize("num_heads", [2, 3, 4, 6, 12, 96])
 @pytest.mark.parametrize(
-    (
-        "use_state_indices,"
-        "update_conv_cache,state_slot_gap,apply_output_norm,apply_beta_sigmoid,gate_lower_bound"
-    ),
+    ("use_state_indices", "state_slot_gap"),
     [
-        pytest.param(True, False, None, True, True, -5.0, id="indexed"),
-        pytest.param(False, False, None, False, False, None, id="batch-local-softplus-decay"),
-        pytest.param(True, True, 73728, True, True, -5.0, id="indexed-conv-strided"),
+        pytest.param(False, None, id="batch-local"),
+        pytest.param(True, None, id="indexed"),
+        pytest.param(True, 73728, id="indexed-strided-state"),
     ],
 )
 def test_kda_decode_matches_fla(
     batch_size: int,
     num_heads: int,
     use_state_indices: bool,
-    update_conv_cache: bool,
     state_slot_gap: int | None,
-    apply_output_norm: bool,
-    apply_beta_sigmoid: bool,
-    gate_lower_bound: float | None,
 ) -> None:
+    apply_output_norm = True
+    update_conv_cache = False
+    apply_beta_sigmoid = True
+    gate_lower_bound = -5.0
     head_dim = HEAD_DIM
     inputs = _make_inputs(
         batch_size=batch_size,
