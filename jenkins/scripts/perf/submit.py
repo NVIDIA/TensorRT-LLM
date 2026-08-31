@@ -26,8 +26,11 @@ Three test shapes are supported (all flow through the same parsing logic):
         runtime_mode = "aggregated", benchmark_mode = "ctx_only"
         (reads disagg yaml, but launches via the aggregated single-pytest path
          using the ctx worker's parallel sizes)
-  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}-{config_base}
-        runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|e2e_time_breakdown|gen_only}-{config_base}
+        runtime_mode = "disaggregated", benchmark_mode in
+        {"e2e", "e2e_time_breakdown", "gen_only"}
+        (e2e_time_breakdown launches exactly like e2e -- it differs only in what
+         the harness asks the servers and the client to record)
 
 Test name → yaml folder mapping mirrors test_perf_sanity.py:parse_test_string.
 """
@@ -336,13 +339,14 @@ def parse_test_case_name(llm_src, selected_line):
     if "disagg" in prefix:
         if len(parts) < 3:
             raise ValueError(
-                f"Invalid disagg test format. Expected disagg[_upload]-{{e2e|gen_only}}-"
-                f"{{config_base}}, got: {bracket_content}"
+                f"Invalid disagg test format. Expected disagg[_upload]-"
+                f"{{e2e|e2e_time_breakdown|gen_only}}-{{config_base}}, got: {bracket_content}"
             )
         benchmark_mode = parts[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
+        if benchmark_mode not in ("e2e", "e2e_time_breakdown", "gen_only"):
             raise ValueError(
-                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e', "
+                f"'e2e_time_breakdown' or 'gen_only'."
             )
         runtime_mode = "disaggregated"
         server_name = None

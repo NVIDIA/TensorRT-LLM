@@ -1107,12 +1107,30 @@ def main(args: argparse.Namespace):
 
         analyzer = RequestTimeBreakdown()
         timing_data = analyzer.parse_json_file(perf_filename)
-        if timing_data:
-            diagram_filename = f"{output_stem}-time_diagram.html"
-            analyzer.create_timing_diagram(timing_data, diagram_filename)
-            print(f"Time diagram saved to: {diagram_filename}")
-        else:
-            print("No time data found; skipping time breakdown diagram.")
+        if not timing_data:
+            print("No time data found; skipping time breakdown report.")
+            return
+
+        # These "Time Breakdown ..." lines are the machine-readable output of the
+        # breakdown -- the perf-sanity harness scrapes them out of this process's
+        # stdout the same way it scrapes "Mean TTFT (ms)" -- whereas the JSON and
+        # the HTML diagram are human aids that need a writable path (and, for the
+        # diagram, plotly). Print first so that neither one failing can cost us
+        # the measurement: output_stem is relative to the current directory
+        # unless --result-dir was given.
+        span_stats = analyzer.compute_statistics(timing_data)
+        for span in sorted(span_stats):
+            for stat in ("mean", "median", "p75", "p99"):
+                print(f"Time Breakdown {span} {stat} (ms): "
+                      f"{span_stats[span][stat]:.4f}")
+
+        stats_filename = f"{output_stem}-time_breakdown_stats.json"
+        analyzer.export_statistics_json(timing_data, stats_filename)
+        print(f"Span statistics saved to: {stats_filename}")
+
+        diagram_filename = f"{output_stem}-time_diagram.html"
+        analyzer.create_timing_diagram(timing_data, diagram_filename)
+        print(f"Time diagram saved to: {diagram_filename}")
 
 
 if __name__ == "__main__":

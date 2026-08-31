@@ -1386,3 +1386,55 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     assert abs(bw - 153600 * 1024 * 1024 / 1e9) < 1e-9
     # no perf files -> None
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
+
+
+@pytest.mark.parametrize("mode", ["e2e", "e2e_time_breakdown", "gen_only"])
+def test_parse_args_accepts_every_forwarded_benchmark_mode(tmp_path, mode):
+    """--benchmark-mode must admit every mode submit.py can forward.
+
+    jenkins/scripts/perf/submit.py builds pytestCommandCTXPrecheck /
+    pytestCommandGENPrecheck by pasting the test id's mode token in verbatim, so
+    a mode missing from these choices makes the precheck srun die in argparse --
+    before the workload starts, and for a reason that reads as a launch failure
+    rather than an unsupported mode. resolve_plan only distinguishes gen_only;
+    the others are accepted precisely because the KV transfer they precheck is
+    the same.
+    """
+    args = rp.parse_args(
+        [
+            "--role",
+            "ctx",
+            "--server-idx",
+            "0",
+            "--config",
+            str(tmp_path / "cfg.yaml"),
+            "--work-dir",
+            str(tmp_path),
+            "--benchmark-mode",
+            mode,
+        ]
+    )
+    assert args.benchmark_mode == mode
+
+
+def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path):
+    """The widened choices list must stay a gate, not become a free-text field.
+
+    A typo'd mode has to fail here, where the message names the argument, rather
+    than silently resolving to the e2e plan.
+    """
+    with pytest.raises(SystemExit):
+        rp.parse_args(
+            [
+                "--role",
+                "ctx",
+                "--server-idx",
+                "0",
+                "--config",
+                str(tmp_path / "cfg.yaml"),
+                "--work-dir",
+                str(tmp_path),
+                "--benchmark-mode",
+                "e2e_time_breakdwon",
+            ]
+        )

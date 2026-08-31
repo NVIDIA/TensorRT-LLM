@@ -1757,7 +1757,15 @@ def parse_args(argv=None):
     ap.add_argument("--server-idx", type=int, required=True)
     ap.add_argument("--config", required=True, help="disagg perf-sanity yaml path")
     ap.add_argument("--work-dir", required=True, help="shared dir for rendezvous/status")
-    ap.add_argument("--benchmark-mode", default="e2e", choices=["e2e", "gen_only"])
+    # e2e_time_breakdown is an e2e run that additionally uploads per-request
+    # lifecycle spans; the KV transfer it prechecks is identical. It has to be
+    # listed here even though resolve_plan only distinguishes gen_only, because
+    # submit.py forwards the test's mode verbatim and argparse would reject it.
+    ap.add_argument(
+        "--benchmark-mode",
+        default="e2e",
+        choices=["e2e", "e2e_time_breakdown", "gen_only"],
+    )
     ap.add_argument("--llm-src", default="", help="repo root (model path dict lookup)")
     ap.add_argument("--dry-run", action="store_true", help="print the resolved plan and exit")
     return ap.parse_args(argv)

@@ -2163,6 +2163,46 @@ class RequestTimeBreakdown:
                 )
                 print(f"  Median: {np.median(valid_times):.3f}")
 
+    def compute_statistics(
+            self, timing_data: List[Dict]) -> Dict[str, Dict[str, float]]:
+        """Aggregate every span across all requests.
+
+        Returns ``{span_name: {mean, median, p75, p99, count}}`` with durations in
+        **milliseconds** (the unit every other serving benchmark metric uses).
+
+        A span that is zero for every request is omitted rather than reported as
+        ``0.0``: :meth:`TimingMetric.calculate_duration` returns 0 when an endpoint
+        timestamp is missing, so 0 means "not measured", not "took no time".
+        Reporting it as 0.0 would silently fabricate a data point.
+        """
+        stats: Dict[str, Dict[str, float]] = {}
+        for metric in self.config.metrics:
+            key = f'{metric.name}_time'
+            valid = [
+                data[key] * 1000 for data in timing_data if data.get(key, 0) > 0
+            ]
+            if not valid:
+                continue
+            stats[metric.name] = {
+                'mean': float(np.mean(valid)),
+                'median': float(np.median(valid)),
+                'p75': float(np.percentile(valid, 75)),
+                'p99': float(np.percentile(valid, 99)),
+                'count': len(valid),
+            }
+        return stats
+
+    def export_statistics_json(self, timing_data: List[Dict],
+                               output_path: str) -> Dict[str, Any]:
+        """Write :meth:`compute_statistics` output to ``output_path`` as JSON."""
+        payload = {
+            'total_requests': len(timing_data),
+            'spans': self.compute_statistics(timing_data),
+        }
+        with open(output_path, 'w', encoding='utf-8') as out_file:
+            json.dump(payload, out_file, indent=2, sort_keys=True)
+        return payload
+
 
 def main():
     """Main CLI entry point."""
@@ -2176,6 +2216,7 @@ Examples:
   python time_breakdown.py perf_metrics.jsonl --stats-only
   python time_breakdown.py perf_metrics.jsonl --max-requests 50 --sort-by e2e
   python time_breakdown.py perf_metrics.jsonl --max-requests 100 --sort-by arrival
+  python time_breakdown.py perf_metrics.jsonl --stats-only --export-stats-json stats.json
         """)
 
     parser.add_argument(
@@ -2193,6 +2234,13 @@ Examples:
     parser.add_argument('--show-stats',
                         action='store_true',
                         help='Show statistics with diagram')
+    parser.add_argument(
+        '--export-stats-json',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='Write per-span mean/median/P75/P99 (in milliseconds) to PATH as '
+        'JSON. Combine with --stats-only to skip rendering the HTML diagram')
     parser.add_argument(
         '--max-requests',
         type=int,
@@ -2226,6 +2274,10 @@ Examples:
 
     if args.stats_only or args.show_stats:
         analyzer.show_statistics(timing_data)
+
+    if args.export_stats_json:
+        analyzer.export_statistics_json(timing_data, args.export_stats_json)
+        print(f"Span statistics saved to: {args.export_stats_json}")
 
     if not args.stats_only:
         analyzer.create_timing_diagram(timing_data,

@@ -244,6 +244,71 @@ GEN_ONLY_REGRESSION_METRICS = (
     "d_median_gen_worker_per_iter_device_step_time",
 )
 
+# Disagg benchmark mode that additionally captures the per-request lifecycle
+# breakdown. Runs exactly the same workload as "e2e"; the only differences are
+# the three worker_config keys injected in _parse_disagg_config_file and the
+# --save-request-time-breakdown flag on the client. It is a distinct mode (and
+# therefore a distinct s_test_case_name / baseline series) rather than a flag on
+# "e2e" because num_postprocess_workers is forced to 0 to keep the per-step
+# detail, which measurably changes throughput -- the two cases' aggregate
+# numbers are deliberately not comparable.
+E2E_TIME_BREAKDOWN_MODE = "e2e_time_breakdown"
+
+# Config stems that get an e2e_time_breakdown test id. Deliberately an allowlist
+# rather than "every disagg yaml": get_disagg_test_cases is a cartesian product,
+# so an unconditional entry would add one parametrised id per config (~90) that
+# nothing ever runs, and every one of them would still have to be waived,
+# durations-seeded, and mapped to a Jenkins stage.
+E2E_TIME_BREAKDOWN_CONFIGS = (
+    "gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL",
+)
+
+# The 12 contiguous lifecycle spans emitted by
+# tensorrt_llm/serve/scripts/time_breakdown, in lifecycle order, x 4 statistics.
+# Uploaded as d_tb_<span>_<stat>; see TIME_BREAKDOWN_METRIC_LOG_QUERY.
+#
+# Listed here (rather than imported from TimingMetricsConfig) only so that
+# collecting this module never has to import tensorrt_llm, which pulls in
+# plotly and the compiled extension. tests/unittest/others/test_perf_sanity_time_breakdown.py
+# pins this tuple against TimingMetricsConfig so the two cannot drift.
+TIME_BREAKDOWN_SPANS = (
+    "disagg_preprocessing",
+    "ctx_preprocessing",
+    "ctx_queue",
+    "ctx_processing",
+    "ctx_postprocessing",
+    "disagg_relay",
+    "gen_preprocessing",
+    "gen_queue_wait",
+    "gen_kv_transfer",
+    "gen_post_transfer",
+    "gen_postprocessing",
+    "disagg_postprocessing",
+)
+TIME_BREAKDOWN_STATS = ("mean", "median", "p75", "p99")
+
+# One regex with capture groups instead of 48 literal patterns, for two reasons.
+# It cannot participate in the leading-word shadowing hazard described above
+# parse_metrics_from_output -- it is matched outside that first-match-wins loop.
+# And a span this file does not know about still reaches OpenSearch (just
+# without a baseline line), so adding a span to the tool is not silently lossy.
+TIME_BREAKDOWN_METRIC_LOG_QUERY = re.compile(
+    r"Time Breakdown ([A-Za-z_][A-Za-z0-9_]*) "
+    rf"({'|'.join(TIME_BREAKDOWN_STATS)}) \(ms\):\s+(-?[\d\.]+)"
+)
+
+
+def time_breakdown_metric_name(span: str, stat: str) -> str:
+    """Metric key for one span/statistic pair (uploaded as ``d_<name>``)."""
+    return f"tb_{span}_{stat}"
+
+
+TIME_BREAKDOWN_METRICS = tuple(
+    time_breakdown_metric_name(span, stat)
+    for span in TIME_BREAKDOWN_SPANS
+    for stat in TIME_BREAKDOWN_STATS
+)
+
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
 #   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
 #   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...,
@@ -555,6 +620,10 @@ def add_perf_metric_value(
       disagg gen_only mode (the only mode that emits them). Of these the mean
       and the median are regression-gated (GEN_ONLY_REGRESSION_METRICS); the
       rest are uploaded for diagnosis.
+    - Adds the `d_tb_<span>_<stat>` family only for e2e_time_breakdown. Every
+      parsed span is forwarded, including one this module does not list in
+      TIME_BREAKDOWN_SPANS: an unlisted span loses its baseline comparison but
+      still reaches OpenSearch, which is strictly better than dropping it.
 
     A missing or non-numeric gen_only statistic is omitted rather than
     forwarded: typeCheckForOpenSearchDB rejects both None and int for a `d_`
@@ -580,6 +649,11 @@ def add_perf_metric_value(
         for metric_name in GEN_ONLY_DEVICE_STEP_TIME_METRICS:
             value = metrics.get(metric_name)
             if value is None:
+                continue
+            new_data[f"d_{metric_name}"] = float(value)
+    if benchmark_mode == E2E_TIME_BREAKDOWN_MODE:
+        for metric_name, value in metrics.items():
+            if not metric_name.startswith("tb_") or value is None:
                 continue
             new_data[f"d_{metric_name}"] = float(value)
 
@@ -617,6 +691,14 @@ MINIMIZE_METRICS = [
     "d_std_gen_worker_per_iter_device_step_time",
     "d_p75_gen_worker_per_iter_device_step_time",
     "d_p99_gen_worker_per_iter_device_step_time",
+    # e2e_time_breakdown-only: per-request lifecycle spans. Every one is a
+    # duration, so lower is better for all 48. Registered here -- and NOT in
+    # REGRESSION_METRICS -- so each gets a baseline and a diff line in
+    # s_regression_info (that is what makes a TTFT regression attributable to a
+    # phase) without any of them being able to fail a build. check_regression
+    # skips a metric absent from new_data, so these names stay inert for every
+    # other mode and cannot perturb an existing case.
+    *(f"d_{name}" for name in TIME_BREAKDOWN_METRICS),
 ]
 
 # Default key metrics that determine regression (throughput metrics only).
@@ -1205,6 +1287,10 @@ class ClientConfig:
         # agentx_client.py. Reported only -- see the s_benchmark_client note in
         # to_db_data for why it is not a match key.
         self.benchmark_client = client_config_data.get("benchmark_client", "")
+        # Directory the servers write per-request perf-metrics JSONLs to. When
+        # set, the client reads the combined disagg record back after the run and
+        # prints the per-span statistics; see PerfSanityTestConfig.time_breakdown_dir.
+        self.save_request_time_breakdown = client_config_data.get("save_request_time_breakdown", "")
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -1346,6 +1432,13 @@ class ClientConfig:
             benchmark_cmd.append("--non-streaming")
         if self.trust_remote_code:
             benchmark_cmd.append("--trust-remote-code")
+        if self.save_request_time_breakdown:
+            # Makes the client read the servers' per-request JSONLs after the
+            # measured window and print one "Time Breakdown <span> <stat> (ms):"
+            # line per aggregate, which parse_metrics_from_output scrapes back
+            # out of this command's stdout.
+            benchmark_cmd.append("--save-request-time-breakdown")
+            benchmark_cmd.append(self.save_request_time_breakdown)
         return benchmark_cmd
 
     def to_env(self) -> Dict[str, str]:
@@ -1574,6 +1667,10 @@ class DisaggTestCmds(NamedTuple):
     ctx_router_config: Optional[dict] = None
     gen_router_config: Optional[dict] = None
     server_config_extra: Optional[dict] = None
+    # Non-empty only for e2e_time_breakdown: goes into the generated disagg
+    # server config so the disagg server writes the combined per-request record.
+    # That combined file is the only one the benchmark client reads.
+    perf_metrics_output_dir: str = ""
 
     def _hostnames_dir(self, server_idx: int) -> str:
         """Directory the disagg tasks exchange bound addresses through.
@@ -1712,6 +1809,21 @@ class DisaggTestCmds(NamedTuple):
                 )
             server_config.update(copy.deepcopy(self.server_config_extra))
 
+        if self.perf_metrics_output_dir:
+            # Also flips the disagg server's _collect_perf_metrics on, which is
+            # what makes it send X-TRTLLM-Return-Metrics: 1 to the workers. Both
+            # halves are required: without this the workers are never asked for
+            # their timings, and without the workers' return_perf_metrics they
+            # would not answer.
+            #
+            # Deliberately after the server_config_extra merge, which otherwise
+            # wins over everything above it: the harness owns this path because
+            # the client resolves the same directory independently
+            # (time_breakdown_dir) to find the combined record. A yaml that
+            # redirected it would not fail -- it would upload no breakdown at
+            # all, which looks exactly like a case that has none. Non-empty only
+            # for e2e_time_breakdown, so no other lane is affected.
+            server_config["perf_metrics_output_dir"] = self.perf_metrics_output_dir
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
@@ -2159,6 +2271,7 @@ def parse_test_string(test_case_name: str):
 
     Test name formats:
     - Disagg e2e: disagg_upload-e2e-{config_base}
+    - Disagg e2e + lifecycle breakdown: disagg_upload-e2e_time_breakdown-{config_base}
     - Disagg gen_only: disagg_upload-gen_only-{config_base}
     - ctx_only: aggr_upload-ctx_only-{config_base} (runs aggr mode but reads disagg config)
     - Regular aggr: aggr_upload-{config}-{server_name}
@@ -2166,7 +2279,8 @@ def parse_test_string(test_case_name: str):
     Returns:
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+            - benchmark_mode: "e2e", "e2e_time_breakdown", "gen_only",
+              "ctx_only", or None (for normal aggr)
     """
     labels = test_case_name.split("-")
 
@@ -2179,8 +2293,8 @@ def parse_test_string(test_case_name: str):
     if is_disagg_prefix:
         # Disagg format: disagg_upload-{e2e|gen_only}-{config_base}
         assert len(labels) > 2, "Disagg test must have benchmark_mode and config!"
-        benchmark_mode = labels[1]  # e2e or gen_only
-        assert benchmark_mode in ("e2e", "gen_only"), (
+        benchmark_mode = labels[1]  # e2e, e2e_time_breakdown, or gen_only
+        assert benchmark_mode in ("e2e", E2E_TIME_BREAKDOWN_MODE, "gen_only"), (
             f"Invalid benchmark_mode for disagg: {benchmark_mode}"
         )
         runtime_mode = "disaggregated"
@@ -2212,12 +2326,13 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
     """Get config directory based on benchmark_mode.
 
     Args:
-        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+        benchmark_mode: "e2e", "e2e_time_breakdown", "gen_only", "ctx_only", or
+            None (for normal aggr)
 
     Returns:
         str: Absolute config directory path
     """
-    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+    if benchmark_mode in ("e2e", E2E_TIME_BREAKDOWN_MODE, "gen_only", "ctx_only"):
         config_dir = DISAGG_CONFIG_FOLDER
     else:
         config_dir = AGG_CONFIG_FOLDER
@@ -2289,9 +2404,10 @@ class PerfSanityTestConfig:
         config_file_path = os.path.join(self.config_dir, self.config_file)
 
         # benchmark_mode determines which parser to use:
-        # - e2e, gen_only, ctx_only: use _parse_disagg_config_file (reads disagg config)
+        # - e2e, e2e_time_breakdown, gen_only, ctx_only: use
+        #   _parse_disagg_config_file (reads disagg config)
         # - None (normal aggr): use _parse_aggr_config_file
-        if self.benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+        if self.benchmark_mode in ("e2e", E2E_TIME_BREAKDOWN_MODE, "gen_only", "ctx_only"):
             self._parse_disagg_config_file(config_file_path, self.config_file)
         else:
             # Normal aggregated mode
@@ -2450,7 +2566,8 @@ class PerfSanityTestConfig:
             ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
             self.server_configs = [ctx_server_config]
         else:
-            # For e2e and gen_only modes - create ctx and gen server configs
+            # For e2e, e2e_time_breakdown and gen_only modes - create ctx and
+            # gen server configs
             ctx_server_config_data = {
                 "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
@@ -2459,6 +2576,7 @@ class PerfSanityTestConfig:
                 "gpus_per_node": gpus_per_node,
                 "disagg_run_type": "ctx",
                 **worker_config.get("ctx", {}),
+                **self._time_breakdown_worker_overrides(),
             }
 
             gen_server_config_data = {
@@ -2469,6 +2587,7 @@ class PerfSanityTestConfig:
                 "gpus_per_node": gpus_per_node,
                 "disagg_run_type": "gen",
                 **worker_config.get("gen", {}),
+                **self._time_breakdown_worker_overrides(),
             }
 
             ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
@@ -2509,6 +2628,17 @@ class PerfSanityTestConfig:
                 f"expected '' or {AGENTX_BENCHMARK_CLIENT!r}."
             )
 
+        # The external bench_serving client has no --save-request-time-breakdown
+        # equivalent, so it cannot produce the lifecycle spans. Fail here with the
+        # reason rather than at upload time with 48 missing metrics.
+        save_request_time_breakdown = self.time_breakdown_dir()
+        if save_request_time_breakdown and use_nv_sa_benchmark:
+            raise ValueError(
+                f"{E2E_TIME_BREAKDOWN_MODE} requires benchmark.use_nv_sa_benchmark: false "
+                "(only tensorrt_llm.serve.scripts.benchmark_serving can emit the "
+                "per-request time breakdown)"
+            )
+
         if benchmark_mode == "ctx_only":
             spec_decoding = bool(ctx_server_config.spec_decoding_type)
         else:
@@ -2539,6 +2669,7 @@ class PerfSanityTestConfig:
                 "benchmark_client": benchmark_client,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
+                "save_request_time_breakdown": save_request_time_breakdown,
             }
             client_config = ClientConfig(
                 client_config_data,
@@ -2549,6 +2680,50 @@ class PerfSanityTestConfig:
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
+
+    def time_breakdown_dir(self) -> str:
+        """Directory the per-request perf-metrics JSONLs are written to.
+
+        Empty for every mode but e2e_time_breakdown, which is what switches the
+        whole feature off elsewhere. A subdirectory of test_output_dir rather
+        than test_output_dir itself so the ~8 JSONLs (one per HTTP-serving
+        worker plus the disagg server's combined file) do not clutter the
+        artifact listing. Computed the same way test_output_dir is, because
+        every srun role parses the config independently and they must agree.
+        """
+        if self.benchmark_mode != E2E_TIME_BREAKDOWN_MODE:
+            return ""
+        return os.path.join(self._output_dir, self._test_param_labels, "perf_metrics")
+
+    def _time_breakdown_worker_overrides(self) -> dict:
+        """worker_config keys the e2e_time_breakdown mode forces on ctx and gen.
+
+        Applied after the yaml's worker_config splat, so these win over the
+        shared config -- which is the point: the yaml is shared with the e2e,
+        gen_only and ctx_only ids and must not be edited for this mode's sake.
+
+        - return_perf_metrics is what makes a worker attach its Server-Timing
+          headers at all (PerfMetricsMiddleware is installed with
+          expose_headers=return_perf_metrics), and those headers are the only
+          way worker-side timestamps reach the disagg server's combined JSONL,
+          which is the one file the benchmark client reads.
+        - perf_metrics_output_dir makes each worker also keep its own record.
+          The client ignores these (_perf_metrics_files prefers the "disagg"
+          file), but they carry per-step and per-chunk detail the header
+          transport cannot express, for offline drill-down.
+        - num_postprocess_workers=0 preserves that detail: PostprocWorker.Output
+          forwards request_perf_metrics but not time_breakdown_metrics, so a
+          non-zero value silently flattens the per-step bars. This measurably
+          changes throughput, which is why the mode has its own baseline series.
+        """
+        perf_metrics_dir = self.time_breakdown_dir()
+        if not perf_metrics_dir:
+            return {}
+        return {
+            "return_perf_metrics": True,
+            "perf_metrics_output_dir": perf_metrics_dir,
+            "num_postprocess_workers": 0,
+        }
 
     def _resolve_internal_request_auth_key(self, config: dict) -> str:
         explicit_key = config.get("internal_request_auth_key")
@@ -2695,6 +2870,7 @@ class PerfSanityTestConfig:
             server_config_extra=disagg_config.server_config_extra,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
+            perf_metrics_output_dir=self.time_breakdown_dir(),
         )
 
     def _check_benchmark_errors(self, output: str) -> None:
@@ -2769,6 +2945,15 @@ class PerfSanityTestConfig:
                 **GEN_ONLY_PERF_METRIC_LOG_QUERIES,
             }
             for line in output.split("\n"):
+                # Handled outside the first-match-wins loop below on purpose:
+                # one regex covers all 12 spans x 4 statistics, so it cannot
+                # shadow (or be shadowed by) a fixed pattern, and a span this
+                # module does not know about is still captured.
+                tb_match = TIME_BREAKDOWN_METRIC_LOG_QUERY.search(line)
+                if tb_match:
+                    span, stat, value = tb_match.groups()
+                    metrics.setdefault(time_breakdown_metric_name(span, stat), float(value))
+                    continue
                 for metric_type, regex in all_queries.items():
                     if metric_type in metrics:
                         continue
@@ -2880,6 +3065,24 @@ class PerfSanityTestConfig:
                         f"gen_only test Server {server_idx} Client {client_idx} is "
                         f"missing 'prev_device_step_time' in gen_server_*.log under "
                         f"{self._output_dir}. "
+                    )
+                # e2e_time_breakdown exists only to publish the lifecycle spans.
+                # If none were parsed the run measured nothing this mode is for,
+                # yet its ordinary metrics are all present -- so without this
+                # check it would upload as an unremarkable green row and the
+                # dashboard would show a gap rather than a failure. Individual
+                # spans stay ungated (a span can legitimately be absent when its
+                # endpoints were never populated); total absence cannot be.
+                if (
+                    self.runtime == "multi_node_disagg_server"
+                    and self.server_configs[server_idx][2].benchmark_mode == E2E_TIME_BREAKDOWN_MODE
+                    and not any(k.startswith("tb_") for k in (metrics or {}))
+                ):
+                    error_msg += (
+                        f"{E2E_TIME_BREAKDOWN_MODE} test Server {server_idx} Client "
+                        f"{client_idx} parsed no 'Time Breakdown ...' lines from the "
+                        f"benchmark output. Check that the disagg server wrote "
+                        f"perf_metrics-disagg-*.jsonl under {self.time_breakdown_dir()}. "
                     )
         if error_msg:
             raise RuntimeError(error_msg)
@@ -3116,6 +3319,9 @@ def get_disagg_test_cases() -> List[str]:
         for test_type in DISAGG_TEST_TYPES:
             test_cases.append(f"{test_type}-e2e-{config_yml}")
             test_cases.append(f"{test_type}-gen_only-{config_yml}")
+            # Allowlisted rather than universal; see E2E_TIME_BREAKDOWN_CONFIGS.
+            if config_yml in E2E_TIME_BREAKDOWN_CONFIGS:
+                test_cases.append(f"{test_type}-{E2E_TIME_BREAKDOWN_MODE}-{config_yml}")
 
         # ctx_only test cases (uses aggr prefix)
         for test_type in AGG_TEST_TYPES:

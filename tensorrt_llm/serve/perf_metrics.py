@@ -22,9 +22,17 @@ Non-streaming request opt-in and response example::
     HTTP/1.1 200 OK
     Content-Type: application/json
     Server-Timing: server_queue;dur=1.250000, server_ttft;dur=8.500000, server_e2e;dur=24.000000
-    X-TRTLLM-Start-End-Time: server-start;ts=12345.123456, server-end;ts=12345.147456
+    X-TRTLLM-Start-End-Time: server-start;ts=12345.123456, server-end;ts=12345.147456,
+        server-srv-start;ts=12345.122000, server-srv-ttft;ts=12345.132000
     X-TRTLLM-Step-Metrics: server-step-0-forward;dur=2.100000, server-step-0-sample;dur=0.400000
     X-TRTLLM-Ctx-Chunk-Metrics: server-ctx-chunk-0-forward;dur=4.200000
+
+``X-TRTLLM-Start-End-Time`` carries absolute timestamps. ``start``/``end`` are the
+executor's arrival and last-token times; ``srv-start``/``srv-ttft`` are the HTTP
+server's arrival and first-token times; ``kv-start``/``kv-end`` bracket the
+KV-cache transfer on a disaggregated generation worker. A disaggregated server
+needs all of them to reconstruct a request's full lifecycle from a worker
+response -- see :func:`build_metrics_record_from_headers`.
 
 Streaming responses carry the same fields in a named SSE event after ``[DONE]``::
 
@@ -300,9 +308,19 @@ def build_metrics_headers(records: List[Dict[str, Any]]) -> Dict[str, str]:
     for record in records:
         for phase, phase_record in record.get("phases", {}).items():
             timing = phase_record.get("timing_metrics", {})
+            # Absolute timestamps forwarded verbatim. The four "srv-"/"kv-" names
+            # are what let a disagg server reconstruct the full request lifecycle
+            # from a worker response; without them the per-phase breakdown
+            # silently collapses to zero-width spans. Names must not contain a
+            # second "server-"/"server_" substring, because the receiving side
+            # rewrites the phase prefix with an unqualified str.replace().
             for name, field in (
                 ("start", "arrival_time"),
                 ("end", "last_token_time"),
+                ("srv-start", "server_arrival_time"),
+                ("srv-ttft", "server_first_token_time"),
+                ("kv-start", "kv_cache_transfer_start"),
+                ("kv-end", "kv_cache_transfer_end"),
             ):
                 timestamp = timing.get(field)
                 if timestamp is not None:
@@ -378,6 +396,10 @@ def build_metrics_record_from_headers(
     fields = {
         f"{phase}-start": "arrival_time",
         f"{phase}-end": "last_token_time",
+        f"{phase}-srv-start": "server_arrival_time",
+        f"{phase}-srv-ttft": "server_first_token_time",
+        f"{phase}-kv-start": "kv_cache_transfer_start",
+        f"{phase}-kv-end": "kv_cache_transfer_end",
     }
     for item in metrics_headers.get(START_END_TIME_HEADER, "").split(","):
         name, separator, timestamp = item.strip().partition(";ts=")
@@ -484,7 +506,14 @@ def _jsonl_perf_metrics(phase_record: Dict[str, Any]) -> PerfMetrics:
 
     timing_metrics = dict(perf_metrics.get("timing_metrics", {}))
     if not timing_metrics.get("kv_cache_size"):
-        for name in ("kv_cache_size", "kv_cache_transfer_start", "kv_cache_transfer_end"):
+        timing_metrics.pop("kv_cache_size", None)
+    # Drop the KV-transfer timestamps only when they were never populated. Keying
+    # this off kv_cache_size instead discards timestamps that the Server-Timing
+    # header transport carried successfully, because kv_cache_size is worker-local
+    # and never reaches a header-derived record -- which zeroed the KV-transfer
+    # span for every disaggregated request.
+    for name in ("kv_cache_transfer_start", "kv_cache_transfer_end"):
+        if timing_metrics.get(name) is None:
             timing_metrics.pop(name, None)
     perf_metrics["timing_metrics"] = timing_metrics
 

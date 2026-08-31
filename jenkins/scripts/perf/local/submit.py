@@ -90,6 +90,7 @@ def parse_test_string(test_case_name: str):
 
     Test name formats:
     - Disagg e2e: disagg_upload-e2e-{config_base}
+    - Disagg e2e + lifecycle breakdown: disagg_upload-e2e_time_breakdown-{config_base}
     - Disagg gen_only: disagg_upload-gen_only-{config_base}
     - ctx_only: aggr_upload-ctx_only-{config_base} (runs aggr mode but reads disagg config)
     - Regular aggr: aggr_upload-{config}-{server_name}
@@ -97,7 +98,8 @@ def parse_test_string(test_case_name: str):
     Returns:
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+            - benchmark_mode: "e2e", "e2e_time_breakdown", "gen_only",
+              "ctx_only", or None (for normal aggr)
     """
     labels = test_case_name.split("-")
 
@@ -108,10 +110,10 @@ def parse_test_string(test_case_name: str):
     is_aggr_prefix = "aggr" in prefix
 
     if is_disagg_prefix:
-        # Disagg format: disagg_upload-{e2e|gen_only}-{config_base}
+        # Disagg format: disagg_upload-{e2e|e2e_time_breakdown|gen_only}-{config_base}
         assert len(labels) > 2, "Disagg test must have benchmark_mode and config!"
-        benchmark_mode = labels[1]  # e2e or gen_only
-        assert benchmark_mode in ("e2e", "gen_only"), (
+        benchmark_mode = labels[1]  # e2e, e2e_time_breakdown, or gen_only
+        assert benchmark_mode in ("e2e", "e2e_time_breakdown", "gen_only"), (
             f"Invalid benchmark_mode for disagg: {benchmark_mode}"
         )
         runtime_mode = "disaggregated"
@@ -145,12 +147,13 @@ def get_config_yaml_path(llm_src, config_base_name, benchmark_mode):
     Args:
         llm_src: Path to LLM source code
         config_base_name: Base name of config file (without .yaml extension)
-        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+        benchmark_mode: "e2e", "e2e_time_breakdown", "gen_only", "ctx_only", or
+            None (for normal aggr)
 
     Returns:
         str: Full path to config yaml file
     """
-    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+    if benchmark_mode in ("e2e", "e2e_time_breakdown", "gen_only", "ctx_only"):
         config_dir = DISAGG_CONFIG_FOLDER
     else:
         config_dir = AGG_CONFIG_FOLDER
@@ -545,7 +548,7 @@ def generate_pytest_command(
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
     if runtime_mode == "disaggregated":
-        # disagg_upload-{e2e|gen_only}-{config_base}
+        # disagg_upload-{e2e|e2e_time_breakdown|gen_only}-{config_base}
         test_list_content = (
             f"perf/test_perf_sanity.py::test_e2e[disagg-{benchmark_mode}-{config_file_base_name}]"
         )
@@ -653,7 +656,7 @@ def main():
     parser.add_argument(
         "--benchmark-mode",
         default="",
-        choices=["", "e2e", "gen_only", "ctx_only"],
+        choices=["", "e2e", "e2e_time_breakdown", "gen_only", "ctx_only"],
         help="Benchmark mode for disagg config (when --config-file is provided)",
     )
     parser.add_argument(
