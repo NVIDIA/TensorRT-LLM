@@ -59,6 +59,9 @@ constexpr int kRadixPasses = 32 / kRadixBits;
 //! 8 copies is 16 KB of shared memory -- affordable, and enough to spread the few buckets
 //! a softmax actually lands in across separate addresses.
 constexpr int kHistCopies = 8;
+//! How many survivors the shared gather buffer holds (16 KB). Past this the descent falls
+//! back to re-reading the row, so the cap is a performance knob, never a correctness one.
+constexpr int kCandCap = 4096;
 //! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
 constexpr float kTempEpsilon = 1e-6f;
 
@@ -221,8 +224,8 @@ struct OnlineSoftmaxOp
 //! Returns 0 when the criterion never fires (this filter keeps everything).
 template <typename T>
 __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv, float maxScaled, float floorValue,
-    long long targetCount, float targetMass, bool byCount, int* sCount, float* sMass, int* sChosen, long long* sCountHi,
-    float* sMassHi, bool* sFired)
+    long long targetCount, float targetMass, bool byCount, int* sCount, float* sMass, float* sCand, int* sCandCount,
+    int* sBucketCount, int* sChosen, long long* sCountHi, float* sMassHi, bool* sFired)
 {
     uint32_t prefix = 0u;
     uint32_t fixedMask = 0u;
@@ -230,6 +233,9 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
     float massHi = 0.0f;
 
     int const tid = threadIdx.x;
+    //! Once the survivors have been gathered into shared memory the remaining passes read
+    //! them from there, and the row is not touched again.
+    bool useShared = false;
 
     for (int pass = 0; pass < kRadixPasses; ++pass)
     {
@@ -257,23 +263,42 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
         int* const myCount = sCount + copy * kRadixBuckets;
         float* const myMass = sMass + copy * kRadixBuckets;
 
-        forEachLogit(rowLogits, vocabSize,
-            [&](int, float logit)
+        if (useShared)
+        {
+            int const n = *sCandCount;
+            for (int i = tid; i < n; i += blockDim.x)
             {
-                float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
-                if (w < floorValue)
-                {
-                    return;
-                }
+                float const w = sCand[i];
                 uint32_t const bits = __float_as_uint(w);
                 if ((bits & fixedMask) != prefix)
                 {
-                    return;
+                    continue;
                 }
                 uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
                 atomicAdd(&myCount[digit], 1);
                 atomicAdd(&myMass[digit], w);
-            });
+            }
+        }
+        else
+        {
+            forEachLogit(rowLogits, vocabSize,
+                [&](int, float logit)
+                {
+                    float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
+                    if (w < floorValue)
+                    {
+                        return;
+                    }
+                    uint32_t const bits = __float_as_uint(w);
+                    if ((bits & fixedMask) != prefix)
+                    {
+                        return;
+                    }
+                    uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
+                    atomicAdd(&myCount[digit], 1);
+                    atomicAdd(&myMass[digit], w);
+                });
+        }
         __syncthreads();
 
         // Fold the private copies into copy 0, one bucket per thread. 256 buckets against
@@ -317,6 +342,9 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             *sChosen = chosen;
             *sCountHi = c;
             *sMassHi = m;
+            // How many survivors the next pass has to look at. Captured now, before the
+            // next iteration zeroes the histogram.
+            *sBucketCount = sCount[chosen];
         }
         __syncthreads();
 
@@ -334,6 +362,47 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
         countHi = *sCountHi;
         massHi = *sMassHi;
         __syncthreads();
+
+        // Everything still in play now lies in one bucket, and after the first pass that
+        // is a tiny fraction of the row -- yet each further pass was re-reading the whole
+        // row to histogram it. Gather the survivors once and the remaining passes never
+        // touch global memory again: 4 sweeps become 2.
+        //
+        // Skipped when the bucket is too wide to fit, which keeps this an optimization and
+        // not a correctness condition: the fallback is the original full-row pass.
+        if (!useShared && pass + 1 < kRadixPasses && *sBucketCount <= kCandCap)
+        {
+            if (tid == 0)
+            {
+                *sCandCount = 0;
+            }
+            __syncthreads();
+            forEachLogit(rowLogits, vocabSize,
+                [&](int, float logit)
+                {
+                    float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
+                    if (w < floorValue)
+                    {
+                        return;
+                    }
+                    uint32_t const bits = __float_as_uint(w);
+                    if ((bits & fixedMask) != prefix)
+                    {
+                        return;
+                    }
+                    int const slot = atomicAdd(sCandCount, 1);
+                    if (slot < kCandCap)
+                    {
+                        sCand[slot] = w;
+                    }
+                });
+            __syncthreads();
+            // sBucketCount is exact, so the cap cannot have been exceeded -- but a
+            // gathered set that does not match it would mean the later passes silently saw
+            // fewer elements, so it is checked rather than assumed.
+            useShared = *sCandCount <= kCandCap;
+            __syncthreads();
+        }
     }
 
     return __uint_as_float(prefix);
@@ -364,6 +433,9 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
 
     __shared__ int sCount[kRadixBuckets * kHistCopies];
     __shared__ float sMass[kRadixBuckets * kHistCopies];
+    __shared__ float sCand[kCandCap];
+    __shared__ int sCandCount;
+    __shared__ int sBucketCount;
     __shared__ int sChosen;
     __shared__ long long sCountHi;
     __shared__ float sMassHi;
@@ -438,9 +510,9 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     float threshold = rp.needMinP ? rp.minP : 0.0f;
     if (rp.needTopK)
     {
-        float const topKThreshold
-            = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold, static_cast<long long>(rp.topK),
-                0.0f, /*byCount=*/true, sCount, sMass, &sChosen, &sCountHi, &sMassHi, &sFired);
+        float const topKThreshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold,
+            static_cast<long long>(rp.topK), 0.0f, /*byCount=*/true, sCount, sMass, sCand, &sCandCount, &sBucketCount,
+            &sChosen, &sCountHi, &sMassHi, &sFired);
         threshold = fmaxf(threshold, topKThreshold);
     }
     if (rp.needTopP)
@@ -464,7 +536,8 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
         __syncthreads();
 
         float const topPThreshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold, 0,
-            rp.topP * sSurvivingMass, /*byCount=*/false, sCount, sMass, &sChosen, &sCountHi, &sMassHi, &sFired);
+            rp.topP * sSurvivingMass, /*byCount=*/false, sCount, sMass, sCand, &sCandCount, &sBucketCount, &sChosen,
+            &sCountHi, &sMassHi, &sFired);
         threshold = fmaxf(threshold, topPThreshold);
     }
 
