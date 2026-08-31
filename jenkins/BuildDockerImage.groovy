@@ -20,8 +20,10 @@ import java.lang.Exception
 import groovy.transform.Field
 
 // Docker image registry
-IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+IMAGE_NAME = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging"
 NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -45,6 +47,19 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+// >>> BOLT profile-bundle overlay -- ships INERT (dead code) >>>
+// Master gate. While false (the default, i.e. the scaffolding PR), buildImage
+// behaves EXACTLY as before: the raw build is published straight to the canonical
+// tag and NONE of the overlay code runs. The follow-up "enable BOLT" PR flips this
+// on (defaultValue below and/or the release/nightly trigger passing it true).
+BOLT_OVERLAY_ENABLED = (params.boltOverlayEnabled ?: env.boltOverlayEnabled ?: "false").toString() == "true"
+// When enabled, a missing/empty bundle is FATAL rather than silently shipping a
+// profile-less canonical image (the contract: a canonical image, if produced,
+// carries profiles). Left false until the enable PR wires it true for the
+// release/nightly path; premerge/new-branch stays lenient (retag plain build).
+BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequired ?: "false").toString() == "true"
+// <<< BOLT profile-bundle overlay <<<
+
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
@@ -63,11 +78,14 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
+    (TRTLLM_VERSION_OVERRIDE): null,
 ]
 
 @Field
@@ -144,7 +162,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -169,7 +187,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172149_docker_dind_mtu_helper
+                    command: ['/usr/local/bin/dind-mtu']
+                    args: ['start']
                     tty: true
                     resources:
                       requests:
@@ -215,6 +235,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
             spec:
                 qosClass: Guaranteed
                 ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -248,8 +270,8 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (TRIGGER_TYPE != "post-merge") {
-        echo "Trigger type is not post-merge, skip preparing wheel from build stage"
+    if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        echo "Trigger type does not use the build stage wheel"
         return ""
     }
 
@@ -268,7 +290,120 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
-def buildImage(config, imageKeyToTag)
+// Produce each CANONICAL image from its raw `-noprofiles` build by
+// overlaying the merged LLVM BOLT profile bundle as a thin layer (docker/
+// Dockerfile.bolt via the docker/Makefile `bolt_overlay` target). Canonical is
+// written ONLY here, so a profile-less image can never masquerade as canonical.
+// Called from buildImage AFTER the raw build+push and BEFORE the pipeline's nspect
+// scan/register stage, so the scanned+registered artifact already carries the
+// bundle (no republish of an already-released image).
+//
+// `pairs` is a list of [raw: <-noprofiles tag>, canon: <canonical tag>]. Per pair:
+//   - bundle present  -> overlay raw -> canon (canonical carries profiles)
+//   - no bundle + BOLT_PROFILES_REQUIRED -> FATAL: refuse to publish a profile-less
+//       canonical (enforces the contract; no silent profile-less release)
+//   - no bundle + not required (pre-enable / BOLT off) -> retag raw -> canon so a
+//       canonical still exists (expected: profiles not required yet)
+//
+// The bundle is arch-specific (only aarch64-linux-gnu today) but baked into every
+// variant by design -- on x86 the files are inert until an x86/merged bundle
+// exists. Fetched via anonymous curl (artifactory.sh pull-latest) WITH RETRIES, so
+// a transient miss isn't mistaken for "no bundle".
+def overlayBoltBundle(pairs, arch, action) {
+    if (!pairs) { return }
+    def triple = "aarch64-linux-gnu"
+    def llmAbs = sh(script: "cd ${LLM_ROOT} && pwd", returnStdout: true).trim()
+    def ctxDir = "${llmAbs}/bolt_overlay_ctx"
+    def bundleSub = "bolt_bundle"
+    def push = (action == "push") ? "1" : "0"
+
+    // Which branch's promoted bundle to consume. The BuildDockerImages helper job is
+    // branch-agnostic; the branch is a RUNTIME value, resolved in order:
+    //   1) boltProfileBranch param -- explicit override; the parent (which has the
+    //      full git context) may pass the MR target branch here;
+    //   2) LLM_BRANCH -- the build's own branch (already correct via params.branch);
+    //      has a promoted bundle for main/release, or a dev branch that gen-promoted
+    //      to itself;
+    //   3) "main" -- mainline fallback, so a dev/PR branch with NO bundle of its own
+    //      still gets profiles.
+    // Profiles are host-layout-stable + .yaml (function-name-keyed, -infer-stale), so
+    // consuming a nearby branch's bundle is valid; the bolt-profiles-ref LABEL records
+    // exactly which commit's profiles were baked in.
+    def candidates = [params.boltProfileBranch, LLM_BRANCH, "main"]
+        .collect { it?.toString()?.trim() }
+        .findAll { it }
+        .unique()
+
+    // 1) Try each candidate branch in order (with retries per branch so a transient
+    //    network/Artifactory blip isn't misread as "no bundle"). Verify non-empty
+    //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
+    def haveBundle = false
+    def branch = null
+    for (cand in candidates) {
+        for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
+            def rc = sh(script: """
+                rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
+            """, returnStatus: true)
+            if (rc == 0) {
+                def ok = sh(script: """
+                    test -f ${ctxDir}/${bundleSub}/manifest.json && \
+                    test -n "\$(find ${ctxDir}/${bundleSub} -type f \\( -name '*.yaml' -o -name '*.fdata' \\) 2>/dev/null | head -1)"
+                """, returnStatus: true)
+                if (ok == 0) { haveBundle = true; branch = cand; break }
+                echo "[BOLT] bundle for ${cand}/${triple} pulled but empty/invalid (attempt ${attempt})"
+            } else {
+                echo "[BOLT] pull-latest ${cand}/${triple} failed (attempt ${attempt}, rc=${rc})"
+            }
+        }
+        if (haveBundle) { break }
+        echo "[BOLT] no usable bundle for ${cand}/${triple}; trying next candidate branch"
+    }
+
+    // 2) No usable bundle from ANY candidate: fail-closed when required, else retag
+    //    raw -> canonical (so a canonical image still exists; expected pre-enable /
+    //    when BOLT off / dev-PR with no promoted profiles anywhere).
+    if (!haveBundle) {
+        def tried = candidates.join(", ")
+        if (BOLT_PROFILES_REQUIRED) {
+            error("[BOLT] required profile bundle missing for ${triple} (tried branches: ${tried}) -- refusing to publish a profile-less canonical image " +
+                  "(promote a bundle via BoltProfileGen, or set boltProfilesRequired=false to allow a plain canonical)")
+        }
+        echo "[BOLT] no bundle for ${triple} (tried: ${tried}); profiles not required -> canonical = plain build"
+        pairs.each { p ->
+            stage ("BOLT retag (no bundle) (${arch}): ${p.canon}") {
+                def retagCmd = "docker tag ${p.raw} ${p.canon}"
+                if (push == "1") { retagCmd += " && docker push ${p.canon}" }
+                trtllm_utils.llmExecStepWithRetry(this, script: retagCmd, numRetries: 3)
+            }
+        }
+        return
+    }
+    echo "[BOLT] using promoted bundle from ${branch}/${triple} for overlay"
+
+    // 3) Provenance: record the bundle's source ref (manifest.json). python3 may be
+    //    absent on the build pod -> fall back to "unknown".
+    def ref = sh(
+        script: "cd ${ctxDir}/${bundleSub} && (python3 -c \"import json;print(json.load(open('manifest.json'))['ref'])\" 2>/dev/null || echo unknown)",
+        returnStdout: true).trim()
+
+    // 4) Overlay each raw image into its CANONICAL tag (canonical carries profiles).
+    pairs.each { p ->
+        stage ("BOLT overlay (${arch}): ${p.canon}") {
+            trtllm_utils.llmExecStepWithRetry(this, script: """
+            cd ${LLM_ROOT} && make -C docker bolt_overlay \
+                BOLT_BASE_IMAGE=${p.raw} \
+                BOLT_OUTPUT_IMAGE=${p.canon} \
+                BOLT_CTX_DIR=${ctxDir} \
+                BOLT_BUNDLE_DIR=${bundleSub} \
+                BOLT_PROFILES_REF=${ref} \
+                BOLT_PUSH=${push}
+            """, numRetries: 3)
+        }
+    }
+}
+
+def buildImage(config, imageKeyToTag, versionOverride)
 {
     def target = config.target
     def action = config.action
@@ -280,16 +415,21 @@ def buildImage(config, imageKeyToTag)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def dockerfileStage = config.dockerfileStage
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+    def imageType = TRIGGER_TYPE == "nightly-release" ?
+        "${target}-nightly" : target
+    def dependentImageType = TRIGGER_TYPE == "nightly-release" ?
+        "${dependent.target}-nightly" : dependent.target
+    def tag = "${arch}-${imageType}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
+    def dependentTag = tag.replace(
+        "${arch}-${imageType}-", "${arch}-${dependentImageType}-")
 
     def imageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
-        echo "Use NGC artifacts for post merge build"
+    if (target == "ngc-release" && (TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        echo "Use the NGC staging registry for ${TRIGGER_TYPE} build"
         dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
         imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
         customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
@@ -300,33 +440,78 @@ def buildImage(config, imageKeyToTag)
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
-        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
+    }
+    if (versionOverride) {
+        def resolvedVersionOverride = versionOverride
+        if (versionOverride.startsWith(".")) {
+            def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+            def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+            if (!versionMatcher.find()) {
+                error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+            }
+            resolvedVersionOverride =
+                "${versionMatcher.group(1)}${versionOverride}"
+        }
+        env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
+        args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
     }
 
     // Step 2: Build the images
     stage ("Install Package") {
+        sh(label: "Validate Docker bridge MTU", script: "/usr/local/bin/dind-mtu validate")
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
-
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
-        }
-
-        withCredentials([
-            usernamePassword(
-                credentialsId: "svc_tensorrt_gitlab_read_api_token",
-                usernameVariable: 'USERNAME',
-                passwordVariable: 'PASSWORD'
-            ),
-            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
-        ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
-        }
     }
-    def containerGenFailure = null
-    try {
+    // resourceLedger.withResource registers the docker-login lifecycle *before*
+    // the first login, then runs the reclaim (logout) in a finally on both
+    // success and failure -- re-raising the body's own error -- replacing the
+    // prior try/catch/finally/containerGenFailure/rethrow. Registering before the
+    // logins means any registry we authenticate to below is owed a logout even if
+    // a later login (or the pod) fails partway through; if the build pod dies
+    // before the finally runs, the entry is left live for a post-build sweep
+    // (Phase 3) rather than being silently lost.
+    resourceLedger.withResource(this,
+        id: "docker-login/${config.stageName}",
+        type: "dockerLogin",
+        reclaim: { p, e ->
+            stage ("Docker Logout") {
+                withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
+                    // Best-effort and independent: attempt every logout even if an
+                    // earlier one fails, so a failure on one registry can't leave
+                    // another still authenticated.
+                    try {
+                        sh "docker logout artifactory.nvidia.com"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout artifactory.nvidia.com failed: ${logoutEx}"
+                    }
+                    try {
+                        sh "docker logout ${DEFAULT_GIT_URL}:5005"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout for gitlab registry failed: ${logoutEx}"
+                    }
+                }
+            }
+        }) {
+        stage ("Docker Login") {
+            // Read-write artifactory credentials (image push)
+            withCredentials([usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login artifactory.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+            }
+
+            withCredentials([
+                usernamePassword(
+                    credentialsId: "svc_tensorrt_gitlab_read_api_token",
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD'
+                ),
+                string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+            ]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
+            }
+        }
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
@@ -343,6 +528,16 @@ def buildImage(config, imageKeyToTag)
         BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
+        // Gated by BOLT_OVERLAY_ENABLED: when the overlay is enabled the
+        // raw build is published to <tag>-noprofiles and the CANONICAL <tag> is
+        // produced ONLY by the overlay (below), so a profile-less image can never
+        // masquerade as canonical. When disabled (default), the suffix is empty ->
+        // raw == canonical -> byte-for-byte the pre-BOLT behavior (dead code).
+        def noprofilesSuffix = BOLT_OVERLAY_ENABLED ? "-noprofiles" : ""
+        def rawImageTag = "${imageWithTag}${noprofilesSuffix}"
+        def rawDependentTag = "${dependentImageWithTag}${noprofilesSuffix}"
+        def rawCustomTag = "${customImageWithTag}${noprofilesSuffix}"
+
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
                 def randomSleep = (Math.random() * 600 + 600).toInteger()
@@ -352,11 +547,11 @@ def buildImage(config, imageKeyToTag)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${dependentImageWithTag} \
+                IMAGE_WITH_TAG=${rawDependentTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-                args += " DEVEL_IMAGE=${dependentImageWithTag}"
+                args += " DEVEL_IMAGE=${rawDependentTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
                 }
@@ -382,7 +577,7 @@ def buildImage(config, imageKeyToTag)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -399,7 +594,7 @@ def buildImage(config, imageKeyToTag)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -416,29 +611,40 @@ def buildImage(config, imageKeyToTag)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${customImageWithTag} \
+                IMAGE_WITH_TAG=${rawCustomTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
         }
-    } catch (Exception ex) {
-        containerGenFailure = ex
-    } finally {
-        stage ("Docker Logout") {
-            withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
-                sh "docker logout urm.nvidia.com"
-                sh "docker logout ${DEFAULT_GIT_URL}:5005"
-            }
-        }
-        if (containerGenFailure != null) {
-            throw containerGenFailure
+
+        // Gated: produce the CANONICAL tag(s) from the raw -noprofiles
+        // build by overlaying the BOLT profile bundle. When BOLT_OVERLAY_ENABLED is
+        // false this whole block is skipped and the raw build above already IS the
+        // canonical image (rawImageTag == imageWithTag) -- i.e. inert dead code.
+        // When enabled, canonical is written EXCLUSIVELY here, so it always carries
+        // profiles (or, when required and no bundle exists, the build fails rather
+        // than silently shipping a profile-less canonical). Runs inside the
+        // docker-login scope and before the pipeline's nspect stage.
+        //
+        // Applied to EVERY image variant this job builds (NGC devel/release,
+        // internal release, and all CI/OS-variant images) by DESIGN -- deliberately
+        // not scoped, to avoid maintaining an allowlist. On images with no BOLT
+        // consumer the bundle is just an inert extra layer. If that proves
+        // undesirable, add a per-config opt-out here (e.g. a `boltOverlay` field on
+        // buildConfigs) rather than special-casing targets.
+        if (BOLT_OVERLAY_ENABLED) {
+            def boltPairs = [[raw: rawImageTag, canon: imageWithTag]]
+            if (dependent) { boltPairs.add([raw: rawDependentTag, canon: dependentImageWithTag]) }
+            if (customTag) { boltPairs.add([raw: rawCustomTag, canon: customImageWithTag]) }
+            overlayBoltBundle(boltPairs, arch, action)
         }
     }
 }
 
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -453,15 +659,26 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     ]
 
     def release_action = params.action
+    def stageNames = [
+        internalReleaseX86:  "Build Internal release (x86_64 trtllm)",
+        internalReleaseSBSA: "Build Internal release (SBSA trtllm)",
+        ciImageX86:          "Build CI Image (x86_64 tritondevel)",
+        ciImageSBSA:         "Build CI Image (SBSA tritondevel)",
+        ciImageRockyPy310:   "Build CI Image (RockyLinux8 Python310)",
+        ciImageRockyPy312:   "Build CI Image (RockyLinux8 Python312)",
+        ciImageSBSAUbuntu:   "Build CI Image (SBSA Ubuntu24.04 Python312)",
+        ngcReleaseX86:       "Build NGC devel And release (x86_64)",
+        ngcReleaseSBSA:      "Build NGC devel And release (SBSA)",
+    ]
     def buildConfigs = [
-        "Build Internal release (x86_64 trtllm)": [
+        (stageNames.internalReleaseX86): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
             dockerfileStage: "release",
         ],
-        "Build Internal release (SBSA trtllm)": [
+        (stageNames.internalReleaseSBSA): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
@@ -469,27 +686,27 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             arch: "arm64",
             dockerfileStage: "release",
         ],
-        "Build CI Image (x86_64 tritondevel)": [:],
-        "Build CI Image (SBSA tritondevel)": [
+        (stageNames.ciImageX86): [:],
+        (stageNames.ciImageSBSA): [
             arch: "arm64",
         ],
-        "Build CI Image (RockyLinux8 Python310)": [
+        (stageNames.ciImageRockyPy310): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI Image (RockyLinux8 Python312)": [
+        (stageNames.ciImageRockyPy312): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build CI Image (SBSA Ubuntu24.04 Python312)": [
+        (stageNames.ciImageSBSAUbuntu): [
             arch: "arm64",
             target: "ubuntu24",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build NGC devel And release (x86_64)": [
+        (stageNames.ngcReleaseX86): [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
@@ -500,7 +717,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             ],
             dockerfileStage: "release",
         ],
-        "Build NGC devel And release (SBSA)": [
+        (stageNames.ngcReleaseSBSA): [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
@@ -513,6 +730,42 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def triggerTypeBuildDefaults = [
+        "nightly-release": [
+            buildInternalRelease: false,
+            buildCiImage: false,
+            buildNgcRelease: true,
+        ],
+    ]
+    def buildDefaults = triggerTypeBuildDefaults[TRIGGER_TYPE] ?: [:]
+    // params may contain a Declarative default even when the remote parameter was dropped.
+    // env presence indicates that the parameter was attached to the current build.
+    def resolveBuildStageParam = { parameterName ->
+        if (env."${parameterName}" != null) {
+            return params[parameterName]
+        }
+        if (buildDefaults.containsKey(parameterName)) {
+            return buildDefaults[parameterName]
+        }
+        return params[parameterName]
+    }
+    def buildInternalRelease = resolveBuildStageParam("buildInternalRelease")
+    def buildCiImage = resolveBuildStageParam("buildCiImage")
+    def buildNgcRelease = resolveBuildStageParam("buildNgcRelease")
+
+    def enabledStages = []
+    if (buildInternalRelease) {
+        enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
+    }
+    if (buildCiImage) {
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+    }
+    if (buildNgcRelease) {
+        enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
+    }
+    buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
+    echo "Running stages: ${buildConfigs.keySet()}"
+
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
         defaultBuildConfig.each { defaultKey, defaultValue ->
@@ -532,7 +785,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     config.stageName = key
                     try {
                         trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
-                            buildImage(config, imageKeyToTag)
+                            buildImage(config, imageKeyToTag, versionOverride)
                         }
                     } catch (InterruptedException e) {
                         throw e
@@ -580,6 +833,36 @@ pipeline {
             name: "action",
             choices: ["build", "push"],
             description: "Docker image generation action. build: only perform image build step; push: build docker image and push it to artifacts"
+        )
+        booleanParam(
+            name: "buildInternalRelease",
+            defaultValue: true,
+            description: "Build internal release images (x86_64 and SBSA trtllm)"
+        )
+        booleanParam(
+            name: "buildCiImage",
+            defaultValue: true,
+            description: "Build CI images (tritondevel and OS variant images)"
+        )
+        booleanParam(
+            name: "buildNgcRelease",
+            defaultValue: true,
+            description: "Build NGC devel and release images (x86_64 and SBSA)"
+        )
+        booleanParam(
+            name: "boltOverlayEnabled",
+            defaultValue: false,
+            description: "Publish the raw build as <tag>-noprofiles and produce the canonical <tag> by overlaying the merged BOLT profile bundle. While false (the default), images are built exactly as before and none of the overlay code runs."
+        )
+        booleanParam(
+            name: "boltProfilesRequired",
+            defaultValue: false,
+            description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
+        )
+        string(
+            name: "boltProfileBranch",
+            defaultValue: "",
+            description: "Branch whose promoted BOLT bundle the overlay should consume. Empty -> resolve automatically: try the build branch (LLM_BRANCH), then fall back to main. Set explicitly (e.g. the MR target branch, passed by the parent) to consume a specific branch's profiles. Only used when boltOverlayEnabled is true."
         )
     }
     options {
@@ -738,8 +1021,8 @@ pipeline {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
+                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
@@ -749,17 +1032,23 @@ pipeline {
                                 trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                             }
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
                                 --env ${nspect_env} \
                                 --nspect_id ${params.nspect_id} \
-                                --program_version_name '${program_version_name}' \
+                                --program_version_name '${nspectReleaseVersion}' \
                                 """
                             if (params.register_images) {
-                                cmd += "--register "
+                                cmd += "--add_version "
+                                if (params.release_type_id) {
+                                    cmd += "--release_type_id ${params.release_type_id} "
+                                }
                             }
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "
+                            }
+                            if (params.export_compliance_bug) {
+                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
                             }
                             if (params.wait_success_seconds) {
                                 cmd += "--check_launch_api "
@@ -767,7 +1056,10 @@ pipeline {
                             }
                             cmd += "--image "
                             cmd += imageKeyToTag.values().join(" ")
-                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            withCredentials([
+                                usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
+                                usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
+                            ]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
                             }
                         }

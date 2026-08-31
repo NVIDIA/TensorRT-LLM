@@ -72,7 +72,9 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+      kv_cache_bounce_size_mb: 384
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: Eagle
       max_draft_len: 3
@@ -103,6 +105,8 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+      kv_cache_bounce_size_mb: 384
+    disable_overlap_scheduler: false
     speculative_config: *id001
     trust_remote_code: true

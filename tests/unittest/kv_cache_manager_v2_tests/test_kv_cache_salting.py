@@ -19,19 +19,26 @@ from collections.abc import Iterator
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
+
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import ReuseScope, TokenId
+    from kv_cache_manager_v2 import TokenId
     from kv_cache_manager_v2._block_radix_tree import (
         Block,
         BlockRadixTree,
+        ReuseScope,
         sequence_to_blockchain_keys,
     )
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, TokenId
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import TokenId
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
         Block,
         BlockRadixTree,
+        ReuseScope,
         sequence_to_blockchain_keys,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
@@ -49,7 +56,11 @@ class _EmptyLifeCycles:
 
 
 class TestReuseScope(unittest.TestCase):
-    def test_to_bytes_distinguishes_scope_fields(self) -> None:
+    def test_reuse_scope_seeds_distinct_keys(self) -> None:
+        # Distinct reuse scopes -- including the None-vs-0 cases for each field --
+        # must seed distinct radix-tree keys. The first blockchain key is the
+        # root (the reuse-scope digest), so hashing the same tokens under each
+        # scope isolates the scope's contribution to the key.
         scopes = [
             ReuseScope(),
             ReuseScope(lora_id=0),
@@ -57,11 +68,15 @@ class TestReuseScope(unittest.TestCase):
             ReuseScope(lora_id=0, salt=0),
             ReuseScope(lora_id=7, salt=11),
         ]
+        tokens = [TokenId(1), TokenId(2)]
 
-        serialized = [scope.to_bytes() for scope in scopes]
-        self.assertEqual(len(set(serialized)), len(scopes))
-        self.assertEqual(serialized[0], b"\x00")
-        self.assertEqual(serialized, [scope.to_bytes() for scope in scopes])
+        def root_key(scope: "ReuseScope") -> bytes:
+            return next(iter(sequence_to_blockchain_keys(2, scope, tokens)))[1]
+
+        roots = [root_key(scope) for scope in scopes]
+        self.assertEqual(len(set(roots)), len(scopes))
+        # Deterministic across repeated derivation.
+        self.assertEqual(roots, [root_key(scope) for scope in scopes])
 
     def test_blockchain_keys_are_seeded_by_reuse_scope(self) -> None:
         tokens = [TokenId(1), TokenId(2), TokenId(3), TokenId(4)]

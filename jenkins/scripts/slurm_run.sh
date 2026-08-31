@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -6,28 +20,6 @@ trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAN
 
 cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
-
-set_value_in_command() {
-    # Parameters
-    local key="$1"
-    local value="$2"
-    local command="$3"
-
-    # Transform the key
-    local placeholder="__PLACEHOLDER_${key}__"
-
-    # Check if placeholder exists
-    if [[ "$command" != *"$placeholder"* ]]; then
-        echo "Error: placeholder '$placeholder' not found in the command" >&2
-        return 1
-    fi
-
-    # Replace all occurrences
-    local result="${command//${placeholder}/${value}}"
-
-    # Return the result
-    echo "$result"
-}
 
 # Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
@@ -37,9 +29,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-# Aggregated mode will run install together with pytest in slurm_run.sh
+# Aggregated mode and infrastructure dry runs install in slurm_run.sh.
 # Disaggregated mode will run install separately in slurm_install.sh
-if [[ "$stageName" != *Disagg* ]]; then
+if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
@@ -54,49 +46,24 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
-# get trtllm wheel path and add to pytest command
+# Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-# In disaggregated mode, we only set coverage config file in benchmark pytest.
-if [[ -z "${DISAGG_SERVING_TYPE:-}" || "${DISAGG_SERVING_TYPE}" == "BENCHMARK" ]]; then
-    pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
-fi
 
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then
-    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+    sed -i "s|@TRTLLM_WHEEL_PATH@|$trtllmWhlPath|g" "$coverageConfigFile"
 else
     # Sleep 30 seconds to wait for the coverage config file to be saved
     sleep 30
 fi
 
-containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
-containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
-containerLDLibPath=$LD_LIBRARY_PATH
-containerLDLibPath=$(echo "$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
-if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
-  containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
-  containerLDLibPath="${containerLDLibPath%:}"
-fi
-export LD_LIBRARY_PATH=$containerLDLibPath
-
-# Slurm ENROOT/pyxis may inject UCX_TLS=tcp from the host MPI stack (intended for
-# host-only MPI jobs). That disables CUDA transports and breaks NIXL GPU memory
-# registration. Unset it so UCX can auto-select.
-if [ "${UCX_TLS:-}" = "tcp" ]; then
-    unset UCX_TLS
-    echo "Unset UCX_TLS (cluster injected UCX_TLS=tcp)"
-fi
-
-# Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.
-# Under `srun --mpi=pmix` with the DLFW 26.04 OpenMPI build, the shared-memory
-# GDS modes can fail to publish UCX worker addresses across nodes, producing:
-#   pml_ucx.c:178  Error: Failed to receive UCX worker address: Not found (-13)
-#   pml_ucx.c:482  Error: Failed to resolve UCX endpoint for rank N
-# See https://github.com/open-mpi/ompi/issues/6981. Setting this is a no-op
-# when PMIx isn't used.
-export PMIX_MCA_gds=hash
+# Library path + UCX/PMIx fixups shared with the disagg cache-transceiver
+# precheck (slurm_precheck_run.sh) -- keeping them in one place guarantees the
+# precheck observes the same network environment as the real test steps.
+source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
+slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
@@ -119,6 +86,60 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# The install lock in slurm_install.sh lives under $resourcePathNode (/tmp), so it
+# is node-local: its wait loop only fences $SLURM_LOCALID peers on the same node,
+# and a node can never observe another node's lock. Nothing else stops one node
+# from reaching `eval $pytestCommand` below while another is still installing, and
+# the per-rank work above skews the ranks further (non-zero ranks cover the
+# coverage-config write with a blind `sleep 30`, and slurm_setup_runtime_env shells
+# out to pip3). Pytest's first action is `import tensorrt_llm`, whose module-scope
+# MPI collective must be entered by every rank; under --mpi=pmix -- added exactly
+# when nodeCount > 1 -- that collective has a 300s fence timeout, so the skew
+# aborts every rank instead of merely running late. Fence every rank on the shared
+# $jobWorkspace so they enter pytest together.
+slurm_wait_all_ranks() {
+    local numRanks="${SLURM_NTASKS:-1}"
+    if [ "$numRanks" -le 1 ] || [ -z "${jobWorkspace:-}" ]; then
+        return 0
+    fi
+
+    # Keyed per job *and* per step: $jobWorkspace outlives a single step, so
+    # markers from another job, or from an earlier step of this job, must not
+    # satisfy the count. Slurm assigns one step id per step across all of its
+    # nodes, so every rank of a step agrees on this path.
+    local readyDir="$jobWorkspace/run_ready_job_${SLURM_JOB_ID:-local}_step_${SLURM_STEP_ID:-0}"
+    mkdir -p "$readyDir"
+    touch "$readyDir/rank_${SLURM_PROCID}.ready"
+
+    # Bounded so a dead rank fails the stage loudly instead of hanging until the
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
+    # in slurm_install.sh so a merely slow rank still releases the barrier.
+    local timeoutSecs=3600
+    local deadline=$((SECONDS + timeoutSecs))
+    local markers ready
+    while true; do
+        # Counted with a glob rather than `ls | wc -l`: under `set -Eeuo pipefail` a
+        # failing `ls` propagates into the assignment and fires the ERR trap. The
+        # touch above guarantees at least one match, so no nullglob is needed.
+        markers=("$readyDir"/*.ready)
+        ready=${#markers[@]}
+        if [ "$ready" -ge "$numRanks" ]; then
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: rank ${SLURM_PROCID} timed out after ${timeoutSecs}s waiting for" \
+                 "all $numRanks ranks to be ready; ready: $ready/$numRanks"
+            return 1
+        fi
+        echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
+        sleep 10
+    done
+}
+
+slurm_wait_all_ranks
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -129,6 +150,10 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

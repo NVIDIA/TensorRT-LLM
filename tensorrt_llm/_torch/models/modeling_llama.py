@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -15,12 +15,12 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -36,12 +36,12 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
@@ -1134,6 +1134,13 @@ class LlamaModel(DecoderModel):
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
@@ -1606,7 +1613,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
-@register_auto_model("MistralForCausalLM")
+# NOTE: deliberately NOT decorated with @register_auto_model: the
+# "MistralForCausalLM" architecture is owned by modeling_mistral (which, under
+# the previous eager import order, always overwrote this legacy registration).
+# With the model zoo imported lazily, a duplicate registration here would make
+# the resolved class depend on import order.
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(

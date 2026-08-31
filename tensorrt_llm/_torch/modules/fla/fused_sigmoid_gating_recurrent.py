@@ -265,6 +265,24 @@ def _flashinfer_gdn_decode(
     HV = v.shape[2]
     V = v.shape[3]
 
+    # The FlashInfer CuTe-DSL kernel requires every input tensor's data pointer
+    # to be 32-byte aligned (enforced in build_memref_desc). ``a`` and ``b`` are
+    # per-head-scalar slices of the fused ``in_proj_ba`` output: ``b`` starts at
+    # offset 0 (aligned) but ``a`` starts ``num_v_heads_per_tp`` bf16 elements in,
+    # so when ``num_v_heads_per_tp`` is not a multiple of 16 (e.g. Qwen3.6-35B-A3B
+    # TEP4: 32 v-heads / 4 = 8 -> 16-byte offset) the slice base is not 32-byte
+    # aligned and the kernel aborts. ``.contiguous()`` is NOT enough: at decode
+    # the token dim is 1, so the strided/offset slice already reports as
+    # contiguous (size-1 dims are ignored by is_contiguous) and ``.contiguous()``
+    # is a no-op that keeps the misaligned pointer. Clone into fresh (allocator-
+    # aligned) storage instead, and only when misaligned so the common aligned
+    # case (e.g. Qwen3.5-397B TEP4: 64 / 4 = 16 -> 32-byte offset) stays zero-copy.
+    # q/k/v are sliced on 128-element head boundaries (>=256 B), always aligned.
+    if a.data_ptr() % 32 != 0:
+        a = a.clone(memory_format=torch.contiguous_format)
+    if b.data_ptr() % 32 != 0:
+        b = b.clone(memory_format=torch.contiguous_format)
+
     # Reshape from packed varlen [1, N*T, ...] to batched [N, T, ...].
     q_bat = q.view(N, T_per_seq, q.shape[2], q.shape[3])
     k_bat = k.view(N, T_per_seq, k.shape[2], k.shape[3])
@@ -278,6 +296,10 @@ def _flashinfer_gdn_decode(
     assert T_per_seq == 1, (
         f"_flashinfer_gdn_decode expects standard decode (T_per_seq == 1), got "
         f"{T_per_seq}; _can_use_flashinfer_gdn_decode should keep T == N")
+    # TP8 leaves eight BF16 ``a`` values per Qwen3.5 GDN shard. Odd shards can
+    # start 16 bytes into fused projection storage, but CuTe requires 32B.
+    if a_bat.data_ptr() % 32:
+        a_bat = a_bat.clone(memory_format=torch.contiguous_format)
     _fi_gdn_decode_bf16_state_t1(
         A_log=A_log,
         a=a_bat,
@@ -368,9 +390,17 @@ def _flashinfer_gdn_verify(
     output = (output.view(N, T, HV, V) if output is not None else q.new_empty(
         N, T, HV, V))
     # The FI CuTe-DSL kernel asserts 32-byte data alignment on every tensor
-    # argument. The int32 index tensor may be a slice of a larger buffer
+    # argument. ``a`` starts ``num_v_heads_per_tp`` bf16 elements into the fused
+    # ``in_proj_ba`` output, so it is misaligned when that count is not a
+    # multiple of 16 (e.g. Qwen3.5 TEP16: 128 / 16 = 8) -- see the note in
+    # _flashinfer_gdn_decode for why this clones instead of .contiguous().
+    if a.data_ptr() % 32 != 0:
+        a = a.clone(memory_format=torch.contiguous_format)
+    if b.data_ptr() % 32 != 0:
+        b = b.clone(memory_format=torch.contiguous_format)
+    # The int32 index tensor may likewise be a slice of a larger buffer
     # (e.g. state_indices_d = cache_indices[num_prefills:]) whose 4*offset
-    # storage offset breaks that; .int() is a no-op for int32, so realign
+    # storage offset breaks alignment; .int() is a no-op for int32, so realign
     # with an explicit copy when needed.
     initial_state_indices = initial_state_indices.int()
     if initial_state_indices.data_ptr() % 32 != 0:

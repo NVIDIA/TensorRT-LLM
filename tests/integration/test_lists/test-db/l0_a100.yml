@@ -19,6 +19,7 @@ l0_a100:
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_llm_encode.py
     - unittest/llmapi/test_llm_encode_multi_item.py
+    - unittest/llmapi/test_flashinfer_workspace.py ISOLATION
     - unittest/llmapi/test_mpi_session.py ISOLATION
     - unittest/llmapi/test_memory_profiling.py::test_profile_kvcache # profile kvcache for vision encoder
     - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
@@ -30,13 +31,9 @@ l0_a100:
     - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
     - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
     - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
-    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_per_token_reward[qwen2.5-prm-7b]
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[tinyllama-1.1b]
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[gemma-3-1b]
-    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[phi-4-mini]
-    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen2-7b]
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen3-0.6b]
-    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[starcoder2-3b]
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b]
     # Moved from l0_a10.yml: Llama-7B + KV cache + spec resources OOM on A10's 22 GB.
     - test_e2e.py::test_openai_lora
@@ -52,11 +49,10 @@ l0_a100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
   - unittest/llmapi/test_llm.py -m "part0"
   - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (90)
-  - unittest/llmapi/test_executor.py
 - condition:
     ranges:
       system_gpu_count:

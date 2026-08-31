@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,17 +61,20 @@ Runner::Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim)
 }
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-    int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
-    int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
+    int32_t numFusedSharedExpert, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts,
+    float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
     int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
     bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits,
     btg::Dtype dtypeRoutingBias)
 {
-    if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1)
+    if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1 && numFusedSharedExpert == 0)
     {
-        // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
+        // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess.
+        // NOTE: routingCustom does not implement fused shared experts; when fusion is
+        // requested we fall through to the routingDeepSeek path below (which handles it
+        // for both grouped and non-grouped routing).
         // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
         // kernel because it uses the warp-level routingTopKExperts flow.
         moe::dev::routing::routingCustom::Data routingData;
@@ -174,9 +177,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     else if (routingMethodType == RoutingMethodType::MiniMax2)
     {
-        // MiniMaxM2: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
-        // Similar to DeepSeek no-groups but with routeScale = 1.0 and epsilon = 1e-20
-        // to match the Python reference: weight / (sum + 1e-20).
+        // MiniMaxM2/M3: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
+        // MiniMaxM2 uses the default routeScale = 1.0, while MiniMaxM3 supplies its
+        // model-specific scale. Both use epsilon = 1e-20 to match the Python reference.
         moe::dev::routing::routingCustom::Data routingData;
 
         //
@@ -189,7 +192,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
         routingData.mDtypeBias = dtypeRoutingBias;
-        routingData.mRouteScale = 1.0f;
+        routingData.mRouteScale = routedScalingFactor;
         routingData.mSumEpsilon = 1e-20f;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
@@ -230,9 +233,17 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         TLLM_CHECK_WITH_INFO(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
+        // Fused shared experts assume the full expert set is resident on this rank
+        // (no expert parallelism): the appended experts live at global indices
+        // [numExperts, numExperts + numFusedSharedExpert) on every rank.
+        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0 || (localExpertOffset == 0 && localNumExperts == numExperts),
+            "Fused shared experts do not support expert parallelism yet.");
+
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+
+        int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
 
         // output:
         routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -255,9 +266,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrTopKIds = expertIds;
         routingData.mNumTokens = numTokens;
         routingData.mNumExperts = numExperts;
+        routingData.mNumFusedSharedExperts = numFusedSharedExpert;
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;
         routingData.mTopK = topK;
+        routingData.mTotalExpertsPerToken = totalExpertsPerToken;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
@@ -274,6 +287,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         {
             TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
         }
+        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0, "Llama routing method does not support fusing shared expert");
+
         moe::dev::routing::routingLlama4::Data routingData;
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
@@ -318,6 +333,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     else if (routingMethodType == RoutingMethodType::Renormalize
         || routingMethodType == RoutingMethodType::RenormalizeNaive || routingMethodType == RoutingMethodType::Default)
     {
+        TLLM_CHECK_WITH_INFO(
+            numFusedSharedExpert == 0, "Renormalize routing method does not support fusing shared expert");
+
         moe::dev::routing::routingCustom::Data routingData;
 
         //
@@ -401,7 +419,11 @@ namespace PermuteGemm1
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType)
 {
-    bool is_gated_activation = actType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(actType);
+    // DeepSeek FP8 runs the gated activation as a standalone kernel (see moe::dev::activation),
+    // which only implements SwiGlu math; SiTu is available exclusively through fused FC1 cubins.
+    TLLM_CHECK_WITH_INFO(!(useDeepSeekFp8 && actType == ActType::SiTu),
+        "SiTu activation is not supported with DeepSeek FP8 (no standalone SiTu activation kernel).");
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options;
 
     if (is_gated_activation)
@@ -465,11 +487,11 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
         // FIXME: enforce valid hidden dim to be multiple of 512 due to unhandled OOB read in routeAct. Please keep this
         // in sync with
-        // tensorrt_llm/_torch/modules/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
+        // tensorrt_llm/_torch/moe/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    bool is_gated_activation = mActType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
     mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, numTokens,
         intermediateSizeFactor * validIntermediateSize, validHiddenSize, {}, numTokens, numExperts,
@@ -484,7 +506,7 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
     int32_t numTokens, int32_t configIndex) const
 {
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    int32_t const intermediateSizeFactor = mActType == ActType::SwiGlu ? 2 : 1;
+    int32_t const intermediateSizeFactor = tensorrt_llm::kernels::isGatedActType(mActType) ? 2 : 1;
 
     return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, configIndex);
@@ -494,7 +516,7 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    bool is_gated_activation = mActType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
         hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize,
         validHiddenSize);
@@ -504,7 +526,7 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    bool is_gated_activation = mActType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
         is_gated_activation ? 2 * intermediateSize : intermediateSize, hiddenSize, {}, numTokens, numExperts,
         maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
@@ -622,6 +644,7 @@ Runner::Runner(
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
     , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
     , mActType(actType)
+    , mTileTokensDim(tileTokensDim)
 {
     auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
     auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
@@ -649,6 +672,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     moe::dev::convertsf::Data& convertSfData, moe::dev::activation::Data& activationData,
     moe::dev::finalize::Data& finalizeData)
 {
+    int32_t const totalNumExperts = args.num_experts + args.num_fused_shared_experts;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
     // Setup sf conversion data if needed
     convertSfData.inSfPtr = args.hidden_states_scale;
     convertSfData.outSfPtr = workspace.hidden_states_scale_linear;
@@ -666,10 +692,12 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     activationData.outPtr = workspace.activation_output;
     activationData.inDqSfsPtr = workspace.gemm1_output_scale;
     activationData.outDqSfsPtr = workspace.activation_output_scale;
-    activationData.innerDim = args.intermediate_size * (mActType == ActType::SwiGlu ? 2 : 1);
-    activationData.topK = args.top_k;
+    activationData.innerDim = args.intermediate_size * (tensorrt_llm::kernels::isGatedActType(mActType) ? 2 : 1);
+    activationData.topK = totalExpertsPerToken; // TODO Rename topK in activation data struct
     activationData.numTokens = args.num_tokens;
     activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
+    activationData.numExperts = args.num_experts;
+    activationData.tileTokensDim = mTileTokensDim;
     // For DeepSeek FP8 the activation runs as a separate kernel rather than
     // fused into the FC1 GEMM cubin; forward the scalar swiglu_limit so it
     // can honor swiglu_limit (uniform across experts; see DevKernel.h note).
@@ -699,8 +727,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         }
         finalizeData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
         finalizeData.numTokens = args.num_tokens;
-        finalizeData.numExperts = args.num_experts;
-        finalizeData.topK = args.top_k;
+        finalizeData.numExperts = totalNumExperts; // TODO Is this used?
+        finalizeData.topK = totalExpertsPerToken;  // TODO Rename topK in finalize data struct
         // We want to fuse unpadding into the finalize kernel, so we need to use the output hidden size.
         finalizeData.hiddenDim = args.valid_hidden_size.value_or(args.hidden_size);
         finalizeData.hiddenDimPadded = args.output_hidden_size.value_or(args.hidden_size);
@@ -710,17 +738,20 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 
 std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args, int64_t configIndex) const
 {
+    int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
     auto const& config = mPassingConfigs[configIndex];
 
-    auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(args.top_k, args.hidden_size,
-        args.intermediate_size, args.local_num_experts, args.num_tokens, config.gemm1Config));
-    auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(args.top_k, args.hidden_size,
-        args.intermediate_size, args.local_num_experts, args.num_tokens, config.gemm2Config));
+    auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(totalExpertsPerToken,
+        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm1Config));
+    auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken,
+        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm2Config));
     return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
 std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-    int32_t numLocalExperts, int32_t numTokens, int32_t validIntermediateSize, int32_t validHiddenSize) const
+    int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     std::vector<int64_t> validIndices;
 
@@ -750,7 +781,6 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-
     int32_t indexGemm1 = mPermuteGemm1.getDefaultValidConfigIndex(
         topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
     int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(
@@ -773,6 +803,9 @@ void Runner::run(
     sync_check_cuda_error(stream);
     setOpsData(args, workspace, convertSfData, activationData, finalizeData);
 
+    int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
     void* hidden_states_scale_linear{args.hidden_states_scale};
 
     auto const& config = mPassingConfigs[configIndex];
@@ -780,7 +813,7 @@ void Runner::run(
     mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
         workspace.expert_weights, args.output1_scales_scalar, args.output1_scales_gate_scalar, args.gemm1_bias,
         args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output, workspace.gemm1_output_scale,
-        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
+        totalExpertsPerToken, args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens,
         workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
@@ -801,11 +834,11 @@ void Runner::run(
 
     // Run gemm2
     mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
-        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
-        args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, args.local_num_experts,
-        args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
-        workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-        config.gemm2Config, args.valid_hidden_size.value_or(args.hidden_size),
+        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, totalExpertsPerToken,
+        args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, totalLocalExperts, args.num_tokens,
+        workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+        workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
+        args.valid_hidden_size.value_or(args.hidden_size),
         args.valid_intermediate_size.value_or(args.intermediate_size));
 
     // Run finalize

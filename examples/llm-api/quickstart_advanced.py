@@ -78,17 +78,14 @@ def add_llm_args(parser):
     parser.add_argument('--attention_backend',
                         type=str,
                         default='TRTLLM',
-                        choices=[
-                            'VANILLA', 'TRTLLM', 'FLASHINFER',
-                            'FLASHINFER_STAR_ATTENTION'
-                        ])
+                        choices=['VANILLA', 'TRTLLM', 'FLASHINFER'])
     parser.add_argument(
         '--moe_backend',
         type=str,
         default='AUTO',
         choices=[
-            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'DEEPGEMM',
-            'CUTEDSL', 'TRITON'
+            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM', 'CUTEDSL',
+            'TRITON'
         ],
         help=
         'MoE backend to use. AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.'
@@ -103,9 +100,6 @@ def add_llm_args(parser):
     parser.add_argument('--attention_dp_batching_wait_iters',
                         type=int,
                         default=0)
-    parser.add_argument('--sampler_type',
-                        default="auto",
-                        choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--orchestrator_type',
@@ -194,6 +188,11 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument('--custom_tokenizer',
+                        type=str,
+                        default=None,
+                        help='Override the tokenizer. Accepts a built-in alias '
+                        " or a fully-qualified class import path.")
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -303,6 +302,8 @@ def setup_llm(args, **kwargs):
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
+        speculative_model = (args.draft_model_dir if args.draft_model_dir
+                             is not None else args.model_dir)
         spec_config = MTPDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
@@ -310,7 +311,10 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
-            speculative_model=args.model_dir)
+            use_dynamic_tree=args.use_dynamic_tree,
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK,
+            max_total_draft_tokens=args.max_total_draft_tokens,
+            speculative_model=speculative_model)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -370,7 +374,6 @@ def setup_llm(args, **kwargs):
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine, load_balancer=args.moe_load_balancer_config),
-        sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
@@ -387,6 +390,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        custom_tokenizer=args.custom_tokenizer,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1

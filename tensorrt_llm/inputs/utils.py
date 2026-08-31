@@ -15,7 +15,7 @@ import soundfile
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
-from transformers import AutoProcessor, ProcessorMixin
+from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
@@ -351,11 +351,15 @@ class ConversationMessage(TypedDict, total=False):
             This is used by `interleave_mm_placeholders` to insert multimodal placeholders at the
             correct positions, and to reconstruct the OpenAI-style content list for templates that
             handle media natively.
+        tools: Message-level (dynamic) tool declarations carried on system messages. Only
+            populated for models whose python-renderer chat template consumes them (kimi_k3);
+            absent for other models.
     """
     role: str
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
+    tools: List[Dict[str, Any]]
 
 
 class MultimodalDataTracker:
@@ -372,6 +376,14 @@ class MultimodalDataTracker:
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
+        # Prompt-order manifest of data-backed items. Each entry is
+        # `{"modality": <str>, "index": <int>, "placeholder": <str>}`:
+        # `modality` is the modality name, `index` is the item's position in
+        # `multi_modal_data[modality]`, and `placeholder` is the exact string
+        # the input processor splices this item's embedding into. Populated by
+        # `add_data` (skipping `is_embedding=True` items — the interleave
+        # manifest addresses raw payload only).
+        self._item_order: list[dict[str, Union[str, int]]] = []
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
@@ -440,6 +452,12 @@ class MultimodalDataTracker:
             self._embeddings[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
                                                       media_type, current_count)
+        if not is_embedding:
+            self._item_order.append({
+                "modality": media_type,
+                "index": len(self._data[media_type]),
+                "placeholder": placeholder,
+            })
         (self._embeddings
          if is_embedding else self._data)[media_type].append(data)
         if placeholder:
@@ -455,20 +473,63 @@ class MultimodalDataTracker:
         """Get the mapping from placeholder string to modality name."""
         return dict(self._placeholder_to_modality)
 
+    def item_order(self) -> List[Dict[str, Union[str, int]]]:
+        """Prompt-order manifest of data-backed items.
 
-def add_multimodal_placeholders(model_type: str, text_prompt: str,
-                                mm_placeholder_counts: dict[str, int]) -> str:
+        Each entry is `{"modality": <str>, "index": <int>, "placeholder": <str>}`.
+        `index` is the item's position in `multi_modal_data[modality]`;
+        `placeholder` is the exact string the input processor will look
+        for when splicing this item's encoder embedding.
+
+        Items are recorded in chat-part send order. When the model's chat
+        template regroups placeholders by modality (declared via
+        `MultimodalPlaceholderMetadata.prompt_modality_order`), sort by
+        that priority so the returned list matches what the template
+        actually emits — preserving per-modality send order as the tie
+        break.
+        """
+        prompt_order = MULTIMODAL_PLACEHOLDER_REGISTRY.get_prompt_modality_order(
+            self._model_type)
+        if not prompt_order:
+            return list(self._item_order)
+        rank = {m: i for i, m in enumerate(prompt_order)}
+        return sorted(
+            self._item_order,
+            key=lambda e:
+            (rank.get(e["modality"], len(prompt_order)), e["index"]),
+        )
+
+
+def add_multimodal_placeholders(
+    model_type: str,
+    text_prompt: str,
+    mm_placeholder_counts: dict[str, int],
+    item_order: Optional[List[Dict[str, Union[str, int]]]] = None,
+) -> str:
     """Add multimodal placeholders to the text prompt.
 
-    Placeholders that already exist in the text are counted and subtracted
-    from the requested count to avoid double-insertion (e.g. when the
-    client already embeds ``<image>`` in the prompt text).
+    Placeholders already in the text are counted and subtracted to
+    avoid double-insertion (e.g. when the client already embeds
+    `<image>` in the prompt text). When `item_order` is supplied,
+    placeholders are emitted in prompt-arrival order (needed for mixed
+    modality); otherwise they follow `mm_placeholder_counts` iteration
+    order.
     """
+    if item_order:
+        wanted = [e["placeholder"] for e in item_order]
+    else:
+        wanted = [
+            ph for ph, n in mm_placeholder_counts.items() for _ in range(n)
+        ]
+
+    remaining = {ph: text_prompt.count(ph) for ph in set(wanted)}
     placeholders = []
-    for placeholder, count in mm_placeholder_counts.items():
-        existing = text_prompt.count(placeholder)
-        needed = max(0, count - existing)
-        placeholders.extend([placeholder] * needed)
+    for ph in wanted:
+        if remaining[ph] > 0:
+            remaining[ph] -= 1
+        else:
+            placeholders.append(ph)
+
     if not placeholders:
         return text_prompt
     parts = []
@@ -543,6 +604,15 @@ def interleave_mm_placeholders(
                 modality_cursor[media_type] = cursor + 1
 
     return separator.join(parts)
+
+
+def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
+    """Return whether a tokenizer overrides Hugging Face's Jinja renderer."""
+    apply_chat_template_method = getattr(type(tokenizer), "apply_chat_template",
+                                         None)
+    return (apply_chat_template_method is not None
+            and apply_chat_template_method
+            is not PreTrainedTokenizerBase.apply_chat_template)
 
 
 def resolve_hf_chat_template(
@@ -650,6 +720,7 @@ def apply_chat_template(
 
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
+    - PYTHON: use a tokenizer-native renderer when no Jinja template is declared
     - OPENAI: reconstructs content as list of dicts for the template to handle
     - STRING: keeps flattened text with pre-inserted placeholders
     """
@@ -674,6 +745,21 @@ def apply_chat_template(
 
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
+
+    if (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer)):
+        native_kwargs = dict(chat_template_kwargs or {})
+        if documents is not None:
+            native_kwargs["documents"] = documents
+        return tokenizer.apply_chat_template(
+            conversation,
+            tools=tools,
+            tokenize=enable_tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **native_kwargs,
+        )
 
     hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
                                                 chat_template, tools)
@@ -923,6 +1009,9 @@ def default_multimodal_input_loader(
                 input[
                     "multi_modal_data"], _ = mm_data_tracker.retrieve_all_sync(
                     )
+            item_order = mm_data_tracker.item_order()
+            if item_order:
+                input["mm_item_order"] = item_order
         inputs.append(input)
 
     return inputs

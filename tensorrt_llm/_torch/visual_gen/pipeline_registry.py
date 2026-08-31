@@ -57,6 +57,8 @@ class PipelineComponent(str, Enum):
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
     SOUND_TOKENIZER = "sound_tokenizer"
+    GUIDER = "guider"
+    VISION_LANGUAGE_ENCODER = "vision_language_encoder"
 
 
 @dataclass
@@ -182,11 +184,16 @@ class AutoPipeline:
                 return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
+            if "QwenImageLayered" in class_name:
+                return "QwenImageLayeredPipeline"
             if "QwenImage" in class_name:
                 return "QwenImagePipeline"
 
             if "Cosmos3" in class_name:
                 return "Cosmos3OmniMoTPipeline"
+
+            if "HunyuanVideo15" in class_name:
+                return "HunyuanVideo15Pipeline"
 
         #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2 specific)

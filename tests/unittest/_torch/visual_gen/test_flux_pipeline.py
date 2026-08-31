@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import PIL.Image
 import pytest
 import torch
 import torch.distributed as dist
@@ -767,6 +768,76 @@ class TestFluxE2E:
 
         # from HF is expected (~15 dB) compared to FLUX.1 (~32 dB).
         assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_reference_image_e2e_vs_hf(self, flux2_checkpoint_exists):
+        """FLUX.2 reference-image generation matches the diffusers pipeline."""
+        from diffusers import Flux2Pipeline as HFFlux2Pipeline
+
+        reference_array = np.zeros((256, 256, 3), dtype=np.uint8)
+        reference_array[..., 0] = np.arange(256, dtype=np.uint8)[None, :]
+        reference_array[..., 1] = np.arange(256, dtype=np.uint8)[:, None]
+        reference_array[..., 2] = 127
+        reference_image = PIL.Image.fromarray(reference_array)
+        cases = [
+            {
+                "image": reference_image,
+                "prompt": "turn the reference into a detailed watercolor painting",
+                "height": 256,
+                "width": 256,
+                "num_images_per_prompt": 1,
+            },
+            {
+                "image": [
+                    reference_image.resize((160, 128)),
+                    PIL.Image.new("RGB", (112, 96), color=(30, 90, 180)),
+                    PIL.Image.new("RGB", (80, 64), color=(180, 90, 30)),
+                ],
+                "prompt": [
+                    "combine the references into a watercolor scene",
+                    "combine the references into a pencil illustration",
+                ],
+                "height": None,
+                "width": None,
+                "num_images_per_prompt": 2,
+            },
+        ]
+
+        hf_pipe = HFFlux2Pipeline.from_pretrained(
+            FLUX2_CHECKPOINT_PATH, torch_dtype=torch.bfloat16
+        ).to("cuda")
+        hf_images = []
+        for case in cases:
+            hf_result = hf_pipe(
+                **case,
+                num_inference_steps=4,
+                guidance_scale=4.0,
+                generator=torch.Generator("cuda").manual_seed(42),
+            )
+            hf_images.append(np.stack([np.array(image) for image in hf_result.images]))
+        del hf_pipe
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        pipeline = PipelineLoader(VisualGenArgs(model=FLUX2_CHECKPOINT_PATH)).load()
+        for case, hf_image_batch in zip(cases, hf_images):
+            result = pipeline.forward(
+                **case,
+                num_inference_steps=4,
+                guidance_scale=4.0,
+                seed=42,
+            )
+            native_image_batch = result.image.cpu().numpy()
+
+            assert native_image_batch.shape == hf_image_batch.shape
+            for hf_image, native_image in zip(hf_image_batch, native_image_batch):
+                mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
+                psnr = 10 * np.log10(255**2 / mse) if mse > 0 else float("inf")
+                assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
 
         del pipeline
         gc.collect()

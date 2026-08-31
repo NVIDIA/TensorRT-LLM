@@ -16,7 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -44,7 +44,7 @@ struct AllReduceFusionParams
 {
     int nranks;
     int rank;
-    nvinfer1::DataType dtype;
+    tensorrt_llm::DataType dtype;
     // size = token_num * hidden_dim
     int size;
     int hidden_dim;
@@ -94,7 +94,7 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
     // Refer to kernel implementation on layout of those params
     // number of active experts on current device
     int top_k;
-    nvinfer1::DataType scale_dtype;
+    tensorrt_llm::DataType scale_dtype;
     // [num_tokens, top_k]
     void* expert_scale_factor = nullptr;
     void* shared_expert_output = nullptr;

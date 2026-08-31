@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import argparse
 import glob
@@ -13,6 +27,8 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 import yaml
+
+DEFAULT_SERVER_HEALTH_TIMEOUT = 1800
 
 
 def parse_args():
@@ -40,6 +56,17 @@ def parse_args():
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def get_server_health_timeout(env_config: Dict[str, Any]) -> int:
+    """Return the configured server health timeout in seconds."""
+    timeout = env_config.get('server_health_timeout',
+                             DEFAULT_SERVER_HEALTH_TIMEOUT)
+    if isinstance(timeout,
+                  bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError(
+            "environment.server_health_timeout must be a positive integer")
+    return timeout
 
 
 def save_worker_config(worker_config, output_path):
@@ -229,6 +256,26 @@ def replace_env_in_file(log_dir, file_path, env_var):
     return tmp_dir
 
 
+def _parse_positive_concurrency(value):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}")
+
+    try:
+        concurrency = int(value)
+    except ValueError as error:
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}") from error
+
+    if concurrency <= 0:
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}")
+    return concurrency
+
+
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                              nsys_on, profile_range, concurrency):
     """Build complete environment dictionary for worker processes.
@@ -257,30 +304,17 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         upsert_env_config(env_config, 'worker_env_var',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1')
-    if benchmark_mode == "gen_only":
-        upsert_env_config(env_config, 'worker_env_var',
+    if benchmark_mode == "gen_only" and role == "GEN":
+        # GEN worker only: skipping transfer-state polling helps the generation
+        # worker, but the same flag on the CTX worker has been seen to hang
+        # gen_only runs with KV blocks never released.
+        upsert_env_config(env_config, 'gen_worker_env_var',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
-        if role == "GEN":
-            gen_config = worker_config.get('gen', {})
-            concurrency_int = int(concurrency)
-            max_batch_size = int(
-                gen_config.get('max_batch_size', concurrency_int))
-            enable_attention_dp = gen_config.get('enable_attention_dp', False)
-            tp_size = int(gen_config.get('tensor_parallel_size', 1))
-            max_capacity = ((max_batch_size * tp_size)
-                            if enable_attention_dp else max_batch_size)
-            queue_size = min(max_capacity, concurrency_int)
-            if queue_size < concurrency_int:
-                print(f"[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
-                      f"{queue_size} (max_batch_size={max_batch_size} x "
-                      f"tp_size={tp_size} with "
-                      f"attention_dp={enable_attention_dp}) "
-                      f"which is less than concurrency={concurrency}. "
-                      f"Fill loop would hang if set to {concurrency}.")
-            upsert_env_config(env_config, 'gen_worker_env_var',
-                              'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size}')
+        concurrency = _parse_positive_concurrency(concurrency)
+        upsert_env_config(env_config, 'gen_worker_env_var',
+                          'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
+                          f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
@@ -622,13 +656,26 @@ def submit_job(config, log_dir, dry_run):
                             hf.write(f"{host}\n")
                             gm.write(f"{rank} {host} {gpu}\n")
                             rank += 1
+                # Compact packing derives CUDA_VISIBLE_DEVICES from gpu_map.
+                cuda_devices = "none"
             else:
                 # Default packing: each node is dedicated to one worker, so
-                # SLURM_LOCALID directly maps to the physical GPU id in
-                # start_worker.sh (no hostfile/gpu_map needed).
+                # every rank on that node is given the node's full GPU list and
+                # binds to its own device via mapping.local_rank
+                # (= rank % gpus_per_node). Exposing the whole node is required
+                # for intra-node TP custom all-reduce (attention_dp=false /
+                # TEP), whose cudaDeviceCanAccessPeer() topology check must see
+                # the peer GPUs; pinning one GPU per rank only works for DEP.
                 node_list = list(allocation["nodes"].keys())
                 num_nodes = len(node_list)
+                # Whole-node ownership means every node carries the same GPU
+                # layout, so the first node's list applies to all ranks.
+                gpu_ids = sorted(list(allocation["nodes"].values())[0])
+                cuda_devices = ','.join(map(str, gpu_ids))
 
+            concurrency_list = benchmark_config['concurrency_list']
+            concurrency = (concurrency_list.split(',')[0] if isinstance(
+                concurrency_list, str) else concurrency_list)
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -636,7 +683,7 @@ def submit_job(config, log_dir, dry_run):
                 benchmark_mode=benchmark_config['mode'],
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
-                concurrency=benchmark_config['concurrency_list'].split(',')[0],
+                concurrency=concurrency,
             )
             export_str = format_export_string(worker_env)
 
@@ -670,6 +717,7 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
+                cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -701,12 +749,17 @@ def submit_job(config, log_dir, dry_run):
     )
 
     # Generate wait server command (use script_dir for wait_server.sh)
+    server_health_timeout = get_server_health_timeout(env_config)
+    wait_server_script = os.path.join(script_dir, 'wait_server.sh')
+    wait_server_command = (
+        f"bash {wait_server_script} {disagg_server_hostname} "
+        f"{disagg_server_port} {server_health_timeout}")
     cmd = [
         "srun -l",
         f"--container-name={container_name}",
         f"--container-mounts={container_mount_str}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port}",
+        wait_server_command,
         f"&> {log_dir}/5_wait_server.log",
     ]
     start_server_cmds.append(" ".join(cmd))

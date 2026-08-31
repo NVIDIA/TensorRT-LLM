@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ from typing import Optional
 
 from blocks import Stage, YAMLIndex, _entry_target
 
-from ._helpers import resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 # Source paths AutoDeployRule claims. Tests under tests/unittest/auto_deploy/
@@ -97,10 +97,6 @@ def _ad_entries(block) -> list[str]:
     return [t for t in block.tests if _entry_is_ad_leaker(t)]
 
 
-def _is_perf_stem(stem: str) -> bool:
-    return stem == "l0_perf" or "perf_sanity" in stem
-
-
 class AutoDeployRule(Rule):
     name = "autodeploy"
     needs_diff_for: tuple[str, ...] = ()
@@ -141,7 +137,7 @@ class AutoDeployRule(Rule):
             )
 
         affected = resolve_affected_stages(block_filters, self.yaml_index, self._stages_by_yaml)
-        perfsanity_relevant = any(_is_perf_stem(stem) for stem, _ in block_filters)
+        perfsanity_relevant = any(is_perf_stem(stem) for stem, _ in block_filters)
 
         return RuleResult(
             handled_files=claimed,

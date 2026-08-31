@@ -64,7 +64,8 @@ class PositionEmbeddingType(IntEnum):
 
     def is_rope(self) -> bool:
         return self in [
-            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope
+            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope,
+            self.yarn
         ]
 
     def is_mrope(self) -> bool:

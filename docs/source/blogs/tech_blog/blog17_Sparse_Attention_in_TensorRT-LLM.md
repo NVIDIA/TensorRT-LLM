@@ -220,7 +220,7 @@ Figure 4 illustrates the prediction implementation within TensorRT LLM. To suppo
 
 **Auxiliary memory management.** Managing the paged KT cache presented another challenge. `RocketKVCacheManager` inherits from `KVCacheManager` and extends it with a dedicated `BlockManager` for the auxiliary KT cache at the Python level. The main KV cache and the KT cache share block IDs for each request, so that the lifecycle of KT cache blocks is automatically tied to the corresponding KV cache blocks. The `BlockManager` handles slot allocation and deallocation for the KT cache independently, while `RocketKVCacheManager` overrides methods such as `get_cache_bytes_per_token` and `prepare_resources` to ensure that memory sizing accounts for the extra KT cache footprint and that the correct KT cache pointers are passed to prediction kernels at each step. This design keeps the integration lightweight and easy to iterate on, though it inherits the limitations of Python-level management—namely, no automatic support for KV cache reuse or disaggregated serving. 
 
-The concrete implementation can be found in `tensorrt_llm/_torch/attention_backend/sparse/rocket.py`.
+The concrete implementation can be found in `tensorrt_llm/_torch/attention_backend/sparse/rocket/`.
 
 ### DeepSeek Sparse Attention (DSA)
 
@@ -261,7 +261,7 @@ As with RocketKV, a dedicated metadata class `DSATrtllmAttentionMetadata` is def
 
 **Auxiliary memory management.** DSA requires an auxiliary **indexer K cache** to store the low-rank K projections for reuse across decoding steps. `DSAKVCacheManager` inherits from `KVCacheManager`, but unlike RocketKV's Python-level KT cache management, DSA's indexer K cache is integrated directly into the C++ `KVCacheManager`. This design enables compatibility with advanced features such as KV cache reuse, chunked prefill, and disaggregated serving—features that would be difficult to support with a Python-level manager. 
 
-The concrete implementation can be found in `tensorrt_llm/_torch/attention_backend/sparse/dsa.py`.
+The concrete implementation can be found in `tensorrt_llm/_torch/attention_backend/sparse/dsa/`.
 
 For a comprehensive description of DSA kernel optimizations, precision strategies, feature support (MTP, disaggregated serving, Wide-EP), and benchmark results, please refer to the dedicated blog post: [Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md).
 

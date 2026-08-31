@@ -92,4 +92,4 @@ worker_config:
       backend: DEEPGEMM
     cache_transceiver_config:
       backend: DEFAULT
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false

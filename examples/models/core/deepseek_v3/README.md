@@ -368,11 +368,11 @@ To serve the model in disaggregated mode, you should launch context and generati
 For example, you can launch a single context server on port 8001 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
-
 cat >./ctx_config.yml <<EOF
 print_iter_log: true
 enable_attention_dp: true
+cache_transceiver_config:
+  backend: NIXL
 EOF
 
 trtllm-serve \
@@ -392,8 +392,6 @@ trtllm-serve \
 And you can launch two generation servers on port 8002 and 8003 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
-
 cat >./gen_config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
@@ -410,6 +408,8 @@ cuda_graph_config:
     - 384
 print_iter_log: true
 enable_attention_dp: true
+cache_transceiver_config:
+  backend: NIXL
 EOF
 
 for port in {8002..8003}; do \
@@ -863,10 +863,10 @@ echo "All processes completed!"
 The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
 
 ### KV Cache Reuse
-KV cache reuse is supported for MLA on SM90, SM100 and SM120. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+KV cache reuse is supported for MLA on SM90, SM100, SM103, SM120 and SM121. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ### Chunked Prefill
-Chunked Prefill is supported for MLA only on SM90 and SM100 currently. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+Chunked Prefill is supported for MLA on SM90, SM100, SM103 and SM120. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
 
 More specifically, we can imitate what we did in the [Quick Start](#quick-start):
 

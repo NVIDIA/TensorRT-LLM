@@ -14,7 +14,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,7 +27,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DEFAULT_BEAM_INDEX
 from tensorrt_llm.sampling_params import SamplingParams
@@ -55,11 +57,13 @@ class _StatsRequest:
     is_disagg_generation_transmission_complete: bool = False
     is_finished_due_to_cancellation: bool = False
     context_phase_params: None = None
+    return_perf_metrics: bool = False
     py_draft_tokens: list[int] = field(default_factory=list)
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
     context_chunk_size: int = 0
+    expect_snapshot_points: list[int] = field(default_factory=list)
     prepopulated_prompt: tuple[int, int] | None = None
     kv_cache_perf_metric_calls: list[dict[str, int]] = field(default_factory=list)
     multimodal_hashes: None = None
@@ -81,6 +85,15 @@ class _StatsRequest:
     def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
         assert beam_id == DEFAULT_BEAM_INDEX
         return self.tokens
+
+    def get_tokens_view(self, beam_id: int = DEFAULT_BEAM_INDEX) -> np.ndarray:
+        """Mirror LlmRequest.get_tokens_view, which the C++ backend takes on the reuse path.
+
+        The real binding returns a zero-copy contiguous 1-D int32 view of the token buffer;
+        the dtype matters because it selects the C++ int32 ingest fast path.
+        """
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return np.asarray(self.tokens, dtype=np.int32)
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
@@ -117,15 +130,21 @@ def _create_manager(
     enable_partial_reuse: bool = True,
     block_reuse_policy: str = "all_reusable",
     enable_stats: bool = True,
+    max_util_for_resume: float = 1.0,
 ) -> KVCacheManagerV2:
+    # NOTE: sizing here is by max_gpu_total_bytes, not max_tokens, so
+    # max_util_for_resume is a pure resume gate with no effect on the pool size
+    # (KVCacheManagerV2 only applies the 1/max_util_for_resume quota inflation
+    # on the max_tokens branch). Lowering it therefore starves resume() without
+    # silently growing the pool underneath the test.
     return KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=enable_block_reuse,
             enable_partial_reuse=enable_partial_reuse,
             max_gpu_total_bytes=gpu_bytes,
-            max_util_for_resume=1.0,
+            max_util_for_resume=max_util_for_resume,
             max_attention_window=max_attention_window,
-            block_reuse_policy=block_reuse_policy,
+            block_reuse_config=BlockReuseConfig(policy=block_reuse_policy),
         ),
         CacheType.SELF,
         num_layers=num_layers,
@@ -276,6 +295,44 @@ def _assert_request_stats(
     assert request.alloc_new_blocks == alloc_new
     assert request.reused_blocks == reused
     assert request.missed_blocks == missed
+
+
+@pytest.mark.parametrize(
+    ("is_active", "resume_succeeds", "expected_result", "expected_calls"),
+    [
+        (True, False, True, []),
+        (False, False, False, ["resume"]),
+        (False, True, True, ["resume", "restore"]),
+    ],
+)
+def test_v2_resume_restores_offsets_only_after_execution_stream_ready(
+    is_active: bool,
+    resume_succeeds: bool,
+    expected_result: bool,
+    expected_calls: list[str],
+) -> None:
+    """V2 restores page tables only after resume joins the execution stream."""
+    manager = object.__new__(KVCacheManagerV2)
+    execution_stream = object()
+    manager._stream = SimpleNamespace(cuda_stream=execution_stream)
+    calls: list[str] = []
+
+    def resume(actual_stream: object) -> bool:
+        assert actual_stream is execution_stream
+        calls.append("resume")
+        return resume_succeeds
+
+    kv_cache = SimpleNamespace(is_active=is_active, resume=resume)
+
+    def restore(request_id: int, actual_cache: object) -> None:
+        assert request_id == 17
+        assert actual_cache is kv_cache
+        calls.append("restore")
+
+    manager._restore_page_index_bufs = restore
+
+    assert manager._resume_and_restore(17, kv_cache) is expected_result
+    assert calls == expected_calls
 
 
 def _run_v1_context(manager: KVCacheManagerV1, request: LlmRequest):
@@ -813,3 +870,140 @@ def test_pool_group_stats_are_reported(resource_guard) -> None:
         alloc_new=2,
         missed=2,
     )
+
+
+def _make_active_request(resource_guard) -> tuple[KVCacheManagerV2, _StatsRequest]:
+    """Create a manager + request driven to an active generation state.
+
+    The intermediate _commit_and_get_stats calls drain the iteration stats, so the
+    suspend/resume counters are back to 0 when the helper returns regardless of
+    what the admission path did.
+    """
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(_create_manager(gpu_bytes=8 << 20), request)
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=8)
+    _finish_context(manager, request)
+    _commit_and_get_stats(manager, _context_batch(request))
+    assert manager.try_allocate_generation(request)
+    _commit_and_get_stats(manager, _generation_batch(request))
+    return manager, request
+
+
+def test_admission_is_not_counted_as_a_resume(resource_guard) -> None:
+    """Bringing a brand-new request up must not increment the resume counter.
+
+    A freshly-created _KVCache starts SUSPENDED and is activated by the resume()
+    that prepare_context performs, so an ungated counter would tick once per
+    admitted request -- turning iterResumedRequests into an arrival-rate metric
+    and making the integration test's `resumed > 0` gate pass without any
+    preemption ever happening.
+    """
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(_create_manager(gpu_bytes=8 << 20), request)
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=8)
+    _finish_context(manager, request)
+
+    stats_report = manager.get_iteration_stats()
+    assert stats_report is not None
+    assert stats_report.suspended_requests == 0
+    assert stats_report.resumed_requests == 0
+
+
+def test_suspend_resume_iteration_stats_are_reported(resource_guard) -> None:
+    """A suspend + successful resume increments the manager-level iteration counters.
+
+    This is the black-box signal I-10 asserts on: offload/onboard bytes stay 0 on
+    suspend (pages go LOCKED->HELD, kept on GPU), so they cannot confirm the
+    ACTIVE<->SUSPENDED state machine fired -- these counters can.
+
+    Unlike the admission path (see test_admission_is_not_counted_as_a_resume), this
+    cache was already ACTIVE before being suspended, so the resume is a genuine
+    preemption recovery and does count.
+    """
+    manager, request = _make_active_request(resource_guard)
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.is_active
+    kv_cache.suspend()
+    assert not kv_cache.is_active
+    assert kv_cache.resume(manager._stream.cuda_stream)
+    assert kv_cache.is_active
+
+    stats_report = manager.get_iteration_stats()
+    assert stats_report is not None
+    assert stats_report.suspended_requests == 1
+    assert stats_report.resumed_requests == 1
+
+
+def _bring_up(manager: KVCacheManagerV2, request: _StatsRequest) -> None:
+    """Drive *request* all the way to an ACTIVE generation state."""
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=len(request.tokens))
+    _finish_context(manager, request)
+    _commit_and_get_stats(manager, _context_batch(request))
+    assert manager.try_allocate_generation(request)
+    _commit_and_get_stats(manager, _generation_batch(request))
+
+
+def test_refused_resume_is_not_counted_as_a_recovery(resource_guard) -> None:
+    """A resume() that is refused must not increment the resume counter.
+
+    resume() returns False before it reaches ACTIVE when the hot tier sits above
+    max_util_for_resume. The suspend that preceded it still counts -- the request
+    really did leave the ACTIVE set -- but nothing was recovered, so
+    resumed_requests must stay 0 and the cache must stay SUSPENDED.
+
+    Without this case, a regression that counted resume *attempts* rather than
+    successes (for example, hoisting the increment above the early returns in
+    _KVCache.resume) would pass every other test in this file.
+
+    Sizing is two-sided and easy to get wrong, so the numbers below are measured,
+    not estimated (16 MiB => 8 blocks of 4 tokens):
+
+      * A alone ACTIVE            -> 2/8 = 0.250 utilization
+      * A + B both ACTIVE         -> 7/8 = 0.875
+      * A SUSPENDED, B ACTIVE     -> 5/8 = 0.625
+
+    Admission also goes through resume() -- a fresh cache starts SUSPENDED -- so
+    the gate must be >= 0.250 or B could never be admitted in the first place.
+    Refusal needs utilization strictly above the gate (the check is `>`, not
+    `>=`), so the gate must be < 0.625. 0.4 sits at least 0.15 clear of both
+    bounds. B must stay ACTIVE to hold the tier up: suspending A returns its
+    pages to the pool, so a lone suspended request can never gate its own resume.
+    """
+    request_a = _StatsRequest(1, list(range(4)), context_remaining_length=4)
+    request_b = _StatsRequest(2, list(range(100, 116)), context_remaining_length=16)
+    manager = resource_guard(
+        _create_manager(gpu_bytes=16 << 20, max_util_for_resume=0.4),
+        request_a,
+        request_b,
+    )
+
+    _bring_up(manager, request_a)
+    _bring_up(manager, request_b)
+
+    kv_cache_a = manager.kv_cache_map[request_a.py_request_id]
+    assert kv_cache_a.is_active
+    # Drain first: the _commit_and_get_stats calls above consume iteration stats,
+    # so the counters must start from zero *after* the last bring-up.
+    manager.get_iteration_stats()
+
+    kv_cache_a.suspend()
+    assert not kv_cache_a.is_active
+
+    refused = not kv_cache_a.resume(manager._stream.cuda_stream)
+    assert refused, (
+        "resume() succeeded, so this test is not exercising the refusal path -- "
+        "retune gpu_bytes/max_util_for_resume against the utilizations in the "
+        "docstring so B alone sits strictly above the gate"
+    )
+    assert not kv_cache_a.is_active
+
+    stats_report = manager.get_iteration_stats()
+    assert stats_report is not None
+    assert stats_report.suspended_requests == 1
+    assert stats_report.resumed_requests == 0

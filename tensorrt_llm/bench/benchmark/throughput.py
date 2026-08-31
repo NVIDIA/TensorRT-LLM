@@ -195,6 +195,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     "length of dataset.",
 )
 @optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requires --concurrency. Requests dropped at the deadline are excluded from the report, so the statistics "
+    "cover the requests that completed rather than the whole dataset.",
+)
+@optgroup.option(
     "--warmup",
     type=int,
     default=2,
@@ -328,6 +337,14 @@ def throughput_command(
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
@@ -468,6 +485,7 @@ def throughput_command(
             "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
         llm = get_llm(runtime_config, kwargs)
+        startup_metrics = llm.startup_metrics
 
         sampler_args = {
             "end_id": options.eos_id,
@@ -518,15 +536,21 @@ def throughput_command(
                                 options.concurrency,
                                 iteration_writer.full_address,
                                 modality=options.modality,
-                                tokenizer=multi_turn_tokenizer))
+                                tokenizer=multi_turn_tokenizer,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, options.streaming)
+        report_utility = ReportUtility(statistics,
+                                       metadata,
+                                       runtime_config,
+                                       logger,
+                                       kwargs,
+                                       options.streaming,
+                                       startup_metrics=startup_metrics)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

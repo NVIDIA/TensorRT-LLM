@@ -35,6 +35,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      perf_metrics_output_dir:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
@@ -60,6 +64,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      num_serve_frontends:
+        annotation: int
+        default: 1
+        status: prototype
       custom_tokenizer:
         annotation: Optional[str]
         default: null
@@ -74,6 +82,10 @@ methods:
         default: null
         status: prototype
       # Runtime behavior
+      generation_config:
+        annotation: Literal['auto', 'trtllm']
+        default: trtllm
+        status: prototype
       garbage_collection_gen0_threshold:
         annotation: int
         default: 20000
@@ -87,6 +99,14 @@ methods:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
+      encoder_cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig]
+        default: null
+        status: prototype
+      enable_encoder_decoder_mixed_cuda_graph:
+        annotation: bool
+        default: True
+        status: prototype
       multimodal_config:
         annotation: tensorrt_llm.llmapi.llm_args.MultimodalConfig
         default: null
@@ -151,10 +171,6 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
-      sampler_type:
-        annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
-        default: auto
-        status: deprecated
       sampler_force_async_worker:
         annotation: bool
         default: False
@@ -198,7 +214,7 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
-        status: prototype
+        status: deprecated
       prometheus_metrics_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
         default: null
@@ -209,6 +225,14 @@ methods:
         status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
+        default: null
+        status: prototype
+      prefill_cuda_graph_backend:
+        annotation: tensorrt_llm.llmapi.llm_args.PrefillCudaGraphBackend
+        default: disabled
+        status: prototype
+      prefill_capture_num_tokens:
+        annotation: Optional[List[int]]
         default: null
         status: prototype
       enable_autotuner:
@@ -252,7 +276,7 @@ methods:
         default: null
         status: prototype
       kv_cache_compression_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheCompressionConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:
@@ -437,6 +461,10 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  get_data_transceiver_state:
+    parameters: {}
+    return_annotation: bytes
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None
@@ -446,5 +474,8 @@ properties:
     annotation: str
     default: inspect._empty
   disaggregated_params:
+    annotation: dict
+    default: None
+  startup_metrics:
     annotation: dict
     default: None

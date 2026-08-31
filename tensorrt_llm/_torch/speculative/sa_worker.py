@@ -21,7 +21,6 @@ integrating the suffix automaton pattern matching into the model's forward pass.
 Key components:
 - SASpecMetadata: Metadata for SA speculative decoding
 - SAWorker: Spec worker that uses suffix automaton for draft generation
-- SASampler: Sampler that handles GPU->CPU result extraction
 """
 
 from dataclasses import dataclass, field
@@ -31,9 +30,8 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..pyexecutor.sampler import TorchSampler
+from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from .interface import SpecMetadata, SpecWorkerBase
-from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
@@ -119,7 +117,7 @@ class SAWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self._max_draft_len
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
@@ -179,6 +177,20 @@ class SAWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata
         )
+
+        # Hybrid (SSM/recurrent) models: promote the accepted step's
+        # recurrent state from the verification scratch buffers into the
+        # live pools — verification never writes the pools in place (a
+        # rejected draft would corrupt them). Same call site as the other
+        # one-engine workers (dflash/eagle3); no-op for pure-attention
+        # models via the isinstance gate.
+        num_gens = batch_size - num_contexts
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
 
         # Step 3-4: Extend SA and generate next draft tokens using GPU kernel
         next_draft_tokens = self._generate_draft_tokens(
@@ -319,20 +331,3 @@ class SAWorker(SpecWorkerBase):
         draft_tokens = draft_tokens * mask
 
         return draft_tokens  # [batch_size, max_draft_len] GPU tensor
-
-
-class SASampler(SpecSamplerBase):
-    """
-    Sampler for SA that extracts GPU results to CPU after graph replay.
-
-    Uses SpecSamplerBase with default behavior (draft_len + 1 storage,
-    adds dummy draft tokens for context requests).
-    """
-
-    SampleState = SampleStateSpec
-
-    def __init__(self, args: TorchSampler.Args, *, max_draft_len: int):
-        super().__init__(args, draft_len=max_draft_len)
-
-    def is_generation_model(self) -> bool:
-        return True

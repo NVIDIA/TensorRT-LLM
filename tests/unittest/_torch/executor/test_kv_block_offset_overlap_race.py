@@ -103,6 +103,53 @@ def _reference_offsets(mgr, ids):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_copy_batch_block_offsets_max_blocks_staging_width():
+    """``max_blocks`` bounds the staged H2D width; ``None`` stages the full
+    allocated width.
+
+    The bounded copy must leave destination columns beyond the cap untouched
+    (callers only pass a cap when nothing reads past it), and the unbounded
+    copy must ship every allocated block: speculative decoding allocates
+    blocks past the host kv_lens snapshot and its kernels dereference those
+    columns, so capping by a host-derived block count corrupted the device
+    block table (EAGLE3 warmup illegal memory access).
+    """
+    mgr = _build_manager()
+
+    ids = list(range(1, 1 + _BATCH))
+    toks = [_TOKENS_PER_SEQ] * _BATCH  # 5 allocated blocks per sequence
+    mgr.add_dummy_requests(request_ids=ids, token_nums=toks, prepare_resource=True)
+    allocated_blocks = _TOKENS_PER_SEQ // _TOKENS_PER_BLOCK
+
+    ref = _reference_offsets(mgr, ids)
+
+    sentinel = -12345
+    capped_width = 2
+    assert capped_width < allocated_blocks <= mgr.max_blocks_per_seq
+
+    dst = torch.full(
+        (mgr.num_pools, 2 * _BATCH, 2, mgr.max_blocks_per_seq),
+        sentinel,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    mgr.copy_batch_block_offsets(dst, ids, 1, _BATCH, _BATCH, max_blocks=capped_width)
+    torch.cuda.synchronize()
+    assert torch.equal(dst[:, :_BATCH, :, :capped_width], ref[..., :capped_width])
+    assert (dst[:, :_BATCH, :, capped_width:] == sentinel).all(), (
+        "bounded staging must not write past the requested block width"
+    )
+
+    dst.fill_(sentinel)
+    mgr.copy_batch_block_offsets(dst, ids, 1, _BATCH, _BATCH, max_blocks=None)
+    torch.cuda.synchronize()
+    assert torch.equal(dst[:, :_BATCH, :, :allocated_blocks], ref[..., :allocated_blocks]), (
+        "max_blocks=None must stage every allocated block, including blocks "
+        "past the batch's current kv length (speculative decoding reads them)"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_copy_batch_block_offsets_survives_overlap_overwrite():
     mgr = _build_manager()
 

@@ -19,6 +19,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <tensorrt_llm/common/attentionOp.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
@@ -164,7 +165,7 @@ void initBindings(nb::module_& m)
         nb::arg("spec_bl_tree_first_sparse_mask_offset_kv").none(), nb::arg("sparse_kv_indices").none(),
         nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
         nb::arg("sparse_attn_offsets").none(), nb::arg("sparse_attn_indices_block_size"),
-        nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_mla_topk_lens") = std::nullopt,
+        nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_attn_kv_lens") = std::nullopt,
         nb::arg("skip_softmax_threshold_scale_factor_prefill") = std::nullopt,
         nb::arg("skip_softmax_threshold_scale_factor_decode") = std::nullopt,
         nb::arg("skip_softmax_stat") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
@@ -174,17 +175,27 @@ void initBindings(nb::module_& m)
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
+        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("aux_kv_cache_pool_ptr") = std::nullopt,
         nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
         nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
         nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
         nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("force_prepare_spec_dec_tree_mask") = false, nb::arg("max_num_sequences") = std::nullopt,
+        nb::arg("kv_norm_weight") = std::nullopt, nb::arg("kv_norm_eps") = 1e-6, "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",
         [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
         nb::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
+
+    m.def("get_context_mla_workspace_bytes_per_token",
+        &tensorrt_llm::common::op::AttentionOp::contextMlaWorkspaceBytesPerToken, nb::arg("num_attn_heads"),
+        nb::arg("qk_rope_head_dim"), nb::arg("qk_nope_head_dim"), nb::arg("v_head_dim"), nb::arg("fp8_context_mla"),
+        nb::arg("separate_q_and_kv_input"), nb::arg("sparse_mla"),
+        "Per-token byte cost of the context-MLA K/V dequant staging buffers (scales with summed attended KV "
+        "length). Returns 0 outside the fp8 context-MLA separate-Q/KV path. Used by the KV-cache estimator to "
+        "reserve workspace headroom before sizing the KV pool.");
 
     m.def("compute_flash_mla_metadata", &tensorrt_llm::computeFlashMlaMetadata, nb::arg("seqlens_k"),
         nb::arg("tile_scheduler_metadata"), nb::arg("num_splits"), nb::arg("batch_size"), nb::arg("s_q"),

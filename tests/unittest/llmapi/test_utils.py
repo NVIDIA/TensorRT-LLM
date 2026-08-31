@@ -1,6 +1,10 @@
+import pytest
+
 from tensorrt_llm.llmapi import LlmArgs
 from tensorrt_llm.llmapi.utils import (ApiStatusRegistry,
                                        generate_api_docs_as_docstring)
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_api_status_registry():

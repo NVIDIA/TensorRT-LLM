@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -433,15 +434,18 @@ def _classify_map_var(var_name: str) -> Optional[str]:
     return None
 
 
+# Stages CBTS always runs, whatever the decision.
+ALWAYS_RUN_STAGE_PREFIX = "CPU-"
+
 # Backend name -> mako value. Same patterns as getMakoArgsFromStageName in
 # jenkins/L0_Test.groovy (line ~2079). IMPORTANT: keep this list in sync.
 _BACKEND_PATTERNS = [
     ("-PyTorch-", "pytorch"),
-    ("-TensorRT-", "tensorrt"),
     ("-CPP-", "cpp"),
     ("-Triton-", "triton"),
     ("-FMHA-", "fmha"),
     ("-AutoDeploy-", "autodeploy"),
+    ("-Generic-", "generic"),
     ("-Verl-", "verl"),
 ]
 
@@ -489,6 +493,9 @@ def derive_mako_from_stage(stage_name: str) -> dict[str, str]:
         mako["gpu"] = gpu_match.group(1).lower()
     count_match = _GPU_COUNT_RE.search(stage_name)
     mako["system_gpu_count"] = count_match.group(1) if count_match else "1"
+    # renderTestDB hardcodes system_gpu_count=0 for CPU- stages (no N_GPUs token).
+    if stage_name.startswith("CPU-"):
+        mako["system_gpu_count"] = "0"
 
     return mako
 
@@ -508,6 +515,9 @@ def parse_stages_from_groovy(
     current_arch: Optional[str] = None
 
     for line in groovy_path.read_text().splitlines():
+        # Skip commented-out lines: disabled stage configs must not be parsed.
+        if line.lstrip().startswith("//"):
+            continue
         open_match = _MAP_OPEN_RE.search(line.rstrip())
         if open_match:
             # Reset on every map opening — including unfamiliar ones — so a
@@ -747,6 +757,8 @@ def write_filtered_test_db(
     tests are kept (prevents silent skip from typo'd waive ids or granularity
     mismatch). The block itself is still kept either way.
     """
+    # Clear first: a leftover YAML from an earlier run would ship in the artifact.
+    shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     affected_stems = {stem for stem, _ in block_filters}

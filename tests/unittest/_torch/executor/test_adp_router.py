@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _MockRequest(MagicMock):
     """Mock executor Request whose ``num_input_tokens`` mirrors the real binding
@@ -1207,11 +1209,23 @@ class TestConversationAwareADPRouter:
         assert len(router._conv_to_rank) == 2
         assert set(router._conv_to_rank) == {"c3", "c4"}
 
-    def test_explicit_target_dp_rank_respected(self):
+    def test_explicit_target_dp_rank_establishes_binding(self):
         router = self._router(tp_size=4)
-        item = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
-        pos = self._route(router, self._states(4), [item])
-        assert pos[1] == 2
+        first = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
+        assert self._route(router, self._states(4), [first])[1] == 2
+        assert router._conv_to_rank["A"] == 2
+
+        second = _make_conv_request_item(2, "A")
+        assert self._route(router, self._states(4), [second])[2] == 2
+
+    def test_existing_binding_wins_over_later_explicit_target(self):
+        router = self._router(tp_size=4)
+        first = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
+        self._route(router, self._states(4), [first])
+
+        second = _make_conv_request_item(2, "A", target_dp_rank=1, attention_dp_relax=False)
+        assert self._route(router, self._states(4), [second])[2] == 2
+        assert router._conv_to_rank["A"] == 2
 
     def test_sticky_overflow_keeps_mapping(self):
         """When the home rank is saturated at the HARD cap (max_num_active_requests),
@@ -1247,6 +1261,62 @@ class TestConversationAwareADPRouter:
         router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
         assert isinstance(router, ConversationAwareADPRouter)
         assert router._max_sessions == 8
+        # A mocked (non-string) placement value must fall back to round_robin.
+        assert router._new_conv_placement == "round_robin"
+
+    @staticmethod
+    def _lq_router(tp_size=4):
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size), new_conv_placement="least_queued"
+        )
+
+    def test_least_queued_places_new_conversation_on_least_loaded_rank(self):
+        router = self._lq_router()
+        pos = self._route(
+            router, self._states(4, active=[5, 1, 3, 4]), [_make_conv_request_item(1, "A")]
+        )
+        assert pos[1] == 1
+        assert router._conv_to_rank["A"] == 1
+
+    def test_least_queued_fills_valleys_within_one_batch(self):
+        """The shared count accumulator spreads a burst valley-first:
+        [3, 0, 2, 3] + 4 new conversations ends level at [3, 3, 3, 3]."""
+        items = [_make_conv_request_item(i, f"c{i}") for i in range(4)]
+        pos = self._route(self._lq_router(), self._states(4, active=[3, 0, 2, 3]), items)
+        placed = [sum(1 for v in pos.values() if v == r) for r in range(4)]
+        assert placed == [0, 3, 1, 0]
+
+    def test_least_queued_sticky_returns_unaffected(self):
+        """A later turn returns to its pinned rank even when it is the busiest."""
+        router = self._lq_router()
+        home = self._route(
+            router, self._states(4, active=[2, 0, 1, 1]), [_make_conv_request_item(1, "A")]
+        )[1]
+        assert home == 1
+        pos = self._route(
+            router, self._states(4, active=[0, 9, 0, 0]), [_make_conv_request_item(2, "A")], cap=100
+        )
+        assert pos[2] == home
+
+    def test_least_queued_routing_is_deterministic_across_ranks(self):
+        convs = ["A", "B", None, "A", "C", None, "B"]
+
+        def run():
+            items = [_make_conv_request_item(i, convs[i]) for i in range(len(convs))]
+            return self._route(self._lq_router(), self._states(4, active=[2, 5, 0, 1]), items)
+
+        assert run() == run()
+
+    def test_new_conv_placement_config(self):
+        """Factory forwards the knob; unknown values fall back to round_robin."""
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = True
+        cfg.kv_cache_routing_max_sessions = 8
+        cfg.kv_cache_routing_new_conv_placement = "least_queued"
+        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        assert router._new_conv_placement == "least_queued"
+        bad = ConversationAwareADPRouter(dist=_mock_dist(tp_size=4), new_conv_placement="banana")
+        assert bad._new_conv_placement == "round_robin"
 
     def test_factory_default_when_disabled(self):
         cfg = MagicMock()
@@ -1272,6 +1342,23 @@ class TestConversationAwareADPRouter:
         final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
         assert all(expected >= f for f in final), (expected, final)
         assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
+
+    def test_new_conversations_never_exceed_slot_capacity(self):
+        """Regression: the spreading target must be clamped to
+        max_num_active_requests. Unclamped it reaches 2 * fair_share, so a rank
+        already holding every sequence slot still passes the `< soft_cap` gate
+        and add_slot later raises NoFreeSlotsError mid-collective."""
+        router = self._router(tp_size=4)
+        cap = 64
+        # 2 * ceil((184 + 8) / 4) = 96 > cap, so the unclamped target admits the
+        # full rank 3 and pushes it to 66 sequence slots.
+        states = self._states(4, active=[40, 40, 40, cap])
+        items = [_make_conv_request_item(i, None) for i in range(8)]
+        assign, expected = router.route_requests(states, items, max_num_active_requests=cap)
+        final = [states[r].num_active_requests + len(assign[r]) for r in range(4)]
+        assert all(f <= cap for f in final), final
+        assert expected <= cap
+        assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
 
 
 class TestNumInputTokens:

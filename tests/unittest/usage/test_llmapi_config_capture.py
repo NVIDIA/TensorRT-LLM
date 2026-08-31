@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
+import pytest
+
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     Field,
@@ -28,6 +30,8 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _NestedConfig(StrictBaseModel):
@@ -81,7 +85,7 @@ def test_collect_llm_api_config_allows_approved_string_converters_only():
     # Path, which is dropped because it is not an allowlisted scalar, while
     # union_backend's allowlisted str is captured. No production telemetry field
     # is Union[str, Path]; the only real Union allowlist fields are
-    # Union[str, Enum] (sampler_type, load_format). See CR-E (declined).
+    # Union[str, Enum] (load_format). See CR-E (declined).
     class _StringConfig(StrictBaseModel):
         backend: Optional[str] = Field(
             default="pytorch",
@@ -140,7 +144,7 @@ def test_sanitize_allowlist_is_value_fail_closed_for_non_scalars():
     (bool/int/float/str) or None. Excluding Union-with-Any/Path from allowlist
     eligibility at the type level is therefore unnecessary for safety, and a
     coarse rule would also break legitimate Union[str, Enum] allowlist fields
-    such as sampler_type and load_format (verified captured elsewhere).
+    such as load_format (verified captured elsewhere).
     """
     from tensorrt_llm.usage import llmapi_config
 
@@ -482,24 +486,6 @@ def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
     assert by_path["int_field"].kind == "value"
 
 
-def test_collect_llm_api_config_captures_star_attention_backend():
-    """attn_backend allowlist recognizes the real FLASHINFER_STAR_ATTENTION value.
-
-    The recognized set mirrors get_attention_backend dispatch; the previously
-    listed FLASH_ATTENTION is not a real backend and is removed.
-    """
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        attn_backend="FLASHINFER_STAR_ATTENTION",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["attn_backend"] == "FLASHINFER_STAR_ATTENTION"
-    assert meta["capture_succeeded"] is True
-
-
 def test_collect_llm_api_config_swallows_expected_capture_errors(monkeypatch):
     """The inner net stays fail-silent for the expected sanitizer error family."""
     from tensorrt_llm.usage import llmapi_config
@@ -640,18 +626,29 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
     assert meta["unsafe_excluded"] is False
 
 
-def test_collect_llm_api_config_captures_sampler_type_categorical():
-    """sampler_type is a bounded Union[str, SamplerType] categorical allowlist."""
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        sampler_type="TorchSampler",
-    )
+def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
+    """transceiver_runtime is a single Optional[Literal] categorical.
 
-    config, meta = _loads_payloads(args)
+    Regression: a two-branch Literal union (Optional[Literal['CPP','PYTHON']]
+    | Literal['auto']) would not unwrap to a top-level Literal, degrading the
+    manifest kind to 'value' and making the sanitizer reject all three
+    strings. Every allowed value plus None must be captured, not excluded.
+    """
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
-    assert config["sampler_type"] == "TorchSampler"
-    assert meta["capture_succeeded"] is True
+    for runtime in ("CPP", "PYTHON", "auto", None):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime=runtime
+            ),
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["cache_transceiver_config.transceiver_runtime"] == runtime
+        assert meta["capture_succeeded"] is True
 
 
 def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():

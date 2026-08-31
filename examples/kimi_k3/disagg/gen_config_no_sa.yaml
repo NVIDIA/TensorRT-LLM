@@ -1,0 +1,50 @@
+# Kimi K3 disaggregated serving - GENERATION (decode) server extra LLM-API
+# options WITHOUT speculative decoding
+# (`trtllm-serve <model> --config gen_config_no_sa.yaml`).
+#
+# Default: CUDA graphs ON. Validated end-to-end: GSM8K 96.89 (in the
+# aggregated band) and 765/2138 out tok/s at c64/c256 — ~3x the eager
+# TPOT and above aggregated serving throughput despite the overlap
+# scheduler being off (a disagg requirement on the ctx side).
+# For strict token-parity debugging (attribution-clean SA-on/SA-off or
+# disagg-vs-agg comparisons), null out the cuda graph config to match
+# the SA config's eager regime, and place ctx and gen in SEPARATE NVL72
+# domains (co-located placement selects different comm algorithms and
+# diverges token-level on a fixed prompt subset; accuracy-neutral).
+# K3 ships a custom (trust-remote-code) tokenizer; without this the
+# server starts tokenizer-less and 400s every string prompt with
+# "tokenizer is required to tokenize string prompt".
+trust_remote_code: true
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+pipeline_parallel_size: 1
+disable_overlap_scheduler: true
+enable_chunked_prefill: false
+cuda_graph_config:
+  max_batch_size: 32
+# No SA SpeculativeState buffer cap here; 32 matches the aggregated
+# non-SA DEP16 eval config.
+max_batch_size: 32
+max_num_tokens: 256
+max_seq_len: 9236
+kv_cache_config:
+  enable_block_reuse: false      # mandatory for K3 (KDA state)
+  tokens_per_block: 64           # mandatory for K3 MLA kernels
+  free_gpu_memory_fraction: 0.25
+cache_transceiver_config:
+  backend: NIXL
+  # Mandatory for K3: `auto` resolves to the C++ transceiver, which
+  # throws for K3's MixedMambaHybridCacheManager.
+  transceiver_runtime: PYTHON
+  max_tokens_in_buffer: 8448
+  # Fabric-VMM bounce buffer (recv side); must match the ctx server.
+  # Without it, cross-node V2 pool-to-pool transfers fall back to
+  # ~0.4 GB/s host-staged tcp; 512 MiB measured at ~455 GB/s/GPU.
+  # Bounce engages automatically above TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES
+  # (default 2 MiB) — always true for K3 payloads.
+  # at tokens_per_block=64). See ctx_config.yaml.
+  # Sized to fit one full request payload (fixed 433 MiB KDA state +
+  # ~27 KB/token MLA latent; 649 MiB at 8k ISL) -- see ctx_config.yaml;
+  # at 512 every 8k transfer falls back to the per-fragment tcp path.
+  kv_cache_bounce_size_mb: 1024

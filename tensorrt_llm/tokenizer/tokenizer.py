@@ -40,8 +40,12 @@ except ImportError:
 
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
-    "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "deepseek_v32":
+    "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4":
+    "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "mistral_common":
+    "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
@@ -60,6 +64,12 @@ except ImportError:
 
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
+
+    def __repr__(self) -> str:
+        # PreTrainedTokenizerBase.__repr__ reads properties (e.g.
+        # added_tokens_decoder) that TokenizerBase subclasses are not
+        # required to implement, so fall back to a class-name-only repr.
+        return f"{self.__class__.__name__}()"
 
 
 def _reconstruct_transformers_tokenizer(inner_bytes: bytes):

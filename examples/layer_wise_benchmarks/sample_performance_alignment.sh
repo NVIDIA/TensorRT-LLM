@@ -14,17 +14,20 @@ export TLLM_AUTOTUNER_CACHE_PATH="$PROFILE_DIR/sample_performance_alignment_cach
 mkdir -p -- "$PROFILE_DIR"
 mkdir -p -- "$(dirname -- "$TLLM_AUTOTUNER_CACHE_PATH")"
 
-python3 ../../benchmarks/cpp/prepare_dataset.py \
-    --tokenizer "$MODEL" \
-    --stdout \
+# Write to a file via --output rather than redirecting --stdout: trtllm-bench
+# prints an import-time banner on stdout that would otherwise corrupt line 1 of
+# the JSONL dataset.
+trtllm-bench \
+    --model "$MODEL" \
+    prepare-dataset \
+    --output /tmp/dataset.jsonl \
     --random-seed 42 \
     token-norm-dist \
     --num-requests $((BATCH_SIZE * NP)) \
     --input-mean 2048 \
     --input-stdev 0 \
     --output-mean 256 \
-    --output-stdev 0 \
-    >/tmp/dataset.jsonl
+    --output-stdev 0
 
 # Step 1
 

@@ -16,6 +16,7 @@
 
 #include "medusaDecodingLayer.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
@@ -88,10 +89,10 @@ void MedusaDecodingLayer<T>::allocateBuffer()
 
     mTiledBatchSlotsSetup = BufferManager::pinnedPool(
         ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize() * maxDraftPathLen)}),
-        nvinfer1::DataType::kINT32);
+        tensorrt_llm::DataType::kINT32);
     mTiledBatchSlotsForward = BufferManager::pinnedPool(
         ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize() * maxDraftPathLen)}),
-        nvinfer1::DataType::kINT32);
+        tensorrt_llm::DataType::kINT32);
     mMedusaInputLogitsPtrs = BufferManager::pinnedPool(
         ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize() * maxDraftPathLen)}),
         TRTDataType<T*>::value);

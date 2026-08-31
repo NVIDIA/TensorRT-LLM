@@ -15,7 +15,7 @@
  */
 #pragma once
 #include "tensorrt_llm/common/assert.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -59,7 +59,7 @@ struct MiniMaxReduceRMSParams
 {
     int nranks{};
     int rank{};
-    nvinfer1::DataType dtype;
+    tensorrt_llm::DataType dtype;
     int size_q{};           // numel of Q (num_token * head_dim_q)
     int hidden_dim{};       // head_dim_q
     int size_k{};           // numel of K (num_token * head_dim_k)

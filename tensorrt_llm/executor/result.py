@@ -188,6 +188,10 @@ class GenerationResultBase:
         self.cached_tokens = 0
         self.per_pos_drafted = None
         self.per_pos_accepted = None
+        # Cumulative (accepted, drafted) draft-token totals attached by the
+        # PyTorch executor (LlmResult.spec_dec_totals); backfills
+        # RequestPerfMetrics.speculative_decoding in _handle_sequence.
+        self.spec_dec_totals = None
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
@@ -200,8 +204,11 @@ class GenerationResultBase:
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
-        # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
-        self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
+        # Multi-beam search does not report logprobs incrementally: each response
+        # carries the full list, so it is sliced against _last_logprobs_len rather
+        # than appended wholesale.
+        self._logprobs_reported_cumulatively = (sampling_params.use_beam_search
+                                                and sampling_params.best_of > 1)
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -281,6 +288,27 @@ class GenerationResultBase:
         """Return the error message if this result completed with an error."""
         return self._error_msg
 
+    def _maybe_fill_spec_dec_perf_metrics(
+            self, perf_metrics: "tllm.RequestPerfMetrics") -> None:
+        """Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.
+
+        Nothing populates that section runtime-side, so it arrives zeroed even
+        when drafting ran. The PyTorch executor instead attaches cumulative
+        (accepted, drafted) totals to the response (LlmResult.spec_dec_totals,
+        stashed on self in _handle_response); fill the section from them.
+        No-op when no drafting occurred.
+        """
+        if not self.spec_dec_totals:
+            return
+        accepted, drafted = self.spec_dec_totals
+        if drafted <= 0:
+            return
+        spec_dec = tllm.SpeculativeDecodingMetrics()
+        spec_dec.total_accepted_draft_tokens = accepted
+        spec_dec.total_draft_tokens = drafted
+        spec_dec.acceptance_rate = accepted / drafted
+        perf_metrics.speculative_decoding = spec_dec
+
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
@@ -295,10 +323,21 @@ class GenerationResultBase:
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
+        output._last_logprobs_len = len(output.logprobs)
+        decoder_output_prefix = ()
+        if (self.sampling_params.exclude_input_from_output
+                or getattr(self, "_streaming", False)):
+            decoder_output_prefix = \
+                self.sampling_params._decoder_output_token_prefix
         if self.sampling_params.use_beam_search:
             # Beam search enforces returning all generated tokens
-            output.token_ids = response_tensors.output_token_ids[src_idx]
+            output.token_ids = [
+                *decoder_output_prefix,
+                *response_tensors.output_token_ids[src_idx],
+            ]
         else:
+            if decoder_output_prefix and not output.token_ids:
+                output.token_ids.extend(decoder_output_prefix)
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
         if response_tensors.cum_log_probs is not None:
@@ -310,16 +349,15 @@ class GenerationResultBase:
         # generation logprobs handling (provenance varies by backend)
         if logprobs_result and logprobs_result.generation is not None:  # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
-            output._last_logprobs_len = len(output.logprobs)
             output.logprobs += logprobs_result.generation
         elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
-            output._last_logprobs_len = len(output.logprobs)
-            # In streaming mode, since out-of-order responses are not possible,
-            # each streamed response_tensors.log_probs[src_idx]
-            # contains a streamwise monotonically growing list of logprobs.
-            # so we need to accumulate only the new ones unique to that particular streamed response
-            if self.use_trtllm_sampler:
+            if decoder_output_prefix and self.sampling_params.use_beam_search:
+                output.logprobs = [
+                    *self._get_decoder_output_prefix_logprobs(),
+                    *response_tensors.log_probs[src_idx],
+                ]
+            elif self._logprobs_reported_cumulatively:
                 assert output._last_logprobs_len <= len(
                     response_tensors.log_probs[src_idx]
                 ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
@@ -327,11 +365,14 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx][
                     output._last_logprobs_len:]
             else:
+                if decoder_output_prefix and not output.logprobs:
+                    output.logprobs.extend(
+                        self._get_decoder_output_prefix_logprobs())
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
-                if self.use_trtllm_sampler and len(
+                if self._logprobs_reported_cumulatively and len(
                         output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
@@ -378,6 +419,7 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+            self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
         # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
         if hasattr(response_tensors, 'time_breakdown_metrics'
@@ -401,7 +443,7 @@ class GenerationResultBase:
                     if output.token_ids[-len(stop_ids):] == stop_ids:
                         output.stop_reason = stop_reason
                         if not self.sampling_params.include_stop_str_in_output:
-                            output.token_ids = output.token_ids[:-len(stop_ids)]
+                            self._trim_stop_word_outputs(output, len(stop_ids))
                         break
             elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
@@ -426,6 +468,41 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+
+    @staticmethod
+    def _trim_stop_word_outputs(output: CompletionOutput,
+                                num_stop_ids: int) -> None:
+        """Drop the trailing stop-word tokens and their per-token outputs.
+
+        ``logprobs``, ``generation_logits`` and every value of
+        ``additional_generation_outputs`` are indexed along their first axis by
+        the same positions as ``token_ids``, so trimming only ``token_ids``
+        leaves them one entry per stop token too long and breaks every consumer
+        that zips them together -- e.g. the OpenAI server's
+        ``create_logprobs``, which turns the mismatch into a 400 for the whole
+        request. ``additional_context_outputs`` is prompt-aligned and is left
+        alone.
+        """
+        output.token_ids = output.token_ids[:-num_stop_ids]
+        if output.logprobs:
+            output.logprobs = output.logprobs[:-num_stop_ids]
+        if output.generation_logits is not None:
+            output.generation_logits = output.generation_logits[:-num_stop_ids]
+        if output.additional_generation_outputs:
+            # HandleAdditionalOutputs concatenates one [1, beam_width, ...]
+            # slice per generated token, so axis 0 is the token axis for every
+            # entry regardless of the output's name or beam width.
+            output.additional_generation_outputs = {
+                name: value[:-num_stop_ids]
+                for name, value in output.additional_generation_outputs.items()
+            }
+
+    def _get_decoder_output_prefix_logprobs(
+            self) -> TokenLogprobs | SimpleTokenLogprobs:
+        prefix = self.sampling_params._decoder_output_token_prefix
+        if self.sampling_params.logprobs_simple_format:
+            return [0.0] * len(prefix)
+        return [{token_id: Logprob(logprob=0.0, rank=1)} for token_id in prefix]
 
     @print_traceback_on_error
     @nvtx_range_debug("handle_response",
@@ -503,6 +580,8 @@ class GenerationResultBase:
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
                                             None)
+            self.spec_dec_totals = getattr(response_result, 'spec_dec_totals',
+                                           None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             # Expose gen-first ctx usage so the postprocessor
             # (_ctx_usage_from_outputs) can adopt the context-side accounting.
@@ -995,7 +1074,11 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        response = self.queue.get()
+        # Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor
+        # worker dies silently without pushing a terminal response, instead of blocking potentially
+        # indefinitely.
+        # Raises `queue.Empty` on timeout; `result()` turns that into a `TimeoutError`.
+        response = self.queue.get(timeout=timeout)
         # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
         # every pending result so this get() unblocks instead of hanging forever
         # on a queue whose producer is gone. Record it as the sticky terminal
@@ -1022,15 +1105,29 @@ class GenerationResult(GenerationResultBase):
         """Wait for the completion of the request, and return the result.
 
         Args:
-            timeout (float, optional): Timeout. Defaults to None.
+            timeout (float, optional): The maximum number of seconds to wait for the request to
+                complete. `None` (default) waits indefinitely.
+                The timeout is a total budget across all streaming steps, not per-step.
 
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
+
+        Raises:
+            TimeoutError: If the request does not complete within `timeout` seconds. Bounding the
+                wait prevents a silently-dead executor worker from hanging the caller forever.
         """
         if self._terminal_error is not None:
             raise self._terminal_error
+        deadline = None if timeout is None else time.monotonic() + timeout
         while not self._done:
-            self._result_step(timeout)
+            remaining = (None if deadline is None else max(
+                0.0, deadline - time.monotonic()))
+            try:
+                self._result_step(remaining)
+            except Empty:
+                raise TimeoutError(
+                    f"Request {self.request_id} did not complete within "
+                    f"{timeout} seconds.") from None
         return self
 
     async def aresult(self) -> "GenerationResult":

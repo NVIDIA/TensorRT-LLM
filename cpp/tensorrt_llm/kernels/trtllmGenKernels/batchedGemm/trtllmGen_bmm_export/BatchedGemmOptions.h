@@ -98,8 +98,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, tg::Dtype biasDtype, gemm::BiasType biasType, int blockK,
         bool clcFastDrain, int clusterDimX, int clusterDimY, int clusterDimZ, gemm::CtaSwizzleType ctaSwizzleType,
         tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
-        tg::Dtype dtypeMmaB, gemm::EltwiseActType eltwiseActType, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
-        bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN,
+        tg::Dtype dtypeMmaB, tg::Dtype dtypeSfC, gemm::EltwiseActType eltwiseActType, bool enablesEarlyExit,
+        bool enablesDelayedEarlyExit, int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN,
         int fallbackClusterDimX, int fallbackClusterDimY, int fallbackClusterDimZ,
         gemm::FusedBiasShuffleMode fusedBiasShuffleMode, bool fuseLoadSfTask, bool fuseUtccpWithUtcmma,
         bool gridTriggerSecondaryA, bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
@@ -107,17 +107,17 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB, int m, int mmaK,
         tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n, int numEpilogueWarps,
         int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp,
-        int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numSlicesForSliceK, int numStagesA,
-        int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile,
-        int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemA, int numStagesTmemSfA, int numStagesTmemSfB,
-        int numStagesWorkId, bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype,
-        gemm::SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC,
-        tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int32_t sfReshapeFactor, bool sliceK,
-        tg::Sparsity sparsityA, gemm::SplitK splitK, int tileK, int tileM, int tileN, gemm::TileScheduler tileScheduler,
-        bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8,
-        bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap,
-        bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps,
-        bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize,
+        int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA, int numStagesB, int numStagesMma,
+        int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB,
+        int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
+        tg::Dtype perTokenSfDtype, gemm::SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB,
+        int32_t sfBlockSizeC, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
+        int32_t sfReshapeFactor, tg::Sparsity sparsityA, gemm::SplitK splitK, int tileK, int tileM, int tileN,
+        gemm::TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomizedMma3xNvFp4,
+        bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useFlexibleClusterDims,
+        bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB,
+        bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
+        bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize,
         // GemmGatedActOptions
         gemmGatedAct::ActType actType, bool clampBeforeAct,
         // BatchedGemmOptions
@@ -125,26 +125,26 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         bool fusedAct, bool gridWaitForPrimaryRouting, bool isStaticBatch, bool isUniformNumTokensPerBatch,
         int numBatches, int numRegsPerThreadLoadA, int numRegsPerThreadLoadB, int numRegsPerThreadLoadSfA,
         int numRegsPerThreadLoadSfB, int numTokens, int numWarpsLoadA, int numWarpsLoadB, int numWarpsLoadSfA,
-        int numWarpsLoadSfB, RouteImpl routeImpl, std::optional<RouteImpl> routeSfsImpl, bool useTmaOobOpt,
-        bool prefetchB)
+        int numWarpsLoadSfB, RouteImpl routeImpl, std::optional<RouteImpl> routeSfsImpl, bool prefetchB,
+        bool useCMulticast, bool useTmaOobOpt)
         : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(allReduceAlgo, biasDtype, biasType, blockK, clcFastDrain, clusterDimX, clusterDimY,
-                clusterDimZ, ctaSwizzleType, dtypeAcc, dtypeA, dtypeB, dtypeC, dtypeMmaA, dtypeMmaB, eltwiseActType,
-                enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs, epilogueLdtmDps, epilogueLdtmBits,
+                clusterDimZ, ctaSwizzleType, dtypeAcc, dtypeA, dtypeB, dtypeC, dtypeMmaA, dtypeMmaB, dtypeSfC,
+                eltwiseActType, enablesEarlyExit, enablesDelayedEarlyExit, epilogueLdtmDps, epilogueLdtmBits,
                 epilogueTileM, epilogueTileN, fallbackClusterDimX, fallbackClusterDimY, fallbackClusterDimZ,
                 fusedBiasShuffleMode, fuseLoadSfTask, fuseUtccpWithUtcmma, gridTriggerSecondaryA, gridTriggerSecondaryB,
                 gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA, gridWaitForPrimaryB, hoistLoadTaskInit,
                 hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mmaTileK,
                 mockAllReduce, n, numEpilogueWarps, numRegsCastAWarps, numRegsCopySfLdsSttm, numRegsCopySparsityInfo,
-                numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp, numSlicesForSplitK, numSlicesForSliceK,
-                numStagesA, numStagesB, numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile,
-                numStagesSmemSfA, numStagesSmemSfB, numStagesTmemA, numStagesTmemSfA, numStagesTmemSfB, numStagesWorkId,
-                outputDebugTensors, patchF2fp, perTokenSfDtype, schedHostTask, sfBlockSizeA, sfBlockSizeB, sfBlockSizeC,
-                sfLayoutA, sfLayoutB, sfLayoutC, sfReshapeFactor, sliceK, sparsityA, splitK, tileK, tileM, tileN,
-                tileScheduler, transposeMmaOutput, useCustomizedMma3xNvFp4, useCustomMmaSchedule, useDeepSeekFp8,
-                useFlexibleClusterDims, useHoistTryWaitForCustomMmaSchedule, useMaxTmemOverlap, usePerTokenSfA,
-                usePerTokenSfB, useShuffledMatrix, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
-                useUnrollLoop2xForMma, validM, validN, validK, worldSize),
+                numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp, numSlicesForSplitK, numStagesA,
+                numStagesB, numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesSmemSfA,
+                numStagesSmemSfB, numStagesTmemSfA, numStagesTmemSfB, numStagesWorkId, outputDebugTensors, patchF2fp,
+                perTokenSfDtype, schedHostTask, sfBlockSizeA, sfBlockSizeB, sfBlockSizeC, sfLayoutA, sfLayoutB,
+                sfLayoutC, sfReshapeFactor, sparsityA, splitK, tileK, tileM, tileN, tileScheduler, transposeMmaOutput,
+                useCustomizedMma3xNvFp4, useCustomMmaSchedule, useDeepSeekFp8, useFlexibleClusterDims,
+                useHoistTryWaitForCustomMmaSchedule, useMaxTmemOverlap, usePerTokenSfA, usePerTokenSfB,
+                useShuffledMatrix, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, useUnrollLoop2xForMma, validM,
+                validN, validK, worldSize),
             actType, clampBeforeAct)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)
@@ -166,8 +166,9 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         , mNumWarpsLoadSfB{numWarpsLoadSfB}
         , mRouteImpl(routeImpl)
         , mRouteSfsImpl(routeSfsImpl)
-        , mUseTmaOobOpt(useTmaOobOpt)
         , mPrefetchB(prefetchB)
+        , mUseCMultiCast(useCMulticast)
+        , mUseTmaOobOpt(useTmaOobOpt)
     {
     }
 
@@ -214,16 +215,18 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     std::optional<RouteImpl> mRouteSfsImpl{std::nullopt};
     // Whether to use TMA out-of-bounds optimization to reduce wasted traffic. See details in
     // BatchedGemm/KernelParamsDecl.h.
-    bool mUseTmaOobOpt{false};
-    // Whether to prefetch B (weights) into L2.
     bool mPrefetchB{false};
+    // Whether to use multicast store for output C.
+    bool mUseCMultiCast{false};
+    // Whether to use TMA out-of-bounds optimization.
+    bool mUseTmaOobOpt{false};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Check if the options are valid or not.
 inline bool checkAndUpdateBatchedGemmOptions(
-    BatchedGemmOptions& options, tg::CudaArch cudaArch, bool updateOptions = true)
+    BatchedGemmOptions& options, tg::CudaArch cudaArch, int worldSize = 1, bool updateOptions = true)
 {
     bool isValid = true;
     if (options.mUseTmaOobOpt && !options.mUseTwoTmaLoadWarps)
@@ -243,6 +246,7 @@ inline bool checkAndUpdateBatchedGemmOptions(
     if (options.mFusedAct)
     {
         // ensure that we check the fused options as well
+        TLLM_CHECK_ERROR(!options.mUseCMultiCast, "C Multicast is not supported with fusedAct option.");
         isValid = gemmGatedAct::checkAndUpdateGemmGatedActOptions(options, cudaArch, updateOptions);
     }
     else
@@ -250,9 +254,13 @@ inline bool checkAndUpdateBatchedGemmOptions(
         TLLM_CHECK_ERROR(!gemm::usesFusedBiasReorder(options.mFusedBiasShuffleMode),
             "FusedBiasShuffleMode::ReorderAndShuffle is only supported for fused-act/"
             "gated-act paths");
-        isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, 1 /* tpGrpSize */, updateOptions);
+        isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, worldSize, updateOptions);
     }
-
+    if (options.mUseCMultiCast)
+    {
+        bool const useBlockScalingOut = tg::dtypeIsBlockFmt(options.mDtypeC);
+        TLLM_CHECK_ERROR(!useBlockScalingOut, "C Multicast is not supported with block scaling.");
+    }
     bool batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
     if (options.mPrefetchB)
     {
@@ -571,8 +579,9 @@ inline std::string dumpOptions(BatchedGemmOptions const& options, bool dumpRunti
     ss << "mRouteImpl=batchedGemm::RouteImpl(" << static_cast<int32_t>(options.mRouteImpl) << ")," << std::endl;
     ss << "mRouteSfsImpl={batchedGemm::RouteImpl(" << static_cast<int32_t>(options.mRouteSfsImpl.value()) << ")},"
        << std::endl;
-    ss << "mUseTmaOobOpt=" << options.mUseTmaOobOpt << "," << std::endl;
-    ss << "mPrefetchB=" << options.mPrefetchB << std::endl;
+    ss << "mPrefetchB=" << options.mPrefetchB << "," << std::endl;
+    ss << "mUseCMultiCast=" << options.mUseCMultiCast << "," << std::endl;
+    ss << "mUseTmaOobOpt=" << options.mUseTmaOobOpt << std::endl;
     return ss.str();
 }
 

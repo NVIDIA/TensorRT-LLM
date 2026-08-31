@@ -229,6 +229,66 @@ class WorkerCommIpcAddrs(NamedTuple):
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
     resource_governor_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
+    # Multi-frontend serving: one result lane per frontend. When set, the
+    # rank0 worker BINDS the request queue (PULL) and routes responses to
+    # these lanes; result_queue_addr then aliases lane 0 (the launcher).
+    frontend_result_queue_addrs: Optional[list[tuple[str,
+                                                     Optional[bytes]]]] = None
+
+
+# Multi-frontend client_id namespacing: a FRONTEND_ID_BITS-wide frontend id
+# sits just below the sign bit -- bit 63 stays clear so ids remain positive
+# in signed-int64 contexts -- and the low bits carry the per-frontend
+# request counter. A stray un-namespaced (small) id reads as frontend 0,
+# the launcher.
+FRONTEND_ID_BITS = 6
+# Keep llm_args.num_serve_frontends le= in sync (it cannot import this
+# module; test_multi_frontend_routing pins the two together).
+MAX_NUM_FRONTENDS = 1 << FRONTEND_ID_BITS
+FRONTEND_ID_SHIFT = 63 - FRONTEND_ID_BITS
+FRONTEND_COUNTER_MASK = (1 << FRONTEND_ID_SHIFT) - 1
+
+
+def get_frontend_id(client_id: Optional[int]) -> int:
+    """Extract the originating frontend id from a namespaced client id."""
+    if not isinstance(client_id, int):
+        return 0
+    return client_id >> FRONTEND_ID_SHIFT
+
+
+def namespace_client_id(frontend_id: int, client_id: int) -> int:
+    """Embed frontend_id in the top bits of a per-frontend client id."""
+    return (frontend_id << FRONTEND_ID_SHIFT) | (client_id
+                                                 & FRONTEND_COUNTER_MASK)
+
+
+def frontend_lane_index(client_id: Optional[int], num_lanes: int) -> int:
+    """The result-lane index for a response's originating frontend.
+
+    None (e.g. ADP dummy requests) and out-of-range frontend ids go to
+    lane 0, the launcher, which silently discards them like today.
+    """
+    frontend_id = get_frontend_id(client_id)
+    return frontend_id if frontend_id < num_lanes else 0
+
+
+def bucket_responses_by_frontend(responses: list,
+                                 num_frontends: int) -> list[list]:
+    """Bucket responses by frontend_lane_index of their client_id."""
+    buckets = [[] for _ in range(num_frontends)]
+    for rsp in responses:
+        buckets[frontend_lane_index(rsp.client_id, num_frontends)].append(rsp)
+    return buckets
+
+
+def multi_frontend_request_addr(ipc_dir: str) -> str:
+    """The request ingress bound by the rank0 worker; frontends PUSH-connect."""
+    return f"ipc://{os.path.join(ipc_dir, 'request.sock')}"
+
+
+def multi_frontend_result_addr(ipc_dir: str, frontend_id: int) -> str:
+    """The result lane bound by a frontend; worker/postproc PUSH-connect."""
+    return f"ipc://{os.path.join(ipc_dir, f'result_{frontend_id}.sock')}"
 
 
 def is_llm_response(instance):

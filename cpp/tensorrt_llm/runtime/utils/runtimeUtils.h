@@ -25,7 +25,6 @@
 
 namespace tensorrt_llm::runtime
 {
-class TllmRuntime;
 
 namespace utils
 {

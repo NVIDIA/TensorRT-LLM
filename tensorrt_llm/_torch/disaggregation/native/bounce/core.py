@@ -192,8 +192,17 @@ class BounceTransport(ABC):
         """Release a send region after its write completes."""
 
     @abstractmethod
-    def reserve(self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = None) -> bool:
-        """Reserve a region and record its address for the senders. False falls back to per-fragment."""
+    def reserve(
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = None,
+        extra_bytes: int = 0,
+    ) -> bool:
+        """Reserve a region and record its address for the senders. False falls back to per-fragment.
+        ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
+        the same coalesced write as the KV blocks."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:
@@ -206,6 +215,10 @@ class BounceTransport(ABC):
     @abstractmethod
     def release_idle_reservation(self, rid_slice) -> None:
         """Immediately free a reservation cancelled before any address went out."""
+
+    @abstractmethod
+    def orphan_reservation(self, rid_slice) -> None:
+        """Give up on an in-flight reservation (cancel/timeout/lost result); quarantine, don't leak."""
 
     @abstractmethod
     def record_result(

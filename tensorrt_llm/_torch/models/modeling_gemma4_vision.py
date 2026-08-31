@@ -629,11 +629,11 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
         clamped = pixel_position_ids.clamp(min=0)
-        one_hot = F.one_hot(clamped, num_classes=self.position_embedding_size)
-        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
-        position_embeddings = one_hot @ self.position_embedding_table
-        position_embeddings = position_embeddings.sum(dim=1)
-        return torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
+        position_embeddings = (
+            self.position_embedding_table[0, clamped[..., 0]]
+            + self.position_embedding_table[1, clamped[..., 1]]
+        )
+        return position_embeddings.masked_fill(padding_positions.unsqueeze(-1), 0.0)
 
     def forward(
         self,
@@ -735,8 +735,8 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
 
         # SigLip-style context-only metadata (kv_cache_manager=None, no decode);
         # built by the engine via ``MultimodalEncoderMixin.setup_attn_metadata``
-        # at the encoder ``(encoder_max_batch_size, encoder_max_num_tokens)``
-        # budget, then re-prepared each forward with the actual per-image seq
+        # at the ``encoder_max_num_tokens`` budget, then re-prepared each
+        # forward with the actual per-image seq
         # lens. The vision tower runs once per LLM step across all images, so
         # the batch axis is the cross-request image count.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata

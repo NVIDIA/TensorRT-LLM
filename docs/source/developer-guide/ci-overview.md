@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # Continuous Integration Overview
 
 This page explains how TensorRT‑LLM's CI is organized and how individual tests map to Jenkins stages. Most stages execute integration tests defined in YAML files, while unit tests run as part of a merge‑request pipeline. The sections below describe how to locate a test and trigger the stage that runs it.
@@ -9,7 +26,8 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 4. [Jenkins stage names](#jenkins-stage-names)
 5. [Finding the stage for a test](#finding-the-stage-for-a-test)
 6. [Waiving tests](#waiving-tests)
-7. [Triggering CI Best Practices](#triggering-ci-best-practices)
+7. [Multi-GPU Tests](#multi-gpu-tests)
+8. [Triggering CI Best Practices](#triggering-ci-best-practices)
 
 ## CI pipelines
 
@@ -22,7 +40,7 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 Integration tests are listed under `tests/integration/test_lists/test-db/`. Most YAML files are named after the GPU or configuration they run on (for example `l0_a100.yml`). Some files, like `l0_sanity_check.yml`, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:
 
 - `stage`: either `pre_merge` or `post_merge`.
-- `backend`: `pytorch`, `tensorrt` or `triton`.
+- `backend`: for example `pytorch`, `autodeploy`, `cpp` or `fmha`. Grep the YAML files for `backend:` to see the values currently in use.
 
 Example from `l0_a30.yml`:
 
@@ -43,16 +61,18 @@ Unit tests live under `tests/unittest/` and run during the merge-request pipelin
 `jenkins/L0_Test.groovy` maps stage names to these YAML files.  For A100 the mapping includes:
 
 ```groovy
-    "A100X-Triton-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-    "A100X-Triton-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+    "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
+    "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
 ```
 
 The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
 
+Stage names are unbracketed, with `Post-Merge` embedded directly in the name. Copy the name exactly as it appears in the Groovy map. Jenkins `stage_list` matches names without a `*` wildcard exactly, so a stale spelling such as `A100X-Triton-[Post-Merge]-1` silently selects nothing. The mapping script's `--stages` option is stricter: it reports unknown names and near-match suggestions on stderr.
+
 ## Finding the stage for a test
 
 1. Locate the test in the appropriate YAML file under `tests/integration/test_lists/test-db/` and note its `stage` and `backend` values.
-2. Search `jenkins/L0_Test.groovy` for a stage whose YAML file matches (for example `l0_a100`) and whose name contains `[Post-Merge]` if the YAML entry uses `stage: post_merge`.
+2. Search `jenkins/L0_Test.groovy` for a stage whose YAML file matches (for example `l0_a100`) and whose name contains `Post-Merge` if the YAML entry uses `stage: post_merge`.
 3. The resulting stage name(s) are what you pass to Jenkins via the `stage_list` parameter when triggering a job.
 
 ### Using `test_to_stage_mapping.py`
@@ -63,7 +83,7 @@ Manually searching YAML and Groovy files can be tedious.  The helper script
 ```bash
 python scripts/test_to_stage_mapping.py --tests "unittest/_torch/sampler/test_beam_search.py"
 python scripts/test_to_stage_mapping.py --tests test_beam_search
-python scripts/test_to_stage_mapping.py --stages A100X-Triton-Post-Merge-1
+python scripts/test_to_stage_mapping.py --stages A100X-PyTorch-Post-Merge-1
 python scripts/test_to_stage_mapping.py --test-list my_tests.txt
 python scripts/test_to_stage_mapping.py --test-list my_tests.yml
 ```
@@ -80,7 +100,7 @@ tests in a newline‑separated text file or a YAML list and supply it with
 To run the same tests on your pull request, comment:
 
 ```bash
-/bot run --stage-list "A100X-Triton-[Post-Merge]-1,A100X-Triton-[Post-Merge]-2"
+/bot run --stage-list "A100X-PyTorch-Post-Merge-1"
 ```
 
 This executes the same tests that run post-merge for this hardware/backend.
@@ -98,19 +118,52 @@ Each line contains the fully qualified test name followed by an optional
 specific hardware family. Example:
 
 ```text
-examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
-full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
+full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
 ```
 
 Changes to `waives.txt` should include a bug link or brief explanation so other
 developers understand why the test is disabled.
 
+## Multi-GPU Tests
+
+Running multi-GPU tests (`--add-multi-gpu-test`, `--only-multi-gpu-test`) requires the
+`ci: full pre-merge approved` label on the PR. Without this label the
+`[Test-x86_64-Multi-GPU] Remote Run` and `[Test-SBSA-Multi-GPU] Remote Run` stages will
+fail with an explanatory error.
+
+To obtain the label, ask a member of `NVIDIA/trt-llm-ci-approvers` to apply it. Only
+members of that team can add the label; unauthorized additions are automatically removed
+by the `Guard Full Pre-Merge Approval Label` GitHub Actions workflow.
+
+Once the label is present, re-trigger CI with the same command you used
+originally. For example:
+
+```bash
+# Run the normal pipeline plus multi-GPU stages
+/bot run --add-multi-gpu-test
+
+# Run only multi-GPU stages
+/bot run --only-multi-gpu-test
+```
+
+Post-merge pipelines and GitLab MR builds are exempt from this label check.
+
 ## Triggering CI Best Practices
 
 ### Triggering Post-merge tests
 
-When you only need to verify a handful of post-merge tests, avoid the heavy
-`/bot run --post-merge` command. Instead, specify exactly which stages to run:
+Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
+label because they can consume substantial shared GPU resources. The label is
+intended to be applied by an active member of the
+`NVIDIA/trt-llm-ci-approvers` GitHub team. A GitHub workflow validates the label
+actor and normally removes invalid approvals. This is a best-effort resource
+governance guard, not a strict authorization boundary. The label remains in
+place when new commits are pushed and can be removed manually when the approval
+no longer applies.
+
+When you only need to verify a handful of post-merge tests, specify exactly
+which stages to run:
 
 ```bash
 /bot run --stage-list "stage-A,stage-B"
@@ -123,8 +176,16 @@ default pre-merge set:
 /bot run --extra-stage "stage-A,stage-B"
 ```
 
-Both options accept any stage name defined in `jenkins/L0_Test.groovy`. Being
-selective keeps CI turnaround fast and conserves hardware resources.
+Both options accept stage names and wildcard patterns defined in
+`jenkins/L0_Test.groovy`. Explicit Post-merge stage test doesn't need
+`ci: post-merge approved` PR label to run. However, the `"*"`,
+`"*Post-Merge*"`, and `"*PerfSanity*"` selectors require the same approval
+label, including when they appear in a comma-separated list. Equivalent escaped
+or repeated-star forms are treated the same. Other stage selectors, including
+explicit stage names and other limited wildcard patterns, retain their existing
+behavior.
+
+Being selective keeps CI turnaround fast and conserves hardware resources.
 
 ### Avoiding unnecessary `--disable-fail-fast` usage
 

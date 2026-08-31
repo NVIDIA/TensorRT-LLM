@@ -30,6 +30,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
@@ -87,7 +88,8 @@ enum class MoeLoraRequestType : int32_t
 // ---------------------------------------------------------------------------
 inline void moeLoraGroupedGemmRunImpl(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmModule const& mod,
     int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
-    int64_t splitk_slices, void const* input_base, void* output_base, nvinfer1::DataType data_type, cudaStream_t stream)
+    int64_t splitk_slices, void const* input_base, void* output_base, tensorrt_llm::DataType data_type,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
         "Grouped-GEMM LoRA module is missing permuted ranks buffer (forgot to populate grouped_gemm?).");
@@ -473,8 +475,19 @@ public:
         {
             // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
             // [num_experts, inter_size, hidden_size]
-            TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
-                "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            // Mirror the non-woq else-branch below: gated activations (Swiglu/Geglu) require fc1's
+            // intermediate dim to be 2x fc2's (one half each for gate and up), while non-gated
+            // activations (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
         }
         else
         {
@@ -530,28 +543,52 @@ public:
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_beta.has_value())
         {
             CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_limit.has_value())
         {
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
+        TORCH_CHECK(
+            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+            "SiTu requires both swiglu_alpha and swiglu_beta.");
+        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+            "SiTu does not support swiglu_limit.");
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
-        setRunnerProfiles(profile_ids);
+        // ===== Routed-expert LoRA activation flags =====
+        // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
+        // (fc1_slot_lora_ranks) schema. Computed before tactic selection so a
+        // GEMM2 fused-finalize tactic can be excluded when LoRA is active (the
+        // routed-expert LoRA delta occupies the GEMM2 epilogue that the FINALIZE
+        // fusion would use).
+        bool const lora_per_request = fc1_lora_ranks.has_value();
+        bool const lora_slot_indexed = fc1_slot_lora_ranks.has_value();
+        bool const lora_active = lora_per_request || lora_slot_indexed;
+
+        setRunnerProfiles(profile_ids, lora_active);
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -571,10 +608,8 @@ public:
         }
 
         // ===== Routed-expert LoRA setup =====
-        // LoRA is activated by the per-request schema (fc1_lora_ranks).
-        bool const lora_per_request = fc1_lora_ranks.has_value();
-        bool const lora_slot_indexed = fc1_slot_lora_ranks.has_value();
-        bool const lora_active = lora_per_request || lora_slot_indexed;
+        // Activation flags (lora_per_request / lora_slot_indexed / lora_active)
+        // were computed above, before tactic selection.
         bool const is_gated_act = isGatedActivation(base_activation_type);
         if (lora_active)
         {
@@ -747,8 +782,6 @@ public:
         }
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
-        TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
-            "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
 
         TORCH_CHECK(!input_sf.has_value() || isWMxfp4AMxfp8Quant() || isNvfp4Quant(),
             "Block-scaling factors provided for non block-scaling quantization");
@@ -759,6 +792,13 @@ public:
         int64_t unpadded_hidden_size_val
             = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        if (mUseINT8WoqPerChannel)
+        {
+            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // [num_experts, inter_size, hidden_size]
+            hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+            inter_size = fc2_expert_weights.sizes()[1];
+        }
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
@@ -771,26 +811,72 @@ public:
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_beta.has_value())
         {
             CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_limit.has_value())
         {
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
+        TORCH_CHECK(
+            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+            "SiTu requires both swiglu_alpha and swiglu_beta.");
+        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+            "SiTu does not support swiglu_limit.");
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+
+        // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
+        // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim
+        // ordering differs from the non-woq path; both mirror the gated/non-gated split used in
+        // runMoe(). Gated activations (Swiglu/Geglu) require fc1's intermediate dim to be 2x fc2's;
+        // non-gated (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
+        if (mUseINT8WoqPerChannel)
+        {
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
+        }
+        else
+        {
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
+        }
 
         setRunnerProfiles(profile_ids);
 
@@ -1138,7 +1224,7 @@ private:
         }
     }
 
-    void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+    void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool lora_active = false)
     {
         if (mUseDeepSeekFP8BlockScaling)
         {
@@ -1161,6 +1247,26 @@ private:
             best_gemm2_profile
                 = profile_ids.value()[1] == -1 ? best_gemm2_profile : mGemm2Profiles.at(profile_ids.value()[1]);
         }
+
+        // Routed-expert MoE LoRA is incompatible with the GEMM2 fused-finalize
+        // epilogue: the LoRA delta is applied in the GEMM2 epilogue that the
+        // FINALIZE fusion would otherwise occupy (see setupTmaWarpSpecializedInputs
+        // in moe_kernels.cu). The GEMM2 tactic autotuner profiles with LoRA off
+        // (runGemmProfile forces USE_LORA=false) and can therefore select a
+        // FINALIZE tactic, and a cached runner may still expose FINALIZE tactics
+        // if it was first constructed with fused finalize enabled. Downgrade the
+        // selected tactic to the equivalent non-fused (NONE) epilogue when LoRA
+        // is active. Every FINALIZE config is a copy of a valid non-FINALIZE
+        // config with the fusion flag flipped (see MoeGemmRunner::getConfigs), so
+        // clearing the flag yields a supported tactic with the same tile shape.
+        if (lora_active
+            && best_gemm2_profile.epilogue_fusion_type
+                == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE)
+        {
+            best_gemm2_profile.epilogue_fusion_type
+                = tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+        }
+
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
 
@@ -1206,17 +1312,17 @@ private:
 
     // ===== LoRA helpers =====
 
-    // Map a torch dtype to the TRT-LLM nvinfer1::DataType used to size the
+    // Map a torch dtype to the TRT-LLM tensorrt_llm::DataType used to size the
     // grouped-GEMM low-rank scratch. Kept as a const member (not static) so the
     // FP8 case can read mOutputDtype to pick the fp16/bf16 LoRA compute dtype.
-    nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
+    tensorrt_llm::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
-        case c10::ScalarType::Half: return nvinfer1::DataType::kHALF;
-        case c10::ScalarType::Float: return nvinfer1::DataType::kFLOAT;
+        case c10::ScalarType::Half: return tensorrt_llm::DataType::kHALF;
+        case c10::ScalarType::Float: return tensorrt_llm::DataType::kFLOAT;
 #ifdef ENABLE_BF16
-        case c10::ScalarType::BFloat16: return nvinfer1::DataType::kBF16;
+        case c10::ScalarType::BFloat16: return tensorrt_llm::DataType::kBF16;
 #endif
 #ifdef ENABLE_FP8
         case c10::ScalarType::Float8_e4m3fn:
@@ -1275,7 +1381,7 @@ private:
             int64_t const a_ptr = ptr_data[req_id * 3 + 0];
             int64_t const b_ptr = ptr_data[req_id * 3 + 1];
             // ptr_data[req_id * 3 + 2] is the optional DoRA magnitude vector pointer; ignored here
-            // (MoE+DoRA is rejected at load time, see tensorrt_llm/lora_manager.py).
+            // (MoE+DoRA is rejected at load time, see tensorrt_llm/_torch/peft/lora/manager.py).
 
             // Validate the raw request type before trusting it. An unexpected
             // value would otherwise fall into the CONTEXT branch and read an

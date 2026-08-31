@@ -511,16 +511,10 @@ bool getEnvKVCachePoolUseFabricMemory()
     return useFabricMemory;
 }
 
-uint16_t getEnvNixlPort()
+bool getEnvNixlDisableCoalesce()
 {
-    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
-    return nixlPort;
-}
-
-bool getEnvNixlEnableCoalesce()
-{
-    static bool const enableCoalesce = getBoolEnv("TRTLLM_NIXL_ENABLE_COALESCE");
-    return enableCoalesce;
+    static bool const disableCoalesce = getBoolEnv("TRTLLM_NIXL_DISABLE_COALESCE");
+    return disableCoalesce;
 }
 
 bool getEnvDisaggBenchmarkGenOnly()

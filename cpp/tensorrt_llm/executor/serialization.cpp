@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
@@ -622,12 +623,13 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
     auto indexerKCacheUseFp4 = su::deserialize<bool>(is);
+    auto indexerLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
     // RNN config (optional)
     auto hasRnnConfig = su::deserialize<bool>(is);
     std::optional<CacheState::RnnModelConfig> rnnModelConfig;
     std::vector<SizeType32> rnnLayerNumPerPP;
-    nvinfer1::DataType convStateDataType{nvinfer1::DataType::kFLOAT};
-    nvinfer1::DataType ssmStateDataType{nvinfer1::DataType::kFLOAT};
+    tensorrt_llm::DataType convStateDataType{tensorrt_llm::DataType::kFLOAT};
+    tensorrt_llm::DataType ssmStateDataType{tensorrt_llm::DataType::kFLOAT};
     if (hasRnnConfig)
     {
         CacheState::RnnModelConfig rnnCfg;
@@ -641,15 +643,15 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
         rnnCfg.mNumHeads = su::deserialize<decltype(CacheState::RnnModelConfig::mNumHeads)>(is);
         rnnCfg.mConvSectionLayout
             = static_cast<CacheState::RnnModelConfig::ConvSectionLayout>(su::deserialize<SizeType32>(is));
-        convStateDataType = su::deserialize<nvinfer1::DataType>(is);
-        ssmStateDataType = su::deserialize<nvinfer1::DataType>(is);
+        convStateDataType = su::deserialize<tensorrt_llm::DataType>(is);
+        ssmStateDataType = su::deserialize<tensorrt_llm::DataType>(is);
         rnnLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
         rnnModelConfig = std::move(rnnCfg);
     }
     CacheState cacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
         DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize,
-        indexerKCacheUseFp4};
+        indexerKCacheUseFp4, indexerLayerNumPerPP};
     if (rnnModelConfig.has_value())
     {
         cacheState.setRnnConfig(
@@ -679,6 +681,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
     su::serialize(state.getIndexerKCacheUseFp4(), os);
+    su::serialize(state.mIndexerLayerNumPerPP, os);
     // RNN config (optional)
     su::serialize(state.mRnnCacheState.has_value(), os);
     if (state.mRnnCacheState.has_value())
@@ -721,6 +724,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
     totalSize += su::serializedSize(state.getIndexerKCacheUseFp4());
+    totalSize += su::serializedSize(state.mIndexerLayerNumPerPP);
     // RNN config (optional)
     totalSize += su::serializedSize(state.mRnnCacheState.has_value());
     if (state.mRnnCacheState.has_value())
@@ -764,6 +768,8 @@ DataTransceiverState Serialization::deserializeDataTransceiverState(std::istream
     {
         state.setCacheState(std::move(cacheState).value());
     }
+    auto isArbitraryTransferState = su::deserialize<decltype(DataTransceiverState::mIsArbitraryTransferState)>(is);
+    state.setIsArbitraryTransferState(isArbitraryTransferState);
     return state;
 }
 
@@ -771,6 +777,7 @@ void Serialization::serialize(DataTransceiverState const& state, std::ostream& o
 {
     su::serialize(state.mCommState, os);
     su::serialize(state.mCacheState, os);
+    su::serialize(state.mIsArbitraryTransferState, os);
 }
 
 std::vector<char> Serialization::serialize(DataTransceiverState const& state)
@@ -789,6 +796,7 @@ size_t Serialization::serializedSize(DataTransceiverState const& state)
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.mCommState);
     totalSize += su::serializedSize(state.mCacheState);
+    totalSize += su::serializedSize(state.mIsArbitraryTransferState);
     return totalSize;
 }
 

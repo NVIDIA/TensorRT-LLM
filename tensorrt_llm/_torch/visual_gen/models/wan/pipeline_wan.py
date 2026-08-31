@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 from typing import List, Optional, Union
@@ -83,6 +98,16 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     "fused fingers, motionless image, cluttered background, three legs, many people in the background, walking backward"
 )
 
+_WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES = (
+    ("text_encoder",),
+    ("transformer",),
+)
+_WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
+    ("text_encoder",),
+    ("transformer",),
+    ("transformer_2",),
+)
+
 
 @register_pipeline(
     "WanPipeline",
@@ -153,10 +178,10 @@ class WanPipeline(BasePipeline):
 
     @property
     def device(self):
-        return self.transformer.device
+        return super().device
 
     @property
-    def transformer_components(self) -> list:
+    def transformer_components(self) -> list[str]:
         """Return list of transformer components this pipeline needs."""
         if self.transformer_2 is not None:
             return ["transformer", "transformer_2"]
@@ -204,6 +229,17 @@ class WanPipeline(BasePipeline):
                 model_config=self.pipeline_config.model_configs["transformer_2"]
             )
 
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        """Return WAN offload stages for the loaded transformer topology.
+
+        Only invoked when ``cpu_offload_config.enable`` is true (the base
+        class short-circuits before calling this). Stages are held in CPU
+        storage while inactive and moved onto the pipeline GPU when active.
+        """
+        if self.transformer_2 is not None:
+            return _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES
+        return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -240,18 +276,27 @@ class WanPipeline(BasePipeline):
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info("Loading text encoder...")
+            text_encoder_device = (
+                torch.device("cpu")
+                if PipelineComponent.TEXT_ENCODER.value in self.offloader.requested_components()
+                else device
+            )
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
                 torch_dtype=self.pipeline_config.torch_dtype,
-            ).to(device)
+            ).to(text_encoder_device)
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
+            vae_device = (
+                torch.device("cpu")
+                if PipelineComponent.VAE.value in self.offloader.requested_components()
+                else device
+            )
             self.vae = load_wan_vae(
                 checkpoint_dir,
-                device,
-                self.pipeline_config.visual_gen_mapping,
+                vae_device,
                 dtype=self.pipeline_config.torch_dtype,
             )
 
@@ -331,16 +376,14 @@ class WanPipeline(BasePipeline):
 
             if not self.is_wan22_14b:
                 self._apply_teacache_coefficients(WAN_TEACACHE_COEFFICIENTS)
-                self._setup_cache_acceleration()
-            else:
-                if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
-        # Wan 2.2 TeaCache after both transformers' post_load_weights (FP8 scales, etc.)
+        # Wan 2.2 TeaCache validation after both transformers' post_load_weights
+        # (FP8 scales, etc.). Cache acceleration itself is enabled by the loader
+        # after torch.compile (see PipelineLoader.load).
         if (
             self.transformer is not None
             and self.transformer_2 is not None
@@ -353,7 +396,6 @@ class WanPipeline(BasePipeline):
                     "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
                     "There is no built-in coefficient table for Wan 2.2."
                 )
-            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -559,7 +601,9 @@ class WanPipeline(BasePipeline):
             # Extract scalar timestep
             current_t = timestep if timestep.dim() == 0 else timestep[0]
 
-            # Select model based on timestep (if two-stage denoising is enabled)
+            # Select the transformer for this timestep and keep its public
+            # component name paired for optional offload staging.
+            transformer_component_name = "transformer"
             if boundary_timestep is not None and self.transformer_2 is not None:
                 if current_t >= boundary_timestep:
                     current_model = self.transformer
@@ -567,6 +611,7 @@ class WanPipeline(BasePipeline):
                 else:
                     current_model = self.transformer_2
                     model_name = "transformer_2 (low-noise)"
+                    transformer_component_name = "transformer_2"
 
                 # Log when switching models
                 if last_model_used[0] != model_name:
@@ -576,49 +621,55 @@ class WanPipeline(BasePipeline):
             else:
                 current_model = self.transformer
 
-            # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
+            # Build the Wan 2.2 TI2V-5B timestep: per-patch 2D for I2V, per-batch 1D for T2V
             if self.is_wan22_5b:
                 _, ph, pw = self.transformer.config.patch_size
-                nf = latents.shape[2]
-                nh = latents.shape[3] // ph
-                nw = latents.shape[4] // pw
                 if is_i2v:
                     # I2V: timestep 0 for reference image, current_t for noisy frames
                     patch_ts = i2v_first_frame_mask[0, 0, :, ::ph, ::pw] * current_t
                     timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
                 else:
-                    # T2V: current_t for all frames
-                    timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+                    # T2V: current_t is uniform across all patches, so keep the
+                    # timestep 1-D per batch. The transformer broadcasts one
+                    # modulation row per batch element instead of embedding
+                    # batch*seq_len identical rows, and a 1-D timestep keeps
+                    # TeaCache's timestep-embedding hook working (diffusers'
+                    # get_timestep_embedding requires a 1-D input).
+                    timestep = current_t.reshape(1).expand(latents.shape[0])
 
-            if _vsa_active and _vsa_builder is not None:
-                # latents: [B, C, T_latent, H_latent, W_latent]
-                raw_latent_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
-                vsa_metadata = _vsa_builder.build(
-                    current_timestep=_vsa_step_counter[0],
-                    raw_latent_shape=raw_latent_shape,
-                    patch_size=_vsa_patch_size,
-                    vsa_sparsity=_vsa_sparsity,
-                    device=latents.device,
-                )
-                _vsa_step_counter[0] += 1
-                with set_vsa_forward_context(vsa_metadata):
-                    return current_model(
-                        hidden_states=latents,
-                        timestep=timestep / self.scheduler.config.num_train_timesteps,
-                        encoder_hidden_states=encoder_hidden_states,
+            with self.offloader.context_if_requested(transformer_component_name):
+                if _vsa_active and _vsa_builder is not None:
+                    # latents: [B, C, T_latent, H_latent, W_latent]
+                    raw_latent_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+                    vsa_metadata = _vsa_builder.build(
+                        current_timestep=_vsa_step_counter[0],
+                        raw_latent_shape=raw_latent_shape,
+                        patch_size=_vsa_patch_size,
+                        vsa_sparsity=_vsa_sparsity,
+                        device=latents.device,
                     )
+                    _vsa_step_counter[0] += 1
+                    with set_vsa_forward_context(vsa_metadata):
+                        return current_model(
+                            hidden_states=latents,
+                            timestep=timestep / self.scheduler.config.num_train_timesteps,
+                            encoder_hidden_states=encoder_hidden_states,
+                        )
 
-            return current_model(
-                hidden_states=latents,
-                timestep=timestep / self.scheduler.config.num_train_timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-            )
+                return current_model(
+                    hidden_states=latents,
+                    timestep=timestep / self.scheduler.config.num_train_timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                )
 
-        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
-        def _pin_i2v_first_frame(x):
-            return ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
+        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only).
+        # post_step_fn also carries the denoise loop's side-stream latents (Cosmos3
+        # denoises action/audio alongside video); Wan has none, so they pass through.
+        def _pin_i2v_first_frame(x, extra_stream_latents):
+            pinned = ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
                 self.dtype
             )
+            return pinned, extra_stream_latents
 
         post_step_fn = _pin_i2v_first_frame if (self.is_wan22_5b and is_i2v) else None
 
@@ -668,7 +719,10 @@ class WanPipeline(BasePipeline):
             input_ids = text_inputs.input_ids.to(self.device)
             attention_mask = text_inputs.attention_mask.to(self.device)
 
-            embeds = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
+            with self.offloader.context_if_requested(PipelineComponent.TEXT_ENCODER.value):
+                embeds = self.text_encoder(
+                    input_ids, attention_mask=attention_mask
+                ).last_hidden_state
             embeds = embeds.to(self.dtype)
 
             # Zero-out padded tokens based on mask
@@ -759,9 +813,10 @@ class WanPipeline(BasePipeline):
         )
 
         # Encode video condition through VAE
-        latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
-            self.dtype
-        )
+        with self.offloader.context_if_requested(PipelineComponent.VAE.value):
+            latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
+                self.dtype
+            )
         if batch_size > 1:
             latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
@@ -817,7 +872,8 @@ class WanPipeline(BasePipeline):
             latents = latents / scaling_factor
 
         # VAE decode: returns (B, C, T, H, W)
-        video = self.vae.decode(latents, return_dict=False)[0]
+        with self.offloader.context_if_requested(PipelineComponent.VAE.value):
+            video = self.vae.decode(latents, return_dict=False)[0]
 
         # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
         video = postprocess_video_tensor(video)

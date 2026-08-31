@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -702,8 +702,7 @@ TEST(VmmDescSplitterTest, SplitTransferDescsDifferentChunkSizes)
     MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
     MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
 
-    auto [splitSrc, splitDst]
-        = VmmDescSplitter::splitTransferDescsWithRegionMaps(srcInput, dstInput, localMap, remoteMap);
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(srcInput, dstInput, localMap, remoteMap);
 
     // dst has smaller chunks (512KB), so we get 4 pieces: 512K, 512K, 512K, 512K
     ASSERT_EQ(splitSrc.getDescs().size(), 4);
@@ -735,8 +734,7 @@ TEST(VmmDescSplitterTest, SplitTransferDescsUnalignedBothSides)
     MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
     MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
 
-    auto [splitSrc, splitDst]
-        = VmmDescSplitter::splitTransferDescsWithRegionMaps(srcInput, dstInput, localMap, remoteMap);
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(srcInput, dstInput, localMap, remoteMap);
 
     // src has 4MB chunks starting at srcBase → 1 piece from src side
     // dst has 2MB chunks starting at dstBase → 2 pieces from dst side
@@ -760,7 +758,7 @@ TEST(VmmDescSplitterTest, SplitTransferDescsNoDstRegion)
     MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
 
     auto [splitSrc, splitDst]
-        = VmmDescSplitter::splitTransferDescsWithRegionMaps(srcInput, dstInput, localMap, emptyRemoteMap);
+        = VmmDescSplitter::splitAndCoalesceTransferDescs(srcInput, dstInput, localMap, emptyRemoteMap);
 
     // Only src boundaries: 2 pieces of 1MB each
     ASSERT_EQ(splitSrc.getDescs().size(), 2);

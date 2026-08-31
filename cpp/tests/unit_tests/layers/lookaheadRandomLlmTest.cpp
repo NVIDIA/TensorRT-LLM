@@ -15,6 +15,7 @@
  */
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
@@ -48,7 +49,7 @@ TEST(LookaheadRandomllm, forward)
         std::string str("hello world!");
         TensorPtr logits
             = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(str.size()), ascii->getVocabSize()}),
-                nvinfer1::DataType::kFLOAT);
+                tensorrt_llm::DataType::kFLOAT);
         ascii->stringToLogits(logits, str);
         auto result = ascii->logitsToString(logits);
         EXPECT_EQ(result, str);
@@ -67,7 +68,7 @@ TEST(LookaheadRandomllm, forward)
         std::vector<TokenIdType> positionIdVec({22, 23, 24, 23, 24, 25, 24, 25, 26, 25, 26, 27, 26, 27, 28});
         TensorPtr positionIds = ITensor::wrap(positionIdVec, ITensor::makeShape({len}));
         TensorPtr outputLogits
-            = BufferManager::cpu(ITensor::makeShape({len, ascii->getVocabSize()}), nvinfer1::DataType::kFLOAT);
+            = BufferManager::cpu(ITensor::makeShape({len, ascii->getVocabSize()}), tensorrt_llm::DataType::kFLOAT);
 
         llm.forward(outputLogits, inputTokens, positionIds);
 
@@ -123,29 +124,29 @@ TEST(LookaheadRandomllm, gpuSampling)
 
     SizeType32 workspaceSize
         = tensorrt_llm::kernels::getTopKWorkspaceSize<float>(maxBatchSize, maxTokensPerStep, mMaxTopK, vocabSizePadded);
-    TensorPtr workspaceDevice
-        = mBufferManager->pinned(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
+    TensorPtr workspaceDevice = mBufferManager->pinned(
+        ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), tensorrt_llm::DataType::kINT8);
 
     auto const dataType = TRTDataType<float>::value;
     auto const ptrType = TRTDataType<float*>::value;
 
     // Allocate GPU data
-    TensorPtr mSeqLengths = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    TensorPtr mSeqLengths = BufferManager::pinned(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
     TensorPtr mFinished = BufferManager::pinned(maxBatchShape1D, TRTDataType<tk::FinishedState::UnderlyingType>::value);
-    TensorPtr mEndIds = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    TensorPtr mTopPs = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kFLOAT);
-    TensorPtr mTopKs = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    TensorPtr mSkipDecode = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kBOOL);
-    TensorPtr mTokensPerStep = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    TensorPtr mEndIds = BufferManager::pinned(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    TensorPtr mTopPs = BufferManager::pinned(maxBatchShape1D, tensorrt_llm::DataType::kFLOAT);
+    TensorPtr mTopKs = BufferManager::pinned(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    TensorPtr mSkipDecode = BufferManager::pinned(maxBatchShape1D, tensorrt_llm::DataType::kBOOL);
+    TensorPtr mTokensPerStep = BufferManager::pinned(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
 
-    TensorPtr mCurandStates
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
+    TensorPtr mCurandStates = BufferManager::pinned(
+        ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), tensorrt_llm::DataType::kINT8);
     TensorPtr mOutputIds
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
 
     TensorPtr mProbs = BufferManager::pinned(maxBatchShape3D, dataType);
 
-    TensorPtr mBatchSlots = BufferManager::pinned(batchShape1D, nvinfer1::DataType::kINT32);
+    TensorPtr mBatchSlots = BufferManager::pinned(batchShape1D, tensorrt_llm::DataType::kINT32);
 
     /////////////////////////////////////
     std::copy(batchSlotsVec.begin(), batchSlotsVec.end(), BufferRange<SizeType32>(*mBatchSlots).begin());

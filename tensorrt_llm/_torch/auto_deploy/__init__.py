@@ -37,9 +37,3 @@ else:
         # import AutoDeploy LLM and LlmArgs (require TRT-LLM base classes)
         from .llm import *
         from .llm_args import *
-
-    try:
-        # This will overwrite the AutoModelForCausalLM.from_config to support modelopt quantization
-        import modelopt
-    except ImportError:
-        pass

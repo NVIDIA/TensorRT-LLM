@@ -20,13 +20,13 @@ set(SRCS
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
+    locality_domain/locality_domain_utils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
     decodingLayerWorkspace.cpp
     eagleBuffers.cpp
     explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
-    layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
@@ -51,9 +51,6 @@ set(SRCS
     promptTuningParams.cpp
     runtimeKernels.cu
     tllmBuffers.cpp
-    tllmRuntime.cpp
-    tllmStreamReaders.cpp
-    tllmLogger.cpp
     workerPool.cpp
     worldConfig.cpp
     virtualMemory.cpp)

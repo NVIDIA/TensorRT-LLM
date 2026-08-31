@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterReusedBlocks",
@@ -24,6 +24,9 @@ KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterCacheHitRate",
 )
 
+# Hot pool groups hold no cold blocks, and cold levels group lifecycles independently of the hot
+# level, so a hot pool-group id cannot index a cold level at all. Cold blocks are reported only by
+# kvCacheIterationStatsByColdPoolGroup, in that view's own numbering.
 KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
     "primaryMaxNumBlocks",
     "primaryFreeNumBlocks",
@@ -32,13 +35,6 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
     "primaryPeakFreeNumBlocks",
     "primaryPeakUsedNumBlocks",
     "primaryPeakEvictableNumBlocks",
-    "secondaryMaxNumBlocks",
-    "secondaryFreeNumBlocks",
-    "secondaryUsedNumBlocks",
-    "secondaryEvictableNumBlocks",
-    "secondaryPeakFreeNumBlocks",
-    "secondaryPeakUsedNumBlocks",
-    "secondaryPeakEvictableNumBlocks",
     "iterAllocTotalBlocks",
     "iterAllocNewBlocks",
     "iterGenAllocBlocks",
@@ -50,6 +46,19 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
     "iterIntraDeviceCopyBytes",
     "iterHostDroppedBlocks",
     "iterHostDroppedBytes",
+)
+
+# Subset of KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS reported per cold pool group. The primary_* keys
+# are omitted because a cold group holds no GPU blocks, and the iter* delta keys because they are not
+# tracked per cold group -- emitting them would report an untracked quantity as a measured zero.
+KV_CACHE_ITERATION_STATS_COLD_POOL_GROUP_KEYS = (
+    "secondaryMaxNumBlocks",
+    "secondaryFreeNumBlocks",
+    "secondaryUsedNumBlocks",
+    "secondaryEvictableNumBlocks",
+    "secondaryPeakFreeNumBlocks",
+    "secondaryPeakUsedNumBlocks",
+    "secondaryPeakEvictableNumBlocks",
 )
 
 
@@ -71,10 +80,45 @@ class KVCacheV2LifeCycleIterationStats:
 
 
 @dataclass(slots=True)
+class KVCacheV2SsmSnapshotIterationStats:
+    iter_snapshot_lookups: int
+    iter_snapshot_hits: int
+    iter_snapshot_misses: int
+    iter_reused_tokens: int
+    iter_unreused_tokens: int
+    iter_aligned_snapshot_hits: int
+    iter_unaligned_snapshot_hits: int
+
+    @property
+    def iter_snapshot_hit_rate(self) -> float:
+        if self.iter_snapshot_hits == 0 or self.iter_snapshot_lookups == 0:
+            return 0.0
+        return self.iter_snapshot_hits / self.iter_snapshot_lookups
+
+
+@dataclass(slots=True)
+class KVCacheV2SsmLifeCycleIterationStats:
+    life_cycle_id: int
+    pool_group_id: int
+    snapshot_stats: KVCacheV2SsmSnapshotIterationStats
+    window_size: None = field(default=None, init=False)
+    kind: Literal["ssm"] = field(default="ssm", init=False)
+
+
+@dataclass(slots=True)
 class KVCacheV2IterationStatsReport:
     by_window_size: dict[int, Any]
     by_pool_group: dict[int, KVCacheV2PoolGroupIterationStats]
-    by_life_cycle: dict[int, KVCacheV2LifeCycleIterationStats] = field(default_factory=dict)
+    by_life_cycle: dict[
+        int, KVCacheV2LifeCycleIterationStats | KVCacheV2SsmLifeCycleIterationStats
+    ] = field(default_factory=dict)
+    # Keyed by *cold* pool-group id, which is unrelated to the hot ids used by by_pool_group.
+    by_cold_pool_group: dict[int, KVCacheV2PoolGroupIterationStats] = field(default_factory=dict)
+    # Preemption counters for this iteration. resumed_requests counts recoveries
+    # only -- a request's initial admission also drives a SUSPENDED->ACTIVE
+    # transition internally, but it is not a preemption and is excluded.
+    suspended_requests: int = 0
+    resumed_requests: int = 0
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -115,22 +159,57 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
     return {key: fields[key] for key in keys}
 
 
+def serialize_ssm_snapshot_iteration_stats(
+    stats: KVCacheV2SsmSnapshotIterationStats,
+) -> dict:
+    return {
+        "iterSnapshotLookups": stats.iter_snapshot_lookups,
+        "iterSnapshotHits": stats.iter_snapshot_hits,
+        "iterSnapshotMisses": stats.iter_snapshot_misses,
+        "iterSnapshotHitRate": stats.iter_snapshot_hit_rate,
+        "iterReusedTokens": stats.iter_reused_tokens,
+        "iterUnreusedTokens": stats.iter_unreused_tokens,
+        "iterAlignedSnapshotHits": stats.iter_aligned_snapshot_hits,
+        "iterUnalignedSnapshotHits": stats.iter_unaligned_snapshot_hits,
+    }
+
+
+def _serialize_v2_window_iteration_stats(stats) -> dict:
+    """Serialize a V2 window bucket, dropping the cold-tier fields.
+
+    A window bucket is keyed by the hot grouping, and cold levels group lifecycles independently, so
+    no window owns a cold pool group. V2 reports cold blocks only in
+    ``kvCacheIterationStatsByColdPoolGroup``. Derived from the full field set rather than a second
+    hard-coded key list so that new fields are picked up automatically.
+    """
+    return {
+        key: value
+        for key, value in serialize_kv_cache_iteration_stats(stats).items()
+        if not key.startswith("secondary")
+    }
+
+
 def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     if kv_iter_stats is None:
         return
     if isinstance(kv_iter_stats, KVCacheV2IterationStatsReport):
         by_window_size = kv_iter_stats.by_window_size
         by_pool_group = kv_iter_stats.by_pool_group
+        serialize_window = _serialize_v2_window_iteration_stats
     else:
         by_window_size = kv_iter_stats
         by_pool_group = None
+        # Legacy V1 windows carry their own cold-tier counters; leave that payload untouched.
+        serialize_window = serialize_kv_cache_iteration_stats
 
     stats_dict["kvCacheIterationStats"] = {
-        str(window_size): serialize_kv_cache_iteration_stats(stats)
-        for window_size, stats in by_window_size.items()
+        str(window_size): serialize_window(stats) for window_size, stats in by_window_size.items()
     }
     if by_pool_group is None:
         return
+
+    stats_dict["iterSuspendedRequests"] = kv_iter_stats.suspended_requests
+    stats_dict["iterResumedRequests"] = kv_iter_stats.resumed_requests
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {
@@ -144,16 +223,39 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
         for pool_group_id, stats in by_pool_group.items()
     }
 
+    # Keyed by cold pool-group id, not hot. A cold group spanning several hot groups is attributed to
+    # none of them above, so this is the only complete account of host/disk blocks.
+    if kv_iter_stats.by_cold_pool_group:
+        stats_dict["kvCacheIterationStatsByColdPoolGroup"] = {
+            str(cold_pool_group_id): {
+                "coldPoolGroupId": stats.pool_group_id,
+                "slotSize": list(stats.slot_size),
+                "windowSizes": list(stats.window_sizes),
+                **serialize_kv_cache_iteration_stats(
+                    stats.stats, KV_CACHE_ITERATION_STATS_COLD_POOL_GROUP_KEYS
+                ),
+            }
+            for cold_pool_group_id, stats in kv_iter_stats.by_cold_pool_group.items()
+        }
+
     if not kv_iter_stats.by_life_cycle:
         return
 
-    stats_dict["kvCacheIterationStatsByLifecycle"] = {
-        str(life_cycle_id): {
+    stats_by_life_cycle = {}
+    for life_cycle_id, stats in kv_iter_stats.by_life_cycle.items():
+        serialized = {
             "lifeCycleId": stats.life_cycle_id,
             "poolGroupId": stats.pool_group_id,
             "windowSize": stats.window_size,
             "kind": stats.kind,
-            **serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS),
         }
-        for life_cycle_id, stats in kv_iter_stats.by_life_cycle.items()
-    }
+        if isinstance(stats, KVCacheV2SsmLifeCycleIterationStats):
+            serialized["snapshotStats"] = serialize_ssm_snapshot_iteration_stats(
+                stats.snapshot_stats
+            )
+        else:
+            serialized.update(
+                serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS)
+            )
+        stats_by_life_cycle[str(life_cycle_id)] = serialized
+    stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle

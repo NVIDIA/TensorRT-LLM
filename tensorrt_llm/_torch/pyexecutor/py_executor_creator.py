@@ -32,7 +32,6 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -40,13 +39,23 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear
+from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 
 
 class _ExecutorMemoryMonitor:
@@ -195,19 +204,6 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
         mapping = copy.deepcopy(_mapping)
         mapping.rank = tensorrt_llm.mpi_rank()
     return mapping
-
-
-def update_sampler_max_seq_len(max_seq_len, sampler):
-    # Originally, TRTLLMSampler is constructed with executor_config, but
-    # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
-    # Because TRTLLMSampler.sample_async still needs the updated limit and executor_config is
-    # deprecated inside TRTLLMSampler, keep TRTLLMSampler.max_seq_len updated with
-    # with executor_config.max_seq_len.
-    from .sampler import TRTLLMSampler
-
-    if isinstance(sampler, TRTLLMSampler):
-        assert hasattr(sampler, "max_seq_len")
-        sampler.max_seq_len = max_seq_len
 
 
 def _extend_full_attention_windows_for_spec_decode(
@@ -373,8 +369,6 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
 
-    decoding_config = llm_args.decoding_config
-
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
     # failures with trust_remote_code models.  Reload it from the checkpoint
     # when guided decoding needs it.
@@ -408,20 +402,25 @@ def create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-    if llm_args.attn_backend == "VANILLA":
+
+    # RocketKV's Vanilla path keeps its landmark (KT) cache in a single block per
+    # sequence: RocketVanillaAttention writes the whole sequence into
+    # kt_cache_block_offsets[0], and kt_tokens_per_block is derived from
+    # tokens_per_block. It does not support a paged KT cache, so force one block
+    # per sequence for it. Plain Vanilla attention supports paged KV cache and is
+    # left untouched.
+    sparse_config = llm_args.sparse_attention_config
+    if (llm_args.attn_backend == "VANILLA" and sparse_config is not None
+            and getattr(sparse_config, "algorithm", None) == "rocket"):
         tokens_per_block = max_num_tokens
+        kv_cache_config.tokens_per_block = tokens_per_block
 
-    if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
-        # Workaround for flashinfer and star attention
-        if kv_cache_config.enable_block_reuse:
-            logger.warning(
-                f"Disabling block reuse for {llm_args.attn_backend} backend")
-            kv_cache_config.enable_block_reuse = False
-
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
-        logger.warning(
-            f"Disabling chunked context for {llm_args.attn_backend} backend")
-        enable_chunked_context = False
+    # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
+    m3_sparse_config = llm_args.sparse_attention_config
+    if is_minimax_m3(m3_sparse_config):
+        tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
+        kv_cache_config.tokens_per_block = tokens_per_block
 
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
@@ -435,14 +434,12 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
-            raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
+            and spec_config.spec_dec_mode.use_one_engine()
+            and not spec_config._use_shared_kv_cache):
+        raise ValueError(
+            "FLASHINFER attention backend supports one-engine speculative "
+            "decoding only when the draft model shares the target KV cache.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -510,10 +507,34 @@ def create_py_executor(
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
-    # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    # Initialize DWDP Manager.
+    #
+    # DWDP needs every global MPI rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # only meaningful under that bijection. Disaggregated context workers satisfy
+    # this with TP=1, aggregated serving with full attention DP; everything that
+    # shards a replica across ranks is rejected. Pipeline and context parallelism
+    # are rejected even under attention DP, since pairing ranks that hold
+    # different layers as DWDP peers gives wrong expert weights rather than an
+    # error. The TP check tests `dp_size == tp_size` rather than
+    # `enable_attention_dp` so a future partial attention DP cannot slip through.
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
-        assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
+        if llm_args.dwdp_config.dwdp_size <= 1:
+            raise ValueError(
+                f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
+            )
+        if mapping.pp_size > 1 or mapping.cp_size > 1:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica, so "
+                "pipeline and context parallelism are not supported, but got "
+                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
+        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica: use "
+                "tp_size=1 (disaggregated context worker) or "
+                "enable_attention_dp=True (aggregated serving), but got "
+                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
@@ -554,7 +575,7 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
-    validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+    validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
@@ -568,38 +589,6 @@ def create_py_executor(
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-
-            use_chain_drafter = (
-                guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
-                and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
-                and draft_spec_config.draft_len_schedule is None)
-
-            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
-
-                def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper,
-                        StaticTreeDraftingLoopWrapper)
-                    from tensorrt_llm.llmapi import EagleDecodingConfig
-
-                    static_tree_drafter = isinstance(
-                        draft_spec_config, EagleDecodingConfig
-                    ) and draft_spec_config.eagle_choices is not None
-
-                    if static_tree_drafter:
-                        return StaticTreeDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, max_batch_size,
-                            model)
-                    else:
-                        return LinearDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, model)
-            else:
-                drafting_loop_wrapper = None
 
             draft_llm_args = copy.copy(llm_args)
             if spec_config.load_format == "dummy":
@@ -620,7 +609,6 @@ def create_py_executor(
                 dist=dist,
                 spec_config=draft_spec_config,
                 is_draft_model=True,
-                drafting_loop_wrapper=drafting_loop_wrapper,
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
@@ -632,13 +620,10 @@ def create_py_executor(
     else:
         draft_model_engine = None
 
-    # TODO: Overlap scheduler is not supported for below cases:
-    # 1. non-CDL is used
-    # 2. non-TrtllmAttention attention backend is used
-    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
-            draft_model_engine.attn_backend, TrtllmAttention)):
+    # TODO: Overlap scheduler is not supported for two-model speculative decoding.
+    if has_draft_model_engine:
         logger.warning(
-            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
+            "Overlap scheduler is not supported for two-model speculative decoding."
         )
         llm_args.disable_overlap_scheduler = True
 
@@ -668,23 +653,9 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
-    # Set default value for cache_transceiver_config.max_tokens_in_buffer
-    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
-        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
-
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
-    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
-            cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None
-            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-        logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
-        )
-        kv_cache_config.enable_block_reuse = False
-        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                       False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -704,12 +675,11 @@ def create_py_executor(
             )
 
         sm_version = get_sm_version()
-        if kv_cache_config.enable_block_reuse and sm_version not in [
-                90, 100, 103, 120
-        ]:
-            logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_block_reuse for SM{sm_version}")
+        if (kv_cache_config.enable_block_reuse and sm_version
+                not in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS):
+            logger.warning("KV cache reuse for MLA can only be enabled on "
+                           f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
@@ -725,14 +695,26 @@ def create_py_executor(
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
-        if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
-            logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_chunked_context for SM{sm_version}")
+        if (enable_chunked_context and sm_version
+                not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
+            logger.warning("Chunked Prefill for MLA can only be enabled on "
+                           f"{_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer.
+    # Placed after the FlashMLA tokens_per_block override and rounded up to a
+    # tokens_per_block multiple: CacheTransBufferManager requires
+    # max_tokens_in_buffer % tokens_per_block == 0 (cacheTransBuffer.cpp),
+    # and net_max_seq_len is in general not aligned (e.g. max_seq_len plus a
+    # non-power-of-two seq_len offset).
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = (
+            (net_max_seq_len + tokens_per_block - 1) // tokens_per_block *
+            tokens_per_block)
 
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block
@@ -754,20 +736,22 @@ def create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
-                            kv_cache_config.mamba_state_cache_interval)
+        # Snapshot boundaries come from expect_snapshot_points.  The unit is
+        # only used to align chunks shortened by the scheduling budget.
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
                 guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_dsv4_overlap_headroom", False) else
-                                        max_batch_size)
+                    model_engine, "_enable_disagg_adp_overlap_headroom", False)
+                                        else max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The scoped DeepSeek-V4 path follows the expanded slot
-                    # pool. Other configurations retain max_batch_size.
+                    # The disaggregated attention-DP overlap path follows the
+                    # expanded slot pool. Other configurations retain
+                    # max_batch_size.
                     "max_num_sequences": guided_decoder_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
@@ -801,11 +785,8 @@ def create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            max_seq_len=max_seq_len,
             mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
-            decoding_config=decoding_config,
-            kv_cache_config=kv_cache_config,
             max_num_sequences=max_num_seq_slots,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
@@ -820,8 +801,7 @@ def create_py_executor(
             )
 
         max_attention_window = kv_cache_config.max_attention_window
-        if max_attention_window is not None and len(
-                set(max_attention_window)) > 1:
+        if uses_vswa_kv_cache_layout(max_attention_window):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
@@ -890,17 +870,16 @@ def create_py_executor(
 
         if is_disagg and is_hybrid:
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
-            # no effect in disagg. The disagg manager choice is driven solely
-            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
-            # otherwise CppMambaHybridCacheManager (unified pool, default).
+            # no effect in disagg. The disagg manager choice is driven by
+            # get_kv_cache_manager_cls and cache_transceiver_config.
             if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
-                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
-                    "to select PythonMambaCacheManager.")
+                    "configure transceiver_runtime='PYTHON' with backend='NIXL' "
+                    "to select MixedMambaHybridCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Using CppMambaHybridCacheManager.")
+                            "Using the configured Mamba cache manager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
@@ -936,10 +915,6 @@ def create_py_executor(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point).
@@ -986,7 +961,7 @@ def create_py_executor(
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             resource_governor_queue=resource_governor_queue,
-            max_seq_len=max_seq_len,
+            max_seq_len=net_max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
@@ -1006,6 +981,7 @@ def create_py_executor(
         assert kv_cache_creator is not None
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
+
         # Shut down the transceiver before tearing down KV cache managers so
         # that NIXL-registered (pinned) GPU memory is deregistered first;
         # otherwise the old KV cache memory stays pinned and the subsequent
@@ -1017,13 +993,11 @@ def create_py_executor(
         finally:
             kv_cache_creator.teardown_managers(resources)
 
-        # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
+        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
+        # releases its CUDA graphs before its resource managers. Only the
+        # profiling attention metadata remains to be discarded here.
         for eng in [model_engine, draft_model_engine]:
-            if eng is None:
-                continue
-            if eng.attn_metadata is not None:
-                if llm_args.cuda_graph_config is not None:
-                    eng._release_cuda_graphs()
+            if eng is not None:
                 eng.attn_metadata = None
 
         del py_executor  # free before constructing new
@@ -1036,10 +1010,6 @@ def create_py_executor(
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1061,7 +1031,7 @@ def create_py_executor(
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
                 resource_governor_queue=resource_governor_queue,
-                max_seq_len=max_seq_len,
+                max_seq_len=net_max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,

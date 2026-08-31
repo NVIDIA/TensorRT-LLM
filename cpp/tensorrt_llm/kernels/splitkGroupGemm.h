@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 #include "cutlass/gemm_coord.h"
 #include "tensorrt_llm/common/config.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -30,7 +30,7 @@ int64_t getSplitkGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
 void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkspace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
+    bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
 
 } // namespace kernels
 

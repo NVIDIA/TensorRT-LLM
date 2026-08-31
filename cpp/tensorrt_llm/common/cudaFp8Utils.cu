@@ -421,6 +421,45 @@ __global__ void computeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, cons
     }
 }
 
+// Vectorized PER_TENSOR amax→scale for bf16 input: 128-bit loads (8 bf16/thread),
+// block reduce, one atomicMax per block. Paired with a numel-sized grid
+// (scaleMatrixVecGridSize) it launches only as many blocks as the input needs, so
+// a skinny decode activation ([64, 2048]) contends ~16 blocks on the scale address
+// instead of the scalar path's fixed grid(1024) — whose ~1024-way single-address
+// atomicMax plus ~900 idle blocks give a data-independent ~6us floor. Mirrors the
+// existing vectorized PER_TENSOR *apply* kernel (scaleMatrixPerTensorVec).
+template <typename T_S>
+__global__ void computeFP8QuantizeScalePerTensorVec(T_S* quant_ptr, __nv_bfloat16 const* weights, int64_t const numel)
+{
+    constexpr float min_scaling_factor = 1.0f / (FP8_E4M3_MAX * 512.f);
+    int64_t const vecElements = numel / kVecSize;
+    int64_t const stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    float max = 0.f;
+    for (int64_t vi = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x; vi < vecElements; vi += stride)
+    {
+        float4 raw = *reinterpret_cast<float4 const*>(weights + vi * kVecSize);
+        __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+        for (int p = 0; p < kPairsPerVec; ++p)
+        {
+            float2 const f2 = __bfloat1622float2(pairs[p]);
+            max = fmaxf(max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+        }
+    }
+    // scalar tail (numel not divisible by 8)
+    int64_t const tailStart = vecElements * kVecSize;
+    for (int64_t i = tailStart + threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x; i < numel; i += stride)
+    {
+        max = fmaxf(max, fabsf(static_cast<float>(weights[i])));
+    }
+    max = blockReduceMax<float>(max);
+    if (threadIdx.x == 0)
+    {
+        auto const scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
+        atomicMaxExtd(quant_ptr, scale);
+    }
+}
+
 template <typename T_S, typename T_W>
 void invokeComputeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, const int64_t numel, const int64_t lda,
     QuantizeMode quantize_mode, cudaStream_t stream)
@@ -441,11 +480,34 @@ void invokeComputeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, const int
     }
     else if (quantize_mode == QuantizeMode::PER_TENSOR)
     {
-        dim3 block(1024);
-        dim3 grid(1024);
         cudaMemsetAsync(quant_ptr, 0, sizeof(T_S), stream);
         sync_check_cuda_error(stream);
-        computeFP8QuantizeScale<QuantizeMode::PER_TENSOR><<<grid, block, 0, stream>>>(quant_ptr, weights, numel, lda);
+        // Size the grid to the input (scaleMatrixVecGridSize), NOT a fixed 1024, so
+        // small activations launch only a handful of blocks — this is the fix for
+        // the ~6us fixed floor at skinny decode shapes. For 16B-aligned bf16 input
+        // use the vectorized amax kernel; otherwise the scalar kernel, still with a
+        // numel-sized grid.
+        dim3 const block(CTA_SIZE);
+        dim3 const grid(static_cast<unsigned int>(scaleMatrixVecGridSize(numel)));
+        bool const aligned = (reinterpret_cast<uintptr_t>(weights) % 16 == 0);
+        if constexpr (std::is_same_v<T_W, __nv_bfloat16>)
+        {
+            if (aligned)
+            {
+                computeFP8QuantizeScalePerTensorVec<<<grid, block, 0, stream>>>(
+                    quant_ptr, reinterpret_cast<__nv_bfloat16 const*>(weights), numel);
+            }
+            else
+            {
+                computeFP8QuantizeScale<QuantizeMode::PER_TENSOR>
+                    <<<grid, block, 0, stream>>>(quant_ptr, weights, numel, lda);
+            }
+        }
+        else
+        {
+            computeFP8QuantizeScale<QuantizeMode::PER_TENSOR>
+                <<<grid, block, 0, stream>>>(quant_ptr, weights, numel, lda);
+        }
     }
     sync_check_cuda_error(stream);
 }
@@ -535,11 +597,28 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
     }
     else if (quantize_mode == QuantizeMode::PER_TENSOR)
     {
-        dim3 block(1024);
-        dim3 grid(1024);
         cudaMemsetAsync(quant_ptr, 0, sizeof(T_S), stream);
         sync_check_cuda_error(stream);
-        computeFP8QuantizeScale<QuantizeMode::PER_TENSOR><<<grid, block, 0, stream>>>(quant_ptr, input, numel, lda);
+        // Size the amax grid to the input (scaleMatrixVecGridSize), NOT a fixed 1024,
+        // so skinny decode activations launch only a handful of blocks — this is the
+        // fix for the ~6us fixed floor. bf16 (16B-aligned) uses the vectorized amax
+        // kernel; otherwise the scalar kernel, still numel-sized. Then apply as before.
+        dim3 const block(CTA_SIZE);
+        dim3 const grid(static_cast<unsigned int>(scaleMatrixVecGridSize(numel)));
+        bool const aligned = (reinterpret_cast<uintptr_t>(input) % 16 == 0);
+        if constexpr (std::is_same_v<T_IN, __nv_bfloat16>)
+        {
+            if (aligned)
+                computeFP8QuantizeScalePerTensorVec<<<grid, block, 0, stream>>>(
+                    quant_ptr, reinterpret_cast<__nv_bfloat16 const*>(input), numel);
+            else
+                computeFP8QuantizeScale<QuantizeMode::PER_TENSOR>
+                    <<<grid, block, 0, stream>>>(quant_ptr, input, numel, lda);
+        }
+        else
+        {
+            computeFP8QuantizeScale<QuantizeMode::PER_TENSOR><<<grid, block, 0, stream>>>(quant_ptr, input, numel, lda);
+        }
         sync_check_cuda_error(stream);
         invokeQuantizeMatrix(output, quant_ptr, input, numel, lda, quantize_mode, stream);
     }

@@ -93,6 +93,19 @@ public:
         throw std::runtime_error("Name not found: " + name);
     }
 
+    // Returns whether a chunk with the given name was allocated.
+    bool hasChunkByName(std::string const& name) const
+    {
+        for (size_t ii = 0; ii < mSmemChunkNames.size(); ++ii)
+        {
+            if (mSmemChunkNames[ii] == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Returns the first chunk reuse flag given chunk name.
     int getFirstChunkReuseFlagByName(std::string const& name) const
     {
@@ -172,6 +185,8 @@ inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK, 
     }
     if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
     {
+        (void) mmaK;
+        (void) isSparseA;
         return 8;
     }
     else
@@ -193,14 +208,15 @@ public:
         tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, tg::Sparsity sparsityA, int32_t mmaK, int32_t tileM, int32_t tileN,
         int32_t tileK, int32_t mmaTileK, int32_t epilogueTileM, int32_t epilogueTileN, int32_t numEltsPerSfA,
         int32_t numEltsPerSfB, int32_t numStagesA, int32_t numStagesB, int32_t numStagesMma, int32_t numStagesSfA,
-        int32_t numStagesSfB, int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
-        bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool fuseUtccpWithUtcmma, bool useMaxTmemOverlap,
-        bool useCustomizedMma3xNvFp4, int32_t numEpilogueWarps, bool usePersistentScheduler, bool useDeepSeekFp8,
-        bool usePerTokenSfA, bool usePerTokenSfB, bool useTwoCtas, BiasType biasType,
-        FusedBiasShuffleMode fusedBiasShuffleMode)
+        int32_t numStagesSfB, int32_t numSlicesForSplitK, SplitK splitK, bool useTmaStore, bool transposeMmaOutput,
+        AllReduceAlgo allReduceAlgo, bool fuseUtccpWithUtcmma, bool useMaxTmemOverlap, bool useCustomizedMma3xNvFp4,
+        int32_t numEpilogueWarps, bool usePersistentScheduler, bool useDeepSeekFp8, bool usePerTokenSfA,
+        bool usePerTokenSfB, bool useTwoCtas, BiasType biasType, FusedBiasShuffleMode fusedBiasShuffleMode)
         : mMmaKind{mmaKind}
         , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
         , mUseMaxTmemOverlap{useMaxTmemOverlap}
+        , mUseTmaStore{useTmaStore}
+        , mUsePersistentScheduler{usePersistentScheduler}
         , mUseCustomizedMma3xNvFp4{useCustomizedMma3xNvFp4}
         , mFusedBiasShuffleMode{fusedBiasShuffleMode}
         , mNumEpilogueWarps{numEpilogueWarps}
@@ -215,14 +231,12 @@ public:
             // [gmemC0       ] (1024B aligned) (if needed)
             // [gmemC1       ] (1024B aligned) (if needed)
             // [rowMax       ] (16B aligned) (if needed)
-            // [sliceK       ] (16B aligned) (if needed)
             // [per-token SF ] (16B aligned) (if needed)
             // [bias         ] (16B aligned) (if needed)
             //
             // SMEM for smemA and smemB might be repurposed and used for gmemC0 and gmemC1:
             //
             // [..smemA..][..smemB..][..smemBShuffle..]
-            // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..][..per-token SF..][..bias..]
             //
 
             if (mMmaKind == tg::MmaKind::Auto)
@@ -277,9 +291,7 @@ public:
             // - Do 4 TMA SW32 loads or several LDGSTS loads.
             {
                 // Number of bytes in save shuffled B in shared memory.
-                auto const numSmemBytesLoadB = numSlicesForSliceK > 1 ? numStagesB * tileN * tileK
-                        * getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK, isSparseA) / 8 /* bits */
-                                                                      : 0;
+                auto const numSmemBytesLoadB = 0;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
                 // No need to reuse the first chunk.
@@ -306,11 +318,6 @@ public:
                 bool usesSmemForGmemC = useTmaStore || doesSplitKUseDsmem(splitK);
                 // SMEM for at leader CTA in DSMEM split-k contains K slices.
                 auto extraGmemCMultiplier = doesSplitKUseDsmem(splitK) ? numSlicesForSplitK : 1;
-                if (numSlicesForSliceK > 1)
-                {
-                    // TileN is expanded in N dimension for slice-K.
-                    extraGmemCMultiplier *= numSlicesForSliceK;
-                }
 
                 if (resIdx != 0 && !useDeepSeekFp8)
                 {
@@ -377,22 +384,6 @@ public:
                 firstChunkReuseSmem.emplace_back(false);
             }
 
-            // SliceK
-            {
-                // Real tile size before slice-K reduction.
-                auto const tileSize
-                    = numSlicesForSliceK > 1 ? numSlicesForSliceK * tileM * numSlicesForSliceK * tileN : 0;
-                // Number of bytes for tile in SMEM.
-                auto const numBytesSmemTile = tileSize * tg::dtypeGetNumBits(dtypeAcc) / 8 /* bits */;
-                // Number of bytes alignment for rowMax in SMEM.
-                auto const numBytesAlignmentTile = 16;
-
-                // Add info.
-                smemChunkNames.emplace_back("smemSliceK");
-                numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemTile, numBytesAlignmentTile));
-                firstChunkReuseSmem.emplace_back(false);
-            }
-
             // Per-token Scale Factors
             {{// Number of bytes for per-token scale factors
                 auto const numBytesSmemPerTokenSf = (usePerTokenSfA ? (tileM) * sizeof(float) : 0);
@@ -418,26 +409,45 @@ public:
     }
 
     // Bias
+    //
+    // For DeepSeek FP8 we have two epilogue resources (Epilogue0 and Epilogue1) that share the
+    // same SMEM stack base pointer. Each handles a different half-tile of the output along the
+    // (halved) hidden axis. If they both wrote into the same bias SMEM chunk, the later loader
+    // would clobber the earlier loader's data. So allocate one bias chunk per resource here
+    // (smemBias0 / smemBias1) and let `getSmemOffsetBias(traits, resIdx)` return the per-
+    // resource offset. For DeepSeek FP8 + BiasType::Mn, each per-resource bias chunk only
+    // holds the half-tile (tileM*tileN/2 floats), matching what each Epilogue actually loads.
     {
-        int32_t numBytesSmemBias = 0;
+        int32_t numBytesSmemBiasPerRes = 0;
         if (isBiasTypeN(biasType))
         {
-            numBytesSmemBias = tileN * sizeof(float);
+            numBytesSmemBiasPerRes = tileN * sizeof(float);
         }
         else if (isBiasTypeM(biasType))
         {
-            numBytesSmemBias = tileM * sizeof(float);
+            numBytesSmemBiasPerRes = tileM * sizeof(float);
         }
         else if (isBiasTypeMn(biasType))
         {
-            numBytesSmemBias = tileM * tileN * sizeof(float);
+            int32_t const numBiasElts = useDeepSeekFp8 ? (tileM * tileN / 2) : (tileM * tileN);
+            numBytesSmemBiasPerRes = numBiasElts * sizeof(float);
         }
         // Number of bytes alignment for bias
         auto const numBytesAlignmentBias = 16;
-        // Add info.
-        smemChunkNames.emplace_back("smemBias");
-        numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemBias, numBytesAlignmentBias));
-        firstChunkReuseSmem.emplace_back(false);
+        // Only split into per-resource (Epilogue0/Epilogue1) chunks for the DeepSeek FP8 +
+        // BiasType::Mn path, where each epilogue resource loads its own half-tile of bias
+        // and they would otherwise clobber each other. For every other configuration —
+        // including plain DeepSeek FP8 with BiasType::None — keep the original single-chunk
+        // layout so we don't perturb SMEM offsets of unrelated tests.
+        int32_t const numBiasResources = (useDeepSeekFp8 && isBiasTypeMn(biasType)) ? 2 : 1;
+        for (int32_t biasResIdx = 0; biasResIdx < numBiasResources; ++biasResIdx)
+        {
+            // Add info.
+            smemChunkNames.emplace_back("smemBias" + std::to_string(biasResIdx));
+            numBytesAndAlignmentPerSmemChunk.emplace_back(
+                std::make_pair(numBytesSmemBiasPerRes, numBytesAlignmentBias));
+            firstChunkReuseSmem.emplace_back(false);
+        }
     }
 
     // Per-block absolute maximum for multi-warp reduction.
@@ -474,19 +484,6 @@ public:
 
     // Create SMEM helper object.
     mSmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem, smemChunkNames);
-#if 0
-      // E.g.,
-      // Chunk 0 smemLoadA: 32768 bytes, 1024 alignment, false, offset 0
-      // Chunk 1 smemLoadB: 32768 bytes, 1024 alignment, false, offset 32768
-      // Chunk 2 smemBShuffle: 0 bytes, 1024 alignment, false, offset 65536
-      // Chunk 3 smemGmemC0: 65536 bytes, 1024 alignment, true, offset 0
-      // Chunk 4 smemGmemC1: 65536 bytes, 1024 alignment, false, offset 65536
-      // Chunk 5 smemRowMax: 512 bytes, 16 alignment, false, offset 131072
-      // Chunk 6 smemSliceK: 0 bytes, 16 alignment, false, offset 131584
-      // Chunk 7 smemPerTokenSfA: 0 bytes, 16 alignment, false, offset 131584
-      // Chunk 8 smemPerTokenSfB: 0 bytes, 16 alignment, false, offset 131584
-      mSmemAllocatorHelper.print();
-#endif
 }
 
 //
@@ -503,8 +500,8 @@ public:
         //  | set0:epiTileN0 | set0:epiTileN1/set1:epiTileN0 | set1:epiTileN1 |
         auto const numCols = mUseMaxTmemOverlap ? 2 * tileN - epilogueTileN : tileN;
         // Number of columns for accumulators.
-        auto const numTmemColsD = numSlicesForSliceK * numCols * numStagesMma * tg::dtypeGetNumBits(dtypeAcc)
-            / tg::dtypeGetNumBits(tg::Dtype::UInt32);
+        auto const numTmemColsD
+            = numCols * numStagesMma * tg::dtypeGetNumBits(dtypeAcc) / tg::dtypeGetNumBits(tg::Dtype::UInt32);
         // Number of columns for D alignment.
         auto const numColsAlignmentD = 2;
         // No need to reuse TMEM.
@@ -518,12 +515,10 @@ public:
 
     // Matrix A
     {
-        // We use TMEM for A if we use slice-K or if we need to cast A.
-        bool const useTmemA = (numSlicesForSliceK > 1) || (dtypeMmaA != dtypeA);
-        // Number of columns for A.
-        auto const numTmemColsA = useTmemA ? numStagesA * tileK
-                / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeMmaA))
-                                           : 0;
+        bool const useTmemA = dtypeMmaA != dtypeA;
+        auto const numTmemColsA = useTmemA
+            ? numStagesA * tileK * tg::dtypeGetNumBits(dtypeMmaA) / tg::dtypeGetNumBits(tg::Dtype::UInt32)
+            : 0;
         // Number of columns for A alignment.
         auto const numColsAlignmentA = 4;
         // No need to reuse TMEM.
@@ -616,6 +611,10 @@ tg::MmaKind mMmaKind{};
 bool mFuseUtccpWithUtcmma{};
 // Whether use the max TMEM overlap trick.
 bool mUseMaxTmemOverlap{};
+// Whether the epilogue stages output in SMEM for an asynchronous TMA store.
+bool mUseTmaStore{};
+// Whether work tiles are assigned by a persistent scheduler.
+bool mUsePersistentScheduler{};
 // Whether use customized MMA for 3xNvFp4
 bool mUseCustomizedMma3xNvFp4{};
 // Which BiasType::Mn preprocessing steps are fused into the kernel instead of the host.
@@ -692,11 +691,6 @@ inline int32_t getSmemOffsetRowMax(KernelTraits traits)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int32_t getSmemOffsetSliceK(KernelTraits traits)
-{
-    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemSliceK");
-}
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetPerTokenSfA(KernelTraits traits)
@@ -713,9 +707,16 @@ inline int32_t getSmemOffsetPerTokenSfB(KernelTraits traits)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int32_t getSmemOffsetBias(KernelTraits traits)
+inline int32_t getSmemOffsetBias(KernelTraits traits, int resIdx = 0)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemBias");
+    // The allocator decides — based on `useDeepSeekFp8 && isBiasTypeMn(biasType)` — whether to
+    // create per-resource chunks (smemBias0, smemBias1) or a single shared chunk (smemBias0).
+    // Rather than have every caller re-derive that predicate, fall back to smemBias0 when the
+    // requested per-resource chunk does not exist. This keeps the rule in one place — where the
+    // chunks are added — and lets consumers stay ignorant of the kernel's SMEM layout strategy.
+    std::string const name = "smemBias" + std::to_string(resIdx);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName(
+        traits.mSmemAllocatorHelper.hasChunkByName(name) ? name : "smemBias0");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

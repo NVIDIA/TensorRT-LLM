@@ -24,6 +24,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -31,7 +32,9 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/ATen.h>
+#include <algorithm>
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -39,6 +42,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
+#include <numeric>
 #include <torch/extension.h>
 #include <tuple>
 
@@ -100,6 +104,48 @@ void initBindings(nb::module_& m)
         .def("get_token", &GenLlmReq::getToken, nb::arg("beam"), nb::arg("pos"))
         .def("get_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getTokens, nb::const_), nb::arg("beam"))
         .def("get_tokens", nb::overload_cast<>(&GenLlmReq::getTokens, nb::const_))
+        // Copies only [begin, end) -> O(end-begin), vs get_tokens(beam) which
+        // marshals the whole O(seq_len) VecTokens into a Python list.
+        .def(
+            "get_tokens_range",
+            [](GenLlmReq const& self, GenLlmReq::SizeType32 beam, GenLlmReq::SizeType32 begin,
+                GenLlmReq::SizeType32 end)
+            {
+                auto const& tokens = self.getTokens(beam);
+                auto const n = static_cast<GenLlmReq::SizeType32>(tokens.size());
+                if (begin < 0)
+                {
+                    begin = 0;
+                }
+                if (begin > n)
+                {
+                    begin = n;
+                }
+                if (end < begin)
+                {
+                    end = begin;
+                }
+                if (end > n)
+                {
+                    end = n;
+                }
+                return GenLlmReq::VecTokens(tokens.begin() + begin, tokens.begin() + end);
+            },
+            nb::arg("beam"), nb::arg("begin"), nb::arg("end"))
+        // Zero-copy read-only int32 view of a beam's tokens (aliases the internal buffer; no
+        // per-token PyLong allocation, unlike get_tokens). reference_internal keeps this request
+        // alive for the view's lifetime. Consume synchronously — the view is invalidated if the
+        // token buffer is mutated/reallocated (e.g. by add_new_token). Used on the KV-cache-v2
+        // block-reuse hot path where it feeds an int32 fast path with no Python round-trip.
+        .def(
+            "get_tokens_view",
+            [](GenLlmReq const& self, GenLlmReq::SizeType32 beam)
+            {
+                auto const& tokens = self.getTokens(beam);
+                return nb::ndarray<nb::numpy, GenLlmReq::TokenIdType const, nb::ndim<1>, nb::c_contig>(
+                    tokens.data(), {tokens.size()});
+            },
+            nb::arg("beam"), nb::rv_policy::reference_internal)
         .def("get_last_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLastTokens), nb::arg("beam"))
         .def("get_last_tokens", nb::overload_cast<>(&GenLlmReq::getLastTokens))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, nb::arg("for_next_iteration") = false)
@@ -173,6 +219,8 @@ void initBindings(nb::module_& m)
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(
             "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
+        .def_prop_rw(
+            "expect_snapshot_points", &GenLlmReq::getExpectedSnapshotPoints, &GenLlmReq::setExpectedSnapshotPoints)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
@@ -193,6 +241,8 @@ void initBindings(nb::module_& m)
         .def_prop_ro("kv_cache_transfer_time_ms", &GenLlmReq::getKvCacheTransferTimeMS)
         .def_prop_ro("kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
         .def_prop_ro("kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
+        .def("get_kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
+        .def("get_kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
         .def_prop_ro("kv_cache_size", &GenLlmReq::getKvCacheSize)
         .def("set_kv_cache_transfer_start", &GenLlmReq::setKvCacheTransferStart, nb::arg("time"))
         .def("set_kv_cache_transfer_end", &GenLlmReq::setKvCacheTransferEnd, nb::arg("time"))
@@ -476,7 +526,11 @@ void initBindings(nb::module_& m)
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
         .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
         .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors)
-        .def_rw_static("global_steady_clock_offset", &tb::LlmRequest::sGlobalSteadyClockOffset);
+        // Bind to the single storage owned by libtensorrt_llm.so (reached through
+        // globalSteadyClockOffset()) instead of an inline-static member, so the
+        // offset is shared with the native library rather than living in this
+        // module's separate copy.
+        .def_rw_static("global_steady_clock_offset", &tb::globalSteadyClockOffset());
 
     nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),
@@ -491,7 +545,7 @@ void initBindings(nb::module_& m)
             nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
-                 tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
+                 tr::WorldConfig const&, int64_t, tensorrt_llm::DataType, tensorrt_llm::DataType,
                  std::vector<tr::SizeType32> const&, tr::SizeType32>(),
             nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
             nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
@@ -539,6 +593,153 @@ void initBindings(nb::module_& m)
         nb::arg("requests"), nb::arg("tokens"), nb::arg("beam_idx"),
         "Add new tokens to multiple LLM requests. The tokens vector should contain tokens for beam beam_idx of all "
         "requests in order.");
+
+    m.def(
+        "prepare_encoder_decoder_inputs",
+        [](std::vector<std::shared_ptr<tb::LlmRequest>> const& contextRequests,
+            std::vector<std::shared_ptr<tb::LlmRequest>> const& generationRequests, at::Tensor const& inputIds,
+            at::Tensor const& positionIds, at::Tensor const& sequenceLengths, at::Tensor const& promptLengths,
+            at::Tensor const& cachedTokenLengths, at::Tensor const& kvLengths, at::Tensor const& encoderKvLengths,
+            at::Tensor const& previousBatchIndices, SizeType32 positionIdOffset)
+        {
+            auto checkIntBuffer = [](at::Tensor const& tensor, char const* name)
+            {
+                TLLM_CHECK_WITH_INFO(tensor.device().is_cpu(), "%s must be a CPU tensor", name);
+                TLLM_CHECK_WITH_INFO(tensor.scalar_type() == at::kInt, "%s must have torch.int32 dtype", name);
+                TLLM_CHECK_WITH_INFO(tensor.is_contiguous(), "%s must be contiguous", name);
+            };
+            checkIntBuffer(inputIds, "input_ids");
+            checkIntBuffer(positionIds, "position_ids");
+            checkIntBuffer(sequenceLengths, "sequence_lengths");
+            checkIntBuffer(promptLengths, "prompt_lengths");
+            checkIntBuffer(cachedTokenLengths, "cached_token_lengths");
+            checkIntBuffer(kvLengths, "kv_lengths");
+            checkIntBuffer(encoderKvLengths, "encoder_kv_lengths");
+            checkIntBuffer(previousBatchIndices, "previous_batch_indices");
+
+            auto const numSequences = contextRequests.size() + generationRequests.size();
+            TLLM_CHECK_WITH_INFO(sequenceLengths.numel() >= static_cast<int64_t>(numSequences),
+                "sequence_lengths capacity is smaller than the batch");
+            TLLM_CHECK_WITH_INFO(promptLengths.numel() >= static_cast<int64_t>(numSequences),
+                "prompt_lengths capacity is smaller than the batch");
+            TLLM_CHECK_WITH_INFO(cachedTokenLengths.numel() >= static_cast<int64_t>(numSequences),
+                "cached_token_lengths capacity is smaller than the batch");
+            TLLM_CHECK_WITH_INFO(kvLengths.numel() >= static_cast<int64_t>(numSequences),
+                "kv_lengths capacity is smaller than the batch");
+            TLLM_CHECK_WITH_INFO(encoderKvLengths.numel() >= static_cast<int64_t>(numSequences),
+                "encoder_kv_lengths capacity is smaller than the batch");
+            TLLM_CHECK_WITH_INFO(previousBatchIndices.numel() >= static_cast<int64_t>(generationRequests.size()),
+                "previous_batch_indices capacity is smaller than the generation batch");
+
+            auto* inputIdsPtr = inputIds.data_ptr<SizeType32>();
+            auto* positionIdsPtr = positionIds.data_ptr<SizeType32>();
+            auto* sequenceLengthsPtr = sequenceLengths.data_ptr<SizeType32>();
+            auto* promptLengthsPtr = promptLengths.data_ptr<SizeType32>();
+            auto* cachedTokenLengthsPtr = cachedTokenLengths.data_ptr<SizeType32>();
+            auto* kvLengthsPtr = kvLengths.data_ptr<SizeType32>();
+            auto* encoderKvLengthsPtr = encoderKvLengths.data_ptr<SizeType32>();
+            auto* previousBatchIndicesPtr = previousBatchIndices.data_ptr<SizeType32>();
+
+            std::vector<tb::LlmRequest::RequestIdType> requestIds;
+            std::vector<SizeType32> encoderSequenceLengths;
+            std::vector<SizeType32> encoderCachedTokenLengths;
+            requestIds.reserve(numSequences);
+            encoderSequenceLengths.reserve(numSequences);
+            encoderCachedTokenLengths.reserve(numSequences);
+
+            SizeType32 numTokens{0};
+            SizeType32 numContextTokens{0};
+            SizeType32 numPreviousBatchRequests{0};
+            SizeType32 cachedKvTokens{0};
+            SizeType32 contextKvTokens{0};
+            SizeType32 generationKvTokens{0};
+            SizeType32 maxKvLength{0};
+            SizeType32 contextEncoderKvTokens{0};
+            SizeType32 generationEncoderKvTokens{0};
+            SizeType32 maxEncoderKvLength{0};
+            for (auto const& request : contextRequests)
+            {
+                auto const sequenceIdx = requestIds.size();
+                auto const begin = request->getContextCurrentPosition();
+                auto const chunkSize = request->getContextChunkSize();
+                auto const& tokens = request->getTokens(0);
+                TLLM_CHECK_WITH_INFO(begin + chunkSize <= static_cast<SizeType32>(tokens.size()),
+                    "Context chunk exceeds the request token count");
+                TLLM_CHECK_WITH_INFO(inputIds.numel() >= static_cast<int64_t>(numTokens + chunkSize),
+                    "input_ids capacity is smaller than the packed context");
+                TLLM_CHECK_WITH_INFO(positionIds.numel() >= static_cast<int64_t>(numTokens + chunkSize),
+                    "position_ids capacity is smaller than the packed context");
+
+                std::copy_n(tokens.data() + begin, chunkSize, inputIdsPtr + numTokens);
+                std::iota(positionIdsPtr + numTokens, positionIdsPtr + numTokens + chunkSize, begin + positionIdOffset);
+                sequenceLengthsPtr[sequenceIdx] = chunkSize;
+                promptLengthsPtr[sequenceIdx] = chunkSize;
+                cachedTokenLengthsPtr[sequenceIdx] = begin;
+                auto const kvLength = begin + chunkSize;
+                kvLengthsPtr[sequenceIdx] = kvLength;
+                auto const encoderKvLength = request->getEncoderOutputLen();
+                encoderKvLengthsPtr[sequenceIdx] = encoderKvLength;
+                cachedKvTokens += begin;
+                contextKvTokens += kvLength;
+                maxKvLength = std::max(maxKvLength, kvLength);
+                contextEncoderKvTokens += encoderKvLength;
+                maxEncoderKvLength = std::max(maxEncoderKvLength, encoderKvLength);
+                numTokens += chunkSize;
+                numContextTokens += chunkSize;
+
+                requestIds.push_back(request->mRequestId);
+                encoderSequenceLengths.push_back(encoderKvLength);
+                encoderCachedTokenLengths.push_back(0);
+            }
+
+            bool sawDummyRequest{false};
+            for (auto const& request : generationRequests)
+            {
+                auto const sequenceIdx = requestIds.size();
+                auto const isDummy = request->isDummyRequest();
+                sawDummyRequest = sawDummyRequest || isDummy;
+                TLLM_CHECK_WITH_INFO(
+                    isDummy || !sawDummyRequest, "CUDA graph dummy requests must follow real generation requests");
+                TLLM_CHECK_WITH_INFO(
+                    positionIds.numel() > numTokens, "position_ids capacity is smaller than the packed batch");
+
+                auto const pastSeenTokens = request->getMaxBeamNumTokens() - (isDummy ? 1 : 0);
+                positionIdsPtr[numTokens] = pastSeenTokens + positionIdOffset;
+                sequenceLengthsPtr[sequenceIdx] = 1;
+                promptLengthsPtr[sequenceIdx] = request->mPromptLen;
+                cachedTokenLengthsPtr[sequenceIdx] = pastSeenTokens;
+                auto const kvLength = pastSeenTokens + 1;
+                kvLengthsPtr[sequenceIdx] = kvLength;
+                auto const encoderKvLength = request->getEncoderOutputLen();
+                encoderKvLengthsPtr[sequenceIdx] = encoderKvLength;
+                cachedKvTokens += pastSeenTokens;
+                generationKvTokens += kvLength;
+                maxKvLength = std::max(maxKvLength, kvLength);
+                generationEncoderKvTokens += encoderKvLength;
+                maxEncoderKvLength = std::max(maxEncoderKvLength, encoderKvLength);
+                ++numTokens;
+
+                if (!isDummy)
+                {
+                    TLLM_CHECK_WITH_INFO(
+                        request->mSeqSlot.has_value(), "A real generation request must have a sequence slot");
+                    previousBatchIndicesPtr[numPreviousBatchRequests++] = request->mSeqSlot.value();
+                }
+
+                requestIds.push_back(request->mRequestId);
+                encoderSequenceLengths.push_back(0);
+                encoderCachedTokenLengths.push_back(encoderKvLength);
+            }
+
+            return std::make_tuple(requestIds, encoderSequenceLengths, encoderCachedTokenLengths, numTokens,
+                numContextTokens, numPreviousBatchRequests, cachedKvTokens, contextKvTokens, generationKvTokens,
+                maxKvLength, contextEncoderKvTokens, generationEncoderKvTokens, maxEncoderKvLength);
+        },
+        nb::arg("context_requests"), nb::arg("generation_requests"), nb::arg("input_ids"), nb::arg("position_ids"),
+        nb::arg("sequence_lengths"), nb::arg("prompt_lengths"), nb::arg("cached_token_lengths"), nb::arg("kv_lengths"),
+        nb::arg("encoder_kv_lengths"), nb::arg("previous_batch_indices"), nb::arg("position_id_offset") = 0,
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Prepare the persistent CPU input buffers for a simple encoder-decoder batch.");
 
     m.def(
         "make_decoding_batch_input",

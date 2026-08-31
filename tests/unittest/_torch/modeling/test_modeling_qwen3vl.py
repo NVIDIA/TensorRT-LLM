@@ -4,6 +4,7 @@
 import copy
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -15,6 +16,7 @@ from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditio
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -352,6 +354,104 @@ class TestQwen3VL(TestModelingMultimodal):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_qwen3vl_deepstack_fusion_reuses_registered_buffer():
+    hidden_size = 4
+    num_tokens = 5
+    mm_token_id = 7
+    config_dict = copy.deepcopy(QWEN3_VL_8B_CONFIG)
+    config_dict.update(
+        image_token_id=mm_token_id,
+        video_token_id=8,
+        vision_start_token_id=9,
+        vision_end_token_id=10,
+    )
+    config_dict["text_config"].update(
+        hidden_size=hidden_size,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden_size,
+        vocab_size=32,
+    )
+    config_dict["vision_config"].update(
+        deepstack_visual_indexes=[0, 1],
+        depth=2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=1,
+        out_hidden_size=hidden_size,
+    )
+    model_config = ModelConfig(
+        pretrained_config=Qwen3VLConfig.from_dict(config_dict),
+        disable_mm_encoder=True,
+        max_num_tokens=num_tokens,
+    )
+    model = Qwen3VLModel(model_config, disable_fuse_rope=True).to("cuda")
+
+    input_ids = torch.tensor([1, mm_token_id, 2, mm_token_id, 3], device="cuda")
+    text_token_indices = torch.tensor([0, 2, 4], device="cuda")
+    mm_token_indices = torch.tensor([1, 3], device="cuda")
+    primary_embeds = [
+        torch.full(
+            (2, hidden_size),
+            10.0,
+            dtype=model.embedding_dtype,
+            device="cuda",
+        )
+    ]
+    deepstack_embeds = [
+        torch.full(
+            (2, hidden_size),
+            value,
+            dtype=model.embedding_dtype,
+            device="cuda",
+        )
+        for value in (20.0, 30.0)
+    ]
+
+    _, _, fused_deepstack = model._fuse_multimodal_embeddings(
+        input_ids=input_ids,
+        multimodal_embeddings=primary_embeds,
+        mm_token_ids=model.multimodal_token_ids,
+        embedding_layer=model.text_embedding_layer,
+        extra_embeds=deepstack_embeds,
+        text_token_indices=text_token_indices,
+        mm_token_indices=mm_token_indices,
+    )
+
+    assert len(fused_deepstack) == 2
+    # The returned per-level tensors must be views into the model-owned scratch
+    # buffer, not newly allocated full-sequence tensors.
+    assert (
+        fused_deepstack[0].untyped_storage().data_ptr()
+        == model.deepstack_input_embeds.untyped_storage().data_ptr()
+    )
+    # Sharing storage alone does not prove that fusion scattered each level to
+    # the right token rows, so verify the multimodal positions independently.
+    torch.testing.assert_close(
+        fused_deepstack[0][mm_token_indices],
+        deepstack_embeds[0],
+    )
+    torch.testing.assert_close(
+        fused_deepstack[1][mm_token_indices],
+        deepstack_embeds[1],
+    )
+    # The scratch buffer is reused across forwards; non-multimodal positions
+    # must be cleared before every scatter to avoid leaking stale features.
+    torch.testing.assert_close(
+        model.deepstack_input_embeds[:, text_token_indices],
+        torch.zeros(
+            2,
+            len(text_token_indices),
+            hidden_size,
+            dtype=model.embedding_dtype,
+            device="cuda",
+        ),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen3vl_init_preserves_caller_quant_config():
     """Building Qwen3VLModel must not mutate the caller's quant_config."""
     hf_config = Qwen3VLConfig.from_dict(copy.deepcopy(QWEN3_VL_8B_CONFIG))
@@ -373,6 +473,55 @@ def test_qwen3vl_init_preserves_caller_quant_config():
     assert model.mm_encoder.model_config.quant_config is not quant_config
     assert model.mm_encoder.model_config.quant_config.kv_cache_quant_algo is None
     assert model.mm_encoder.model_config.quant_config.quant_algo is None
+
+
+def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_max_seq_len = 65_536
+    seq_lens = [256, 1024]
+    metadata = object()
+    calls = []
+
+    def capture_prepare_attn_metadata(
+        actual_seq_lens: List[int],
+        actual_metadata: object,
+        *,
+        max_seq_len: int,
+    ) -> object:
+        calls.append((actual_seq_lens, actual_metadata, max_seq_len))
+        return actual_metadata
+
+    monkeypatch.setattr(
+        modeling_qwen3vl,
+        "_prepare_qwen_vl_vision_attn_metadata",
+        capture_prepare_attn_metadata,
+    )
+    model = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(model)
+    model.set_attn_max_seq_len(fixed_max_seq_len)
+
+    result = model.prepare_attn_metadata(seq_lens, metadata)
+
+    assert result is metadata
+    assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
+
+
+def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
+    max_pixels = 16_777_216
+    expected_max_tokens_per_item = {"image": 65_536}
+    processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+    processor._config = Qwen3VLConfig.from_dict(copy.deepcopy(QWEN3_VL_8B_CONFIG))
+    processor._processor = SimpleNamespace(
+        image_processor=SimpleNamespace(
+            size={
+                "shortest_edge": 3_136,
+                "longest_edge": max_pixels,
+            }
+        )
+    )
+
+    assert processor.get_mm_max_tokens_per_item() == expected_max_tokens_per_item
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +798,7 @@ def test_rot_pos_ids_matches_gpu_reference(grid_thw_list):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.cpu_only
 def test_rot_pos_ids_lru_cache_hit():
     """Repeated (h, w, spatial_merge_size) keys must hit the lru_cache and
     return the same underlying tensor object (no recompute)."""

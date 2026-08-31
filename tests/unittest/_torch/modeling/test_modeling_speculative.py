@@ -13,13 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Eagle3ForCausalLM.apply_eagle3_fc fc_norm branch."""
+"""Unit tests for speculative modeling classes."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
+from tensorrt_llm._torch.attention_backend.interface import RopeParams
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import (
+    Eagle3ForCausalLM,
+    SpecDecOneEngineForCausalLM,
+)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 
@@ -144,3 +154,273 @@ def test_apply_eagle3_fc_with_fc_norm(num_capture_layers):
         "fc_norm should apply per-chunk normalization which differs from "
         "whole-tensor normalization"
     )
+
+
+# ---------------------------------------------------------------------------
+# SpecDecOneEngineForCausalLM: optional hidden_size / vocab_size
+# ---------------------------------------------------------------------------
+
+_BASE_CLS = "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM"
+
+
+def _init_specdec_with_mocked_base(model_config, **kwargs):
+    """Instantiate SpecDecOneEngineForCausalLM with the base class stubbed out.
+
+    DecoderModelForCausalLM is built on the PostInitCaller metaclass, which
+    invokes __post_init__/__pp_init__ right after __init__ returns. Those
+    hooks must be stubbed too: the mocked __init__ never sets the attributes
+    (model_config, lm_head, ...) they rely on.
+
+    Returns the kwargs captured by the mocked base __init__.
+    """
+    with (
+        patch(f"{_BASE_CLS}.__init__", return_value=None) as mock_init,
+        patch(f"{_BASE_CLS}.__post_init__"),
+        patch(f"{_BASE_CLS}.__pp_init__"),
+    ):
+        SpecDecOneEngineForCausalLM(MagicMock(), model_config, **kwargs)
+    _, captured_kwargs = mock_init.call_args
+    return captured_kwargs
+
+
+def test_specdec_one_engine_reads_from_pretrained_config() -> None:
+    """Default path: hidden_size/vocab_size come from pretrained_config."""
+    hidden_size = 4096
+    vocab_size = 32000
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=hidden_size, vocab_size=vocab_size)
+    )
+
+    kwargs = _init_specdec_with_mocked_base(model_config)
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def test_specdec_one_engine_accepts_explicit_sizes() -> None:
+    """Composite configs (e.g. VL wrappers) can pass sizes explicitly."""
+    hidden_size = 8192
+    vocab_size = 128256
+    # Bare PretrainedConfig lacks hidden_size/vocab_size; the caller
+    # supplies them instead.
+    model_config = ModelConfig(pretrained_config=PretrainedConfig())
+
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def test_specdec_one_engine_explicit_overrides_pretrained_config() -> None:
+    """Explicit args take precedence over pretrained_config when both present."""
+    hidden_size = 2048
+    vocab_size = 64000
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=4096, vocab_size=32000)
+    )
+
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def _fake_dflash_attention(rope_params, source):
+    if source == "rotary_emb":
+        return SimpleNamespace(
+            rotary_emb=SimpleNamespace(
+                rope_params=rope_params,
+                head_dim=128,
+                is_neox=True,
+            ),
+            pos_embd_params=None,
+        )
+    return SimpleNamespace(
+        rotary_emb=None,
+        pos_embd_params=SimpleNamespace(rope=rope_params, is_neox=True),
+        head_dim=128,
+    )
+
+
+def _fake_dflash_wrapper(rope_params, source):
+    layers = [
+        SimpleNamespace(self_attn=_fake_dflash_attention(params, source)) for params in rope_params
+    ]
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.model = SimpleNamespace(layers=layers)
+    wrapper.config = SimpleNamespace(layer_types=["sliding_attention", "full_attention"])
+    return wrapper
+
+
+@pytest.mark.parametrize("source", ["rotary_emb", "pos_embd_params"])
+def test_dflash_allows_mixed_layer_types_with_uniform_rope(source):
+    rope_params = RopeParams(dim=128, theta=1_000_000.0, max_positions=4096)
+    wrapper = _fake_dflash_wrapper([rope_params, rope_params], source)
+
+    DFlashForCausalLM._validate_uniform_rope(wrapper)
+
+
+@pytest.mark.parametrize("source", ["rotary_emb", "pos_embd_params"])
+def test_dflash_rejects_different_effective_rope(source):
+    wrapper = _fake_dflash_wrapper(
+        [
+            RopeParams(dim=128, theta=1_000_000.0, max_positions=4096),
+            RopeParams(dim=128, theta=10_000_000.0, max_positions=4096),
+        ],
+        source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"layers \[1\] have a different effective RoPE configuration",
+    ):
+        DFlashForCausalLM._validate_uniform_rope(wrapper)
+
+
+def _fake_dflash_mask_wrapper(config, sliding_layers_causal=False):
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.config = config
+    wrapper._sliding_layers_causal = sliding_layers_causal
+    return wrapper
+
+
+def test_dflash_attention_mask_args():
+    wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=4,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=4096,
+            use_sliding_window=True,
+        )
+    )
+
+    assert wrapper._get_attention_mask_args(0) == (True, (4095, 0))
+    assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
+    assert wrapper._get_attention_mask_args(2) == (True, (4095, 0))
+
+    with patch("tensorrt_llm._torch.models.modeling_dflash.logger.warning") as warning:
+        wrapper._warn_inferred_attention_windows()
+    warning.assert_not_called()
+
+    disabled_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=4096,
+            use_sliding_window=False,
+        )
+    )
+
+    assert disabled_wrapper._get_attention_mask_args(0) == (False, (-1, -1))
+
+    missing_window_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=1,
+            layer_types=["sliding_attention"],
+            use_sliding_window=True,
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="use_sliding_window=True requires a positive integer sliding_window",
+    ):
+        missing_window_wrapper._get_attention_mask_args(0)
+
+    laguna_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            model_type="laguna",
+            architectures=["DFlashLagunaForCausalLM"],
+            num_hidden_layers=5,
+            layer_types=["sliding_attention"] * 5,
+            sliding_window=512,
+        ),
+        sliding_layers_causal=True,
+    )
+
+    for layer_idx in range(5):
+        assert laguna_wrapper._get_attention_mask_args(layer_idx) == (True, (511, 0))
+
+    with patch("tensorrt_llm._torch.models.modeling_dflash.logger.warning") as warning:
+        laguna_wrapper._warn_inferred_attention_windows()
+    warning.assert_called_once_with(
+        "DFlash inferred pooled-context sliding-window attention from checkpoint "
+        "config for draft layers [0, 1, 2, 3, 4]: window=512. Context attention "
+        "is truncated to 512 tokens for these layers; if the drafter expects full "
+        "context, acceptance rate may drop. Set use_sliding_window explicitly to "
+        "confirm or disable windowing."
+    )
+
+
+def _fake_dflash_buffer_wrapper():
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper._dflash_trtllm_gen_ops = SimpleNamespace(
+        get_workspace_size=MagicMock(side_effect=lambda **kwargs: kwargs["max_num_requests"] * 16),
+        get_multi_ctas_kv_counter_size=MagicMock(
+            side_effect=lambda _num_heads, max_batch_size, _sm_count: max_batch_size * 8
+        ),
+    )
+    wrapper._dflash_trtllm_gen_workspace = None
+    wrapper._dflash_trtllm_gen_counters = None
+    wrapper.register_buffer("_dflash_batch_indices", None, persistent=False)
+    wrapper.register_buffer("_dflash_block_offsets", None, persistent=False)
+    wrapper._dflash_trtllm_gen_device = None
+    wrapper._dflash_trtllm_gen_sm_count = None
+    return wrapper
+
+
+def _prepare_dflash_buffers(wrapper, max_batch_size):
+    wrapper._prepare_dflash_trtllm_gen_buffers(
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        max_batch_size=max_batch_size,
+        block_size=4,
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+    )
+
+
+def test_dflash_trtllm_gen_buffers_reuse_and_grow():
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties) as get_props,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, 2)
+        workspace = wrapper._dflash_trtllm_gen_workspace
+        counters = wrapper._dflash_trtllm_gen_counters
+
+        _prepare_dflash_buffers(wrapper, 2)
+        assert wrapper._dflash_trtllm_gen_workspace is workspace
+        assert wrapper._dflash_trtllm_gen_counters is counters
+
+        _prepare_dflash_buffers(wrapper, 4)
+        assert wrapper._dflash_trtllm_gen_workspace.numel() >= 64
+        assert wrapper._dflash_trtllm_gen_counters.numel() >= 32
+        get_props.assert_called_once_with(torch.device("cpu"))
+
+
+def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, 2)
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+        with pytest.raises(RuntimeError, match="workspace.*before CUDA graph capture"):
+            _prepare_dflash_buffers(wrapper, 4)
+
+        wrapper._dflash_trtllm_gen_counters = torch.empty(16, dtype=torch.uint8, device="meta")
+        with pytest.raises(RuntimeError, match="counter buffer.*before CUDA graph capture"):
+            _prepare_dflash_buffers(wrapper, 2)

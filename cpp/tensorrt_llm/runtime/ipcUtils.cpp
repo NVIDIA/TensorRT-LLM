@@ -20,7 +20,7 @@
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
-#include <NvInferRuntimeBase.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cstddef>
 
 namespace tensorrt_llm::runtime
@@ -83,7 +83,7 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
     // IPC handles. If we want to support stream-ordered allocations here, we need to create another pool with the
     // correct handle type.
     auto const ipcAlignedBufferSize = common::alignSize(bufferSize, 1LU << 21);
-    mBuffer = BufferManager::gpuSync(ipcAlignedBufferSize, nvinfer1::DataType::kUINT8);
+    mBuffer = BufferManager::gpuSync(ipcAlignedBufferSize, tensorrt_llm::DataType::kUINT8);
     manager.setZero(*mBuffer);
     auto* bufferPtr = mBuffer->data();
 
@@ -149,7 +149,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     {
         auto const tpSize = worldConfig.getTensorParallelism();
         mAllReduceCommPtrs = BufferManager::cpu(
-            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 3}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 3}), tensorrt_llm::DataType::kINT64);
     }
     else
     {
@@ -178,7 +178,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
 
         mAllReduceCommPtrs
             = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 3}),
-                nvinfer1::DataType::kINT64);
+                tensorrt_llm::DataType::kINT64);
         auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
         // Start from 1 since 0 represents released state for barrier at the beginning of the all_reduce.
         // The last element is the barrier flag counter.
@@ -211,9 +211,9 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
 void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size)
 {
 #if ENABLE_MULTI_DEVICE
-    tensorrt_llm::kernels::lamportInitialize(buffer_0, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
-    tensorrt_llm::kernels::lamportInitialize(buffer_1, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
-    tensorrt_llm::kernels::lamportInitialize(buffer_2, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_0, size / sizeof(half), tensorrt_llm::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_1, size / sizeof(half), tensorrt_llm::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_2, size / sizeof(half), tensorrt_llm::DataType::kHALF, 0);
     cudaDeviceSynchronize();
 #endif
 }

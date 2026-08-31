@@ -15,7 +15,6 @@
 
 import os
 from pathlib import Path
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -50,25 +49,14 @@ def _use_diffuser_vae_env() -> bool:
         ) from None
 
 
-def _vae_is_parallel(visual_gen_mapping: Any | None) -> bool:
-    if visual_gen_mapping is None:
-        return False
-    return getattr(visual_gen_mapping, "parallel_vae_size", 1) > 1
-
-
-def _use_native_wan_vae(visual_gen_mapping: Any | None) -> bool:
+def _use_native_wan_vae() -> bool:
     """Select the Wan VAE backend and log the reason.
 
-    The native ``WanVAE`` is the default. Diffusers ``AutoencoderKLWan`` is used
-    only when the VAE is tensor-parallel (``parallel_vae_size > 1``), which the
-    native path does not support yet, or when forced via
-    ``TRTLLM_USE_DIFFUSER_VAE``.
+    The native ``WanVAE`` is the default; the diffusers ``AutoencoderKLWan``
+    is used only when forced via ``TRTLLM_USE_DIFFUSER_VAE``.
     """
     if _use_diffuser_vae_env():
         logger.info(f"Loading Diffusers Wan VAE because {TRTLLM_USE_DIFFUSER_VAE_ENV} is non-zero.")
-        return False
-    if _vae_is_parallel(visual_gen_mapping):
-        logger.info("Loading Diffusers Wan VAE because parallel VAE is not supported natively yet.")
         return False
     return True
 
@@ -76,10 +64,9 @@ def _use_native_wan_vae(visual_gen_mapping: Any | None) -> bool:
 def load_wan_vae(
     checkpoint_dir: str,
     device: torch.device,
-    visual_gen_mapping: Any | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
-    if not _use_native_wan_vae(visual_gen_mapping):
+    if not _use_native_wan_vae():
         return AutoencoderKLWan.from_pretrained(
             checkpoint_dir,
             subfolder="vae",

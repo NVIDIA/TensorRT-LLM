@@ -1,17 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
-from os import getenv
+from os import environ, getenv
 from typing import Any, Dict, List, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
+                                          CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager)
+                                  CppMambaHybridCacheManager,
+                                  MambaHybridCacheManagerV2,
+                                  MixedMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -24,14 +30,38 @@ _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
 _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
+_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
-_CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
-    ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
-    ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-    ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
-)
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+def maybe_enable_fabric_memory_for_python_transceiver(
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        kv_cache_manager_cls: type) -> None:
+    """Default the C++ V1 KV pool to fabric memory for the Python transceiver.
+
+    This must run before any KV pool allocation because the C++ environment
+    getter caches the value on first read. Explicit user settings are always
+    respected.
+
+    Args:
+        cache_transceiver_config: Configuration used to select the cache
+            transceiver runtime and backend.
+        kv_cache_manager_cls: KV-cache manager class to check for C++ V1 pool
+            allocation.
+    """
+    if (cache_transceiver_config is None
+            or cache_transceiver_config.backend is None
+            or cache_transceiver_config.transceiver_runtime != "PYTHON"):
+        return
+    if not issubclass(kv_cache_manager_cls, KVCacheManager):
+        return
+    if getenv(_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV) is None:
+        environ[_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV] = "1"
+        logger.info(
+            "Python cache transceiver with C++ KV cache manager detected; "
+            f"defaulting {_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV}=1 (set it "
+            "to 0 explicitly to disable)")
 
 
 def is_disagg_inflight_cancel_enabled() -> bool:
@@ -122,38 +152,69 @@ def create_kv_cache_transceiver(
         logger.info("cache_transceiver is disabled")
         return None
 
+    # "auto" is normally resolved against the model's preference at config
+    # load time (ModelLoader.load_config_and_apply_defaults); paths that skip
+    # that step (e.g. AutoDeploy) fall back to the C++ transceiver here. This
+    # must run before any consumer of transceiver_runtime below (e.g. the
+    # inflight-cancel validation, which treats non-CPP runtimes as
+    # unsupported).
+    if cache_transceiver_config.transceiver_runtime == "auto":
+        cache_transceiver_config.transceiver_runtime = None
+
+    if (cache_transceiver_config.transceiver_runtime != "PYTHON"
+            and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
+        raise ValueError(
+            "MixedMambaHybridCacheManager requires the Python transceiver "
+            "runtime in disaggregated serving.")
+
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
-        cache_transceiver_config.backend = "NIXL"
-        # Ordered by priority
-        for env_var, be_type in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
-            if getenv(env_var) == "1":
-                logger.warning(
-                    f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
-                )
-                cache_transceiver_config.backend = be_type
-                break
+        backend, env_var = cache_transceiver_config._resolve_default_backend()
+        if env_var is not None:
+            logger.warning(
+                f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
+            )
+        cache_transceiver_config.backend = backend
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
     elif cache_transceiver_config.backend == "UCX":
         logger.info(
-            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
-            f"hangs or lower-than-expected performance.")
+            "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
+            "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            "hangs or lower-than-expected performance.")
 
-    # Select transceiver implementation based on transceiver_runtime
+    # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
-    # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
-        # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+    # transceiver_runtime == "PYTHON" -> use Python transceiver.
+    #
+    # MambaHybridCacheManagerV2 is backed by the Python KVCacheManagerV2 core,
+    # not the C++ BaseKVCacheManager binding required by CacheTransceiverCpp.
+    is_v2_mamba_hybrid = isinstance(mamba_cache_manager,
+                                    MambaHybridCacheManagerV2)
+    use_python_transceiver = (
+        cache_transceiver_config.transceiver_runtime == "PYTHON")
+
+    if is_v2_mamba_hybrid and not use_python_transceiver:
+        raise ValueError(
+            "MambaHybridCacheManagerV2 requires transceiver_runtime='PYTHON' "
+            "with backend='NIXL'; it cannot use the C++ transceiver.")
+
+    if use_python_transceiver:
+        if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
             raise ValueError(
-                f"Python transceiver currently only supports NIXL or DEFAULT backend, "
+                "transceiver_runtime='PYTHON' cannot drive "
+                "CppMambaHybridCacheManager (C++ pool backed). Use "
+                "transceiver_runtime='CPP', or select the V2 manager "
+                "with use_kv_cache_manager_v2=True.")
+        # DEFAULT has already been resolved above, so Python must see NIXL.
+        if cache_transceiver_config.backend != "NIXL":
+            raise ValueError(
+                f"Python transceiver currently only supports the NIXL backend, "
                 f"got {cache_transceiver_config.backend}. "
                 f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
             )
@@ -226,6 +287,14 @@ class KvCacheTransceiver(ABC):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
+    def get_data_transceiver_state(self) -> bytes:
+        """Get the serialized DataTransceiverState (CacheState + CommState)."""
+        return b""
+
+    def get_status_dump(self) -> str:
+        """Return a human-readable dump of transceiver state for debugging hangs."""
+        return ""
+
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 
@@ -267,6 +336,21 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             _is_disagg_inflight_cancel_config_supported(
                 cache_transceiver_config))
 
+        # Per-PP indexer k-cache layer counts. With a masked indexer pool
+        # (per-layer indexer mask, e.g. GLM 5.2 cross-layer indexer sharing)
+        # only full-indexer layers own a pool row, so the counts can be
+        # smaller than the attention layer counts.
+        indexer_layer_num_per_pp_rank = []
+        if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
+            local_indexer_mask = getattr(kv_cache_manager,
+                                         "indexer_k_cache_local_layer_mask",
+                                         None)
+            local_indexer_layer_num = (sum(local_indexer_mask)
+                                       if local_indexer_mask is not None else
+                                       pp_layer_num)
+            indexer_layer_num_per_pp_rank = dist.pp_allgather(
+                local_indexer_layer_num)
+
         # Get RNN layer distribution if mamba_cache_manager is provided.
         rnn_layer_num_per_pp_rank = []
         if mamba_cache_manager is not None:
@@ -283,13 +367,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
-        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
-                                        total_num_kv_heads_per_layer, head_dim,
-                                        tokens_per_block, world_config,
-                                        pp_layer_num_per_pp_rank, dtype,
-                                        attention_type,
-                                        cache_transceiver_config._to_pybind(),
-                                        rnn_layer_num_per_pp_rank)
+        self.impl = CacheTransceiverCpp(
+            kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
+            tokens_per_block, world_config,
+            pp_layer_num_per_pp_rank, dtype, attention_type,
+            cache_transceiver_config._to_pybind(), rnn_layer_num_per_pp_rank,
+            indexer_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
@@ -320,9 +403,15 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             return False
         return self.impl.has_poisoned_transfer_buffer()
 
+    def get_status_dump(self) -> str:
+        return self.impl.get_status_dump()
+
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally
         ...
+
+    def get_data_transceiver_state(self) -> bytes:
+        return self.impl.get_serialized_data_transceiver_state()
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response

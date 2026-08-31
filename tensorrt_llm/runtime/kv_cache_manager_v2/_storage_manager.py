@@ -219,6 +219,7 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
+        max_util_for_resume: float = 1.0,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -243,39 +244,44 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
-        constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
-        self._min_slots = self._compute_min_slots_from_constraints(
-            constraints_for_min_slots, tokens_per_block, swa_scratch_reuse
+        # Constraints are hot-level feasibility floors. Other levels need only one
+        # structural slot per pool group.
+        self._min_slots = self._compute_pool_group_min_slots_from_constraints(
+            constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
 
-        # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
+        # Derive one lifecycle ratio, then project it onto each level's pool grouping.
+        life_cycle_ratio: TypedIndexList[LifeCycleId, float]
         if initial_pool_ratio is not None:
-            if len(initial_pool_ratio) != self.num_pool_groups:
+            if len(initial_pool_ratio) != self.num_life_cycles:
                 raise ValueError(
-                    f"initial_pool_ratio length must match number of pool groups "
-                    f"({self.num_pool_groups}), got {len(initial_pool_ratio)}"
+                    f"initial_pool_ratio length must match number of layer groups "
+                    f"({self.num_life_cycles}), got {len(initial_pool_ratio)}"
                 )
             if any(r <= 0 for r in initial_pool_ratio):
                 raise ValueError("initial_pool_ratio values must be positive")
             if not math.isclose(sum(initial_pool_ratio), 1.0, rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError("initial_pool_ratio values must sum to 1.0")
-            init_ratio = cast(TypedIndexList[PoolGroupIndex, float], list(initial_pool_ratio))
+            life_cycle_ratio = cast(TypedIndexList[LifeCycleId, float], list(initial_pool_ratio))
         elif typical_batch is not None:
-            init_ratio = self.ratio_from_batch(
+            life_cycle_ratio = self.ratio_from_batch(
                 typical_batch, tokens_per_block, swa_scratch_reuse, gpu_granularity
             )
         elif constraints:
-            # Use the constraint slot counts as the ratio basis.
-            min_bytes = self._slots_to_bytes(self._min_slots, gpu_granularity)
-            total = sum(min_bytes)
-            init_ratio = typed_map(min_bytes, lambda x: x / total)
+            life_cycle_slots = self._compute_slots_from_constraints(
+                constraints, tokens_per_block, swa_scratch_reuse, max_util_for_resume
+            )
+            life_cycle_bytes = self._slots_to_bytes(life_cycle_slots, gpu_granularity)
+            total = sum(life_cycle_bytes)
+            life_cycle_ratio = typed_map(life_cycle_bytes, lambda x: x / total)
         else:
-            init_ratio = self.ratio_from_batch(
+            life_cycle_ratio = self.ratio_from_batch(
                 BatchDesc([KVCacheDesc(capacity=2049, history_length=2048)]),
                 tokens_per_block,
                 swa_scratch_reuse,
                 gpu_granularity,
             )
+        init_ratio = self.pool_group_ratio(life_cycle_ratio)
 
         num_levels = CacheLevel(len(config.cache_tiers))
         self._levels = cast(
@@ -287,7 +293,7 @@ class StorageManager:
                     config.cache_tiers[i],
                     slot_size_lists,
                     self._compute_slot_count_for_level(
-                        config.cache_tiers[i], slot_size_lists, init_ratio
+                        i, config.cache_tiers[i], slot_size_lists, init_ratio
                     ),
                 )
                 for i in typed_range(num_levels)
@@ -837,17 +843,16 @@ class StorageManager:
             if new_quota is None
             else round_up(new_quota, lvl_storage.pool_size_granularity)
         )
+        min_slots = self._min_slots_for_level(level)
         min_quota = self._min_quota_for_level(
-            lvl_storage.slot_size_lists, lvl_storage.pool_size_granularity
+            lvl_storage.slot_size_lists, lvl_storage.pool_size_granularity, min_slots
         )
         if new_quota < min_quota:
             raise ValueError(
                 f"Quota {new_quota} is insufficient for min_slots constraints "
                 f"(requires at least {min_quota})"
             )
-        new_num_slots = lvl_storage.compute_slot_count_list(
-            new_ratio_list, self._min_slots, new_quota
-        )
+        new_num_slots = lvl_storage.compute_slot_count_list(new_ratio_list, min_slots, new_quota)
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (
                 "Persistent pages should be None for non-last level cache"
@@ -867,26 +872,35 @@ class StorageManager:
 
     def ratio_from_length(
         self, tokens_per_block: int, history_length: int, capacity: int
-    ) -> TypedIndexList[PoolGroupIndex, float]:
+    ) -> TypedIndexList[LifeCycleId, float]:
         if capacity < history_length:
             warnings.warn("Bad sampling for capacity and history_length")
             capacity = history_length
         num_blocks = div_up(capacity, tokens_per_block)
-        num_bytes = filled_list(0.0, self.num_pool_groups)
+        num_bytes = filled_list(0, self.num_life_cycles)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
-        for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
-            pg_idx = self.get_pool_group_index(lc_idx)
-            slot_size = self.slot_size(pg_idx)
-            num_required_blocks: int
-            if lc_idx == ssm_lc_idx:
+        for life_cycle, lc in typed_enumerate(self._life_cycles.get()):
+            pool_group = self.get_pool_group_index(life_cycle)
+            if life_cycle == ssm_lc_idx:
                 num_required_blocks = 1
             else:
                 stale = lc.get_stale_range(history_length, tokens_per_block)
                 num_required_blocks = max(num_blocks - len(stale), 1)
-            num_bytes[pg_idx] += num_required_blocks * sum(slot_size)
+            num_bytes[life_cycle] = num_required_blocks * sum(self.slot_size(pool_group))
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)
+
+    def pool_group_ratio(
+        self, life_cycle_ratio: TypedIndexList[LifeCycleId, float]
+    ) -> TypedIndexList[PoolGroupIndex, float]:
+        assert len(life_cycle_ratio) == self.num_life_cycles
+        pool_group_ratio = filled_list(0.0, self.num_pool_groups)
+        for life_cycle in typed_range(self.num_life_cycles):
+            pool_group_ratio[self.get_pool_group_index(life_cycle)] += life_cycle_ratio[life_cycle]
+        total = sum(pool_group_ratio)
+        assert total > 0
+        return typed_map(pool_group_ratio, lambda x: x / total)
 
     def ratio_from_batch(
         self,
@@ -894,50 +908,75 @@ class StorageManager:
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
         granularity: int,
-    ) -> TypedIndexList[PoolGroupIndex, float]:
-        """Compute the ratio of bytes needed per pool group for a batch described by a BatchDesc."""
+    ) -> TypedIndexList[LifeCycleId, float]:
         num_slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
         num_bytes = self._slots_to_bytes(num_slots, granularity)
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)
 
-    def _compute_min_slots_from_constraints(
+    def _compute_slots_from_constraints(
         self,
         constraints: list[BatchDesc],
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
-    ) -> TypedIndexList[PoolGroupIndex, int]:
-        """Compute the minimum slots per pool group across all constraints (element-wise max).
-
-        All returned elements are positive.
-        """
-        max_slots = filled_list(0, self.num_pool_groups)
+        max_util_for_resume: float,
+    ) -> TypedIndexList[LifeCycleId, int]:
+        if not 0 < max_util_for_resume <= 1:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
+        max_slots = filled_list(0, self.num_life_cycles)
 
         def swa_floor_blocks(lc: AttnLifeCycle) -> int:
             window = unwrap_optional(lc.window_size)
-            # Handle oscillation of slot count required by SWA while the window slides.
             return lc.num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
 
-        # Full-attention lifecycles share the largest SWA floor: all attention
-        # lifecycles see the same seq_len, so this is a valid lower bound.
         floor_num_blocks = 1
         for _, lc in self.life_cycles.attention_life_cycles():
             if lc.window_size is not None:
                 floor_num_blocks = max(floor_num_blocks, swa_floor_blocks(lc))
-        for lc_idx, lc in self.life_cycles.items():
-            pg_idx = self.get_pool_group_index(lc_idx)
+        for life_cycle, lc in self.life_cycles.items():
             if not isinstance(lc, AttnLifeCycle):
-                # SSM / non-attention: 1 slot floor per life cycle.
-                max_slots[pg_idx] += 1
+                max_slots[life_cycle] = 1
             elif lc.window_size is not None:
-                max_slots[pg_idx] += swa_floor_blocks(lc)
+                max_slots[life_cycle] = swa_floor_blocks(lc)
             else:
-                max_slots[pg_idx] += floor_num_blocks
+                max_slots[life_cycle] = floor_num_blocks
+
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+            for life_cycle in typed_range(self.num_life_cycles):
+                scaled_slots = math.ceil(slots[life_cycle] / max_util_for_resume)
+                max_slots[life_cycle] = max(max_slots[life_cycle], scaled_slots)
+        return max_slots
+
+    def _compute_pool_group_min_slots_from_constraints(
+        self,
+        constraints: list[BatchDesc],
+        tokens_per_block: int,
+        swa_scratch_reuse: SwaScratchReuseConfig | None,
+        max_util_for_resume: float,
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Compute the minimum slots per pool group across all constraints (element-wise max).
+
+        All returned elements are positive. Constraint-derived floors include
+        headroom for the utilization gate checked by ``_KVCache.resume``.
+        """
+        if not 0 < max_util_for_resume <= 1:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
+        max_slots = filled_list(0, self.num_pool_groups)
+        life_cycle_floors = self._compute_slots_from_constraints(
+            [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
+        )
+        for life_cycle in typed_range(self.num_life_cycles):
+            max_slots[self.get_pool_group_index(life_cycle)] += life_cycle_floors[life_cycle]
+
+        for batch in constraints:
+            slots = self._compute_pool_group_slots_for_batch(
+                batch, tokens_per_block, swa_scratch_reuse
+            )
             for pg_idx in typed_range(self.num_pool_groups):
-                max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
+                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
+                max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 
     def _compute_slots_for_batch(
@@ -945,16 +984,15 @@ class StorageManager:
         batch: BatchDesc,
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
-    ) -> TypedIndexList[PoolGroupIndex, int]:
-        """Compute the minimum number of slots per pool group to support a BatchDesc."""
-        num_slots = filled_list(0, self.num_pool_groups)
+    ) -> TypedIndexList[LifeCycleId, int]:
+        """Compute the minimum number of slots per lifecycle to support a BatchDesc."""
+        num_slots = filled_list(0, self.num_life_cycles)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
         sys_blocks = batch.system_prompt_length // tokens_per_block
         for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
-            pg_idx = self.get_pool_group_index(lc_idx)
             if lc_idx == ssm_lc_idx:
                 # SSM: always 1 dedicated block per request, never shared.
-                num_slots[pg_idx] += len(batch.kv_caches)
+                num_slots[lc_idx] += len(batch.kv_caches)
                 continue
             # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
             # A sys block needs memory if it's non-stale for ANY request.
@@ -965,7 +1003,7 @@ class StorageManager:
             for kv in batch.kv_caches:
                 stale = lc.get_stale_range(kv.history_length, tokens_per_block)
                 stale_intersection = intersect(stale_intersection, stale)
-            num_slots[pg_idx] += sys_blocks - len(stale_intersection)
+            num_slots[lc_idx] += sys_blocks - len(stale_intersection)
             # Per-request unique blocks (excluding shared sys blocks already counted above).
             for kv in batch.kv_caches:
                 total_blocks = div_up(kv.capacity, tokens_per_block)
@@ -986,14 +1024,37 @@ class StorageManager:
                     # overlap with shared sys blocks (which are history).
                     num_scratch = len(scratch)
                     frac_max = self._slot_util_frac_max[lc_idx]
-                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(
+                    num_slots[lc_idx] += (unique_non_stale - num_scratch) + math.ceil(
                         num_scratch * frac_max
                     )
                 else:
-                    num_slots[pg_idx] += unique_non_stale
+                    num_slots[lc_idx] += unique_non_stale
+        return num_slots
+
+    def _compute_pool_group_slots_for_batch(
+        self,
+        batch: BatchDesc,
+        tokens_per_block: int,
+        swa_scratch_reuse: SwaScratchReuseConfig | None,
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Compute the minimum number of slots per hot pool group."""
+        life_cycle_slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+        num_slots = filled_list(0, self.num_pool_groups)
+        for life_cycle in typed_range(self.num_life_cycles):
+            num_slots[self.get_pool_group_index(life_cycle)] += life_cycle_slots[life_cycle]
         return num_slots
 
     def _slots_to_bytes(
+        self, num_slots: TypedIndexList[LifeCycleId, int], granularity: int
+    ) -> TypedIndexList[LifeCycleId, int]:
+        num_bytes = filled_list(0, self.num_life_cycles)
+        for life_cycle in typed_range(self.num_life_cycles):
+            pool_group = self.get_pool_group_index(life_cycle)
+            for pool_size in self.slot_size(pool_group):
+                num_bytes[life_cycle] += round_up(num_slots[life_cycle] * pool_size, granularity)
+        return num_bytes
+
+    def _pool_group_slots_to_bytes(
         self, num_slots: TypedIndexList[PoolGroupIndex, int], granularity: int
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Convert slot counts to bytes, rounding up each pool to granularity."""
@@ -1003,38 +1064,46 @@ class StorageManager:
                 num_bytes[pg_idx] += round_up(num_slots[pg_idx] * pool_size, granularity)
         return num_bytes
 
+    def _min_slots_for_level(self, level: CacheLevel) -> TypedIndexList[PoolGroupIndex, int]:
+        if level == GPU_LEVEL:
+            return self._min_slots
+        return filled_list(1, self.num_pool_groups)
+
+    @staticmethod
     def _min_quota_for_level(
-        self,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         granularity: int,
+        min_slots: TypedIndexList[PoolGroupIndex, int],
     ) -> int:
-        """Minimum quota (in bytes) required to satisfy _min_slots constraints."""
+        """Minimum quota in bytes required by the supplied slot floors."""
         return sum(
             round_up(ms * s, granularity)
-            for ms, sizes in zip(self._min_slots, slot_size_lists)
+            for ms, sizes in zip(min_slots, slot_size_lists)
             for s in sizes
         )
 
     def _compute_slot_count_for_level(
         self,
+        level: CacheLevel,
         tier_config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         ratio: TypedIndexList[PoolGroupIndex, float],
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute slot counts for a cache level from its tier config and ratio.
 
-        Applies min_slots constraints (always at least 1 per life cycle).
+        Applies hot constraint floors or a one-slot structural floor on colder levels.
         """
         granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
+        min_slots = self._min_slots_for_level(level)
         quota = max(
-            self._min_quota_for_level(slot_size_lists, granularity),
+            self._min_quota_for_level(slot_size_lists, granularity, min_slots),
             round_up(tier_config.quota, granularity),
         )
         return CacheLevelStorage.ratio_to_slot_count_list(
-            quota, slot_size_lists, ratio, granularity, self._min_slots
+            quota, slot_size_lists, ratio, granularity, min_slots
         )
 
-    def constrain_ratio(
+    def constrain_pool_group_ratio(
         self,
         ratio: TypedIndexList[PoolGroupIndex, float],
     ) -> TypedIndexList[PoolGroupIndex, float]:
@@ -1046,7 +1115,7 @@ class StorageManager:
         gpu_storage = self._levels[GPU_LEVEL].storage
         granularity = gpu_storage.pool_size_granularity
         slot_count_list = gpu_storage.compute_slot_count_list(ratio, self._min_slots)
-        num_bytes = self._slots_to_bytes(slot_count_list, granularity)
+        num_bytes = self._pool_group_slots_to_bytes(slot_count_list, granularity)
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)

@@ -46,18 +46,19 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 class QuantAttentionConfig(StrictBaseModel):
     """Attention quantization recipe (TRTLLM / CUTEDSL backends).
 
-    Describes user intent for quantized attention: per-bmm dtype and per-block layout for Q, K, V.
-    Providing this config to AttentionConfig enables quantized attention; setting
-    AttentionConfig.quant_attention_config = None disables it.
+    Specifies Q/K and V quantization formats and their optional block sizes.
 
     Bare QuantAttentionConfig() is a valid Qk16Pv8 recipe.
     Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
     """
 
-    qk_dtype: Literal["bf16", "int8", "fp8"] = Field(
+    qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
         "bf16",
         status="prototype",
-        description="Q/K quantization dtype; bf16 leaves Q/K unquantized.",
+        description=(
+            "Q/K quantization format. bf16 leaves Q/K unquantized; int8 and fp8 use 8-bit "
+            "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
+        ),
     )
     v_dtype: Literal["fp8"] = Field(
         "fp8",
@@ -68,19 +69,21 @@ class QuantAttentionConfig(StrictBaseModel):
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for Q; 0 for per-tensor quantization.",
+        description="Number of Q tokens per SageAttention quantization block; 0 otherwise.",
     )
     k_block_size: int = Field(
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for K; 0 for per-tensor quantization.",
+        description="Number of K tokens per SageAttention quantization block; 0 otherwise.",
     )
     v_block_size: int = Field(
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for V; 0 for per-tensor quantization.",
+        description=(
+            "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
+        ),
     )
 
 
@@ -113,13 +116,13 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM backend) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
         ),
     )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # SAGE recipes target the TRTLLM backend (per-block Q/K/V scales).
+        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block)).
         SAGE_RECIPES = {
             ("int8", "fp8", (1, 1, 1)),
             ("int8", "fp8", (1, 4, 1)),
@@ -127,9 +130,12 @@ class AttentionConfig(StrictBaseModel):
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
         }
-        # QK16PV8 (CUTEDSL backend): Q/K kept in bf16, V quantized to FP8.
-        QK16PV8_DTYPES = {
+        CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("mxfp8", "fp8", (0, 0, 0)),
+            ("mxfp8", "fp8", (0, 0, 1)),
+            ("nvfp4", "fp8", (0, 0, 0)),
+            ("nvfp4", "fp8", (0, 0, 1)),
         }
 
         if self.quant_attention_config is None:
@@ -150,11 +156,12 @@ class AttentionConfig(StrictBaseModel):
                     f"{sorted(SAGE_RECIPES)}."
                 )
         elif self.backend == "CUTEDSL":
-            if recipe not in QK16PV8_DTYPES:
+            if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported (qk_dtype, v_dtype): "
-                    f"{sorted(QK16PV8_DTYPES)}."
+                    f"for backend='CUTEDSL'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(CUTEDSL_RECIPES)}."
                 )
         else:
             raise ValueError(
@@ -170,29 +177,34 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         algo = self.sparse_attention_config.algorithm
-        required_backend = {"skip_softmax": "TRTLLM", "vsa": "CUTEDSL"}.get(algo)
-        if required_backend is None:
+        supported_backends = {
+            "skip_softmax": ("TRTLLM", "CUTEDSL"),
+            "vsa": ("CUTEDSL",),
+        }.get(algo)
+        if supported_backends is None:
             return self
 
-        if self.backend != required_backend:
+        if self.backend not in supported_backends:
             raise ValueError(
                 f"sparse_attention_config with algorithm='{algo}' requires "
-                f"backend='{required_backend}', got backend='{self.backend}'. "
-                f"Either set backend='{required_backend}' or remove "
+                f"backend in {supported_backends}, got backend='{self.backend}'. "
+                f"Either select a supported backend or remove "
                 f"sparse_attention_config."
             )
         return self
 
     @model_validator(mode="after")
     def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # quant_attention_config and sparse_attention_config are mutually exclusive.
+        # VSA replaces the dense CuTeDSL path and cannot compose with quantized
+        # attention. SkipSoftmax is part of that dense path and can compose.
         if (
             self.backend == "CUTEDSL"
             and self.quant_attention_config is not None
             and self.sparse_attention_config is not None
+            and self.sparse_attention_config.algorithm == "vsa"
         ):
             raise ValueError(
-                "CUTEDSL backend: quant_attention_config and "
+                "CUTEDSL backend: quant_attention_config and VSA "
                 "sparse_attention_config are mutually exclusive (the "
                 "CuTeDSLAttention dispatcher selects either the dense path "
                 "or the sparse VSA path, not both)."
@@ -471,6 +483,57 @@ class CudaGraphConfig(StrictBaseModel):
     enable: bool = Field(False, status="prototype")
 
 
+class CpuOffloadConfig(StrictBaseModel):
+    """Configuration for offloading visual-generation model components to CPU.
+
+    A diffusion pipeline is a sequence of large *components* (text encoder,
+    denoising transformer, VAE, optional guardrails, ...) that run one after
+    another, so only one is needed on the GPU at any moment. Offloading
+    exploits this: weights are loaded and quantized normally, then held in
+    packed host (CPU) storage and brought onto the GPU one *stage* at a time,
+    rebinding each module's parameters/buffers to a reusable GPU arena while
+    that stage runs and evicting it back to CPU afterwards. This lowers peak
+    GPU memory to roughly the largest single stage rather than the whole
+    pipeline, letting larger models fit on limited VRAM, at the cost of
+    host<->device copies between stages (mitigated by ``pin_memory``).
+
+    Terminology (used consistently across these fields):
+
+    - **component**: a named, public sub-model of the pipeline, e.g.
+      ``text_encoder``, ``transformer``, ``vae``.
+    - **stage**: one step of the offload schedule — a single component, or a
+      group of components that are co-resident on the GPU and run together
+      before being evicted. For example, a stage ``["text_encoder", "transformer"]``
+      keeps both components on GPU until that stage completes. The ordered list
+      of stages is set by ``stages``.
+    """
+
+    enable: bool = Field(
+        False,
+        status="prototype",
+        description="Enable offloading of model components to CPU between pipeline stages.",
+    )
+    pin_memory: bool = Field(
+        True,
+        status="prototype",
+        description="Allocate pinned CPU storage for faster host-to-device copies.",
+    )
+    stages: Optional[List[Union[str, List[str]]]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Optional ordered list of stages, named with model-specific public component "
+            "names. Each entry is a single component, or a list of components that are "
+            "co-resident on the GPU and run together as one stage. For example, "
+            "[['text_encoder', 'transformer'], 'vae'] keeps text_encoder and "
+            "transformer co-resident before moving to vae. Example components: "
+            "['text_encoder', 'transformer', 'vae'] for Wan T2V, or "
+            "['reasoner', 'generator', 'text_guardrail', 'video_guardrail', 'vae'] for Cosmos3. "
+            "If omitted, the model chooses default stages."
+        ),
+    )
+
+
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -506,6 +569,56 @@ class CompilationConfig(StrictBaseModel):
         status="prototype",
         description="Skip the post-load warmup pass (compile + capture).",
     )
+
+
+class RuntimeLoRAConfig(StrictBaseModel):
+    """Startup-preloaded LoRA adapter fused into transformer weights."""
+
+    path: str = Field(
+        "",
+        status="prototype",
+        description="Local safetensors file or directory containing LoRA adapter weights.",
+    )
+    scale: float = Field(
+        1.0,
+        status="prototype",
+        description="LoRA adapter strength multiplier applied on top of alpha/rank scaling.",
+    )
+    target_components: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Transformer component names to patch. Empty is allowed only for "
+            "single-transformer pipelines; multi-transformer pipelines require "
+            "explicit component names."
+        ),
+    )
+    strip_prefixes: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description="Extra LoRA key prefixes to strip before matching transformer module names.",
+    )
+    key_map: Dict[str, str] = Field(
+        default_factory=dict,
+        status="prototype",
+        description="Prefix map from LoRA checkpoint module names to TRTLLM module names.",
+    )
+    fuse_qkv: bool = Field(
+        True,
+        status="prototype",
+        description="Map to_q/to_k/to_v LoRA tensors onto fused qkv_proj modules when present.",
+    )
+    strict: bool = Field(
+        True,
+        status="prototype",
+        description="Raise when adapter tensors do not match any target module or expected shapes.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_path(self) -> "RuntimeLoRAConfig":
+        if not self.path:
+            raise ValueError("runtime_lora_config.path must be non-empty")
+        return self
 
 
 # =============================================================================
@@ -567,6 +680,10 @@ class VisualGenArgs(StrictBaseModel):
         default_factory=CudaGraphConfig,
         status="prototype",
     )
+    cpu_offload_config: CpuOffloadConfig = Field(
+        default_factory=CpuOffloadConfig,
+        status="prototype",
+    )
     attention_config: AttentionConfig = Field(
         default_factory=AttentionConfig,
         status="prototype",
@@ -576,6 +693,11 @@ class VisualGenArgs(StrictBaseModel):
         status="prototype",
     )
     cache_config: Optional[CacheConfig] = Field(None, status="prototype")
+    runtime_lora_config: Optional[RuntimeLoRAConfig] = Field(
+        None,
+        status="prototype",
+        description=("Startup-preloaded LoRA adapter fused into VisualGen transformer weights."),
+    )
 
     pipeline_config: Dict[str, Any] = Field(
         default_factory=dict,
@@ -668,5 +790,6 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "RuntimeLoRAConfig",
     "VisualGenArgs",
 ]

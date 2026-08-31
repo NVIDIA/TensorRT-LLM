@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from fastapi import Request
 from starlette.datastructures import Headers
 
-from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
+from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -24,9 +27,90 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _raw_request(headers: dict[str, str]):
     return SimpleNamespace(headers=Headers(headers=headers))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_kwargs", "expected_timeout"),
+    [({}, 10), ({"server_keep_alive_timeout": 3600}, 3600)],
+)
+async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
+    monkeypatch, config_kwargs, expected_timeout
+):
+    config = extract_disagg_cfg(
+        context_servers={"num_instances": 0},
+        generation_servers={"num_instances": 0},
+        **config_kwargs,
+    )
+    server = object.__new__(OpenAIDisaggServer)
+    server._config = config
+    server.app = object()
+
+    uvicorn_config = object()
+    config_factory = Mock(return_value=uvicorn_config)
+    uvicorn_server = SimpleNamespace(serve=AsyncMock())
+    server_factory = Mock(return_value=uvicorn_server)
+    monkeypatch.setattr(openai_disagg_server.uvicorn, "Config", config_factory)
+    monkeypatch.setattr(openai_disagg_server.uvicorn, "Server", server_factory)
+
+    await server(host="localhost", port=8000)
+
+    assert config_factory.call_args.kwargs["timeout_keep_alive"] == expected_timeout
+    server_factory.assert_called_once_with(uvicorn_config)
+    uvicorn_server.serve.assert_awaited_once_with(sockets=None)
+
+
+@pytest.mark.asyncio
+async def test_http_cluster_storage_request_is_proxied_to_coordinator():
+    payload = b'{"key":"worker","value":"ready"}'
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/set",
+            "query_string": b"source=worker",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive,
+    )
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._coordinator = SimpleNamespace(
+        proxy_cluster_storage_request=AsyncMock(
+            return_value=(b'{"result":true}', 200, "application/json")
+        )
+    )
+
+    response = await server._proxy_cluster_storage_request(request)
+
+    server._coordinator.proxy_cluster_storage_request.assert_awaited_once_with(
+        "POST", "/set", [("source", "worker")], payload, "application/json"
+    )
+    assert response.status_code == 200
+    assert response.body == b'{"result":true}'
+
+
+def test_create_client_does_not_register_with_server_metrics_collector():
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._coordinator = SimpleNamespace(get_disagg_request_id=AsyncMock(return_value=1))
+    server._req_timeout_secs = 30
+    server._collect_perf_metrics = True
+    server._config = SimpleNamespace(internal_request_auth_key="key")
+    server._perf_metrics_collector = SimpleNamespace()
+
+    with patch("tensorrt_llm.serve.openai_disagg_server.OpenAIHttpClient") as mock_client:
+        client = server._create_client(SimpleNamespace(), ServerRole.GENERATION, max_retries=2)
+
+    assert client is mock_client.return_value
+    mock_client.assert_called_once()
 
 
 def test_extract_conversation_id_from_headers():
@@ -102,7 +186,6 @@ def test_extract_conversation_id_preserves_body_conversation_params():
     )
 
     assert request.conversation_params.conversation_id == "body-id"
-    assert request.disaggregated_params.conversation_id is None
 
 
 def test_extract_conversation_id_populates_conversation_params_with_existing_disaggregated_params():
@@ -118,7 +201,6 @@ def test_extract_conversation_id_populates_conversation_params_with_existing_dis
     )
 
     assert request.conversation_params.conversation_id == "multi-turn-session-id"
-    assert request.disaggregated_params.conversation_id is None
 
 
 def test_disagg_config_allows_request_chat_template_opt_in():

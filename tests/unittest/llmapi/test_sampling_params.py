@@ -14,10 +14,12 @@
 # limitations under the License.
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
@@ -27,9 +29,145 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     KVCacheTruncateRequest,
+    ResponsesRequest,
     ensure_request_chat_template_allowed,
 )
 from tensorrt_llm.serve.resource_governor import ResourceGovernor
+
+pytestmark = pytest.mark.cpu_only
+
+
+def _apply_generation_config_sampling_defaults(
+    mode: str,
+    sampling_params: SamplingParams,
+    generation_config_explicit_values: dict,
+) -> SamplingParams:
+    llm = SimpleNamespace(
+        args=SimpleNamespace(backend="pytorch", generation_config=mode),
+        _generation_config_explicit_values=generation_config_explicit_values,
+    )
+    BaseLLM._apply_generation_config_sampling_defaults(llm, sampling_params)
+    return sampling_params
+
+
+def test_generation_config_mode_controls_sampling_defaults():
+    values = {"temperature": 0.7}
+
+    trtllm_params = _apply_generation_config_sampling_defaults(
+        "trtllm", SamplingParams(end_id=1), values
+    )
+    auto_params = _apply_generation_config_sampling_defaults(
+        "auto", SamplingParams(end_id=1), values
+    )
+
+    assert trtllm_params.temperature is None
+    assert auto_params.temperature == 0.7
+
+
+def test_generation_config_sampling_precedence():
+    params = SamplingParams(end_id=1, temperature=0.2)
+    prepared = _apply_generation_config_sampling_defaults(
+        "auto",
+        params,
+        {
+            "temperature": 0.7,
+            "top_p": 0.9,
+        },
+    )
+
+    # Check each precedence level:
+    # 1. Request-provided values
+    # 2. Generation config values
+    # 3. TRT-LLM defaults
+    assert prepared.temperature == 0.2
+    assert prepared.top_p == 0.9
+    assert prepared.top_k is None
+
+
+def test_generation_config_applies_all_supported_sampling_fields():
+    # Use typical_p because it is not supported by the generation config.
+    values = {
+        "early_stopping": True,
+        "length_penalty": 0.8,
+        "min_p": 0.05,
+        "no_repeat_ngram_size": 3,
+        "repetition_penalty": 1.1,
+        "temperature": 0.7,
+        "top_k": 20,
+        "top_p": 0.9,
+        "typical_p": 0.95,
+    }
+
+    prepared = _apply_generation_config_sampling_defaults("auto", SamplingParams(end_id=1), values)
+
+    for field_name, expected in values.items():
+        if field_name != "typical_p":
+            assert getattr(prepared, field_name) == expected
+
+    unsupported_values = _apply_generation_config_sampling_defaults(
+        "auto",
+        SamplingParams(end_id=1),
+        {
+            "top_p": None,
+            "early_stopping": "never",
+        },
+    )
+    assert unsupported_values.top_p is None
+    assert unsupported_values.early_stopping is None
+
+
+@pytest.mark.parametrize(
+    "request_obj",
+    [
+        CompletionRequest(model="test", prompt="hi"),
+        ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "hi"}]),
+        ResponsesRequest(model="test", input="hi"),
+    ],
+)
+def test_generation_config_overrides_omitted_serve_defaults(request_obj):
+    params = request_obj.to_sampling_params()
+
+    assert params.temperature == 1.0
+    prepared = _apply_generation_config_sampling_defaults(
+        "auto", params, {"temperature": 0.7, "top_p": 0.9}
+    )
+
+    assert prepared.temperature == 0.7
+    assert prepared.top_p == 0.9
+
+
+@pytest.mark.parametrize(
+    "request_obj",
+    [
+        CompletionRequest(model="test", prompt="hi", temperature=0.2),
+        ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.2,
+        ),
+        ResponsesRequest(model="test", input="hi", temperature=0.2),
+    ],
+)
+def test_explicit_serve_request_overrides_generation_config(request_obj):
+    prepared = _apply_generation_config_sampling_defaults(
+        "auto",
+        request_obj.to_sampling_params(),
+        {"temperature": 0.7},
+    )
+
+    assert prepared.temperature == 0.2
+
+
+def test_absent_generation_config_value_preserves_existing_defaults():
+    direct_params = _apply_generation_config_sampling_defaults("auto", SamplingParams(end_id=1), {})
+    serve_params = _apply_generation_config_sampling_defaults(
+        "auto",
+        CompletionRequest(model="test", prompt="hi").to_sampling_params(),
+        {},
+    )
+
+    assert direct_params.temperature is None
+    assert serve_params.temperature == 1.0
 
 
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
@@ -113,6 +251,44 @@ def test_completion_logprobs_assignment_revalidates():
 
     with pytest.raises(ValueError, match=f"less than or equal to {MAX_TOP_LOGPROBS}"):
         request.to_sampling_params(backend="pytorch")
+
+
+@pytest.mark.parametrize("field", ["top_p", "min_p", "temperature"])
+def test_sampling_params_rejects_nan(field):
+    with pytest.raises(ValueError, match=field):
+        SamplingParams(**{field: float("nan")})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("top_p", -0.1),
+        ("top_p", 1.1),
+        ("min_p", -0.1),
+        ("min_p", 1.1),
+        ("temperature", -1.0),
+    ],
+)
+def test_sampling_params_rejects_out_of_range(field, value):
+    with pytest.raises(ValueError, match=field):
+        SamplingParams(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("top_p", 0.0),
+        ("top_p", 0.9),
+        ("top_p", 1.0),
+        ("min_p", 0.0),
+        ("min_p", 0.5),
+        ("min_p", 1.0),
+        ("temperature", 0.0),
+        ("temperature", 1.0),
+    ],
+)
+def test_sampling_params_accepts_in_range_values(field, value):
+    assert getattr(SamplingParams(**{field: value}), field) == value
 
 
 @pytest.mark.parametrize("value", [None, -1])
@@ -199,6 +375,66 @@ def test_thinking_budget_logits_processor_ignores_closed_reasoning_block():
     processor(0, logits, [[1, 5, 2, 6]], None, None)
 
     assert torch.equal(logits, torch.zeros(1, 1, 8))
+
+
+def _run(processor, token_ids):
+    """Call the processor on a fresh logits row and return it."""
+    logits = torch.zeros(1, 1, 8)
+    processor(0, logits, token_ids, None, None)
+    return logits
+
+
+def test_thinking_budget_logits_processor_does_not_force_end_twice_on_stale_view():
+    """Regression: a stale token view must not re-force the end tag.
+
+    With the overlap scheduler, logits processors run one step
+    behind the sampled tokens, so the call right after forcing the end token
+    sees token_ids WITHOUT it. A stateless processor forces the end token a
+    second time, producing e.g. `</think></think>` — the reasoning parser
+    consumes the first tag and the second leaks into message.content.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=2,
+        reasoning_start_token_ids=[1],
+        reasoning_end_token_ids=[2],
+    )
+    stale = [[1, 5, 6]]  # budget spent, forced end not visible yet
+
+    logits = _run(processor, stale)
+    assert logits[0, 0, 2] == 0 and torch.isneginf(logits[0, 0, 3])
+
+    # Next step: the forced end token is still not visible (stale view).
+    assert torch.equal(_run(processor, stale), torch.zeros(1, 1, 8))
+
+    # Once the view catches up (end tag present), progress state resets so a
+    # later reasoning block is budgeted again.
+    assert torch.equal(_run(processor, [[1, 5, 6, 2, 7]]), torch.zeros(1, 1, 8))
+    logits = _run(processor, [[1, 5, 6, 2, 7, 1, 8, 9]])
+    assert logits[0, 0, 2] == 0 and torch.isneginf(logits[0, 0, 3])
+
+
+def test_thinking_budget_logits_processor_continues_end_sequence_on_stale_view():
+    """Multi-token end sequence must continue, not restart, on a stale view.
+
+    Under the overlap scheduler the processor must continue from its
+    recorded progress rather than re-derive from token_ids.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=2,
+        reasoning_start_token_ids=[1],
+        reasoning_end_token_ids=[2, 3],
+    )
+    stale = [[1, 5, 6]]
+
+    assert _run(processor, stale)[0, 0, 2] == 0
+
+    # Stale view: forced first end token not visible; must force the SECOND
+    # end token, not the first again.
+    logits = _run(processor, stale)
+    assert logits[0, 0, 3] == 0 and torch.isneginf(logits[0, 0, 2])
+
+    # Sequence complete: no further forcing even while the view is stale.
+    assert torch.equal(_run(processor, stale), torch.zeros(1, 1, 8))
 
 
 def test_add_thinking_budget_logits_processor_uses_reasoning_parser_tokens():

@@ -58,7 +58,7 @@ commands:
       backend:
         type: Choice(['_autodeploy', 'pytorch'])
         default: pytorch
-        status: beta
+        status: deprecated
         required: false
         multiple: false
         is_flag: false
@@ -166,6 +166,15 @@ commands:
         flags:
         - "--free_gpu_memory_fraction"
         - "--kv_cache_free_gpu_memory_fraction"
+      generation_config:
+        type: Choice(['auto', 'trtllm'])
+        default: trtllm
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--generation-config"
       gpus_per_node:
         type: int
         default: null
@@ -184,6 +193,15 @@ commands:
         is_flag: true
         flags:
         - "--grpc"
+      grpc_protocol:
+        type: Choice(['openengine', 'smg'])
+        default: smg
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--grpc-protocol"
       host:
         type: str
         default: localhost
@@ -303,6 +321,15 @@ commands:
         is_flag: false
         flags:
         - "--num_postprocess_workers"
+      num_serve_frontends:
+        type: int
+        default: 1
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--num_serve_frontends"
       num_input_processor_workers:
         type: int
         default: 8
@@ -359,7 +386,7 @@ commands:
         flags:
         - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false
@@ -367,6 +394,15 @@ commands:
         is_flag: false
         flags:
         - "--reasoning_parser"
+      report_addr:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--report_addr"
       revision:
         type: str
         default: null
@@ -425,7 +461,7 @@ commands:
         flags:
         - "--tokenizer"
       tool_parser:
-        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
+        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'kimi_k3', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
         default: null
         status: prototype
         required: false
@@ -502,6 +538,15 @@ commands:
         is_flag: false
         flags:
         - "--metrics-log-interval"
+      report_addr:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--report_addr"
       request_timeout:
         type: int
         default: 180

@@ -16,6 +16,7 @@ context_servers:
   disable_overlap_scheduler: true
   cache_transceiver_config:
     backend: DEFAULT
+    kv_transfer_timeout_ms: 100000
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -29,3 +30,4 @@ generation_servers:
   disable_overlap_scheduler: true
   cache_transceiver_config:
     backend: DEFAULT
+    kv_transfer_timeout_ms: 100000

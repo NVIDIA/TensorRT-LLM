@@ -18,6 +18,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
+- CPU offloading to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
@@ -34,26 +35,41 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
+| `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
+| `Qwen/Qwen-Image-Layered` | Image-to-Image |
+| `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
+| `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
+| `zai-org/GLM-Image` | Text-to-Image |
+
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
-|---|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image** [^5] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FastWan 2.2** | Yes | Yes | No | No | No | No [^7] | No | No | Yes | Yes | Yes | No | No | No | No |
+| **LTX-2** | Yes | Yes | Yes [^4] | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -63,7 +79,9 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
 
-[^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
+[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing and returns one RGBA image per generated layer by default. Set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, and Tensor Parallelism are not enabled for this pipeline yet.
+
+[^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
 ## Quick Start
 
@@ -90,11 +108,16 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/images/generations` | POST | Synchronous image generation |
 | `/v1/images/edits` | POST | Image editing |
 | `/v1/videos` | POST | Asynchronous video generation |
-| `/v1/videos/generations` | POST | Synchronous video generation |
+| `/v1/videos/sync` | POST | Synchronous video generation |
+| `/v1/videos/generations` | POST | Deprecated alias of `/v1/videos/sync` (kept for back-compat) |
 | `/v1/videos/{id}` | GET | Video status / metadata |
 | `/v1/videos/{id}/content` | GET | Download generated video |
 | `/v1/videos/{id}` | DELETE | Delete generated video |
 | `/v1/videos` | GET | List all videos |
+
+The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
+
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
 ## Optimizations
 
@@ -116,6 +139,34 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+### Runtime LoRA
+
+VisualGen can preload a local LoRA adapter at startup and fuse its deltas into transformer weights before warmup, CUDA graph capture, and cache acceleration setup. Configure this through `VisualGenArgs.runtime_lora_config` in Python or YAML:
+
+```yaml
+runtime_lora_config:
+  path: /path/to/adapter-or-safetensors
+  target_components:
+    - transformer
+```
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import RuntimeLoRAConfig
+
+args = VisualGenArgs(
+    model="/path/to/model",
+    runtime_lora_config=RuntimeLoRAConfig(
+        path="/path/to/adapter-or-safetensors",
+        target_components=["transformer"],
+    ),
+)
+```
+
+The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
+
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
 
 ### Quantized Attention
 
@@ -183,7 +234,7 @@ cache_config:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for FLUX.2 and Wan 2.1. |
+| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for all other supported models. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
 | `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
 
@@ -267,6 +318,9 @@ attention_config:
     vsa_sparsity: 0.90
 ```
 
+### CPU Offloading
+
+CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
 
 ### Multi-GPU Parallelism
 
@@ -280,6 +334,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+
 ## Developer Guide
 
 ### Architecture Overview

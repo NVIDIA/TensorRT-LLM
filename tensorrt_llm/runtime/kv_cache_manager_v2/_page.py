@@ -31,7 +31,6 @@ from ._common import (
     PageIndex,
     PageStatus,
     Priority,
-    TokenIdExt,
 )
 
 if TYPE_CHECKING:
@@ -132,8 +131,6 @@ class UncommittedPage(Page):
     ordinal: BlockOrdinal
     beam_index: BeamIndex
 
-    tokens: list[TokenIdExt] = field(default_factory=list)
-
     def is_committed(self) -> bool:
         return False
 
@@ -164,48 +161,36 @@ class UncommittedPage(Page):
         )
         self.set_slot(slot)
 
-    def convert_to_committed(self, block: Block, ready_event: CachedCudaEvent) -> "CommittedPage":
+    def convert_to_committed(
+        self, block: Block, ready_event: CachedCudaEvent, num_tokens_in_block: int
+    ) -> "CommittedPage":
         """
         Moves the slot to a new committed page and add the new page to the block.
         The uncommitted page becomes invalid.
+
+        `num_tokens_in_block` records the page's token count. See
+        `CommittedPage.num_tokens_in_block` for its attention and SSM interpretations.
         """
         assert not self.scheduled_for_eviction
-        assert block.storage[self.life_cycle] is None
+        # Check before building: replace_page() below drops the superseded page, so a
+        # failure in between must not lose a usable snapshot.
+        assert block.can_replace_page(self.life_cycle, num_tokens_in_block)
         # If you hit this assertion failure, it's likely because you are using debugpy, which delayed GC
         # for _KVCache._take_uncommitted_page(). Disable breakpoints on exceptions to avoid this issue.
         assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
         self.ready_event = ready_event
         committed_page = CommittedPage(
-            self.manager, block, self.life_cycle, self.cache_level, self, self.priority
-        )
-        assert not self.has_valid_slot and self.ready_event is CachedCudaEvent.NULL
-        assert committed_page.has_valid_slot
-        block.storage[self.life_cycle] = rawref.ref(committed_page)
-        return committed_page
-
-    def convert_to_ssm_committed(
-        self, block: Block, ready_event: CachedCudaEvent, num_tokens_in_block: int
-    ) -> "SsmCommittedPage":
-        """
-        Moves the slot to a new committed SSM page and add the new page to the block.
-        The uncommitted page becomes invalid.
-        """
-        assert not self.scheduled_for_eviction
-        assert block.storage[self.life_cycle] is None
-        assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
-        self.ready_event = ready_event
-        committed_page = SsmCommittedPage(
             self.manager,
             block,
             self.life_cycle,
             self.cache_level,
             self,
-            self.priority,
             num_tokens_in_block,
+            self.priority,
         )
         assert not self.has_valid_slot and self.ready_event is CachedCudaEvent.NULL
         assert committed_page.has_valid_slot
-        block.storage[self.life_cycle] = rawref.ref(committed_page)
+        block.replace_page(self.life_cycle, committed_page)
         return committed_page
 
     def __del__(self) -> None:
@@ -241,6 +226,17 @@ class CommittedPage(Page):
     """
 
     block: rawref.ref["Block"]
+    # Token count recorded for this page. It is usually len(block.tokens), but a snapshot
+    # taken at an earlier token boundary may live in a block that spans more tokens -- see
+    # Block.__init__ and _KVCache._snapshot_partial_block_to_tree.
+    #
+    # Attention and SSM life cycles interpret it differently:
+    #   * for attention pages, it is the number of leading tokens with valid per-token KV,
+    #     so the page is reusable for any prefix up to that count (compare with `>=`);
+    #   * for an SSM page, it is the exact recurrent-state checkpoint, so reuse must be
+    #     truncated to exactly that boundary.
+    num_tokens_in_block: int
+    planned_drop_count: int
     __rawref__: rawref.ref["CommittedPage"]
 
     def is_committed(self) -> bool:
@@ -253,9 +249,13 @@ class CommittedPage(Page):
         life_cycle: LifeCycleId,
         cache_level: CacheLevel,
         slot: Slot,
+        num_tokens_in_block: int,
         priority: Priority,
     ):
+        assert 0 < num_tokens_in_block <= len(block.tokens)
         self.block = rawref.ref(block)
+        self.num_tokens_in_block = num_tokens_in_block
+        self.planned_drop_count = 0
         self.__rawref__ = rawref.NULL
         Page.__init__(
             self,
@@ -274,7 +274,7 @@ class CommittedPage(Page):
         block = self.block()
         # block may be None when rebase happens, i.e. another block with the same key is committed,
         # replacing it, but the page is still used by a _KVCache.
-        if block is not None and block.unlink_page(self.life_cycle, self):
+        if block is not None and block.unlink_page(self.life_cycle, self) is not None:
             Block.clear_stale_blocks_after_page_unlink(
                 block,
                 self.life_cycle,
@@ -282,25 +282,6 @@ class CommittedPage(Page):
             )
         Page.__del__(self)
         self.__rawref__.invalidate()
-
-
-@dataclass(slots=True)
-class SsmCommittedPage(CommittedPage):
-    num_tokens_in_block: int
-
-    def __init__(
-        self,
-        storage: "StorageManager",
-        block: Block,
-        life_cycle: LifeCycleId,
-        cache_level: CacheLevel,
-        slot: Slot,
-        priority: Priority,
-        num_tokens_in_block: int,
-    ):
-        assert num_tokens_in_block > 0
-        self.num_tokens_in_block = num_tokens_in_block
-        CommittedPage.__init__(self, storage, block, life_cycle, cache_level, slot, priority)
 
 
 @dataclass(slots=True)
@@ -327,7 +308,10 @@ class _PageHolder:
             if not page.scheduled_for_eviction:
                 page.manager.schedule_for_eviction(page)
             block = page.block()
-            if block is None or block.is_orphan:
+            # A page that no longer sits in its block's slot (orphaned block, or replaced
+            # by a page with a larger recorded token count) is unreachable for reuse, so
+            # keeping it in the eviction LRU would just pin a slot until memory pressure hits.
+            if block is None or block.is_orphan or not block.holds_page(page):
                 page.manager.exclude_from_eviction(page)
         elif page.scheduled_for_eviction:
             page = cast(UncommittedPage, self.page)

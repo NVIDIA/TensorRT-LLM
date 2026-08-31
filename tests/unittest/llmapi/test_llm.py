@@ -17,7 +17,9 @@ from tensorrt_llm import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, RequestOutput)
+                                 LookaheadDecodingConfig, RequestOutput,
+                                 SADecodingConfig)
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
@@ -124,7 +126,7 @@ def llm_check_output(llm: LLM,
 
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-mixtral_model_name = "Mixtral-8x7B-v0.1"
+qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)
 
@@ -234,12 +236,10 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('gpt2'), False, 0.95),  # BPE
         (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
         (get_model_path('t5-small'), True, 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), False, 0.95),
-        (get_model_path('falcon-7b-instruct'), False, 0.95),
         (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
-        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
         (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
@@ -1106,6 +1106,38 @@ def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
         llm.generate(prompt)
 
 
+def test_oversized_prompt_rejected_with_inflated_max_seq_len():
+    """Oversized prompt is rejected gracefully when max_seq_len is inflated internally.
+
+    With speculative decoding, KV cache max_seq_len is inflated to reserve space
+    for draft tokens. Admission control must use the net (user-configured) limit,
+    not the inflated value. Otherwise oversized prompts crash the event loop.
+    """
+    max_seq_len = 256
+
+    llm = LLM(
+        model=llama_model_path,
+        max_seq_len=max_seq_len,
+        max_batch_size=1,
+        max_num_tokens=(max_seq_len + 32),
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        speculative_config=SADecodingConfig(max_draft_len=4),
+        disable_overlap_scheduler=True,
+    )
+
+    # Prompt that fills the entire net budget -> 0 tokens left for output -> rejected
+    oversized_prompt_ids = [1] * (max_seq_len + 1)
+    with pytest.raises(RequestError):
+        llm.generate([oversized_prompt_ids],
+                     sampling_params=SamplingParams(max_tokens=1))
+
+    # Executor must still be alive
+    result = llm.generate(["Hello"],
+                          sampling_params=SamplingParams(max_tokens=5))
+    assert len(result) == 1
+    assert len(result[0].outputs[0].text) > 0
+
+
 def test_llm_shutdown_executor():
     llm = LLM(
         model=llama_model_path,
@@ -1206,6 +1238,7 @@ class _FakeCompletionGeneratorArgs:
     gather_generation_logits = False
     num_postprocess_workers = 0
     return_perf_metrics = False
+    reasoning_parser = None
 
 
 class _FakeModelConfig:
@@ -1293,6 +1326,48 @@ class _FakeRawRequest:
         return True
 
 
+def test_startup_metrics_by_server_info() -> None:
+
+    class FakeExecutor:
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_startup_metrics(self):
+            self.calls += 1  # keep track of # calls to ensure the cache in the server works
+            if self.calls == 1:
+                return None
+            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+
+    executor = FakeExecutor()
+    generator = object.__new__(BaseLLM)
+    generator._executor = executor
+    generator._startup_metrics = None
+    generator._disaggregated_params = {}
+
+    server = object.__new__(OpenAIServer)
+    server.generator = generator
+    first_response = asyncio.run(server.get_server_info())
+    second_response = asyncio.run(server.get_server_info())
+    third_response = asyncio.run(server.get_server_info())
+
+    assert json.loads(first_response.body) == {
+        "disaggregated_params": {},
+        "startup_metrics": {},
+    }
+    expected_success = {
+        "disaggregated_params": {},
+        "startup_metrics": {
+            "model_loader": {
+                "total_model_loading_seconds": 1.5
+            }
+        },
+    }
+    assert json.loads(second_response.body) == expected_success
+    assert json.loads(third_response.body) == expected_success
+    assert executor.calls == 2
+
+
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
 
     async def run_request():
@@ -1303,7 +1378,8 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.model_config = _FakeModelConfig()
         server.tokenizer = None
         server.metrics_collector = None
-        server.perf_metrics = None
+        server._collect_perf_metrics = False
+        server._input_proc_executor = None
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],

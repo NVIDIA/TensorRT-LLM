@@ -17,10 +17,13 @@ from tensorrt_llm.visual_gen.args import (
     CudaGraphConfig,
     ParallelConfig,
     QuantAttentionConfig,
+    RuntimeLoRAConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestVisualGenArgsStrictValidation:
@@ -60,6 +63,10 @@ class TestVisualGenArgsStrictValidation:
     def test_nested_warmup_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             CompilationConfig(resolutions=[(480, 832)], bad_field=True)
+
+    def test_nested_runtime_lora_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            RuntimeLoRAConfig(path="/tmp/lora.safetensors", unknown_opt=True)
 
     def test_legacy_linear_field_rejected(self):
         """The removed 'linear' YAML field must now cause an error."""
@@ -119,6 +126,48 @@ class TestAttentionConfigQuantValidation:
         )
 
         assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("v_block_size", [0, 1])
+    def test_supported_quant_config_cute_mxfp8(self, v_block_size):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="mxfp8",
+                v_dtype="fp8",
+                v_block_size=v_block_size,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_block_size == v_block_size
+
+    @pytest.mark.parametrize("v_block_size", [0, 1])
+    def test_supported_quant_config_cute_nvfp4(self, v_block_size):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4",
+                v_dtype="fp8",
+                v_block_size=v_block_size,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_block_size == v_block_size
+
+    def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
+            )
+
+    def test_sage_qk_block_size_rejected_on_cute(self):
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="CUTEDSL",
+                quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", q_block_size=1),
+            )
 
 
 class TestPipelineRegistryUnique:
@@ -212,6 +261,22 @@ class TestVisualGenArgsFromDict:
         assert isinstance(args.cache_config, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.3
 
+    def test_runtime_lora_nested_dict_auto_coerced(self):
+        args = VisualGenArgs(
+            **{
+                "model": "/tmp/model",
+                "runtime_lora_config": {
+                    "path": "/tmp/lora.safetensors",
+                    "scale": 0.75,
+                    "target_components": ["transformer"],
+                },
+            }
+        )
+        assert isinstance(args.runtime_lora_config, RuntimeLoRAConfig)
+        assert args.runtime_lora_config.path == "/tmp/lora.safetensors"
+        assert args.runtime_lora_config.scale == 0.75
+        assert args.runtime_lora_config.target_components == ["transformer"]
+
     def test_quant_config_dict_passthrough(self):
         """ModelOpt-format dicts are accepted as-is — they parse in PipelineLoader."""
         from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -233,6 +298,7 @@ class TestVisualGenArgsFromDict:
         args = VisualGenArgs(
             model="/tmp/model",
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
         )
         # Negative: removed fields raise ValidationError when set directly.
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
@@ -246,6 +312,26 @@ class TestVisualGenArgsFromDict:
         dumped = set(args.model_dump())
         assert "dynamic_weight_quant" not in dumped
         assert "force_dynamic_quantization" not in dumped
+
+    def test_runtime_lora_rejects_quantized_visual_gen_config(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+        model_dir = tmp_path / "model"
+        transformer_dir = model_dir / "transformer"
+        transformer_dir.mkdir(parents=True)
+        (model_dir / "model_index.json").write_text(
+            '{"transformer": ["diffusers", "WanTransformer3DModel"]}'
+        )
+        (transformer_dir / "config.json").write_text("{}")
+
+        args = VisualGenArgs(
+            model=str(model_dir),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+        )
+
+        with pytest.raises(ValueError, match="runtime_lora_config.*weight quantization"):
+            DiffusionPipelineConfig.from_pretrained(model_dir, args=args)
 
 
 class TestVisualGenArgsFromYaml:
@@ -265,6 +351,15 @@ class TestVisualGenArgsFromYaml:
         yaml_path.write_text("model: /tmp/model\nrevision: original\n")
         args = VisualGenArgs.from_yaml(yaml_path, revision="override")
         assert args.revision == "override"
+
+    def test_from_yaml_runtime_lora_config(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\nruntime_lora_config:\n  path: /tmp/lora.safetensors\n  scale: 0.5\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert isinstance(args.runtime_lora_config, RuntimeLoRAConfig)
+        assert args.runtime_lora_config.scale == 0.5
 
     def test_from_yaml_unknown_field_raises(self, tmp_path):
         yaml_path = tmp_path / "bad.yml"
@@ -345,6 +440,7 @@ class TestVisualGenArgsPickle:
             parallel_config=ParallelConfig(cfg_size=2, ulysses_size=1),
             attention_config=AttentionConfig(backend="TRTLLM"),
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
         )
         data = pickle.dumps(args)
         restored = pickle.loads(data)
@@ -353,6 +449,7 @@ class TestVisualGenArgsPickle:
         assert restored.compilation_config.skip_warmup is True
         assert restored.parallel_config.cfg_size == 2
         assert restored.attention_config.backend == "TRTLLM"
+        assert restored.runtime_lora_config.path == "/tmp/lora.safetensors"
         # quant_config is the user dict (lazy-parsed in PipelineLoader)
         assert restored.quant_config["quant_algo"] == "FP8"
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -25,8 +25,13 @@ include_directories(
   ${PROJECT_SOURCE_DIR}/include
   ${cutlass_source_dir}/include
   ${cutlass_source_dir}/tools/util/include
-  ${PROJECT_SOURCE_DIR}/tests/batch_manager
-  ${PROJECT_SOURCE_DIR}/tests/utils)
+  ${PROJECT_SOURCE_DIR}/tests/batch_manager)
+
+# Tests previously inherited the MPI include dirs transitively through the
+# removed TensorRT plugin target's PUBLIC includes.
+if(ENABLE_MULTI_DEVICE)
+  include_directories(${MPI_C_INCLUDE_DIRS})
+endif()
 
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
@@ -34,17 +39,17 @@ add_custom_target(google-tests)
 
 function(add_gtest test_name test_src)
   set(options NO_GTEST_MAIN NO_TLLM_LINKAGE)
+  set(oneValueArgs TIMEOUT)
   cmake_parse_arguments(ARGS "${options}" "${oneValueArgs}" "${multiValueArgs}"
                         ${ARGN})
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(${test_name} PUBLIC gmock_main TensorRT::OnnxParser)
+  target_link_libraries(${test_name} PUBLIC gmock_main)
   if(NOT ARGS_NO_GTEST_MAIN)
     target_link_libraries(${test_name} PUBLIC gtest_main)
   endif()
   if(NOT ARGS_NO_TLLM_LINKAGE)
-    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET}
-                                              nvinfer_plugin_tensorrt_llm)
+    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET})
     if(WIN32)
       target_link_libraries(${test_name} PRIVATE context_attention_src)
     endif()
@@ -57,15 +62,20 @@ function(add_gtest test_name test_src)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
+  set(test_properties ENVIRONMENT "CUDA_MODULE_LOADING=LAZY")
+  if(ARGS_TIMEOUT)
+    list(APPEND test_properties TIMEOUT "${ARGS_TIMEOUT}")
+  endif()
+
   gtest_discover_tests(
     ${test_name}
-    PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" DISCOVERY_MODE
+    PROPERTIES ${test_properties}
+               DISCOVERY_MODE
                PRE_TEST # WAR for DLL discovery on windows.
-               DISCOVERY_TIMEOUT 30) # Longer timeout needed because discovery
-                                     # can be slow on Windows
+               DISCOVERY_TIMEOUT
+               30) # Longer timeout needed because discovery can be slow on
+                   # Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 
-add_subdirectory(utils)
 add_subdirectory(unit_tests)
-add_subdirectory(e2e_tests)
