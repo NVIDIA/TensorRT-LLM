@@ -421,17 +421,12 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         // --transform so tar contents carry the postTag filename without
         // touching on-disk results*.xml files.
         ensureStageResultNotUploaded("${stageName}${postTag}")
-        def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
-        if (suppressTestReporting || xmlCount > 0) {
-            def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-            trtllm_utils.uploadArtifacts(
-                "results-${stageName}${postTag}.tar.gz",
-                "${UPLOAD_PATH}/test-results/"
-            )
-        } else {
-            println("No results xml to submit")
-        }
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        trtllm_utils.uploadArtifacts(
+            "results-${stageName}${postTag}.tar.gz",
+            "${UPLOAD_PATH}/test-results/"
+        )
         deleteProgressArtifact(stageName, postTag)
 
         // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
