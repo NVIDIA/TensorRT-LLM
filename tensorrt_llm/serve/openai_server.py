@@ -109,9 +109,11 @@ from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
 from tensorrt_llm.serve.visual_gen_utils import (
     cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
+from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
+from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
@@ -414,6 +416,31 @@ def _configure_parser_special_token_decoding(
         # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
         # changes the protocol and prevents the K3 parsers from matching it.
         sampling_params.spaces_between_special_tokens = False
+
+
+def _record_generator_termination(generator) -> None:
+    """Classify a fatal generator error without exposing exception details."""
+    component = "llm"
+    reporting_source = "self"
+    termination_kind = "exception"
+    try:
+        from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+
+        if isinstance(getattr(generator, "_executor", None),
+                      GenerationExecutorProxy):
+            component = "engine_worker"
+            reporting_source = "executor_proxy"
+            termination_kind = "worker_failure"
+    except Exception:
+        pass
+    record_termination_observation(
+        TerminalOutcome(
+            termination_kind=termination_kind,
+            component=component,
+            reporting_source=reporting_source,
+            exit_code_known=False
+            if termination_kind == "worker_failure" else None,
+        ))
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1599,6 +1626,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.error(
                         "Health check detected fatal engine error, initiating "
                         f"server shutdown: {executor._fatal_error}")
+                    _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
             return Response(
                 status_code=503,
@@ -2265,6 +2293,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
+            _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
         except ValueError as e:
             return self.create_error_response(str(e))
@@ -2377,6 +2406,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
+            _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
@@ -2597,6 +2627,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
+            _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
@@ -2914,6 +2945,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
+            _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
@@ -3398,7 +3430,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = uvicorn.Server(config)
+        server = create_uvicorn_server(config)
 
         async def _register_after_serving():
             while not server.started:

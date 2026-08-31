@@ -33,7 +33,10 @@ Usage:
 
 import json
 import os
+import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -131,6 +134,69 @@ def _assert_llm_api_config_capture(params):
     assert meta["captured_field_count"] > 0
 
 
+def _wait_for_event(event_name, timeout=30):
+    """Wait until the local server captures an event with the requested name."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for payload in CaptureHandler.captured_payloads:
+            if payload.get("events", [{}])[0].get("name") == event_name:
+                return payload
+        time.sleep(0.05)
+    pytest.fail(f"Timed out waiting for {event_name}")
+
+
+def _assert_lifecycle_snapshot(
+    params,
+    *,
+    active_instances,
+    usage_context,
+):
+    """Verify the process-scoped lifecycle counters emitted by a real LLM."""
+    assert params["ingressPoint"] == usage_context
+    assert params["llmInitializationAttempts"] == 1
+    assert params["llmInstancesCreated"] == 1
+    assert params["activeLlmInstances"] == active_instances
+    assert params["maxConcurrentLlmInstances"] == 1
+    assert params["llmInitializationFailures"] == 0
+
+
+def _assert_event_matches_sms_schema(event):
+    """Validate captured event parameters against the committed SMS schema."""
+    import jsonschema
+
+    from tensorrt_llm.usage import schemas
+
+    sms_schema = json.loads(schemas.SMS_SCHEMA_PATH.read_text())
+    event_schema = sms_schema["definitions"]["events"][event["name"]].copy()
+    event_schema["definitions"] = sms_schema["definitions"]
+    jsonschema.validate(instance=event["parameters"], schema=event_schema)
+
+
+@pytest.fixture(autouse=True)
+def reset_usage_state():
+    """Isolate process-scoped telemetry and stop its daemon between GPU tests."""
+    import tensorrt_llm.usage.usage_lib as usage_lib
+
+    def reset():
+        usage_lib._REPORTER_STOP.set()
+        deadline = time.monotonic() + 2
+        while usage_lib._REPORTER_ACTIVE and time.monotonic() < deadline:
+            time.sleep(0.01)
+        usage_lib._SESSION = None
+        usage_lib._SESSION_DISABLED = False
+        usage_lib._SESSION_LOCK = threading.Lock()
+        usage_lib._REPORTER_STARTED = False
+        usage_lib._REPORTER_ACTIVE = False
+        usage_lib._REPORTER_LOCK = threading.Lock()
+        usage_lib._REPORTER_STOP = threading.Event()
+        usage_lib._PENDING_TERMINAL = None
+        usage_lib._PROCESS_PID = os.getpid()
+
+    reset()
+    yield
+    reset()
+
+
 # ---------------------------------------------------------------------------
 # E2E test
 # ---------------------------------------------------------------------------
@@ -147,12 +213,13 @@ class TestE2ECapture:
     """End-to-end telemetry capture: real model → real HTTP POST → validate JSON."""
 
     def test_initial_report_captured(self, capture_server, monkeypatch):
-        """Load TinyLlama and verify the initial telemetry report arrives."""
+        """Verify real-model initial telemetry and the post-shutdown heartbeat."""
         import tensorrt_llm.usage.usage_lib as usage_lib
 
         # Bypass endpoint validation for local capture server
         monkeypatch.setattr(usage_lib, "_get_stats_server", lambda: capture_server)
         monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
+        monkeypatch.setenv("TRTLLM_USAGE_HEARTBEAT_INTERVAL", "1")
         # The parent conftest (tests/unittest/conftest.py) sets
         # TRTLLM_NO_USAGE_STATS=1 to prevent telemetry during normal tests.
         # We must clear it for e2e verification.
@@ -174,6 +241,8 @@ class TestE2ECapture:
             assert received, (
                 "Timed out waiting for telemetry POST. The background reporter may not have fired."
             )
+
+        heartbeat_payload = _wait_for_event("trtllm_heartbeat", timeout=5)
 
         # --- Validate the captured payload ---
         assert len(CaptureHandler.captured_payloads) >= 1, "Expected at least 1 captured payload"
@@ -217,6 +286,7 @@ class TestE2ECapture:
 
         # Model architecture
         assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassHash"] == ""
 
         # Backend
         assert params["backend"] == "pytorch"
@@ -225,8 +295,12 @@ class TestE2ECapture:
         assert params["tensorParallelSize"] == 1
         assert params["pipelineParallelSize"] == 1
 
-        # Ingress point (default Python API → promoted to llm_class)
-        assert params["ingressPoint"] == "llm_class"
+        # Process lifecycle after successful model initialization.
+        _assert_lifecycle_snapshot(
+            params,
+            active_instances=1,
+            usage_context="llm_class",
+        )
 
         # Features JSON
         assert "featuresJson" in params
@@ -244,13 +318,29 @@ class TestE2ECapture:
         assert set(features.keys()) == expected_keys
 
         # Schema version
-        assert payload["eventSchemaVer"] == "0.2"
+        assert payload["eventSchemaVer"] == "0.7"
 
         # Disagg fields present (may be empty strings)
         assert "disaggRole" in params
         assert "deploymentId" in params
 
         _assert_llm_api_config_capture(params)
+        _assert_event_matches_sms_schema(event)
+
+        # LLM.shutdown() decrements the active instance count. The next real
+        # heartbeat must contain the current counter snapshot for the same
+        # process-scoped telemetry session.
+        assert heartbeat_payload["sessionId"] == payload["sessionId"]
+        assert heartbeat_payload["eventSchemaVer"] == "0.7"
+        heartbeat = heartbeat_payload["events"][0]
+        assert heartbeat["name"] == "trtllm_heartbeat"
+        assert heartbeat["parameters"]["seq"] == 0
+        _assert_lifecycle_snapshot(
+            heartbeat["parameters"],
+            active_instances=0,
+            usage_context="llm_class",
+        )
+        _assert_event_matches_sms_schema(heartbeat)
 
     def test_cli_serve_context_e2e(self, capture_server, monkeypatch):
         """Verify CLI_SERVE context flows through to the captured payload."""
@@ -279,6 +369,89 @@ class TestE2ECapture:
             assert received, "Timed out waiting for telemetry POST"
 
         payload = CaptureHandler.captured_payloads[0]
-        params = payload["events"][0]["parameters"]
-        assert params["ingressPoint"] == "cli_serve"
+        event = payload["events"][0]
+        params = event["parameters"]
+        assert payload["eventSchemaVer"] == "0.7"
+        _assert_lifecycle_snapshot(
+            params,
+            active_instances=1,
+            usage_context="cli_serve",
+        )
         _assert_llm_api_config_capture(params)
+        _assert_event_matches_sms_schema(event)
+
+    def test_direct_llm_process_exit_e2e(self, capture_server, monkeypatch):
+        """A real LLM child emits one correlated atexit terminal report."""
+        monkeypatch.delenv("TRTLLM_NO_USAGE_STATS", raising=False)
+
+        child_code = """
+import os
+import time
+
+import tensorrt_llm.usage.usage_lib as usage_lib
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig
+
+usage_lib._get_stats_server = lambda: os.environ["CAPTURE_SERVER_URL"]
+
+with LLM(
+    model=os.environ["MODEL_PATH"],
+    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        session = usage_lib._get_session()
+        if session is not None and session.initial_reported:
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("initial telemetry was not prepared")
+"""
+        env = os.environ.copy()
+        env["CAPTURE_SERVER_URL"] = capture_server
+        env["MODEL_PATH"] = _get_model_path()
+        env["TRTLLM_USAGE_FORCE_ENABLED"] = "1"
+        env.pop("TRTLLM_NO_USAGE_STATS", None)
+        env.pop("DO_NOT_TRACK", None)
+        env.pop("TELEMETRY_DISABLED", None)
+
+        completed = subprocess.run(
+            [sys.executable, "-c", child_code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, (
+            f"child failed with {completed.returncode}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+
+        initial_payload = _wait_for_event("trtllm_initial_report", timeout=5)
+        exit_payload = _wait_for_event("trtllm_exit_report", timeout=5)
+        assert exit_payload["sessionId"] == initial_payload["sessionId"]
+        assert exit_payload["eventSchemaVer"] == "0.7"
+
+        terminal_events = [
+            payload
+            for payload in CaptureHandler.captured_payloads
+            if payload.get("events", [{}])[0].get("name") == "trtllm_exit_report"
+        ]
+        assert len(terminal_events) == 1
+
+        event = exit_payload["events"][0]
+        params = event["parameters"]
+        assert params["exitCodeKnown"] is False
+        assert params["exitCode"] == 0
+        assert params["signalNumber"] == 0
+        assert params["terminationKind"] == "unknown"
+        assert params["lifecyclePhase"] == "serving"
+        assert params["component"] == "llm"
+        assert params["reportingSource"] == "self"
+        _assert_lifecycle_snapshot(
+            params,
+            active_instances=0,
+            usage_context="llm_class",
+        )
+        _assert_event_matches_sms_schema(event)
