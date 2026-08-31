@@ -112,7 +112,9 @@ slurm_wait_all_ranks() {
     touch "$readyDir/rank_${SLURM_PROCID}.ready"
 
     # Bounded so a dead rank fails the stage loudly instead of hanging until the
-    # partition walltime kills it; the ceiling exceeds the 2700s pip3 retry budget
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
     # in slurm_install.sh so a merely slow rank still releases the barrier.
     local timeoutSecs=3600
     local deadline=$((SECONDS + timeoutSecs))
@@ -131,10 +133,7 @@ slurm_wait_all_ranks() {
                  "all $numRanks ranks to be ready; ready: $ready/$numRanks"
             return 1
         fi
-        # One rank reports progress; all of them would spam the log every 10s.
-        if [ "$SLURM_PROCID" -eq 0 ]; then
-            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
-        fi
+        echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
         sleep 10
     done
 }
@@ -151,8 +150,10 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-python3 "$llmSrcNode/tests/test_common/s3_output.py" \
-    --drain-spool "$jobWorkspace" || true
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

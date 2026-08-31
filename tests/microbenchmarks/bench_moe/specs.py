@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from tensorrt_llm._torch.modules.fused_moe.routing import (
+from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -313,15 +313,6 @@ class RunResult:
 # publicly known MoE checkpoint.
 
 BUILT_IN_MODELS: Dict[str, ModelSpec] = {
-    "qwen1.5_moe": ModelSpec(
-        name="qwen1.5_moe",
-        num_experts=60,
-        top_k=4,
-        hidden_size=2048,
-        intermediate_size=1408,
-        quant_algo="FP8",
-        routing_method="RENORMALIZE",
-    ),
     "deepseek_v2_lite": ModelSpec(
         name="deepseek_v2_lite",
         num_experts=64,

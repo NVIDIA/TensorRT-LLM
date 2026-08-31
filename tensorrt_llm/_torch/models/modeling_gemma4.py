@@ -26,10 +26,10 @@ from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
@@ -1339,11 +1339,10 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """Build context mask with causal + bidirectional for MM tokens.
 
         Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) are True for
-          all rows. SWA window enforcement is delegated to the kernel's
-          window_left clip. Bidirectional MM across the prefix/extend
-          boundary is NOT supported here; callers must ensure chunk
-          boundaries do not split a multimodal block.
+        - The first `prefix_len` columns (cached/paged history) apply the
+          sliding window using absolute token positions. Bidirectional MM
+          across the prefix/extend boundary is NOT supported here; callers
+          must ensure chunk boundaries do not split a multimodal block.
         - The last `extend_len` columns follow the original causal +
           (optional) sliding window + MM-bidirectional logic.
         """
@@ -1360,9 +1359,19 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
 
         if prefix_len > 0:
-            prefix_block = torch.ones(
-                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-            )
+            if (
+                effective_sliding_window is not None
+                and effective_sliding_window < prefix_len + extend_len
+            ):
+                query_pos = prefix_len + pos
+                prefix_pos = torch.arange(prefix_len, device=device)
+                prefix_block = (
+                    prefix_pos.unsqueeze(0) > query_pos.unsqueeze(1) - effective_sliding_window
+                )
+            else:
+                prefix_block = torch.ones(
+                    extend_len, prefix_len, dtype=causal_mask.dtype, device=device
+                )
             causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
 
         return causal_mask

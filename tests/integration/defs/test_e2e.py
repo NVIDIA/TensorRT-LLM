@@ -693,21 +693,20 @@ def test_openai_post_processor(llm_root, llm_venv):
          str(test_root / "_test_openai_post_processor.py")])
 
 
-@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
-def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
+def test_openai_completions_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_completions.py"), "-k", sampler
+        str(test_root / "_test_openai_completions.py"), "-k",
+        "logit_bias_effect"
     ])
 
 
-@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
-def test_openai_chat_with_logit_bias(llm_root, llm_venv, sampler: str):
+def test_openai_chat_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_chat.py"), "-k", sampler
+        str(test_root / "_test_openai_chat.py"), "-k", "logit_bias_effect"
     ])
 
 
@@ -985,7 +984,7 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ]
         if "Qwen3" in model_name:
             cmds.append("--kv_cache_fraction=0.6")
-        if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
+        if "Llama3.3-70B" in model_name:
             cmds.append("--max_num_tokens=1024")
         if "Llama-4" in model_name:
             cmds.append("--max_seq_len=8192")
