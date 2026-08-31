@@ -87,12 +87,13 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
             kv_cache_manager.shutdown()
 
 
-def _request(temperature=None, top_k=None, top_p=None, slot=0):
+def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
             temperature=[temperature] if temperature is not None else None,
             top_k=[top_k] if top_k is not None else None,
             top_p=[top_p] if top_p is not None else None,
+            min_p=[min_p] if min_p is not None else None,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
@@ -107,8 +108,14 @@ def _fake_meta():
 
 def _scan(meta, requests):
     normalized, _ = SpecMetadata._scan_one_model_sampling(meta, requests)
-    # Drop the trailing num_tokens; only the sampling params matter here.
+    # Drop min_p and the trailing num_tokens; these tests are about the other three.
     return [entry[:3] for entry in normalized]
+
+
+def _scan_with_min_p(meta, requests):
+    """Like ``_scan`` but keeps min_p, which the tests below are about."""
+    normalized, _ = SpecMetadata._scan_one_model_sampling(meta, requests)
+    return [entry[:4] for entry in normalized]
 
 
 class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
@@ -167,6 +174,86 @@ class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
         self.assertEqual(temp, 1.0)
         self.assertNotEqual(top_k, CAPTURE_TOP_K)
         self.assertEqual(top_p, 1.0)
+
+
+class TestScanOneModelSamplingMinP(unittest.TestCase):
+    """min_p's two silent-failure modes in the one-model scan.
+
+    Both are invisible at op level -- the kernel is handed whatever the scan produced --
+    and both degrade output rather than raising, so they get their own tests.
+    """
+
+    def test_min_p_only_request_is_not_greedy(self):
+        """A request whose only knob is min_p must classify as NON-greedy.
+
+        If it classified greedy it would take the argmax fast path and min_p would be
+        dropped without a trace. ``is_all_greedy_sample`` is also part of the CUDA graph
+        key, so the same mistake would select the argmax graph variant.
+        """
+        meta = _fake_meta()
+        normalized = _scan_with_min_p(meta, [_request(min_p=0.05, slot=0)])
+        self.assertFalse(meta.is_all_greedy_sample)
+        # ... and the value must survive normalization rather than being reset to the
+        # 0.0 disable sentinel the greedy branch would apply.
+        self.assertEqual(normalized[0][3], 0.05)
+
+    def test_min_p_one_is_explicit_greedy(self):
+        """min_p == 1.0 keeps only the argmax, which SamplingParams documents as
+        explicit greedy -- so the scan must agree and take the fast path."""
+        meta = _fake_meta()
+        _scan_with_min_p(meta, [_request(min_p=1.0, slot=0)])
+        self.assertTrue(meta.is_all_greedy_sample)
+
+    def test_absent_min_p_normalizes_to_the_disable_sentinel(self):
+        """min_p's neutral value is 0.0, not 1.0 like top_p -- getting that backwards
+        would filter every row down to the argmax."""
+        meta = _fake_meta()
+        normalized = _scan_with_min_p(meta, [_request(temperature=1.0, top_p=0.9, slot=0)])
+        self.assertEqual(normalized[0][3], 0.0)
+
+    def test_changing_only_min_p_invalidates_the_buffer_signature(self):
+        """Two batches differing ONLY in min_p must refill the device buffers.
+
+        The refill is skipped when the signature is unchanged, so leaving min_p out of it
+        would let the second batch decode from the first batch's min_p -- silently, and
+        only for requests that happen to follow one another.
+        """
+        meta = _fake_meta()
+        meta._sampling_params_signature = [None, None]
+
+        first, _ = SpecMetadata._scan_one_model_sampling(
+            meta, [_request(temperature=1.0, min_p=0.05)]
+        )
+        SpecMetadata._sampling_params_buffers_need_update(meta, first)
+
+        second, _ = SpecMetadata._scan_one_model_sampling(
+            meta, [_request(temperature=1.0, min_p=0.5)]
+        )
+        need_request, need_expanded = SpecMetadata._sampling_params_buffers_need_update(
+            meta, second
+        )
+        self.assertTrue(need_request)
+        self.assertTrue(need_expanded)
+
+    def test_identical_batches_still_skip_the_refill(self):
+        """The counterpart: adding min_p to the signature must not defeat the caching
+        that keeps a steady-state decode batch off the H2D path."""
+        meta = _fake_meta()
+        meta._sampling_params_signature = [None, None]
+
+        first, _ = SpecMetadata._scan_one_model_sampling(
+            meta, [_request(temperature=1.0, min_p=0.05)]
+        )
+        SpecMetadata._sampling_params_buffers_need_update(meta, first)
+
+        second, _ = SpecMetadata._scan_one_model_sampling(
+            meta, [_request(temperature=1.0, min_p=0.05)]
+        )
+        need_request, need_expanded = SpecMetadata._sampling_params_buffers_need_update(
+            meta, second
+        )
+        self.assertFalse(need_request)
+        self.assertFalse(need_expanded)
 
 
 if __name__ == "__main__":

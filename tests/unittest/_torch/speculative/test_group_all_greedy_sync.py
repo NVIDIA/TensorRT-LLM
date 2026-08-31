@@ -20,12 +20,13 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 
-def _fake_request(temperature=None, top_k=None, top_p=None, slot=0):
+def _fake_request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
             temperature=[temperature] if temperature is not None else None,
             top_k=[top_k] if top_k is not None else None,
             top_p=[top_p] if top_p is not None else None,
+            min_p=[min_p] if min_p is not None else None,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
@@ -33,12 +34,19 @@ def _fake_request(temperature=None, top_k=None, top_p=None, slot=0):
 
 
 def _fake_meta(group_all_greedy_sample=None):
-    return types.SimpleNamespace(
+    meta = types.SimpleNamespace(
         runtime_draft_len=2,
         dummy_slot_row=0,
         spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
         group_all_greedy_sample=group_all_greedy_sample,
     )
+    # update_is_all_greedy_sample dispatches through self, so the stand-in needs the
+    # method bound to itself -- calling the unbound SpecMetadata function with a plain
+    # namespace is not enough.
+    meta._scan_one_model_sampling = lambda requests: SpecMetadata._scan_one_model_sampling(
+        meta, requests
+    )
+    return meta
 
 
 def _scan(meta, requests):
