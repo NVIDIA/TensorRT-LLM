@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import time
 from dataclasses import dataclass, field
 from operator import getitem
@@ -255,8 +258,16 @@ class MultiStreamDAG:
             return (-distance) * num_nodes + node_id
 
         streams = [Stream(i) for i in range(max_num_streams)]
+        # Scope stacks are stream-local; output dependencies make the end op wait
+        # for any auxiliary-stream producer before it runs on the primary stream.
+        primary_stream_ops = {
+            torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
+            torch.ops.trtllm.end_nccl_window_tensor_scope.default,
+        }
 
         def pick_stream(start_time, node) -> Stream:
+            if node.node.op == "call_function" and node.node.target in primary_stream_ops:
+                return streams[0]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.

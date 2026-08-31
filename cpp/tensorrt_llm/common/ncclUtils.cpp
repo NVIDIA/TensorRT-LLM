@@ -397,12 +397,17 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 namespace
 {
 thread_local std::optional<uint64_t> gGraphPoolOwner;
-}
+} // namespace
 
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 {
     static NCCLWindowAllocator instance;
     return instance;
+}
+
+NCCLWindowAllocator::TensorLeaseScopeKey NCCLWindowAllocator::getTensorLeaseScopeKey(int device, cudaStream_t stream)
+{
+    return {device, reinterpret_cast<uintptr_t>(stream)};
 }
 
 void NCCLWindowAllocator::setGraphPoolOwner(int64_t owner)
@@ -440,6 +445,22 @@ void NCCLWindowAllocator::releaseGraphPoolOwner(int64_t owner)
     }
 }
 
+bool NCCLWindowAllocator::markFallbackWarningLogged(ncclComm_t comm, FallbackWarning warning)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    registerBufferCleanup(comm);
+    return markFallbackWarningLoggedLocked(comm, warning);
+}
+
+bool NCCLWindowAllocator::markFallbackWarningLoggedLocked(ncclComm_t comm, FallbackWarning warning)
+{
+    auto& loggedWarnings = mLoggedFallbackWarnings[comm];
+    auto const warningBit = static_cast<uint8_t>(warning);
+    bool const firstOccurrence = (loggedWarnings & warningBit) == 0U;
+    loggedWarnings |= warningBit;
+    return firstOccurrence;
+}
+
 NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
 {
     if (!isNcclWindowSupported())
@@ -451,22 +472,50 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
     cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
-    auto const captureError = cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &captureStatus);
+    cudaStream_t const currentStream = at::cuda::getCurrentCUDAStream();
+    auto const captureError = cudaStreamIsCapturing(currentStream, &captureStatus);
     if (clearCudaErrorIfCaptureStateUnknown(captureError))
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] CUDA graph capture state is unknown because another thread owns a global capture. "
-            "Falling back to an unregistered buffer.");
+        // Production capture paths that can request NCCL windows are serialized within each rank
+        // and entered in the same SPMD order on every rank. Consequently this error is not a normal
+        // registered/plain selection path: it indicates an unsupported overlapping global capture
+        // from another host thread. Retain the unregistered fallback as a defensive diagnostic for
+        // external or otherwise unwrapped capture code.
+        if (markFallbackWarningLogged(comm, FallbackWarning::kCaptureStateUnknown))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] CUDA graph capture state is unknown on comm %p because another thread owns a global "
+                "capture. Falling back to an unregistered buffer; use thread-local capture or serialize global "
+                "captures across threads.",
+                static_cast<void*>(comm));
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Repeated unknown CUDA graph capture state on comm %p; using an unregistered buffer.",
+                static_cast<void*>(comm));
+        }
         return NCCLWindowBuffer();
     }
     TLLM_CUDA_CHECK(captureError);
     bool const isCapturing = captureStatus != cudaStreamCaptureStatusNone;
     if (isCapturing && !gGraphPoolOwner.has_value())
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] NCCL symmetric window requested during CUDA graph capture without a PyTorch graph-pool "
-            "owner. Refusing unsafe window reuse and falling back to an unregistered buffer; wrap this capture "
-            "with nccl_window_graph_capture.");
+        if (markFallbackWarningLogged(comm, FallbackWarning::kCaptureWithoutOwner))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] NCCL symmetric window requested during CUDA graph capture on comm %p without a PyTorch "
+                "graph-pool owner. Refusing unsafe window reuse and falling back to an unregistered buffer; wrap "
+                "this capture with nccl_window_graph_capture or nccl_window_graph_owner.",
+                static_cast<void*>(comm));
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Repeated CUDA graph capture without a graph-pool owner on comm %p; using an "
+                "unregistered buffer.",
+                static_cast<void*>(comm));
+        }
         return NCCLWindowBuffer();
     }
     TLLM_CHECK_WITH_INFO(isCapturing || !gGraphPoolOwner.has_value(),
@@ -488,7 +537,9 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         size_t bestFitSize = std::numeric_limits<size_t>::max();
         for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
         {
-            if (!it->inUse && it->graphPoolOwner == graphPoolOwner && it->buffer.size >= size
+            bool const streamEligible
+                = it->reusableOnAnyStream || (it->reusableStream.has_value() && *it->reusableStream == currentStream);
+            if (!it->inUse && streamEligible && it->graphPoolOwner == graphPoolOwner && it->buffer.size >= size
                 && it->buffer.size < bestFitSize)
             {
                 bestFit = it;
@@ -512,23 +563,38 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     if (bestFit != commBuffers.end())
     {
         bestFit->inUse = true;
+        bestFit->reusableOnAnyStream = false;
+        bestFit->reusableStream.reset();
+        bestFit->buffer.leaseId = mNextLeaseId++;
         TLLM_LOG_TRACE(
             "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
             static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
         return bestFit->buffer;
     }
 
-    // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer
-    // must use the existing unregistered fallback path. Safety relies on all ranks for this
-    // communicator executing window requests, releases, and graph-owner transitions in identical
-    // SPMD order. This keeps pool history and the registered/plain decision rank-symmetric; an NCCL
-    // symmetric collective must not mix window-backed and plain pointers across ranks.
+    // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer must
+    // use the existing unregistered fallback path. Successful production capture lifecycles, window
+    // requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD order.
+    // Failure and destructor paths abandon or quarantine their buffers instead of changing eligibility.
+    // Cross-stream reuse is enabled only at an explicit device-synchronization boundary. Together,
+    // these rules keep best-fit selection rank-symmetric: GC timing cannot change pool
+    // history, and an NCCL symmetric collective never mixes window-backed and plain pointers.
     if (isCapturing)
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] No eligible NCCL window buffer for capture owner %llu on comm %p (requested: %zu); "
-            "falling back to unregistered buffer.",
-            graphOwner, static_cast<void*>(comm), size);
+        if (markFallbackWarningLoggedLocked(comm, FallbackWarning::kNoEligibleCaptureBuffer))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] No eligible NCCL window buffer for capture owner %llu on comm %p (requested: %zu); "
+                "falling back to an unregistered buffer. Preallocate this window size eagerly before capture.",
+                graphOwner, static_cast<void*>(comm), size);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Repeated capture request without an eligible NCCL window buffer for owner %llu on comm "
+                "%p (requested: %zu); using an unregistered buffer.",
+                graphOwner, static_cast<void*>(comm), size);
+        }
         return NCCLWindowBuffer();
     }
 
@@ -553,7 +619,8 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
     if (buffer.isValid())
     {
-        commBuffers.push_back({buffer, true, std::nullopt});
+        buffer.leaseId = mNextLeaseId++;
+        commBuffers.push_back({buffer, true, at::cuda::current_device(), std::nullopt});
     }
     else
     {
@@ -622,8 +689,6 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] Attempted to release buffer %p for unknown comm %p", ptr, static_cast<void*>(comm));
         return;
     }
 
@@ -631,7 +696,13 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
     {
         if (entry.buffer.ptr == ptr)
         {
+            if (!entry.inUse)
+            {
+                return;
+            }
             entry.inUse = false;
+            entry.reusableOnAnyStream = true;
+            entry.reusableStream.reset();
             if (entry.releaseOwnerWhenUnused)
             {
                 entry.graphPoolOwner.reset();
@@ -641,8 +712,331 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
             return;
         }
     }
+}
 
-    TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer %p for comm %p", ptr, static_cast<void*>(comm));
+bool NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, cudaStream_t stream)
+{
+    if (!comm || !ptr)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto commIt = mBufferPool.find(comm);
+    if (commIt == mBufferPool.end())
+    {
+        return false;
+    }
+
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != ptr || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream = stream;
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        TLLM_LOG_TRACE("[NCCLUtil] Explicitly released NCCL window buffer for comm %p: ptr=%p, lease=%llu",
+            static_cast<void*>(comm), ptr, static_cast<unsigned long long>(entry.buffer.leaseId));
+        return true;
+    }
+    return false;
+}
+
+void NCCLWindowAllocator::synchronizeBufferReleases()
+{
+    int device = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+
+    // Capture setup is serialized, and NCCL-window releases do not run from CUDA host callbacks.
+    // Hold the allocator lock so eligibility stays fixed through synchronization and promotion.
+    std::lock_guard<std::mutex> lock(mMutex);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    for (auto& commBuffers : mBufferPool)
+    {
+        for (auto& entry : commBuffers.second)
+        {
+            if (entry.device == device && !entry.inUse && entry.reusableStream.has_value())
+            {
+                entry.reusableOnAnyStream = true;
+                entry.reusableStream.reset();
+            }
+        }
+    }
+}
+
+void NCCLWindowAllocator::registerTensorLease(
+    ncclComm_t comm, c10::StorageImpl const* storage, void* ptr, uint64_t leaseId, int device, cudaStream_t stream)
+{
+    if (!comm || !storage || !ptr || leaseId == 0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const stackIt = mTensorLeaseScopeStacks.find(getTensorLeaseScopeKey(device, stream));
+    TensorLeaseScope* scope = nullptr;
+    if (stackIt != mTensorLeaseScopeStacks.end() && !stackIt->second.empty())
+    {
+        scope = &stackIt->second.back();
+    }
+    auto const inserted = mTensorLeases.emplace(storage, TensorLease{comm, ptr, leaseId, scope}).second;
+    TLLM_CHECK_WITH_INFO(inserted, "NCCL window storage already has an active lease");
+    if (scope)
+    {
+        scope->storages.insert(storage);
+    }
+}
+
+void NCCLWindowAllocator::beginTensorLeaseScope(
+    std::vector<c10::StorageImpl const*> const& inputStorages, int device, cudaStream_t stream)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto& scopeStack = mTensorLeaseScopeStacks[getTensorLeaseScopeKey(device, stream)];
+    scopeStack.emplace_back();
+    auto* scope = &scopeStack.back();
+
+    for (auto const* storage : inputStorages)
+    {
+        auto leaseIt = mTensorLeases.find(storage);
+        if (leaseIt == mTensorLeases.end())
+        {
+            continue;
+        }
+        if (leaseIt->second.scope)
+        {
+            leaseIt->second.scope->storages.erase(storage);
+        }
+        leaseIt->second.scope = scope;
+        scope->storages.insert(storage);
+    }
+}
+
+void NCCLWindowAllocator::endTensorLeaseScope(
+    std::vector<c10::StorageImpl const*> const& outputStorages, int device, cudaStream_t stream, bool failed)
+{
+    std::unordered_set<c10::StorageImpl const*> const escapedStorages(outputStorages.begin(), outputStorages.end());
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto stackIt = mTensorLeaseScopeStacks.find(getTensorLeaseScopeKey(device, stream));
+    TLLM_CHECK_WITH_INFO(stackIt != mTensorLeaseScopeStacks.end() && !stackIt->second.empty(),
+        "NCCL window tensor lease scope stack is empty for device %d and stream %p", device,
+        static_cast<void*>(stream));
+
+    auto& scopeStack = stackIt->second;
+    auto& scope = scopeStack.back();
+    auto* parentScope = scopeStack.size() > 1 ? &scopeStack[scopeStack.size() - 2] : nullptr;
+    auto finishLease = [&](TensorLease const& lease)
+    {
+        if (failed)
+        {
+            quarantineTensorLeaseLocked(lease);
+        }
+        else
+        {
+            releaseTensorLeaseLocked(lease, stream);
+        }
+    };
+
+    for (auto const* storage : scope.storages)
+    {
+        auto leaseIt = mTensorLeases.find(storage);
+        TLLM_CHECK_WITH_INFO(leaseIt != mTensorLeases.end(), "NCCL window tensor scope contains an unknown storage");
+        if (!failed && escapedStorages.find(storage) != escapedStorages.end())
+        {
+            leaseIt->second.scope = parentScope;
+            if (parentScope)
+            {
+                parentScope->storages.insert(storage);
+            }
+            continue;
+        }
+
+        auto const releasedLease = leaseIt->second;
+        mTensorLeases.erase(leaseIt);
+        finishLease(releasedLease);
+    }
+
+    for (auto const& detachedLease : scope.detachedLeases)
+    {
+        finishLease(detachedLease);
+    }
+
+    scopeStack.pop_back();
+    if (scopeStack.empty())
+    {
+        mTensorLeaseScopeStacks.erase(stackIt);
+    }
+}
+
+bool NCCLWindowAllocator::releaseTensorBuffer(ncclComm_t comm, c10::StorageImpl const* storage, cudaStream_t stream)
+{
+    if (!comm || !storage)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    return releaseTensorBufferLocked(storage, stream, comm);
+}
+
+bool NCCLWindowAllocator::releaseTensorBuffer(c10::StorageImpl const* storage, cudaStream_t stream)
+{
+    if (!storage)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    return releaseTensorBufferLocked(storage, stream, nullptr);
+}
+
+bool NCCLWindowAllocator::releaseTensorBufferLocked(
+    c10::StorageImpl const* storage, cudaStream_t stream, ncclComm_t expectedComm)
+{
+    auto const leaseIt = mTensorLeases.find(storage);
+    if (leaseIt == mTensorLeases.end() || (expectedComm && leaseIt->second.comm != expectedComm))
+    {
+        return false;
+    }
+
+    auto const lease = leaseIt->second;
+    if (lease.scope)
+    {
+        lease.scope->storages.erase(storage);
+    }
+    mTensorLeases.erase(leaseIt);
+    return releaseTensorLeaseLocked(lease, stream);
+}
+
+bool NCCLWindowAllocator::releaseTensorLeaseLocked(TensorLease const& tensorLease, cudaStream_t stream)
+{
+    auto commIt = mBufferPool.find(tensorLease.comm);
+    if (commIt == mBufferPool.end())
+    {
+        return false;
+    }
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != tensorLease.ptr || entry.buffer.leaseId != tensorLease.leaseId || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream = stream;
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        TLLM_LOG_TRACE("[NCCLUtil] Explicitly released NCCL window tensor for comm %p: ptr=%p, lease=%llu",
+            static_cast<void*>(tensorLease.comm), tensorLease.ptr,
+            static_cast<unsigned long long>(tensorLease.leaseId));
+        return true;
+    }
+    return false;
+}
+
+void NCCLWindowAllocator::quarantineTensorLeaseLocked(TensorLease const& tensorLease)
+{
+    auto commIt = mBufferPool.find(tensorLease.comm);
+    if (commIt == mBufferPool.end())
+    {
+        return;
+    }
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != tensorLease.ptr || entry.buffer.leaseId != tensorLease.leaseId || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream.reset();
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        TLLM_LOG_DEBUG("[NCCLUtil] Quarantining NCCL window lease %llu on comm %p after a failed tensor lease scope.",
+            static_cast<unsigned long long>(tensorLease.leaseId), static_cast<void*>(tensorLease.comm));
+        return;
+    }
+}
+
+void NCCLWindowAllocator::releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId)
+{
+    if (!comm || !ptr || leaseId == 0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (auto it = mTensorLeases.begin(); it != mTensorLeases.end(); ++it)
+    {
+        auto const lease = it->second;
+        if (lease.comm != comm || lease.ptr != ptr || lease.leaseId != leaseId)
+        {
+            continue;
+        }
+
+        if (lease.scope)
+        {
+            // Storage lifetime inside a scope is intentionally irrelevant. The scope retains the
+            // lease generation and releases it at the same logical boundary on every rank.
+            lease.scope->storages.erase(it->first);
+            lease.scope->detachedLeases.push_back(lease);
+            mTensorLeases.erase(it);
+            return;
+        }
+
+        mTensorLeases.erase(it);
+        break;
+    }
+
+    auto commIt = mBufferPool.find(comm);
+    if (commIt == mBufferPool.end())
+    {
+        return;
+    }
+
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != ptr || entry.buffer.leaseId != leaseId || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream.reset();
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        if (markFallbackWarningLoggedLocked(comm, FallbackWarning::kDestructorFallback))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] NCCL window lease %llu on comm %p was released by its tensor destructor instead of "
+                "an explicit final consumer. Quarantining this buffer until communicator teardown.",
+                static_cast<unsigned long long>(leaseId), static_cast<void*>(comm));
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Another NCCL window lease was released by its tensor destructor on comm %p; "
+                "quarantining the buffer.",
+                static_cast<void*>(comm));
+        }
+        return;
+    }
 }
 
 ncclWindow_t NCCLWindowAllocator::getWindow(ncclComm_t comm, void* ptr) const
@@ -824,6 +1218,31 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     std::lock_guard<std::mutex> lock(mMutex);
 
+    for (auto it = mTensorLeases.begin(); it != mTensorLeases.end();)
+    {
+        if (it->second.comm != comm)
+        {
+            ++it;
+            continue;
+        }
+        if (it->second.scope)
+        {
+            it->second.scope->storages.erase(it->first);
+        }
+        it = mTensorLeases.erase(it);
+    }
+
+    for (auto& stackEntry : mTensorLeaseScopeStacks)
+    {
+        for (auto& scope : stackEntry.second)
+        {
+            auto& detachedLeases = scope.detachedLeases;
+            detachedLeases.erase(std::remove_if(detachedLeases.begin(), detachedLeases.end(),
+                                     [comm](TensorLease const& lease) { return lease.comm == comm; }),
+                detachedLeases.end());
+        }
+    }
+
     // Check if we've already cleaned up this communicator
     if (mRegisteredComms.find(comm) == mRegisteredComms.end())
     {
@@ -837,6 +1256,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
         // No buffers to clean up, but mark as cleaned
         mRegisteredComms.erase(comm);
         mMinSymmetricFailureSize.erase(comm);
+        mLoggedFallbackWarnings.erase(comm);
         return;
     }
 
@@ -913,6 +1333,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
     mMinSymmetricFailureSize.erase(comm);
+    mLoggedFallbackWarnings.erase(comm);
 }
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
