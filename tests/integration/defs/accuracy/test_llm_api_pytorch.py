@@ -2125,7 +2125,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip(
         reason="CuteDslFusedMoE declines FP8 block scales: it has no FP8 "
         "block-scale kernel, only a torch.einsum reference. See the ‡ footnote "
-        "in tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md. "
+        "in tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md. "
         "Re-enable against DEEPGEMM / TRTLLM once this checkpoint has an "
         "owner backend on SM100.")
     @skip_pre_blackwell

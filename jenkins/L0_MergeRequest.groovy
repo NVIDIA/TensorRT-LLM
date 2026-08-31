@@ -1275,6 +1275,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
+        "requirements.txt",
+        "security_scanning/pyproject.toml",
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
@@ -1283,7 +1285,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/distributed/",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
-        "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
@@ -1354,6 +1356,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/_torch/multi_gpu/",
+        "tests/unittest/_torch/moe/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
@@ -1800,7 +1803,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
     // Infra-scoped fail-fast (parent half). A downstream sub-job returns UNSTABLE
     // when it saw only infra aborts and no genuine test/build failure (see
-    // runBranchesWithInfraDefer in L0_Test.groovy). That is incomplete coverage,
+    // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
     // not a failure: throwing here is exactly what trips the per-arch failFast and
     // cancels the healthy sibling architecture, so do NOT throw. Mark the build
     // UNSTABLE (visible + re-runnable) and let the sibling finish. FAILURE and
@@ -1909,13 +1912,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // Nightly publishes the PackageSanityCheck wheel, while this
                 // build still provides the source tar consumed by test runners.
                 def testStageName = "[Build-x86_64] Remote Run"
+                def buildInfraIncomplete = false
                 stage(testStageName) {
                     def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-                    launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    // launchJob returns UNSTABLE (without throwing) when the build
+                    // sub-job was infra-incomplete: only infra aborts, no genuine
+                    // build failure (see runBranchesWithInfraDefer in Build.groovy).
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    buildInfraIncomplete = (buildStatus == "UNSTABLE")
                 }
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
@@ -1933,6 +1941,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
                     launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
+                    return
+                }
+
+                // Build was infra-incomplete (UNSTABLE): the wheel/tar this arch's
+                // test sub-jobs would consume was never produced, so launching them
+                // can only fail on a missing artifact. Skip them WITHOUT throwing --
+                // throwing is exactly what trips the arch-level failFast and cancels
+                // the healthy sibling architecture and its consumers. Keep the build
+                // UNSTABLE (already set by launchJob); do NOT escalate to FAILURE.
+                // Unlike the single-GPU-infra-incomplete policy below, post-merge
+                // skips too: with no artifact there is no signal to be had.
+                if (buildInfraIncomplete) {
+                    stage("[Test-x86_64] Blocked - build infra-incomplete") {
+                        echo "x86_64 build was infra-incomplete (UNSTABLE); skipping x86_64 test sub-jobs (no artifact to test). Build stays UNSTABLE."
+                    }
                     return
                 }
 
@@ -2071,11 +2094,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // see x86 track above for the rationale.
 
                 def testStageName = "[Build-SBSA] Remote Run"
+                def buildInfraIncomplete = false
                 stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
-                    launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    // launchJob returns UNSTABLE (without throwing) when the build
+                    // sub-job was infra-incomplete: only infra aborts, no genuine
+                    // build failure (see runBranchesWithInfraDefer in Build.groovy).
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    buildInfraIncomplete = (buildStatus == "UNSTABLE")
                 }
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
@@ -2116,6 +2144,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
                     }
+                }
+
+                // Build was infra-incomplete (UNSTABLE): the wheel/tar this arch's
+                // test sub-jobs would consume was never produced, so launching them
+                // can only fail on a missing artifact. Skip them WITHOUT throwing --
+                // throwing is exactly what trips the arch-level failFast and cancels
+                // the healthy sibling architecture and its consumers. Keep the build
+                // UNSTABLE (already set by launchJob); do NOT escalate to FAILURE.
+                // Unlike the single-GPU-infra-incomplete policy below, post-merge
+                // skips too: with no artifact there is no signal to be had.
+                if (buildInfraIncomplete) {
+                    stage("[Test-SBSA] Blocked - build infra-incomplete") {
+                        echo "SBSA build was infra-incomplete (UNSTABLE); skipping SBSA test sub-jobs (no artifact to test). Build stays UNSTABLE."
+                    }
+                    return
                 }
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
@@ -2265,6 +2308,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            // Canonical images carry BOLT profiles: the raw build is
+                            // published as <tag>-noprofiles and <tag> is produced by the
+                            // overlay. Both unconditional -- the contract is a property of
+                            // the image, not of what triggered the build, so a bundle that
+                            // cannot be pulled is an error rather than a silent plain
+                            // retag. Left unset, boltProfileBranch resolves LLM_BRANCH ->
+                            // main, so a ref with no promoted bundle still gets profiles.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2334,7 +2386,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'buildInternalRelease': false,
                             'buildCiImage': false,
                             'artifactPath': ARTIFACT_PATH,
-                            'uploadPath': UPLOAD_PATH
+                            'uploadPath': UPLOAD_PATH,
+                            // Must match Build-Docker-Images above: this path pushes the
+                            // same tags, so the scanned+registered image has to be the
+                            // BOLTed canonical one rather than a plain build.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [

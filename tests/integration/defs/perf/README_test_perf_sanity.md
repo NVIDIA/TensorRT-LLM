@@ -63,10 +63,59 @@ If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `
 
 ### Match Keys
 
-Match keys differ by deployment mode:
+Match keys are the fields that identify a test case when looking up its history to
+build a baseline. They are the same for every deployment mode
+(`get_test_case_match_keys()` in `tests/test_common/perf_sanity_matching.py`):
 
-- **Aggregated**: `["s_gpu_type", "s_runtime"]` + `ServerConfig.to_match_keys()` + `ClientConfig.to_match_keys()`
-- **Disaggregated**: `["s_gpu_type", "s_runtime", "s_benchmark_mode", "l_num_ctx_servers", "l_num_gen_servers"]` + prefixed ctx/gen `ServerConfig.to_match_keys()` + `ClientConfig.to_match_keys()`
+| Key | Why |
+|-----|-----|
+| `s_test_case_name` | `<server_config.name>-<client_config.name>` for aggregated, `<e2e\|ctx_only\|gen_only>-<disagg stem>-<client_config.name>` for disaggregated. Already encodes every fixed parameter of the case: model, parallelism, ISL/OSL, concurrency. |
+| `s_gpu_type` | The same case name runs on more than one GPU type. |
+| `s_runtime` | The same case name runs on both `aggr_server` and `multi_node_aggr_server`. |
+| `s_branch` | Release branches keep their own baseline rather than blending into `main`'s. |
+
+A case is identified by its **name**, not by the config values it happens to run
+with today. Server/client config fields such as `l_max_batch_size`,
+`s_kv_cache_dtype`, `s_spec_decoding_type`, `l_force_num_accepted_tokens` or
+`b_streaming` are *tunables* — they are adjusted to improve perf on the same test.
+Keying on them forked the case and reset its baseline, hiding the very effect the
+tuning was meant to have. They are still recorded on each document for filtering
+and analysis; they just do not participate in matching.
+
+**A value that feeds the case name still forks the case.** Dropping a field from
+the match key only stops it forking if the name does not encode it, and
+`l_iterations` is the one field where that distinction bites:
+
+- Aggregated configs all set an explicit client `name:` (190 of 190 blocks in
+  `tests/scripts/perf-sanity/`), so changing `iterations` there keeps the case and
+  its history. 93 of those names contain a stale `iter<N>` for that reason.
+- Disagg configs set no client name, so `ClientConfig` derives
+  `con<C>_iter<N>_isl<I>_osl<O>`. `benchmark.multi_round` becomes `iterations`,
+  which lands in that name and therefore in `s_test_case_name` — so changing
+  `multi_round` renames the case, and the renamed case starts with no history.
+
+That is intended rather than a gap to close: `iterations` sets how long the
+measurement runs, and a longer run amortizes warmup differently, so `iter10` and
+`iter12` do not measure the same quantity and should not share a baseline. It is
+also not a regression — `l_iterations` was previously a match key in its own
+right, so it forked the case before this change too. What matters is that renaming
+a case silently costs it its history and its next pre-merge regression check, so
+`multi_round` should be treated as a workload parameter, not a knob to sweep.
+
+`s_benchmark_mode` is deliberately excluded: it is null on every aggregated record
+and exactly equals the test case name's prefix on every disaggregated one, so it
+adds no information while breaking matching against records written before the
+field existed (`benchmark_data_matches` treats `None` and `"e2e"` as different).
+
+`match_mode: scenario` in the server yamls is now inert — not forking a case on a
+config change is the default for every case.
+
+**Pre-merge branch substitution.** Since `s_branch` is a match key and history
+queries are restricted to post-merge documents, a pre-merge run (whose `s_branch`
+is `github-pr-<N>`) would match nothing and its regression check would silently
+pass. `process_and_upload_test_results` therefore looks history up against a
+baseline branch — `PERF_BASELINE_BRANCH`, default `main` — using a lookup-only copy
+of the data. The uploaded documents keep their true `s_branch`.
 
 ## Overview
 
