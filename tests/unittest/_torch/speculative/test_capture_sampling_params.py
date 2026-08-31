@@ -258,19 +258,19 @@ class TestScanOneModelSamplingMinP(unittest.TestCase):
         self.assertFalse(need_expanded)
 
 
-def _populate_meta(mode):
+def _populate_meta(mode, draft_len=1):
     """Stand-in with just enough of SpecMetadata to run populate_sampling_params_for_one_model.
 
     Same style as test_rejection_buffers_guard.py: SpecMetadata methods called unbound on a
     namespace, with the parts not under test stubbed out.
     """
     meta = types.SimpleNamespace(
-        runtime_draft_len=1,
+        runtime_draft_len=draft_len,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
         max_num_requests=4,
-        max_draft_len=1,
-        max_total_draft_tokens=1,
+        max_draft_len=draft_len,
+        max_total_draft_tokens=draft_len,
         is_spec_dec_tree=False,
         advanced_sampling_mode=mode,
         use_rejection_sampling=False,
@@ -333,6 +333,110 @@ class TestMinPBufferFillIsGatedOnUniversal(unittest.TestCase):
         self.assertEqual(meta.min_ps[0].item(), 0.0)
         # The other buffers are still filled, i.e. the gate is narrow.
         self.assertAlmostEqual(meta.request_top_ps[0].item(), 0.9, places=6)
+
+
+def _context_request(**kwargs):
+    """A request that has not started generating: its expanded span is one row, not
+    ``draft_len + 1``."""
+    request = _request(**kwargs)
+    request.state = LlmRequestState.CONTEXT_INIT
+    return request
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "populate allocates CUDA buffers")
+class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
+    """Hazard B4: the expanded per-token buffers are laid out by each request's token
+    count, and a context request occupies one row where a generation request occupies
+    ``draft_len + 1``.
+
+    min_p is filled by a separate ``if fill_min_p`` branch from the one that fills top_p.
+    Two branches walking the same list is only correct as long as they agree on the
+    layout, and nothing in the types would catch them diverging -- the buffers are flat
+    float32 and any misalignment is a silently wrong filter on the wrong token, not a
+    crash.
+    """
+
+    DRAFT_LEN = 3
+
+    def _expected_owner_per_token(self, requests):
+        """Token index -> index of the request that owns it."""
+        owners = []
+        for i, request in enumerate(requests):
+            span = (
+                1 + self.DRAFT_LEN if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            )
+            owners.extend(i for _ in range(span))
+        return owners
+
+    def _assert_aligned(self, meta, requests, min_ps, top_ps):
+        owners = self._expected_owner_per_token(requests)
+        for token, owner in enumerate(owners):
+            self.assertAlmostEqual(
+                meta.min_ps[token].item(),
+                min_ps[owner],
+                places=6,
+                msg=f"token {token} should carry request {owner}'s min_p",
+            )
+            self.assertAlmostEqual(
+                meta.top_ps[token].item(),
+                top_ps[owner],
+                places=6,
+                msg=f"token {token} should carry request {owner}'s top_p",
+            )
+        return len(owners)
+
+    def test_mixed_context_and_generation_batch(self):
+        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL, draft_len=self.DRAFT_LEN)
+        min_ps = [0.1, 0.2, 0.3]
+        top_ps = [0.7, 0.8, 0.9]
+        requests = [
+            _request(temperature=1.0, min_p=min_ps[0], top_p=top_ps[0], slot=0),
+            _context_request(temperature=1.0, min_p=min_ps[1], top_p=top_ps[1], slot=1),
+            _request(temperature=1.0, min_p=min_ps[2], top_p=top_ps[2], slot=2),
+        ]
+        SpecMetadata.populate_sampling_params_for_one_model(meta, requests)
+        # 4 + 1 + 4: the context request in the middle shifts every later token.
+        self.assertEqual(self._assert_aligned(meta, requests, min_ps, top_ps), 9)
+
+    def test_layout_is_rebuilt_when_a_context_request_starts_generating(self):
+        """The transition itself, with the sampling parameters held fixed.
+
+        Only the token counts change, so the per-request buffers stay valid and only the
+        expanded ones must be refilled. If the refill were keyed on the sampling values
+        alone, min_p would keep the previous, shorter layout and every token after the
+        transition would read its neighbour's filter.
+        """
+        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL, draft_len=self.DRAFT_LEN)
+        min_ps = [0.1, 0.2]
+        top_ps = [0.7, 0.8]
+
+        def batch(second_is_generating):
+            first = _request(temperature=1.0, min_p=min_ps[0], top_p=top_ps[0], slot=0)
+            make = _request if second_is_generating else _context_request
+            second = make(temperature=1.0, min_p=min_ps[1], top_p=top_ps[1], slot=1)
+            return [first, second]
+
+        before = batch(second_is_generating=False)
+        SpecMetadata.populate_sampling_params_for_one_model(meta, before)
+        self.assertEqual(self._assert_aligned(meta, before, min_ps, top_ps), 5)
+
+        after = batch(second_is_generating=True)
+        SpecMetadata.populate_sampling_params_for_one_model(meta, after)
+        self.assertEqual(self._assert_aligned(meta, after, min_ps, top_ps), 8)
+
+    def test_transition_invalidates_only_the_expanded_signature(self):
+        """The refill decision itself, stated directly rather than through the buffers."""
+        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL, draft_len=self.DRAFT_LEN)
+        as_context = [_context_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
+        as_generation = [_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
+
+        normalized, _ = meta._scan_one_model_sampling(as_context)
+        meta._sampling_params_buffers_need_update(normalized)
+
+        normalized, _ = meta._scan_one_model_sampling(as_generation)
+        need_request, need_expanded = meta._sampling_params_buffers_need_update(normalized)
+        self.assertFalse(need_request, "sampling values did not change")
+        self.assertTrue(need_expanded, "the token count -- and so the layout -- did")
 
 
 if __name__ == "__main__":
