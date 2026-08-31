@@ -666,11 +666,11 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     Returns 0 when not set.
 
     The runtime accepts a fractional value (see get_force_num_accepted_tokens_float
-    in tensorrt_llm), so parse as float first and truncate. The return value only
-    feeds the l_force_num_accepted_tokens baseline match key, which is a long, so
-    two lanes differing solely in the fractional part share a match identity --
-    acceptable today because every such lane also differs in concurrency and
-    parallelism, but widen the key if that ever stops holding.
+    in tensorrt_llm), so parse as float first and truncate. The return value is
+    uploaded as l_force_num_accepted_tokens, which is a long, so a fractional
+    setting is not preserved in the record. It is reported rather than matched on:
+    case identity is keyed on the test case name, so two lanes differing solely in
+    the fractional part are already separate cases by name.
     """
     val = to_env_dict(env_vars).get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS")
     return int(float(val)) if val is not None else 0
@@ -1202,8 +1202,8 @@ class ClientConfig:
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         # Which load generator drives the lane. "" selects the built-in
         # benchmark_serving client; "agentx" selects the trace-replay client in
-        # agentx_client.py. The empty default is load-bearing for baseline
-        # matching -- see the s_benchmark_client note in to_db_data.
+        # agentx_client.py. Reported only -- see the s_benchmark_client note in
+        # to_db_data for why it is not a match key.
         self.benchmark_client = client_config_data.get("benchmark_client", "")
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
@@ -1369,10 +1369,11 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
-            # Match key. Deliberately uploaded as "" (not "default") for the
-            # built-in client: benchmark_data_matches treats absent and empty
-            # as equal, so every baseline recorded before this field existed
-            # keeps matching. Only named clients form their own population.
+            # Reported, not matched. Case identity is keyed on s_test_case_name
+            # (plus GPU type, runtime, branch), and a disagg case name embeds its
+            # config stem, so an agentx lane already forms its own population by
+            # name. Uploaded as "" (not "default") for the built-in client so the
+            # column reads consistently against records written before this field.
             "s_benchmark_client": self.benchmark_client,
             "b_eos": self.spec_decoding,
             "s_client_log_link": "",
@@ -2832,8 +2833,8 @@ class PerfSanityTestConfig:
                 # avg_decoded_tokens_per_iter response field, which aiperf does
                 # not propagate. It is not a real loss of signal, because every
                 # agentx lane pins the accepted length with
-                # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS -- already captured
-                # as the l_force_num_accepted_tokens match key -- so 'al' would
+                # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS -- recorded on the
+                # case as l_force_num_accepted_tokens -- so 'al' would
                 # be a restatement of a configured constant rather than a
                 # measurement. The exemption is conditioned on that forcing
                 # actually being in effect rather than merely documented, so an

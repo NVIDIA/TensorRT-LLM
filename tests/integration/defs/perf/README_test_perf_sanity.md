@@ -117,11 +117,13 @@ pass. `process_and_upload_test_results` therefore looks history up against a
 baseline branch — `PERF_BASELINE_BRANCH`, default `main` — using a lookup-only copy
 of the data. The uploaded documents keep their true `s_branch`.
 
-`ClientConfig.to_match_keys()` includes `s_benchmark_client`, so a lane driven by a
-different load generator forms its own baseline population instead of being compared
-against `benchmark_serving` history. The built-in client uploads `""` (not `"default"`)
-for this field, and `benchmark_data_matches` treats absent and empty as equal, so every
-baseline recorded before the field existed keeps matching.
+Case identity is keyed on `s_test_case_name` (plus GPU type, runtime and branch), and a
+disaggregated case name embeds its config stem — so an agentx lane, whose stem contains
+`agentx`, already forms its own baseline population without needing an extra match key.
+`s_benchmark_client` is still uploaded, as a reportable record of which load generator
+drove the lane, but it does not participate in matching. The built-in client uploads `""`
+(not `"default"`) so the column reads consistently against records written before the
+field existed.
 
 ## Benchmark Clients
 
@@ -145,7 +147,7 @@ config-parse time rather than silently falling through to the default client.
 - `al` (Mean Avg Decoded Tokens per Iter) is exempt from the spec-decoding hard-fail for
   agentx lanes: it derives from a TRT-LLM-specific per-response field that `aiperf` does
   not propagate. This loses no signal as long as the lane pins the accepted length with
-  `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS` (already a match key), which makes `al` a
+  `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS` (set per-yaml), which makes `al` a
   restatement of a configured constant rather than a measurement.
 
 ## Overview
