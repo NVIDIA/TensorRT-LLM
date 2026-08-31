@@ -64,6 +64,13 @@ constexpr int kHistCopies = 8;
 constexpr int kCandCap = 4096;
 //! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
 constexpr float kTempEpsilon = 1e-6f;
+//! Rejection rounds a tokens-only row may spend before it settles for the argmax. Each
+//! round drops the rejected candidate and everything at or below its weight, so the
+//! support collapses geometrically; the cap exists because that is a statement about the
+//! expectation, not the worst case. The argmax belongs to every kept set this kernel can
+//! build, so exhausting the budget still answers with a token inside the support -- it
+//! perturbs the distribution rather than leaving it.
+constexpr int kMaxRejectRounds = 32;
 
 __device__ inline float toFloat(float v)
 {
@@ -205,6 +212,25 @@ struct OnlineSoftmaxOp
     __device__ inline OnlineSoftmax operator()(OnlineSoftmax const& a, OnlineSoftmax const& b) const
     {
         return combineOnlineSoftmax(a, b);
+    }
+};
+
+//! How much sits strictly above a candidate weight: how many entries, and how much mass.
+//! Both of the rank/mass criteria are statements about exactly this, so the rejection test
+//! costs one sweep and one reduction rather than one of each per criterion. ``count`` is a
+//! float because the reduction is shared with ``mass`` and a vocabulary never approaches
+//! 2^24, where a float stops counting exactly.
+struct CountMass
+{
+    float count;
+    float mass;
+};
+
+struct CountMassOp
+{
+    __device__ inline CountMass operator()(CountMass const& a, CountMass const& b) const
+    {
+        return CountMass{a.count + b.count, a.mass + b.mass};
     }
 };
 
@@ -457,12 +483,14 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
 
     using BlockReduceF = cub::BlockReduce<float, BLOCK>;
     using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, BLOCK>;
+    using BlockReduceCountMass = cub::BlockReduce<CountMass, BLOCK>;
     using BlockScanF = cub::BlockScan<float, BLOCK>;
 
     __shared__ union
     {
         typename BlockReduceF::TempStorage reduceF;
         typename BlockReduceOnline::TempStorage reduceOnline;
+        typename BlockReduceCountMass::TempStorage reduceCountMass;
         typename BlockScanF::TempStorage scanF;
     } temp;
 
@@ -482,6 +510,14 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     __shared__ float sTarget;
     __shared__ int sArgMax;
     __shared__ int sToken;
+    // Rejection-path state. Distinct names rather than reuse of the above: the descent
+    // path's scalars each mean one thing for one stage, and an earlier version of this
+    // kernel shipped a bug where the sampler's target clobbered the mass it was derived
+    // from.
+    __shared__ float sPivot;
+    __shared__ float sCandWeight;
+    __shared__ int sCandIdx;
+    __shared__ curandStatePhilox4_32_10_t sRejectRng;
 
     // --- Pass 1: online softmax -- max, total mass and argmax in a SINGLE read of the
     //     row (Milakov & Gimelshein). The naive form needs two, one for the max and one
@@ -528,6 +564,196 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
             sTotalMass = filteredMass;
         }
         __syncthreads();
+    }
+
+    // --- Tokens-only fast path: draw the token by rejection instead of solving for the
+    //     cutoff that defines the kept set.
+    //
+    // The exact cutoff exists to *materialize* the filtered distribution. A token drawn
+    // from that distribution does not need it: sample from any superset of the kept set,
+    // test whether the draw landed inside, and on a rejection shrink the superset to what
+    // the test just measured. Each round conditions on "inside the kept set", so what
+    // survives is the kept distribution exactly -- the standard rejection argument, and it
+    // stays valid across rounds because every support this loop builds still contains the
+    // kept set.
+    //
+    // This is the stage the measurements pointed at: at 64 rows the descent is 77-83% of a
+    // filtered tokens call, and a descent-free row already runs ~3x faster than
+    // flashinfer's filtered tokens path. Removing it is worth more than tuning it.
+    //
+    // Two things keep a row out of here, and they are different in kind.
+    //
+    // top-k, because rejection has no bound on it. How often a draw is accepted is the
+    // fraction of mass the filter keeps -- for top-p that fraction IS top_p, a number the
+    // caller chose and which sits near 0.9 in practice, so the loop ends in about one
+    // round. top-k keeps k *entries*, and what mass they carry is a property of the
+    // logits: on a flat row, 50 of 131072 hold almost nothing and the support has to be
+    // whittled down instead. Measured at 64 rows: routing top-k through here cost
+    // 188us -> 250us at 131072 vocab, while top-p gained 208us -> 76us. (At 32000 vocab
+    // top-k did gain, 56us -> 36us -- so the real predicate is how peaked the row is,
+    // not which filter is set. Estimating that from pass 1's mass is left alone here;
+    // "no top-k" is the rule that is right for the reason stated rather than by
+    // coincidence of vocabulary size.)
+    //
+    // top-k AND top-p together, because top-p's target is a fraction of the *post-top-k*
+    // mass, which nothing knows without solving for the top-k cutoff first. Subsumed by
+    // the rule above, and noted because it is the constraint that would still bind if
+    // top-k rows were ever admitted.
+    if constexpr (NEED_TOKENS && !NEED_PROBS)
+    {
+        if (!rp.needTopK)
+        {
+            // Both criteria are thresholds on what lies strictly above a candidate, and
+            // both are taken over the min-p survivors -- which is what pass 2 left in
+            // sTotalMass. `<` for the count and `<=` for the mass mirror findThreshold's
+            // firing rules (count *reaches* k, mass *exceeds* its target), so this test
+            // and the descent accept exactly the same set.
+            float const minPFloor = rp.needMinP ? rp.minP : 0.0f;
+            float const massTarget = rp.topP * sTotalMass;
+            float const countTarget = static_cast<float>(rp.topK);
+
+            if (tid == 0)
+            {
+                int const rngIdx = params.perRowRng ? row : 0;
+                uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
+                uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
+                curand_init(seed, static_cast<uint64_t>(row), offset, &sRejectRng);
+                // -1 admits every weight: w is an exp, so it is never negative.
+                sPivot = -1.0f;
+                sToken = -1;
+            }
+            __syncthreads();
+
+            for (int round = 0; round < kMaxRejectRounds; ++round)
+            {
+                float const pivot = sPivot;
+
+                // Inverse-CDF draw over the current support. The scan's aggregate is the
+                // support's mass, recomputed here rather than carried over from the
+                // previous round's reduction, so the target can never fall outside the
+                // walk that has to find it.
+                float localMass = 0.0f;
+                forEachLogit(rowLogits, vocabSize,
+                    [&](int, float logit)
+                    {
+                        float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                        if (w >= minPFloor && w > pivot)
+                        {
+                            localMass += w;
+                        }
+                    });
+                float base = 0.0f;
+                float supportMass = 0.0f;
+                BlockScanF(temp.scanF).ExclusiveSum(localMass, base, supportMass);
+                __syncthreads();
+                if (tid == 0)
+                {
+                    sTarget = curand_uniform(&sRejectRng) * supportMass;
+                    sCandIdx = -1;
+                }
+                __syncthreads();
+
+                float const target = sTarget;
+                if (target >= base && target < base + localMass)
+                {
+                    // Same traversal as the accumulation above, so the two float sums
+                    // agree term for term and the crossing lands on the same element.
+                    float running = base;
+                    bool found = false;
+                    forEachLogit(rowLogits, vocabSize,
+                        [&](int i, float logit)
+                        {
+                            if (found)
+                            {
+                                return;
+                            }
+                            float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                            if (!(w >= minPFloor && w > pivot))
+                            {
+                                return;
+                            }
+                            running += w;
+                            if (running > target)
+                            {
+                                sCandIdx = i;
+                                sCandWeight = w;
+                                found = true;
+                            }
+                        });
+                }
+                __syncthreads();
+
+                if (sCandIdx < 0)
+                {
+                    // Rounding left the target past the last element of the support.
+                    // The argmax below is the answer, as on the descent path.
+                    break;
+                }
+                float const candWeight = sCandWeight;
+
+                // Nothing can reject: min-p is already built into the support, so the
+                // first draw is the answer. Skipping the sweep is what keeps a neutral or
+                // min-p-only row at the two passes it had before this path existed.
+                if (!rp.needTopP)
+                {
+                    if (tid == 0)
+                    {
+                        sToken = sCandIdx;
+                    }
+                    __syncthreads();
+                    break;
+                }
+
+                // One sweep decides membership for both criteria.
+                CountMass local{0.0f, 0.0f};
+                forEachLogit(rowLogits, vocabSize,
+                    [&](int, float logit)
+                    {
+                        float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                        if (w >= minPFloor && w > candWeight)
+                        {
+                            local.count += 1.0f;
+                            local.mass += w;
+                        }
+                    });
+                CountMass const above = BlockReduceCountMass(temp.reduceCountMass).Reduce(local, CountMassOp());
+                __syncthreads();
+
+                if (tid == 0)
+                {
+                    // The top-k arm cannot fire while the gate above excludes those rows.
+                    // It is kept because the gate is a performance choice, not a
+                    // correctness one -- admitting top-k rows must stay a one-line change
+                    // rather than one that silently samples from the wrong set.
+                    bool const keep
+                        = (!rp.needTopK || above.count < countTarget) && (!rp.needTopP || above.mass <= massTarget);
+                    if (keep)
+                    {
+                        sToken = sCandIdx;
+                    }
+                    else
+                    {
+                        // The kept set is downward-closed in w, so a rejected candidate
+                        // rules out everything at or below its weight -- and the mass of
+                        // what remains is the mass just measured. Narrowing is free, and
+                        // it always drops at least the candidate, so the loop terminates.
+                        sPivot = candWeight;
+                    }
+                }
+                __syncthreads();
+
+                if (sToken >= 0)
+                {
+                    break;
+                }
+            }
+
+            if (tid == 0)
+            {
+                params.outputTokens[row] = sToken >= 0 ? sToken : sArgMax;
+            }
+            return;
+        }
     }
 
     // --- Pass 3: the rank/mass thresholds, skipped wholesale when neither top-k nor

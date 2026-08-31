@@ -275,3 +275,121 @@ def test_sampling_follows_the_filtered_distribution():
     counts = torch.bincount(tokens.long(), minlength=vocab).float() / draws
     tv = 0.5 * (counts - probs[0]).abs().sum().item()
     assert tv < 0.05, f"total-variation distance {tv:.3f} between draws and the reported probs"
+
+
+# --- The tokens-only rejection path ------------------------------------------------
+#
+# ``universal_sample_from_logits`` (tokens, no probs) does not solve for the cutoff at
+# all: it draws from a superset of the kept set and retries until the draw lands inside.
+# The tests above reach it only through ``test_same_seed_and_offset_reproduce_the_same_
+# tokens``, and determinism says nothing about *which* distribution is reproduced -- so
+# the ones below drive it directly, against the descent path's own probs.
+
+# Rows without top-k take the rejection path; rows with it keep the descent. Both are
+# listed, because the point of the split is that the two agree on the distribution -- a
+# routing change that sends a row the wrong way has to fail here rather than quietly
+# sample from a different set.
+_REJECT_FILTERS = [
+    pytest.param({}, id="neutral"),
+    pytest.param({"top_p": 0.8}, id="top_p"),
+    pytest.param({"min_p": 0.05}, id="min_p"),
+    pytest.param({"min_p": 0.02, "top_p": 0.8}, id="min_p_top_p"),
+    pytest.param({"top_k": 8}, id="top_k_descent"),
+    pytest.param({"min_p": 0.02, "top_k": 16}, id="min_p_top_k_descent"),
+    pytest.param({"top_k": 16, "top_p": 0.8}, id="top_k_top_p_descent"),
+]
+
+
+@pytest.mark.parametrize("filters", _REJECT_FILTERS)
+def test_rejection_tokens_lie_in_the_filtered_support(filters):
+    """A rejection sampler that accepts too readily still returns a plausible token, so
+    membership is the assertion that catches it."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    rows, vocab = 256, 4096
+    logits = torch.randn(rows, vocab, device=dev) * 2.0
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, **filters)
+    reference = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+
+    for step in range(8):
+        seed, offset = _rng(rows, dev, offset=step)
+        tokens = uni.universal_sample_from_logits(
+            logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+        )
+        picked = reference.gather(1, tokens.long().unsqueeze(-1)).squeeze(-1)
+        assert (picked > 0).all(), f"step {step} sampled a token the filters removed"
+
+
+@pytest.mark.parametrize("filters", _REJECT_FILTERS)
+def test_rejection_tokens_follow_the_filtered_distribution(filters):
+    """The acceptance test decides *which* distribution the loop converges to; an
+    off-by-one in it (``<`` vs ``<=`` against the count/mass target) keeps or drops the
+    boundary token and shifts the distribution without ever leaving the support."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    vocab, draws = 64, 32768
+    logits = (torch.randn(1, vocab, device=dev) * 1.5).expand(draws, vocab).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(draws, device=dev, temperature=1.0, **filters)
+
+    seed = torch.tensor([99], dtype=torch.int64, device=dev)
+    offset = torch.tensor([0], dtype=torch.int64, device=dev)
+    tokens = uni.universal_sample_from_logits(
+        logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+    )
+    expected = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)[0]
+
+    counts = torch.bincount(tokens.long(), minlength=vocab).float() / draws
+    tv = 0.5 * (counts - expected).abs().sum().item()
+    assert tv < 0.05, f"total-variation distance {tv:.3f} from the filtered distribution"
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [pytest.param({"top_p": 1e-6}, id="top_p"), pytest.param({"top_k": 1}, id="top_k_descent")],
+)
+def test_rejection_converges_when_the_support_barely_shrinks(filters):
+    """The round budget's worst case: a near-flat row keeping exactly one token.
+
+    Every rejection here removes only the weights at or below the draw, and on a flat row
+    a draw is uniform over the support -- so the support halves per round rather than
+    collapsing, which is the slowest descent the loop can be given. Both filters admit the
+    argmax alone, so a budget that ran out would show up as a wrong token, not a slow one.
+    """
+    dev = "cuda"
+    rows, vocab = 512, 4096
+    # Distinct but nearly equal, so no tie lets the loop finish early.
+    logits = (torch.arange(vocab, device=dev, dtype=torch.float32) * 1e-4).expand(rows, vocab)
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, temperature=1.0, **filters)
+
+    for step in range(4):
+        seed, offset = _rng(rows, dev, offset=step)
+        tokens = uni.universal_sample_from_logits(
+            logits.contiguous(), temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+        )
+        assert torch.equal(tokens.long(), torch.full_like(tokens.long(), vocab - 1))
+
+
+def test_rejection_and_descent_keep_the_same_set():
+    """Mixed batch: rows that take the rejection path and rows that fall through to the
+    descent are dispatched per row, inside one launch. Both must sample from the set the
+    probs-only op reports for that row."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    rows, vocab = 64, 4096
+    logits = torch.randn(rows, vocab, device=dev) * 2.0
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev)
+    # Row r cycles through: neutral, top-k, top-p, min-p, and the top-k+top-p fallback.
+    top_ks[1::5] = 32
+    top_ps[2::5] = 0.7
+    min_ps[3::5] = 0.05
+    top_ks[4::5] = 32
+    top_ps[4::5] = 0.7
+
+    reference = uni.universal_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+    for step in range(8):
+        seed, offset = _rng(rows, dev, offset=step)
+        tokens = uni.universal_sample_from_logits(
+            logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+        )
+        picked = reference.gather(1, tokens.long().unsqueeze(-1)).squeeze(-1)
+        assert (picked > 0).all(), f"step {step} sampled outside its row's support"
