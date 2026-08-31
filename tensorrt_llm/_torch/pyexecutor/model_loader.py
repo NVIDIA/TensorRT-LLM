@@ -41,8 +41,9 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
-from ..modules.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
+from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+                                               maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
@@ -50,10 +51,11 @@ from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
+    "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto"
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -1127,6 +1129,8 @@ class ModelLoader:
                             for name, value in self._metrics.items())
         logger.info(
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+        if LOW_M_GEMM_ACTIVE:
+            prepare_low_m_gemm(model)
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:
@@ -1558,6 +1562,8 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        config.extra_attrs[
+            'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

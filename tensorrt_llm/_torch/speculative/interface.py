@@ -32,8 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -118,9 +117,14 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
-    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
-    # model does not read the paged draft KV cache managed by attention metadata.
-    if spec_config.spec_dec_mode.is_dspark():
+    # The embedded DSpark draft owns a dedicated rolling-window cache in
+    # DSv4DSparkWorker and never reads the paged draft KV cache that attention
+    # metadata manages. A standalone DSpark drafter runs on DSparkWorker
+    # (DFlash lineage), which does read it, so it keeps the default -- hence a
+    # form check, not a mode check
+    # (see DSparkDecodingConfig.draft_is_embedded_in_target).
+    if (spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target):
         return False
     return spec_config._allow_separate_draft_kv_cache
 
@@ -396,31 +400,23 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         Args:
-            spec_resource_manager: the resource manager for the spec-dec mode.
             is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
-            use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
         use_case_1 = self.use_one_engine()
-        # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
-        # the target model (verification) or on the first draft for CDL based speculation.
-        use_case_2 = not self.use_one_engine() and (
-            not is_draft_model or
-            (spec_resource_manager is not None
-             and spec_resource_manager.is_first_draft
-             and use_chain_drafter)) and is_trtllm_attention
+        # For 2-model, only the target model (verification) processes multiple tokens at once.
+        use_case_2 = (not self.use_one_engine() and not is_draft_model
+                      and is_trtllm_attention)
 
         return use_case_1 or use_case_2
 
@@ -1044,7 +1040,7 @@ class SpecMetadata:
         """Single source of truth for one-engine sampling-param detection.
 
         Scans the batch's sampling configs and sets skip_*/is_all_greedy_sample
-        (honoring the warmup capture override). Returns
+        (honoring the group-synchronized value, see below). Returns
         ``(per_request_normalized, per_request_slot_ids)`` for buffer
         population. Does NOT allocate or fill GPU buffers, so it is safe to call
         before the CUDA graph key is built.
@@ -1148,22 +1144,10 @@ class SpecMetadata:
         # unset), so this cannot be derived from which filters are in use.
         self.is_all_greedy_sample = not has_non_greedy_requests
 
-        # Warmup-time override: force the advanced-sampling path so the CUDA
-        # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
-        # warmup requests carry no sampling params, so substitute synthetic
-        # non-greedy scalars to populate the GPU buffers.
-        if getattr(self, '_force_non_greedy_for_capture', False):
-            self.is_all_greedy_sample = False
-            per_request_normalized = [
-                (0.7, 50, 0.9, num_tokens)
-                for (_, _, _, num_tokens) in per_request_normalized
-            ]
-
-        # Apply the group-synchronized override last (semantics: see the
-        # ``group_all_greedy_sample`` field comment). Local contract: the
-        # synced value already incorporates any capture override, and rescans
-        # (e.g. populate after the graph key) must converge to it rather than
-        # resurrect the local value.
+        # Apply the group-synchronized value last (semantics: see the
+        # ``group_all_greedy_sample`` field comment). Local contract: rescans
+        # (e.g. populate after the graph key) must converge to the synced
+        # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
         return per_request_normalized, per_request_slot_ids
@@ -1191,6 +1175,10 @@ class SpecMetadata:
         """
         if not self.spec_dec_mode.use_one_engine():
             return
+        # The synchronized group decision belongs to the previous iteration.
+        # Clear it before deriving this iteration's local flag; the caller
+        # immediately recomputes the group decision before graph-key lookup.
+        self.group_all_greedy_sample = None
         self._scan_one_model_sampling(requests)
 
     def populate_sampling_params_for_one_model(

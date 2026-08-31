@@ -31,6 +31,7 @@ from torch import nn
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
@@ -50,11 +51,11 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
-from tensorrt_llm._torch.modules.fused_moe.routing import (
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -793,6 +794,31 @@ def test_minimax_m3_fused_qk_norm_rope_index_matches_separate():
 
     torch.testing.assert_close(iq_f.contiguous(), iq_s.contiguous(), rtol=5e-2, atol=1e-1)
     torch.testing.assert_close(ik_f.contiguous(), ik_s.contiguous(), rtol=5e-2, atol=1e-1)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons() -> None:
+    """The fused kernel has one epsilon, so Q/K norms must agree."""
+    attn = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attn)
+    backend = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    attn.attn = backend
+    attn.rotary_emb = object()
+    attn.pos_embd_params = SimpleNamespace(
+        rope=SimpleNamespace(dim=64, theta=5000000.0),
+        is_neox=True,
+    )
+    attn.use_gemma_norm = True
+    attn.index_q_norm = SimpleNamespace(variance_epsilon=1e-6)
+    attn.index_k_norm = SimpleNamespace(variance_epsilon=1e-5)
+
+    with pytest.raises(ValueError, match=r"identical index Q/K RMSNorm epsilon"):
+        attn._fused_fp8_index_qk_norm_rope(
+            torch.empty(1, 640, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.int32),
+            SimpleNamespace(),
+        )
 
 
 @pytest.mark.gpu

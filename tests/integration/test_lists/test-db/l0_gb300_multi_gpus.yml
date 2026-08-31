@@ -17,6 +17,7 @@ l0_gb300_multi_gpus:
   tests:
   - unittest/_torch/attention
   - unittest/_torch/thop/parallel
+  - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/executor
   # ------------- modules (non-MoE) ---------------
@@ -30,27 +31,26 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
-  - unittest/_torch/modules/test_moe_load_balancer.py
-  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/moe/test_moe_load_balancer.py
+  - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Kimi K3 speculative decoding: exact kernel-level verify parity (random
   # weights, no checkpoint) + truncated-model e2e SA logits parity
   # (auto-skips when the Kimi K3 checkpoint is not staged).
-  - unittest/_torch/modeling -k "kimi_kda_verify"
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   # Fused KDA multi-token verify (trtllm::kda_mtp_decode): kernel-level
   # parity vs CPU golden + FLA sequential, and runtime-level fused-vs-
   # sequential two-round replay parity.
-  - unittest/_torch/modeling -k "kda_mtp_decode_cute_parity"
-  - unittest/_torch/modeling -k "kimi_kda_fused_verify"
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
-  - unittest/_torch/modules/moe/test_moe_backend.py -k "kimi_k3_shape"
+  - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=True]

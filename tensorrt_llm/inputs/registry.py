@@ -205,21 +205,6 @@ class DefaultInputProcessor(InputProcessor):
                 token_ids = self.tokenizer.encode(
                     inputs["prompt"], allowed_special=toktoken_special_tokens)
 
-        if "query" in inputs:
-            with nvtx_range_debug("tokenize query"):
-                try:
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        add_special_tokens=sampling_params.add_special_tokens,
-                        **kwargs)
-                except:
-                    # Tiktoken path
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        allowed_special=toktoken_special_tokens)
-
-            return token_ids, {"query_token_ids": query_token_ids}
-
         return token_ids, None
 
 
@@ -1274,7 +1259,7 @@ def maybe_compute_mm_embed_cumsum(
     # `multimodal_hashing_process` already setdefault()ed the cumsum (without
     # this flag) leaves scheduler_v2 reading mm_bidirectional_blocks=None and
     # silently skipping align — which then trips
-    # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
+    # get_attention_mask's `cached_token_lens == 0` assert on
     # 26B/31B once an image block is split across chunks. Gemma4 sets this
     # per-instance from text_config.use_bidirectional_attention.
     mm_data.setdefault(
