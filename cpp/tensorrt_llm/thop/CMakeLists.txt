@@ -155,6 +155,8 @@ add_library(
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
+target_include_directories(th_common
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)

@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
@@ -36,7 +35,6 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-using tensorrt_llm::common::op::AttentionOp;
 using tensorrt_llm::kernels::AttentionMaskType;
 using tensorrt_llm::kernels::BlockSparseParams;
 using tensorrt_llm::kernels::BuildDecoderInfoParams;
