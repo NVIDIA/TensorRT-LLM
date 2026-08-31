@@ -767,8 +767,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Container and modality are already checked at the coordinator's
         # reference choke point, so the bytes reaching here are known video.
         video = refs_v[0].content if refs_v else None
-        # Container and modality are already checked at the coordinator's
-        # reference choke point, so the bytes reaching here are known video.
         is_action = extra_params.get("action_mode") is not None
         if is_action:
             # Action resolves its whole recipe in forward() -- the canvas from
