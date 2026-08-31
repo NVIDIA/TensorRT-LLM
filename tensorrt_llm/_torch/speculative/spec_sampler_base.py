@@ -66,6 +66,10 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
+    # Per-request verify windows for this sampler step, keyed by request id.
+    # The overlap scheduler can stamp the next step on the live request before
+    # this state is consumed, so rewind accounting must use this snapshot.
+    verify_lens_snapshot: Optional[dict[int, int]] = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -280,6 +284,31 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
+    @staticmethod
+    def _verified_len(
+        request: LlmRequest,
+        runtime_draft_len: int,
+        verify_lens_snapshot: Optional[dict[int, int]],
+    ) -> int:
+        """Return the number of draft positions verified for one request."""
+        if verify_lens_snapshot is not None:
+            verify_len = verify_lens_snapshot.get(request.py_request_id)
+        else:
+            verify_len = getattr(request, "py_verify_len", None)
+        return runtime_draft_len if verify_len is None else int(verify_len)
+
+    @staticmethod
+    def _snapshot_verify_lens(
+        requests: list[LlmRequest],
+    ) -> Optional[dict[int, int]]:
+        """Capture overlap-sensitive ragged windows for one sampler step."""
+        snapshot = {
+            request.py_request_id: int(verify_len)
+            for request in requests
+            if (verify_len := getattr(request, "py_verify_len", None)) is not None
+        }
+        return snapshot or None
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -325,10 +354,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # replaces py_draft_tokens with the next step's buffer, so its
             # length must not be used as the denominator (0 for the request's
             # prefill step, where nothing was verified).
-            req.py_num_draft_tokens_verified = (
-                state.draft_lens[req_idx] if state.draft_lens is not None else 0
-            )
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            verified_len = self._verified_len(req, runtime_draft_len, state.verify_lens_snapshot)
+            drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
+            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
@@ -433,6 +462,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         for request in finished_context_requests:
             request.py_draft_tokens = [1] * self.draft_len
 
+        verify_lens_snapshot = self._snapshot_verify_lens(sampling_requests)
+
         return SampleStateSpec(
             requests=sampling_requests,
             device=device_tensors,
@@ -440,4 +471,5 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
+            verify_lens_snapshot=verify_lens_snapshot,
         )

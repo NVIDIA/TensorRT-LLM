@@ -672,6 +672,10 @@ class SpecMetadataLike(Protocol):
     vocab_size: int
     penalty_state: Optional["PenaltyState"]
     batch_slot_ids: Optional[torch.Tensor]
+    is_ragged_verify: bool
+    verify_lens: Optional[torch.Tensor]
+    qo_indptr: Optional[torch.Tensor]
+    total_verify_tokens: Optional[int]
 
 
 @dataclass(kw_only=True)
@@ -886,13 +890,16 @@ def build_row_mapping(
     draft_len: int,
     draft_tokens: torch.Tensor,
     device: torch.device,
+    num_logit_rows: Optional[int] = None,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Derive the per-row slot map and intra-step prefix for a packed logits batch.
 
-    Assumes the layout every linear one-model mode produces once
-    ``_reshape_logits_for_accept`` has run: ``[ctx (1 row each), gen (draft_len + 1
-    rows each)]``, request-major. PARD emits ``2 * draft_len`` rows per gen request
-    but that hook already narrows them to ``draft_len + 1``, so both share this code.
+    Uniform linear modes produce ``[ctx (1 row each), gen (draft_len + 1 rows
+    each)]`` once ``_reshape_logits_for_accept`` has run. Ragged verification
+    instead packs each generation request's ``verify_lens[r]`` token rows back to
+    back on the flat token axis. In either layout, rows for one request are
+    contiguous and ordered by speculative position. PARD emits ``2 * draft_len``
+    rows per gen request but its reshape hook narrows them before this function.
 
     Tree modes do NOT fit: their rows are tree nodes, so a row's prefix is its
     root path rather than the rows before it. They are rejected at admission.
@@ -909,16 +916,58 @@ def build_row_mapping(
         return None
 
     num_gens = batch_size - num_contexts
-    rows_per_gen = draft_len + 1
-    total_rows = num_contexts + num_gens * rows_per_gen
+    batch_slots = slot_ids[:batch_size].to(device=device, dtype=torch.int64)
 
-    batch_slots = slot_ids[:batch_size].to(torch.int64)
-    # Context requests own one row; gen requests own rows_per_gen consecutive rows.
+    if getattr(spec_metadata, "is_ragged_verify", False):
+        verify_lens = getattr(spec_metadata, "verify_lens", None)
+        qo_indptr = getattr(spec_metadata, "qo_indptr", None)
+        total_verify_tokens = getattr(spec_metadata, "total_verify_tokens", None)
+        if (
+            verify_lens is None
+            or qo_indptr is None
+            or verify_lens.dim() != 1
+            or qo_indptr.dim() != 1
+            or verify_lens.numel() != num_gens
+            or qo_indptr.numel() != num_gens + 1
+        ):
+            return None
+        if total_verify_tokens is None:
+            if num_logit_rows is None:
+                return None
+            total_verify_tokens = num_logit_rows - num_contexts
+        total_gen_rows = int(total_verify_tokens)
+        if total_gen_rows < 0:
+            return None
+        total_rows = num_contexts + total_gen_rows
+        if num_logit_rows is not None and total_rows != num_logit_rows:
+            return None
+
+        lens = verify_lens.to(device=device, dtype=torch.int64)
+        gen_request_ids = torch.repeat_interleave(
+            torch.arange(num_gens, device=device),
+            lens,
+            output_size=total_gen_rows,
+        )
+        packed_positions = torch.arange(total_gen_rows, device=device)
+        starts = qo_indptr[:num_gens].to(device=device, dtype=torch.int64)
+        position_in_request = packed_positions - starts[gen_request_ids]
+    else:
+        rows_per_gen = draft_len + 1
+        total_gen_rows = num_gens * rows_per_gen
+        total_rows = num_contexts + total_gen_rows
+        if num_logit_rows is not None and total_rows != num_logit_rows:
+            return None
+        gen_rows = torch.arange(total_gen_rows, device=device)
+        gen_request_ids = gen_rows // rows_per_gen
+        position_in_request = gen_rows % rows_per_gen
+
+    # Context requests own one row. Generation rows are request-contiguous in
+    # both the uniform rectangle and the ragged packed token axis.
     row_slots = (
         torch.cat(
             [
                 batch_slots[:num_contexts],
-                batch_slots[num_contexts:batch_size].repeat_interleave(rows_per_gen),
+                batch_slots[num_contexts:batch_size][gen_request_ids],
             ]
         )
         if num_gens > 0
@@ -935,15 +984,12 @@ def build_row_mapping(
     intra_valid = torch.zeros((total_rows, max(draft_len, 0)), dtype=torch.bool, device=device)
     if num_gens > 0 and draft_len > 0 and draft_tokens.numel() > 0:
         drafts = draft_tokens.reshape(num_gens, -1)[:, :draft_len].to(torch.int64)
-        gen_rows = torch.arange(num_gens * rows_per_gen, device=device)
-        g_of_row = gen_rows // rows_per_gen  # which request owns the row
-        k_of_row = gen_rows % rows_per_gen  # the row's speculative position
         # Every gen row carries its own request's drafts; validity alone selects the
         # strictly-earlier prefix. Column j counts for row k iff j < k.
-        intra_tokens[num_contexts:] = drafts[g_of_row]
+        intra_tokens[num_contexts:] = drafts[gen_request_ids]
         intra_valid[num_contexts:] = torch.arange(draft_len, device=device).unsqueeze(
             0
-        ) < k_of_row.unsqueeze(1)
+        ) < position_in_request.unsqueeze(1)
     return row_slots, intra_tokens, intra_valid
 
 
