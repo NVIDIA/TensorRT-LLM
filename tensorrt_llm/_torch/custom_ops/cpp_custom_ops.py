@@ -369,10 +369,9 @@ def _register_fake():
           conv_state_v: torch.Tensor, a_log: torch.Tensor, g: torch.Tensor,
           dt_bias: torch.Tensor, beta: torch.Tensor, onorm_g: torch.Tensor,
           onorm_weight: torch.Tensor, ssm_state_indices: Optional[torch.Tensor],
-          cu_seqlens: torch.Tensor, state: torch.Tensor, apply_onorm: bool,
-          update_conv_cache: bool, use_lower_bound: bool,
-          apply_beta_sigmoid: bool, lower_bound: float, scale: float,
-          onorm_eps: float, output: torch.Tensor) -> None:
+          state: torch.Tensor, apply_onorm: bool, update_conv_cache: bool,
+          use_lower_bound: bool, apply_beta_sigmoid: bool, lower_bound: float,
+          scale: float, onorm_eps: float, output: torch.Tensor) -> None:
         # Inplace-only: the kernel writes into ``output``, so there is nothing
         # to allocate and nothing to return.
         return None

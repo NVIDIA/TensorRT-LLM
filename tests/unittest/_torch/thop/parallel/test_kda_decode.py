@@ -42,7 +42,6 @@ class KdaInputs:
     output_norm_weight: torch.Tensor
     state_storage: torch.Tensor
     state_indices: torch.Tensor | None
-    cu_seqlens: torch.Tensor
 
 
 def _state_view(
@@ -198,7 +197,6 @@ def _make_inputs(
         ),
         state_storage=state_storage,
         state_indices=state_indices,
-        cu_seqlens=torch.arange(batch_size + 1, device="cuda", dtype=torch.int32),
     )
 
 
@@ -447,7 +445,6 @@ def test_kda_decode_matches_fla(
         inputs.output_norm_gate,
         inputs.output_norm_weight,
         inputs.state_indices,
-        inputs.cu_seqlens,
         actual_state,
         apply_output_norm,
         update_conv_cache,

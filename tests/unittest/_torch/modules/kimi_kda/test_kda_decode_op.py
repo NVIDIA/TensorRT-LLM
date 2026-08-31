@@ -465,7 +465,6 @@ def _make_direct_decode_args(
             device=device,
         ),
         "ssm_state_indices": indices,
-        "cu_seqlens": torch.arange(batch_size + 1, dtype=torch.int32, device=device),
         "lower_bound": -5.0,
     }
 
