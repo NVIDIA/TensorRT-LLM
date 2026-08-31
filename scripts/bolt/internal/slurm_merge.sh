@@ -36,15 +36,19 @@
 #           OUT_DIR LLVM_BOLT_VERSION BOLT_APPLY
 
 # ====================== EDIT THESE (cluster specifics) ======================
-# NOTE: this merge job is 100% CPU
-# (setup_env pip, readelf, merge-fdata, llvm-bolt .fdata->.yaml conversion,
-# packaging) and needs NO GPUs -- requesting gpus-per-node=4 holds a full GB200
-# node for nothing and queues behind GPU demand. Switch to a CPU partition (or
-# --gpus-per-node=0) once we confirm the target cluster accepts GPU-less jobs.
+# NOTE: this merge job is 100% CPU (setup_env pip, readelf, merge-fdata, llvm-bolt
+# .fdata->.yaml conversion, packaging, apply_bolt.py) and needs NO GPUs, so it runs
+# on the CPU partition (TRTLLMINF-365). Requesting a full GPU node held ~4
+# accelerators idle for the whole merge and queued it behind GPU demand on
+# oversubscribed clusters. IMPORTANT: these clusters REJECT a zero GPU request
+# (--gpus-per-node=0 / --gpus=0) -- any GPU resource arg must be a positive integer
+# (a multiple of 4 on NVL72). A CPU job simply omits every --gpus* arg and requests
+# "--nodes=1 --partition=cpu". Override the CPU partition name via BoltProfileGen's
+# boltMergePartition (passed on the sbatch CLI, which overrides this header).
 #SBATCH --account=coreai_tensorrt_ci
 #SBATCH --job-name=bolt-merge
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --partition=cpu
 #SBATCH --time=01:00:00
 
 set -euo pipefail

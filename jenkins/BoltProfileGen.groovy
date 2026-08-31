@@ -368,6 +368,22 @@ def submitProfileGen(pipeline)
         def harnessMounts = params.boltHarnessMounts ?: env.boltHarnessMounts ?: "${ws}:${ws},${modelsRoot}:${modelsRoot}"
         // The merge job still uses our own slurm_merge.sh (not the harness).
         def partArgs = "${partition.additionalArgs} ${SlurmConfig.getTimeArgs(partition)} ${SlurmConfig.getPartitionArgs(partition)}"
+        // TRTLLMINF-365: the merge job is 100% CPU (merge-fdata, llvm-bolt
+        // .fdata->.yaml, packaging, apply_bolt.py) -- run it on the CPU partition so
+        // it doesn't hold a GPU node idle or queue behind GPU demand. These clusters
+        // REJECT a zero GPU request (--gpus-per-node=0 / --gpus=0; any GPU arg must
+        // be a positive integer), so a CPU job omits every --gpus* arg and just uses
+        // --partition=cpu. Deliberately NOT partArgs here: partition.additionalArgs /
+        // getPartitionArgs carry the GPU partition's GPU-request flags. Override the
+        // CPU partition name via boltMergePartition; the CLI args below override
+        // slurm_merge.sh's #SBATCH header (time comes from that header). We pass the
+        // account explicitly (-A) so submission does not depend on the header's
+        // #SBATCH --account (which is extracted from the input tarball and may be
+        // stale): the cpu partition's QOS (cpu-*) caps gres/gpu=0, so any GPU
+        // request that leaked from a stale header would be rejected with
+        // QOSMaxGRESPerJob.
+        def mergePartition = params.boltMergePartition ?: env.boltMergePartition ?: "cpu"
+        def mergeArgs = "-A coreai_tensorrt_ci --partition=${mergePartition}"
 
         // Wrap each branch in a stage() so Blue Ocean renders one parallel stage
         // per workload (named "Collect: <workload>").
@@ -389,7 +405,7 @@ def submitProfileGen(pipeline)
         //    Wrapped in its own stage() so it shows as a distinct marker in
         //    Blue Ocean after the parallel collect fan-out.
         stage("Merge + Package") {
-            def mid = submitMerge(pipeline, remote, ws, fdataRoot, outDir, partArgs)
+            def mid = submitMerge(pipeline, remote, ws, fdataRoot, outDir, mergeArgs)
             pipeline.echo("submitted merge job ${mid}")
             pollSlurm(pipeline, remote, mid, "merge")
             pipeline.echo("Merge COMPLETED. Bundle: ${bundle}")
@@ -688,6 +704,11 @@ pipeline {
             name: "boltHarnessTimeLimit",
             defaultValue: "",
             description: "SLURM walltime per collect job. Empty -> 04:00:00 (instrumented runs are much slower than uninstrumented ones)."
+        )
+        string(
+            name: "boltMergePartition",
+            defaultValue: "",
+            description: "SLURM CPU partition for the merge job (TRTLLMINF-365). Empty -> 'cpu'. The merge is 100% CPU and requests no GPUs (these clusters reject a 0-GPU request), so it runs on the CPU partition. Set this if a cluster names its CPU partition differently."
         )
     }
     options {
