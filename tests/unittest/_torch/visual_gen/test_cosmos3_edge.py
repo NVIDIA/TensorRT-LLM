@@ -27,8 +27,14 @@ from diffusers import UniPCMultistepScheduler
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    ACTION_MODE_FORWARD_DYNAMICS,
+    ACTION_MODE_INVERSE_DYNAMICS,
+    ACTION_MODE_POLICY,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
+    COSMOS3_ACTION_PARAMS,
     COSMOS3_EDGE_T2I_PARAMS,
     COSMOS3_EDGE_VIDEO_PARAMS,
     COSMOS3_GENERATION_DEFAULTS,
@@ -241,10 +247,11 @@ class TestArchRecipe:
         cfg = SimpleNamespace(hidden_act="silu", qk_norm_for_text=True)
         assert resolve_arch_recipe(cfg) is QWEN3_RECIPE
 
-    def test_edge_export_resolves_from_complete_signature_without_backbone_type(self):
+    def test_edge_signature_without_backbone_type_is_rejected(self):
         cfg = _reduced_edge_config()
         cfg.backbone_type = None
-        assert resolve_arch_recipe(cfg) is NEMOTRON_DENSE_RECIPE
+        with pytest.raises(ValueError, match="hidden_act"):
+            resolve_arch_recipe(cfg)
 
     def test_unknown_backbone_raises(self):
         cfg = _reduced_edge_config()
@@ -809,7 +816,7 @@ class TestEdgeDefaults:
         assert "nvidia/Cosmos3-Edge" in hf_ids
         assert "nvidia/Cosmos3-Edge-Policy-DROID" in hf_ids
 
-    def test_policy_manifest_overrides_action_sampling_only(self):
+    def test_policy_manifest_overrides_policy_sampling_only(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
         pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
             {
@@ -819,11 +826,27 @@ class TestEdgeDefaults:
             }
         )
 
-        action = pipeline._mode_params("action")
+        policy = pipeline._mode_params("action", action_mode=ACTION_MODE_POLICY)
 
-        assert action["num_inference_steps"] == 4
-        assert action["guidance_scale"] == 3.0
-        assert action["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
+        assert policy["num_inference_steps"] == 4
+        assert policy["guidance_scale"] == 3.0
+        assert policy["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
+        assert (
+            pipeline._mode_params("action", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
+            is COSMOS3_ACTION_PARAMS
+        )
+        assert (
+            pipeline._mode_params("action", action_mode=ACTION_MODE_INVERSE_DYNAMICS)
+            is COSMOS3_ACTION_PARAMS
+        )
+        for action_mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS):
+            resolved = pipeline._resolve_generation_params(
+                "action",
+                action_mode=action_mode,
+                num_inference_steps=None,
+                guidance_scale=None,
+            )
+            assert resolved == {"num_inference_steps": 30, "guidance_scale": 1.0}
         assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
 
     def test_none_params_resolve_from_edge_tables(self):

@@ -286,11 +286,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         super().__init__(pipeline_config)
 
-    def _mode_params(self, mode: str) -> dict:
+    def _mode_params(self, mode: str, *, action_mode: Optional[str] = None) -> dict:
         """Generation default table for this checkpoint family and request mode."""
         params = COSMOS3_GENERATION_DEFAULTS[(self.family, mode)]
         checkpoint_policy_defaults = getattr(self, "checkpoint_policy_defaults", {})
-        if mode == "action" and checkpoint_policy_defaults:
+        if (
+            mode == "action"
+            and normalize_action_mode(action_mode) == ACTION_MODE_POLICY
+            and checkpoint_policy_defaults
+        ):
             sampling_keys = {"num_inference_steps", "guidance_scale", "guidance_interval"}
             return {
                 **params,
@@ -302,10 +306,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             }
         return params
 
-    def _resolve_generation_params(self, mode: str, **values) -> dict:
+    def _resolve_generation_params(
+        self, mode: str, *, action_mode: Optional[str] = None, **values
+    ) -> dict:
         """Fill None values: sampling-policy overrides win, then the mode
         table, then the video table (for fields the image table omits)."""
-        mode_params = self._mode_params(mode)
+        mode_params = self._mode_params(mode, action_mode=action_mode)
         video_params = self._mode_params("video")
         sampling_overrides = self.sampling.generation_default_overrides()
         resolved = {}
@@ -1439,12 +1445,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         mode_params = self._mode_params(output_type)
         if do_action:
-            mode_params = self._mode_params("action")
+            mode_params = self._mode_params("action", action_mode=normalized_action_mode)
             # The embodiment resolves the canvas, clip length and frame rate
             # below; only the sampling recipe and the text budget come from
             # tables (distilled overrides still win inside the resolver).
             resolved = self._resolve_generation_params(
                 "action",
+                action_mode=normalized_action_mode,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 max_sequence_length=max_sequence_length,

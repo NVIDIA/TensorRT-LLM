@@ -15,6 +15,12 @@ from pathlib import Path
 
 import pytest
 
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import VIDEO_RES_SIZE_INFO
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    resolve_checkpoint_policy_defaults,
+    resolve_domain_action_config,
+)
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE_DIR = _PROJECT_ROOT / "examples" / "visual_gen" / "models" / "cosmos3"
 
@@ -243,6 +249,29 @@ class TestShippedPromptFiles:
     def test_bundled_prompt_files_load(self, name):
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         assert data["prompt"]
+
+    def test_edge_policy_prompt_matches_checkpoint_defaults(self):
+        data = cosmos3.load_prompt_file("prompts/action_edge_policy_droid.json")
+        prompt = data["prompt"]
+        policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+        config = resolve_domain_action_config(checkpoint_policy_defaults=policy_defaults)
+
+        duration_seconds = config["num_frames"] / config["frame_rate"]
+        minutes, seconds = divmod(round(duration_seconds), 60)
+        assert prompt["duration"] == f"{int(duration_seconds)}s"
+        assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
+        assert prompt["fps"] == config["frame_rate"]
+        assert prompt["aspect_ratio"] == "3,4"
+        width, height = VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][
+            prompt["aspect_ratio"]
+        ]
+        assert prompt["resolution"] == {"H": height, "W": width}
 
     def test_default_prompt_file(self):
         assert cosmos3.load_prompt_file(cosmos3.DEFAULT_PROMPT_FILE)["prompt"]
