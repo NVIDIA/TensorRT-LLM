@@ -285,6 +285,8 @@ class TopK(nn.Module):
                 and scores.data_ptr() % 16 == 0
                 and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
             ):
+                # hint-free k derives from the output width; pin it to the module's k
+                assert output_indices.shape[1] == self.top_k
                 from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
 
                 logger.info_once(

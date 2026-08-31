@@ -214,11 +214,11 @@ def _install_fake_selfsampling_runner(monkeypatch) -> Mock:
     return runner
 
 
-def _run_gvr_v2_decode(top_k: TopK, prior_indices: torch.Tensor) -> None:
+def _run_gvr_v2_decode(top_k: TopK, prior_indices: torch.Tensor, out_width: int = 2) -> None:
     scores = torch.randn(1, 8)  # satisfies the V2 hardware-format gate
     top_k(
         scores,
-        torch.empty(1, 2, dtype=torch.int32),
+        torch.empty(1, out_width, dtype=torch.int32),
         is_prefill=False,
         sequence_lengths=torch.tensor([32], dtype=torch.int32),
         scan_lengths=torch.tensor([8], dtype=torch.int32),
@@ -254,6 +254,24 @@ def test_gvr_v2_decode_hinted_env_restores_prior(monkeypatch) -> None:
     _run_gvr_v2_decode(top_k, prior_indices)
 
     assert runner.call_args.args[1] is prior_indices
+
+
+def test_gvr_v2_decode_rejects_output_width_mismatch(monkeypatch) -> None:
+    """Hint-free k derives from the output width; a scratch wider than
+    top_k must be rejected before launch, not silently become the k."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    monkeypatch.delenv("TRTLLM_GVR_V2_HINTED", raising=False)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        compress_ratio=4,
+    )
+    prior_indices = torch.zeros(1, 2, dtype=torch.int32)
+
+    with pytest.raises(AssertionError):
+        _run_gvr_v2_decode(top_k, prior_indices, out_width=3)
+
+    runner.assert_not_called()
 
 
 def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
