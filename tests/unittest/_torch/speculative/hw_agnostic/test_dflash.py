@@ -16,13 +16,18 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
 from tensorrt_llm.llmapi import CudaGraphConfig, DFlashDecodingConfig, KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -31,6 +36,93 @@ PROMPTS = [
     "The president of the United States is",
     "The future of AI is",
 ]
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+def test_dflash_metadata_preserves_default_seq_slot_pool_in_graph_copy():
+    metadata = DFlashSpecMetadata(
+        max_draft_len=4,
+        max_total_draft_tokens=4,
+        spec_dec_mode=SpeculativeDecodingMode.DFLASH,
+        max_num_requests=5,
+    )
+
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert metadata.num_seq_slots == 5
+    assert graph_metadata.max_num_requests == 2
+    assert graph_metadata.num_seq_slots == 5
+
+
+def test_dflash_graph_bucket_uses_full_seq_slot_pool():
+    """A small graph bucket must not shrink the persistent context pool."""
+    num_seq_slots = 5
+    spec_config = DFlashDecodingConfig(
+        max_draft_len=4,
+        target_layer_ids=[0],
+    )
+    metadata = get_spec_metadata(
+        spec_config,
+        SimpleNamespace(hidden_size=4, torch_dtype=torch.bfloat16, vocab_size=32),
+        max_num_requests=num_seq_slots,
+        max_num_tokens=8,
+        num_seq_slots=num_seq_slots,
+    ).create_cuda_graph_metadata(max_batch_size=2)
+
+    class DraftModel:
+        block_size = 5
+        config = SimpleNamespace(max_position_embeddings=8)
+        fc = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
+        hidden_norm = object()
+        _num_attn_layers = 1
+        _num_kv_heads = 2
+        _head_dim = 4
+
+        def _build_fused_kv_buffers(self):
+            pass
+
+        def project_target_hidden(self, hidden_states):
+            return hidden_states
+
+        def precompute_context_kv(self, hidden_states, position_ids):
+            shape = (hidden_states.shape[0], 1, 2, 4)
+            return (
+                torch.zeros(shape, dtype=torch.bfloat16, device="cuda"),
+                torch.zeros(shape, dtype=torch.bfloat16, device="cuda"),
+            )
+
+    worker = DFlashWorker(spec_config, Mapping())
+    draft_model = DraftModel()
+    attn_metadata = SimpleNamespace(
+        max_seq_len=8,
+        num_ctx_tokens=1,
+        num_contexts=1,
+        _seq_lens=[1],
+    )
+    worker._lazy_init_ctx_buffers(draft_model, metadata, attn_metadata)
+
+    assert metadata.max_num_requests == 2 < metadata.num_seq_slots
+    num_slots = num_seq_slots + 1
+    assert worker._ctx_k_buf.shape[0] == num_slots
+    assert worker._ctx_v_buf.shape == worker._ctx_k_buf.shape
+    assert worker._ctx_len.shape[0] == num_slots
+    assert worker._batch_to_slot.shape == (num_seq_slots,)
+    assert worker._dummy_slot == num_seq_slots
+    assert list(worker._free_slots) == list(range(num_seq_slots))
+
+    metadata.request_ids = [42]
+    worker._store_prefill_context(
+        draft_model,
+        metadata,
+        attn_metadata,
+        torch.tensor([0], device="cuda"),
+        total_target_tokens=1,
+    )
+    live_slot = worker._req_to_slot[42]
+    assert live_slot != worker._dummy_slot
+    assert worker._dummy_slot not in worker._free_slots
+    assert list(worker._free_slots) == [1, 2, 3, 4]
 
 
 def _make_llm_config(
