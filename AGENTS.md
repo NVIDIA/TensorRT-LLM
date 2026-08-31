@@ -1,7 +1,7 @@
 # AGENTS.md
 
 TensorRT-LLM: open-source library for optimized LLM inference on NVIDIA GPUs.
-Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execution paths.
+Python and C++ codebase with PyTorch and AutoDeploy execution paths.
 
 > If a `CLAUDE.local.md` file exists alongside this file, read and respect it — it contains developer-specific overrides that supplement this shared guidance.
 
@@ -13,6 +13,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 - `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Always rely on `git` to do the sign off instead of directly adding sign off in commit message.
 - Do not add co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
+- LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
@@ -53,17 +55,16 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 |---------|--------|-------------|----------|
 | **PyTorch** | Default | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
 | **AutoDeploy** | Beta | `_torch/auto_deploy/` shim | `_torch/auto_deploy/shim/ad_executor.py` → adapts `PyExecutor` → graph transforms + torch.export |
-| **TensorRT** | Legacy | `TrtLlmArgs` | `builder.py` → `trtllm.Executor` → TensorRT Engine |
 
 ### Shared C++ Core (via Nanobind)
 
-Both PyTorch and TensorRT backends share these C++ components:
+Both backends share these C++ components:
 - **Scheduling pipeline**: Scheduler → BatchManager (in-flight batching) → KV Cache Manager
 - **Decoding pipeline**: Decoder (token generation orchestration) → Sampling
 
 ### Request Flow
 ```text
-HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
+HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
     → Scheduler → Model Forward → Decoder → Sampling → Generated Tokens
 ```
 
@@ -82,16 +83,16 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 | `tensorrt_llm/models/modeling_utils.py` | Base classes for all models (`PretrainedConfig`, `PretrainedModel`) |
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
-| `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from `models/` used by TensorRT backend) |
+| `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py`, `tensorrt_llm/_torch/modules/mla.py`, or `tensorrt_llm/_torch/attention_backend/`** |
-| `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
 
 | Pattern | Key Points |
 |---------|------------|
-| **Config hierarchy** | `BaseLlmArgs` → `TrtLlmArgs` / `TorchLlmArgs`, model-specific defaults override generics, Pydantic validation |
+| **Config hierarchy** | `BaseLlmArgs` → `TorchLlmArgs`, model-specific defaults override generics, Pydantic validation |
 | **Model architecture** | Each model: `Config` (inherits `PretrainedConfig`) + `ForCausalLM` (inherits `PretrainedModel`) |
 | **Model defaults** | Architecture-specific overrides in `llm_utils.py` (attention kernels, quant, spec decoding, cache) |
 | **Attention backends** | `TorchLlmArgs.attn_backend` selects kernel: `TRTLLM` (default), `FlashInfer`, `FlashAttention` |
@@ -123,7 +124,6 @@ Key files:
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
-- **TensorRT backend is legacy** — `TrtLlmArgs` / `backend="tensorrt"` and all exclusive tooling (`trtllm-build`, `trtllm-refit`, `convert_checkpoint.py`, `ModelRunner*`) are legacy. Bug fixes OK; new features target PyTorch or AutoDeploy.
 
 ## Development Workflow
 
@@ -145,8 +145,9 @@ Key files:
 The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
 
 1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
-2. If not explicitly set, **ask the user** whether the default `~/.config/gh` is correct or if a different directory should be used. This is especially relevant when the PR target is a fork (e.g., `nv-auto-deploy/TensorRT-LLM`) rather than `NVIDIA/TensorRT-LLM`.
+2. If not explicitly set, default to `~/.config/gh`; do not ask for confirmation.
 3. Prefix all `gh` commands with the resolved config dir: `GH_CONFIG_DIR=<path> gh ...`
+4. If the command fails due to missing authentication or the wrong GitHub host/account, report the failure and ask for the correct `GH_CONFIG_DIR`.
 
 ## CI / Testing
 
@@ -166,7 +167,6 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline
 - `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
-- `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 

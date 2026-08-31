@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+metadata:
+  model_name: gemma_4_26b_a4b_nvfp4
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 1
+server_configs:
+  # Production-like concurrency 64 covers the scheduler, KV-pool sizing,
+  # CUDA graph padding, and VSWA block-table decode paths together.
+  - name: "gemma4_26b_a4b_nvfp4_tp1_1k1k"
+    tensor_parallel_size: 1
+    max_batch_size: 256
+    load_format: dummy
+    trust_remote_code: true
+    enable_chunked_prefill: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 256
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+    multimodal_config:
+      encoder_cache_max_bytes: 0
+    client_configs:
+      - name: "con64_iter3_1k1k"
+        concurrency: 64
+        iterations: 3
+        isl: 1000
+        osl: 1000
+        backend: "openai-chat"

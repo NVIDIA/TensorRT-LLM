@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/groupRmsNormKernels/groupRmsNormKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -655,9 +656,9 @@ void GroupRMSNormBaseKernelLauncher(GroupRMSParams<n>& params)
 
     switch (params.dtype)
     {
-    case nvinfer1::DataType::kHALF: GROUP_RMS_NORM_DISPATCH(half); break;
-    case nvinfer1::DataType::kBF16: GROUP_RMS_NORM_DISPATCH(__nv_bfloat16); break;
-    case nvinfer1::DataType::kFLOAT: GROUP_RMS_NORM_DISPATCH(float); break;
+    case tensorrt_llm::DataType::kHALF: GROUP_RMS_NORM_DISPATCH(half); break;
+    case tensorrt_llm::DataType::kBF16: GROUP_RMS_NORM_DISPATCH(__nv_bfloat16); break;
+    case tensorrt_llm::DataType::kFLOAT: GROUP_RMS_NORM_DISPATCH(float); break;
     default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNorm");
     }
 
@@ -750,9 +751,9 @@ void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n>& params)
 
     switch (params.dtype)
     {
-    case nvinfer1::DataType::kHALF: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(half); break;
-    case nvinfer1::DataType::kBF16: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(__nv_bfloat16); break;
-    case nvinfer1::DataType::kFLOAT: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(float); break;
+    case tensorrt_llm::DataType::kHALF: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(half); break;
+    case tensorrt_llm::DataType::kBF16: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(__nv_bfloat16); break;
+    case tensorrt_llm::DataType::kFLOAT: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(float); break;
     default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNormV2");
     }
 
@@ -813,15 +814,15 @@ void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params)
         // Choose the appropriate DType
         switch (params.dtype)
         {
-        case nvinfer1::DataType::kHALF:
+        case tensorrt_llm::DataType::kHALF:
             base_warps = calculateNumWarpsBase<half, n>(params);
             large_batch_warps = calculateNumWarpsLargeBatch<half, n>(params).num_warps_to_launch;
             break;
-        case nvinfer1::DataType::kBF16:
+        case tensorrt_llm::DataType::kBF16:
             base_warps = calculateNumWarpsBase<__nv_bfloat16, n>(params);
             large_batch_warps = calculateNumWarpsLargeBatch<__nv_bfloat16, n>(params).num_warps_to_launch;
             break;
-        case nvinfer1::DataType::kFLOAT:
+        case tensorrt_llm::DataType::kFLOAT:
             base_warps = calculateNumWarpsBase<float, n>(params);
             large_batch_warps = calculateNumWarpsLargeBatch<float, n>(params).num_warps_to_launch;
             break;

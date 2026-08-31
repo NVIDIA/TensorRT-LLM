@@ -14,14 +14,20 @@
 
 # yapf: disable
 import asyncio
+import json
+import os
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tuple, Type
 
 import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.disagg_auth import (
+    build_internal_disagg_auth_headers,
+    request_requires_internal_disagg_auth,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -30,7 +36,13 @@ from tensorrt_llm.serve.openai_protocol import (
     UCompletionRequest,
     UCompletionResponse,
 )
-from tensorrt_llm.serve.perf_metrics import ClientMetricsCollector
+from tensorrt_llm.serve.perf_metrics import (
+    _PERF_METRICS_HEADER_BUDGET_BYTES,
+    RETURN_METRICS_HEADER,
+    SSE_METRICS_EVENT,
+    ClientMetricsCollector,
+    build_metrics_record_from_headers,
+)
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -40,6 +52,26 @@ from tensorrt_llm.serve.router import Router
 
 # yapf: enable
 
+# msgspec msgpack is an opt-in transport for the orchestrator->worker request
+# body (alternative to the JSON path). Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1;
+# the orchestrator encodes the forwarded body as msgpack and flags it with the
+# X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
+# routes it through Request.json()). Fails loudly at import if msgspec is missing.
+_MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
+if _MSGSPEC_ENABLED:
+    try:
+        import msgspec
+    except ImportError as exc:
+        raise ImportError(
+            "TRTLLM_SERVE_ENABLE_MSGSPEC=1 requires the msgspec package "
+            "(listed in requirements.txt)."
+        ) from exc
+    _msgpack_encoder = msgspec.msgpack.Encoder()
+
+
+def _metrics_phase(role: ServerRole) -> str:
+    return "ctx" if role is ServerRole.CONTEXT else "gen"
+
 
 class OpenAIClient(ABC):
     async def send_request(
@@ -47,14 +79,20 @@ class OpenAIClient(ABC):
         request: UCompletionRequest,
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                "v1/completions", request, CompletionResponse, server, hooks
+                "v1/completions", request, CompletionResponse, server, hooks, req_id
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
-                "v1/chat/completions", request, ChatCompletionResponse, server, hooks
+                "v1/chat/completions",
+                request,
+                ChatCompletionResponse,
+                server,
+                hooks,
+                req_id,
             )
         else:
             raise ValueError(f"Invalid request type: {type(request)}")
@@ -67,15 +105,13 @@ class OpenAIClient(ABC):
         response_type: Type[UCompletionResponse],
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         """Send a request to the server and return the response and the body generator.
 
         The request is finished (in routers) when the generator is exhausted or there is an error.
         """
         ...
-
-    @abstractmethod
-    async def collect_metrics(self) -> Dict[str, Any]: ...
 
     @abstractmethod
     async def check_ready(self) -> Tuple[List[str], List[str]]:
@@ -85,7 +121,12 @@ class OpenAIClient(ABC):
     async def shutdown(self) -> None: ...
 
     @abstractmethod
-    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
+    async def _finish_request(
+        self,
+        request: UCompletionRequest,
+        success: bool = True,
+        req_id: Optional[int] = None,
+    ) -> None:
         """Finish the request in the router.
 
         ``success`` lets the router distinguish completed vs failed requests
@@ -103,7 +144,9 @@ class OpenAIHttpClient(OpenAIClient):
         max_retries: int = 1,
         retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
-        disagg_id_generator: Optional[Callable[[], int]] = None,
+        disagg_id_generator: Optional[Callable[[], Awaitable[int]]] = None,
+        request_perf_metrics: bool = False,
+        internal_disagg_auth_key: Optional[str] = None,
     ):
         self._router = router
         self._role = role
@@ -117,10 +160,20 @@ class OpenAIHttpClient(OpenAIClient):
                 keepalive_timeout=1,
             ),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
+            max_field_size=_PERF_METRICS_HEADER_BUDGET_BYTES,
         )
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
+        self._request_perf_metrics = request_perf_metrics
+        self._internal_disagg_auth_key = internal_disagg_auth_key
+
+    def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
+        if self._role != ServerRole.GENERATION:
+            return {}
+        if not request_requires_internal_disagg_auth(request):
+            return {}
+        return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
 
     async def _send_request(
         self,
@@ -129,9 +182,13 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[UCompletionResponse],
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         if server is None:
-            server, _ = await self._router.get_next_server(request)
+            if req_id is None:
+                server, _ = await self._router.get_next_server(request)
+            else:
+                server, _ = await self._router.get_next_server(request, req_id=req_id)
         url = f"http://{server}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
@@ -139,7 +196,7 @@ class OpenAIHttpClient(OpenAIClient):
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
         try:
             self._metrics_collector.total_requests.inc()
-            resp_generator = self._post_with_retry(server, url, request, hooks)
+            resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
             if request.stream:
                 # return the response generator, the request is not done yet
                 return resp_generator
@@ -158,7 +215,7 @@ class OpenAIHttpClient(OpenAIClient):
         except Exception:
             self._metrics_collector.error_requests.inc()
             # finish the request upon error
-            await self._finish_request(request, success=False)
+            await self._finish_request(request, success=False, req_id=req_id)
             raise
 
     async def _post_with_retry(
@@ -167,6 +224,7 @@ class OpenAIHttpClient(OpenAIClient):
         url: str,
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
         # Loop range must cover the transient-TCP extended budget (up to 5)
@@ -180,21 +238,54 @@ class OpenAIHttpClient(OpenAIClient):
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
-                    dp.disagg_request_id = self._disagg_id_generator()
-            # Serialize once on the orchestrator's single event-loop thread:
-            # model_dump_json (pydantic-core) is ~2.3x faster than
-            # model_dump(mode="json") + aiohttp json= (json.dumps). Decodes to
-            # identical JSON (pydantic just emits compact UTF-8 vs spaced ASCII).
-            body = request.model_dump_json(exclude_unset=True)
+                    dp.disagg_request_id = await self._disagg_id_generator()
+                    if hooks:
+                        hooks.on_disagg_request_id(dp.disagg_request_id)
+            # Serialize once on the orchestrator's single event-loop thread.
+            if _MSGSPEC_ENABLED:
+                # msgspec msgpack: encode the request dict to msgpack bytes. Keep
+                # Content-Type application/json so FastAPI still routes the body
+                # through Request.json() (it only does that for json/+json content
+                # subtypes); the X-TRTLLM-Msgpack header tells the worker's
+                # Request.json() to decode with msgspec instead of stdlib json.
+                body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+                headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+            else:
+                body = request.model_dump_json(exclude_unset=True)
+                headers = {"Content-Type": "application/json"}
+            if self._request_perf_metrics:
+                headers[RETURN_METRICS_HEADER] = "1"
+            headers.update(self._get_request_headers(request))
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(
                     url,
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
+                    if self._request_perf_metrics:
+                        role = _metrics_phase(self._role)
+                        disagg_params = getattr(request, "disaggregated_params", None)
+                        request_id = ""
+                        if disagg_params is not None:
+                            request_id = str(
+                                disagg_params.disagg_request_id
+                                or disagg_params.ctx_request_id
+                                or ""
+                            )
+                        response_metrics = build_metrics_record_from_headers(
+                            http_response.headers,
+                            role,
+                            request_id=request_id,
+                        )
+                        if hooks and response_metrics:
+                            hooks.on_perf_metrics(
+                                server,
+                                role,
+                                response_metrics,
+                            )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -203,7 +294,7 @@ class OpenAIHttpClient(OpenAIClient):
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
                         async for line in self._response_generator(
-                            request, http_response, start_time, server, hooks
+                            request, http_response, start_time, server, hooks, req_id
                         ):
                             lines_yielded += 1
                             yield line
@@ -222,7 +313,7 @@ class OpenAIHttpClient(OpenAIClient):
                         # yield here since python forbids return statements in async generators
                         yield response_dict
                         # finish the request after the successful response
-                        await self._finish_request(request)
+                        await self._finish_request(request, req_id=req_id)
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
                         )
@@ -272,6 +363,7 @@ class OpenAIHttpClient(OpenAIClient):
         start_time: float,
         server: str,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
@@ -280,24 +372,66 @@ class OpenAIHttpClient(OpenAIClient):
         success = True
         try:
             last_token_time = start_time
-            i = 0
-            async for line in http_response.content.iter_any():
+            chunk_count = 0
+            marker = f"event: {SSE_METRICS_EVENT}\n".encode()
+            event_delimiter = b"\n\n"
+            pending = b""
+            metrics_event = b""
+            async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if line:
-                    if i == 0:
-                        if hooks:
-                            hooks.on_first_token(server, request)
-                        self._metrics_collector.first_token_latency_seconds.observe(
-                            now_time - last_token_time
-                        )
-                    else:
-                        self._metrics_collector.per_token_latency_seconds.observe(
-                            now_time - last_token_time
-                        )
-                    i += 1
-                    yield line
+                if chunk:
+                    if chunk_count == 0 and hooks:
+                        hooks.on_first_token(server, request)
+                    latency = now_time - last_token_time
+                    metric = (
+                        self._metrics_collector.first_token_latency_seconds
+                        if chunk_count == 0
+                        else self._metrics_collector.per_token_latency_seconds
+                    )
+                    metric.observe(latency)
+                    chunk_count += 1
+                    last_token_time = now_time
+
+                if not self._request_perf_metrics:
+                    yield chunk
                     await asyncio.sleep(0)
-                last_token_time = now_time
+                    continue
+
+                if metrics_event:
+                    metrics_event += chunk
+                    continue
+                pending += chunk
+                marker_index = pending.find(marker)
+                if marker_index >= 0:
+                    if marker_index:
+                        yield pending[:marker_index]
+                    metrics_event = pending[marker_index:]
+                    pending = b""
+                    continue
+                event_end = pending.rfind(event_delimiter)
+                if event_end >= 0:
+                    emit_size = event_end + len(event_delimiter)
+                    yield pending[:emit_size]
+                    pending = pending[emit_size:]
+                await asyncio.sleep(0)
+
+            if pending:
+                yield pending
+            if hooks and metrics_event:
+                data_prefix = b"data: "
+                data_index = metrics_event.find(data_prefix)
+                if data_index >= 0:
+                    data = metrics_event[data_index + len(data_prefix) :].split(b"\n", 1)[0]
+                    try:
+                        headers = json.loads(data)
+                        metrics = build_metrics_record_from_headers(
+                            headers, _metrics_phase(self._role)
+                        )
+                    except (TypeError, ValueError) as error:
+                        logger.warning("Ignoring malformed perf metrics event: %s", error)
+                        metrics = None
+                    if metrics:
+                        hooks.on_perf_metrics(server, _metrics_phase(self._role), metrics)
 
             if hooks:
                 hooks.on_resp_done(server, request, None)
@@ -316,22 +450,21 @@ class OpenAIHttpClient(OpenAIClient):
             raise
         finally:
             # finish the request after streaming response is done or error is raised
-            await self._finish_request(request, success=success)
+            await self._finish_request(request, success=success, req_id=req_id)
 
-    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
+    async def _finish_request(
+        self,
+        request: UCompletionRequest,
+        success: bool = True,
+        req_id: Optional[int] = None,
+    ) -> None:
         self._metrics_collector.completed_requests.inc()
-        await self._router.finish_request(request, self._session, success=success)
-
-    async def collect_metrics(self) -> Dict[str, Any]:
-        metrics = {}
-        for server in self._router.servers:
-            try:
-                async with self._session.get(f"http://{server}/perf_metrics") as response:
-                    metrics[server] = await response.json()
-            except Exception:
-                logger.error(f"Failed to collect metrics from {server}")
-                continue
-        return metrics
+        if req_id is None:
+            await self._router.finish_request(request, self._session, success=success)
+        else:
+            await self._router.finish_request(
+                request, self._session, success=success, req_id=req_id
+            )
 
     async def shutdown(self) -> None:
         await self._session.close()

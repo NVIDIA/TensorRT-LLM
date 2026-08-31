@@ -17,17 +17,20 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-    SkipSoftmaxKernelParams,
-    SkipSoftmaxParams,
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    CustomAttentionMask,
 )
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 
-from .interface import Fmha
+from .interface import Fmha, FmhaPhase
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 # ``AttentionForwardArgs`` fields that this backend does not consume.
@@ -36,9 +39,11 @@ if TYPE_CHECKING:
 # transitively reads; entries here are exempt.
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
     {
-        "topk_indices",  # DSA-only
+        "sparse_backend_args",  # consumed by sparse prediction before the attention op
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
+        "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
+        "timestep",  # used to populate skip-softmax params in ``TrtllmAttention.forward``
     }
 )
 
@@ -51,6 +56,31 @@ _THOP_LITERALS: dict = {}
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
+    @classmethod
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
+        sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
+        if sparse_algorithm in ("deepseek_v4", "dsa"):
+            if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
+                return False
+            if get_sm_version() in (120, 121):
+                return False
+        return True
+
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        del q, k, v, phase
+        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
+            forward_args.update_kv_cache or metadata.is_cross
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -60,18 +90,11 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
-        sparse_params = attn.sparse_params
-        skip_softmax_kernel_params = (
-            sparse_params.scheduler.get_kernel_params(timestep=forward_args.timestep)
-            if isinstance(sparse_params, SkipSoftmaxParams)
-            else SkipSoftmaxKernelParams()
-        )
 
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
-        # (with ``forward_args.sparse_prediction`` for sparse-attn inputs),
-        # ``skip_softmax_kernel_params``, or a literal allowlisted in
-        # ``_THOP_LITERALS``. ``test_attention_op_sync.py`` enforces this
-        # statically.
+        # (with ``forward_args.sparse_runtime_params`` for sparse inputs),
+        # or a literal allowlisted in ``_THOP_LITERALS``.
+        # ``test_attention_op_sync.py`` enforces this statically.
         thop.attention(
             q=q,
             k=k,
@@ -94,6 +117,7 @@ class FallbackFmha(Fmha):
             block_ids_per_seq=metadata.block_ids_per_seq,
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
+            max_num_sequences=metadata.max_num_sequences,
             beam_width=metadata.effective_beam_width,
             use_paged_context_fmha=metadata.use_paged_context_fmha,
             helix_position_offsets=metadata.helix_position_offsets,
@@ -107,6 +131,7 @@ class FallbackFmha(Fmha):
             spec_decoding_bl_tree_mask_offset=metadata.spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
             spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
+            force_prepare_spec_dec_tree_mask=metadata.force_prepare_spec_dec_tree_mask,
             spec_bl_tree_first_sparse_mask_offset_kv=metadata.spec_bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=metadata.num_sparse_topk,
             flash_mla_tile_scheduler_metadata=metadata.flash_mla_tile_scheduler_metadata,
@@ -137,6 +162,11 @@ class FallbackFmha(Fmha):
             mla_bmm1_scale=forward_args.mla_bmm1_scale,
             mla_bmm2_scale=forward_args.mla_bmm2_scale,
             quant_q_buffer=forward_args.quant_q_buffer,
+            quant_scale_qkv=forward_args.quant_scale_qkv,
+            dsv4_inv_rope_cos_sin_cache=forward_args.dsv4_inv_rope_cos_sin_cache,
+            enable_dsv4_epilogue_fusion=forward_args.enable_dsv4_epilogue_fusion,
+            kv_norm_weight=forward_args.kv_norm_weight,
+            kv_norm_eps=forward_args.kv_norm_eps,
             sage_attn_num_elts_per_blk_q=forward_args.sage_attn_num_elts_per_blk_q,
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,
@@ -173,15 +203,21 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
-            skip_softmax_threshold_scale_factor_prefill=skip_softmax_kernel_params.threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=skip_softmax_kernel_params.threshold_scale_factor_decode,
             skip_softmax_stat=attn.skip_softmax_stat,
-            # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
-            sparse_kv_indices=forward_args.sparse_prediction.sparse_kv_indices,
-            sparse_kv_offsets=forward_args.sparse_prediction.sparse_kv_offsets,
-            sparse_attn_indices=forward_args.sparse_prediction.sparse_attn_indices,
-            sparse_attn_offsets=forward_args.sparse_prediction.sparse_attn_offsets,
-            sparse_attn_indices_block_size=forward_args.sparse_prediction.sparse_attn_indices_block_size,
-            sparse_mla_topk_lens=forward_args.sparse_prediction.sparse_mla_topk_lens,
-            compressed_kv_cache_pool_ptr=forward_args.sparse_prediction.compressed_kv_cache_pool_ptr,
+            # --- Sparse runtime parameters ---
+            sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,
+            sparse_kv_offsets=forward_args.sparse_runtime_params.sparse_kv_offsets,
+            sparse_attn_indices=forward_args.sparse_runtime_params.sparse_attn_indices,
+            sparse_attn_offsets=forward_args.sparse_runtime_params.sparse_attn_offsets,
+            sparse_attn_indices_block_size=(
+                forward_args.sparse_runtime_params.sparse_attn_indices_block_size
+            ),
+            sparse_attn_kv_lens=forward_args.sparse_runtime_params.sparse_attn_kv_lens,
+            aux_kv_cache_pool_ptr=(forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr),
+            skip_softmax_threshold_scale_factor_prefill=(
+                forward_args.sparse_runtime_params.threshold_scale_factor_prefill
+            ),
+            skip_softmax_threshold_scale_factor_decode=(
+                forward_args.sparse_runtime_params.threshold_scale_factor_decode
+            ),
         )

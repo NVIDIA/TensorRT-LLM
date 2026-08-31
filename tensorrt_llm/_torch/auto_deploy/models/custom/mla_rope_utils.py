@@ -140,3 +140,25 @@ def _kv_b_proj_dequant_load_hook(
 
         # Remove scale from state_dict so it is not loaded into a non-existent buffer.
         del state_dict[scale_key]
+
+
+# Model types whose MLA modeling skips _rope_deinterleave_load_hook and keeps
+# RoPE weights in native GPTJ layout end-to-end.  For these, the round-trip
+# (load-time de-interleave + fusion-time undo) is omitted, so
+# fuse_rope_into_trtllm_mla must NOT run _undo_rope_deinterleave.
+_GPTJ_LAYOUT_MODEL_TYPES: frozenset = frozenset({"deepseek_v3"})
+
+
+def is_gptj_layout(model_config) -> bool:
+    """Return True if MLA RoPE weights stay in native GPTJ layout (no de-interleave).
+
+    Models in _GPTJ_LAYOUT_MODEL_TYPES omit ``_rope_deinterleave_load_hook``;
+    their weights are never permuted, so ``fuse_rope_into_trtllm_mla`` skips the
+    undo.  Other MLA models apply the hook (GPTJ→NeoX) and need the undo.
+
+    NOTE: detection is by model_type, NOT by graph op.  The interleaving-aware
+    eager op (torch_rope_with_qk_interleaving) mis-pairs with the fused kernel's
+    is_neox=True rotation (~0.7 GSM8K loss), so these models use
+    torch_rope_with_explicit_cos_sin and cannot be distinguished by graph op.
+    """
+    return getattr(model_config, "model_type", "") in _GPTJ_LAYOUT_MODEL_TYPES

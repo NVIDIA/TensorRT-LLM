@@ -162,16 +162,6 @@ class BatchDesc:
 
 
 @dataclass(slots=True)
-class HelixConfig:
-    helix_group_size: int
-    helix_gpu_rank: int
-    # number of tokens in one helix shard
-    helix_shard_size: int
-    # must be the same for all ranks in the same helix group and different for different helix groups.
-    shared_comm_port: int
-
-
-@dataclass(slots=True)
 class SwaScratchReuseConfig:
     """
     Configuration for SWA scratch reuse.
@@ -195,8 +185,6 @@ class KVCacheManagerConfig:
     """
 
     tokens_per_block: int
-    # if you have p-tuning tokens, include them. Only needed for multi-modal.
-    vocab_size: int
     # cache tiers are sorted from warm to cold. The first one must be GPU memory.
     cache_tiers: list[CacheTierConfig]
 
@@ -225,14 +213,11 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
-    User-provided initial memory partitioning between pool groups. When set, this
-    takes precedence over typical_step and constraints for initial sizing.
-    """
-
-    ssm_reuse_interval: int = 512
-    """
-    Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
-    Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
+    One positive, normalized hot-tier byte-quota weight per layer group. Cold-tier
+    initialization preserves the implied layer-group slot-count proportions while
+    accounting for cold page sizes. When set, this takes precedence over typical_step
+    and constraints for initial ratio selection; constraints remain hot-level feasibility
+    floors.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
@@ -249,13 +234,29 @@ class KVCacheManagerConfig:
     where the number of out-of-window blocks dominates memory usage.
     """
 
+    commit_min_snapshot: bool = False
+    """
+    If True, commit() records only the minimum cache snapshot reusable at the post-call
+    num_committed_tokens. Only the minimum amount of pages required for such reuse will
+    be preserved.
+
+    Required when SSM layers are present.
+    """
+
     enable_stats: bool = True
     """
     Collect V2 KV cache allocation, reuse, and transfer statistics.
     """
 
-    # unsupported yet
-    helix_config: HelixConfig | None = None
+    text_only: bool = False
+    """
+    Deployment-level guarantee that no request carries multi-modal content, so token
+    sequences never contain digests. A per-_KVCache text_only override may only tighten
+    this (a text-only deployment forbids a request claiming otherwise). Default False.
+
+    (In this pure-Python backend the block hasher has no digest-free fast path, so this
+    flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
+    """
 
     @property
     def enable_swa_scratch_reuse(self) -> bool:
@@ -273,11 +274,6 @@ class KVCacheManagerConfig:
             for buffer in layer.buffers
         )
         if any(layer.type == LayerType.SSM for layer in self.layers):
-            assert self.ssm_reuse_interval > 0, "ssm_reuse_interval must be positive"
-            assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
-                f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
-                f"tokens_per_block ({self.tokens_per_block})"
-            )
-            assert not self.enable_partial_reuse, (
-                "enable_partial_reuse must be False when SSM layers are present"
+            assert self.commit_min_snapshot, (
+                "commit_min_snapshot must be True when SSM layers are present"
             )

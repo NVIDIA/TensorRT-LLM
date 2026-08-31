@@ -49,7 +49,7 @@ When GDRCopy is installed and the kernel module is loaded, you should be able to
 An example yaml file to enable wide EP:
 ```yaml
 moe_config:
-    backend: WIDEEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer:
       num_slots: 288
@@ -59,7 +59,7 @@ moe_config:
 #### `backend`
 
  - MoE backend type, defaults to `CUTLASS`.
- - Currently, TensorRT LLM has multiple MoE backends that support wide EP, including `WIDEEP`, `CUTLASS`, `TRTLLM` and `CUTEDSL`. There are on-going efforts to refactor the backends so that we don't necessarily need a specific `WIDEEP` backend, and each other backend will support wide EP functionality.
+ - TensorRT LLM has multiple MoE backends that support wide EP, including `CUTEDSL`, `CUTLASS` and `TRTLLM`. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
 
 #### `max_num_tokens`
 

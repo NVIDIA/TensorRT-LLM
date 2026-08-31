@@ -42,9 +42,9 @@ from test_sharding_num_correctness import (  # noqa: E402
     _run_equivalence_job,
 )
 
-# Modeling file under test (bare path relative to repo root; the harness's
-# ``spec_from_modeling_file`` also accepts a bare module short name).
-_MODELING_FILE = "tensorrt_llm/_torch/auto_deploy/models/custom/modeling_step3p7.py"
+# A bare module name lets the harness resolve the model from either bundled
+# AutoDeploy or the generated standalone package.
+_MODELING_FILE = "modeling_step3p7"
 
 # Per-model relative-RMSE tolerance (see module docstring for the rationale).
 STEP3P7_REL_RMSE_TOL = 0.08

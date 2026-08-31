@@ -12,6 +12,7 @@
 
 import gc
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -20,7 +21,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -73,6 +74,15 @@ class _IndexKeyOnSparseLayersV2(KVCacheManagerV2):
             for layer_id in self._sparse_layer_ids
             if layer_id in self.layer_offsets
         }
+
+
+class _CoalescedIndexKeyV2(_IndexKeyOnSparseLayersV2):
+    """Mirror M3's pool mapping when INDEX_KEY coalesces with K/V."""
+
+    def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr):
+        del key_base_addr
+        layers_in_group = list(self.impl.layer_grouping[int(layer_group_id)])
+        return layers_in_group.index(int(layer_id))
 
 
 class _DuplicateRoleV2(KVCacheManagerV2):
@@ -144,6 +154,33 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
                 )
                 self.assertNotIn(Role.INDEX_KEY, roles)
         finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_page_table_uses_physical_pool_representative(self):
+        mgr = KVCacheManagerV2(**_make_kwargs(head_dim=[64, 192, 64, 192]))
+        real_impl = mgr.impl
+        try:
+            pool_id = 0
+            physical_layer = mgr._pool_layer_ids_by_role[(pool_id, Role.KEY)]
+            other_layer = next(
+                layer_id
+                for layer_id in real_impl.layer_grouping[pool_id]
+                if int(layer_id) != int(physical_layer)
+            )
+            impl_proxy = Mock(wraps=real_impl)
+            impl_proxy.layer_grouping = ((other_layer, physical_layer),)
+            mgr.impl = impl_proxy
+
+            mgr._prepare_page_table_tensor(index_mapper_capacity=1)
+
+            self.assertEqual(
+                impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
+                (physical_layer, Role.KEY, PageIndexMode.SHARED),
+            )
+            impl_proxy.get_page_index_scale.assert_called_once_with(physical_layer, Role.KEY)
+        finally:
+            mgr.impl = real_impl
             mgr.shutdown()
             del mgr
 
@@ -238,11 +275,10 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
 class TestIndexKeyBufferAccessor(unittest.TestCase):
     """CUDA/GPU regressions for :meth:`KVCacheManagerV2.get_index_k_buffer`.
 
-    The accessor returns a paged torch view shaped
-    ``[num_pages, tokens_per_block, num_heads, head_dim]`` over the
-    managed ``Role.INDEX_KEY`` pool, returns ``None`` for dense layers,
-    rejects wiring mismatches against the V2-reported page stride, and
-    is zero-copy (writes propagate; ``data_ptr`` stable across calls).
+    The accessor returns NHD or HND paged torch views over the managed
+    ``Role.INDEX_KEY`` pool, returns ``None`` for dense layers, rejects
+    wiring mismatches against the V2-reported page stride, and is zero-copy
+    (writes propagate; ``data_ptr`` stable across calls).
     """
 
     NUM_HEADS = 1
@@ -353,6 +389,62 @@ class TestIndexKeyBufferAccessor(unittest.TestCase):
             mgr.shutdown()
             del mgr
 
+    def test_accessor_hnd_and_nhd_alias_coalesced_pool(self):
+        # Match MiniMax-M3's one-head Index-K byte size to one main K/V
+        # head so V2 coalesces all roles. Both layout views must retain the
+        # larger physical page stride while addressing the same bytes.
+        mgr = _CoalescedIndexKeyV2(
+            sparse_layer_ids=[0, 1, 2, 3],
+            **_make_kwargs(
+                num_layers=4,
+                num_kv_heads=1,
+                dtype=DataType.BF16,
+            ),
+        )
+        try:
+            layer_idx = 3
+            nhd = mgr.get_index_k_buffer(
+                layer_idx,
+                num_heads=self.NUM_HEADS,
+                head_dim=self.HEAD_DIM,
+                dtype=torch.bfloat16,
+            )
+            hnd = mgr.get_index_k_buffer(
+                layer_idx,
+                num_heads=self.NUM_HEADS,
+                head_dim=self.HEAD_DIM,
+                dtype=torch.bfloat16,
+                kv_layout="HND",
+            )
+            self.assertIsNotNone(nhd)
+            self.assertIsNotNone(hnd)
+
+            converter = mgr.impl.get_page_index_converter(
+                mgr.layer_offsets[layer_idx], Role.INDEX_KEY
+            )
+            self.assertGreater(int(converter.scale), 1)
+            self.assertEqual(
+                nhd.shape,
+                (nhd.shape[0], mgr.tokens_per_block, self.NUM_HEADS, self.HEAD_DIM),
+            )
+            self.assertEqual(
+                hnd.shape,
+                (hnd.shape[0], self.NUM_HEADS, mgr.tokens_per_block, self.HEAD_DIM),
+            )
+            self.assertEqual(nhd.data_ptr(), hnd.data_ptr())
+            self.assertEqual(nhd.stride(0), hnd.stride(0))
+            self.assertEqual(hnd.stride(2), self.HEAD_DIM)
+            self.assertEqual(hnd.stride(3), 1)
+            self.assertFalse(hnd.is_contiguous())
+
+            sentinel = torch.tensor(37.0, dtype=torch.bfloat16, device="cuda")
+            hnd[0, 0, 3, 7] = sentinel
+            torch.cuda.synchronize()
+            self.assertEqual(nhd[0, 3, 0, 7].item(), float(sentinel))
+        finally:
+            mgr.shutdown()
+            del mgr
+
     def test_accessor_pointer_matches_v2_pool_base(self):
         # Verify the wrapper points at the exact V2-managed pool base
         # for INDEX_KEY, so the view participates in the same lifecycle
@@ -411,6 +503,21 @@ class TestIndexKeyBufferAccessor(unittest.TestCase):
                     num_heads=self.NUM_HEADS,
                     head_dim=self.HEAD_DIM,
                     dtype=torch.float32,  # 4 bytes vs registered 2
+                )
+        finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_accessor_rejects_unknown_layout(self):
+        mgr = self._make_sparse_mgr(sparse_layer_ids=(3,))
+        try:
+            with self.assertRaisesRegex(ValueError, "Unsupported kv_layout"):
+                mgr.get_index_k_buffer(
+                    3,
+                    num_heads=self.NUM_HEADS,
+                    head_dim=self.HEAD_DIM,
+                    dtype=torch.bfloat16,
+                    kv_layout="HDN",
                 )
         finally:
             mgr.shutdown()

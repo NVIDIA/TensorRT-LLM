@@ -51,7 +51,7 @@ class VisualGenResult:
     A single instance backs both single-prompt and batch-prompt requests:
 
     - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
-      Underlying-request failure raises :class:`RuntimeError`.
+      Underlying-request failure raises.
     - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
       Per-item or whole-batch failure never raises; failed items carry
       ``error != None`` (Option B semantics).
@@ -90,8 +90,8 @@ class VisualGenResult:
     async def aresult(self, timeout: Optional[float] = None):
         """Wait for the underlying request and return the resolved value.
 
-        For single-prompt requests, returns a :class:`VisualGenOutput`. Raises
-        :class:`RuntimeError` on underlying-request failure.
+        For single-prompt requests, returns a :class:`VisualGenOutput`.
+        Underlying-request failure raises.
 
         For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
         raises; failed items carry ``error != None``.
@@ -156,20 +156,30 @@ class VisualGenResult:
     # ----- internals -----
 
     def _build_resolved(self, response: "DiffusionResponse"):
+        # Failure class travels on the result object, not on the public
+        # ``VisualGenOutput`` — no new public field for an error taxonomy.
+        self._error_type = getattr(response, "error_type", None)
         if self._batch_size is None:
             return to_visual_gen_output(response)
         return split_visual_gen_output(response, self._batch_size)
 
     def _resolved_value(self):
-        # For single prompts, surface engine-side failure as
-        # ``RuntimeError``. Request-parameter validation is enforced
-        # synchronously at :meth:`VisualGen.generate_async` entry, so
-        # anything reaching this point is by definition a runtime
-        # failure from ``pipeline.infer()``. For batches, return the
+        # For single prompts, surface engine-side failure as a built-in
+        # exception carrying the detail in its message: ``ValueError`` for
+        # client errors (unusable reference content, conditioning bounds) —
+        # uniform with the synchronous parameter validation at
+        # ``generate_async`` entry — ``MemoryError`` for capacity, and
+        # ``RuntimeError`` for anything unclassified. For batches, return the
         # list as-is so callers iterate per-item ``error``.
         if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
             if self._resolved.error is not None:
-                raise RuntimeError(f"Generation failed: {self._resolved.error}")
+                message = f"Generation failed: {self._resolved.error}"
+                error_type = getattr(self, "_error_type", None)
+                if error_type == "client":
+                    raise ValueError(message)
+                if error_type == "capacity":
+                    raise MemoryError(message)
+                raise RuntimeError(message)
         return self._resolved
 
 
@@ -289,6 +299,11 @@ class VisualGen:
         pipeline's defaults.  All declared ``extra_params`` keys are
         included with their defaults (``None`` for params without one).
 
+        Fields carrying a pipeline default are reported as unset, so a
+        round trip through this object does not read as caller intent
+        and request-dependent defaults stay resolvable; assigning any of
+        them marks it as yours.
+
         Use this to inspect what the model will use, then modify and
         pass to ``generate()``::
 
@@ -306,7 +321,13 @@ class VisualGen:
         if extra:
             kwargs["extra_params"] = extra
 
-        return VisualGenParams(**kwargs)
+        params = VisualGenParams(**kwargs)
+        # These came from the pipeline, not the caller. Un-marking them keeps
+        # request-dependent defaults resolvable after a round trip through
+        # this object; assigning any of them re-marks it automatically.
+        for field_name in self.executor.default_generation_params:
+            params.model_fields_set.discard(field_name)
+        return params
 
     @set_api_status("prototype")
     def generate(
@@ -327,9 +348,6 @@ class VisualGen:
             prompts, ``List[VisualGenOutput]`` of the same length.
 
         Raises:
-            RuntimeError: Single-prompt path on underlying-request failure.
-                The batch path never raises on per-item or whole-batch
-                failure; failed items carry ``error != None``.
             NotImplementedError: ``params`` is a list (per-item parameters
                 are not yet supported).
         """

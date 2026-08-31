@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,18 +22,31 @@
 namespace tensorrt_llm::batch_manager
 {
 
+// Single, process-global storage for the steady-clock offset. Keeping it in this
+// translation unit (rather than as an inline-static member reachable from every
+// shared object) guarantees that libtensorrt_llm.so and the nanobind extension
+// module observe the same value once either side calibrates it.
+std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset()
+{
+    static std::optional<std::chrono::steady_clock::duration> offset{std::nullopt};
+    return offset;
+}
+
 template <typename TTensor, typename TStream>
 runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
 {
     runtime::SizeType32 beamWidth = mSamplingConfig.beamWidth; // For non-Variable-Beam-Width-Search
     auto const& beamWidthArray = mSamplingConfig.beamWidthArray;
-    if (beamWidthArray.has_value())
+    if (beamWidthArray.has_value() && !beamWidthArray.value().empty() && !beamWidthArray.value()[0].empty())
     {
+        auto const& requestBeamWidthArray = beamWidthArray.value()[0];
         auto const iter = mDecodingIter + (forNextIteration ? 1 : 0);
-        // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
-        int const index
-            = std::max(std::min(iter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1, 0);
-        beamWidth = beamWidthArray.value()[0][index];
+        // Clamp `decodingIter` with the actual array length, so that decoding
+        // longer than the array holds the last width instead of reading past
+        // the end. kMaxBeamWidthArrayLength is only the capacity limit; the
+        // user array is not padded up to it.
+        int const index = std::max(std::min(iter, static_cast<int>(requestBeamWidthArray.size())) - 1, 0);
+        beamWidth = requestBeamWidthArray[index];
     }
     return beamWidth;
 }

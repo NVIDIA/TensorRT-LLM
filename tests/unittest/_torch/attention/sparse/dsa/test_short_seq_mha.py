@@ -36,6 +36,10 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.dsa.module import (
+    _forward_dsa_attn,
+    should_use_short_mha,
+)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -268,6 +272,11 @@ def _build_mla(rope_config, device, threshold):
     return mla, mapping, sparse_config, model_config
 
 
+def _attention_cls_for_sparse_config(sparse_config, model_config):
+    sparse_params = sparse_config.to_sparse_params(pretrained_config=model_config.pretrained_config)
+    return get_attention_backend("TRTLLM", sparse_params=sparse_params)
+
+
 def _init_mla_weights(mla):
     """Initialize MLA weights deterministically in the loaded layout.
 
@@ -379,19 +388,20 @@ def _make_metadata(
 
 
 def _run_forward(
-    mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices=None
+    mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, indexer_inputs=None
 ):
-    """Run forward_context_sparse_mla on cloned inputs and return the output tensor."""
+    """Run the production DSA attention dispatcher on cloned inputs."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
-    mla.forward_context_sparse_mla(
+    _forward_dsa_attn(
+        mla,
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),
         k_pe=k_pe.clone(),
+        latent_cache=latent_cache.clone(),
+        indexer_intermediates=indexer_inputs or [],
+        position_ids=position_ids.clone(),
         attn_metadata=metadata,
         output=output,
-        latent_cache=latent_cache.clone(),
-        topk_indices=topk_indices,
-        position_ids=position_ids.clone(),
     )
     return output
 
@@ -417,7 +427,7 @@ def test_forward_context_short_mha(name: str, seq_lens: List[int], threshold_off
     _init_mla_weights(mla)
 
     kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
 
@@ -445,6 +455,7 @@ def test_threshold_zero_disables_mha():
 
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
+@torch.inference_mode()
 def test_standard_path_when_exceeds_threshold():
     """When total tokens > threshold, the standard absorption path is used."""
     device = torch.device("cuda")
@@ -457,7 +468,7 @@ def test_standard_path_when_exceeds_threshold():
     _init_mla_weights(mla)
 
     kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
 
     total_tokens = sum(seq_lens)
@@ -465,21 +476,15 @@ def test_standard_path_when_exceeds_threshold():
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
 
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
-    topk_indices = mla.mqa.indexer(
-        qr,
-        hidden_states,
-        metadata,
-        position_ids,
-    )
+    inputs = list(mla.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
 
-    output = _run_forward(
-        mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices
-    )
+    output = _run_forward(mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, inputs)
     assert torch.isfinite(output).all()
     kv_mgr.shutdown()
 
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
+@torch.inference_mode()
 def test_agrees_with_absorption_path():
     """Short MHA and absorption paths produce numerically close results."""
     device = torch.device("cuda")
@@ -511,7 +516,7 @@ def test_agrees_with_absorption_path():
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
     hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
 
     def _run(mla_module):
         kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
@@ -520,16 +525,15 @@ def test_agrees_with_absorption_path():
             mla_module.short_seq_mha_threshold > 0
             and total_tokens <= mla_module.short_seq_mha_threshold
         )
-        topk = None
+        inputs = None
         if not use_short:
-            topk = mla_module.mqa.indexer(
-                qr.clone(),
-                hidden_states.clone(),
-                meta,
-                position_ids.clone(),
+            inputs = list(
+                mla_module.mqa.indexer.pre_indexer_proj(
+                    qr.clone(), hidden_states.clone(), position_ids.clone()
+                )
             )
         out = _run_forward(
-            mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, topk
+            mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, inputs
         )
         kv_mgr.shutdown()
         return out
@@ -559,7 +563,7 @@ def test_chunked_correctness(name: str, chunk_specs: List[Tuple[int, int]], chun
 
     mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
 
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(total_per_seq, device)
 
@@ -640,7 +644,7 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
 
     mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
-    attn_cls = get_attention_backend("TRTLLM", sparse_attention_config=sparse_config)
+    attn_cls = _attention_cls_for_sparse_config(sparse_config, model_config)
 
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(total_per_seq, device)
 
@@ -660,10 +664,10 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
     pos_c2 = torch.arange(cached_per_seq[0], total_per_seq[0], device=device, dtype=torch.int32)
 
     # max_ctx_kv_len (96) > threshold (80) -> short MHA should NOT be used.
-    assert not mla._should_use_short_mha(meta_c2, pos_c2)
+    assert not should_use_short_mha(mla, meta_c2, pos_c2)
 
     # With threshold large enough for the full KV -> short MHA IS used.
     mla.short_seq_mha_threshold = total_per_seq[0] + 100
-    assert mla._should_use_short_mha(meta_c2, pos_c2)
+    assert should_use_short_mha(mla, meta_c2, pos_c2)
 
     kv_mgr.shutdown()

@@ -7,6 +7,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 
 #include <random>
@@ -27,12 +28,12 @@ protected:
         std::vector<SizeType32> kvLayersPerPP(pp, 0); // No attention layers
         auto state = texec::kv_cache::CacheState(
             /*nbAttentionLayers=*/0, /*nbKvHeads=*/1, /*sizePerHead=*/64, /*tokensPerBlock=*/32, tp, pp,
-            /*contextParallelism=*/1, kvLayersPerPP, nvinfer1::DataType::kFLOAT);
+            /*contextParallelism=*/1, kvLayersPerPP, tensorrt_llm::DataType::kFLOAT);
 
         texec::kv_cache::CacheState::RnnModelConfig rnnModelConfig{/*mDState=*/16, /*mDConv=*/4, /*mHiddenSize=*/256,
             /*mHeadDim=*/64,
             /*mConvDimSize=*/128, /*mNGroups=*/1, /*mNumLayers=*/numLayers, /*mNumHeads=*/4};
-        state.setRnnConfig(rnnModelConfig, layersPerPP, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
+        state.setRnnConfig(rnnModelConfig, layersPerPP, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
         return state;
     }
 };
@@ -194,7 +195,7 @@ TEST_F(RnnTargetIRanksTest, inquireSupport)
 
     // Use reinterpret_cast to pass a non-null dummy pointer (formatter only stores it, doesn't use it in
     // inquireSupport)
-    tbm::RnnCacheFormatter formatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter formatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // Same TP, different PP -> should be supported
@@ -216,7 +217,7 @@ protected:
         SizeType32 tokensPerBlock = 32)
     {
         return texec::kv_cache::CacheState(numLayers, numHeads, sizePerHead, tokensPerBlock, tp, pp,
-            /*contextParallelism=*/1, layersPerPP, nvinfer1::DataType::kFLOAT,
+            /*contextParallelism=*/1, layersPerPP, tensorrt_llm::DataType::kFLOAT,
             texec::kv_cache::CacheState::AttentionType::kDEFAULT, /*kvFactor=*/2,
             /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1);
     }
@@ -228,7 +229,8 @@ protected:
     {
         auto state = makeKvCacheState(kvNumLayers, tp, pp, kvLayersPerPP, numHeads, sizePerHead, tokensPerBlock);
         texec::kv_cache::CacheState::RnnModelConfig rnnModelConfig{16, 4, 256, 64, 128, 1, rnnNumLayers, 4};
-        state.setRnnConfig(rnnModelConfig, rnnLayersPerPP, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
+        state.setRnnConfig(
+            rnnModelConfig, rnnLayersPerPP, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
         return state;
     }
 
@@ -272,7 +274,7 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
     auto genState = makeHybridState(/*kvNumLayers=*/10, /*rnnNumLayers=*/6, tp, /*pp=*/2, {5, 5}, {3, 3});
 
     // Use dummy formatter pointers (we only need them to call getCounterparts)
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // ============= Test from Context rank 0 (PP=0, TP=0) =============
@@ -337,7 +339,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     auto contextState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/1, {8}, {4});
     auto genState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/4, {2, 2, 2, 2}, {2, 2, 0, 0});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // ============= Test from Context rank 0 (PP=0, TP=0) =============
@@ -420,7 +422,7 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
     auto genState = makeHybridState(
         /*kvNumLayers=*/4, /*rnnNumLayers=*/4, tp, /*pp=*/4, {2, 2, 0, 0}, {0, 0, 2, 2});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // ============= Test from Context rank 0 (PP=0, TP=0) - has KV only =============
@@ -471,7 +473,7 @@ protected:
         SizeType32 tokensPerBlock = 32)
     {
         return texec::kv_cache::CacheState(numLayers, numHeads, sizePerHead, tokensPerBlock, tp, pp,
-            /*contextParallelism=*/1, layersPerPP, nvinfer1::DataType::kFLOAT,
+            /*contextParallelism=*/1, layersPerPP, tensorrt_llm::DataType::kFLOAT,
             texec::kv_cache::CacheState::AttentionType::kDEFAULT, /*kvFactor=*/2,
             /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1);
     }
@@ -586,7 +588,7 @@ TEST_F(HybridModelCounterpartsTest, InterleavedLayers)
     auto contextState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/8, tp, /*pp=*/1, {8}, {8});
     auto genState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/8, tp, /*pp=*/2, {4, 4}, {4, 4});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     SizeType32 contextRank0 = 0;
@@ -612,7 +614,7 @@ TEST_F(HybridModelCounterpartsTest, RnnMorePPThanKv)
     auto contextState = makeHybridState(/*kvNumLayers=*/4, /*rnnNumLayers=*/8, tp, /*pp=*/1, {4}, {8});
     auto genState = makeHybridState(/*kvNumLayers=*/4, /*rnnNumLayers=*/8, tp, /*pp=*/4, {2, 2, 0, 0}, {2, 2, 2, 2});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     SizeType32 contextRank0 = 0;
@@ -639,7 +641,7 @@ TEST_F(HybridModelCounterpartsTest, KvMorePPThanRnn)
     auto contextState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/1, {8}, {4});
     auto genState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/4, {2, 2, 2, 2}, {2, 2, 0, 0});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     SizeType32 contextRank0 = 0;
@@ -672,7 +674,7 @@ TEST_F(HybridModelCounterpartsTest, RnnOnlyModel)
     auto contextState = makeHybridState(/*kvNumLayers=*/0, /*rnnNumLayers=*/8, tp, /*pp=*/1, {0}, {8});
     auto genState = makeHybridState(/*kvNumLayers=*/0, /*rnnNumLayers=*/8, tp, /*pp=*/2, {0, 0}, {4, 4});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     SizeType32 contextRank0 = 0;
@@ -702,7 +704,7 @@ TEST_F(HybridModelCounterpartsTest, LargeScaleMixedLayers)
     auto contextState = makeHybridState(/*kvNumLayers=*/32, /*rnnNumLayers=*/16, tp, /*pp=*/1, {32}, {16});
     auto genState = makeHybridState(/*kvNumLayers=*/32, /*rnnNumLayers=*/16, tp, /*pp=*/4, {8, 8, 8, 8}, {8, 8, 0, 0});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // Context rank 0 (PP=0, TP=0)
@@ -754,7 +756,7 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
     auto genState = makeHybridState(
         /*kvNumLayers=*/16, /*rnnNumLayers=*/8, tp, /*pp=*/1, {16}, {8});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // ============= Test from Context rank 0 (PP=0, TP=0) =============
@@ -812,7 +814,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
     auto genState = makeHybridState(
         /*kvNumLayers=*/8, /*rnnNumLayers=*/6, tp, /*pp=*/2, {4, 4}, {3, 3});
 
-    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
+    tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::kv_cache_manager::BaseKVCacheManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
 
     // ============= Test from Context rank 0 (PP=0, TP=0) - KV only =============

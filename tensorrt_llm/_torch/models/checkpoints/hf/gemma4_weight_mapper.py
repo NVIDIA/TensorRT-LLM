@@ -23,11 +23,16 @@ from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
 _LANG_PREFIX = "model.language_model."
 _MODEL_PREFIX = "model."
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)$")
+_LAYER_SCALAR_KEY_RE = re.compile(r"^(?:language_model\.)?model\.layers\.(\d+)\.layer_scalar$")
+_K_PROJ_KEY_RE = re.compile(
+    r"^((?:language_model\.)?model\.layers\.(\d+)\.self_attn\.)k_proj(\..+)$"
+)
 
 
 @register_mapper("HF", "Gemma4ForCausalLM")
 @register_mapper("HF", "Gemma4ForConditionalGeneration")
 @register_mapper("HF", "Gemma4UnifiedForConditionalGeneration")
+@register_mapper("HF", "Gemma4AssistantForCausalLM")
 class Gemma4HfWeightMapper(HfWeightMapper):
     @property
     def _is_vlm(self) -> bool:
@@ -205,12 +210,19 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         HF stores MoE as 3D tensors:
           experts.gate_up_proj [E, 2*I, H] → per-expert {id}.w1.weight + {id}.w3.weight
           experts.down_proj    [E, H, I]   → per-expert {id}.w2.weight
+        ModelOpt NVFP4 checkpoints store already-split per-expert tensors:
+          experts.{id}.{gate,up,down}_proj.{field} → moe.experts.{id}.{w1,w3,w2}.{field}
           router.per_expert_scale          → moe.per_expert_scale
           router.*                         → moe.router.*
 
         Paths are also adjusted: layers.N.{experts,router} → layers.N.moe.{...}
         """
         _layer_re = r"((?:model\.|language_model\.model\.)?layers\.\d+)\."
+        expert_projection_map = {
+            "gate_proj": "w1",
+            "up_proj": "w3",
+            "down_proj": "w2",
+        }
         remapped = {}
         for key, val in weights.items():
             # per_expert_scale: HF router.per_expert_scale → TRT moe.per_expert_scale
@@ -218,6 +230,18 @@ class Gemma4HfWeightMapper(HfWeightMapper):
             if m_pes:
                 prefix = m_pes.group(1)
                 remapped[f"{prefix}.moe.per_expert_scale"] = val
+                continue
+
+            # ModelOpt NVFP4 per-expert layout. Preserve the field suffix so
+            # weight, weight_scale, input_scale, and weight_scale_2 all map.
+            m_expert = re.match(
+                _layer_re + r"experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(.+)$", key
+            )
+            if m_expert:
+                prefix, expert_id, projection, field = m_expert.groups()
+                remapped[
+                    f"{prefix}.moe.experts.{expert_id}.{expert_projection_map[projection]}.{field}"
+                ] = val
                 continue
 
             # experts.gate_up_proj [E, 2*I, H] → per-expert w1 + w3
@@ -245,15 +269,15 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                 remapped[new_key] = val
                 continue
 
+            if re.match(_layer_re + r"experts\.", key):
+                raise ValueError(f"Unsupported Gemma4 expert checkpoint tensor: {key}")
+
             # Non-MoE key: pass through
             remapped[key] = val
         return remapped
 
     def _handle_buffers_and_kvdup(self, weights: dict) -> dict:
         """Load layer_scalar buffers and duplicate k_proj for k_eq_v layers."""
-        # Determine the layer scalar key pattern and accessor based on
-        # whether any key starts with "language_model." (VLM sub-model
-        # weights after filter_weights) or "model." (text-only).
         # Navigate to decoder layers regardless of model structure
         # (multimodal wrapper has .llm.model.layers, text-only has .model.layers)
         _root = self.model
@@ -267,17 +291,9 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         def get_layer(idx):
             return _layers[idx] if _layers else None
 
-        sample = next(iter(weights), "")
-        if sample.startswith("language_model.model."):
-            scalar_pattern = r"language_model\.model\.layers\.(\d+)\.layer_scalar"
-            key_tmpl = "language_model.model.layers.{}.self_attn.{}_proj.weight"
-        else:
-            scalar_pattern = r"model\.layers\.(\d+)\.layer_scalar"
-            key_tmpl = "model.layers.{}.self_attn.{}_proj.weight"
-
         layer_scalar_keys = [k for k in weights if k.endswith(".layer_scalar")]
         for key in layer_scalar_keys:
-            m = re.match(scalar_pattern, key)
+            m = _LAYER_SCALAR_KEY_RE.match(key)
             if m:
                 layer_idx = int(m.group(1))
                 try:
@@ -290,12 +306,17 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         config = self.model.config
         if getattr(config, "attention_k_eq_v", False):
             layer_types = getattr(config, "layer_types", [])
-            for layer_idx, lt in enumerate(layer_types):
-                if lt == "full_attention":
-                    k_key = key_tmpl.format(layer_idx, "k")
-                    v_key = key_tmpl.format(layer_idx, "v")
-                    if k_key in weights and v_key not in weights:
-                        weights[v_key] = weights[k_key]
+            for k_key, value in list(weights.items()):
+                match = _K_PROJ_KEY_RE.match(k_key)
+                if match is None:
+                    continue
+                layer_idx = int(match.group(2))
+                if layer_idx >= len(layer_types) or layer_types[layer_idx] != "full_attention":
+                    continue
+                suffix = match.group(3)
+                suffix = {".k_scale": ".v_scale", ".k_bias": ".v_bias"}.get(suffix, suffix)
+                v_key = f"{match.group(1)}v_proj{suffix}"
+                weights.setdefault(v_key, value)
 
         # KV shared layers: HF omits k_proj/v_proj for shared layers.
         # The model uses Q-only projection for these layers, so no dummy

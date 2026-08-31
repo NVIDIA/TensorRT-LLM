@@ -20,12 +20,14 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/bindingUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include <ATen/ATen.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
@@ -88,8 +90,15 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
     nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
-        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
+        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
+        .def("get_serialized_data_transceiver_state",
+            [](tb::BaseCacheTransceiver& self)
+            {
+                auto serialized = self.getSerializedDataTransceiverState();
+                return nb::bytes(serialized.data(), serialized.size());
+            })
         .def(
             "check_context_transfer_status",
             [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
@@ -110,7 +119,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
-        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("has_poisoned_transfer_buffer", &BaseCacheTransceiver::hasPoisonedTransferBuffer);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
@@ -118,13 +128,15 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 
     nb::class_<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
-                 runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
+                 runtime::WorldConfig, std::vector<SizeType32>, tensorrt_llm::DataType,
                  executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>,
-                 tb::rnn_state_manager::RnnStateManager*, std::vector<SizeType32>>(),
+                 std::vector<SizeType32>, std::vector<SizeType32>>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{},
+            nb::arg("indexer_layer_num_per_pp") = std::vector<SizeType32>{})
+        .def("get_status_dump", &tb::CacheTransceiver::getStatusDump);
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

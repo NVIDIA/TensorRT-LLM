@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -35,10 +36,12 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                 duration = float(case.attrib.get('time', 0))
                 if duration <= 5 * 60:
                     rerun_2_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will rerun 2 times")
+                    print(test_name +
+                          " will rerun 2 times, because duration <= 5 min")
                 elif duration <= 10 * 60:
                     rerun_1_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will rerun 1 time")
+                    print(test_name +
+                          " will rerun 1 time, because duration <= 10 min")
                 elif any(failSig.lower() in ET.tostring(
                         case, encoding='unicode').lower()
                          for failSig in failSignaturesList):
@@ -47,7 +50,10 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                           " will rerun 1 time, because of fail signature")
                 else:
                     rerun_0_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will not rerun")
+                    print(
+                        test_name +
+                        " will not rerun, because duration > 10 min and no failure signature matches"
+                    )
     return ran_tests
 
 
@@ -129,7 +135,7 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
                 line = raw.strip()
                 if not line:
                     continue
-                test_name = line.split()[0]
+                test_name = re.split(r' TIMEOUT | ISOLATION', line)[0]
                 tests.append(test_name)
                 test_to_line[test_name] = line
 
@@ -235,7 +241,10 @@ def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def xml_to_html(xml_filename, html_filename, sort_by_name=False):
+def xml_to_html(xml_filename,
+                html_filename,
+                sort_by_name=False,
+                only_rerun_results=False):
     # HTML template
     html_template = """
     <!DOCTYPE html>
@@ -336,26 +345,7 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
     all_suites_html = []
 
     for suite in suite_list:
-        tests_count = int(suite.attrib.get('tests', 0))
-        failed_tests_count = int(suite.attrib.get('failures', 0)) + \
-                         int(suite.attrib.get('errors', 0))
-        skipped_tests_count = int(suite.attrib.get('skipped', 0))
-        passed_tests_count = tests_count - failed_tests_count - skipped_tests_count
-
-        # Generate summary for the suite
-        summary = f"""
-            <div class="suite-header">
-                <h3>Stage: {suite.attrib.get('name', '')}</h3>
-                <p>Tests: {tests_count} |
-                   <span class="failure">Failed: {failed_tests_count}</span> |
-                   <span class="skipped">Skipped: {skipped_tests_count}</span> |
-                   <span class="success">Passed: {passed_tests_count}</span>
-                </p>
-            </div>
-        """
-
-        # Generate test case details for the suite
-        test_cases_html = []
+        # Get all test cases from the suite
         all_test_cases = []
 
         for testcase in suite.findall('testcase'):
@@ -367,6 +357,42 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
             elif testcase.find('skipped') is not None:
                 status = "skipped"
             all_test_cases.append((status, testcase))
+
+        if only_rerun_results:
+            # Keep only tests that were re-run (isrerun=true) and their
+            # corresponding original failures from the first pytest run.
+            rerun_ids = {(tc.attrib.get('name',
+                                        ''), tc.attrib.get('classname', ''))
+                         for _, tc in all_test_cases
+                         if tc.attrib.get('isrerun') == 'true'}
+            all_test_cases = [(s, tc) for s, tc in all_test_cases
+                              if tc.attrib.get('isrerun') == 'true' or (
+                                  tc.attrib.get('name', ''),
+                                  tc.attrib.get('classname', '')) in rerun_ids]
+
+        tests_count = len(all_test_cases)
+        if tests_count == 0:
+            continue
+        failed_tests_count = sum(1 for s, _ in all_test_cases
+                                 if s in ('failure', 'error'))
+        skipped_tests_count = sum(1 for s, _ in all_test_cases
+                                  if s == 'skipped')
+        passed_tests_count = tests_count - failed_tests_count - skipped_tests_count
+
+        # Generate summary for the suite
+        summary = f"""
+            <div class="suite-header">
+                <h3>Stage: {suite.attrib.get('name', '')}</h3>
+                <p>Tests: {tests_count} |
+                    <span class="failure">Failed: {failed_tests_count}</span> |
+                    <span class="skipped">Skipped: {skipped_tests_count}</span> |
+                    <span class="success">Passed: {passed_tests_count}</span>
+                </p>
+            </div>
+        """
+
+        # Generate test case details for the suite
+        test_cases_html = []
 
         if sort_by_name:
             all_test_cases.sort(key=lambda x: x[1].attrib.get('name', '') + \
@@ -452,6 +478,12 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
         """
         all_suites_html.append(suite_html)
 
+    if not all_suites_html:
+        print(
+            f"No rerun test results found in {xml_filename}, skipping HTML generation."
+        )
+        return
+
     # Generate complete HTML
     html_content = html_template.format(test_suites='\n'.join(all_suites_html))
 
@@ -513,7 +545,8 @@ def generate_rerun_report(output_filename, input_filenames):
     merge_junit_xmls(output_filename, new_filename_list)
     xml_to_html(output_filename,
                 output_filename.replace(".xml", ".html"),
-                sort_by_name=True)
+                sort_by_name=True,
+                only_rerun_results=True)
 
 
 if __name__ == '__main__':

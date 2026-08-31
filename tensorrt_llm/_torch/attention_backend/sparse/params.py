@@ -12,33 +12,48 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Base sparse parameter interfaces for attention backend boundaries.
+"""Shared sparse attention parameter types."""
 
-User-facing SparseAttentionConfig live in LLM / VisualGen args and
-ModelConfig. They lower through ``to_sparse_params()`` for per-backend runtime
-state and ``to_sparse_metadata_params()`` for metadata allocation/update state.
+from dataclasses import dataclass
+from typing import Optional
 
-Concrete parameter classes live with their backend implementations.
-"""
+import torch
 
 
 class SparseParams:
-    """Base for per AttentionBackend instance sparse runtime parameters.
-
-    User-facing SparseAttentionConfig objects lower into this type through
-    ``to_sparse_params()`` before an AttentionBackend is constructed. That
-    lowering can resolve per-model or per-layer settings without passing
-    configs into backend instances.
-    """
+    """Base parameters for a sparse attention backend."""
 
     algorithm: str
 
 
 class SparseMetadataParams:
-    """Base for sparse settings needed by AttentionMetadata.
+    """Base parameters for sparse attention metadata."""
 
-    Derived from the same user-facing SparseAttentionConfig through
-    ``to_sparse_metadata_params()``, but kept separate from SparseParams because
-    metadata owns batch/runtime buffers rather than per-layer
-    ``AttentionBackend`` behavior.
-    """
+
+@dataclass(kw_only=True, slots=True)
+class SparseBackendForwardArgs:
+    """Sparse inputs passed from an attention module to its backend."""
+
+    # Shared by algorithms that accept precomputed top-k indices.
+    topk_indices: Optional[torch.Tensor] = None
+
+
+@dataclass(kw_only=True, slots=True)
+class SparseRuntimeParams:
+    """Flat optional sparse inputs passed from a backend to ``AttentionOp``."""
+
+    # Sparse index inputs shared by multiple algorithms.
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    # Per-query offsets, or backend-specific secondary sparse indices
+    # (DeepSeek-V4 fp8_ds_mla compressed-pool indices).
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+    sparse_attn_kv_lens: Optional[torch.Tensor] = None
+    aux_kv_cache_pool_ptr: Optional[int] = None
+
+    # SkipSoftmax prefill threshold; kernels divide it by context length.
+    threshold_scale_factor_prefill: float = 0.0
+    # SkipSoftmax decode threshold; diffusion models leave it at zero.
+    threshold_scale_factor_decode: float = 0.0

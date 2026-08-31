@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/tensorView.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
@@ -72,22 +73,22 @@ ITensor::UniquePtr ITensor::slice(SharedPtr tensor, Shape const& offsetDims, ITe
     return std::make_unique<TensorView>(std::move(tensor), offset, volume(dims), dims);
 }
 
-ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const& dims)
+ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, tensorrt_llm::Dims const& dims)
 {
     auto const size = buffer->getSize();
     return std::make_unique<TensorView>(std::move(buffer), 0, size, dims);
 }
 
-nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType64> const& dims)
+tensorrt_llm::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType64> const& dims)
 {
-    TLLM_CHECK_WITH_INFO(dims.size() <= nvinfer1::Dims::MAX_DIMS, "Number of dimensions is too large");
-    nvinfer1::Dims shape{};
+    TLLM_CHECK_WITH_INFO(dims.size() <= tensorrt_llm::Dims::MAX_DIMS, "Number of dimensions is too large");
+    tensorrt_llm::Dims shape{};
     shape.nbDims = static_cast<decltype(Shape::nbDims)>(dims.size());
     std::copy(dims.begin(), dims.end(), shape.d);
     return shape;
 }
 
-std::string ITensor::toString(nvinfer1::Dims const& dims)
+std::string ITensor::toString(tensorrt_llm::Dims const& dims)
 {
     if (dims.nbDims < 0)
     {
@@ -103,7 +104,8 @@ std::string ITensor::toString(nvinfer1::Dims const& dims)
     }
 }
 
-ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::Dims const& shape, std::size_t capacity)
+ITensor::UniquePtr ITensor::wrap(
+    void* data, tensorrt_llm::DataType type, tensorrt_llm::Dims const& shape, std::size_t capacity)
 {
     auto const size = volumeNonNegative(shape);
     TLLM_CHECK_WITH_INFO(size <= capacity, "Requested size is larger than capacity");
@@ -230,18 +232,18 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& out, ITensor const
 {
     switch (tensor.getDataType())
     {
-    case nvinfer1::DataType::kFLOAT: printTensor<float>(tensor, out); break;
-    case nvinfer1::DataType::kHALF: printTensor<half, float>(tensor, out); break;
-    case nvinfer1::DataType::kBOOL: printTensor<bool>(tensor, out); break;
-    case nvinfer1::DataType::kINT8: printTensor<std::int8_t, std::int32_t>(tensor, out); break;
-    case nvinfer1::DataType::kINT32: printTensor<std::int32_t>(tensor, out); break;
-    case nvinfer1::DataType::kINT64: printTensor<std::int64_t>(tensor, out); break;
-    case nvinfer1::DataType::kUINT8: printTensor<std::uint8_t, std::int32_t>(tensor, out); break;
+    case tensorrt_llm::DataType::kFLOAT: printTensor<float>(tensor, out); break;
+    case tensorrt_llm::DataType::kHALF: printTensor<half, float>(tensor, out); break;
+    case tensorrt_llm::DataType::kBOOL: printTensor<bool>(tensor, out); break;
+    case tensorrt_llm::DataType::kINT8: printTensor<std::int8_t, std::int32_t>(tensor, out); break;
+    case tensorrt_llm::DataType::kINT32: printTensor<std::int32_t>(tensor, out); break;
+    case tensorrt_llm::DataType::kINT64: printTensor<std::int64_t>(tensor, out); break;
+    case tensorrt_llm::DataType::kUINT8: printTensor<std::uint8_t, std::int32_t>(tensor, out); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: printTensor<__nv_bfloat16, float>(tensor, out); break;
+    case tensorrt_llm::DataType::kBF16: printTensor<__nv_bfloat16, float>(tensor, out); break;
 #endif
 #ifdef ENABLE_FP8
-    case nvinfer1::DataType::kFP8: printTensor<__nv_fp8_e4m3, float>(tensor, out); break;
+    case tensorrt_llm::DataType::kFP8: printTensor<__nv_fp8_e4m3, float>(tensor, out); break;
 #endif
     default: TLLM_THROW("Unsupported data type");
     }

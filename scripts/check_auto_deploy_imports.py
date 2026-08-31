@@ -15,7 +15,7 @@ B. Relative imports MUST stay inside the auto_deploy package. A relative
    instead.
 
 These rules keep auto_deploy's source tree portable: it can be copied
-verbatim into the standalone ``llmc`` package without rewriting any
+verbatim into the standalone ``paragraf`` package without rewriting any
 in-package import statements.
 """
 

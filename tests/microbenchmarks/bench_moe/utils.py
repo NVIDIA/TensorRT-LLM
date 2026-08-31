@@ -24,7 +24,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._utils import local_mpi_rank, mpi_barrier, mpi_rank
+from tensorrt_llm._utils import local_mpi_rank, mpi_barrier, mpi_comm, mpi_rank
 
 from .backend import MoeBackendType
 
@@ -65,14 +65,31 @@ def _get_free_tcp_port() -> int:
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
     """Initialize the torch.distributed NCCL ProcessGroup for MegaMoE."""
-    if moe_backend.upper() != MoeBackendType.MEGAMOE_DEEPGEMM.value:
+    if moe_backend.upper() not in (
+        MoeBackendType.MEGAMOE_DEEPGEMM.value,
+        MoeBackendType.MEGAMOE_CUTEDSL.value,
+    ):
         return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for MegaMoE backend")
     if dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(_get_free_tcp_port()))
+    if world_size == 1:
+        dist.init_process_group(
+            backend="nccl",
+            store=dist.HashStore(),
+            rank=rank,
+            world_size=world_size,
+        )
+        return
+    rendezvous = None
+    if rank == 0:
+        master_addr = os.environ.get("MASTER_ADDR") or "127.0.0.1"
+        master_port = os.environ.get("MASTER_PORT") or str(_get_free_tcp_port())
+        rendezvous = (master_addr, master_port)
+    master_addr, master_port = mpi_comm().bcast(rendezvous, root=0)
+    os.environ["MASTER_ADDR"] = str(master_addr)
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(local_mpi_rank())
@@ -106,15 +123,18 @@ def _compute_stats(values: List[float]) -> Dict[str, float]:
 
 
 def _distribute_tokens(total: int, world_size: int) -> List[int]:
-    """Distribute ``total`` global tokens evenly across ``world_size`` ranks."""
+    """Distribute ``total`` global tokens evenly across ranks.
+
+    Remainder tokens are spread one-per-rank over the leading ranks (instead of
+    piling the entire remainder on rank 0), so e.g. (total=2, world_size=4) ->
+    [1, 1, 0, 0]. An even, non-degenerate split keeps every rank's per-rank token
+    count within 1 of each other, which the downstream symmetric-memory workspace
+    sizing relies on.
+    """
     if world_size <= 0 or total < 0:
         raise ValueError(f"invalid args: total={total}, world_size={world_size}")
-    if world_size == 1:
-        return [total]
-    base = total // world_size
-    out = [base] * world_size
-    out[0] += total - base * world_size
-    return out
+    base, rem = divmod(total, world_size)
+    return [base + (1 if i < rem else 0) for i in range(world_size)]
 
 
 def _validate_per_rank_token_list(

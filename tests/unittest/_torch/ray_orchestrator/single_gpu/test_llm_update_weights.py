@@ -1,4 +1,5 @@
 import base64
+import gc
 import pickle
 import re
 from typing import Callable, List, Optional, Tuple
@@ -6,7 +7,7 @@ from typing import Callable, List, Optional, Tuple
 import pytest
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
 from utils.util import getSMVersion, skip_pre_hopper
@@ -26,14 +27,50 @@ from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+@pytest.fixture(autouse=True)
+def release_shared_cuda_memory():
+    """Reclaim producer-side CUDA IPC memory between parametrize IDs."""
+    yield
+    # Break reference cycles so the test-local hf_model actually dies now.
+    gc.collect()
+    # Free sent IPC storages whose consumers have already closed them.
+    torch.cuda.ipc_collect()
+    # Return freed cached segments to the driver so other processes
+    # (the next test's Ray workers) can allocate them.
+    torch.cuda.empty_cache()
+
+
 class RefHFModelWithIPCHandles(RefHFModel):
-    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: int = 4):
+    def __init__(
+        self,
+        model_dir: str,
+        device_id: int = 0,
+        *,
+        num_hidden_layers: Optional[int] = None,
+        layers_block_type: Optional[List[str]] = None,
+    ):
         self.device_id = device_id
-        config = AutoConfig.from_pretrained(model_dir)
-        config.num_hidden_layers = num_hidden_layers
+        model_kwargs = {}
+        if num_hidden_layers is not None:
+            model_kwargs["num_hidden_layers"] = num_hidden_layers
+        if layers_block_type is not None:
+            model_kwargs["layers_block_type"] = layers_block_type
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
+            model_dir,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+            **model_kwargs,
         ).to(f"cuda:{device_id}")
+        # Hybrid configs (e.g. NemotronH) derive num_hidden_layers from
+        # ``layers_block_type`` and silently ignore the num_hidden_layers
+        # override; callers must pass a truncated ``layers_block_type`` for
+        # such models. Catch a silently ignored override loudly here.
+        if num_hidden_layers is not None:
+            assert self.model.config.num_hidden_layers == num_hidden_layers, (
+                f"num_hidden_layers override silently ignored: "
+                f"HF loaded {self.model.config.num_hidden_layers}, "
+                f"expected {num_hidden_layers}"
+            )
         self.all_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._replicate_weights()
@@ -43,13 +80,12 @@ class RefHFModelWithIPCHandles(RefHFModel):
         for n, p in self.model.named_parameters():
             model_weights.append((n, p.detach().clone()))
 
+        # Only populate the owning device. Extra replicas are materialized
+        # lazily by ``get_weight_ipc_handles_serialized`` so that GPUs never
+        # asked for via IPC (e.g. cuda:2/3 on a 4-GPU runner when a TP=2
+        # test only requests device_ids=[0, 1]) don't hold weight copies
+        # that persist across parametrize IDs.
         self.all_weights[self.device_id] = model_weights
-        for i in range(torch.cuda.device_count()):
-            if i != self.device_id:
-                cur_weights = []
-                for n, p in self.all_weights[self.device_id]:
-                    cur_weights.append((n, p.to("cuda:" + str(i))))
-                self.all_weights[i] = cur_weights
 
     def get_weight_ipc_handles_serialized(
         self,
@@ -70,6 +106,10 @@ class RefHFModelWithIPCHandles(RefHFModel):
         device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
 
         for device in device_list:
+            if device not in self.all_weights:
+                src = self.all_weights[self.device_id]
+                self.all_weights[device] = [(n, p.to(f"cuda:{device}")) for n, p in src]
+
             all_handles = []
             for item in self.all_weights[device]:
                 name, p = item
@@ -135,7 +175,7 @@ def run_generate(
     "model_dir",
     [
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen2.5-0.5B-Instruct",
+        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
@@ -182,13 +222,15 @@ def test_llm_update_weights(model_dir):
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
 
+    del hf_model
+
 
 @skip_pre_hopper
 @pytest.mark.parametrize(
     "model_dir",
     [
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen2.5-0.5B-Instruct",
+        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
@@ -254,6 +296,8 @@ def test_llm_partial_update_weights(model_dir):
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
 
+    del hf_model
+
 
 @skip_pre_hopper
 @pytest.mark.parametrize(
@@ -314,3 +358,5 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir, kv_cache
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
+
+    del hf_model

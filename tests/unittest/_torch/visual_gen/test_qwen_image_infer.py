@@ -83,7 +83,7 @@ def test_infer_forwards_generation_params():
     assert captured["height"] == 768
     assert captured["width"] == 1024
     assert captured["num_inference_steps"] == 7
-    assert captured["true_cfg_scale"] == 3.25
+    assert captured["negative_prompt_cfg_scale"] == 3.25
     assert captured["seed"] == 123
     assert captured["max_sequence_length"] == 256
 

@@ -88,7 +88,7 @@ def _test_attention_trtllm_sage(
         sparse_attention_config.to_sparse_params() if sparse_attention_config is not None else None
     )
     attention_cls = attention_backend_utils.get_attention_backend(
-        "TRTLLM", sparse_attention_config=sparse_attention_config
+        "TRTLLM", sparse_params=sparse_params
     )
     attention = attention_cls(
         layer_idx=0,

@@ -1,6 +1,7 @@
 __pycache__/
 .mypy_cache/
 .vscode
+.zed
 .cursor
 *.engine
 *.engine.config
@@ -46,18 +47,18 @@ tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/**/*.pyi
 tensorrt_llm/tensorrt_llm_transfer_agent_binding.*.so
 tensorrt_llm/tensorrt_llm_transfer_agent_binding.pyi
-tensorrt_llm/deep_ep/
+tensorrt_llm/deep_ep
 tensorrt_llm/deep_ep_cpp_tllm.*.so
 tensorrt_llm/deep_ep_cpp_tllm.pyi
-tensorrt_llm/deep_gemm/
+tensorrt_llm/deep_gemm
 tensorrt_llm/deep_gemm_cpp_tllm.*.so
 tensorrt_llm/deep_gemm_cpp_tllm.pyi
 tensorrt_llm/pg_utils_bindings.*.so
-tensorrt_llm/flash_mla/
+tensorrt_llm/flash_mla
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
+/3rdparty/fmha_sm100/
 tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
-!tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so
 **/*__mypyc*.so
 tensorrt_llm/scripts
 *docs/cpp_docs*
@@ -122,3 +123,11 @@ tests/integration/defs/stress_test/artifacts/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
+.claude/ralph-loop.local.md
+
+.plans/
+
+# Kimi K3 eval harness per-job runtime configs
+# (run_eval_kimi_k3.sbatch --parallel tep and --dflash rewrites)
+examples/kimi_k3/.eval_tep_runtime.*.yaml
+examples/kimi_k3/.eval_dflash_runtime.*.yaml

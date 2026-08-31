@@ -1,35 +1,59 @@
-import logging
-from dataclasses import dataclass, field
-from typing import List
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, List
+
+from examples.scaffolding.mcp.fetch_webpage import VisitController, VisitTask
+from examples.scaffolding.mcp.tavily_search import TavilyController, TavilyTask
+from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding import (
     AssistantMessage,
     ChatTask,
     Controller,
+    MCPCallTask,
     SystemMessage,
     Task,
     UserMessage,
 )
-from tensorrt_llm.scaffolding.task_collection import drop_kv_cache_scope, sub_request_node
+from tensorrt_llm.scaffolding.controller import ChatWithMCPController
+from tensorrt_llm.scaffolding.task import ToolMessage
+from tensorrt_llm.scaffolding.task_collection import sub_request_node
 
-from .prompts import research_system_prompt, research_system_prompt_prefix
-from .tools import reflection_tool, web_search_tool
+from .prompts import RESEARCHER_SYSTEM_PROMPT
+from .tools import (
+    fetch_webpage_tool,
+    # google_scholar_tool,
+    python_interpreter_tool,
+    reflection_tool,
+    tavily_search_tool,
+)
 from .utils import get_today_str
-
-LOGGER = logging.getLogger()
 
 
 @dataclass
 class ResearchTask(Task):
     research_topic: str = field(default=None)
     research_result: str = field(default=None)
+    tool_call_id: str = field(default=None)
 
     @staticmethod
-    def from_topic(topic: str) -> "ResearchTask":
-        task = ResearchTask()
-        task.research_topic = topic
-        task.research_result = ""
-        return task
+    def from_topic(topic: str, tool_call_id: str) -> "ResearchTask":
+        return ResearchTask(research_topic=topic, research_result="", tool_call_id=tool_call_id)
 
 
 class Compressor(Controller):
@@ -71,10 +95,167 @@ class Compressor(Controller):
         return
 
 
+def _extraction_goal_from_chat(chat_task: ChatTask) -> str:
+    """Goal string for webpage extraction (matches IterResearch ``Visit`` goal)."""
+    for message in chat_task.messages:
+        if message.role == "user" and getattr(message, "content", None):
+            return str(message.content)
+    return "Extract relevant information for the research task."
+
+
+def _parse_tool_arguments(arguments: Any) -> dict:
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        return json.loads(arguments)
+    raise TypeError(f"Unsupported tool arguments type: {type(arguments).__name__}")
+
+
+class ResearchChatWithMCPController(ChatWithMCPController):
+    """Dispatches large retrieval tools through compression controllers.
+
+    ``fetch_webpage`` uses :class:`VisitController` for fetch + LLM summary.
+    ``tavily_search`` uses :class:`TavilyController` for search + optional LLM summary.
+    Other MCP tools keep the same batching behavior as :class:`ChatWithMCPController`.
+    """
+
+    def __init__(
+        self,
+        generation_controller: Controller,
+        visit_controller: VisitController,
+        tavily_controller: TavilyController,
+        system_prompts: Any = None,
+        max_iterations: int = 3,
+        tools: Any = None,
+    ):
+        super().__init__(
+            generation_controller=generation_controller,
+            system_prompts=system_prompts,
+            max_iterations=max_iterations,
+            tools=tools,
+        )
+        self.visit_controller = visit_controller
+        self.tavily_controller = tavily_controller
+
+    def clone(self) -> ResearchChatWithMCPController:
+        return ResearchChatWithMCPController(
+            generation_controller=self.generation_controller.clone(),
+            visit_controller=self.visit_controller.clone(),
+            tavily_controller=self.tavily_controller.clone(),
+            system_prompts=self.system_prompts,
+            max_iterations=self.max_iterations,
+            tools=self.tools,
+        )
+
+    def process(self, tasks: List[Task], **kwargs):
+        assert len(tasks) == 1, "ResearchChatWithMCPController only supports one task"
+        chat_task = tasks[0]
+        assert isinstance(chat_task, ChatTask), (
+            "ResearchChatWithMCPController only supports ChatTask"
+        )
+        goal = _extraction_goal_from_chat(chat_task)
+
+        for _ in range(self.max_iterations):
+            yield from self.generation_controller.process([chat_task])
+            response_message = chat_task.messages[-1]
+            if not isinstance(response_message, AssistantMessage):
+                logger.warning(
+                    "Stopping ChatWithMCP tool loop: expected AssistantMessage "
+                    "after generation, got %s",
+                    type(response_message).__name__,
+                )
+                break
+            if response_message.tool_calls:
+                tool_calls = response_message.tool_calls
+
+                tool_results = {}
+                mcp_tasks = []
+                mcp_indices = []
+                for i, tool_call in enumerate(tool_calls):
+                    if tool_call.function.name in ("fetch_webpage", "tavily_search"):
+                        continue
+                    mcp_tasks.append(
+                        MCPCallTask.create_mcptask(
+                            tool_call.id,
+                            tool_call.function.name,
+                            tool_call.function.arguments,
+                            self.WorkerTag.TOOLCALL,
+                        )
+                    )
+                    mcp_indices.append(i)
+
+                if mcp_tasks:
+                    yield mcp_tasks
+                for i, mcp_task in zip(mcp_indices, mcp_tasks):
+                    if mcp_task.result_str is None:
+                        continue
+                    tool_results[i] = (
+                        mcp_task.result_str,
+                        mcp_task.result_stdout,
+                        mcp_task.result_stderr,
+                    )
+
+                for i, tool_call in enumerate(tool_calls):
+                    tool_name = tool_call.function.name
+                    if tool_name == "fetch_webpage":
+                        args = _parse_tool_arguments(tool_call.function.arguments)
+                        urls = args.get("url", [])
+                        if isinstance(urls, str):
+                            urls = [urls]
+                        visit_task = VisitTask(
+                            urls=urls or [],
+                            goal=goal,
+                            parse_type=args.get("parse_type", "html"),
+                        )
+                        yield from self.visit_controller.process([visit_task])
+                        if visit_task.result_str is not None:
+                            tool_results[i] = (visit_task.result_str, None, None)
+                    elif tool_name == "tavily_search":
+                        args = _parse_tool_arguments(tool_call.function.arguments)
+                        queries = args.get("query", [])
+                        if isinstance(queries, str):
+                            queries = [queries]
+                        tavily_task = TavilyTask(query=queries or [], goal=goal)
+                        yield from self.tavily_controller.process([tavily_task])
+                        if tavily_task.result_str is not None:
+                            tool_results[i] = (
+                                tavily_task.result_str,
+                                tavily_task.result_stdout,
+                                tavily_task.result_stderr,
+                            )
+
+                for i, tool_call in enumerate(tool_calls):
+                    if i in tool_results:
+                        body, out, err = tool_results[i]
+                    else:
+                        # The MCP / visit / tavily controller failed to write
+                        # ``result_str`` (e.g., upstream 504, connection reset,
+                        # JSON parse error). Bedrock / Anthropic require every
+                        # tool_use_id in the prior assistant message to have a
+                        # matching tool_result in the immediately following
+                        # message; emit a placeholder so the request payload
+                        # stays valid and the loop can keep making progress.
+                        body = f"[{tool_call.function.name}] tool produced no result"
+                        out, err = None, None
+                    chat_task.add_message(
+                        ToolMessage(body, tool_call.id, trace_stdout=out, trace_stderr=err)
+                    )
+                if any(tc.function.name == "complete_task" for tc in tool_calls):
+                    break
+            else:
+                break
+
+
 @sub_request_node("Researcher")
-@drop_kv_cache_scope()
+# @drop_kv_cache_scope()
 class Researcher(Controller):
-    tools = [web_search_tool, reflection_tool]
+    tools = [
+        tavily_search_tool,
+        # google_scholar_tool,
+        fetch_webpage_tool,
+        python_interpreter_tool,
+        reflection_tool,
+    ]
 
     def __init__(self, chat_with_tools_controller: Controller, compress_controller: Controller):
         super().__init__()
@@ -88,12 +269,17 @@ class Researcher(Controller):
         )
 
     def process(self, research_tasks: List[ResearchTask], **kwargs):
+        assert len(research_tasks) == 1, "Researcher only supports one ResearchTask"
+        assert research_tasks[0].research_topic is not None, (
+            "ResearchTask must have a research topic"
+        )
+        assert research_tasks[0].tool_call_id is not None, "ResearchTask must have a tool call id"
+
         chat_task = ChatTask.create_from_prompt(
             research_tasks[0].research_topic,
             [
                 SystemMessage(
-                    research_system_prompt.format(date=get_today_str()),
-                    prefix=research_system_prompt_prefix,
+                    RESEARCHER_SYSTEM_PROMPT.format(date=get_today_str()),
                 )
             ],
             tools=self.tools,
@@ -103,5 +289,5 @@ class Researcher(Controller):
 
         yield from self.compress_controller.process([chat_task])
 
-        research_tasks[0].research_result = chat_task.output_str
+        research_tasks[0].research_findings = chat_task.output_str
         return

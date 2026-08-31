@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections.abc import Callable
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -14,14 +29,14 @@ from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 FusedMoEQuantScalesFP8,
-                                 Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode)
 from ..modules.gated_mlp import GatedMLP, swiglu
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
+                             CutlassFusedMoE, FusedMoEQuantScalesFP8,
+                             Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
@@ -308,7 +323,7 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
 
     # After loading both gate_up_proj and down_proj, we need to set the scales needed by the special kernels and by
     # the trtllm-gen gemm+swiglu kernel.
-    def post_load_weights(self):
+    def cache_derived_state(self) -> None:
         if self.gate_up_proj.has_fp8_qdq:
             # For the special gemm+swiglu kernel, we need to set the inverse of the output scale, which is the inverse
             # of down_proj's combined input scale.
@@ -316,6 +331,9 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
             # For the trtllm-gen gemm+swiglu kernel, we need to set the global scale, which is gate_up_proj's
             # combined input scale times inv_output_scale.
             self.gate_up_proj.trtllm_gen_global_scale = self.gate_up_proj.combined_scale * self.gate_up_proj.inv_output_scale
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def forward(
         self,
@@ -427,7 +445,14 @@ class Llama4MinLatencyAttention(Llama4Attention):
                                      skip_attn_scaling)
 
 
-class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
+class Llama4MinLatencyFusedMoE(ConfigurableMoE):
+    """Cutlass MoE layer with a min-latency FP8 fast path.
+
+    Subclasses the wrapper rather than ``CutlassFusedMoE``: the latter is an
+    execution unit (``MoEImplBase``) with no ``forward``, so it can only be
+    reached as ``ConfigurableMoE.backend``. ``moe_cls`` pins that backend
+    because the min-latency op below reads the Cutlass weight layout.
+    """
 
     def __init__(
         self,
@@ -447,6 +472,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
     ):
 
         super().__init__(
+            moe_cls=CutlassFusedMoE,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -478,6 +504,8 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         router_logits: torch.Tensor,
         output_dtype: Optional[torch.dtype] = None,
         x_high: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
 
         # Use special min-latency MoE kernels when num_tokens <= 8.
@@ -500,10 +528,14 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
                     "x_high is required when x.dtype is float8_e4m3fn in Llama4FusedMoE fallback path!"
                 )
 
+        # The wrapper's scheduler defaults a missing rank list to ``[x.shape[0]]``,
+        # which is only correct at parallel_size 1; forward what the caller knows.
         return super().forward(x,
                                router_logits,
                                do_finalize=True,
-                               output_dtype=output_dtype)
+                               output_dtype=output_dtype,
+                               all_rank_num_tokens=all_rank_num_tokens,
+                               use_dp_padding=use_dp_padding)
 
 
 class Llama4MinLatencyMoE(Llama4MoE):
@@ -566,21 +598,27 @@ class Llama4MinLatencyMoE(Llama4MoE):
             dtype=model_config.pretrained_config.torch_dtype,
             quant_config=None)
 
-    def post_load_weights(self):
+    def cache_derived_state(self) -> None:
         # Set min-latency quant scales for routed experts if we plan to use min-latency MoE kernels.
         # This is because the routed experts' input scale is after the score multiplication, so we must use the
         # pre-score scaling input scale, which happens to be shared expert's input scale.
         if self.experts.enable_min_latency_fused_moe and hasattr(
                 self.shared_expert.gate_up_proj, "input_scale"):
             pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
+            # FP8 dequant scales are created by the quant method on the weight
+            # owner, which is the backend execution unit, not the wrapper.
+            experts_impl = self.experts.backend
             self.experts.min_latency_quant_scales = FusedMoEQuantScalesFP8(
-                fc1_dequant=self.experts.fc31_dequant.data /
-                self.experts.fc31_input_dequant.data *
+                fc1_dequant=experts_impl.fc31_dequant.data /
+                experts_impl.fc31_input_dequant.data *
                 pre_score_scaling_input_scale,
-                fc2_quant=self.experts.fc2_quant,
-                fc2_dequant=self.experts.fc2_dequant,
+                fc2_quant=experts_impl.fc2_quant,
+                fc2_dequant=experts_impl.fc2_dequant,
                 fc1_input_dequant=pre_score_scaling_input_scale,
             )
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def compute_routed_output(
             self,
@@ -594,6 +632,8 @@ class Llama4MinLatencyMoE(Llama4MoE):
             hidden_states,
             router_logits,
             x_high=hidden_states_high,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
         )
 
         return routed_output

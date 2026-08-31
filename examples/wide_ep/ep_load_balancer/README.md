@@ -27,9 +27,8 @@ Run 32-way expert parallelism inference on the prepared dataset. Please refer to
 cat > ./config.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
-moe_backend: WideEP
 moe_config:
-    backend: WideEP
+    backend: CUTEDSL
     max_num_tokens: 8192
 EOF
 
@@ -119,7 +118,7 @@ cat > ./config_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_config:
-    backend: WideEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer: ./moe_load_balancer.yaml
 EOF
@@ -185,7 +184,7 @@ cat > ./config_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_config:
-    backend: WideEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer: ./moe_load_balancer.yaml
 EOF

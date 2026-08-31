@@ -45,7 +45,6 @@ add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
-option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
@@ -126,12 +125,6 @@ else()
   message(STATUS "Not building Google tests")
 endif()
 
-if(BUILD_BENCHMARKS)
-  message(STATUS "Building benchmarks")
-else()
-  message(STATUS "Not building benchmarks")
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   message(STATUS "Building C++ micro benchmarks")
 else()
@@ -165,9 +158,29 @@ else()
   message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
+# Where the configured executor/version.h is written. Out-of-tree builds point
+# this at the build tree so the source tree is never written (it may be mounted
+# read-only); the default keeps the in-source location.
+set(TRTLLM_VERSION_H_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    CACHE PATH "Include root for the configured executor/version.h")
 configure_file(
   cmake/templates/version.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+  "${TRTLLM_VERSION_H_INCLUDE_DIR}/tensorrt_llm/executor/version.h")
+if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
+   "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  # BEFORE: the configured header must win over a stale in-source copy.
+  include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
+endif()
+
+# Generated FMHA sources (see contextFusedMultiHeadAttention/CMakeLists.txt for
+# the full definition and default). fmha_cubin.h is included transitively by
+# headers used across several targets, so when generation is redirected out of
+# the source tree the directory must be on every target's include path, not just
+# the FMHA target's.
+if(DEFINED TRTLLM_FMHA_GEN_DIR AND NOT "${TRTLLM_FMHA_GEN_DIR}" STREQUAL "")
+  include_directories("${TRTLLM_FMHA_GEN_DIR}")
+endif()
 
 setup_cuda_compiler()
 
@@ -249,8 +262,6 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 # TRT dependencies
-find_package(TensorRT 10 REQUIRED COMPONENTS OnnxParser)
-set(TRT_LIB TensorRT::NvInfer)
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
@@ -267,7 +278,7 @@ endif()
 FetchContent_MakeAvailable(nanobind)
 include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
-FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 
 if(ENABLE_UCX)
   FetchContent_MakeAvailable(cppzmq ucxx)
@@ -291,7 +302,6 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
-  $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${maybe_nvtx_includedir}
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
@@ -406,8 +416,13 @@ endif()
 option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
 if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   message(STATUS "BOLT compatible flags enabled")
-  # Compiler flags for C/C++
-  add_compile_options(-fno-reorder-blocks-and-partition -fno-plt)
+  # Compiler flags for C/C++ -fno-reorder-blocks-and-partition is GCC-only
+  # (required for GCC 8+ per BOLT docs). Clang does not support this flag and
+  # does not enable the corresponding optimization by default.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-fno-reorder-blocks-and-partition)
+  endif()
+  add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
@@ -664,11 +679,6 @@ if(BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(BUILD_BENCHMARKS)
-  add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
-                   ${CMAKE_BINARY_DIR}/benchmarks)
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/micro_benchmarks
                    ${CMAKE_BINARY_DIR}/micro_benchmarks)
@@ -683,6 +693,6 @@ if(MEASURE_BUILD_TIME)
 endif()
 
 set(BUILD_WHEEL_TARGETS
-    tensorrt_llm;nvinfer_plugin_tensorrt_llm
+    tensorrt_llm
     CACHE STRING "Targets used to build wheel")
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})

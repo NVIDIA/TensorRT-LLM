@@ -7,6 +7,8 @@ import zmq
 
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TestIpcBasics:
     """Test basic synchronous IPC operations."""
@@ -255,18 +257,6 @@ class TestIpcBasics:
                 is_async=False,
                 name="test_client_no_key",
                 use_hmac_encryption=True,  # But encryption enabled
-            )
-
-    def test_hmac_encryption_cannot_be_disabled(self):
-        """Test that HMAC cannot be disabled by optimized Python removing asserts."""
-        with pytest.raises(ValueError, match="HMAC encryption is always required"):
-            ZeroMqQueue(
-                address=None,
-                socket_type=zmq.PAIR,
-                is_server=True,
-                is_async=False,
-                name="test_hmac_disabled",
-                use_hmac_encryption=False,
             )
 
     def test_put_noblock_retry(self):

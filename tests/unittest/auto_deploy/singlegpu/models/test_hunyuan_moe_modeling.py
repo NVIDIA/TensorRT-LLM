@@ -727,6 +727,7 @@ def test_model_can_be_exported(device):
 # ===========================================================================
 
 
+@pytest.mark.cpu_only
 def test_config_registration():
     """Factory knows the model class under the real HF config name."""
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
@@ -734,6 +735,7 @@ def test_config_registration():
     assert "HunYuanConfig" in AutoModelForCausalLMFactory._custom_model_mapping
 
 
+@pytest.mark.cpu_only
 def test_tied_weights():
     """tie_word_embeddings: lm_head.weight is the same tensor as embed_tokens.weight."""
     cfg = _create_small_custom_config()
@@ -741,6 +743,7 @@ def test_tied_weights():
     assert model.lm_head.weight is model.model.embed_tokens.weight
 
 
+@pytest.mark.cpu_only
 def test_moe_structure():
     """Every decoder layer has the expected MoE submodule structure."""
     cfg = _create_small_custom_config()
@@ -755,6 +758,7 @@ def test_moe_structure():
             assert hasattr(moe, "shared_mlp"), f"Layer {i}: missing mlp.shared_mlp"
 
 
+@pytest.mark.cpu_only
 def test_qk_norm_structure():
     """QK normalization layers exist in each attention module."""
     cfg = _create_small_custom_config()
@@ -765,6 +769,7 @@ def test_qk_norm_structure():
         assert hasattr(attn, "key_layernorm"), f"Layer {i}: missing key_layernorm"
 
 
+@pytest.mark.cpu_only
 def test_state_dict_keys_match_checkpoint():
     """State dict keys match the HF checkpoint naming convention."""
     cfg = _create_small_custom_config()

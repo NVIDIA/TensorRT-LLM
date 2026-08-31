@@ -13,3 +13,6 @@ world_size: 1
 # Gemma 3n uses shared-KV decode semantics in the tail layers. FlashInfer
 # supports the read-only shared-KV cache path and alternating sliding windows.
 attn_backend: flashinfer
+
+kv_cache_config:
+  free_gpu_memory_fraction: 0.8

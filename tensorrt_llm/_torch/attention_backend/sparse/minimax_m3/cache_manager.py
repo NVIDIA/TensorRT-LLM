@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """KV cache management for MiniMax-M3 sparse attention.
 
 Provides:
@@ -13,10 +25,11 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -25,9 +38,9 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, LayerId
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import typed_range
+from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
 from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
@@ -150,15 +163,24 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_index_dim: Optional[int] = None,
         **kwargs,
     ):
-        # Resolve M3 sparse-layer metadata from explicit kwargs first,
-        # then from ``sparse_attn_config``, then from the M3 checkpoint
-        # convention (layers 0..2 dense, 3..N-1 sparse,
-        # disable_index_value=True, sparse_index_dim=128).
-        sparse_attn_config = kwargs.get("sparse_attn_config")
+        # Resolve M3 sparse-layer metadata from explicit kwargs first, then
+        # from the executor's ``sparse_attention_config`` keyword, then from
+        # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
+        # disable_index_value=True, sparse_index_dim=128). Honoring the
+        # executor keyword also makes non-default sparse_index_dim values
+        # authoritative for the cache layout instead of falling back to 128.
+        sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
 
         if sparse_index_dim is None:
-            sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
+            sparse_index_dim = getattr(sparse_attention_config, "sparse_index_dim", None)
+            if sparse_index_dim is None:
+                sparse_index_dim = 128
+        sparse_index_dim = int(sparse_index_dim)
+        if sparse_index_dim <= 0:
+            raise ValueError(
+                f"MiniMax M3 sparse_index_dim must be greater than 0, got {sparse_index_dim}."
+            )
         if sparse_layer_ids is None:
             if num_layers is not None:
                 sparse_layer_ids = list(range(3, int(num_layers)))
@@ -168,13 +190,27 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
         # Must be set BEFORE super().__init__ — the base
-        # ``_build_cache_config`` invokes ``_extra_buffers_per_layer``
+        # ``_build_base_config`` invokes ``_extra_buffers_per_layer``
         # which reads these attributes.
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
-        self.sparse_index_dim = int(sparse_index_dim)
-
+        self.sparse_index_dim = sparse_index_dim
+        self.indexer_kv_dtype = str(getattr(sparse_attention_config, "indexer_kv_dtype", "bf16"))
+        if self.indexer_kv_dtype not in ("bf16", "fp8"):
+            raise ValueError(
+                "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
+                f"{self.indexer_kv_dtype!r}."
+            )
         super().__init__(*args, **kwargs)
+
+        index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
+        if self.is_disagg and index_v_layer_ids:
+            raise ValueError(
+                "MiniMax M3 disaggregated serving requires disable_index_value=True "
+                "for every sparse layer because the optional test-only index-V cache "
+                "is not managed or transferred by KVCacheManagerV2; enabled layers="
+                f"{sorted(index_v_layer_ids)}"
+            )
 
         # Optional plain-tensor index-V cache for non-disabled sparse
         # layers (test-only; production has disable_index_value=True
@@ -198,7 +234,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         ``size`` is bytes per **block**: ``1 * sparse_index_dim *
         elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_cache_config`` iterates local ids, so keying
+        the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
         """
@@ -210,6 +246,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
+        }
+
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Declare MiniMax M3's token-major K/V and replicated index-K."""
+        return {
+            Role.ALL: MapperKind.NHD,
+            Role.INDEX_KEY: MapperKind.REPLICATED,
         }
 
     def _compute_num_total_slots(self) -> int:
@@ -227,25 +270,23 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return int((page_upper // kv_factor) * self.tokens_per_block)
 
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
-        """Match the main cache dtype where possible, fall back to bf16."""
-        if self.dtype == DataType.HALF:
-            return torch.float16
-        if self.dtype == DataType.FLOAT:
-            return torch.float32
+        """Return the independently configured index-cache storage dtype."""
+        if self.indexer_kv_dtype == "fp8":
+            return torch.float8_e4m3fn
         return torch.bfloat16
 
-    def get_index_k_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_index_k_buffer(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         """Return the V2-managed paged index-K view for ``layer_idx``.
 
-        Shape: ``[num_pages, tokens_per_block, 1, sparse_index_dim]``.
-        Reads/writes decompose ``slot = (page, within)`` and use
-        multi-dim fancy indexing; writes propagate to pool storage.
+        NHD shape is ``[num_pages, tokens_per_block, 1, sparse_index_dim]``;
+        HND shape is ``[num_pages, 1, tokens_per_block, sparse_index_dim]``.
         """
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=1,
             head_dim=self.sparse_index_dim,
             dtype=self._torch_dtype_for_index_cache(),
+            kv_layout=kv_layout,
         )
 
     def get_index_v_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
@@ -260,12 +301,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         The base :meth:`KVCacheManagerV2.get_buffers` produces a
         ``[num_pages, kv_factor, ...]`` view with contiguous strides
-        that assume each slot contains exactly K+V. With INDEX_KEY
-        registered, sparse layers may have ``scale > 2`` per-slot
-        buffers (e.g. M3 TP=8 coalesces K, V, INDEX_K into one pool
-        where ``scale == 3 * num_sparse + 2 * num_dense``), and the
-        base view's dim-0 stride no longer reaches the next slot's K
-        for this layer.
+        that assume the slot holds exactly one layer's K+V. In M3's
+        pool the slot packs K+V for *all* layers of the group
+        (``scale >= 2 * num_layers_in_group``), so the base view's
+        dim-0 stride does not reach the next slot's K for this layer.
+        (When INDEX_KEY's per-block size coincides with K/V's, it is
+        coalesced into the same pool and contributes to ``scale`` too.)
 
         The override builds a ``[num_slots, scale, ...]`` view rooted
         at K's base, then slices ``[:, :2]`` to extract K+V. The slice
@@ -341,75 +382,30 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
 
-    def _build_pool_mapping_tensors(self):
-        """Compute pool-mapping offsets from layer position in the pool group.
+    def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr) -> int:
+        """Pool-mapping offset from the layer's physical position in its pool.
 
-        The base method does ``exact_div(addr_offset, key_bytes *
-        kv_factor * tokens_per_block)``, which assumes each layer
-        contributes exactly K+V. When INDEX_KEY coincidentally shares
-        the same per-block size as K/V (M3 production at TP=8: all
-        three are 256 B/token), V2 coalesces all three into one pool
-        and the per-layer stride becomes ``3 * single_buffer_size`` —
-        the base ``exact_div`` then asserts.
-
-        Compute ``offset`` directly from
-        ``self.impl.layer_grouping[group_id]`` so the formula stays
-        correct regardless of how many extra buffers coalesce with
-        K/V. The M3 forward path uses :meth:`get_buffers` /
-        :meth:`get_index_k_buffer` rather than this mapping, so the
-        offset just needs to be consistent (layer position in group).
+        The base formula ``exact_div(addr_offset, key_bytes * kv_factor *
+        tokens_per_block)`` assumes each layer contributes exactly K+V to
+        its pool slot. When index-K coalesces into the K/V pool the layer
+        stride is non-uniform (sparse layers add an INDEX_KEY sub-page),
+        so no uniform-stride offset exists. The M3 forward path uses
+        :meth:`get_buffers` / :meth:`get_index_k_buffer` rather than this
+        mapping, so the offset just needs to be a consistent per-layer
+        position. Rank the group's layers by their K base address instead
+        of by ``layer_grouping`` iteration order: the ordering of
+        ``layer_grouping`` is not a V2 API contract, while the address
+        rank always reflects the physical slot layout (and keeps the
+        NVFP4 ``block_scale_offset == offset`` cross-check in the base
+        pool-mapping loop meaningful).
         """
-        kv_cache_pool_pointers = torch.tensor(
-            [
-                [
-                    self.impl.get_mem_pool_base_address(
-                        self.impl.layer_grouping[pool_id][0], Role.KEY
-                    ),
-                    0,
-                ]
-                for pool_id in range(self.num_pools)
-            ],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=prefer_pinned(),
+        layers_by_addr = sorted(
+            self.impl.layer_grouping[int(layer_group_id)],
+            key=lambda lid: self.impl.get_mem_pool_base_address(
+                lid, Role.KEY, PageIndexMode.SHARED
+            ),
         )
-
-        if self.dtype == DataType.NVFP4:
-            kv_cache_pool_pointers = torch.stack(
-                [
-                    kv_cache_pool_pointers,
-                    torch.tensor(
-                        [
-                            [
-                                self.impl.get_mem_pool_base_address(
-                                    self.impl.layer_grouping[pool_id][0], Role.KEY_BLOCK_SCALE
-                                ),
-                                0,
-                            ]
-                            for pool_id in range(self.num_pools)
-                        ],
-                        dtype=torch.int64,
-                        device="cpu",
-                        pin_memory=prefer_pinned(),
-                    ),
-                ],
-                dim=-1,
-            )
-
-        kv_cache_pool_mapping_list = []
-        for layer_id in typed_range(LayerId(self.num_local_layers)):
-            layer_group_id = self.impl.get_layer_group_id(layer_id)
-            layers_in_group = list(self.impl.layer_grouping[int(layer_group_id)])
-            offset = layers_in_group.index(int(layer_id))
-            kv_cache_pool_mapping_list.append([int(layer_group_id), offset])
-
-        kv_cache_pool_mapping = torch.tensor(
-            kv_cache_pool_mapping_list,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
-        return kv_cache_pool_pointers, kv_cache_pool_mapping
+        return layers_by_addr.index(int(layer_id))
 
     def _get_batch_cache_indices_by_pool_id(
         self,
@@ -417,34 +413,45 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         *,
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
+        index_scale: Optional[int] = None,
     ):
-        """Return per-request slot ids in ``[0, num_slots)`` directly.
+        """Return page indices; padded entries remain ``BAD_PAGE_INDEX`` (-1).
 
         The base method converts slot ids to V1-style block ids via
         ``base_idx * index_scales[pool_id] // kv_factor``, which is
-        only correct when each layer contributes exactly K+V. With
-        INDEX_KEY-coalesced sparse pools (M3 production), the scale
-        breaks the V1 conversion and produces out-of-bounds block ids
-        during V2 warmup.
+        only correct when each layer contributes exactly K+V. M3's slot
+        packs K+V for all layers of the group, so the scale breaks the
+        V1 conversion and produces out-of-bounds block ids during V2
+        warmup.
 
         Bypass the conversion: the M3 forward path indexes paged
         views (built by :meth:`get_buffers` /
         :meth:`get_index_k_buffer`) directly by slot id.
-        ``BAD_PAGE_INDEX`` slots stay as 0 to match the legacy
-        padding contract.
+        ``BAD_PAGE_INDEX`` slots remain ``-1`` here because disaggregation's
+        :class:`KVRegionExtractorV1` filters ``region_ids >= 0``.
+        :meth:`get_block_ids_per_seq` maps them to zero for the attention
+        metadata's padded tensor.
+
+        Args:
+            request_ids: Request IDs whose page-index rows are returned.
+            pool_id: V2 pool whose page indices are requested.
+            is_kv_aggregate: Kept for compatibility with the base virtual method.
+            num_blocks_per_seq: Optional per-request truncation limits. When
+                omitted, preserve the full padded width required by MiniMax
+                CUDA-graph metadata initialization.
+            index_scale: Kept for compatibility with the base virtual method;
+                M3 bypasses the V1 block-id conversion entirely, so any
+                caller-supplied scale is ignored alongside ``index_scales``.
         """
         res = []
-        for req_id in request_ids:
-            idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
-            res.append(
-                (
-                    torch.where(
-                        idx_tensor != BAD_PAGE_INDEX,
-                        idx_tensor,
-                        torch.full_like(idx_tensor, BAD_PAGE_INDEX),
-                    )
-                ).tolist()
-            )
+        for req_idx, req_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[req_id]
+            base_page_indices = kv_cache.get_base_page_indices(pool_id)
+            if num_blocks_per_seq is not None:
+                num_blocks = min(kv_cache.num_blocks, num_blocks_per_seq[req_idx])
+                base_page_indices = base_page_indices[:num_blocks]
+            res.append(list(base_page_indices))
         return res
 
     def get_block_ids_per_seq(self, request_ids):
@@ -453,20 +460,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         Drops the base's final ``i // num_local_layers`` step (paired
         with the base ``index_scales`` multiplication that's also
         bypassed here). Pads with ``0`` to preserve shape.
+
+        The rows are written through a numpy view of a single zero-filled,
+        pinned result, so the attention metadata builders ship it to the device
+        in one asynchronous copy.
         """
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-        block_ids_per_seq_tensors = [
-            torch.tensor(
-                [i if i != BAD_PAGE_INDEX else 0 for i in sublist],
-                dtype=torch.int,
-            )
-            for sublist in block_ids_per_seq
-        ]
-        padded_tensor = torch.nn.utils.rnn.pad_sequence(
-            block_ids_per_seq_tensors,
-            batch_first=True,
-            padding_value=0,
+        batch = len(block_ids_per_seq)
+        max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
+        padded_tensor = torch.zeros(
+            (batch, max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
         )
+        rows = padded_tensor.numpy()
+        for row, block_ids in zip(rows, block_ids_per_seq):
+            row[: len(block_ids)] = block_ids
+        # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
+        rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor
 
 

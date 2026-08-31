@@ -90,7 +90,7 @@ cd tests/integration/defs
 # Run all fp8 functional test
 pytest --no-header -vs --test-list=../test_lists/qa/llm_function_full.txt -k fp8
 # Run a single test case
-pytest -vs accuracy/test_cli_flow.py::TestLlama3_1_8B::test_auto_dtype
+pytest -vs accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
 ```
 
 ### Automated Execution

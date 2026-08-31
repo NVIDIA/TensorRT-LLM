@@ -14,7 +14,7 @@
 # limitations under the License.
 r"""Integration tests for prefix-aware scheduling with trtllm-serve.
 
-Launches trtllm-serve with Qwen2-0.5B and runs the LMBenchmark
+Launches trtllm-serve with Qwen3-0.6B and runs the LMBenchmark
 multi-round QA workload that originally triggered the over-admission bug:
   total_num_tokens (13985) should be less than or equal to max_num_tokens (8192)
 
@@ -50,8 +50,8 @@ from ..conftest import llm_models_root
 from ..local_venv import PythonVenvRunnerImpl
 from ..trt_test_alternative import popen, print_error, print_info
 
-MODEL_PATH = f"{llm_models_root()}/Qwen2-0.5B"
-MODEL_NAME = "Qwen2-0.5B"
+MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
+MODEL_NAME = "Qwen3-0.6B"
 
 # c1e05a70 "add timeout, skip-ssl-verify, gap-between-requests, itl/throughput
 # metrics to real multi-round qa (#36)" by Ziwen Ning, 2026-01-28.
@@ -146,7 +146,7 @@ SCHED_CONFIGS = [
         id="python-scheduler",
     ),
     # ── Sliding-window attention (SWA, 2048-token window) ────────────────────
-    # Qwen2-0.5B has 24 layers; max_attention_window=[2048] broadcasts to all.
+    # Qwen3-0.6B: max_attention_window=[2048] broadcasts to all layers.
     # The 1000-token system prompt fits within the window, but older history
     # rounds are evicted, exercising the SWA eviction path in the scheduler.
     pytest.param(
@@ -662,6 +662,11 @@ def _run_lmbenchmark(
     benchmark_debug_context = _stage_debug_context(debug_context, port, server_log, output_csv)
 
     def _popen_lmbenchmark(call_args: list[str], env: Mapping[str, str]) -> subprocess.Popen:
+        # multi-round-qa.py imports its sibling utils.py via the implicit
+        # script-directory sys.path entry. PYTHONSAFEPATH=1 (set by some CI
+        # environments) disables that entry and the script dies at import
+        # time with ModuleNotFoundError: No module named 'utils'.
+        env = {k: v for k, v in env.items() if k != "PYTHONSAFEPATH"}
         return subprocess.Popen(
             call_args,
             stdout=subprocess.PIPE,
@@ -695,7 +700,7 @@ def _run_lmbenchmark(
     # Grace window above the scripted duration. LMBenchmark keeps requests
     # in flight after `--time` expires, and at higher QPS the backlog the
     # server still has to drain scales roughly linearly with offered load.
-    # Observed worst-case drain on H100 PCIe + Qwen2-0.5B (5 scheduler
+    # Observed worst-case drain on H100 PCIe + Qwen3-0.6B (5 scheduler
     # variants, 3 stages each): drain ≈ 1.7·qps + 1 s. The coefficient below
     # gives ≥2.8× margin over the observed worst case at every tested qps
     # while still catching genuine stalls within a few minutes.

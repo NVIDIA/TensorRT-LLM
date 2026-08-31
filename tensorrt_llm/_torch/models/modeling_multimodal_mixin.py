@@ -15,70 +15,302 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
-import os
+import copy
+import itertools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Hashable,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.registry import (
+    MultimodalEncoderItemMetadata,
+    get_multimodal_encoder_item_metadata,
+)
 from tensorrt_llm.logger import logger
 
 from .modeling_multimodal_utils import (
-    _cache_multimodal_embeddings,
+    _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
 
+
+class MultimodalEncoderContractError(ValueError):
+    """A request-local MM encoder input or output contract violation."""
+
+
+def _assemble_multimodal_encoder_embeddings(
+    item_tensors: Dict[int, torch.Tensor], total_items: int
+) -> torch.Tensor:
+    """Copy prompt-ordered item embeddings into one contiguous tensor."""
+    ordered = [item_tensors[i] for i in range(total_items)]
+    first = ordered[0]
+    if any(
+        output.shape[1:] != first.shape[1:]
+        or output.dtype != first.dtype
+        or output.device != first.device
+        for output in ordered[1:]
+    ):
+        raise ValueError(
+            "MM encoder items for one request must have matching output shape, dtype, and device"
+        )
+
+    embeddings = torch.empty(
+        (sum(output.shape[0] for output in ordered), *first.shape[1:]),
+        dtype=first.dtype,
+        device=first.device,
+    )
+    start = 0
+    for output in ordered:
+        end = start + output.shape[0]
+        embeddings[start:end].copy_(output.detach())
+        start = end
+    return embeddings
+
+
+@dataclass(frozen=True)
+class EncoderGroup:
+    """Modalities that share a single encoder call.
+
+    Batching all items in a group into one encoder invocation amortizes
+    fixed costs (kernel launches, dispatch) across items. The framework
+    splits the output back per-modality and reorders it into prompt order
+    via each request's `mm_item_order` manifest.
+
+    Contract between `build_batched_input` and `encoder_fn`:
+
+    * `build_batched_input` must concatenate items across requests in
+      `modalities` order (all items for the first modality across requests,
+      then all items for the second modality, etc.).
+    * Within a modality, items must appear in the same per-request iteration
+      order that `_lengths_by_modality` uses (i.e. the order of
+      `multimodal_params` passed in).
+    * `encoder_fn` must return one tensor whose rows correspond 1:1 to the
+      input layout produced by `build_batched_input`, so the framework can
+      split the output by `_lengths_by_modality` and reorder into prompt
+      order via each request's `mm_item_order` manifest.
+    """
+
+    modalities: Tuple[str, ...]
+    """Ordered modality names that share this encoder. Defines the row
+    layout of the encoder output tensor: first all items of
+    `modalities[0]`, then all items of `modalities[1]`, etc."""
+
+    encoder_fn: Callable[..., torch.Tensor]
+    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`.
+    Returns a single tensor with one row per embedding, laid out per the
+    contract above."""
+
+    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
+    """Builds the kwargs dict passed to `encoder_fn`. Responsible for
+    concatenating raw per-item tensors from `multimodal_data` across
+    requests in the order described in the class docstring."""
+
+
+def _lengths_by_modality(
+    multimodal_params: List[MultimodalParams],
+    modalities: Tuple[str, ...],
+) -> Dict[str, List[int]]:
+    """Invert prompt-ordered `multimodal_embedding_lengths` (number of
+    embedding rows per item) into per-modality per-item lengths, matching
+    the per-modality item order used by `EncoderGroup.build_batched_input`.
+
+    Glossary used below:
+
+    * **group** — one `EncoderGroup` entry (a single tuple of modalities
+      that share an encoder call). E.g. Qwen3-VL registers one group
+      `("image", "video")`; Nano registers three groups
+      `("image",)`, `("video",)`, `("audio",)`.
+    * **group-local modalities** — the `modalities` tuple of the group
+      whose encoder is being invoked (this function's `modalities` arg).
+    * **cross-group mix** — a single request whose items span modalities
+      belonging to two *different* groups (e.g. one image + one audio
+      item for Nano, where image and audio live in separate groups).
+    * **multi-group model** — a model that registers more than one
+      `EncoderGroup`, so its group-local `modalities` tuples are each
+      strictly narrower than the full request-level modality set.
+    """
+    by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
+    for mp in multimodal_params:
+        flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
+        if mp.mm_item_order:
+            for entry, length in zip(mp.mm_item_order, flat, strict=True):
+                if entry["modality"] in by_modality:
+                    by_modality[entry["modality"]].append(length)
+            continue
+        # Raw-prompt entrypoints (non chat-parsing) do not attach a manifest,
+        # so this is the single enforcement point that a >1-modality request
+        # must carry `mm_item_order` to make prompt-order reordering possible.
+        # Check the *request-level* modality set so multi-group models (each
+        # group with a single modality) still catch cross-group mixes — the
+        # group-local `modalities` tuple can have length 1 and never trip.
+        present = [m for m in _MM_DATA_INPUT_MODALITY_KEYS if mp.multimodal_data.get(m) is not None]
+        if len(present) > 1:
+            raise ValueError(
+                "Request with multiple modalities present "
+                f"({present}) must carry mm_item_order on MultimodalParams."
+            )
+        if present and present[0] in by_modality:
+            by_modality[present[0]].extend(flat)
+    return by_modality
+
+
+def _reorder_embeds_by_manifest(
+    multimodal_params: List[MultimodalParams],
+    per_modality_embeds: Dict[str, torch.Tensor],
+    per_modality_lengths: Dict[str, List[int]],
+) -> torch.Tensor:
+    """Slice per-modality tensors item-by-item and concat in prompt order."""
+    per_modality_row_starts: Dict[str, List[int]] = {
+        m: list(itertools.accumulate(lens, initial=0)) for m, lens in per_modality_lengths.items()
+    }
+
+    slices: List[torch.Tensor] = []
+    # `entry["index"]` is per-request per-modality; advance a cursor to
+    # translate it into a global item index within `per_modality_embeds`.
+    per_modality_cursor: Dict[str, int] = {m: 0 for m in per_modality_embeds}
+    for mp in multimodal_params:
+        manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
+            mp, per_modality_embeds.keys()
+        )
+        req_counts: Dict[str, int] = {}
+        for entry in manifest:
+            m = entry["modality"]
+            if m not in per_modality_embeds:
+                continue
+            i = per_modality_cursor[m] + entry["index"]
+            starts = per_modality_row_starts[m]
+            slices.append(per_modality_embeds[m][starts[i] : starts[i + 1]])
+            req_counts[m] = req_counts.get(m, 0) + 1
+        for m, c in req_counts.items():
+            per_modality_cursor[m] += c
+    if not slices:
+        # No items resolved for any request. This happens on the executor's
+        # KV-cache profiling pass: `_encode_dummy_inputs` runs the encoder on a
+        # worst-case dummy batch that carries the encoder tensors but no
+        # `multimodal_embedding_lengths`, so the per-modality lengths (and thus
+        # the sliced `per_modality_embeds`) come back empty. The encoder forward
+        # still ran (its activation is what peak-memory profiling captures), so
+        # return a correctly-typed empty embedding tensor instead of crashing on
+        # `torch.cat([])`. `per_modality_embeds` values are already zero-row
+        # slices of the encoder output, so their concat preserves dtype/device
+        # and the hidden dim.
+        if per_modality_embeds:
+            return torch.cat(list(per_modality_embeds.values()), dim=0)
+        return torch.empty(0)
+    return torch.cat(slices, dim=0)
+
+
+def _synthesize_single_modality_manifest(
+    mp: MultimodalParams,
+    modalities: Iterable[str],
+) -> List[Dict[str, Union[str, int]]]:
+    """Trivial manifest for requests with only one modality present."""
+    flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
+    for m in modalities:
+        if mp.multimodal_data.get(m) is not None:
+            return [{"modality": m, "index": i} for i in range(len(flat))]
+    return []
+
+
+def encode_multimodal_by_groups(
+    mm_encoder_groups: Sequence["EncoderGroup"],
+    multimodal_params: List[MultimodalParams],
+) -> torch.Tensor:
+    """Run each group's encoder over its batched items and reorder into
+    per-request prompt order.
+
+    For each group present in the batch, one encoder call is issued over all
+    items across all requests belonging to that group's modalities
+    (arithmetic-intensity win). The output is split back per-modality using
+    the prompt-ordered `multimodal_embedding_lengths` already stashed on
+    `multimodal_data`, then reordered into each request's `mm_item_order`
+    prompt sequence.
+
+    Shared entry point for both the aggregated (`MultimodalModelMixin`) and
+    mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
+    contract lives in one place.
+    """
+    per_modality_embeds: Dict[str, torch.Tensor] = {}
+    per_modality_lengths: Dict[str, List[int]] = {}
+    for group in mm_encoder_groups:
+        group_params = [
+            mp
+            for mp in multimodal_params
+            if any(mp.multimodal_data.get(m) is not None for m in group.modalities)
+        ]
+        if not group_params:
+            continue
+        out = group.encoder_fn(**group.build_batched_input(group_params))
+        lengths = _lengths_by_modality(group_params, group.modalities)
+        cursor = 0
+        for m in group.modalities:
+            total = sum(lengths[m])
+            per_modality_embeds[m] = out[cursor : cursor + total]
+            cursor += total
+        per_modality_lengths.update(lengths)
+    return _reorder_embeds_by_manifest(multimodal_params, per_modality_embeds, per_modality_lengths)
+
+
 if TYPE_CHECKING:
+    from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
 
-_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME = "TLLM_MM_SIDE_STREAM_MAX_AHEAD"
-_MM_SIDE_STREAM_DEFAULT_MAX_AHEAD = 0
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
+_MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
 
 
-def _get_mm_side_stream_max_ahead() -> int:
-    raw_value = os.getenv(_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME)
-    if raw_value is None:
-        return _MM_SIDE_STREAM_DEFAULT_MAX_AHEAD
-
-    try:
-        max_ahead = int(raw_value)
-    except ValueError:
-        logger.warning_once(
-            f"Invalid {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={raw_value!r}; "
-            f"using default value {_MM_SIDE_STREAM_DEFAULT_MAX_AHEAD}.",
-            key="invalid_mm_side_stream_max_ahead",
-        )
-        return _MM_SIDE_STREAM_DEFAULT_MAX_AHEAD
-
-    if max_ahead < 0:
-        logger.warning_once(
-            f"Invalid {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={raw_value!r}; "
-            "treating negative value as 0.",
-            key="negative_mm_side_stream_max_ahead",
-        )
-        return 0
-    return max_ahead
+def _build_request_multimodal_input(
+    request: "LlmRequest", cache_enabled: bool
+) -> Optional[MultimodalInput]:
+    """Build the encoder-cache key metadata carried by one request."""
+    # Skip construction (and `from_components` validation) when no persistent cache consumes it.
+    if not cache_enabled or request.multimodal_hashes is None:
+        return None
+    # `MultimodalModelMixin._encoder_cache_keys` uses UUID-aware multimodal hashes internally.
+    # Although the UUIDs are not exposed as an attribute, they remain in the backing C++ request
+    # for KV-cache block keys and cache events.
+    return MultimodalInput.from_components(
+        request.multimodal_hashes,
+        request.multimodal_positions,
+        request.multimodal_lengths,
+        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
+        mm_run_positions=request.multimodal_run_positions,
+        mm_run_lengths=request.multimodal_run_lengths,
+    )
 
 
-def _get_mm_aux_stream(max_prefetch_ahead: Optional[int] = None) -> Optional[torch.cuda.Stream]:
+def _get_mm_aux_stream(max_prefetch_ahead: int = 0) -> Optional[torch.cuda.Stream]:
     """Return the side CUDA stream used for multimodal encoder prefetch.
 
-    Returns `None` when `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is unset or non-positive,
-    CUDA is unavailable, or the current stream is being captured. The cache intentionally
-    keeps only one stream because executor processes are expected to run on one current
+    Returns `None` when side-stream prefetch is disabled, CUDA is unavailable,
+    or the current stream is being captured. The cache intentionally keeps only
+    one stream because executor processes are expected to run on one current
     CUDA device; if the current device changes, the cached stream is replaced.
     """
     global _MM_AUX_STREAM
 
-    if max_prefetch_ahead is None:
-        max_prefetch_ahead = _get_mm_side_stream_max_ahead()
     if max_prefetch_ahead <= 0:
         return None
     if not torch.cuda.is_available():
@@ -91,7 +323,7 @@ def _get_mm_aux_stream(max_prefetch_ahead: Optional[int] = None) -> Optional[tor
         _MM_AUX_STREAM = (device, torch.cuda.Stream(device=device))
         logger.warning_once(
             f"Using multimodal encoder side stream on CUDA device {device} "
-            f"with {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={max_prefetch_ahead}. "
+            f"with encoder_side_stream_max_ahead={max_prefetch_ahead}. "
             "This may increase peak GPU memory usage because raw multimodal "
             "encoder inputs and computed embeddings can be resident before "
             "request prefill.",
@@ -132,13 +364,63 @@ class PreparedLlmInputs:
     extra_embeds: Sequence[torch.Tensor] = ()
 
 
+@dataclass(frozen=True)
+class EncoderCachePartition:
+    """Per-item cache partition for a single `MultimodalParams`.
+
+    `hits` maps item index to its cached embedding row-block; `miss_indices` lists item
+    indices that still require encoder work; `keys` is aligned to item order so miss
+    embeddings can be written back after they are computed.
+
+    `keys` always spans every item in the request -- full embedding assembly needs the total
+    item count, and misses are written back by item index. `hits` and `miss_indices` instead
+    cover only `looked_up`, the indices the caller asked about. The item scheduler passes the
+    subset it picked for this iteration, so items it has no budget for yet are not touched: an
+    LRU `get` refreshes recency, and probing an item the caller cannot encode would reorder
+    eviction against items that are actually in flight.
+    """
+
+    hits: Dict[int, torch.Tensor]
+    miss_indices: list[int]
+    keys: list[Hashable]
+    looked_up: list[int]
+
+    @property
+    def is_full_hit(self) -> bool:
+        return bool(self.looked_up) and not self.miss_indices
+
+    @property
+    def is_full_miss(self) -> bool:
+        return bool(self.looked_up) and not self.hits
+
+
 class MultimodalModelMixin:
     """Template-method mixin for PyTorch multimodal causal LM models.
 
-    Concrete model forwards can call `prepare_multimodal_inputs` while
-    keeping their explicit language-model delegation. A future optional
-    mixin-owned forward can build on the same template method.
+    Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
+    language-model delegation.
+
+    Current limitations:
+
+    * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
+      single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
+    * A partially cached `MultimodalParams` is handled by encoding only its miss items
+      and interleaving cached items back in original per-item order. The default
+      `build_multimodal_encoder_input` handles stacked-on-dim-0 and packed-with-grid-thw
+      layouts; models with other layouts override that method.
     """
+
+    supports_encoder_cache: ClassVar[bool] = False
+    """Whether the model's production forward path uses the persistent encoder cache."""
+
+    supports_mm_encoder_item_scheduling: ClassVar[bool] = False
+    """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
+    forward and pairs with a processor that overrides
+    `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the executor-layer gate for
+    item scheduling."""
+
+    model_config: ModelConfig
+    _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -157,6 +439,14 @@ class MultimodalModelMixin:
 
         return module._apply(convert)
 
+    # Per-model registration of encoder-batching groups. Each `EncoderGroup`
+    # bundles a set of modalities that share one encoder call. Set as a class
+    # attribute or on `self` in `__init__` (when `encoder_fn` binds to instance
+    # methods). Consumers call the module-level `encode_multimodal_by_groups`
+    # with these groups; both the aggregated and mm-encoder-only paths share
+    # that helper so the ordering contract lives in one place.
+    mm_encoder_groups: Sequence[EncoderGroup] = ()
+
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
@@ -169,6 +459,148 @@ class MultimodalModelMixin:
         """
         raise NotImplementedError
 
+    def prepare_multimodal_encoder_inputs(
+        self,
+        selected_items: Sequence[tuple[MultimodalParams, int]],
+    ) -> list[tuple[MultimodalParams, list[int], str]]:
+        """Build selected item encoder inputs before the caller performs H2D.
+
+        Adjacent items from the same request and modality are sliced in one
+        call. That is not just tidier: the packed-layout slicer splits the
+        request's whole pixel payload and concatenates the chosen pieces, so
+        slicing item-by-item re-splits the payload N times and copies each
+        item separately.
+
+        Args:
+            selected_items: `(request params, item index)` pairs in scheduler-selected order.
+
+        Returns:
+            Tuples of `(sliced encoder params, per-item embedding row counts, modality)`, in
+            input order. Flattening the row-count lists recovers the per-item sequence.
+        """
+        encoder_inputs: list[tuple[MultimodalParams, list[int], str]] = []
+        for (
+            multimodal_param,
+            run_indices,
+            modality,
+            item_metadata,
+        ) in self._runs_by_request_modality(selected_items):
+            item_refs = item_metadata.item_refs
+            # The two slicers take different index spaces. The raw-tensor
+            # slicer indexes the modality's own payload, so it gets the
+            # modality-local indices (plus the modality, which also lets it
+            # slice out of an interleaved request); the parallel metadata is
+            # prompt-ordered across modalities, so it gets the global ones.
+            try:
+                residual = self.build_multimodal_encoder_input(
+                    multimodal_param,
+                    [item_refs[i][1] for i in run_indices],
+                    modality=modality,
+                )
+                self._apply_metadata_slice(residual, multimodal_param, run_indices)
+            except MultimodalEncoderContractError:
+                raise
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise MultimodalEncoderContractError(
+                    f"Invalid multimodal encoder item input: {error}"
+                ) from error
+            encoder_inputs.append(
+                (
+                    residual,
+                    [int(item_metadata.output_embedding_lengths[i]) for i in run_indices],
+                    modality,
+                )
+            )
+        return encoder_inputs
+
+    @staticmethod
+    def _runs_by_request_modality(
+        selected_items: Sequence[tuple[MultimodalParams, int]],
+    ) -> Iterator[tuple[MultimodalParams, list[int], str, "MultimodalEncoderItemMetadata"]]:
+        """Split scheduler order into maximal same-request, same-modality runs.
+
+        Only adjacent items merge, so the flattened result keeps the
+        scheduler's order and outputs map back positionally. Each run also
+        carries its request's item metadata: fetching it validates the whole
+        record, so it is read once per request rather than once per item, and
+        the caller reuses it instead of fetching again.
+        """
+        run_param: Optional[MultimodalParams] = None
+        run_modality: Optional[str] = None
+        run_metadata: Optional[MultimodalEncoderItemMetadata] = None
+        run_indices: list[int] = []
+        for multimodal_param, item_idx in selected_items:
+            try:
+                metadata = (
+                    run_metadata
+                    if multimodal_param is run_param
+                    else get_multimodal_encoder_item_metadata(
+                        multimodal_param.multimodal_data or {}
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                raise MultimodalEncoderContractError(str(error)) from error
+            if metadata is None:
+                raise MultimodalEncoderContractError(
+                    "MM item metadata is required for item encoding"
+                )
+            if item_idx < 0 or item_idx >= len(metadata.item_refs):
+                raise MultimodalEncoderContractError(
+                    f"MM item index {item_idx} is out of range for "
+                    f"{len(metadata.item_refs)} item(s)"
+                )
+            modality = metadata.item_refs[item_idx][0]
+            if run_indices and (multimodal_param is not run_param or modality != run_modality):
+                yield run_param, run_indices, run_modality, run_metadata
+                run_indices = []
+            run_param, run_modality, run_metadata = multimodal_param, modality, metadata
+            run_indices.append(item_idx)
+        if run_indices:
+            yield run_param, run_indices, run_modality, run_metadata
+
+    def forward_multimodal_encoder_items(
+        self,
+        encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],
+    ) -> list[torch.Tensor]:
+        """Forward prepared MM encoder inputs in scheduler item order.
+
+        Args:
+            encoder_inputs: Tuples returned by `prepare_multimodal_encoder_inputs`. Consecutive
+                inputs with the same modality must be batch-compatible.
+
+        Returns:
+            One encoder output tensor **per item** (not per input tuple). Each tensor has the
+            declared embedding row count and retains scheduler input order.
+        """
+        outputs: list[torch.Tensor] = []
+        group_params: list[MultimodalParams] = []
+        group_lengths: list[int] = []
+        group_modality: Optional[str] = None
+
+        def flush_group() -> None:
+            if not group_params:
+                return
+            embeddings = self.encode_multimodal_inputs(group_params)
+            expected_length = sum(group_lengths)
+            if embeddings.shape[0] != expected_length:
+                raise MultimodalEncoderContractError(
+                    f"MM encoder output length {embeddings.shape[0]} does not "
+                    f"match the {expected_length} rows declared by the "
+                    "selected items"
+                )
+            outputs.extend(torch.split(embeddings, group_lengths, dim=0))
+            group_params.clear()
+            group_lengths.clear()
+
+        for multimodal_param, embedding_lengths, modality in encoder_inputs:
+            if group_modality is not None and modality != group_modality:
+                flush_group()
+            group_modality = modality
+            group_params.append(multimodal_param)
+            group_lengths.extend(embedding_lengths)
+        flush_group()
+        return outputs
+
     @property
     def multimodal_token_ids(self) -> Optional[Sequence[int] | torch.Tensor]:
         """Return placeholder token ids in `input_ids` replaced by MM embeds.
@@ -177,12 +609,41 @@ class MultimodalModelMixin:
         by multimodal embeddings. Return `None` to use the out-of-vocabulary
         sentinel behavior in `fuse_input_embeds`.
         """
-        raise NotImplementedError
+        return None
 
     @property
     def text_embedding_layer(self):
         """Return the token embedding layer used by `fuse_input_embeds`."""
         raise NotImplementedError
+
+    @property
+    def embedding_dim(self) -> int:
+        """Return the width of each cached multimodal embedding row."""
+        raise NotImplementedError
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        """Return the dtype of each cached multimodal embedding row."""
+        raise NotImplementedError
+
+    @property
+    def encoder_cache_active(self) -> bool:
+        """Whether the persistent encoder cache is active for this model.
+
+        Single source of truth shared by:
+
+        * the in-iter consume path
+        * the side-stream prefetch dispatch
+        * the engine's cache-related gate
+        * the KV-cache memory reservation.
+
+        The cache is only active when the model opts in via `supports_encoder_cache` and configures
+        a positive capacity.
+        """
+        if not self.supports_encoder_cache:
+            return False
+        multimodal_config = self.model_config.multimodal_config
+        return multimodal_config is not None and multimodal_config.encoder_cache_max_bytes > 0
 
     def select_multimodal_params(
         self,
@@ -191,15 +652,136 @@ class MultimodalModelMixin:
     ) -> Sequence[MultimodalParams]:
         """Select the params that participate in multimodal encoder work.
 
-        Returns the context-slice params with multimodal content. Helpers below
+        Returns the context-slice params with active multimodal content. Helpers below
         this method (`get_multimodal_embeddings`, `find_input_mm_embeds`,
         `fuse_input_embeds`) operate on the returned list and therefore see
         only `has_content()` params. Models overriding this hook must
         preserve that invariant.
         """
         return [
-            param for param in list(multimodal_params)[:num_context_requests] if param.has_content()
+            param
+            for param in list(multimodal_params)[:num_context_requests]
+            if param.has_content()
+            and (
+                param.multimodal_runtime is None
+                or param.multimodal_runtime.num_mm_tokens_in_chunk != 0
+            )
         ]
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        """Return the inner language model that receives prepared inputs."""
+        raise NotImplementedError
+
+    @property
+    def vocab_size_padded(self) -> int:
+        """Return the inner language model's padded vocabulary size."""
+        return self.language_model.vocab_size_padded
+
+    def infer_max_seq_len(self) -> int:
+        """Return the inner language model's maximum sequence length."""
+        return self.language_model.infer_max_seq_len()
+
+    def set_guided_decoder(self, guided_decoder: "CapturableGuidedDecoder") -> bool:
+        """Install a guided decoder on the inner language model.
+
+        Returns False when the inner model does not support guided decoding,
+        matching the contract ModelEngine.set_guided_decoder() expects.
+        """
+        inner = self.language_model
+        if not hasattr(inner, "set_guided_decoder"):
+            return False
+        return inner.set_guided_decoder(guided_decoder)
+
+    def get_language_model_extra_forward_kwargs(
+        self,
+        *,
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Return model-specific arguments for the inner language-model forward."""
+        return {}
+
+    def get_language_model_forward_kwargs(
+        self,
+        *,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor],
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        return_context_logits: bool,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build common and model-specific inner language-model forward arguments."""
+        llm_kwargs = {
+            "attn_metadata": attn_metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "return_context_logits": return_context_logits,
+        }
+        llm_kwargs.update(
+            self.get_language_model_extra_forward_kwargs(
+                raw_input_ids=raw_input_ids,
+                position_ids=position_ids,
+                mm_inputs=mm_inputs,
+                **forward_kwargs,
+            )
+        )
+        return llm_kwargs
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Prepare multimodal inputs and dispatch them to the language model."""
+        multimodal_params = kwargs.pop("multimodal_params", [])
+        mm_inputs = self.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=position_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=attn_metadata.num_contexts,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+        if inputs_embeds is not None:
+            if mm_inputs.inputs_embeds is not None:
+                raise ValueError(
+                    "MultimodalModelMixin.forward received both caller-supplied inputs_embeds "
+                    "and multimodal-derived inputs_embeds. These paths are mutually exclusive; "
+                    "pass at most one."
+                )
+            mm_inputs = PreparedLlmInputs(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                extra_embeds=mm_inputs.extra_embeds,
+            )
+
+        llm_kwargs = self.get_language_model_forward_kwargs(
+            attn_metadata=attn_metadata,
+            input_ids=mm_inputs.input_ids,
+            raw_input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=mm_inputs.inputs_embeds,
+            mm_inputs=mm_inputs,
+            return_context_logits=return_context_logits,
+            multimodal_params=multimodal_params,
+            num_generation_requests=attn_metadata.num_generations,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        return self.language_model.forward(**llm_kwargs)
 
     def after_full_multimodal_embeddings(
         self,
@@ -234,6 +816,181 @@ class MultimodalModelMixin:
         # them as extra embeds without changing the base flow.
         return active_embeddings, ()
 
+    def build_multimodal_encoder_input(
+        self,
+        param: MultimodalParams,
+        item_indices: Sequence[int],
+        modality: Optional[str] = None,
+    ) -> MultimodalParams:
+        """Return a `MultimodalParams` whose raw modality inputs contain only
+        `item_indices` from `param`, in that order.
+
+        `item_indices` are indices into `modality`'s own payload. When `modality`
+        is None it is inferred from `param`, which requires the request to hold a
+        single modality -- the full-request path's case, where an item's global
+        index and its index within its modality coincide. Callers that already
+        know an item's modality (item scheduling reads it from `item_refs`) pass
+        it explicitly along with the modality-local indices, which is what lets
+        a single item be sliced out of an interleaved image+video request.
+
+        Default handles three common single-modality layouts:
+
+        - Image, stacked on dim 0 (Mistral 3 / Pixtral / LLaVA-family): `pixel_values`
+          `[B, C, H, W]` with a parallel `image_sizes` list; both sliced by item.
+        - Image / video, packed with `*_grid_thw` offsets (Qwen2-VL family):
+          `pixel_values` `[total_patches, feat]` + `image_grid_thw` `[B, 3]`;
+          prefix-summed patch counts locate each item's slice, and `image_grid_thw`
+          is sliced in parallel.
+        - Audio, stacked on dim 0 (Whisper / Qwen2-Audio / Gemma4 audio):
+          `input_features` `[B, mel_bins, T]` sliced by item.
+
+        Any additional sibling field in the modality dict whose first-axis length equals
+        the item count is also sliced -- covers per-item metadata such as
+        `second_per_grid_ts` (Qwen2.5-VL video) or `input_features_mask` /
+        `feature_attention_mask` (audio) without model-specific code.
+
+        Models with a different layout (e.g. mixed-modality per param, custom packed
+        formats) should override this method. The parallel per-item metadata
+        (`multimodal_embedding_lengths`, `multimodal_hashes`) is model-agnostic and is
+        re-sliced by the mixin after this returns, so overrides need only handle the
+        modality-specific raw data.
+        """
+        if modality is None:
+            modality = self._encoder_cache_modality(param)
+        if modality is None:
+            raise NotImplementedError(
+                "Default `build_multimodal_encoder_input` cannot infer the modality of a "
+                "mixed-modality param. Pass `modality` with modality-local indices, or "
+                "override for other layouts."
+            )
+        modality_data = param.multimodal_data[modality]
+        if not isinstance(modality_data, dict):
+            raise TypeError(
+                f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
+            )
+
+        indices = list(item_indices)
+        grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
+        pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
+
+        if (
+            (grid_key and pixel_key)
+            and (grid_key in modality_data)
+            and (pixel_key in modality_data)
+        ):
+            # Packed layout: prefix-sum patch counts to locate each item's slab, then
+            # concat the requested subset in item-index order.
+            grids = modality_data[grid_key]
+            n_items = grids.shape[0]
+            patch_counts = [int(c) for c in torch.prod(grids, dim=1).tolist()]
+            row_starts = list(itertools.accumulate(patch_counts, initial=0))
+            if indices == list(range(indices[0], indices[0] + len(indices))):
+                # Contiguous run: the concatenation is just a row range, so take
+                # a view instead of copying the payload. The common case for
+                # both callers -- a scheduler picks items in order, and cache
+                # misses cluster.
+                pixel_slice = modality_data[pixel_key][
+                    row_starts[indices[0]] : row_starts[indices[-1] + 1]
+                ]
+            else:
+                per_item = torch.split(modality_data[pixel_key], patch_counts, dim=0)
+                pixel_slice = torch.cat([per_item[i] for i in indices], dim=0)
+            sliced = {
+                pixel_key: pixel_slice,
+                grid_key: grids[indices],
+            }
+        elif (
+            modality == "image"
+            and "pixel_values" in modality_data
+            and "image_sizes" in modality_data
+        ):
+            # Stacked layout: dim-0 select from `pixel_values` and list-index `image_sizes`.
+            n_items = modality_data["pixel_values"].shape[0]
+            miss_sizes = [modality_data["image_sizes"][i] for i in indices]
+            miss_pixel = modality_data["pixel_values"][indices]
+            # `pixel_values` was padded to the request-wide max H/W by the input
+            # processor. After keeping only the miss subset, crop the trailing H/W back
+            # down to that subset's own max true size -- otherwise a downstream re-batch
+            # step (e.g. Mistral 3's `batch_pixel_values`) that pads to
+            # `max(residual.image_sizes)` would compute a negative pad amount whenever
+            # the omitted items were the largest in the original request.
+            if miss_sizes and miss_pixel.dim() >= 4:
+                max_h = max(int(s[0]) for s in miss_sizes)
+                max_w = max(int(s[1]) for s in miss_sizes)
+                miss_pixel = miss_pixel[..., :max_h, :max_w]
+            sliced = {
+                "pixel_values": miss_pixel,
+                "image_sizes": miss_sizes,
+            }
+        elif modality == "audio" and "input_features" in modality_data:
+            # Stacked layout: `input_features [B, mel_bins, T]` sliced on dim 0.
+            # Per-item masks (`input_features_mask`, `feature_attention_mask`, ...)
+            # are handled by the sibling-slice pass below.
+            n_items = modality_data["input_features"].shape[0]
+            sliced = {
+                "input_features": modality_data["input_features"][indices],
+            }
+        else:
+            raise NotImplementedError(
+                f"Default `build_multimodal_encoder_input` cannot slice {modality} layout "
+                f"with fields {sorted(modality_data)}; override this method."
+            )
+
+        # Sibling per-item fields (e.g. `second_per_grid_ts` on Qwen2.5-VL video)
+        # must be sliced alongside the load-bearing keys above, or the residual
+        # carries a shape-mismatched encoder input.
+        sliced = {
+            **modality_data,
+            **sliced,
+            **self._slice_per_item_sibling_fields(modality_data, n_items, indices, sliced.keys()),
+        }
+
+        # Shallow-copy `multimodal_input` so `_apply_metadata_slice` can rewrite
+        # `multimodal_hashes` on the residual without mutating the source.
+        residual_input = (
+            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
+        )
+        # Carry the source's other entries through, but keep only the sliced
+        # modality's raw payload: leaving a sibling modality's unsliced tensors
+        # on the residual would make it look mixed-modality to the encoder
+        # (`_lengths_by_modality` rejects that without an `mm_item_order`
+        # manifest) while its rows were never requested.
+        residual_data = {
+            key: value
+            for key, value in param.multimodal_data.items()
+            if key not in _MM_DATA_INPUT_MODALITY_KEYS or key == modality
+        }
+        residual_data[modality] = sliced
+        return MultimodalParams(
+            multimodal_data=residual_data,
+            multimodal_input=residual_input,
+        )
+
+    @staticmethod
+    def _slice_per_item_sibling_fields(
+        modality_data: Dict[str, Any],
+        n_items: int,
+        item_indices: Sequence[int],
+        already_sliced: Iterable[str],
+    ) -> Dict[str, Any]:
+        """Slice modality-dict siblings whose first axis is parallel to items.
+
+        Anything with `shape[0] == n_items` (tensor) or `len == n_items` (list) is
+        assumed to be per-item metadata and sliced by `item_indices`. Fields already
+        handled by the caller (`already_sliced`) and everything else pass through.
+        """
+        skip = set(already_sliced)
+        sliced: Dict[str, Any] = {}
+        for key, value in modality_data.items():
+            if key in skip:
+                continue
+            if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == n_items:
+                sliced[key] = value[item_indices]
+            elif isinstance(value, list) and len(value) == n_items:
+                sliced[key] = [value[i] for i in item_indices]
+        return sliced
+
+    # A future optional mixin-owned forward can build on the same template method.
     def prepare_multimodal_inputs(
         self,
         *,
@@ -303,15 +1060,452 @@ class MultimodalModelMixin:
 
         Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
         the single tensor contract for both encoded and cached-only paths.
+
+        During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
+        the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
+        records each entry's producer event on the issuing (aux) stream; the next iteration's
+        main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
+        encoder_cache = self._get_multimodal_encoder_cache()
+        cache_misses: list[MultimodalParams] = []
+        partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
+        if encoder_cache is not None:
+            for param in multimodal_params:
+                if param.multimodal_data.get("multimodal_embedding") is not None:
+                    # A present embedding means either an earlier forward already wrote the
+                    # persistent cache, or a prefetch hit attached a cache-owned tensor. Either
+                    # way, skip re-lookup and re-write. `get_multimodal_embeddings` waits on the
+                    # request event and records the attached tensor on the consuming stream before
+                    # gathering it.
+                    continue
+                partition = self.partition_encoder_cache(param, encoder_cache)
+                if partition is None or partition.is_full_miss:
+                    cache_misses.append(param)
+                    continue
+                if partition.is_full_hit:
+                    param.multimodal_data["multimodal_embedding"] = (
+                        _assemble_multimodal_encoder_embeddings(partition.hits, len(partition.keys))
+                    )
+                    continue
+                partial_hits.append((param, partition))
+
+        if partial_hits:
+            # `encoder_cache` is non-None here because partitions are only produced when the cache
+            # exists.
+            self._encode_with_partial_cache(partial_hits, encoder_cache)
+
         embeddings = get_multimodal_embeddings(
             encoder_forward_fn=self.encode_multimodal_inputs,
             multimodal_params=list(multimodal_params),
         )
+        if encoder_cache is not None:
+            for param in cache_misses:
+                self._write_encoder_cache_entries(param, encoder_cache)
+
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
         # checked, not just paths that ran the encoder.
         self._validate_embeddings(embeddings, multimodal_params)
         return embeddings[0]
+
+    def _get_multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
+        """Return the per-model full-request-path encoder clone cache, if enabled.
+
+        The cache stores per-item embeddings for params that can be represented by one modality.
+        See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
+
+        Scope: the single encoder cache instance for a cache-enabled model
+        (`supports_encoder_cache`). The full-request (legacy inline-encode) consumers — side-stream
+        prefetch, `mm_encoder_only`/disagg encoding — populate and read it inline; the
+        item-scheduling path consumes the same instance read-through at encode time
+        (`ModelEngine.forward_multimodal_encoder_items`). The key format is shared
+        (`_encoder_cache_item_key`) so hits cross between paths. The item path's recorded outputs
+        are cloned, so cache eviction never invalidates an in-flight request.
+        """
+        if not self.encoder_cache_active:
+            logger.debug_once(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because the model does not opt in via "
+                "supports_encoder_cache or multimodal_config.encoder_cache_max_bytes=0.",
+                key="mm_encoder_cache_disabled",
+            )
+            return None
+
+        multimodal_config = self.model_config.multimodal_config
+        max_bytes = multimodal_config.encoder_cache_max_bytes
+        if self._multimodal_encoder_cache is None:
+            # Per-item embeddings are views produced by splitting a request-level encoder output.
+            # Clone them so a cached item neither aliases mutable caller output nor retains the
+            # entire batch allocation while cache accounting charges only its logical size. This
+            # briefly needs source and clone memory during insertion, but preserves existing cache
+            # entries when the copy cannot be allocated.
+            self._multimodal_encoder_cache = TensorLRUCache(
+                max_bytes,
+                name=_MM_ENCODER_CACHE_LOG_NAME,
+                cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+            )
+            try:
+                embedding_dim = self.embedding_dim
+                embedding_dtype = self.embedding_dtype
+            except NotImplementedError:
+                logger.info(
+                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                    "embedding row capacity unavailable because the model does not implement "
+                    "embedding_dim and embedding_dtype."
+                )
+            else:
+                bytes_per_embedding_row = (
+                    embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
+                )
+                max_embedding_rows = max_bytes // bytes_per_embedding_row
+                logger.info(
+                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                    f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
+                    f"embedding_dtype={embedding_dtype}"
+                )
+        return self._multimodal_encoder_cache
+
+    @staticmethod
+    def _encoder_cache_modality(param: MultimodalParams) -> Optional[str]:
+        """Return the single modality represented by `param`, if cacheable.
+
+        `None` means the params either do not identify a modality or contain
+        multiple modality inputs. The persistent encoder cache deliberately does
+        not cache mixed-modality params today.
+        """
+        mm_data = param.multimodal_data or {}
+        modalities = [key for key in _MM_DATA_INPUT_MODALITY_KEYS if key in mm_data]
+
+        modality = mm_data.get("modality_type")
+        if isinstance(modality, str):
+            # Trust the explicit `modality_type` only when it agrees with the actual data keys.
+            # Otherwise fall through to the mixed-modality skip so an inconsistent producer (e.g.
+            # `modality_type="image"` while both image and audio data are present) cannot bypass the
+            # safety check below and have the cache serve embeddings for the wrong modality.
+            if modalities == [modality]:
+                return modality
+
+        if len(modalities) != 1:
+            # Mixed-modality params are skipped because the cache key metadata is request-item
+            # oriented: `multimodal_hashes` and `multimodal_embedding_lengths` are parallel per
+            # item, but there is no parallel per-item modality list. Without that, a cache key
+            # cannot unambiguously distinguish, for example, an image item from an audio item inside
+            # the same params object.
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params with {len(modalities)} detected "
+                "modalities."
+            )
+            return None
+        return modalities[0]
+
+    @classmethod
+    def _encoder_cache_keys(
+        cls,
+        param: MultimodalParams,
+    ) -> Optional[list[Hashable]]:
+        """Build per-item encoder cache keys for `param`.
+
+        The returned keys split one request's concatenated encoder output by
+        `multimodal_embedding_lengths`.
+
+        When the request carries atomic-item metadata, each key takes its modality from
+        that item's `item_refs` entry, so mixed-modality requests are keyable per item.
+        Without that metadata the whole param must resolve to one modality, since there
+        is nothing else that says which item is which.
+        """
+        mm_input = param.multimodal_input
+        mm_data = param.multimodal_data or {}
+        if mm_input is None:
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params without multimodal hashes."
+            )
+            return None
+
+        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        if item_metadata is not None:
+            return cls.build_encoder_cache_item_keys(
+                mm_input.multimodal_hashes,
+                item_metadata.item_refs,
+                item_metadata.output_embedding_lengths,
+                mm_data.get("mm_processor_kwargs_hash"),
+            )
+
+        modality = cls._encoder_cache_modality(param)
+        embedding_lengths = mm_data.get("multimodal_embedding_lengths")
+        kwargs_hash = mm_data.get("mm_processor_kwargs_hash")
+        if modality is None or not isinstance(embedding_lengths, list) or kwargs_hash is None:
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping unkeyable params, "
+                f"has_modality={modality is not None}, "
+                f"has_embedding_lengths={isinstance(embedding_lengths, list)}, "
+                f"has_processor_kwargs_hash={kwargs_hash is not None}"
+            )
+            return None
+        if len(mm_input.multimodal_hashes) != len(embedding_lengths):
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params with mismatched "
+                "multimodal_hashes and multimodal_embedding_lengths counts"
+            )
+            return None
+
+        # The item hash, embedding row count, processor kwargs, and modality fully describe a
+        # reusable item embedding. Request order is excluded so the same item can be reused from a
+        # different request layout; the current request order is restored when cached item tensors
+        # are concatenated below.
+        return [
+            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
+            for item_hash, embedding_length in zip(
+                mm_input.multimodal_hashes,
+                embedding_lengths,
+                strict=True,
+            )
+        ]
+
+    @staticmethod
+    def _encoder_cache_item_key(
+        modality: str,
+        item_hash: Sequence[int],
+        embedding_length: int,
+        kwargs_hash: str,
+    ) -> Hashable:
+        # Sole definition of the key format, so entries written by the
+        # full-request path and the item-scheduling path hit from either.
+        return (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
+
+    @classmethod
+    def build_encoder_cache_item_keys(
+        cls,
+        multimodal_hashes: Optional[Sequence[Sequence[int]]],
+        item_refs: Sequence[tuple[str, int]],
+        embedding_lengths: Sequence[int],
+        kwargs_hash: Optional[str],
+    ) -> Optional[list[Hashable]]:
+        """Build per-item cache keys from request-level item metadata.
+
+        The modality comes from each item's `item_refs` entry, so mixed-modality requests are
+        keyable per item. Returns `None` when the request cannot participate in the cache (missing
+        hashes or kwargs hash, or item counts that do not line up).
+        """
+        if multimodal_hashes is None or kwargs_hash is None:
+            return None
+        if not (len(multimodal_hashes) == len(item_refs) == len(embedding_lengths)):
+            # Malformed metadata rather than a normal miss: the request loses
+            # cache participation silently, so say so once with the counts.
+            logger.warning_once(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping item keys because "
+                f"multimodal_hashes ({len(multimodal_hashes)}), item_refs "
+                f"({len(item_refs)}) and multimodal_embedding_lengths "
+                f"({len(embedding_lengths)}) counts disagree",
+                key="mm_encoder_cache_item_key_count_mismatch",
+            )
+            return None
+        return [
+            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
+            for (modality, _), item_hash, embedding_length in zip(
+                item_refs,
+                multimodal_hashes,
+                embedding_lengths,
+                strict=True,
+            )
+        ]
+
+    @classmethod
+    def partition_encoder_cache(
+        cls,
+        param: MultimodalParams,
+        encoder_cache: TensorLRUCache,
+        item_indices: Optional[Sequence[int]] = None,
+        keys: Optional[Sequence[Hashable]] = None,
+    ) -> Optional[EncoderCachePartition]:
+        """Look up `param`'s items in the cache and return the per-item partition.
+
+        Args:
+            item_indices: restrict the lookup to these items. `None` looks up every item,
+                which is what the full-request path wants. The item scheduler passes the
+                subset it selected for this iteration so unscheduled items keep their LRU
+                recency -- see `EncoderCachePartition`.
+            keys: precomputed per-item keys. `None` derives them from `param`, which needs
+                `multimodal_input` to carry the content hashes. The executor builds params
+                from `LlmRequest.py_multimodal_data` alone -- the hashes live on the
+                request, not the params -- so it derives keys there and passes them in.
+
+        Returns `None` when the param is not keyable (missing item metadata, content
+        hashes or processor-kwargs hash, or a request-local embedding is already
+        attached); the caller should treat that as a full miss.
+        """
+        if param.multimodal_data.get("multimodal_embedding") is not None:
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: request-local multimodal embedding present; "
+                "skipping persistent cache lookup"
+            )
+            return None
+
+        keys = list(keys) if keys is not None else cls._encoder_cache_keys(param)
+        if not keys:
+            return None
+
+        looked_up = list(range(len(keys))) if item_indices is None else list(item_indices)
+        out_of_range = [i for i in looked_up if not 0 <= i < len(keys)]
+        if out_of_range:
+            raise MultimodalEncoderContractError(
+                f"item_indices {out_of_range} out of range for {len(keys)} cache keys"
+            )
+
+        hits: Dict[int, torch.Tensor] = {}
+        miss_indices: list[int] = []
+        for i in looked_up:
+            cached = encoder_cache.get(keys[i])
+            if cached is None:
+                miss_indices.append(i)
+            else:
+                hits[i] = cached
+
+        logger.debug(
+            f"{_MM_ENCODER_CACHE_LOG_NAME}: partition hit_items={len(hits)}, "
+            f"miss_items={len(miss_indices)}, looked_up={len(looked_up)}, "
+            f"total_items={len(keys)}."
+        )
+        return EncoderCachePartition(
+            hits=hits, miss_indices=miss_indices, keys=keys, looked_up=looked_up
+        )
+
+    @staticmethod
+    def _apply_metadata_slice(
+        residual: MultimodalParams,
+        source: MultimodalParams,
+        item_indices: Sequence[int],
+    ) -> None:
+        """Overwrite `residual`'s per-item metadata to match the sliced items.
+
+        Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
+        the parallel per-item metadata slice so every model gets it identically.
+        """
+        source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
+        residual.multimodal_data["multimodal_embedding_lengths"] = [
+            source_lengths[i] for i in item_indices
+        ]
+        if residual.multimodal_input is not None and source.multimodal_input is not None:
+            source_hashes = source.multimodal_input.multimodal_hashes
+            residual.multimodal_input.multimodal_hashes = [source_hashes[i] for i in item_indices]
+
+    def _encode_with_partial_cache(
+        self,
+        partials: Sequence[tuple[MultimodalParams, EncoderCachePartition]],
+        encoder_cache: TensorLRUCache,
+    ) -> None:
+        """Encode only the miss items of each partial-hit param and stitch results.
+
+        Miss residuals from all partial-hit params in the batch are encoded in a
+        single call and the concatenated output is split back per param, mirroring
+        how `get_multimodal_embeddings` batches full-miss params. After this returns,
+        each param's `multimodal_embedding` has the same shape as a full encoder run
+        so downstream `get_multimodal_embeddings` treats it as fully cached.
+        """
+        if not partials:
+            return
+
+        # Cross-iter prefetch may have staged some params' raw MM tensors on the aux
+        # stream. If a prefetch encoder call then raised, the request reaches this
+        # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
+        # those tensors on the main stream before the event would race the aux-stream
+        # H2D copy. Wait per param up front, before any raw-tensor read.
+        for param, _ in partials:
+            if param.encoder_event is not None:
+                torch.cuda.current_stream().wait_event(param.encoder_event)
+
+        # Build every residual, then run one batched encoder call over the whole set.
+        residuals: list[MultimodalParams] = []
+        per_param_miss_lengths: list[list[int]] = []
+        for param, partition in partials:
+            residual = self.build_multimodal_encoder_input(param, partition.miss_indices)
+            self._apply_metadata_slice(residual, param, partition.miss_indices)
+            residuals.append(residual)
+            per_param_miss_lengths.append(
+                [
+                    param.multimodal_data["multimodal_embedding_lengths"][i]
+                    for i in partition.miss_indices
+                ]
+            )
+
+        batched_output = self.encode_multimodal_inputs(residuals)
+        per_param_slabs = torch.split(
+            batched_output, [sum(lengths) for lengths in per_param_miss_lengths], dim=0
+        )
+
+        for (param, partition), slab, miss_lengths in zip(
+            partials, per_param_slabs, per_param_miss_lengths, strict=True
+        ):
+            miss_tensors = torch.split(slab, miss_lengths, dim=0)
+
+            by_item: Dict[int, torch.Tensor] = dict(partition.hits)
+            for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
+                by_item[miss_idx] = tensor
+            param.multimodal_data["multimodal_embedding"] = _assemble_multimodal_encoder_embeddings(
+                by_item, len(partition.keys)
+            )
+
+            inserted = 0
+            rejected = 0
+            for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
+                if encoder_cache.put(partition.keys[miss_idx], tensor):
+                    inserted += 1
+                else:
+                    rejected += 1
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: partial-hit encode "
+                f"total_items={len(partition.keys)} "
+                f"hit_items={len(partition.hits)} "
+                f"encoded_items={len(partition.miss_indices)} "
+                f"cache_writes_inserted={inserted} "
+                f"cache_writes_rejected={rejected}"
+            )
+
+    @classmethod
+    def _write_encoder_cache_entries(
+        cls,
+        param: MultimodalParams,
+        encoder_cache: TensorLRUCache,
+    ) -> None:
+        keys = cls._encoder_cache_keys(param)
+        if not keys:
+            return
+
+        embedding = param.multimodal_data.get("multimodal_embedding")
+        if isinstance(embedding, list):
+            embedding = torch.cat(embedding, dim=0)
+            param.multimodal_data["multimodal_embedding"] = embedding
+        if not isinstance(embedding, torch.Tensor):
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping write because no tensor embedding was "
+                "attached after encoder execution."
+            )
+            return
+
+        embedding_lengths = param.multimodal_data["multimodal_embedding_lengths"]
+        if sum(embedding_lengths) != embedding.shape[0]:
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping write because embedding row count "
+                "does not match multimodal_embedding_lengths."
+            )
+            return
+
+        # Encoder outputs are concatenated per params object. Splitting by item length lets future
+        # requests reuse matching items independently, even when their request-level item order
+        # differs.
+        inserted_entries = 0
+        rejected_entries = 0
+        for key, item_embedding in zip(
+            keys,
+            torch.split(embedding, embedding_lengths, dim=0),
+            strict=True,
+        ):
+            if encoder_cache.put(key, item_embedding):
+                inserted_entries += 1
+            else:
+                rejected_entries += 1
+        logger.debug(
+            f"{_MM_ENCODER_CACHE_LOG_NAME}: wrote {inserted_entries} item entries, "
+            f"rejected={rejected_entries}, rows={embedding.shape[0]}."
+        )
+        encoder_cache.log_stats("multimodal encoder cache write.")
 
     def _fuse_multimodal_embeddings(
         self,
@@ -457,16 +1651,19 @@ def _dispatch_cross_iter_prefetch(
     The event covers all work queued in the aux-stream block, so the same
     event object is shared across all candidates.
     """
+    encoder_cache_enabled = model.encoder_cache_active
     params_list = [
         MultimodalParams(
+            multimodal_input=_build_request_multimodal_input(req, encoder_cache_enabled),
             multimodal_data=mm_data,
             multimodal_runtime=MultimodalRuntimeData(
                 past_seen_token_num=0,
                 chunk_end_pos=cumsum.numel(),
                 embed_mask_cumsum=cumsum,
             ),
+            mm_item_order=req.py_mm_item_order,
         )
-        for _, mm_data, cumsum in candidates
+        for req, mm_data, cumsum in candidates
     ]
 
     # Prefetch targets requests outside the current iteration, so their
@@ -474,14 +1671,35 @@ def _dispatch_cross_iter_prefetch(
     # this after the iteration's LLM kernels so aux-stream H2D copies and
     # encoder work can overlap them.
     #
-    # Ordering is handled by `encoder_event`, and tensor lifetime is anchored
-    # by `req.py_multimodal_data` until the request is consumed or terminated.
-    # Keeping `record_stream` out also keeps this path modality-neutral.
+    # Request-local ordering is handled by `encoder_event`; the consume path also `record_stream`s
+    # attached embeddings before gathering them so post-prefill request cleanup cannot release
+    # storage while main-stream work is pending. Persistent-cache clones use their own producer
+    # events and consumer `record_stream` calls inside `TensorLRUCache`.
     encoder_event = None
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
-            for p in params_list:
-                p.to_device(
+            encoder_cache = model._get_multimodal_encoder_cache() if encoder_cache_enabled else None
+            cache_misses: list[MultimodalParams] = []
+            partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
+            if encoder_cache is None:
+                cache_misses = params_list
+            else:
+                for param in params_list:
+                    partition = model.partition_encoder_cache(param, encoder_cache)
+                    if partition is None or partition.is_full_miss:
+                        cache_misses.append(param)
+                    elif partition.is_full_hit:
+                        param.multimodal_data["multimodal_embedding"] = (
+                            _assemble_multimodal_encoder_embeddings(
+                                partition.hits, len(partition.keys)
+                            )
+                        )
+                    else:
+                        partial_hits.append((param, partition))
+
+            params_to_transfer = cache_misses + [param for param, _ in partial_hits]
+            for param in params_to_transfer:
+                param.to_device(
                     "multimodal_data",
                     "cuda",
                     pin_memory=prefer_pinned(),
@@ -494,8 +1712,23 @@ def _dispatch_cross_iter_prefetch(
             # model_engine._prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
-            encoder_output = model.encode_multimodal_inputs(params_list)
-            _cache_multimodal_embeddings(params_list, [encoder_output])
+
+            if partial_hits and encoder_cache is not None:
+                model._encode_with_partial_cache(partial_hits, encoder_cache)
+            if cache_misses:
+                encoder_output = model.encode_multimodal_inputs(cache_misses)
+                _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
+                if encoder_cache is not None:
+                    for param in cache_misses:
+                        model._write_encoder_cache_entries(param, encoder_cache)
+
+            # Prefetch only needs to attach each request's embedding. Validate each request
+            # independently instead of gathering the unused batch output with `torch.cat`.
+            for param in params_list:
+                embedding = param.multimodal_data.get("multimodal_embedding")
+                if not isinstance(embedding, torch.Tensor):
+                    raise ValueError("Multimodal encoder prefetch did not produce an embedding.")
+                model._validate_embeddings([embedding], [param])
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the
@@ -545,9 +1778,9 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     - With `max_prefetch < len(pending)`, if the head is bumped by budget reasons, the next-admitted
       request is one we did not prefetch.
 
-    Gated by `TLLM_MM_SIDE_STREAM_MAX_AHEAD`: unset or 0 disables the side stream; a positive
-    integer enables it and caps the total number of not-in-flight requests with prefetched MM
-    encoder work.
+    Gated by `MultimodalConfig.encoder_side_stream_max_ahead`: 0 disables the side stream; a
+    positive integer enables it and caps the total number of not-in-flight requests with
+    prefetched MM encoder work.
 
     Returns the number of requests for which an encoder kick-off was queued.
     """
@@ -556,7 +1789,7 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     if max_prefetch <= 0:
         return 0
     if max_prefetch_ahead is None:
-        max_prefetch_ahead = _get_mm_side_stream_max_ahead()
+        max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
         return 0
 

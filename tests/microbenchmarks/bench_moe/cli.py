@@ -20,15 +20,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
+from .mapping import _resolve_mapping_layout
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
@@ -38,6 +39,7 @@ from .search import (
     _resolve_search_from_args,
 )
 from .specs import (
+    _ACTIVATIONS,
     _ALL_BACKENDS,
     _COMM_METHODS,
     _ROUTING_METHODS,
@@ -91,7 +93,14 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
         "world_size": world_size,
         "analysis": list(ctx.analysis) or ["summary"],
         "workloads": [
-            w.to_dict(per_rank_num_tokens=_per_rank_tokens(w, world_size)) for w in ctx.workloads
+            w.to_dict(
+                per_rank_num_tokens=_per_rank_tokens(
+                    w,
+                    world_size,
+                    enable_dp=bool(_resolve_mapping_layout(ctx.base_config, world_size)[2]),
+                )
+            )
+            for w in ctx.workloads
         ],
         "base_config": ctx.base_config.to_dict(),
     }
@@ -147,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=sorted(BUILT_IN_MODELS.keys()),
         help=(
-            "Built-in model shape. Examples: deepseek_v3, qwen1.5_moe. "
+            "Built-in model shape. Example: deepseek_v3. "
             "Omit only when passing all custom shape fields below."
         ),
     )
@@ -188,6 +197,24 @@ def parse_args() -> argparse.Namespace:
         help="DeepSeek-style number of routing groups kept per token.",
     )
     model_group.add_argument(
+        "--n_shared_experts",
+        type=int,
+        default=None,
+        help="Number of shared experts to fuse into the routed-expert grouped "
+        "GEMM (DeepSeek-style). Only takes effect on the TRTLLM backend with "
+        "FP8_BLOCK_SCALES and dp_size==1; ignored by other backends. Default 0.",
+    )
+    model_group.add_argument(
+        "--shared_expert_mode",
+        type=lambda s: str(s).lower(),
+        default="fused",
+        choices=["fused", "unfused"],
+        help="How shared experts (n_shared_experts>0) are realized: 'fused' folds "
+        "them into the routed grouped GEMM (PR #11143); 'unfused' runs the routed "
+        "MoE plus a separate shared GatedMLP and sums them (pre-fusion baseline, "
+        "for measuring fusion's net benefit). Default fused.",
+    )
+    model_group.add_argument(
         "--quant",
         type=lambda s: QuantAlgo[str(s).upper()] if s is not None else None,
         default=None,
@@ -204,6 +231,13 @@ def parse_args() -> argparse.Namespace:
             "default; custom shapes must specify an explicit method."
         ),
     )
+    model_group.add_argument(
+        "--activation",
+        type=lambda s: str(s).upper(),
+        default=None,
+        choices=sorted(_ACTIVATIONS),
+        help="Expert activation. Defaults to the model's value, else SWIGLU.",
+    )
 
     workload_group = parser.add_argument_group("Workload shape")
     workload_group.add_argument(
@@ -214,8 +248,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         required=False,
         help=(
-            "Global token counts to sweep. Each value is balanced across ranks "
-            "with any remainder on rank 0. Example: --balanced_total_num_tokens 64 256 1024."
+            "Global token counts to sweep. Each value is balanced across ranks, "
+            "spreading any remainder one token per leading rank (e.g. world_size=4, "
+            "tokens=2 -> [1, 1, 0, 0]). Example: --balanced_total_num_tokens 64 256 1024."
         ),
     )
 
@@ -371,6 +406,14 @@ def parse_args() -> argparse.Namespace:
     timing_group.add_argument("--warmup", type=int, default=1, help="Warmup iterations per case.")
     timing_group.add_argument("--iters", type=int, default=12, help="Timed iterations per case.")
     timing_group.add_argument(
+        "--nsys",
+        action="store_true",
+        default=False,
+        help="Emit an NVTX range + cudaProfilerStart/Stop around the measured MoE forward "
+        "(after warmup) so `nsys profile -c cudaProfilerApi` captures only that region. "
+        "Disables CUPTI kernel breakdown (conflicts with nsys). Latency measurement is unchanged.",
+    )
+    timing_group.add_argument(
         "--fast_autotune",
         action="store_true",
         help="Use a short autotune pass for smoke tests; may reduce measurement quality.",
@@ -509,33 +552,27 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
             routing_method=routing,
             n_group=args.n_group,
             topk_group=args.topk_group,
+            n_shared_experts=int(args.n_shared_experts) if args.n_shared_experts is not None else 0,
+            shared_expert_mode=args.shared_expert_mode,
+            activation_type=args.activation or "SWIGLU",
         )
 
-    # Built-in model with optional per-field overrides.
-    if routing == "AUTO":
-        routing = base.routing_method
-
-    quant_name: Optional[str]
+    # Built-in model: override only what the CLI actually provided, so any
+    # preset field without a flag (swiglu_*, situ_*, ...) is inherited.
+    overrides: Dict[str, Any] = {"shared_expert_mode": args.shared_expert_mode}
+    if routing != "AUTO":
+        overrides["routing_method"] = routing
     if args.quant is not None:
-        quant_name = args.quant.name
-    else:
-        quant_name = base.quant_algo
-    return ModelSpec(
-        name=base.name,
-        num_experts=int(args.num_experts) if args.num_experts is not None else base.num_experts,
-        top_k=int(args.top_k) if args.top_k is not None else base.top_k,
-        hidden_size=int(args.hidden_size) if args.hidden_size is not None else base.hidden_size,
-        intermediate_size=int(args.intermediate_size)
-        if args.intermediate_size is not None
-        else base.intermediate_size,
-        quant_algo=quant_name,
-        routing_method=routing,
-        n_group=args.n_group if args.n_group is not None else base.n_group,
-        topk_group=args.topk_group if args.topk_group is not None else base.topk_group,
-        swiglu_alpha=base.swiglu_alpha,
-        swiglu_beta=base.swiglu_beta,
-        swiglu_limit=base.swiglu_limit,
-    )
+        overrides["quant_algo"] = args.quant.name
+    if args.activation is not None:
+        overrides["activation_type"] = args.activation
+    for field in ("num_experts", "top_k", "hidden_size", "intermediate_size", "n_shared_experts"):
+        if getattr(args, field) is not None:
+            overrides[field] = int(getattr(args, field))
+    for field in ("n_group", "topk_group"):
+        if getattr(args, field) is not None:
+            overrides[field] = getattr(args, field)
+    return replace(base, **overrides)
 
 
 def _resolve_workloads_from_args(args: argparse.Namespace) -> List[WorkloadSpec]:

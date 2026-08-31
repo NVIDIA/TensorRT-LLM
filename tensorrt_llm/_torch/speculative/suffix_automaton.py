@@ -26,6 +26,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
+from tensorrt_llm.logger import logger as trtllm_logger
 
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -87,6 +88,17 @@ class SuffixAutomatonManager(BaseResourceManager):
     and are CUDA graph compatible.
 
     Used as the resource manager for both NGram and MTP+SA speculative decoding.
+
+    Rejection sampling is not supported for NGram or SA drafting. Both are
+    retrieval-based drafters: they propose draft tokens by matching against
+    previously seen context (n-gram lookup / suffix-automaton traversal) instead
+    of sampling from a model head, so they emit only token ids with no per-token
+    proposal distribution ``q(x)`` over the vocabulary. Rejection sampling's
+    acceptance test needs ``q`` to form the ratio ``min(1, p(x)/q(x))`` and the
+    residual ``(p - q)+`` correction on rejection; without ``q`` the target
+    distribution cannot be preserved. The gate lives in
+    ``TorchLlmArgs.validate_speculative_config`` (NGram falls outside the
+    supported-mode whitelist; SA is rejected via ``rs_sa_active``).
     """
 
     def __init__(
@@ -587,13 +599,55 @@ class SuffixAutomatonManager(BaseResourceManager):
     # --- BaseResourceManager interface ---
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        """Prepare SA states for new context requests."""
+        """Prepare SA states for new context and disagg-generation requests."""
         for req in scheduled_batch.context_requests:
+            # Disaggregated serving: the executor's _prepare_disagg_gen_init
+            # also routes DISAGG_GENERATION_INIT requests through
+            # prepare_resources as context_requests_last_chunk, BEFORE the
+            # context server's first generated token has arrived (it is only
+            # appended later, by _prepare_disagg_gen_transmission_complete).
+            # Initializing here would (a) freeze the automaton at prompt-only
+            # -- permanently missing the ctx-produced first token relative to
+            # an aggregated run, since _initialized_requests makes init
+            # one-shot -- and (b) pin an SA slot for the whole KV-transfer
+            # duration. Defer to the generation-request loop below, which
+            # runs once the request is scheduled with its full history.
+            if req.is_generation_only_request():
+                continue
             if req.is_first_context_chunk:
                 if req.request_id not in self._initialized_requests:
                     context_tokens = req.get_tokens(0)
                     self.add_request(req.request_id, context_tokens)
                     self._initialized_requests.add(req.request_id)
+
+        # Disaggregated serving: on a generation server, requests skip the
+        # local context phase -- they arrive as DISAGG_GENERATION_INIT
+        # and are scheduled as generation requests (the executor's
+        # _prepare_disagg_gen_transmission_complete appends the context
+        # server's first generated token before resources are prepared).
+        # Build the automaton here from the full token history (prompt +
+        # first generated token), matching the state an aggregated run would
+        # have after its context step. _initialized_requests keeps this a
+        # one-shot init; free_resources clears it on completion.
+        for req in scheduled_batch.generation_requests:
+            if (
+                req.is_generation_only_request()
+                and not req.is_dummy
+                and req.request_id not in self._initialized_requests
+            ):
+                history = req.get_tokens(0)
+                self.add_request(req.request_id, history)
+                self._initialized_requests.add(req.request_id)
+                # Observability marker for disagg SA:
+                # confirms the automaton is built in the GENERATION schedule
+                # with the full history (prompt + ctx first token, i.e.
+                # len(history) == prompt_len + 1), not in the premature
+                # context-phase pass at _prepare_disagg_gen_init.
+                trtllm_logger.debug(
+                    f"[SA] disagg gen-init: request {req.request_id} automaton "
+                    f"built in generation schedule from {len(history)} history "
+                    f"tokens (prompt_len={getattr(req, 'py_prompt_len', None)})"
+                )
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         """Update resources after forward pass (no-op for SA)."""

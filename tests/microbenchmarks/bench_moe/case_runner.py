@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._utils import mpi_allgather
 
 from .build import (
@@ -35,6 +35,7 @@ from .build import (
     _build_moe_module,
     _calculate_num_chunks_safe,
     _comm_method_name,
+    _epilogue_activation_name,
     _scheduler_kind_name,
 )
 from .mapping import _build_mapping_from_config, _resolve_mapping_layout
@@ -156,6 +157,16 @@ def _build_routing_control_block(
     hist_max = max(flat_hist) if flat_hist else 0
     active_experts = sum(1 for v in flat_hist if v > 0)
 
+    # ``max_abs`` compares the re-materialised plan with itself outside forced
+    # mode, so it is 0 by construction -- including for a plan the routing
+    # method could not realise. Publishing that 0 next to
+    # ``realization_status="projected"`` reads as "the projection was perfect",
+    # which is exactly backwards. Only report the number where it means
+    # something: forced mode, where the kernel consumes the materialised plan.
+    error_is_meaningful = routing_mode == "forced"
+    reported_abs: Optional[int] = int(max_abs) if error_is_meaningful else None
+    reported_rel: Optional[float] = float(max_rel) if error_is_meaningful else None
+
     warnings_out = list(warnings)
     if routing_mode != "forced":
         warnings_out.append(
@@ -179,8 +190,8 @@ def _build_routing_control_block(
             "routing_realization": {
                 "status": realization_status,
                 "reason": realization_reason,
-                "max_abs_slot_error": int(max_abs),
-                "max_relative_slot_error": float(max_rel),
+                "max_abs_slot_error": reported_abs,
+                "max_relative_slot_error": reported_rel,
             },
             "enable_perfect_router": bool(enable_perfect_router),
             "effective_src_axis": "dp_rank",
@@ -198,7 +209,7 @@ def _build_routing_control_block(
                 "row_sums": row_sums,
                 "col_sums": col_sums,
                 "off_diagonal_ratio": float(off_diag_ratio),
-                "max_abs_slot_error": int(max_abs),
+                "max_abs_slot_error": reported_abs,
                 "matrix_dump_path": None,
             },
             "observed_expert_histogram_summary": {
@@ -258,11 +269,13 @@ def _initial_instrumentation(
     analysis: Tuple[str, ...],
     config: ConfigSpec,
     cupti_ctx: Optional[Any],
+    nsys: bool = False,
 ) -> Dict[str, Any]:
     return {
         "level": ",".join(sorted(analysis)) if analysis else "summary",
         "cuda_graph": bool(config.cuda_graph),
         "cupti_available": bool(cupti_ctx is not None and cupti_ctx.ok),
+        "nsys_capture": bool(nsys),
         "phase_timing_available": False,
         "kernel_breakdown_available": "kernels" in analysis,
         "autotune_status": "not_run",
@@ -344,6 +357,7 @@ def _select_routing_inputs(
     routing_plan: RoutingPlan,
     rank: int,
     moe_ep_size: int,
+    enable_attention_dp: bool,
     base_router_logits: torch.Tensor,
     device: torch.device,
     act_dtype: torch.dtype,
@@ -410,6 +424,21 @@ def _select_routing_inputs(
         )
     except Exception as exc:
         return None, _RoutingSkip(f"native logits projection error: {type(exc).__name__}: {exc}")
+
+    # In attention-DP + MoE-TP layouts (DTP / CUSTOM-DP), _project_router_logits
+    # returns logits shaped [agg_tokens, E] covering all DP shards aggregated
+    # onto ep_axis_rank.  The MoE internally allgathers each rank's local
+    # router_logits before routing, so each rank must supply only its local
+    # slice [offset_r : offset_r + n_r] of the full projected tensor.
+    world_size_inferred = len(routing_plan.per_rank_num_tokens)
+    if enable_attention_dp and int(moe_ep_size) < world_size_inferred:
+        offset = sum(
+            routing_plan.per_rank_num_tokens[s]
+            for s in range(world_size_inferred)
+            if s % int(moe_ep_size) == ep_axis_rank and s < rank
+        )
+        local_n = routing_plan.per_rank_num_tokens[rank]
+        new_logits = new_logits[offset : offset + local_n]
 
     if projection_status != "exact" and rc_spec.projection_policy == "reject":
         return None, _RoutingSkip(
@@ -536,21 +565,6 @@ def _resolve_layout_and_plan(
     except ValueError as exc:
         return _short_circuit(result, "skipped", str(exc))
 
-    # Routing-control's dispatch_matrix axis is ``moe_ep_size`` while
-    # ``per_rank_num_tokens`` follows the world (DP source) axis. When the two
-    # disagree (DTP/TTP/CUSTOM with ``moe_ep_size != world_size``) the plan
-    # either crashes inside ``_build_routing_plan`` or silently drops the
-    # tokens of world ranks beyond ``moe_ep_size``. Skip cleanly.
-    if rc_active and int(moe_ep_size) != int(world_size):
-        return _short_circuit(
-            result,
-            "skipped",
-            f"routing-control requires moe_ep_size == world_size "
-            f"(got moe_ep_size={moe_ep_size}, world_size={world_size}); "
-            "the dispatch_matrix axis would not align with the per-rank token "
-            "distribution. Use parallel_mode in {DEP, TEP} or drop routing-control.",
-        )
-
     routing_plan: Optional[RoutingPlan] = None
     if rc_active:
         try:
@@ -561,6 +575,7 @@ def _resolve_layout_and_plan(
                 top_k=int(model.top_k),
                 num_experts=int(model.num_experts),
                 moe_ep_size=int(moe_ep_size),
+                enable_dp=bool(_enable_dp),
             )
         except Exception as exc:
             reason = f"routing plan error: {type(exc).__name__}: {exc}"
@@ -568,7 +583,7 @@ def _resolve_layout_and_plan(
             return _short_circuit(result, "skipped", reason)
         per_rank = list(routing_plan.per_rank_num_tokens)
     else:
-        per_rank = _per_rank_tokens(workload, world_size)
+        per_rank = _per_rank_tokens(workload, world_size, enable_dp=bool(_enable_dp))
 
     return int(moe_ep_size), per_rank, routing_plan
 
@@ -613,6 +628,7 @@ def _run_one_candidate(
     random_seed: int,
     input_cache: Optional[_InputCache],
     enable_perfect_router_requested: bool,
+    nsys: bool = False,
 ) -> RunResult:
     """Build, autotune, and time one ``ConfigSpec`` candidate.
 
@@ -651,7 +667,7 @@ def _run_one_candidate(
     local_num_tokens = per_rank[rank] if rank < len(per_rank) else 0
     all_rank_num_tokens = list(per_rank)
 
-    result.instrumentation = _initial_instrumentation(analysis, config, cupti_ctx)
+    result.instrumentation = _initial_instrumentation(analysis, config, cupti_ctx, nsys)
 
     # ---- Step 2: mapping + AutoTuner + comm env -------------------------
     try:
@@ -662,6 +678,11 @@ def _run_one_candidate(
     result.moe_ep_size = int(mapping.moe_ep_size)
     result.moe_tp_size = int(mapping.moe_tp_size)
     result.enable_attention_dp = bool(mapping.enable_attention_dp)
+
+    # TEP/TTP (no attention DP): no cross-rank dispatch; the scheduler fills
+    # all_rank_num_tokens from x.shape[0]. Pass None to follow that path.
+    if not mapping.enable_attention_dp:
+        all_rank_num_tokens = None
 
     AutoTuner.get().setup_distributed_state(mapping)
     AutoTuner.get().clear_cache()
@@ -683,7 +704,15 @@ def _run_one_candidate(
                 mapping=mapping,
                 moe_backend=config.backend,
                 use_cuda_graph=bool(config.cuda_graph),
-                max_num_tokens=max(int(local_num_tokens), 1),
+                # Symmetric-memory comm backends (e.g. NVLINK_ONE_SIDED) size their
+                # workspace from max_num_tokens and require every rank to allocate the
+                # same size, so use the global per-rank maximum rather than this rank's
+                # local token count (which differs under uneven attention-DP shards).
+                # No CUDA-graph special-casing is needed anymore: since #15397 the
+                # non-DP (TEP/TTP) path passes all_rank_num_tokens=None and the MoE
+                # scheduler derives chunking from this rank's rows, so max(per_rank)
+                # already yields num_chunks==1 under graph capture.
+                max_num_tokens=max(int(max(per_rank)) if per_rank else 0, 1),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
                 enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,
@@ -692,12 +721,13 @@ def _run_one_candidate(
             )
         except Exception as exc:
             reason = f"build error: {type(exc).__name__}: {exc}"
-            _maybe_print_rank0(f"[bench_moe] build failed: {reason}")
+            _maybe_print_rank0(f"[bench_moe] build failed: {reason}\n{traceback.format_exc()}")
             return _short_circuit(result, "failed", reason)
 
         result.actual_backend = _backend_name_from_module(moe)
         result.scheduler_kind = _scheduler_kind_name(moe)
         result.actual_comm_method = _comm_method_name(moe)
+        result.actual_epilogue_activation = _epilogue_activation_name(moe)
         result.num_chunks = _calculate_num_chunks_safe(moe, all_rank_num_tokens)
 
         if result.actual_backend != config.backend.upper():
@@ -735,6 +765,7 @@ def _run_one_candidate(
                 routing_plan=routing_plan,
                 rank=rank,
                 moe_ep_size=int(moe_ep_size),
+                enable_attention_dp=bool(result.enable_attention_dp),
                 base_router_logits=router_logits,
                 device=device,
                 act_dtype=act_dtype,
@@ -789,6 +820,7 @@ def _run_one_candidate(
                         warmup=int(warmup),
                         iters=int(iters),
                         cupti_ctx=cupti_ctx,
+                        nsys=nsys,
                     )
                 else:
                     fwd_times_ms, detailed_stats = _time_moe_forward_eager(
@@ -799,6 +831,7 @@ def _run_one_candidate(
                         warmup=int(warmup),
                         iters=int(iters),
                         collect_kernels="kernels" in analysis,
+                        nsys=nsys,
                     )
             except Exception as exc:
                 reason = f"timed phase error: {type(exc).__name__}: {exc}"

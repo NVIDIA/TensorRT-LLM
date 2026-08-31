@@ -3,7 +3,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -17,6 +17,7 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
+MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
@@ -165,6 +166,18 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     mm_data.clear()
     if mrope_deltas is not None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
+
+
+def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
+    """Drop raw encoder payloads while preserving cached MM embeddings.
+
+    Item-level encoder scheduling keeps the original request payload on CPU
+    and transfers only selected items to GPU. Once every item is encoded, the
+    raw modality dictionaries are no longer needed and must not be moved to
+    GPU by the subsequent LLM input-preparation path.
+    """
+    for modality in ("image", "video", "audio"):
+        mm_data.pop(modality, None)
 
 
 @dataclass
@@ -449,6 +462,7 @@ class MultimodalRuntimeData:
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
 })
 
 
@@ -503,10 +517,17 @@ class MultimodalParams:
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
+    # Prompt-order manifest of data-backed items. Each entry is
+    # ``{"modality": m, "index": i, "placeholder": p}`` where ``i`` indexes
+    # ``multi_modal_data[m]``. Encoders that interleave items across modalities
+    # in prompt order read ``modality``/``index``; ``placeholder`` is carried
+    # for parity with the tracker manifest.
+    mm_item_order: Optional[List[Dict[str, Union[str, int]]]] = None
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
     # When set, the consume site in `get_multimodal_embeddings` issues a
-    # `wait_event` on the current stream before reading cached embeddings.
-    # Always `None` unless `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is positive and a prefetch ran.
+    # `wait_event` and records attached embeddings on the current stream before
+    # reading them.
+    # Always `None` unless side-stream prefetch is enabled and a prefetch ran.
     encoder_event: Optional[torch.cuda.Event] = field(default=None,
                                                       repr=False,
                                                       compare=False)
@@ -814,11 +835,26 @@ def _update_hash(hasher, item: object) -> None:
     hasher.update(serialize_item(item))
 
 
-def apply_mm_hashes(
-    mm_data: Dict[str, Any],
-    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
-    hash_lib=default_hasher
-) -> Tuple[Dict[str, List[str]], Optional[List[Optional[str]]]]:
+class MMHashResult(NamedTuple):
+    """Parallel per-modality dicts of content hashes and their UUIDs.
+
+    Both dicts are indexed first by modality name (`"image"`, `"video"`,
+    ...) then by within-modality item position, so `hashes[m][i]` and
+    `uuids[m][i]` describe the same item.
+    """
+
+    hashes: Dict[str, List[str]]
+    """Modality -> list of BLAKE3 hex digests (64 chars each)."""
+
+    uuids: Optional[Dict[str, List[Optional[str]]]]
+    """Modality -> list of original UUID strings. `None` entries mark
+    items that fell back to content-only hashing. The whole dict is
+    `None` when the caller supplied no UUIDs at all."""
+
+
+def apply_mm_hashes(mm_data: Dict[str, Any],
+                    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
+                    hash_lib=default_hasher) -> "MMHashResult":
     """Apply hashing to multimodal data, one hash per multimodal item.
 
     When a UUID is provided for an item, the hash is computed from both the UUID
@@ -834,9 +870,8 @@ def apply_mm_hashes(
         hash_lib: Hash function to use (default: blake3)
 
     Returns:
-        Tuple of:
-        - Dictionary of modality -> list of hash hex strings (64 chars each)
-        - Flattened list of original UUID strings (or None for content-hashed items)
+        `MMHashResult` with per-modality `hashes` and `uuids` dicts. See
+        the type's own docstring for the field-level contract.
     """
 
     def _hash_item(item):
@@ -868,9 +903,8 @@ def apply_mm_hashes(
         for modality, items in mm_data.items()
     }
 
-    # Collect UUIDs in the same order as items
-    all_uuids: List[Optional[str]] = []
     mm_hashes: Dict[str, List[str]] = {}
+    mm_uuids_by_key: Dict[str, List[Optional[str]]] = {}
 
     for modality, items in mm_items.items():
         modality_uuids = None
@@ -884,22 +918,25 @@ def apply_mm_hashes(
                     f"data items length ({len(items)}) for modality '{modality}'"
                 )
 
-        hashes = []
+        hashes: List[str] = []
+        uuids: List[Optional[str]] = []
         for i, item in enumerate(items):
             uuid = modality_uuids[i] if modality_uuids else None
             if uuid is not None:
                 # Hash UUID + content together for cache correctness
                 hashes.append(_hash_item_with_uuid(item, uuid))
-                all_uuids.append(uuid)  # Store original UUID
             else:
                 # Fall back to content-only hashing
                 hashes.append(_hash_item(item))
-                all_uuids.append(None)
+            uuids.append(uuid)  # `None` when the caller didn't supply one
 
         mm_hashes[modality] = hashes
+        mm_uuids_by_key[modality] = uuids
 
-    # Return None for uuids if no UUIDs were provided at all
-    return mm_hashes, all_uuids if mm_uuids is not None else None
+    return MMHashResult(
+        hashes=mm_hashes,
+        uuids=mm_uuids_by_key if mm_uuids is not None else None,
+    )
 
 
 def hexdigest_to_int32(hex_digest: str) -> List[int]:
@@ -1004,7 +1041,12 @@ def find_mm_token_lengths(
                     video_metadata = item.metadata
                     video_audio = item.audio
                     item = item.frames
-                assert isinstance(item, list), "Video must be a list of frames"
+                if isinstance(item, np.ndarray):
+                    item = list(item)
+                if not isinstance(item, list):
+                    raise ValueError(
+                        "Video must be decoded frames represented as a list "
+                        f"or stacked numpy array, got {type(item).__name__}")
                 call_kwargs = {"video": item}
                 if video_metadata is not None:
                     # Used by per-model overrides that need to account for
@@ -1044,6 +1086,7 @@ _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",
 })

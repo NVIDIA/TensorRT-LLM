@@ -130,6 +130,7 @@ def _find_dynamic_op_node(gm):
     )
 
 
+@pytest.mark.cpu_only
 def test_inject_out_param_reuses_positional_out_schema_slot():
     graph = Graph()
     q = graph.placeholder("q")
@@ -180,6 +181,7 @@ def test_inject_out_param_reuses_positional_out_schema_slot():
     assert "out" not in dynamic_node.kwargs
 
 
+@pytest.mark.cpu_only
 def test_inject_out_param_uses_kwarg_when_out_slot_not_materialized():
     graph = Graph()
     q = graph.placeholder("q")
@@ -237,6 +239,7 @@ def test_inject_out_param_uses_kwarg_when_out_slot_not_materialized():
         ([], 15, None),  # Case 8: empty list should return None
     ],
 )
+@pytest.mark.cpu_only
 def test_round_up_to_closest(lst, value, expected):
     assert _round_up_to_closest(lst, value) == expected
 
@@ -392,6 +395,7 @@ def test_cudagraph_replays_with_rectangular_seq_len_input():
 class TestCapturedGraphCapture:
     """Tests for capture-time input truncation in CapturedGraph."""
 
+    @pytest.mark.cpu_only
     def test_capture_graph_uses_per_input_extents_for_truncation(self, monkeypatch):
         class ModelWithDifferentDynamicDims(nn.Module):
             def forward(self, x, y):
@@ -426,6 +430,7 @@ class TestCapturedGraphCapture:
             (3, 2, 2, 4),
         }
 
+    @pytest.mark.cpu_only
     def test_capture_graph_refetches_max_batch_after_probe(self, monkeypatch):
         class ModelWithStatefulMetadata(nn.Module):
             def __init__(self):
@@ -457,6 +462,7 @@ class TestCapturedGraphCapture:
 
         assert compiled_model.model.seen == [(2, 2)]
 
+    @pytest.mark.cpu_only
     def test_capture_graph_skips_static_arg_mismatched_batch_size(self, monkeypatch):
         class ModelWithStaticMetadata(nn.Module):
             def forward(self, x, meta):
@@ -486,6 +492,7 @@ class TestCapturedGraphCapture:
         assert captured_shapes == [torch.Size([4, 1])]
         assert set(compiled_model.cudagraphs) == {(4, 1)}
 
+    @pytest.mark.cpu_only
     def test_auto_batched_inputs_keep_explicit_resources_static(self, monkeypatch):
         class ModelWithInterleavedKwargs(nn.Module):
             def forward(self, runtime_a, explicit_cache, runtime_b):
@@ -520,6 +527,7 @@ class TestCapturedGraphCapture:
         assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2), (4, 2)]
         assert captured_kwarg_orders == [("runtime_a", "runtime_b", "explicit_cache")]
 
+    @pytest.mark.cpu_only
     def test_auto_batched_inputs_keep_cache_seq_interface_static(self, monkeypatch):
         class Interface:
             pass
@@ -556,6 +564,7 @@ class TestCapturedGraphCapture:
         assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2)]
         assert captured_kwarg_orders == [("runtime_a", "cache_seq_interface")]
 
+    @pytest.mark.cpu_only
     def test_auto_batched_inputs_do_not_guess_legacy_cache_names(self, monkeypatch):
         class ModelWithLegacyCacheName(nn.Module):
             def forward(self, runtime_a, r0_cache, runtime_b):
@@ -626,6 +635,7 @@ class TestCapturedGraphCapture:
             assert out.shape == (bs - 1, hidden_size)
             torch.testing.assert_close(out, replay_input[:-1] + 1)
 
+    @pytest.mark.cpu_only
     def test_forward_uses_captured_output_extent_when_input_extent_is_larger(self, monkeypatch):
         class GatherLikeModel(nn.Module):
             def __init__(self):
@@ -676,6 +686,7 @@ class TestCapturedGraphCapture:
         assert out.shape == (4, 2)
         torch.testing.assert_close(out, torch.full((4, 2), 4.0))
 
+    @pytest.mark.cpu_only
     def test_forward_falls_back_when_captured_output_extent_exceeds_buffer(self, monkeypatch):
         class EchoModel(nn.Module):
             def __init__(self):
@@ -720,6 +731,7 @@ class TestCapturedGraphCapture:
             ((2, 2), "output extent metadata does not match captured outputs"),
         ],
     )
+    @pytest.mark.cpu_only
     def test_forward_raises_for_inconsistent_output_extent_metadata(
         self, monkeypatch, output_extents, error_match
     ):
@@ -787,6 +799,7 @@ def _build_graphmodule_with_linear():
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestSubmodHasCudaOps:
     """Tests for submod_has_cuda_ops."""
 
@@ -837,6 +850,7 @@ class TestSubmodHasCudaOps:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestDualModeCapturedGraphRouting:
     """Tests for DualModeCapturedGraph routing logic (no actual graph capture)."""
 
@@ -950,6 +964,7 @@ class TestDualModeCapturedGraphRouting:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestPiecewiseCapturedGraphPrepare:
     """Tests for PiecewiseCapturedGraph.prepare."""
 
@@ -976,6 +991,7 @@ class TestPiecewiseCapturedGraphPrepare:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestPiecewiseCapturedGraphOutputHandling:
     """Tests for output reconstruction and forward-state cleanup."""
 
@@ -1030,6 +1046,7 @@ class TestPiecewiseCapturedGraphOutputHandling:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestPiecewiseCapturedGraphStaticInputBuffers:
     """Tests for static kwarg buffers used by piecewise capture."""
 
@@ -1126,6 +1143,7 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestADPiecewiseRunnerCapture:
     """Tests for dynamic output buffers allocated during runner capture."""
 
@@ -1181,6 +1199,7 @@ class TestADPiecewiseRunnerCapture:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestGenerateDefaultPiecewiseNumTokens:
     """Tests for _generate_default_piecewise_num_tokens."""
 
@@ -1233,6 +1252,7 @@ class TestGenerateDefaultPiecewiseNumTokens:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestCompileModelGraphModuleTargetCollection:
     """Tests for selecting GraphModule compile targets."""
 
@@ -1509,6 +1529,7 @@ def _build_plain_static_submod():
     return torch.fx.GraphModule(root, g)
 
 
+@pytest.mark.cpu_only
 class TestPiecewiseCapturedGraphMultiStreamWiring:
     def _build_split_gm(self, ms_submod, plain_submod):
         parent = nn.Module()
@@ -1547,6 +1568,7 @@ class TestPiecewiseCapturedGraphMultiStreamWiring:
         assert isinstance(pcg.split_gm.submod_1, ADPiecewiseRunner)
 
 
+@pytest.mark.cpu_only
 class TestSetupPiecewiseMixedBatch:
     """Coverage for piecewise warmup synthetic mixed-batch setup.
 

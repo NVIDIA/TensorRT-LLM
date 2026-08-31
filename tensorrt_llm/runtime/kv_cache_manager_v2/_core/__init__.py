@@ -14,11 +14,14 @@
 # limitations under the License.
 
 from .._common import DEFAULT_BEAM_INDEX, BeamIndex
-from ._kv_cache import _KVCache
+from ._kv_cache import PlannedDropHandle, _KVCache
 from ._kv_cache_manager import (
     AggregatedPageDesc,
+    ExpandedBuffer,
     KVCacheManager,
     PageIndexConverter,
+    PoolDesc,
+    PoolGroupDesc,
     PoolGroupPeakBlockStats,
     ScratchDesc,
 )
@@ -26,10 +29,14 @@ from ._kv_cache_manager import (
 __all__ = [
     "KVCacheManager",
     "_KVCache",
+    "PlannedDropHandle",
     "BeamIndex",
     "DEFAULT_BEAM_INDEX",
     "AggregatedPageDesc",
+    "ExpandedBuffer",
     "PageIndexConverter",
+    "PoolDesc",
+    "PoolGroupDesc",
     "PoolGroupPeakBlockStats",
     "ScratchDesc",
 ]

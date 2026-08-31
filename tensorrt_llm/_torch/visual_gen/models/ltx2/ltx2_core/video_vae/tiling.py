@@ -147,20 +147,19 @@ class Tile(NamedTuple):
     out_coords: Tuple[slice, ...]
     masks_1d: Tuple[Tuple[torch.Tensor, ...]]
 
-    @property
-    def blend_mask(self) -> torch.Tensor:
+    def blend_mask(self, device, dtype) -> torch.Tensor:
         num_dims = len(self.out_coords)
         per_dimension_masks: List[torch.Tensor] = []
         for dim_idx in range(num_dims):
             mask_1d = self.masks_1d[dim_idx]
             view_shape = [1] * num_dims
             if mask_1d is None:
-                one = torch.ones(1)
-                view_shape[dim_idx] = 1
-                per_dimension_masks.append(one.view(*view_shape))
+                per_dimension_masks.append(
+                    torch.ones(1, device=device, dtype=dtype).view(*view_shape)
+                )
                 continue
             view_shape[dim_idx] = mask_1d.shape[0]
-            per_dimension_masks.append(mask_1d.view(*view_shape))
+            per_dimension_masks.append(mask_1d.to(device=device, dtype=dtype).view(*view_shape))
         combined_mask = per_dimension_masks[0]
         for mask in per_dimension_masks[1:]:
             combined_mask = combined_mask * mask

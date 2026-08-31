@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -279,6 +279,36 @@ constexpr int CVT_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
+// Membermask for the __shfl_xor_sync butterfly among the NUM_THREADS_PER_SF
+// lanes that share one scale factor. The butterfly exchange never crosses
+// this aligned lane group, so only the group has to converge on the shuffle.
+//
+// Do not widen the mask to the full warp. A sync shuffle waits until every
+// lane named in the mask reaches the same call site, but here not every lane
+// of a warp gets there: in quantize_with_block_size, lanes that drew padding
+// columns (or ran out of columns) skip the cvt call and go wait at the CTA
+// barrier at the end of the kernel. If the data/padding boundary cuts through
+// a warp, a full-warp shuffle deadlocks against that barrier. A full mask can
+// also name lanes that were never launched, because blockDim is not always a
+// multiple of 32 (e.g. 200 threads leave the last warp with only 8 lanes);
+// that is undefined behavior.
+//
+// The group mask is always safe: blockDim and every column boundary (data,
+// padded, SF-padded) are multiples of the group size, so the lanes of one
+// group always reach the same set of shuffle calls together.
+template <int NUM_THREADS_PER_SF>
+inline __device__ uint32_t cvt_sf_group_shfl_mask()
+{
+    static_assert(
+        NUM_THREADS_PER_SF >= 2 && NUM_THREADS_PER_SF <= 32 && (NUM_THREADS_PER_SF & (NUM_THREADS_PER_SF - 1)) == 0,
+        "The SF group size must be a power of two between 2 and 32.");
+    constexpr uint32_t groupSize = static_cast<uint32_t>(NUM_THREADS_PER_SF);
+    constexpr uint32_t groupMask = 0xFFFFFFFFU >> (32U - groupSize);
+    uint32_t laneId = 0;
+    asm("mov.u32 %0, %%laneid;" : "=r"(laneId));
+    return groupMask << (laneId & ~(groupSize - 1U));
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8])
 {
@@ -439,10 +469,11 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 
     constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
     // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
     if constexpr (CVT_NUM_THREADS_PER_SF == 4)
     {
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+        localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
     }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -540,7 +571,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     if constexpr (CVT_NUM_THREADS_PER_SF == 2)
     {
         // For block 32, we need to reduce the local max across two threads.
-        localMax = __hmax2(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+        localMax = __hmax2(__shfl_xor_sync(cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>(), localMax, 1), localMax);
     }
 
     // Get the final absolute maximum values.
@@ -599,8 +630,30 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 #endif
 }
 
-// Quantizes the provided PackedVec into the uint64_t output
-template <class Type, int SF_VEC_SIZE>
+// Stores one scale value into the adjacent consumer slots of a K4 SF atom.
+template <int SF_REPLICATION>
+inline __device__ void cvt_store_replicated_sf(uint8_t* SFout, uint8_t sfValue)
+{
+    static_assert(
+        SF_REPLICATION == 1 || SF_REPLICATION == 2 || SF_REPLICATION == 4, "SF replication must divide a K4 atom.");
+    if (SFout)
+    {
+        if constexpr (SF_REPLICATION == 4)
+        {
+            *reinterpret_cast<uint32_t*>(SFout) = static_cast<uint32_t>(sfValue) * 0x01010101U;
+        }
+        else if constexpr (SF_REPLICATION == 2)
+        {
+            *reinterpret_cast<uint16_t*>(SFout) = static_cast<uint16_t>(sfValue) * 0x0101U;
+        }
+        else
+        {
+            *SFout = sfValue;
+        }
+    }
+}
+
+template <class Type, int SF_VEC_SIZE, int SF_REPLICATION = 1>
 __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -615,14 +668,21 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
     }
 
     constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
-    // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-    if constexpr (CVT_NUM_THREADS_PER_SF == 4)
+    // Get the absolute maximum among all values that share one scale factor.
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+#pragma unroll
+    for (int offset = 1; offset < CVT_NUM_THREADS_PER_SF; offset *= 2)
     {
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+        localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, offset), localMax);
     }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+    // Match fp8_quantize_1x128's handling of an all-zero block.
+    if constexpr (SF_VEC_SIZE == 128)
+    {
+        vecMax = fmaxf(vecMax, 1e-10f);
+    }
 
     // Get the SF (max value of the vector / max value of mxfp8).
     float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
@@ -636,11 +696,9 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
     // Get the output scale (reciprocal of the SFValue).
     float outputScale = vecMax != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
 
-    if (SFout)
-    {
-        // Write the SF to global memory (STG.8).
-        *SFout = fp8SFVal;
-    }
+    // Store one byte per consumer scale slot. For example, a K128 quantization
+    // scale is replicated into four K32 slots for an MXFP8 consumer.
+    cvt_store_replicated_sf<SF_REPLICATION>(SFout, fp8SFVal);
 
     // Convert the input to float.
     float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
@@ -693,8 +751,7 @@ inline __host__ __device__ int64_t get_sf_out_offset_128x4(
     int32_t kTileIdx = (kIdx / 4);
     int64_t kTileStride = 32 * outerMStride; // 512
 
-    // SF vector size 16 or 32. We round the "numCols" up to a multiple of 64 or 128.
-    // It is the same as rounding the "numColVecs" up to a multiple of 4.
+    // Round the number of scale-factor columns up to a multiple of four.
     int32_t numKTiles = (numColVecs + 4 - 1) / 4;
     int32_t mTileIdx = mIdx / (32 * 4);
     int64_t mTileStride = numKTiles * kTileStride;
@@ -710,24 +767,28 @@ inline __host__ __device__ int64_t get_sf_out_offset_128x4(
     return SFOffset;
 }
 
-template <class SFType, int CVT_NUM_THREADS_PER_SF>
+template <class SFType, int CVT_NUM_THREADS_PER_SF, int SF_REPLICATION = 1>
 __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx, int colVecIdx,
     std::optional<int> numRows, int numColVecs, SFType* SFout, QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     // Each thread holds one vector.
-    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2 || CVT_NUM_THREADS_PER_SF == 4);
+    static_assert(CVT_NUM_THREADS_PER_SF >= 1 && CVT_NUM_THREADS_PER_SF <= 32
+            && (CVT_NUM_THREADS_PER_SF & (CVT_NUM_THREADS_PER_SF - 1)) == 0,
+        "The number of threads per SF must be a power of two no greater than 32.");
+    static_assert(
+        SF_REPLICATION == 1 || SF_REPLICATION == 2 || SF_REPLICATION == 4, "SF replication must divide a K4 atom.");
 
-    // One pair of threads write one SF to global memory.
+    // One aligned group of threads writes one SF to global memory.
     // TODO: stage through smem for packed STG.32
     // is it better than STG.8 from 4 threads ?
     if (threadIdx.x % CVT_NUM_THREADS_PER_SF == 0)
     {
         if (layout == QuantizationSFLayout::SWIZZLED)
         {
-            // SF vector index (16 elements share one SF in the K dimension).
-            // numRows and numCols are unpadded.
-            int32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
+            // Output SF vector index. A quantization scale can be replicated
+            // into multiple adjacent consumer scale slots.
+            int32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF * SF_REPLICATION;
             int32_t mIdx = rowIdx;
 
             auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
@@ -736,7 +797,7 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
         else if (layout == QuantizationSFLayout::LINEAR)
         {
             // Linear row-major layout, no padding required.
-            int32_t KTileIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
+            int32_t KTileIdx = colVecIdx / CVT_NUM_THREADS_PER_SF * SF_REPLICATION;
 
             int32_t numKTiles = numColVecs;
             int64_t mTileStride = numKTiles;
@@ -755,7 +816,8 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
     return nullptr;
 }
 
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
+    int SF_OUTPUT_VEC_SIZE = SF_VEC_SIZE>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) quantize_with_block_size(
@@ -773,7 +835,12 @@ quantize_with_block_size(
         : CVT_ELTS_PER_THREAD;
 
     using PackedVec = PackedVec<Type>;
-    static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD; // 2 or 4
+    static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+    static constexpr int SF_REPLICATION = SF_VEC_SIZE / SF_OUTPUT_VEC_SIZE;
+    static_assert(SF_VEC_SIZE % ELTS_PER_THREAD == 0, "SF vector size must be divisible by elements per thread.");
+    static_assert(SF_VEC_SIZE % SF_OUTPUT_VEC_SIZE == 0, "Quantization SF size must be divisible by output SF size.");
+    static_assert(
+        SF_REPLICATION == 1 || SF_REPLICATION == 2 || SF_REPLICATION == 4, "SF replication must divide a K4 atom.");
     static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
     // Get the global scaling factor, which will be applied to the SF.
@@ -786,7 +853,7 @@ quantize_with_block_size(
 
     // The number of padded rows considering 128x4 SF layout.
     int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
-    int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+    int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_OUTPUT_VEC_SIZE) : numPaddedCols;
 
     // The number of threads in the column dimension。
     // Note that numCols/numPaddedCols/numColsForSf are guaranteed to be multiples of ELTS_PER_THREAD.
@@ -817,14 +884,12 @@ quantize_with_block_size(
                     std::optional<int> optionalNumRows = numRows;
 
                     // The SF output pointer.
-                    auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-                        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+                    auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF, SF_REPLICATION>(
+                        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_OUTPUT_VEC_SIZE, SFout,
+                        layout);
 
                     // Set the SF padding to 0.
-                    if (sf_out != nullptr)
-                    {
-                        sf_out[0] = 0x00;
-                    }
+                    cvt_store_replicated_sf<SF_REPLICATION>(sf_out, 0x00);
                 }
             }
         }
@@ -839,8 +904,9 @@ quantize_with_block_size(
                     std::optional<int> optionalNumRows = numRows;
 
                     // The SF output pointer.
-                    auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-                        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+                    auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF, SF_REPLICATION>(
+                        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_OUTPUT_VEC_SIZE, SFout,
+                        layout);
 
                     // The input tensor offset.
                     int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
@@ -866,10 +932,7 @@ quantize_with_block_size(
                     if (colIdx >= numColThreads)
                     {
                         // Set the SF padding to 0.
-                        if (sf_out != nullptr)
-                        {
-                            sf_out[0] = 0x00;
-                        }
+                        cvt_store_replicated_sf<SF_REPLICATION>(sf_out, 0x00);
                     }
                     else
                     {
@@ -890,13 +953,23 @@ quantize_with_block_size(
                         else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
                         {
                             reinterpret_cast<uint64_t*>(out)[outOffset]
-                                = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+                                = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, SF_REPLICATION>(in_vec, sf_out);
                         }
                     }
                 }
             }
         }
     }
+    // PDL completion is reported when every CTA has either exited or called
+    // this function at least once (per CUDA Programming Guide). Without a
+    // CTA-wide barrier, an early-finishing warp can trigger completion while
+    // other warps in the same CTA are still writing sf_out / out, allowing the
+    // downstream NVF4 GEMM consumer to read partial data once
+    // wait_on_dependent_grids returns. Each thread first makes its own stores
+    // device-visible; the barrier then guarantees every thread has done so
+    // before any thread can reach the trigger.
+    __threadfence();
+    __syncthreads();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }

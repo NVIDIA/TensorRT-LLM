@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Base class for speculative decoding samplers.
+Sampler for one-model speculative decoding.
 
-This module provides a common base class for MTPSampler, SASampler, and
-Eagle3OneModelSampler.
+Every one-model speculative mode (MTP, Eagle3, SA, DraftTarget, PARD, DFlash,
+DSpark) shares a single sampler: the worker's fused kernel already performs
+drafting, target verification and acceptance, so the sampler only scatters that
+output into slot-indexed buffers, starts the async D2H copy, and updates
+requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
 from dataclasses import dataclass
@@ -26,7 +29,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
@@ -38,6 +41,9 @@ from ..pyexecutor.sampler import (
     add_token,
     int_tensor,
 )
+from ..pyexecutor.sampler.penalties import has_occurrence_penalty
+from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
+from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
 
 
@@ -55,27 +61,127 @@ class SampleStateSpec(SampleState):
 
     device: SampleStateTensorsSpec
     host: SampleStateTensorsSpec
+    # Per-request draft-token counts of the step this state samples, captured
+    # in sample_async before dummy draft tokens are added (index-aligned with
+    # `requests`; 0 for finished-context requests). update_requests pairs
+    # them with py_num_accepted_draft_tokens: reading py_draft_tokens there
+    # instead would see the NEXT step's buffer, which update_requests itself
+    # installs.
+    draft_lens: Optional[list[int]] = None
 
 
-class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
+class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     """
-    Base class for speculative decoding samplers (MTP, NGram, Eagle3, SA).
+    Sampler for all one-model speculative decoding modes.
 
-    Provides common functionality:
-    - Pre-allocated GPU storage buffers
+    Provides:
+    - Pre-allocated, slot-indexed GPU storage buffers
     - Async GPU->CPU copy in sample_async
     - Request state updates in update_requests
 
-    Subclasses can customize behavior by overriding:
-    - _get_max_tokens(): How to calculate max_tokens for storage
-    - _get_draft_tokens_storage_size(): Size of next_draft_tokens tensor
-    - _add_dummy_draft_tokens(): Whether to add dummy drafts for context requests
+    This class carries no per-mode behavior. ``args.max_total_draft_tokens`` is
+    ``spec_config.tokens_per_gen_step - 1`` (see ``create_torch_sampler_args``),
+    i.e. the target's per-step input width minus one, which is exactly the
+    draft length every mode used to compute for itself.
     """
 
     SampleState = SampleStateSpec
 
     def is_generation_model(self) -> bool:
         return True
+
+    def validate_request(self, request: LlmRequest) -> None:
+        """Reject sampling parameters the one-model speculative path cannot honor.
+
+        The one-model sampling kernels take only temperature/top_k/top_p (see
+        SpecMetadata.populate_sampling_params_for_one_model); min_p has no
+        buffer there, so it would be silently dropped and the request would
+        decode from a different distribution than the user asked for. Threading
+        it through costs measurable throughput on the rejection path, so reject
+        instead. Raised from validate_request (request admission), so only the
+        offending request fails rather than the whole executor step.
+        """
+        sampling_config = request.sampling_config
+        if sampling_config is None:
+            return
+        # min_p lives on the C++ SamplingConfig as an optional singleton list.
+        min_p = sampling_config.min_p
+        if min_p and min_p[0] > 0.0:
+            raise ValueError(
+                "min_p is not supported with one-model speculative decoding. "
+                "Drop min_p from the request, or disable speculative decoding."
+            )
+        self._validate_unsupported_logits_processors(request)
+        # The occurrence penalties need a [slots, vocab_size] workspace that is only
+        # allocated when the deploy opted in, so a request asking for them while the
+        # flag is off cannot be honored. Reject instead of silently decoding from an
+        # unpenalized distribution -- same reasoning as min_p above.
+        if not has_occurrence_penalty(request):
+            return
+        if not self._enable_penalty:
+            raise ValueError(
+                "repetition_penalty / presence_penalty / frequency_penalty require "
+                "'enable_penalty: true' in the speculative decoding config when using "
+                "one-model speculative decoding. Enable that flag, drop the penalties "
+                "from the request, or disable speculative decoding."
+            )
+        # Tree speculation lays each request's logits out as tree nodes, where a
+        # row's history is its root path rather than the rows before it. Applying
+        # the linear mapping there would let sibling branches penalize each other,
+        # so reject until tree-aware prefixes are implemented.
+        if not self._penalty_supported:
+            raise ValueError(
+                "repetition_penalty / presence_penalty / frequency_penalty are not "
+                "supported with tree speculative decoding (eagle_choices / dynamic "
+                "tree) yet. Drop the penalties, use a linear speculation mode, or "
+                "disable speculative decoding."
+            )
+
+    @staticmethod
+    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+        """Reject logits-side sampling features the one-model path cannot apply.
+
+        TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
+        embedding_bias and top_p_decay by editing the target logits before
+        sampling. The one-model path has no logits-editing hook, so each is
+        rejected here instead of being silently dropped.
+
+        Each check gates on a non-neutral value rather than on presence, since a
+        frontend may forward a default explicitly.
+        """
+        # py_min_length mirrors the C++ SamplingConfig field, i.e. an optional
+        # singleton list. The OpenAI frontend always forwards min_tokens (default
+        # 0), so the list is routinely present and holds the neutral value --
+        # gate on the value, not on the list being non-empty.
+        min_length = getattr(request, "py_min_length", None)
+        if min_length and min_length[0] > 0:
+            raise ValueError(
+                "min_length is not supported with one-model speculative decoding. "
+                "Drop min_length from the request, or disable speculative decoding."
+            )
+        if getattr(request, "py_bad_words", None):
+            raise ValueError(
+                "bad_words is not supported with one-model speculative decoding. "
+                "Drop bad_words from the request, or disable speculative decoding."
+            )
+        if getattr(request, "py_no_repeat_ngram_size", None):
+            raise ValueError(
+                "no_repeat_ngram_size is not supported with one-model speculative "
+                "decoding. Drop no_repeat_ngram_size from the request, or disable "
+                "speculative decoding."
+            )
+        if getattr(request, "_py_embedding_bias_1d", None) is not None:
+            raise ValueError(
+                "embedding_bias is not supported with one-model speculative decoding. "
+                "Drop embedding_bias from the request, or disable speculative decoding."
+            )
+        # Reuse the handler's own predicate so "active" cannot drift between paths.
+        if top_p_decay_active(_request_get_sampling_params(request)):
+            raise ValueError(
+                "top_p_decay is not supported with one-model speculative decoding. "
+                "Drop top_p_decay / top_p_min from the request, or disable "
+                "speculative decoding."
+            )
 
     @dataclass(kw_only=True)
     class Store:
@@ -86,67 +192,70 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
 
-    def __init__(self, args: TorchSampler.Args, *, draft_len: int):
+    def __init__(
+        self,
+        args: TorchSampler.Args,
+        *,
+        accepted_path_len: Optional[int] = None,
+        enable_penalty: bool = False,
+        penalty_supported: bool = True,
+    ):
         """
         Initialize the speculative sampler.
 
         Args:
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
-            draft_len: Maximum number of draft tokens per iteration.
+            accepted_path_len: Upper bound on the number of tokens a single step
+                can accept, used to size new_tokens. Defaults to
+                ``args.max_draft_len + 1``; see the store comment below for the
+                one mode that has to override it.
+            enable_penalty: whether the deploy enabled the occurrence penalties.
+                Only used to decide whether a request asking for them is admitted;
+                the penalties themselves are applied inside the worker.
+            penalty_supported: whether this speculation mode's row layout is one
+                the penalties can map (linear modes yes, tree modes not yet).
         """
+        self._enable_penalty = enable_penalty
+        self._penalty_supported = penalty_supported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
-        self.draft_len = draft_len
         self.max_seq_len = args.max_seq_len
+        # Wire width minus one: the number of draft slots the target verifies
+        # per step. Linear modes set max_total_draft_tokens == max_draft_len;
+        # tree modes set it to the total node count; PARD sets it to 2K-1
+        # because it also feeds mask tokens through the target.
+        self.draft_len = args.max_total_draft_tokens
 
         seq_slots = args.max_num_sequences
-        max_tokens = self._get_max_tokens(args, draft_len)
-        max_new_tokens = self._get_max_new_tokens(args, draft_len)
-        draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
+        # new_tokens holds the accepted tokens only, so it is sized to how many
+        # a step can accept rather than to the wire width. Normally that is
+        # max_draft_len + 1: the drafter advances max_draft_len times, and the
+        # golden token the target always accepts adds one. Verified against
+        # Eagle3 dynamic tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and
+        # the linear modes -- none exceed it.
+        #
+        # The exception is the deprecated eagle_choices static tree. There the
+        # one-model drafter ignores the tree and runs _forward_draft_loop, a
+        # linear loop over runtime_draft_len == max_total_draft_tokens, so a
+        # step can accept up to max_total_draft_tokens + 1 tokens even though
+        # max_draft_len only describes the depth of a tree that is never built.
+        # (Tree-aware acceptance lives in TorchSampler, i.e. the two-model
+        # path.) get_spec_decoder passes the wire width for that mode; both it
+        # and this workaround go away with the feature in release 1.4.
+        self.max_accepted_path_len = (
+            accepted_path_len if accepted_path_len is not None else args.max_draft_len + 1
+        )
         self.store = self.Store(
-            new_tokens=int_tensor((max_new_tokens, seq_slots, self.max_beam_width)),
-            next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
-            next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
+            new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
+            next_new_tokens=int_tensor(
+                (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
+            ),
+            next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
-
-    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """
-        Calculate max_tokens for storage allocation.
-
-        Override in subclasses if needed. Default: draft_len + 1.
-        MTP uses args.max_total_draft_tokens + 1 for tree-based speculation.
-        """
-        return draft_len + 1
-
-    def _get_max_new_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """Max depth of accepted token path for new_tokens buffer.
-
-        Defaults to _get_max_tokens (same size as next_new_tokens).
-        Override when accepted path depth differs from total draft tokens,
-        e.g. dynamic tree where max_draft_len < max_total_draft_tokens.
-        """
-        return self._get_max_tokens(args, draft_len)
-
-    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """
-        Calculate storage size for next_draft_tokens tensor.
-
-        Override in subclasses if needed. Default: draft_len.
-        MTP uses args.max_total_draft_tokens for tree-based speculation.
-        """
-        return draft_len
-
-    def _add_dummy_draft_tokens(self) -> bool:
-        """
-        Whether to add dummy draft tokens for context requests.
-
-        Override in subclasses. Default: True (needed for KV cache preparation).
-        """
-        return True
 
     def _request_common_handling(
         self,
@@ -197,17 +306,32 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
-        for req in state.requests:
+        for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            # new_tokens is sized to this bound, and add_token indexes a plain
+            # host-side list, so a violation would otherwise surface as an
+            # opaque IndexError.
+            assert num_new_tokens <= self.max_accepted_path_len, (
+                f"accepted {num_new_tokens} tokens in one step, but new_tokens is "
+                f"sized for {self.max_accepted_path_len}"
+            )
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
-                if TorchSampler._handle_stop_criteria(
+                if handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
+            # Pair the acceptance count with the draft count of the SAME step,
+            # snapshotted at sample_async time: _request_common_handling below
+            # replaces py_draft_tokens with the next step's buffer, so its
+            # length must not be used as the denominator (0 for the request's
+            # prefill step, where nothing was verified).
+            req.py_num_draft_tokens_verified = (
+                state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            )
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
@@ -238,6 +362,21 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         sampling_requests = finished_context_requests + scheduled_requests.generation_requests
         num_sampling_requests = len(sampling_requests)
 
+        # Snapshot each request's draft count for THIS step before
+        # _add_dummy_draft_tokens below installs placeholder drafts on
+        # finished-context requests; update_requests pairs these with the
+        # acceptance counts (see SampleStateSpec.draft_lens). Drafter-fed
+        # flows (NGram, SA) pad py_draft_tokens to the static max for CUDA
+        # graphs before the forward, so prefer the pre-padding count the
+        # drafter recorded; min() guards against a stale count when the
+        # buffer was since cleared (e.g. speculation dynamically disabled).
+        draft_lens = [
+            min(r.py_draft_tokens_effective_len, get_draft_token_length(r))
+            if r.py_draft_tokens_effective_len is not None
+            else get_draft_token_length(r)
+            for r in sampling_requests
+        ]
+
         slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
 
@@ -250,8 +389,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
-        # Use actual store buffer dimensions (which may differ from draft_len
-        # when _get_max_new_tokens is overridden, e.g. dynamic tree mode).
+        # The worker output width tracks runtime_draft_len, which dynamic draft
+        # length shrinks below the statically allocated store width.
         new_tokens_width = self.store.new_tokens.shape[0]
         next_new_tokens_width = self.store.next_new_tokens.shape[0]
         draft_tokens_width = self.store.next_draft_tokens.shape[1]
@@ -295,9 +434,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
-        if self._add_dummy_draft_tokens():
-            for request in finished_context_requests:
-                request.py_draft_tokens = [1] * self.draft_len
+        for request in finished_context_requests:
+            request.py_draft_tokens = [1] * self.draft_len
 
         return SampleStateSpec(
             requests=sampling_requests,
@@ -305,4 +443,5 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             host=host_tensors,
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
+            draft_lens=draft_lens,
         )

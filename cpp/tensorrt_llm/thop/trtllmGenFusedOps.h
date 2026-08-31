@@ -66,14 +66,15 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
     std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
     std::optional<torch::Tensor> attention_output_orig_quant, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, int64_t layer_idx, int64_t seq_offset, int64_t num_heads,
-    int64_t num_kv_heads, int64_t head_size, int64_t tokens_per_block, int64_t kv_cache_quant_mode,
-    int64_t max_attention_window_size, int64_t cyclic_attention_window_size, int64_t num_tokens, int64_t batch_beam,
-    int64_t input_seq_length, int64_t max_past_kv_length, int64_t rotary_embedding_dim, double rotary_embedding_base,
-    int64_t rotary_embedding_scale_type, double rotary_embedding_scale, int64_t rotary_embedding_max_positions,
-    int64_t position_embedding_type, double bmm1_scale, double bmm2_scale, bool fp8_context_fmha,
-    int64_t predicted_tokens_per_seq, int64_t attention_chunk_size, int64_t multi_processor_count,
-    int64_t total_num_blocks, int64_t kv_factor, bool need_build_kv_cache_metadata, bool cross_attention = false);
+    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas, int64_t layer_idx,
+    int64_t seq_offset, int64_t num_heads, int64_t num_kv_heads, int64_t head_size, int64_t tokens_per_block,
+    int64_t kv_cache_quant_mode, int64_t max_attention_window_size, int64_t cyclic_attention_window_size,
+    int64_t num_tokens, int64_t batch_beam, int64_t input_seq_length, int64_t max_past_kv_length,
+    int64_t rotary_embedding_dim, double rotary_embedding_base, int64_t rotary_embedding_scale_type,
+    double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
+    double bmm1_scale, double bmm2_scale, bool fp8_context_fmha, int64_t predicted_tokens_per_seq,
+    int64_t attention_chunk_size, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
+    bool need_build_kv_cache_metadata, bool cross_attention = false);
 
 } // namespace torch_ext
 

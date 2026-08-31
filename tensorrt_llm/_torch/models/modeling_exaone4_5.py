@@ -10,6 +10,7 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
+from tensorrt_llm.logger import logger
 
 from ...inputs import (
     ContentFormat,
@@ -35,6 +36,31 @@ from .modeling_qwen2vl import (
     Qwen2VLModelBase,
 )
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
+
+
+def _normalize_exaone4_5_mtp_layer_types(text_config: dict) -> None:
+    """Remove MTP-only entries from the base decoder layer layout."""
+    layer_types = text_config.get("layer_types")
+    num_hidden_layers = text_config.get("num_hidden_layers")
+    num_mtp_layers = text_config.get("_num_mtp_layers")
+    num_nextn_predict_layers = text_config.get("num_nextn_predict_layers")
+
+    if not (
+        isinstance(layer_types, list)
+        and isinstance(num_hidden_layers, int)
+        and isinstance(num_mtp_layers, int)
+        and num_mtp_layers > 0
+        and num_mtp_layers == num_nextn_predict_layers
+        and len(layer_types) == num_hidden_layers + num_mtp_layers
+    ):
+        return
+
+    logger.warning(
+        f"EXAONE 4.5 config includes {num_mtp_layers} trailing MTP layer type(s); "
+        f"excluding them from the {num_hidden_layers}-layer base decoder layout."
+    )
+    text_config["layer_types"] = layer_types[:num_hidden_layers]
+
 
 # transformers >= 5.8 ships native Exaone4.5 configs with the same
 # sub-config-instantiation logic we'd otherwise re-implement here. Prefer
@@ -66,6 +92,7 @@ except ImportError:
         ):
             if isinstance(text_config, dict):
                 text_config = copy.deepcopy(text_config)
+                _normalize_exaone4_5_mtp_layer_types(text_config)
                 model_type = text_config.get("model_type", "exaone4")
                 # BC: EXAONE 4.5 first released with the text model type
                 # as `exaone4_5_text`, later renamed to `exaone4`.

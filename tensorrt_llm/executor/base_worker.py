@@ -16,29 +16,30 @@ import datetime
 import enum
 import gc
 import json
+import time
+import traceback
+import uuid
 import weakref
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.peft.lora.manager import LoraManager
+from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
-from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..lora_manager import LoraManager
-from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
-from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
@@ -48,9 +49,11 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    bucket_responses_by_frontend, frontend_lane_index,
                     is_llm_response)
 
 if TYPE_CHECKING:
+    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -88,7 +91,7 @@ class BaseWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -117,6 +120,9 @@ class BaseWorker(GenerationExecutor):
         self.engine = None
         self.result_queue: Optional[IpcQueue] = None
         self.postproc_queues: Optional[List[IpcQueue]] = None
+        # Multi-frontend serving: one result lane per frontend process,
+        # selected by the frontend id in client_id's top bits.
+        self.frontend_result_queues: Optional[List[IpcQueue]] = None
         self.rank = mpi_rank()
         self.global_rank = global_mpi_rank()
         # mapping: client_id -> GenerationResult
@@ -206,56 +212,12 @@ class BaseWorker(GenerationExecutor):
                 self.max_seq_len = _executor.max_seq_len
             return _executor
 
-        def _create_engine(executor_config):
-            engine = self._engine
-            if executor_config is None:
-                executor_config = tllm.ExecutorConfig(1)
-            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-                processor_batched=self._batched_logits_processor,
-                replicate=False)
-            comm_ranks, device_ids = self._get_comm_ranks_device_id()
-            executor_config.parallel_config = tllm.ParallelConfig(
-                participant_ids=comm_ranks, device_ids=device_ids)
-
-            if isinstance(engine, Engine):
-                return tllm.Executor(engine.engine,
-                                     json.dumps(engine.config.to_dict(),
-                                                cls=ConfigEncoder),
-                                     tllm.ModelType.DECODER_ONLY,
-                                     executor_config=executor_config,
-                                     managed_weights=engine.managed_weights)
-
-            assert not hasattr(executor_config, "backend")
-            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                 executor_config)
-
-        self.engine = _create_py_executor(
-        ) if self.llm_args is not None else _create_engine(
-            self._executor_config)
+        assert self.llm_args is not None, "llm_args is required to set up the worker engine"
+        self.engine = _create_py_executor()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
-        if self.rank == 0 and isinstance(self.engine, tllm.Executor):
-            if isinstance(self.engine, Engine):
-                engine_config = self.engine.config
-            else:
-                engine_config = EngineConfig.from_json_file(
-                    f"{self._engine}/config.json")
-            self._runtime_model_config = _engine_config_to_model_config(
-                engine_config)
-            if engine_config.build_config.plugin_config.lora_plugin:
-                # TODO(azuker): Passing peft cache manager to LoraManager is used for LoRA optimization
-                # (see LoraManager constructor docstring). Getting the peft cache manager from this
-                # point in the TRT flow is currently not supported (it's at the CPP
-                # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
-                # optimization is not available in TRT-python flow.
-                self._lora_manager = LoraManager(
-                    mapping=engine_config.pretrained_config.mapping,
-                    model_config=self._runtime_model_config,
-                    cpp_peft_cache_manager=None)
-            if engine_config.build_config.max_prompt_embedding_table_size > 0:
-                self._prompt_adapter_manager = PromptAdapterManager()
 
         if self._backend == "pytorch" and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
@@ -272,29 +234,38 @@ class BaseWorker(GenerationExecutor):
             seconds=timeout) if timeout is not None else None)
 
     def fetch_stats(self) -> list:
-        if isinstance(self.engine, tllm.Executor):
-            iter_stats = self.engine.get_latest_iteration_stats()
-            #TODO: Support req stats with TRT engine
-            #      This would require ensuring iter and req stats have same size
-            return [(iter_stat, None, None) for iter_stat in iter_stats]
-        else:
-            return self.engine.get_latest_iteration_stats()
+        return self.engine.get_latest_iteration_stats()
+
+    def fetch_kv_cache_capacity(self) -> dict:
+        if self.engine is None:
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_capacity()
+
+        return {}
 
     def fetch_kv_cache_events(self) -> list:
-        if isinstance(self.engine, tllm.Executor):
-            return self.engine.get_latest_kv_cache_events()
-        else:
-            return self.engine.get_latest_kv_cache_events()
+        return self.engine.get_latest_kv_cache_events()
 
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None
+        assert self.frontend_result_queues is None
         self.result_queue = queue
 
     def set_postproc_queues(self, queues: List["IpcQueue"]):
         """ Set the IPC queues for feeding post-processing processes. """
         assert self.result_queue is None
+        assert self.frontend_result_queues is None
         self.postproc_queues = queues
+
+    def set_frontend_result_queues(self, queues: List["IpcQueue"]):
+        """Multi-frontend serving: one result lane per frontend process."""
+        assert self.result_queue is None
+        assert self.postproc_queues is None
+        self.frontend_result_queues = queues
 
     def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
                                     queue: Union[Queue, FusedIpcQueue,
@@ -454,8 +425,10 @@ class BaseWorker(GenerationExecutor):
                                llm_args: Optional[BaseLlmArgs] = None) -> int:
             # deduce max_tokens when it's not set by user
             max_tokens = request.sampling_params.max_tokens
-            query_token_len = len(
-                request.query_token_ids) if request.query_token_ids else 0
+            output_prefix_len = len(
+                request.sampling_params._decoder_output_token_prefix)
+            if max_tokens is not None:
+                max_tokens -= output_prefix_len
 
             cp_size = 1
             max_seq_len = None
@@ -486,14 +459,13 @@ class BaseWorker(GenerationExecutor):
                     len(prompt_token_ids) <= executor_config.max_seq_len
                 ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
-            default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
+            default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
                 # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
                 raise ValueError(
                     f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
-                    f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
-                )
+                    f" - `splited_prompt_len` ({splited_prompt_len})")
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -571,6 +543,8 @@ class BaseWorker(GenerationExecutor):
                     # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
+                if request.multimodal_params.mm_item_order:
+                    executor_request.py_mm_item_order = request.multimodal_params.mm_item_order
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
@@ -590,23 +564,11 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
-            if request.query_token_ids is not None:
-                # pytorch star attention workflow
-                # a workaround to avoid public interface update
-                if self._is_pytorch_backend and result_wait_queue is not None:
-                    req_id = self.engine.enqueue_request(
-                        executor_request,
-                        request.query_token_ids,
-                        result_wait_queue=result_wait_queue)
-                else:
-                    req_id = self.engine.enqueue_request(
-                        executor_request, request.query_token_ids)
+            if self._is_pytorch_backend and result_wait_queue is not None:
+                req_id = self.engine.enqueue_request(
+                    executor_request, result_wait_queue=result_wait_queue)
             else:
-                if self._is_pytorch_backend and result_wait_queue is not None:
-                    req_id = self.engine.enqueue_request(
-                        executor_request, result_wait_queue=result_wait_queue)
-                else:
-                    req_id = self.engine.enqueue_request(executor_request)
+                req_id = self.engine.enqueue_request(executor_request)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
@@ -655,7 +617,6 @@ class BaseWorker(GenerationExecutor):
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         # _autodeploy is intentionally excluded: its allocations are not tagged
         # under sleep_config VMM scopes, so release_with_tag would silently
@@ -669,20 +630,245 @@ class BaseWorker(GenerationExecutor):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
-        # Non-rank-0 processes block on their local control_action_done
-        # threading.Event with no Python caller to release it — deadlock.
-        if self.llm_args.parallel_config.world_size > 1:
-            raise NotImplementedError(
-                f"{method}() requires parallel_config.world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
 
-    def sleep(self, sleep_tags: List[str]) -> None:
+    def _multi_rank_sleep_wakeup(
+        self,
+        action: str,
+        tags: list[ExecutorMemoryType],
+    ) -> None:
+        """Coordinate a sleep or wakeup operation across all MPI ranks.
+
+        Called on rank-0 only for ``world_size > 1`` deployments.
+
+        Sequence:
+        1. Enter ``control_action()`` to drain in-flight requests and pause
+           rank-0's event loop.  Non-rank-0 event loops become idle (starved
+           of NCCL collectives from rank-0) once the current iteration drains.
+        2. Send PREPARE to every non-rank-0 rank via the dedicated
+           ``_sleep_wakeup_comm`` communicator.  Peers quiesce and ACK without
+           changing VMM state.
+        3. Execute the VMM operation (``release_with_tag`` or
+           ``materialize_with_tag``) locally on rank-0.
+        4. Send COMMIT to prepared peers and collect ACKs after their local VMM
+           operations.  If PREPARE or rank-0 local execution fails, send ABORT
+           so peers leave the control barrier without changing VMM state.
+        5. Exit ``control_action()``, resuming rank-0's event loop.
+
+        Args:
+            action: ``"sleep"`` or ``"wakeup"``.
+            tags: Parsed :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                values; forwarded verbatim to each rank's VMM call.
+        """
+        from tensorrt_llm._torch.pyexecutor.py_executor import (
+            _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
+            _SleepWakeupAction, _SleepWakeupTag)
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
+
+        if self.rank != 0:
+            raise RuntimeError(
+                "_multi_rank_sleep_wakeup must only be called on rank 0")
+
+        sleep_wakeup_comm = self.engine._sleep_wakeup_comm
+        if sleep_wakeup_comm is None:
+            raise RuntimeError(
+                "_sleep_wakeup_comm not initialised; was start_worker() called?"
+            )
+
+        world_size = self.llm_args.parallel_config.world_size
+        if world_size <= 1:
+            raise ValueError(
+                "_multi_rank_sleep_wakeup requires world_size greater than 1")
+
+        tag_strings = [t.value for t in tags]
+        op_id = uuid.uuid4().hex
+        target_action = _SleepWakeupAction(action)
+        prepare_msg = {
+            "action": _SleepWakeupAction.PREPARE,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+        commit_msg = {
+            "action": _SleepWakeupAction.COMMIT,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+
+        # Serialise concurrent sleep/wakeup calls.  control_action() uses an
+        # Event-based barrier, not a mutex, so two concurrent callers can both
+        # pass the barrier and then interleave sends/recvs on _sleep_wakeup_comm,
+        # consuming the wrong ACKs or resuming the event loop prematurely.
+        # _sleep_wakeup_lock turns the whole sequence into a critical section.
+        with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                control_id=op_id):
+            prepared_ranks = []
+            errors = []
+            local_error = None
+            abort_sent = False
+
+            def send_abort(reason: str,
+                           ranks: Optional[list[int]] = None) -> list[int]:
+                abort_ranks = []
+                abort_dests = ranks if ranks is not None else range(
+                    1, world_size)
+                abort_msg = {
+                    "action": _SleepWakeupAction.ABORT,
+                    "tags": [],
+                    "op_id": op_id,
+                    "reason": reason,
+                }
+                for abort_dest in abort_dests:
+                    try:
+                        sleep_wakeup_comm.send(
+                            abort_msg,
+                            dest=abort_dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        abort_ranks.append(abort_dest)
+                    except Exception as abort_exc:
+                        abort_error = (
+                            "rank 0 failed to send sleep/wakeup abort "
+                            f"to rank {abort_dest}: {abort_exc}")
+                        errors.append(abort_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            abort_error,
+                            exc_info=True,
+                        )
+                return abort_ranks
+
+            def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
+                ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
+                for src in ranks:
+                    try:
+                        ack = _recv_sleep_wakeup_ack_until(sleep_wakeup_comm,
+                                                           src,
+                                                           ack_deadline,
+                                                           expected_op_id=op_id,
+                                                           expected_phase=phase)
+                    except Exception as exc:
+                        errors.append(
+                            f"rank 0 failed to receive {phase} ACK from "
+                            f"rank {src}: {exc}")
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: failed to receive %s "
+                            "ACK from rank %d",
+                            phase,
+                            src,
+                            exc_info=True,
+                        )
+                        continue
+                    if ack.get("status") != "ok":
+                        errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown {phase} ACK")
+
+            try:
+                # Phase 1: prepare peers.  A prepared peer has reached the
+                # control barrier and synchronized CUDA, but has not modified
+                # VMM state yet.  This keeps send/local failures from leaving
+                # a subset of ranks slept/woken while rank 0 did not commit.
+                for dest in range(1, world_size):
+                    try:
+                        sleep_wakeup_comm.send(prepare_msg,
+                                               dest=dest,
+                                               tag=_SleepWakeupTag.ACTION)
+                        prepared_ranks.append(dest)
+                    except Exception as exc:
+                        send_error = (
+                            f"rank 0 failed to send '{action}' prepare to rank "
+                            f"{dest}: {exc}")
+                        errors.append(send_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            send_error,
+                            exc_info=True,
+                        )
+                        abort_ranks = send_abort(send_error)
+                        abort_sent = True
+                        drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                        break
+
+                if not errors:
+                    drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+
+                if not errors:
+                    # Execute locally on rank-0.  Only CUDA/VMM errors are
+                    # captured as local_error. Peers are still prepared but
+                    # uncommitted, so local failure can abort them without
+                    # changing their VMM state.
+                    torch.cuda.synchronize()
+                    if action == _SleepWakeupAction.SLEEP:
+                        release_with_tag(*tags)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    else:
+                        materialize_with_tag(*tags)
+                        torch.cuda.synchronize()
+            except (RuntimeError, torch.OutOfMemoryError) as exc:
+                local_error = (f"rank 0 '{action}' failed: {exc}\n"
+                               f"{traceback.format_exc()}")
+                logger.error(
+                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
+                    action,
+                    exc_info=True,
+                )
+            finally:
+                if local_error:
+                    errors.append(local_error)
+
+                if errors and prepared_ranks and not abort_sent:
+                    abort_ranks = send_abort("\n".join(errors))
+                    drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                elif not errors:
+                    commit_ranks = []
+                    commit_failed_ranks = []
+                    for dest in prepared_ranks:
+                        try:
+                            sleep_wakeup_comm.send(
+                                commit_msg,
+                                dest=dest,
+                                tag=_SleepWakeupTag.ACTION,
+                            )
+                            commit_ranks.append(dest)
+                        except Exception as exc:
+                            commit_error = (
+                                f"rank 0 failed to send '{action}' commit to "
+                                f"rank {dest}: {exc}")
+                            errors.append(commit_error)
+                            commit_failed_ranks.append(dest)
+                            logger.error(
+                                "_multi_rank_sleep_wakeup: %s",
+                                commit_error,
+                                exc_info=True,
+                            )
+                    if commit_failed_ranks:
+                        abort_ranks = send_abort("\n".join(errors),
+                                                 ranks=commit_failed_ranks)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                    drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
+
+                if errors:
+                    raise RuntimeError(
+                        f"{action}() failed on {len(errors)} rank(s):\n" +
+                        "\n".join(errors))
+
+    def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  Uses
-        ``PyExecutor.control_action()`` to drain in-flight requests and pause
-        the event loop before calling ``release_with_tag()``, matching the
-        ``@control_action_decorator`` behaviour used in Ray.
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  For multi-rank, a lightweight
+        control-listener thread on each non-rank-0 worker handles the local
+        ``release_with_tag()`` call while rank-0 coordinates via a dedicated
+        secondary MPI communicator.
+
+        Uses ``PyExecutor.control_action()`` to drain in-flight requests and
+        pause rank-0's event loop, matching the ``@control_action_decorator``
+        behaviour used in the Ray executor.
 
         Only allocations backed by virtual memory (VMM) and registered under
         the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
@@ -697,13 +883,12 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released and the event loop
-            has been resumed.
+            VMM-tagged allocations have been released on every rank and the
+            event loop has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("sleep")
 
@@ -711,18 +896,23 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
         logger.info(f"Sleep: {tags}")
-        with self.engine.control_action():
-            torch.cuda.synchronize()
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("sleep", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-    def wakeup(self, wakeup_tags: List[str]) -> None:
+    def wakeup(self, wakeup_tags: list[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
-        details on VMM scope restrictions and backend prerequisites.
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  See :meth:`sleep` for details
+        on VMM scope restrictions, backend prerequisites, and multi-rank
+        coordination.
 
         Args:
             wakeup_tags: List of
@@ -731,13 +921,12 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized and the event loop
-            has been resumed.
+            VMM-tagged allocations have been materialized on every rank and the
+            event loop has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("wakeup")
 
@@ -745,10 +934,13 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
         logger.info(f"Wakeup: {tags}")
-        with self.engine.control_action():
-            torch.cuda.synchronize()
-            materialize_with_tag(*tags)
-            torch.cuda.synchronize()
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("wakeup", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                materialize_with_tag(*tags)
+                torch.cuda.synchronize()
 
     def shutdown(self):
         if self.doing_shutdown:
@@ -765,6 +957,35 @@ class BaseWorker(GenerationExecutor):
             logger.warning("Engine or kv cache transceiver is not initialized")
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
+
+    def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
+        if self.engine is None:
+            return None
+        return self.engine.kv_cache_transceiver
+
+    def get_data_transceiver_state(self) -> bytes:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            return b""
+        return self.engine.kv_cache_transceiver.get_data_transceiver_state()
+
+    def get_startup_metrics(self) -> dict:
+        """Return rank-local startup metrics for the PyTorch backend."""
+        if not self._is_pytorch_backend or self.engine is None:
+            return {}
+
+        startup_metrics = {}
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_loader = getattr(model_engine, "model_loader", None)
+        if model_loader is not None:
+            startup_metrics["model_loader"] = dict(model_loader.metrics)
+
+        draft_model_engine = getattr(self.engine, "draft_model_engine", None)
+        draft_model_loader = getattr(draft_model_engine, "model_loader", None)
+        if draft_model_loader is not None:
+            startup_metrics["draft_model_loader"] = dict(
+                draft_model_loader.metrics)
+
+        return startup_metrics
 
     @staticmethod
     def _stats_serializer(stats) -> str:
@@ -829,6 +1050,10 @@ class BaseWorker(GenerationExecutor):
         # Convert back to JSON string
         return json.dumps(stats_dict)
 
+    @staticmethod
+    def _kv_cache_capacity_serializer(capacity) -> str:
+        return json.dumps(capacity)
+
     # Define a Callable to serialize KV cache events
     @staticmethod
     def _kv_cache_events_serializer(events) -> str:
@@ -866,24 +1091,37 @@ class AwaitResponseHelper:
         # The error responses when submit request failed will be put here
         self.temp_error_responses = Queue()
 
-    def responses_handler(self, responses: List[tllm.Response]):
+    def _resolve_handler_kind(self) -> "AwaitResponseHelper.HandlerKind":
+        """Determine (and memoise) which side of the IPC boundary we are on.
+
+        Split out of ``responses_handler`` so the error path can ask the same
+        question without having handled a response batch first — a crash
+        during the very first ``await_responses`` leaves ``handler_kind``
+        ``unknown`` otherwise.
+        """
         HandlerKind = AwaitResponseHelper.HandlerKind
 
         if self.handler_kind is HandlerKind.unknown:
-            if not (self.worker.result_queue is not None
-                    or self.worker.postproc_queues is not None):
+            has_ipc_queues = (self.worker.result_queue is not None
+                              or self.worker.postproc_queues is not None
+                              or self.worker.frontend_result_queues is not None)
+            if not has_ipc_queues:
                 logger_debug(f"creating await_response helper for Worker\n",
                              color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
-            elif self.worker.result_queue is not None or self.worker.postproc_queues is not None:
+            else:
                 # The ExecutorBindingProxy is used
                 logger_debug(f"creating await_response helper for IPC\n",
                              color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
-            else:
-                raise NotImplementedError
+        return self.handler_kind
+
+    def responses_handler(self, responses: List[tllm.Response]):
+        HandlerKind = AwaitResponseHelper.HandlerKind
+
+        self._resolve_handler_kind()
 
         match self.handler_kind:
             case HandlerKind.single_process_worker:
@@ -892,6 +1130,35 @@ class AwaitResponseHelper:
                 return self.handle_for_ipc_batched(responses)
             case _:
                 raise NotImplementedError
+
+    def process_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Apply engine callbacks and append deferred submission errors."""
+        responses = list(
+            filter(
+                lambda _: _,
+                [self.worker._engine_response_callback(r) for r in responses]))
+
+        # Drain with get_nowait(): this may run concurrently from the
+        # ManagedThread and RPC fetch_responses(), and empty()+get() can
+        # block forever if another consumer wins the race.
+        while True:
+            try:
+                responses.append(self.temp_error_responses.get_nowait())
+            except Empty:
+                break
+
+        return responses
+
+    def process_and_handle_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Process engine responses and dispatch the client-visible results."""
+        responses = self.process_responses(responses)
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
+            self.responses_handler(responses)
+        return responses
 
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
@@ -909,20 +1176,7 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
-        # filter since The _engine_response_callback may return None
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
-
-        # append the error responses to the temp_error_responses
-        while not self.temp_error_responses.empty():
-            responses.append(self.temp_error_responses.get())
-
-        with nvtx_range_debug(f"await_response-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-            self.responses_handler(responses)
+        self.process_and_handle_responses(responses)
 
         # Even when await_responses returned normally (e.g. via
         # _await_any_response, whose predicate already includes
@@ -931,6 +1185,8 @@ class AwaitResponseHelper:
         # thread in that case too — see nvbug 6038228.
         error = getattr(self.worker.engine, "_event_loop_error", None)
         if error is not None:
+            # _broadcast_event_loop_error owns the delivery gate: it is the
+            # only place that knows whether a client was actually woken.
             return self._broadcast_event_loop_error(error)
         return True
 
@@ -951,8 +1207,21 @@ class AwaitResponseHelper:
         results on a different side of the boundary and would need a
         separate poison-pill on ``self.worker.result_queue``; that is left
         as a follow-up consistent with the PyExecutor-side fix.
+
+        Because of that scope, this method also owns the rank-crash kill's
+        delivery gate. The gate may only be set when a client verifiably
+        woke: on ``ipc_batched`` the queues written below have no reader
+        (responses travel via ``handle_for_ipc_batched``), so setting it
+        there would stand the kill down while the peer ranks are still
+        stranded — the case the kill exists for, in the default spawned-
+        worker deployment. When delivery cannot be proven the gate stays
+        clear and the kill fires, which is the safe direction: a spurious
+        world-kill costs a traceback, a missed one costs the job.
         """
         error_msg = f"Event loop terminated with error: {error}"
+        can_reach_client = (
+            self._resolve_handler_kind()
+            is AwaitResponseHelper.HandlerKind.single_process_worker)
         pending_client_ids = list(self.worker._results.keys())
         if not pending_client_ids:
             logger.error(
@@ -965,6 +1234,9 @@ class AwaitResponseHelper:
 
         event_loop = None
         async_queues: List[_SyncQueue] = []
+        # Counts queues a caller can actually read from. A _SyncQueue is only
+        # readable once notify_many() has run, so those are counted there.
+        woken = 0
         for client_id in pending_client_ids:
             try:
                 queue = self.worker.return_queue(client_id)
@@ -982,6 +1254,7 @@ class AwaitResponseHelper:
                     event_loop = event_loop or queue.loop
                 else:
                     queue.put(err_resp)
+                    woken += 1
             except Exception as put_error:
                 logger.error(f"Failed to push ErrorResponse for client_id="
                              f"{client_id}: {put_error}")
@@ -991,10 +1264,27 @@ class AwaitResponseHelper:
         if async_queues:
             try:
                 _SyncQueue.notify_many(event_loop, async_queues)
+                woken += len(async_queues)
             except Exception as notify_error:
                 logger.error(
                     f"Failed to notify async queues on event-loop error: "
                     f"{notify_error}")
+
+        if woken and can_reach_client:
+            # A client is now holding the real error, so the crash is
+            # reportable without killing the world: a symmetric crash (every
+            # rank raised the same deterministic error, nobody stranded) ends
+            # in N tracebacks rather than in MPI_Abort replacing them with a
+            # bare exit 137.
+            delivered = getattr(self.worker.engine,
+                                "_event_loop_error_delivered", None)
+            if delivered is not None:
+                delivered.set()
+        elif not can_reach_client:
+            logger.error(
+                "Event-loop error broadcast cannot reach the client on the "
+                "IPC/proxy path; leaving the rank-crash hard kill armed so "
+                "peer ranks are not stranded.")
 
         return False
 
@@ -1062,7 +1352,13 @@ class AwaitResponseHelper:
                     self.worker.postproc_queues[wid].put(batch)
 
         if rsp_batch:
-            self.worker.result_queue.put(rsp_batch)
+            if (lanes := self.worker.frontend_result_queues) is not None:
+                for frontend_id, sub_batch in enumerate(
+                        bucket_responses_by_frontend(rsp_batch, len(lanes))):
+                    if sub_batch:
+                        lanes[frontend_id].put(sub_batch)
+            else:
+                self.worker.result_queue.put(rsp_batch)
 
 
 def _get_params_for_first_rsp(
@@ -1176,7 +1472,16 @@ def _send_rsp(
         rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
 
-    if worker.result_queue is not None:
+    if worker.frontend_result_queues is not None:
+        # Route to the origin frontend's result lane; None/out-of-range ids
+        # fall back to lane 0 (see frontend_lane_index).
+        if rsp_batch is not None:
+            rsp_batch.append(response)
+        else:
+            lanes = worker.frontend_result_queues
+            lanes[frontend_lane_index(response.client_id,
+                                      len(lanes))].put(response)
+    elif worker.result_queue is not None:
         if rsp_batch is not None:
             rsp_batch.append(response)
         else:

@@ -39,7 +39,9 @@ import os
 import tempfile
 import unittest
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Optional, Tuple
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -49,6 +51,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell_unittest
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_kimi_k25 import (
     KimiK25ForConditionalGeneration,
     KimiK25InputProcessor,
@@ -256,6 +259,24 @@ class TestKimiK25Structure(unittest.TestCase):
 
         # Media placeholder token ID
         self.assertEqual(model._media_placeholder_token_id, 163605)
+
+    def test_language_weights_preserve_checkpoint_dir(self):
+        """The text backbone retains metadata needed for shard streaming."""
+        weights = ConsumableWeightsDict({"language_model.foo": object()})
+        weights.checkpoint_dir = "/checkpoint"
+        mm_encoder = torch.nn.Module()
+        mm_encoder.load_weights = mock.Mock()
+        model = SimpleNamespace(
+            _LANG_PREFIX="language_model.", mm_encoder=mm_encoder, llm=mock.Mock()
+        )
+
+        KimiK25ForConditionalGeneration.load_weights(model, weights)
+
+        lm_weights = model.llm.load_weights.call_args.args[0]
+        self.assertIsInstance(lm_weights, ConsumableWeightsDict)
+        self.assertEqual(lm_weights.checkpoint_dir, "/checkpoint")
+        self.assertEqual(lm_weights.checkpoint_prefix, "language_model.")
+        self.assertIn("foo", lm_weights)
 
     def test_vision_encoder_uses_trtllm_modules(self):
         """Vision blocks reuse TRT-LLM normalization, attention, linear, and MLP modules."""
@@ -604,6 +625,12 @@ class TestKimiK25AutoModelRegistration(unittest.TestCase):
         cls = MODEL_CLASS_MAPPING.get("KimiK25ForConditionalGeneration")
         self.assertIsNotNone(cls, "KimiK25ForConditionalGeneration not in MODEL_CLASS_MAPPING")
         self.assertIs(cls, KimiK25ForConditionalGeneration)
+
+    def test_prefers_python_transceiver(self):
+        """Kimi-K2.5 defaults to the Python KV-cache transceiver in disagg."""
+        self.assertEqual(
+            KimiK25ForConditionalGeneration.get_preferred_transceiver_runtime(), "PYTHON"
+        )
 
 
 # ---------------------------------------------------------------------------

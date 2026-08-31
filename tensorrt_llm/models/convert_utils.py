@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import load_dataset
 
 from .._utils import torch_dtype_to_str
 from ..logger import logger
@@ -290,39 +289,6 @@ def iterate_shard_files(model_dir: Union[Path, str],
 
 def has_safetensors(model_dir: str):
     return len(list(Path(model_dir).glob('*.safetensors'))) > 0
-
-
-DEFAULT_HF_DATASET_META = {
-    'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
-    'cnn_dailymail': ('3.0.0', 'train', 'article'),
-    'lambada': (None, 'validation', 'text'),
-    '': (None, 'train', 'text'),  # Default value in HF
-}
-
-
-def load_calib_dataset(dataset_name_or_dir: str,
-                       config_name: Optional[str] = None,
-                       split: Optional[str] = None,
-                       key: Optional[str] = None,
-                       trust_remote_code=True,
-                       **kwargs):
-    if config_name is None:
-        for name, meta in DEFAULT_HF_DATASET_META.items():
-            if name in dataset_name_or_dir:
-                if config_name is None:
-                    config_name = meta[0]
-                if split is None:
-                    split = meta[1]
-                if key is None:
-                    key = meta[2]
-                break
-
-    dataset = load_dataset(dataset_name_or_dir,
-                           name=config_name,
-                           split=split,
-                           trust_remote_code=trust_remote_code,
-                           **kwargs)
-    return dataset[key]
 
 
 @torch.no_grad()

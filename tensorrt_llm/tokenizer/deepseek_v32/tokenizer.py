@@ -31,6 +31,12 @@ class DeepseekV32Tokenizer(TransformersTokenizer):
         download_dir: str | None = None,
         **kwargs,
     ) -> "DeepseekV32Tokenizer":
+        # AutoTokenizer resolves the checkpoint config first, and the
+        # deepseek_v32 model_type is invisible to stock transformers; the
+        # registration is an import side effect of tensorrt_llm._torch.configs
+        # (previously guaranteed by the eager `import tensorrt_llm`).
+        import tensorrt_llm._torch.configs  # noqa: F401
+
         # Load HF tokenizer
         hf_tokenizer = AutoTokenizer.from_pretrained(
             path_or_repo_id,

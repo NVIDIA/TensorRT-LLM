@@ -45,6 +45,10 @@ from utils.util import getSMVersion, skip_pre_blackwell, skip_pre_hopper
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLTopKPrefillSingleCTARunner
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
+    cute_dsl_radix_filter_topk_wrapper,
+)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if not torch.cuda.is_available():
@@ -150,62 +154,89 @@ def compare_top_k_results(
     Returns:
         True if results match within tolerance, False otherwise
     """
-    num_rows = cuda_indices.shape[0]
+    # --- vectorized implementation (no per-row .item() syncs) ---
+    row_lengths = row_ends - row_starts  # [num_rows]
+    expected_valid = torch.minimum(row_lengths, torch.full_like(row_lengths, top_k))
 
-    # Calculate valid lengths for each row (vectorized)
-    row_lengths = row_ends - row_starts
+    cuda_valid_counts = (cuda_indices != -1).sum(dim=1)
+    torch_valid_counts = (torch_indices != -1).sum(dim=1)
 
-    for row_idx in range(num_rows):
-        row_len = row_lengths[row_idx].item()
-        expected_valid = min(row_len, top_k)
+    # Count mismatch between cuda and torch
+    mismatch = (cuda_valid_counts != torch_valid_counts).nonzero(as_tuple=True)[0]
+    if mismatch.numel() > 0:
+        row_idx = mismatch[0].item()
+        print(
+            f"Row {row_idx}: Different number of valid indices - "
+            f"CUDA: {cuda_valid_counts[row_idx].item()}, "
+            f"PyTorch: {torch_valid_counts[row_idx].item()}"
+        )
+        return False
 
-        cuda_row = cuda_indices[row_idx]
-        torch_row = torch_indices[row_idx]
+    # Count mismatch vs expected
+    wrong = (cuda_valid_counts != expected_valid).nonzero(as_tuple=True)[0]
+    if wrong.numel() > 0:
+        row_idx = wrong[0].item()
+        print(
+            f"Row {row_idx}: Expected {expected_valid[row_idx].item()} valid indices, "
+            f"got {cuda_valid_counts[row_idx].item()}"
+        )
+        return False
 
-        cuda_valid_mask = cuda_row != -1
-        torch_valid_mask = torch_row != -1
+    # Value check: safe gather (-1 → 0), add row_start, gather logits, mask invalid → -inf, sort, compare.
+    # cuda_indices and torch_indices may have different column counts (e.g. decode path where
+    # torch_indices is built with min(top_k, max_row_len) columns), so use separate masks.
+    cuda_invalid = cuda_indices == -1
+    torch_invalid = torch_indices == -1
 
-        cuda_valid = cuda_row[cuda_valid_mask]
-        torch_valid = torch_row[torch_valid_mask]
+    cuda_safe = cuda_indices.clone()
+    torch_safe = torch_indices.clone()
+    cuda_safe[cuda_invalid] = 0
+    torch_safe[torch_invalid] = 0
 
-        if cuda_valid.shape[0] != torch_valid.shape[0]:
-            print(
-                f"Row {row_idx}: Different number of valid indices - "
-                f"CUDA: {cuda_valid.shape[0]}, PyTorch: {torch_valid.shape[0]}"
+    cuda_abs = cuda_safe.long() + row_starts.unsqueeze(1)
+    torch_abs = torch_safe.long() + row_starts.unsqueeze(1)
+
+    cuda_vals = logits.gather(1, cuda_abs)
+    torch_vals = logits.gather(1, torch_abs)
+    cuda_vals[cuda_invalid] = float("-inf")
+    torch_vals[torch_invalid] = float("-inf")
+
+    cuda_sorted = cuda_vals.sort(dim=1, descending=True).values
+    torch_sorted = torch_vals.sort(dim=1, descending=True).values
+
+    # Build per-tensor position masks (first expected_valid[i] positions per row).
+    # Flattening both gives the same element count because counts were verified equal above.
+    cuda_k = cuda_indices.shape[1]
+    torch_k = torch_indices.shape[1]
+    cuda_pos_mask = torch.arange(cuda_k, device=cuda_indices.device).unsqueeze(
+        0
+    ) < expected_valid.unsqueeze(1)
+    torch_pos_mask = torch.arange(torch_k, device=torch_indices.device).unsqueeze(
+        0
+    ) < expected_valid.unsqueeze(1)
+
+    if not torch.allclose(
+        cuda_sorted[cuda_pos_mask], torch_sorted[torch_pos_mask], rtol=tolerance, atol=tolerance
+    ):
+        bad = (cuda_k == torch_k) and (
+            (
+                ~torch.isclose(cuda_sorted, torch_sorted, rtol=tolerance, atol=tolerance)
+                & cuda_pos_mask
             )
-            return False
-
-        if cuda_valid.shape[0] != expected_valid:
-            print(
-                f"Row {row_idx}: Expected {expected_valid} valid indices, got {cuda_valid.shape[0]}"
-            )
-            return False
-
-        if cuda_valid.shape[0] == 0:
-            continue
-
-        row_start = row_starts[row_idx].item()
-        logits_row = logits[row_idx]
-
-        cuda_abs_indices = cuda_valid + row_start
-        torch_abs_indices = torch_valid + row_start
-
-        cuda_values = logits_row[cuda_abs_indices]
-        torch_values = logits_row[torch_abs_indices]
-
-        cuda_values_sorted, _ = torch.sort(cuda_values, descending=True)
-        torch_values_sorted, _ = torch.sort(torch_values, descending=True)
-
-        if not torch.allclose(
-            cuda_values_sorted, torch_values_sorted, rtol=tolerance, atol=tolerance
-        ):
+            .any(dim=1)
+            .nonzero(as_tuple=True)[0]
+        )
+        if bad is not False and bad.numel() > 0:
+            row_idx = bad[0].item()
+            cuda_valid = cuda_indices[row_idx][cuda_indices[row_idx] != -1]
+            torch_valid = torch_indices[row_idx][torch_indices[row_idx] != -1]
             cuda_set = set(cuda_valid.cpu().tolist())
             torch_set = set(torch_valid.cpu().tolist())
             if cuda_set != torch_set:
                 print("  Different indices selected:")
                 print(f"    Only in CUDA: {cuda_set - torch_set}")
                 print(f"    Only in Torch: {torch_set - cuda_set}")
-            return False
+        return False
 
     return True
 
@@ -720,123 +751,122 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
-):
-    """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("index_topk", [1023, 2047, 4095, 4096, 8192, 16384])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+def test_cute_dsl_topk_decode_high_and_odd_k(batch_size, index_topk, num_tokens):
+    """Large (>4096) and odd top_k stay bit-exact on the decode entry points.
+
+    The indexer entry point is the path KV-cache eviction uses with large or
+    odd keep budgets, so it is checked for every top_k across all three dtypes
+    (the scalar output write at vecsize_out=1 is dtype dependent). The
+    single-CTA and multi-CTA wrappers, whose raised guard this test backs, only
+    support even top_k, so they are checked on the even values in fp32.
+    """
+
+    def run_single_cta(logits, seq_lens):
+        return torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
             input_values=logits,
             seq_lens=seq_lens,
             top_k=index_topk,
-            next_n=next_n,
+            next_n=1,
             num_copy_bits=256,
-            load_balance=load_balance,
-        ),
-    )
+        )
 
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("chunk_size_per_cta", [16384])
-@pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
-):
-    """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
+    def run_multi_cta(logits, seq_lens):
+        return torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
             input_values=logits,
             seq_lens=seq_lens,
             top_k=index_topk,
-            next_n=next_n,
+            next_n=1,
             num_copy_bits=256,
-            chunk_size_per_cta=chunk_size_per_cta,
-            dynamic=dynamic,
-        ),
-    )
+            chunk_size_per_cta=16384,
+            dynamic=False,
+        )
 
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
-    """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
-    num_gen_tokens = batch_size * next_n
-
-    def run_fn(logits, seq_lens):
-        """Run CuTE DSL indexer TopK decode and return output indices."""
-        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
+    def run_indexer(logits, seq_lens):
+        output_indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.cute_dsl_indexer_topk_decode(
             input_values=logits,
             seq_lens=seq_lens,
             output_indices=output_indices,
             top_k=index_topk,
-            next_n=next_n,
+            next_n=1,
             num_copy_bits=256,
         )
         return output_indices
 
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        torch.float32,
-        run_fn,
-    )
+    if index_topk % 2 == 0:
+        # Even top_k: all three entry points are defined; the raised guard this
+        # test backs is exercised on the wrappers in fp32.
+        dtype_runs = [(torch.float32, (run_single_cta, run_multi_cta, run_indexer))]
+    else:
+        # Odd top_k: only the indexer path supports it, checked across dtypes.
+        dtype_runs = [
+            (torch.float32, (run_indexer,)),
+            (torch.float16, (run_indexer,)),
+            (torch.bfloat16, (run_indexer,)),
+        ]
+
+    for dtype, run_fns in dtype_runs:
+        for run_fn in run_fns:
+            _run_cute_dsl_topk_test(
+                batch_size,
+                1,
+                index_topk,
+                num_tokens,
+                dtype,
+                run_fn,
+            )
+
+    # Regression (effective row length <= top_k in a radix-filter cluster):
+    # fp32 num_tokens=32768, top_k=16384 routes the indexer to a 4-CTA cluster
+    # (chunk=8192). A row whose effective length spans >1 chunk but is <= top_k
+    # (eff=12000) has a merged histogram total (== eff) that never exceeds
+    # top_k, so the cluster radix threshold search cannot fire; the kernel must
+    # fall back to the solo trivial path (select all valid columns, pad -1).
+    if batch_size == 1 and index_topk == 16384 and num_tokens == 32768:
+        eff = 12000  # chunk (8192) < eff <= top_k
+        logits = torch.full((1, num_tokens), float("-inf"), dtype=torch.float32, device="cuda")
+        logits[0, :eff] = torch.randn(eff, dtype=torch.float32, device="cuda")
+        seq_lens = torch.tensor([eff], dtype=torch.int32, device="cuda")
+        got = run_indexer(logits, seq_lens)[0].cpu()
+        valid = got[got != -1]
+        assert valid.numel() == eff, f"expected {eff} valid, got {valid.numel()}"
+        assert set(valid.tolist()) == set(range(eff)), "selected set != all valid columns"
+        assert (got == -1).sum().item() == index_topk - eff, "wrong -1 pad count"
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 256])
-@pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype
-):
-    """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
+@pytest.mark.parametrize("top_k", [1023, 2047, 2048])
+@pytest.mark.parametrize("dtype_name", ["float32", "float16", "bfloat16"])
+def test_filtered_topk_varlen_odd_k(top_k, dtype_name):
+    """The filtered varlen kernel supports odd top_k (scalar output tail).
+
+    The reference check inside the runner asserts bitwise agreement with a
+    torch reference; 2048 is the even control. The scalar tail write is dtype
+    dependent, so all three supported dtypes are exercised.
+    """
+    import cutlass
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
+        run_topk_decode,
+    )
+
+    dtype = {
+        "float32": cutlass.Float32,
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+    }[dtype_name]
+
+    run_topk_decode(
         dtype,
-        lambda logits,
-        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            return_val=False,
-            num_copy_bits=256,
-        )[0],
+        batch_size=16,
+        max_num_cols=4096,
+        top_k=top_k,
+        next_n=3,
+        do_benchmark=False,
     )
 
 
@@ -1294,17 +1324,15 @@ def generate_pre_idx_v4(
     return pre_idx
 
 
+# radix filter single-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
-    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
-):
+def test_cute_dsl_radix_topk_decode_single_cta(batch_size, next_n, index_topk, num_tokens, dtype):
     """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
@@ -1318,21 +1346,21 @@ def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
             top_k=index_topk,
             next_n=next_n,
             num_copy_bits=256,
-            load_balance=load_balance,
         ),
     )
 
 
+# radix filter 2-pass multi-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 65536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
+def test_cute_dsl_radix_topk_decode_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
 ):
     """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
@@ -1354,13 +1382,14 @@ def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
     )
 
 
+# cute dsl top-k public interface test, tuned between single-cta and multi-cta.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):  # noqa: F811
+def test_cute_dsl_indexer_radix_topk_decode(batch_size, next_n, index_topk, num_tokens):
     """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
     num_gen_tokens = batch_size * next_n
 
@@ -1387,14 +1416,15 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
     )
 
 
+# radix select multi-cta (atomicAdd gmem for cta communication) test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
+def test_cute_dsl_radix_topk_decode_single_pass_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
@@ -1416,14 +1446,15 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
     )
 
 
+# radix select multi-cta cluster test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
+def test_cute_dsl_radix_topk_decode_single_pass_multi_cta_cluster(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-pass multi-CTA cluster TopK on Blackwell."""
@@ -1452,6 +1483,166 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
     )
 
 
+# radix filter single-pass multi-cta test.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+# fp32 (4 refine rounds -> 5 histogram merges) MUST be covered; the
+# merge-placement path only fully exercises on fp32.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+def test_cute_dsl_radix_filter_topk_decode_single_pass_multi_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype, cluster_size
+):
+    """Correctness test for the radix-FILTER single-pass multi-CTA (cluster)
+    decode top-k. num_tokens is large enough that ceil(seq/chunk) >= 2 for the
+    longer rows, exercising the DSMEM histogram-merge + prefix-scan collection.
+    """
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits,
+        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            cluster_size=cluster_size,
+            return_val=False,
+            num_copy_bits=256,
+        )[0],
+    )
+
+
+def _rf_sp_check(logits, seq_lens, top_k, next_n, cluster_size):
+    """Value-based correctness check for radix-filter SP multi-CTA on custom
+    inputs (controls the value distribution for edge cases).
+    """
+    idx, _ = cute_dsl_custom_ops.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+        input_values=logits,
+        seq_lens=seq_lens,
+        top_k=top_k,
+        next_n=next_n,
+        cluster_size=cluster_size,
+        return_val=False,
+        num_copy_bits=256,
+    )
+    torch.cuda.synchronize()
+    num_rows = logits.shape[0]
+    for r in range(num_rows):
+        b = r // next_n
+        off = r % next_n
+        eff = int(seq_lens[b].item()) - next_n + off + 1
+        k = min(top_k, eff)
+        row = logits[r, :eff]
+        ref = row.topk(k)[0].sort(descending=True)[0].float()
+        gi = idx[r, :k].long()
+        gi = gi[(gi >= 0) & (gi < eff)]
+        got = row[gi].sort(descending=True)[0].float()
+        assert got.numel() == ref.numel() and torch.allclose(got, ref, atol=1e-3), (
+            f"row {r}: mismatch (got {got.numel()} vs ref {ref.numel()})"
+        )
+
+
+# radix filter single-pass multi-cta group-2-heavy test.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize("index_topk", [512, 1024])
+def test_cute_dsl_radix_filter_sp_multi_cta_group2_heavy(dtype, cluster_size, index_topk):
+    """Group-2-heavy: quantized logits create many exact ties at the threshold
+    bin, spread across CTAs -> exercises per-CTA s_last_remain, exclusive_offset_2
+    and the pos<top_k truncation in the DSMEM collection.
+    """
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+    num_tokens = 16384
+    batch = 4
+    seq_lens = torch.full((batch,), num_tokens, dtype=torch.int32, device="cuda")
+    # Few distinct levels -> heavy ties.
+    logits = ((torch.randn(batch, num_tokens, device="cuda") * 4).round() / 4).to(dtype)
+    _rf_sp_check(logits, seq_lens, index_topk, 1, cluster_size)
+
+
+# radix filter single-pass multi-cta solo and degrade test.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+def test_cute_dsl_radix_filter_sp_multi_cta_solo_and_degrade(dtype, cluster_size):
+    """Short rows: needed_ctas==1 (solo fast path, extra CTAs exit -> no cluster
+    sync, no deadlock) and 2<=needed<cluster_size (degrade: some CTAs get an
+    empty chunk but must still join every cluster barrier). Also mixes both in
+    one launch (cluster-uniform branch keeps it deadlock-safe).
+    """
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    num_tokens = 8192  # bucketed 8192; chunk = ceil(8192/cluster_size)
+    top_k = 512
+    chunk = -(-num_tokens // cluster_size)
+    # solo: seq just under one chunk; degrade: needs 2..cluster_size chunks; full.
+    solo_len = max(top_k + 1, chunk - 1)
+    degrade_len = min(num_tokens, 2 * chunk + chunk // 2)
+    seq_lens = torch.tensor(
+        [solo_len, degrade_len, num_tokens, solo_len], dtype=torch.int32, device="cuda"
+    )
+    logits = torch.randn(4, num_tokens, device="cuda").to(dtype)
+    _rf_sp_check(logits, seq_lens, top_k, 1, cluster_size)
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("index_topk", [2047, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_cluster", [False, True])
+def test_cute_dsl_single_pass_multi_cta_high_and_odd_k(batch_size, index_topk, dtype, use_cluster):
+    """Large (>2048) and odd top_k stay bit-exact on the single-pass multi-CTA
+    and cluster decode paths.
+
+    The raised wrapper guard forwards these values to both dispatch paths, so
+    this covers the odd-K scalar output write on routes the other tests only
+    exercise at top_k=2048.
+    """
+    num_tokens = 131072
+    next_n = 1
+
+    if use_cluster:
+        runner = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner
+    else:
+        runner = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner
+
+    def run_fn(logits, seq_lens):
+        result = runner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            return_val=False,
+            num_copy_bits=256,
+        )
+        # The cluster runner returns None when the problem exceeds its capacity.
+        if result[0] is None:
+            pytest.skip("Problem size exceeds cluster kernel capacity")
+        return result[0]
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        run_fn,
+    )
+
+
 # ============================================================================
 # Heuristic Decode Distribution-Parameterised Tests
 # ============================================================================
@@ -1464,7 +1655,11 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
 @pytest.mark.parametrize("batch_size", [1, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [8192, 16384])
+# num_tokens=4096 added to cover the new uniform kSeqSmall=4096 boundary
+# across all K (indexerTopK.cu kSeqSmallDefaultForK). num_tokens=4096 sits
+# right at the GVR routing threshold for every K ∈ {512, 1024, 2048} so the
+# assertion validates the just-inside-GVR path correctness.
+@pytest.mark.parametrize("num_tokens", [4096, 8192, 16384])
 @pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.bfloat16, torch.float16],
@@ -1601,11 +1796,19 @@ def _run_indexer_topk_decode_v4_gvr_check(
     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
 
     # Uncompressed seq_lens are what the kernel receives in `seq_lens`.
-    # Clamp so that compressed_actual_kv_len ≥ kSeqSmall (= 12288) for every
-    # row; the kernel will divide actual_kv_len by compress_ratio internally,
-    # so a floor of (kSeqSmall + 1) * compress_ratio + next_n on the
-    # uncompressed seq_len guarantees compressed N stays in the GVR window.
-    min_uncompressed = (12288 + 1) * compress_ratio + next_n
+    # Clamp so that compressed_actual_kv_len > kSeqSmall for every row; the
+    # kernel will divide actual_kv_len by compress_ratio internally, so a
+    # floor of (kSeqSmall + 1) * compress_ratio + next_n on the uncompressed
+    # seq_len guarantees compressed N stays in the GVR window.
+    # kSeqSmall is uniform 4096 across K (matches indexerTopK.cu
+    # kSeqSmallDefaultForK).
+    ksmall = 4096
+    min_uncompressed = (ksmall + 1) * compress_ratio + next_n
+    if min_uncompressed >= num_tokens:
+        pytest.skip(
+            f"num_tokens={num_tokens} too small to clamp into the GVR window for "
+            f"K={index_topk} (needs uncompressed > {min_uncompressed})"
+        )
     seq_lens = generate_seq_lens(batch_size, min_uncompressed, num_tokens)
     seq_lens = seq_lens.clamp(min=min_uncompressed)
 
@@ -1690,7 +1893,10 @@ def _run_indexer_topk_decode_v4_gvr_check(
 @pytest.mark.parametrize("batch_size", [1, 64])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [65536, 131072])
+# num_tokens=32768 added so that all K ∈ {512, 1024, 2048} hit the uniform
+# kSeqSmall=4096 boundary at compress_ratio=4 (helper's clamp floor =
+# (4096+1)*4+next_n ≈ 16389 < 32768, so no skip is triggered for any K).
+@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072])
 @pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.bfloat16, torch.float16],
@@ -1712,3 +1918,532 @@ def test_indexer_topk_decode_dist_v4_cr4(
     _run_indexer_topk_decode_v4_gvr_check(
         batch_size, next_n, index_topk, num_tokens, dtype, dist_cfg, success_ratio
     )
+
+
+# ============================================================================
+# CuTE DSL Prefill Top-K Tests
+# ============================================================================
+
+
+def _run_cute_dsl_topk_prefill_test(batch_size, index_topk, num_tokens, dtype, row_start_offset=0):
+    """Common test logic for CuTE DSL prefill top-k kernel.
+
+    Tests that the DSL kernel outputs LOCAL indices (0-indexed within each
+    row's valid range) matching torch.topk.
+
+    Args:
+        row_start_offset: Fixed offset added to all row_starts. 0 = standard
+            zero-start case; nonzero exercises the subtract_row_start_on_output path.
+    """
+    torch.manual_seed(77)
+    torch.cuda.manual_seed(77)
+
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    num_rows = int(seq_lens.sum().item())
+
+    # Build per-row token counts from seq_lens (same logic as CUDA prefill tests).
+    row_indices = torch.arange(1, seq_lens.max() + 1, dtype=torch.int32, device="cuda")
+    row_lengths = row_indices.expand(seq_lens.size(0), -1)[
+        row_indices.expand(seq_lens.size(0), -1) <= seq_lens.unsqueeze(1)
+    ].contiguous()  # shape: (num_rows,)
+
+    # Apply fixed offset: row_start = offset, row_end = offset + row_length.
+    row_starts = torch.full((num_rows,), row_start_offset, dtype=torch.int32, device="cuda")
+    row_ends = (row_starts + row_lengths).contiguous()
+
+    logits = create_random_logits(row_starts, row_ends, dtype, 77)
+
+    # Run DSL kernel — writes LOCAL indices (0-indexed within [row_start, row_end))
+    # into the caller-provided output_indices buffer.
+    output_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+        logits, row_starts, row_ends, output_indices, index_topk, 256
+    )
+    torch.cuda.synchronize()
+
+    # Reference: torch.topk returns ABSOLUTE indices; convert to LOCAL.
+    # logits has -inf outside [row_start, row_end), so topk selects valid cols.
+    max_row_end = int(row_ends.max().item())
+    torch_abs = logits.topk(min(index_topk, max_row_end), dim=-1)[1].to(torch.int32)
+    torch_local = torch_abs - row_starts.unsqueeze(1)
+    valid = (torch_abs >= row_starts.unsqueeze(1)) & (torch_abs < row_ends.unsqueeze(1))
+    torch_local = torch_local.masked_fill(~valid, -1)
+
+    # compare_top_k_results expects LOCAL indices from both sides; it converts
+    # to absolute internally (+ row_start) for logit-value comparison.
+    assert compare_top_k_results(
+        logits, output_indices, torch_local, row_starts, row_ends, index_topk
+    ), "CuTE DSL prefill top-k results don't match torch.topk"
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_radix_topk_prefill_zero_row_starts(batch_size, index_topk, num_tokens, dtype):
+    """Correctness test for CuTE DSL prefill top-k with row_start=0 (all rows).
+
+    Note: batch_size here is the number of sequences; num_rows = sum(seq_lens)
+    can be much larger. Keep batch_size small to avoid OOM on large num_tokens.
+    """
+    _run_cute_dsl_topk_prefill_test(batch_size, index_topk, num_tokens, dtype, row_start_offset=0)
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_radix_topk_prefill_nonzero_row_starts(batch_size, index_topk, num_tokens, dtype):
+    """Correctness test for CuTE DSL prefill top-k with nonzero row_starts.
+
+    Uses a fixed offset = index_topk // 4 to verify that output indices are
+    properly localised (subtract_row_start_on_output path).
+    """
+    _run_cute_dsl_topk_prefill_test(
+        batch_size, index_topk, num_tokens, dtype, row_start_offset=index_topk // 4
+    )
+
+
+# ===========================================================================
+# Overflow-policy correctness tests (moved from
+# test_cute_dsl_topk_overflow_policy.py). Reuse the generate_seq_lens /
+# compare_top_k_results / create_random_logits helpers defined above.
+#
+# Overflow policies:
+#   GMEM_SPILL    - spill threshold-bucket overflow to a pre-allocated GMEM buffer (exact)
+#   TRUNCATE      - discard overflow elements; histogram stays consistent (non-exact)
+#   REREAD_ALWAYS - first pass builds histogram only; second GMEM scan fills s_input_idx (exact)
+#   REREAD        - optimistic SMEM collection; falls back to GMEM re-scan on overflow (exact)
+# All policies are identical when num_cols <= smem_input_size; these cover the
+# overflow scenarios. SMEM overflow thresholds (large_occupancy, B200): bf16/fp16
+# = 16384, fp32 = 8192; overflow occurs when num_cols > smem_input_size.
+# ===========================================================================
+
+
+def _build_torch_ref(logits, row_starts, row_ends, top_k):
+    """Exact-copy of the reference computation in existing tests."""
+    max_row_len = int(row_ends.max().item())
+    torch_indices = logits.topk(min(top_k, max_row_len), dim=-1)[1]
+    mask = (torch_indices >= 0) & ((torch_indices - (row_ends - row_starts)[:, None]) < 0)
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+    return torch_indices
+
+
+def _compare_truncate_result(
+    logits: torch.Tensor,
+    cuda_indices: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    top_k: int,
+) -> bool:
+    """TRUNCATE correctness check.
+
+    TRUNCATE is non-exact: it returns top-K of the first smem_size elements
+    (memory order) in the threshold-coarse bin, NOT the global top-K.  With
+    adversarial data layout the returned values can legitimately be below the
+    global k-th largest, so comparing against torch.topk would be incorrect.
+
+    We verify instead:
+      1. Each row returns exactly min(top_k, row_len) valid (non -1) elements.
+      2. All returned indices are within [row_start, row_end).
+      3. No duplicate indices within a row.
+
+    cuda_indices must contain absolute indices into logits (not row-local).
+    """
+    invalid_mask = cuda_indices == -1  # [num_rows, K]
+    valid_counts = (~invalid_mask).sum(dim=1)  # [num_rows]
+
+    # 1. count check
+    row_lens = row_ends - row_starts
+    expected = torch.minimum(row_lens, row_lens.new_full((), top_k))
+    bad_rows = (valid_counts != expected).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() > 0:
+        r = bad_rows[0].item()
+        print(
+            f"TRUNCATE Row {r}: expected {expected[r].item()} valid elements, got {valid_counts[r].item()}"
+        )
+        return False
+
+    # 2. bounds check: safe-clamp -1 slots to 0 before comparison, then mask them out
+    safe = cuda_indices.clone()
+    safe[invalid_mask] = 0
+    out_of_bounds = (
+        (safe < row_starts.unsqueeze(1)) | (safe >= row_ends.unsqueeze(1))
+    ) & ~invalid_mask
+    bad_rows = out_of_bounds.any(dim=1).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() > 0:
+        r = bad_rows[0].item()
+        bad_vals = safe[r][out_of_bounds[r]]
+        print(
+            f"TRUNCATE Row {r}: index out of [row_start={row_starts[r].item()}, "
+            f"row_end={row_ends[r].item()}): {bad_vals[:4].tolist()}"
+        )
+        return False
+
+    # 3. no-duplicate check: replace invalid with INT_MAX so they sort to the end,
+    # then compare adjacent entries that are not sentinel.
+    sentinel = torch.iinfo(torch.int32).max
+    safe_for_dup = cuda_indices.clone()
+    safe_for_dup[invalid_mask] = sentinel
+    sorted_dup = safe_for_dup.sort(dim=1).values  # [num_rows, K]
+    dups = (sorted_dup[:, 1:] == sorted_dup[:, :-1]) & (sorted_dup[:, 1:] != sentinel)
+    bad_rows = dups.any(dim=1).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() > 0:
+        r = bad_rows[0].item()
+        print(f"TRUNCATE Row {r}: duplicate indices found")
+        return False
+
+    return True
+
+
+# ── decode kernel run via wrapper ─────────────────────────────────────────────
+
+
+def _run_decode_kernel(logits, seq_lens, top_k, next_n, overflow_policy):
+    """Run decode kernel via cute_dsl_radix_filter_topk_wrapper with given overflow_policy."""
+    indices, _ = cute_dsl_radix_filter_topk_wrapper(
+        logits,
+        seq_lens,
+        top_k,
+        next_n,
+        return_val=False,
+        overflow_policy=overflow_policy,
+    )
+    return indices
+
+
+# ── shared test bodies ────────────────────────────────────────────────────────
+
+
+def _run_decode_policy_test(policy, batch_size, next_n, top_k, num_tokens, dtype, seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = generate_seq_lens(batch_size, top_k, num_tokens)
+    seq_lens = seq_lens.clamp(min=next_n)
+    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+
+    logits = create_random_logits(row_starts, row_ends, dtype, seed)
+
+    cuda_indices = _run_decode_kernel(logits, seq_lens, top_k, next_n, policy)
+    torch.cuda.synchronize()
+
+    cuda_indices = cuda_indices.to(torch.int32)
+
+    if policy == "TRUNCATE":
+        assert _compare_truncate_result(logits, cuda_indices, row_starts, row_ends, top_k), (
+            f"TRUNCATE decode: invalid results (policy={policy})"
+        )
+    else:
+        torch_indices = _build_torch_ref(logits, row_starts, row_ends, top_k)
+        assert compare_top_k_results(
+            logits, cuda_indices, torch_indices, row_starts, row_ends, top_k
+        ), f"Decode results mismatch vs torch.topk (policy={policy})"
+
+
+def _run_prefill_policy_test(
+    policy, batch_size, top_k, num_tokens, dtype, row_start_offset=0, seed=77
+):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    seq_lens = generate_seq_lens(batch_size, top_k, num_tokens)
+    num_rows = int(seq_lens.sum().item())
+
+    row_indices = torch.arange(1, seq_lens.max() + 1, dtype=torch.int32, device="cuda")
+    row_lengths = row_indices.expand(seq_lens.size(0), -1)[
+        row_indices.expand(seq_lens.size(0), -1) <= seq_lens.unsqueeze(1)
+    ].contiguous()
+
+    row_starts = torch.full((num_rows,), row_start_offset, dtype=torch.int32, device="cuda")
+    row_ends = (row_starts + row_lengths).contiguous()
+
+    logits = create_random_logits(row_starts, row_ends, dtype, seed)
+
+    cuda_local, _ = CuteDSLTopKPrefillSingleCTARunner.forward(
+        logits,
+        row_starts,
+        row_ends,
+        top_k,
+        return_val=False,
+        overflow_policy=policy,
+    )
+
+    if policy == "TRUNCATE":
+        # TRUNCATE returns LOCAL indices; convert reference to LOCAL too.
+        max_row_end = int(row_ends.max().item())
+        torch_abs = logits.topk(min(top_k, max_row_end), dim=-1)[1].to(torch.int32)
+        torch_local = torch_abs - row_starts.unsqueeze(1)
+        valid = (torch_abs >= row_starts.unsqueeze(1)) & (torch_abs < row_ends.unsqueeze(1))
+        torch_local = torch_local.masked_fill(~valid, -1)
+
+        # For TRUNCATE with local indices: build absolute cuda_indices for comparison.
+        cuda_abs = cuda_local.clone()
+        not_neg1 = cuda_abs != -1
+        cuda_abs[not_neg1] = (
+            cuda_abs[not_neg1] + row_starts.unsqueeze(1).expand_as(cuda_abs)[not_neg1]
+        )
+        # compare_truncate expects absolute indices in logits space and row_starts=0 for absolute check.
+        # Easier: rebuild logits for absolute-index comparison using row_starts.
+        assert _compare_truncate_result(logits, cuda_abs, row_starts, row_ends, top_k), (
+            f"TRUNCATE prefill: invalid results (policy={policy})"
+        )
+    else:
+        # Exact policy: compare LOCAL indices using compare_top_k_results.
+        max_row_end = int(row_ends.max().item())
+        torch_abs = logits.topk(min(top_k, max_row_end), dim=-1)[1].to(torch.int32)
+        torch_local = torch_abs - row_starts.unsqueeze(1)
+        valid = (torch_abs >= row_starts.unsqueeze(1)) & (torch_abs < row_ends.unsqueeze(1))
+        torch_local = torch_local.masked_fill(~valid, -1)
+        assert compare_top_k_results(
+            logits, cuda_local, torch_local, row_starts, row_ends, top_k
+        ), f"Prefill results mismatch vs torch.topk (policy={policy})"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parametrized tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ALL_POLICIES = ["GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS", "REREAD"]
+
+# ----------------------------------------------------------------------------
+# Decode single-CTA — overflow (num_tokens > smem_input_size)
+# bf16: smem_size=16384 → overflow at 32768
+# fp32: smem_size=8192  → overflow at 16384
+# Use large batch_size (256) to trigger large_occupancy path.
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("overflow_policy", _ALL_POLICIES)
+@pytest.mark.parametrize("batch_size", [256])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "num_tokens, dtype",
+    [
+        (32768, torch.bfloat16),  # bf16: 32768 > smem_size 16384 → overflow
+        (65536, torch.bfloat16),  # bf16: 65536 >> smem_size
+        (16384, torch.float32),  # fp32: 16384 > smem_size  8192 → overflow
+        (32768, torch.float32),  # fp32: 32768 >> smem_size
+    ],
+)
+def test_decode_overflow_policy_overflow(
+    overflow_policy, batch_size, next_n, top_k, num_tokens, dtype
+):
+    """Decode single-CTA: all policies, large num_tokens (SMEM overflow triggered)."""
+    _run_decode_policy_test(overflow_policy, batch_size, next_n, top_k, num_tokens, dtype)
+
+
+# ----------------------------------------------------------------------------
+# Decode — REREAD policy: enable_reread=True but did_overflow=False at runtime
+#
+# REREAD has two compile-time conditions:
+#   enable_reread=True  requires num_tokens > filtered_topk_smem_input_size
+#                       (large_occ bf16: 16384, fp32: 8192)
+#   did_overflow=False  at runtime: threshold-bin count fits in SMEM
+#
+# With uniform random data and top_k=512, the threshold bin holds
+#   ~num_tokens / 256 ≈ 128 elements (bf16@32768) or 64 elements (fp32@16384),
+# both far below smem_input_size → did_overflow=False → SMEM-refinement path.
+#
+# This test exercises the REREAD path that test_decode_overflow_policy_no_overflow
+# cannot cover (those use num_tokens ≤ smem_size → enable_reread=False).
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 64, 256])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize(
+    "num_tokens, dtype",
+    [
+        (32768, torch.bfloat16),  # large_occ bf16: enable_reread=True, threshold-bin ~128 << 16384
+        (16384, torch.float32),  # large_occ fp32: enable_reread=True, threshold-bin ~64  <<  8192
+    ],
+)
+def test_decode_reread_no_smem_overflow(batch_size, next_n, top_k, num_tokens, dtype):
+    """REREAD: enable_reread=True (num_tokens > smem_size) but runtime did_overflow=False.
+
+    Exercises the SMEM-based refinement path inside the REREAD policy.
+    """
+    _run_decode_policy_test("REREAD", batch_size, next_n, top_k, num_tokens, dtype)
+
+
+# ----------------------------------------------------------------------------
+# Decode — small batch (no large_occupancy), overflow path uses base-class smem_size
+# Base-class: bf16 Uint16 num_buffer=1 → max_smem=64K → smem_size=min(64K, max_cols)
+# Only overflows at very large num_tokens (> 65536); use 131072.
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("overflow_policy", _ALL_POLICIES)
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1])
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize(
+    "num_tokens, dtype",
+    [
+        (131072, torch.bfloat16),
+        (131072, torch.float32),
+    ],
+)
+def test_decode_overflow_policy_small_batch_overflow(
+    overflow_policy, batch_size, next_n, top_k, num_tokens, dtype
+):
+    """Decode small batch (no large_occupancy): overflow at very large num_tokens."""
+    _run_decode_policy_test(overflow_policy, batch_size, next_n, top_k, num_tokens, dtype)
+
+
+# ----------------------------------------------------------------------------
+# Prefill — overflow (num_tokens > smem_input_size)
+# Prefill large_occupancy smem_input_size: bf16 Uint16 num_buffer=1 → 16384
+#                                           fp32 Uint16 num_buffer=2 →  8192
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("overflow_policy", _ALL_POLICIES)
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "num_tokens, dtype",
+    [
+        (20480, torch.bfloat16),  # bf16: 20480 > smem_size 16384 → overflow
+        (12288, torch.float32),  # fp32: 12288 > smem_size  8192 → overflow
+    ],
+)
+@pytest.mark.parametrize("row_start_offset", [256])
+def test_prefill_overflow_policy_overflow(
+    overflow_policy, batch_size, top_k, num_tokens, dtype, row_start_offset
+):
+    """Prefill: all policies, large num_tokens (SMEM overflow triggered)."""
+    # Skip combinations where the logits tensor would exceed ~80 GB.
+    # logits shape = (sum_seq_lens, num_tokens); sum_seq_lens ≈ batch_size * num_tokens / 2.
+    dtype_bytes = 2 if dtype == torch.bfloat16 else 4
+    est_gb = batch_size * (num_tokens // 2) * num_tokens * dtype_bytes / (1024**3)
+    if est_gb > 80:
+        pytest.skip(
+            f"Estimated logits tensor ~{est_gb:.0f} GB exceeds memory budget; "
+            f"use smaller batch_size or num_tokens"
+        )
+    _run_prefill_policy_test(
+        overflow_policy,
+        batch_size,
+        top_k,
+        num_tokens,
+        dtype,
+        row_start_offset=row_start_offset,
+    )
+
+
+# ============================================================================
+# GVR Phase-3 threshold-repair regressions: hints that defeat the threshold
+# search (undershoot / degenerate hint / tie plateau wider than kC) used to
+# produce a silently wrong top-K (-1 pads or row[0:K]).
+# ============================================================================
+
+
+def _gvr_decode_exact_check(logits_row, pre_idx_row, index_topk, tag):
+    """Run indexer_topk_decode (cr=4, BS=1) and assert a tie-aware exact top-K."""
+    n = logits_row.shape[-1]
+    dtype = logits_row.dtype
+    logits = logits_row.view(1, n).contiguous()
+    pre_idx = pre_idx_row.view(1, index_topk).to(torch.int32).contiguous()
+    seq_lens = torch.full((1,), n * 4, dtype=torch.int32, device="cuda")
+    # -1 sentinel so unwritten slots trip the assertions below.
+    indices = torch.full((1, index_topk), -1, dtype=torch.int32, device="cuda")
+    scratch = torch.empty(index_topk, dtype=dtype, device="cuda")
+    aux_indices, aux_logits = _build_radix_aux_buffers(1, index_topk)
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices,
+        1,
+        index_topk,
+        pre_idx,
+        scratch,
+        compress_ratio=4,
+        radix_aux_indices=aux_indices,
+        radix_aux_logits=aux_logits,
+    )
+    torch.cuda.synchronize()
+
+    assert int((indices < 0).sum()) == 0, (
+        f"{tag}: {int((indices < 0).sum())} of {index_topk} output slots are -1"
+    )
+    # Distinctness: a duplicate+omission pair on a tie plateau would leave
+    # the sorted value multiset below unchanged.
+    n_unique = int(torch.unique(indices[0]).numel())
+    assert n_unique == index_topk, (
+        f"{tag}: only {n_unique} of {index_topk} output indices are distinct"
+    )
+    flat = logits[0].float()
+    got = flat[indices[0].long()].sort().values
+    ref = flat.topk(index_topk).values.sort().values
+    assert torch.equal(got, ref), f"{tag}: selected values differ from torch.topk"
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [65536, 131072])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"]
+)
+@pytest.mark.parametrize("hint", ["bottom_k", "uniform_max", "random"])
+def test_indexer_topk_decode_gvr_hostile_hint(index_topk, num_tokens, dtype, hint):
+    """A hint that points away from the top-K must not change the result.
+
+    ``uniform_max`` (every slot = argmax) additionally collapses Phase 1's
+    min/max bracket to a point, which used to short-circuit the kernel into
+    emitting row[0:K].
+    """
+    torch.manual_seed(1234)
+    logits = torch.randn(num_tokens, dtype=torch.float32, device="cuda").to(dtype)
+    flat = logits.float()
+    if hint == "bottom_k":
+        pre = flat.topk(index_topk, largest=False).indices
+    elif hint == "uniform_max":
+        pre = flat.argmax().repeat(index_topk)
+    else:
+        pre = torch.randint(0, num_tokens, (index_topk,), device="cuda")
+    _gvr_decode_exact_check(logits, pre, index_topk, f"hint={hint}")
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("n_tie", [6000, 20000, 100000])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"]
+)
+def test_indexer_topk_decode_gvr_tie_plateau(index_topk, n_tie, dtype):
+    """More ties at the K-th value than the candidate buffer can hold: no
+    threshold lands in [K, kC], so the repair must emit the strictly-greater
+    set plus arbitrary ties. bf16/fp16 cover the reduced-precision driver's
+    separate direct-emit block."""
+    torch.manual_seed(1234)
+    num_tokens = 131072
+    n_above = index_topk // 2
+    logits = torch.full((num_tokens,), -1.0, dtype=torch.float32, device="cuda")
+    logits[:n_above] = torch.linspace(2.0, 3.0, n_above, device="cuda")
+    logits[n_above : n_above + n_tie] = 1.0
+    # Plateau (1.0) and floor (-1.0) are exact in every dtype; casting can
+    # only merge strictly-greater values with each other, which is tolerated.
+    logits = logits[torch.randperm(num_tokens, device="cuda")].contiguous().to(dtype)
+    pre = torch.randint(0, num_tokens, (index_topk,), device="cuda")
+    _gvr_decode_exact_check(logits, pre, index_topk, f"n_tie={n_tie}")

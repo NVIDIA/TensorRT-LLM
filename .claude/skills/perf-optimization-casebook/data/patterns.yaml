@@ -1,0 +1,406 @@
+# Pattern registry (pilot) — transferable patterns as first-class entries.
+#
+# Why: a case's `Generalizes to` prose often carries SEVERAL reusable
+# patterns (the sparse-MLA case carries three), but a case has only one
+# title and one index row — burying patterns flattens the match surface.
+# Registering each pattern with a stable id gives every pattern its own
+# match entry point: symptom → pattern → instance case(s).
+#
+# Hybrid-registry contract (KernelWiki DEC-1 style — keep by hand):
+#   - every id listed in a case's frontmatter `patterns:` must exist here;
+#   - every `instances:` entry here must resolve to an existing case file
+#     whose frontmatter lists this pattern back.
+#
+# Fields: id (stable, prefix `pattern-`), name (imperative one-liner),
+# bottleneck / signals (canonical terms from tags.yaml — the top-down hook),
+# families (where instances live today; not a constraint on transfer),
+# instances (case ids), notes (adapt delta / scope caveat, optional).
+
+patterns:
+  - id: pattern-host-prep-pipelining
+    name: Pipeline host prep for step N+1 against device compute of step N
+    bottleneck: [host-overhead, launch]
+    signals: [gpu-idle-between-steps, host-prep-on-critical-path]
+    families: [runtime-execution]
+    instances: [case-overlap-scheduler]
+    notes: >
+      Adapt by keeping step N+1 prep state disjoint from state mutated by
+      step N results — the disjoint-state plumbing is the hard part.
+
+  - id: pattern-fuse-small-op-chain
+    name: Collapse a small launch-bound op-chain into one fused per-token kernel
+    bottleneck: [launch, memory]
+    signals: [many-small-kernels, hbm-roundtrip-between-ops]
+    families: [kernel-and-fusion]
+    instances: [case-fuse-moe-routing-kernel]
+    notes: >
+      Keep intermediates in registers/shared instead of HBM. Carries to any
+      per-token "activation → reduction → select" chain (routers, sampling,
+      RoPE/norm epilogues, KV scatter).
+
+  - id: pattern-reuse-warp-primitive
+    name: Reuse an existing purpose-built warp/reduction primitive over a generic algorithm
+    bottleneck: [compute, launch]
+    signals: [many-small-kernels, kernel-far-from-sol]
+    families: [kernel-and-fusion]
+    instances: [case-fuse-moe-routing-kernel]
+    notes: >
+      E.g. moeTopKFuncs.cuh::reduceTopK instead of a bitonic sort. Search
+      existing kernels for a primitive before writing a new one.
+
+  - id: pattern-bounded-fastpath-fallback
+    name: Guard a specialized fast path with explicit config bounds plus a generic fallback
+    bottleneck: [launch]
+    signals: [slow-path-fallback]
+    families: [kernel-and-fusion]
+    instances: [case-fuse-moe-routing-kernel]
+    notes: >
+      The bounds guard is part of the pattern, not incidental: the host-side
+      eligibility check must stay in sync with the kernel's hard-checked
+      supported bounds, or a config errors instead of falling back.
+
+  - id: pattern-attend-selected-kv-subset
+    name: Make the attention kernel operate on a selected KV subset, not the full sequence
+    bottleneck: [compute, memory]
+    signals: [attention-hot-path, kv-reads-dominate, long-context]
+    families: [kernel-and-fusion]
+    instances: [case-sparse-mla-topk-attention]
+    notes: >
+      Pass selected page/block indices; bound the KV loop AND the cross-CTA
+      reduction by the selection count. Carries to block-sparse,
+      sliding-window/streaming, landmark/NSA-style selection.
+
+  - id: pattern-write-direct-into-paged-cache
+    name: Write K/V straight into the paged cache to skip a materialization pass
+    bottleneck: [memory]
+    signals: [hbm-roundtrip-between-ops, kv-reads-dominate]
+    families: [kernel-and-fusion]
+    instances: [case-sparse-mla-topk-attention]
+    notes: >
+      Absorption/latent layout; also lets redundant scratch buffers be
+      dropped once K/V live in the cache.
+
+  - id: pattern-early-exit-ragged-bounds
+    name: Early-exit CTAs beyond the ragged per-sequence length so padded work is free
+    bottleneck: [compute]
+    signals: [attention-hot-path, high-concurrency]
+    families: [kernel-and-fusion]
+    instances: [case-sparse-mla-topk-attention]
+    notes: >
+      Applies to any kernel launched on a padded/max-shape grid over ragged
+      batches — clamp per-CTA work by the actual sequence bound.
+
+  # ---- runtime-execution (migration round) ----
+
+  - id: pattern-push-language-boundary-off-hot-path
+    name: Push Python/C++ language-boundary crossings off the host hot path
+    bottleneck: [host-overhead]
+    signals: [gpu-idle-between-steps, host-prep-on-critical-path]
+    families: [runtime-execution]
+    instances: [case-pybind-wrapper-pure-python]
+    notes: >
+      Pure-Python hot objects, py_*-mirrored C++ fields read once, and
+      bulk-serialize-once + lazy-deserialize for anything crossing a process
+      boundary.
+
+  - id: pattern-hoist-step-invariant-host-work
+    name: Hoist step-invariant work out of the per-layer loop
+    bottleneck: [host-overhead]
+    signals: [gpu-idle-between-steps, host-prep-on-critical-path]
+    families: [runtime-execution]
+    instances: [case-cache-step-invariant-per-layer]
+    notes: >
+      Cache once per step on the metadata object; invalidate at step start
+      with a cheap flag plus identity guard.
+
+  - id: pattern-stable-torch-compile-target
+    name: Keep a torch.compile target stable and module-level; never redefine it on the hot path
+    bottleneck: [host-overhead]
+    signals: [recompilation-churn, host-prep-on-critical-path]
+    families: [runtime-execution]
+    instances: [case-hoist-torch-compile-closures]
+    notes: >
+      Hoist the decorated function to a stable def passing only needed
+      tensors; drop the decorator entirely for single cheap ops.
+
+  - id: pattern-overlap-independent-work
+    name: Overlap two data-independent pieces of work on separate streams or engines
+    bottleneck: [launch, sync]
+    signals: [small-batch-decode, many-small-kernels, draft-forward-exposed, expert-load-imbalance]
+    families: [runtime-execution]
+    instances: [case-multi-stream-shared-routed-expert, case-overlap-mla-rope-uk-bgemm, case-overlap-online-eplb, case-two-model-mtp-eagle]
+    notes: >
+      The hard part is proving data-independence (disjoint output slices /
+      disjoint step state); stream-switching only pays off under CUDA-graph
+      capture.
+
+  - id: pattern-process-only-real-work
+    name: Process only the real work, not padded-to-max
+    bottleneck: [host-overhead, compute]
+    signals: [expert-load-imbalance, host-prep-on-critical-path]
+    families: [runtime-execution]
+    instances: [case-attention-dp-padding]
+    notes: >
+      Make the collective length-aware and remove downstream padded-shape
+      assumptions; carries to any DP/ragged-batch collective and any resource
+      sized off max_*.
+
+  - id: pattern-pad-to-captured-bucket
+    name: Pad the dynamic dimension to a captured bucket so the CUDA graph always matches
+    bottleneck: [launch]
+    signals: [slow-path-fallback, expert-load-imbalance]
+    families: [runtime-execution]
+    instances: [case-cuda-graph-padding]
+    notes: >
+      Pad with shape-correct dummies up to the nearest captured size; dummies
+      need reserved IDs and cleanup.
+
+  - id: pattern-reuse-computed-state
+    name: Reuse computed state instead of recomputing it; free large intermediates at last use
+    bottleneck: [compute, memory]
+    signals: [attention-hot-path, long-context, memory-capacity-bound]
+    families: [runtime-execution]
+    instances: [case-mla-kv-cache-reuse, case-free-mla-intermediates]
+    notes: >
+      Choose what to persist (full KV vs compressed latent) and gate on
+      kernel availability; for freeing, find the true last-use point of each
+      big tensor.
+
+  - id: pattern-pdl-producer-consumer-overlap
+    name: Overlap a consumer kernel's preamble with the producer's tail via PDL — verify accuracy per kernel
+    bottleneck: [launch]
+    signals: [many-small-kernels, small-batch-decode]
+    families: [runtime-execution]
+    instances: [case-pdl]
+    notes: >
+      Gate on sm90+; accuracy-check each kernel — PDL changes inter-kernel
+      ordering and has produced real NaN regressions.
+
+  - id: pattern-bounded-relaxed-acceptance
+    name: Trade exact-match draft verification for a bounded relaxed criterion where small divergence is tolerable
+    bottleneck: [compute]
+    signals: [low-accept-rate]
+    families: [runtime-execution]
+    instances: [case-relaxed-mtp-acceptance]
+    notes: >
+      Gate relaxed acceptance to a delimited low-stakes phase (e.g. thinking)
+      and tune topk/delta; lossy — needs accuracy record + rollback.
+
+  - id: pattern-fold-side-cache-into-kv-manager
+    name: Fold a model-specific auxiliary cache into the unified paged KV-cache manager as a typed pool
+    bottleneck: [memory]
+    signals: [memory-capacity-bound, long-context]
+    families: [runtime-execution]
+    instances: [case-auxiliary-cache-in-kv-manager]
+    notes: >
+      Register the pool type sharing block IDs with the main KV; sum
+      mixed-dtype pools additively by physical dtype.
+
+  - id: pattern-chunk-prefill-align-auxiliary
+    name: Chunk long prefill and align any auxiliary structure's chunking to the primary's boundaries
+    bottleneck: [memory]
+    signals: [memory-capacity-bound, long-context]
+    families: [runtime-execution]
+    instances: [case-chunked-prefill-aligned-auxiliary]
+    notes: >
+      The auxiliary gathers only the current chunk and inherits the primary
+      chunker's boundaries — never two chunking schemes.
+
+  - id: pattern-skip-degenerate-sparse-path
+    name: Skip the sparse/approximate path when it degenerates to the exact one below a threshold
+    bottleneck: [compute, launch]
+    signals: [attention-hot-path, small-batch-decode]
+    families: [runtime-execution]
+    instances: [case-skip-sparse-path-when-degenerate]
+    notes: >
+      Substitute a trivially-constructed exact result and add a
+      CUDA-graph-key dimension so the fast path stays captured.
+
+  - id: pattern-graph-the-graphable
+    name: Graph the graphable regions and run the un-capturable ops eagerly (piecewise capture)
+    bottleneck: [launch]
+    signals: [many-small-kernels, slow-path-fallback]
+    families: [runtime-execution]
+    instances: [case-piecewise-cuda-graph]
+    notes: >
+      Choose the split op, ensure safe resume after it, and enumerate
+      token-count buckets.
+
+  - id: pattern-split-op-at-graphable-seam
+    name: Split a monolithic custom op at the graphable/non-graphable seam so its shape-static half can be captured
+    bottleneck: [launch]
+    signals: [many-small-kernels, slow-path-fallback]
+    families: [runtime-execution]
+    instances: [case-split-custom-op-for-piecewise-capture]
+    notes: >
+      Route through a registered torch.ops op with constant-arity
+      register_fake and straight-line control flow under compile.
+
+  - id: pattern-fold-bookkeeping-into-consuming-op
+    name: Push per-step Python tensor wrangling and count-deriving syncs into the kernel/op that already runs
+    bottleneck: [host-overhead, sync]
+    signals: [host-prep-on-critical-path, gpu-idle-between-steps]
+    families: [runtime-execution]
+    instances: [case-move-bookkeeping-into-cpp-op]
+    notes: >
+      Widen the op signature to accept raw tensors plus a length; thread
+      known counts through instead of .item() syncs.
+
+  # ---- kernel-and-fusion (migration round) ----
+
+  - id: pattern-fuse-chain-feeding-gemm
+    name: Fuse the op chain that feeds the next GEMM (collective epilogue, add+norm+quant, QK-norm+RoPE, layout pre-pass, up to a mega-fused pipeline)
+    bottleneck: [launch, memory, communication]
+    signals: [many-small-kernels, hbm-roundtrip-between-ops, allreduce-dominates]
+    families: [kernel-and-fusion]
+    instances: [case-fuse-ar-epilogue, case-fuse-add-norm-quant, case-fuse-qk-norm-rope, case-fold-scale-swizzle-into-kernel, case-mega-fuse-moe-deepgemm]
+    notes: >
+      A quant step inside the fused chain makes it lossy (parity-check);
+      most land as torch.compile PatternMatcher rewrites or a single custom
+      op.
+
+  - id: pattern-quantize-memory-bound-side
+    name: Quantize the memory-bound side (KV cache + matching operand) while keeping the precision-sensitive output high
+    bottleneck: [memory]
+    signals: [kv-reads-dominate, long-context, high-concurrency]
+    families: [kernel-and-fusion]
+    instances: [case-fp8-mla-kv-cache]
+    notes: >
+      Choose a KV dtype the FMHA kernel supports, supply dequant/BMM scales,
+      keep the output dtype unquantized where the next op is sensitive.
+
+  - id: pattern-split-compute-from-reduction
+    name: Split a monolithic compute + serial cross-partition-reduction kernel into main + reduction kernels
+    bottleneck: [compute]
+    signals: [attention-hot-path, kernel-far-from-sol]
+    families: [kernel-and-fusion]
+    instances: [case-split-mla-reduction-kernel]
+    notes: >
+      Choose where to materialize partials (GMEM stats/partial-O) and gate on
+      the regime where the extra launch pays off.
+
+  - id: pattern-hw-matched-lowprec-gemm-backend
+    name: Pick the hardware-matched low-precision (grouped-)GEMM backend over the generic one
+    bottleneck: [compute, memory]
+    signals: [gemm-dominates-step, weight-reads-dominate]
+    families: [kernel-and-fusion]
+    instances: [case-trtllm-gen-fp4-moe-backend, case-hw-matched-lowprec-moe-gemm, case-mega-fuse-moe-deepgemm]
+    notes: >
+      Match format and scale layout to the SM's tensor-core support; keep a
+      non-quant fallback backend.
+
+  - id: pattern-specialize-hotpath-topk
+    name: Replace a hot-path generic-sort top-k with a specialized radix-select dispatched by (k, N, dtype, SM-wave-occupancy)
+    bottleneck: [launch, compute]
+    signals: [many-small-kernels, recompilation-churn]
+    families: [kernel-and-fusion]
+    instances: [case-specialize-topk-selection-kernel]
+    notes: >
+      Two exact short-circuits travel with it — a coarse low-precision first
+      pass with exact fallback, and a warm-start from the previous decode
+      step's answer.
+
+  - id: pattern-fuse-datamovement-into-quantize
+    name: Fuse a data-movement/layout prologue into the quantize that consumes it, reading strided views directly
+    bottleneck: [memory, launch]
+    signals: [many-small-kernels, hbm-roundtrip-between-ops]
+    families: [kernel-and-fusion]
+    instances: [case-fuse-datamovement-into-quantize]
+    notes: >
+      Accept strided input pointers, do the layout in registers, emit
+      quantized data plus scales in one pass; keep the unfused path as
+      reference.
+
+  - id: pattern-ranking-only-reduced-precision
+    name: Run a ranking-only computation on the fast tensor-core path and verify the accelerated kernel is actually dispatched
+    bottleneck: [compute]
+    signals: [kernel-far-from-sol, slow-path-fallback]
+    families: [kernel-and-fusion]
+    instances: [case-ranking-only-precision-tf32]
+    notes: >
+      Confirm the output only ranks, then verify dispatch with ncu — small-M
+      GEMMs silently fall back to CUDA-core SGEMM even when TF32 was
+      requested.
+
+  - id: pattern-reevaluate-fusion-boundary
+    name: Re-evaluate the GEMM fusion boundary per dtype/checkpoint — fusion is not monotonic
+    bottleneck: [compute, launch]
+    signals: [mixed-dtype-checkpoint, many-small-kernels]
+    families: [kernel-and-fusion]
+    instances: [case-reevaluate-fusion-boundary-per-dtype]
+    notes: >
+      Gate the fuse on a runtime dtype check and weigh whether keeping an op
+      separate unlocks a conditional skip.
+
+  - id: pattern-triton-to-precompiled-cpp-op
+    name: Move a host-bound Triton kernel to a precompiled C++/CUDA custom op with a register_fake
+    bottleneck: [host-overhead, launch]
+    signals: [many-small-kernels, recompilation-churn, host-prep-on-critical-path]
+    families: [kernel-and-fusion]
+    instances: [case-triton-to-cpp-op]
+    notes: >
+      Only worth it when host overhead (not GPU SOL) is the bottleneck; keep
+      the Triton version as reference/fallback.
+
+  - id: pattern-constexpr-only-when-required
+    name: Mark a Triton param tl.constexpr only when it must be compile-time; pass the rest as runtime args
+    bottleneck: [host-overhead]
+    signals: [recompilation-churn]
+    families: [kernel-and-fusion]
+    instances: [case-relax-tl-constexpr]
+    notes: >
+      Check each constexpr param for a genuine compile-time requirement
+      (tl.arange bounds, static unrolling) before relaxing it.
+
+  # ---- communication (migration round) ----
+
+  - id: pattern-swap-generic-collective-for-specialized-comm
+    name: Swap a generic collective for a workload-specialized comm library
+    bottleneck: [communication]
+    signals: [alltoall-dominates, slow-path-fallback]
+    families: [communication]
+    instances: [case-deepep]
+    notes: >
+      Match the backend's buffer-reservation and layout-adapter contract;
+      pick the CUDA-graph-safe variant for decode.
+
+  - id: pattern-send-activations-post-quant
+    name: Send activations post-quant, not pre-quant
+    bottleneck: [communication]
+    signals: [alltoall-dominates, full-precision-on-wire]
+    families: [communication]
+    instances: [case-low-precision-dispatch]
+    notes: >
+      Pack scale factors with the payload, re-swizzle on receive, honor
+      per-format hidden-size divisibility; lossy — needs an accuracy record
+      plus rollback criterion.
+
+  - id: pattern-tune-collective-kernel-not-algorithm
+    name: Make the collective kernel faster instead of changing the algorithm
+    bottleneck: [communication, sync]
+    signals: [allreduce-dominates, kernel-far-from-sol]
+    families: [communication]
+    instances: [case-mnnvl-twoshot-allreduce]
+    notes: >
+      Match the target collective's alignment/divisibility assumptions and
+      the buffer-flag lifecycle.
+
+  - id: pattern-preregister-symmetric-comm-buffers
+    name: Pre-register symmetric comm buffers to kill per-step allocation and unlock in-place fused collectives
+    bottleneck: [communication, launch, memory]
+    signals: [allreduce-dominates, hbm-roundtrip-between-ops]
+    families: [communication]
+    instances: [case-userbuffers-symmetric-memory]
+    notes: >
+      Route producers to write directly into the registered buffer; gate on
+      dtype support.
+
+  - id: pattern-autotune-collective-per-shape
+    name: Autotune or heuristically pick the collective implementation per shape and concurrency
+    bottleneck: [communication]
+    signals: [allreduce-dominates, high-concurrency]
+    families: [communication]
+    instances: [case-shape-aware-allreduce-autotune]
+    notes: >
+      Benchmark candidates offline into a LUT or register a TunableRunner
+      with the runtime AutoTuner.

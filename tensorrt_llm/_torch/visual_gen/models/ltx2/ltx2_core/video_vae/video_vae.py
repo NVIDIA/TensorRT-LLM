@@ -589,7 +589,7 @@ class VideoDecoder(nn.Module):
         weights = torch.zeros_like(buffer)
         for tile in group_tiles:
             decoded_tile = self.forward(latent[tile.in_coords], timestep, generator)
-            mask = tile.blend_mask.to(device=buffer.device, dtype=buffer.dtype)
+            mask = tile.blend_mask(buffer.device, buffer.dtype)
             temporal_offset = tile.out_coords[2].start - temporal_slice.start
             expected_temporal_len = tile.out_coords[2].stop - tile.out_coords[2].start
             decoded_temporal_len = decoded_tile.shape[2]

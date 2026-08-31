@@ -175,6 +175,27 @@ def _build_tiny_moe(backend: str, dtype: torch.dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_moe_backend_not_silently_downgraded():
+    """The requested MoE backend is honored, not silently downgraded (Cat 3.4).
+
+    Split out from ``test_moe_forward_launch_count`` so this fallback-regression
+    guard runs on ANY GPU host, not only ones with the optional ``cupti`` package
+    installed (the launch-count test skips early when cupti is unavailable).
+    """
+    from .backend import MoeBackendType
+    from .build import _backend_name_from_module
+
+    backend = MoeBackendType.CUTLASS.value
+    moe, _model, _routing_logits_dtype = _build_tiny_moe(backend, torch.bfloat16)
+
+    actual_backend = _backend_name_from_module(moe)
+    assert actual_backend == backend, (
+        f"requested backend {backend!r} was silently downgraded to "
+        f"{actual_backend!r} for this config (silent fallback regression)."
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_moe_forward_launch_count():
     """A CUDA-graph MoE forward issues a fixed, expected number of kernels.
 

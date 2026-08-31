@@ -1,20 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import pathlib
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from typing import NamedTuple, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager,
+    KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
+    _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -23,7 +33,6 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1,
@@ -64,6 +73,101 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+class TestMergeKVCachePoolPointers(unittest.TestCase):
+
+    def test_mixed_half_nvfp4_pools_align_scale_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.HALF, DataType.NVFP4],
+        )
+
+        expected = torch.tensor([
+            [[11, 0], [12, 0]],
+            [[21, 31], [22, 32]],
+        ])
+        self.assertEqual(merged.shape, (2, 2, 2))
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_shared_nvfp4_pool_consumes_one_scale_row(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_physical_pool_ids_map_to_compact_data_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [2, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+
+class TestKVCacheManagerPoolPointers(unittest.TestCase):
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_default_nvfp4_pool_configuration_merges_scale_pointers(self):
+        manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=64),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(),
+            dtype=DataType.NVFP4,
+        )
+        try:
+            data_pointers = manager.impl.get_block_pool_pointers()
+            scale_pointers = manager.impl.get_block_scale_pool_pointers()
+
+            self.assertEqual(manager.pool_configurations, [])
+            self.assertEqual(
+                [(config.window_size, config.dtype)
+                 for config in manager.impl.pool_configurations],
+                [(64, DataType.NVFP4)],
+            )
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 0],
+                            data_pointers))
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 1],
+                            scale_pointers))
+        finally:
+            manager.shutdown()
 
 
 class TestResourceManager(unittest.TestCase):
@@ -323,6 +427,19 @@ class TestResourceManager(unittest.TestCase):
         self.assertTrue(peft_cache_manager.impl.enabled)
         self.assertGreaterEqual(peft_cache_manager.impl.max_host_pages, 1)
         self.assertGreaterEqual(peft_cache_manager.impl.max_device_pages, 1)
+
+    def test_initial_fp8_data_type_configures_cache(self):
+        if (not torch.cuda.is_available()
+                or torch.cuda.get_device_capability() != (9, 0)):
+            self.skipTest("Requires SM90 FP8 support")
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=self.create_peft_cache_config(),
+            lora_config=LoraConfig(),
+            model_config=self.model_config,
+            initial_data_type=torch.float8_e4m3fn,
+        )
+
+        self.assertEqual(peft_cache_manager.data_type, torch.float8_e4m3fn)
 
     def test_add_request_peft_empty_weights_config(self):
         """Test adding a request with empty LoRA task."""
@@ -825,6 +942,83 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
+    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
+        """V1 truncates packed beam cache indices to the requested blocks."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=1,
+            max_beam_width=2,
+            mapping=Mapping(),
+        )
+        try:
+            request_id = 7
+            kv_cache_manager.add_dummy_requests([request_id], [64],
+                                                max_beam_width=2)
+
+            full_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id], beam_width=2)
+            requested_blocks = 4
+            truncated_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id],
+                beam_width=2,
+                num_blocks_per_seq=[requested_blocks],
+            )
+
+            self.assertGreater(len(full_indices[0]), requested_blocks)
+            self.assertEqual(truncated_indices,
+                             [full_indices[0][:requested_blocks]])
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_add_dummy_requests_failure_frees_partial_allocation(self):
+        """A partial add_dummy_requests failure must free every block it
+        allocated (TRTLLM-14903): leaked blocks on the minimal pool built for
+        cache-size estimation starve the estimation requests and hang startup.
+        """
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=2,
+            mapping=Mapping(),
+        )
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            self.assertEqual(total_free, 4)
+            # Both sequences fit in one block each, but the per-request draft
+            # add_token loop needs two more blocks per request: request 0
+            # drains the pool and request 1's first add_token raises, after
+            # three of the four blocks were already allocated.
+            with self.assertRaises(Exception):
+                kv_cache_manager.add_dummy_requests([0, 1],
+                                                    token_nums=[64, 64],
+                                                    is_gen=True,
+                                                    max_num_draft_tokens=128)
+            self.assertEqual(kv_cache_manager._preprepared_dummy_request_ids,
+                             set())
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+            # The freed pool must serve follow-up allocations.
+            requests = kv_cache_manager.add_dummy_requests([2], token_nums=[64])
+            self.assertIsNotNone(requests)
+            kv_cache_manager.free_resources(requests[0])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.
@@ -913,6 +1107,77 @@ class TestResourceManager(unittest.TestCase):
         self.assertTrue(peft_cache_manager.impl.enabled)
 
 
+@pytest.mark.cpu_only
+class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(is_draft: bool = False) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.impl.get_kv_cache_stats.return_value = SimpleNamespace(
+            free_num_blocks=8)
+        manager.is_linear_attention = False
+        manager.is_vswa = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.is_draft = is_draft
+        manager.kv_connector_manager = None
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        return manager
+
+    @staticmethod
+    def _context_batch(request: LlmRequest) -> ScheduledRequests:
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_context_dummy_is_registered_once_and_id_can_be_reused(self):
+        manager = self._make_manager()
+
+        requests = manager.add_dummy_requests([0], token_nums=[64])
+        self.assertIsNotNone(requests)
+        request = requests[0]
+        self.assertEqual(manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 1)
+
+        manager.prepare_resources(self._context_batch(request))
+
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 1)
+
+        manager.free_resources(request)
+        self.assertEqual(manager._preprepared_dummy_request_ids, set())
+
+        manager.add_dummy_requests([0], token_nums=[64])
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 2)
+
+    def test_preprepared_dummy_ownership_is_manager_local(self):
+        target_manager = self._make_manager()
+        draft_manager = self._make_manager(is_draft=True)
+        other_manager = self._make_manager()
+
+        requests = target_manager.add_dummy_requests(
+            [0],
+            token_nums=[64],
+            draft_kv_cache_manager=draft_manager,
+        )
+        self.assertIsNotNone(requests)
+        request = requests[0]
+        self.assertEqual(target_manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(draft_manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(other_manager._preprepared_dummy_request_ids, set())
+
+        target_manager.prepare_resources(self._context_batch(request))
+        draft_manager.prepare_resources(self._context_batch(request))
+        other_manager.prepare_resources(self._context_batch(request))
+
+        self.assertEqual(target_manager.impl.add_sequence_batch.call_count, 1)
+        self.assertEqual(draft_manager.impl.add_sequence_batch.call_count, 1)
+        self.assertEqual(other_manager.impl.add_sequence_batch.call_count, 1)
+
+
+@pytest.mark.cpu_only
 class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
@@ -956,6 +1221,327 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
                 kwargs["secondary_offload_min_priority"], 0)
         finally:
             kv_cache_manager.shutdown()
+
+
+class TestResolveWindowSize(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(max_attention_window_vec, is_vswa):
+        mgr = KVCacheManager.__new__(KVCacheManager)
+        mgr.max_attention_window_vec = max_attention_window_vec
+        mgr.is_vswa = is_vswa
+        return mgr
+
+    def test_uniform_multi_layer_vector_does_not_raise(self):
+        mgr = self._make_manager([4096, 4096, 4096], is_vswa=False)
+        self.assertEqual(mgr._resolve_window_size(None), 4096)
+
+    def test_genuine_vswa_requires_window_size(self):
+        mgr = self._make_manager([4096, 8192], is_vswa=True)
+        with self.assertRaises(ValueError):
+            mgr._resolve_window_size(None)
+        self.assertEqual(mgr._resolve_window_size(8192), 8192)
+
+
+class TestRequestBudget(unittest.TestCase):
+    """Unit tests for the beam-aware KV block budget estimation and the
+    request admission budget check."""
+
+    TOKENS_PER_BLOCK = 8
+
+    class _OptedInKVCacheManager(KVCacheManager):
+        """A subclass that has checked its cost model against the dense one."""
+
+        def kv_block_budget_applies(self):
+            return True
+
+    @classmethod
+    def _make_kv_cache_manager(cls, manager_cls=KVCacheManager):
+        # Build a bare KVCacheManager without touching the GPU (mirrors
+        # TestResolveWindowSize) so we can exercise the pure block math.
+        mgr = manager_cls.__new__(manager_cls)
+        mgr.tokens_per_block = cls.TOKENS_PER_BLOCK
+        mgr.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        mgr.is_vswa = False
+        mgr.is_linear_attention = False
+        mgr.num_extra_kv_tokens = 0
+        mgr.max_total_draft_tokens = 0
+        mgr._kv_reserve_draft_tokens = 0
+        mgr.max_seq_len = 4096
+        mgr.max_attention_window_vec = [mgr.max_seq_len]
+        mgr.blocks_in_primary_pool = 32
+        mgr.blocks_in_secondary_pool = 100
+        return mgr
+
+    @staticmethod
+    def _make_request(prompt_len,
+                      max_new_tokens,
+                      beam_width,
+                      encoder_output_len=None):
+        sampling_params = SamplingParams(n=beam_width,
+                                         best_of=beam_width,
+                                         use_beam_search=beam_width > 1)
+        return LlmRequest(
+            request_id=1,
+            max_new_tokens=max_new_tokens,
+            input_tokens=list(range(prompt_len)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            encoder_output_len=encoder_output_len,
+        )
+
+    def test_num_blocks_beam_one_matches_needed_resource(self):
+        """For beam_width=1 the beam-aware estimate must equal the historical
+        beam-unaware get_needed_resource_to_completion value."""
+        mgr = self._make_kv_cache_manager()
+        for prompt_len, max_new_tokens in [(20, 5), (16, 1), (1, 100), (8, 8)]:
+            req = self._make_request(prompt_len, max_new_tokens, beam_width=1)
+            self.assertEqual(
+                mgr._num_blocks_to_completion(req.orig_prompt_len,
+                                              req.max_new_tokens,
+                                              req.py_beam_width),
+                mgr.get_needed_resource_to_completion(req))
+
+    def test_num_blocks_shares_prompt_across_beams(self):
+        """Only the partial-last-prompt block and generated tokens scale with
+        beam width; full prompt blocks are shared."""
+        mgr = self._make_kv_cache_manager()
+        # prompt_len=20, tpb=8 -> 2 full shared blocks, 4 leftover prompt tokens.
+        # max_new_tokens=5 -> per-beam tokens = 4 + 5 = 9 -> ceil(9/8) = 2 blocks.
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        # shared(2) + per_beam(2) * beam(4) = 10
+        self.assertEqual(
+            mgr._num_blocks_to_completion(req.orig_prompt_len,
+                                          req.max_new_tokens,
+                                          req.py_beam_width), 10)
+
+        # Beam width only multiplies the per-beam portion, not the shared prompt.
+        req1 = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=1)
+        self.assertEqual(
+            mgr._num_blocks_to_completion(req1.orig_prompt_len,
+                                          req1.max_new_tokens,
+                                          req1.py_beam_width), 4)
+
+    def test_num_blocks_block_aligned_prompt(self):
+        """A block-aligned prompt contributes no per-beam partial block."""
+        mgr = self._make_kv_cache_manager()
+        # prompt_len=16 (2 full blocks, 0 leftover), max_new_tokens=1.
+        # per-beam tokens = 0 + 1 = 1 -> ceil(1/8) = 1 block per beam.
+        req = self._make_request(prompt_len=16, max_new_tokens=1, beam_width=3)
+        # shared(2) + per_beam(1) * beam(3) = 5
+        self.assertEqual(
+            mgr._num_blocks_to_completion(req.orig_prompt_len,
+                                          req.max_new_tokens,
+                                          req.py_beam_width), 5)
+
+    def test_container_returns_v1_primary_pool_budget(self):
+        mgr = self._make_kv_cache_manager()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        self.assertEqual(
+            resource_manager.get_request_kv_block_budgets(req),
+            [(ResourceManagerType.KV_CACHE_MANAGER, 10,
+              mgr.blocks_in_primary_pool)],
+        )
+
+    def test_container_no_kv_cache_manager_is_explicit_noop(self):
+        resource_manager = ResourceManager({})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_v2_manager_does_not_run_v1_budget_check(self):
+        mgr = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=1)
+
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_subclass_manager_opts_out_by_default(self):
+        """Sparse/compressed KV and mamba hybrid subclasses hold a different
+        amount of KV per token, so they must not inherit the dense estimate."""
+
+        class _SubclassedKVCacheManager(KVCacheManager):
+            pass
+
+        mgr = self._make_kv_cache_manager(_SubclassedKVCacheManager)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_subclass_manager_can_opt_in(self):
+        """A subclass whose cost model matches opts in by declaring the budget
+        applies, which routes it through the dense estimate."""
+
+        mgr = self._make_kv_cache_manager(self._OptedInKVCacheManager)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+
+        self.assertEqual(
+            resource_manager.get_request_kv_block_budgets(req),
+            [(ResourceManagerType.KV_CACHE_MANAGER, 10,
+              mgr.blocks_in_primary_pool)],
+        )
+
+    def test_windowed_v1_manager_does_not_use_single_pool_budget(self):
+        mgr = self._make_kv_cache_manager()
+        mgr.max_attention_window_vec = [128]
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
+
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_validate_request_budget_rejects_oversized_request(self):
+        """_validate_request_budget raises for a request that can never fit and
+        passes for one that fits."""
+        mgr = self._make_kv_cache_manager()
+        mgr.blocks_in_primary_pool = 8
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+
+        # shared(25) + per_beam(1) * beam(4) exceeds primary capacity.
+        req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
+        with self.assertRaisesRegex(
+                ValueError, "KV_CACHE_MANAGER requires 29 KV cache blocks.*"
+                "GPU-primary capacity of 8"):
+            executor._validate_request_budget(req)
+
+        # shared(2) + per_beam(2) * beam(2) = 6, so it fits.
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=2)
+        executor._validate_request_budget(req)
+
+    def test_validate_request_budget_checks_draft_manager(self):
+        mgr = self._make_kv_cache_manager()
+        mgr.blocks_in_primary_pool = 8
+        resource_manager = ResourceManager(
+            {ResourceManagerType.DRAFT_KV_CACHE_MANAGER: mgr})
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+
+        oversized = self._make_request(prompt_len=200,
+                                       max_new_tokens=5,
+                                       beam_width=4)
+        with self.assertRaisesRegex(
+                ValueError,
+                "DRAFT_KV_CACHE_MANAGER requires 29 KV cache blocks"):
+            executor._validate_request_budget(oversized)
+
+        fitting = self._make_request(prompt_len=20,
+                                     max_new_tokens=5,
+                                     beam_width=2)
+        executor._validate_request_budget(fitting)
+
+    def test_validate_request_budget_checks_cross_manager(self):
+        mgr = self._make_kv_cache_manager()
+        mgr.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+        mgr.blocks_in_primary_pool = 2
+        resource_manager = ResourceManager(
+            {ResourceManagerType.CROSS_KV_CACHE_MANAGER: mgr})
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+
+        oversized = self._make_request(prompt_len=20,
+                                       max_new_tokens=5,
+                                       beam_width=1,
+                                       encoder_output_len=17)
+        with self.assertRaisesRegex(
+                ValueError,
+                "CROSS_KV_CACHE_MANAGER requires 3 KV cache blocks"):
+            executor._validate_request_budget(oversized)
+
+        fitting = self._make_request(prompt_len=20,
+                                     max_new_tokens=5,
+                                     beam_width=1,
+                                     encoder_output_len=16)
+        executor._validate_request_budget(fitting)
+
+    def test_unchecked_pools_reported_exactly_when_budget_is_skipped(self):
+        """get_unchecked_kv_block_budget_pools must agree with which managers
+        actually produce a budget -- the startup warning names pools from it,
+        so a disagreement would either warn about a checked pool or stay
+        silent about an unchecked one."""
+
+        class _SubclassedKVCacheManager(KVCacheManager):
+            pass
+
+        windowed = self._make_kv_cache_manager()
+        windowed.max_attention_window_vec = [128]
+        cases = [
+            ("dense base manager", self._make_kv_cache_manager(), True),
+            ("subclass opting in",
+             self._make_kv_cache_manager(self._OptedInKVCacheManager), True),
+            ("subclass opting out",
+             self._make_kv_cache_manager(_SubclassedKVCacheManager), False),
+            ("sliding window", windowed, False),
+            ("V2 manager", KVCacheManagerV2.__new__(KVCacheManagerV2), False),
+        ]
+        for name, mgr, is_checked in cases:
+            with self.subTest(manager=name):
+                self._assert_unchecked_matches_budget(mgr, is_checked)
+
+    def _assert_unchecked_matches_budget(self, mgr, is_checked):
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+
+        unchecked = resource_manager.get_unchecked_kv_block_budget_pools()
+        has_budget = bool(resource_manager.get_request_kv_block_budgets(req))
+        self.assertEqual(has_budget, is_checked)
+        self.assertEqual(
+            unchecked,
+            [] if is_checked else [ResourceManagerType.KV_CACHE_MANAGER])
+
+    def test_startup_warns_when_beam_search_runs_unchecked(self):
+        """Beam search against a pool that opts out of the budget check gets a
+        warning naming it, since such a request stalls rather than failing."""
+
+        class _SubclassedKVCacheManager(KVCacheManager):
+            pass
+
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            self._make_kv_cache_manager(_SubclassedKVCacheManager)
+        })
+
+        executor.max_beam_width = 4
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger"
+                   ) as mock_logger:
+            executor._warn_if_kv_block_budget_unchecked()
+        mock_logger.warning_once.assert_called_once()
+        message = mock_logger.warning_once.call_args.args[0]
+        self.assertIn("max_beam_width=4", message)
+        self.assertIn("KV_CACHE_MANAGER", message)
+
+        # Greedy and single-beam requests cannot outgrow the pool by beam
+        # width, so the warning would be noise.
+        executor.max_beam_width = 1
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger"
+                   ) as mock_logger:
+            executor._warn_if_kv_block_budget_unchecked()
+        mock_logger.warning_once.assert_not_called()
+
+    def test_startup_silent_when_every_pool_is_checked(self):
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            self._make_kv_cache_manager()
+        })
+        executor.max_beam_width = 4
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger"
+                   ) as mock_logger:
+            executor._warn_if_kv_block_budget_unchecked()
+        mock_logger.warning_once.assert_not_called()
 
 
 if __name__ == "__main__":

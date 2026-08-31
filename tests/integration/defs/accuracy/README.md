@@ -9,7 +9,6 @@ In addition, most tests are based on the offline API -- [LLM API](https://nvidia
 This test suite is organized as following:
 * [accuracy_core.py](./accuracy_core.py) provides the test harness, including hypothesis testing logics, evaluation task configurations, and common utilities.
 * [test_cli_flow.py](./test_cli_flow.py) contains the tests with CLI workflow, i.e., checkpoint conversion, engine building and evaluation.
-* [test_llm_api.py](./test_llm_api.py) contains the tests with LLM API and TensorRT backend.
 * [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) contains the tests with LLM API and PyTorch backend.
 * [references](./references) registers the reference accuracies for each task, each model and each specification (e.g., data type, quantization).
 * [scripts](./scripts) provides some utility scripts that may help setup accuracy tests.

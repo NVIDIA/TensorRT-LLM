@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,9 +83,9 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // Classmethod: batch construction from numpy arrays
         .def_static(
             "from_arrays",
-            [](kvc::MemoryType type, nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
-                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
-                nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
+            [](kvc::MemoryType type, nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
+                nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
             {
                 size_t n = addrs.shape(0);
                 auto const* a = addrs.data();
@@ -105,8 +105,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // Classmethod: batch construction with uniform device_id (avoids np.full allocation)
         .def_static(
             "from_arrays_uniform_device",
-            [](kvc::MemoryType type, nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
-                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes, uint32_t deviceId)
+            [](kvc::MemoryType type, nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes, uint32_t deviceId)
             {
                 size_t n = addrs.shape(0);
                 auto const* a = addrs.data();
@@ -198,20 +198,24 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "__init__",
             [](kvc::BaseAgentConfig* self, std::string name, bool use_prog_thread, bool multi_thread,
                 bool use_listen_thread, bool enable_telemetry,
-                std::unordered_map<std::string, std::string> backend_params)
+                std::unordered_map<std::string, std::string> backend_params, std::optional<int> rank,
+                std::optional<int> world_size)
             {
                 new (self) kvc::BaseAgentConfig{std::move(name), use_prog_thread, multi_thread, use_listen_thread,
-                    enable_telemetry, std::move(backend_params)};
+                    enable_telemetry, std::move(backend_params), rank, world_size};
             },
             nb::arg("name"), nb::arg("use_prog_thread") = true, nb::arg("multi_thread") = false,
             nb::arg("use_listen_thread") = false, nb::arg("enable_telemetry") = false,
-            nb::arg("backend_params") = std::unordered_map<std::string, std::string>{})
+            nb::arg("backend_params") = std::unordered_map<std::string, std::string>{}, nb::arg("rank") = std::nullopt,
+            nb::arg("world_size") = std::nullopt)
         .def_rw("name", &kvc::BaseAgentConfig::mName)
         .def_rw("use_prog_thread", &kvc::BaseAgentConfig::useProgThread)
         .def_rw("multi_thread", &kvc::BaseAgentConfig::multiThread)
         .def_rw("use_listen_thread", &kvc::BaseAgentConfig::useListenThread)
         .def_rw("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
-        .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams);
+        .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams)
+        .def_rw("rank", &kvc::BaseAgentConfig::rank)
+        .def_rw("world_size", &kvc::BaseAgentConfig::worldSize);
 
     // BaseTransferAgent class (abstract base)
     // All transfer-engine operations release the GIL: they may block on NIXL /
@@ -261,28 +265,35 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
         .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
-        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::NixlTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
             nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
             nb::keep_alive<0, 1>())
-        .def(
-            "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
+        .def("notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"),
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
+            nb::call_guard<nb::gil_scoped_release>());
 #endif
 
     // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally

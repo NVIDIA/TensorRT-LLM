@@ -3,27 +3,26 @@
 
 The runner has two layers worth testing:
 
-* Pure-Python (bucket selection, side-stream guard, padding policy).
+* Pure-Python (bucket selection, padding policy).
 * CUDA graph capture/replay.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 from unittest import mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
-    _MM_SIDE_STREAM_ENV,
     EncoderGraphKey,
     EncoderGraphTensorSpec,
     MultimodalEncoderGraphRunner,
     _CapturedGraph,
 )
+from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 HIDDEN = 8
@@ -140,13 +139,6 @@ class _FakeGraph:
         self.replay_calls += 1
 
 
-@pytest.fixture(autouse=True)
-def clean_side_stream_env(monkeypatch):
-    """Temporarily unset side-stream prefetch for tests unless a test sets it explicitly."""
-    monkeypatch.delenv(_MM_SIDE_STREAM_ENV, raising=False)
-    yield
-
-
 def _make_logic_runner(
     *,
     buckets: Optional[List[EncoderGraphKey]] = None,
@@ -173,31 +165,6 @@ def _make_logic_runner(
         output_specs={"y": 0},
         config=config,
     )
-
-
-@pytest.fixture
-def construct_with_env():
-    """Build a runner with the side-stream env var forced to a value.
-
-    The autouse env fixture restores the prior env state on teardown.
-    """
-
-    def _construct(env_value: Optional[str]):
-        os.environ.pop(_MM_SIDE_STREAM_ENV, None)
-        if env_value is not None:
-            os.environ[_MM_SIDE_STREAM_ENV] = env_value
-        config = MultimodalEncoderCudaGraphConfig(
-            buckets=[(128, 1)],
-        )
-        return MultimodalEncoderGraphRunner(
-            encoder_fn=_NeverInvokedEncoder(),
-            metadata_provider=_NoopMetadataProvider(),
-            input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
-            output_specs={"y": 0},
-            config=config,
-        )
-
-    return _construct
 
 
 @pytest.mark.parametrize(
@@ -331,21 +298,6 @@ def test_empty_buckets_rejected():
         )
 
 
-def test_side_stream_env_var_blocks_runner(construct_with_env):
-    with pytest.raises(RuntimeError):
-        construct_with_env("2")
-
-
-def test_side_stream_env_var_zero_is_allowed(construct_with_env):
-    # Should construct without raising.
-    construct_with_env("0")
-
-
-def test_side_stream_invalid_env_value_raises(construct_with_env):
-    with pytest.raises(ValueError):
-        construct_with_env("not-an-int")
-
-
 def test_metadata_buffer_snapshot_records_declared_attrs():
     md = _ToyMetadata(
         max_contexts=2,
@@ -436,13 +388,14 @@ def make_cuda_runner(cuda_device):
         *,
         buckets: List[EncoderGraphKey],
         enable_padding: bool = True,
+        encoder_fn: Optional[Callable] = None,
     ) -> MultimodalEncoderGraphRunner:
         config = MultimodalEncoderCudaGraphConfig(
             buckets=[(bucket.total_tokens, bucket.num_contexts) for bucket in buckets],
             enable_padding=enable_padding,
         )
         return MultimodalEncoderGraphRunner(
-            encoder_fn=_make_toy_encoder_fn(SCALE),
+            encoder_fn=encoder_fn or _make_toy_encoder_fn(SCALE),
             metadata_provider=_ToyMetadataProvider(cuda_device),
             input_specs={
                 "x": EncoderGraphTensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0),
@@ -587,39 +540,64 @@ def test_replay_matches_eager_across_sizes(cuda_device, make_cuda_runner, real_t
     torch.testing.assert_close(out["y"], expected, rtol=0, atol=0)
 
 
-@pytestmark_cuda
-def test_capture_uses_inference_mode_when_grad_enabled(cuda_device):
-    bucket = EncoderGraphKey(num_contexts=1, total_tokens=128)
-    grad_enabled_states = []
+def _probing_encoder_fn(probe: Callable[[], bool], sink: List[bool]):
+    """Toy encoder that records `probe()` on every call the runner makes.
+
+    Used to assert what ambient state capture establishes for the encoder region,
+    across the warmup steps and the capture itself.
+    """
 
     def encoder_fn(
         inputs: Dict[str, torch.Tensor], metadata: _ToyMetadata
     ) -> Dict[str, torch.Tensor]:
-        grad_enabled_states.append(torch.is_grad_enabled())
+        sink.append(probe())
         x = inputs["x"]
         bias = metadata.seq_lens_cuda.sum().to(x.dtype)
         return {"y": x + bias}
 
-    config = MultimodalEncoderCudaGraphConfig(
-        buckets=[(bucket.total_tokens, bucket.num_contexts)],
-        enable_padding=True,
-        warmup_steps=2,
-    )
-    runner = MultimodalEncoderGraphRunner(
-        encoder_fn=encoder_fn,
-        metadata_provider=_ToyMetadataProvider(cuda_device),
-        input_specs={
-            "x": EncoderGraphTensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0),
-        },
-        output_specs={"y": 0},
-        config=config,
+    return encoder_fn
+
+
+@pytestmark_cuda
+def test_capture_uses_inference_mode_when_grad_enabled(cuda_device, make_cuda_runner):
+    bucket = EncoderGraphKey(num_contexts=1, total_tokens=128)
+    observed: List[bool] = []
+    runner = make_cuda_runner(
+        buckets=[bucket],
+        encoder_fn=_probing_encoder_fn(torch.is_grad_enabled, observed),
     )
 
     with torch.enable_grad():
         assert torch.is_grad_enabled()
         runner.capture_all(cuda_device)
 
-    assert grad_enabled_states == [False, False, False]
+    assert observed and not any(observed)
+
+
+@pytestmark_cuda
+def test_capture_lowers_torch_compiling_and_restores_it(cuda_device, make_cuda_runner):
+    """Capture must not inherit a raised compile flag from a previous engine.
+
+    `is_torch_compiling_flag` is a plain module global, so in a reused worker it
+    still holds whatever the last engine set. Layers gate their custom-op path on
+    it (`Attention.forward_impl`), and that op resolves attention metadata from
+    `extra_attrs`, which nothing binds during `load_weights`-driven capture. The
+    caller's value must be restored on exit so an engine mid-compile is unaffected.
+    """
+    bucket = EncoderGraphKey(num_contexts=1, total_tokens=128)
+    observed: List[bool] = []
+    runner = make_cuda_runner(
+        buckets=[bucket],
+        encoder_fn=_probing_encoder_fn(is_torch_compiling, observed),
+    )
+
+    with torch_compiling(True):
+        assert is_torch_compiling()
+        runner.capture_all(cuda_device)
+        assert is_torch_compiling(), "capture must restore the caller's value"
+
+    assert observed and not any(observed)
+    assert not is_torch_compiling()
 
 
 class _ReallocatingProvider:

@@ -21,7 +21,7 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -41,13 +41,23 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
+
+
+@pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
+def test_typical_seq_len_preserves_deepseek_v4_fallback(
+    avg_seq_len: int | None, expected: int
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.max_seq_len = 1024
+
+    assert manager._get_typical_seq_len(KvCacheConfig(avg_seq_len=avg_seq_len)) == expected
 
 
 def test_cache_size_estimation_uses_model_attention_layer_count():
@@ -87,6 +97,7 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager._max_draft_len = 0
     manager._max_num_tokens = 1024
@@ -121,6 +132,7 @@ def test_needed_resource_uses_context_swa_scratch_slope():
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager.tokens_per_block = 128
     manager.num_extra_kv_tokens = 0
@@ -182,77 +194,6 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
     return buffer
 
 
-def _build_deepseek_v4_cache_config_for_test(
-    kv_cache_config: KvCacheConfig,
-    *,
-    max_batch_size: int = 4,
-    max_seq_len: int = 1024,
-    max_num_tokens: int | None = 2048,
-    max_draft_len: int = 0,
-):
-    cache_manager = object.__new__(DeepseekV4CacheManager)
-    cache_manager.pp_layers = [0, 1, 2]
-    cache_manager._compress_ratios = [1, 4, 128]
-    cache_manager._swa_window_size = 128
-    cache_manager._max_draft_len = max_draft_len
-    cache_manager._max_num_tokens = max_num_tokens
-    cache_manager.compressed_block_sizes = [128, 32, 1]
-    cache_manager.index_head_dim = 128
-    cache_manager.head_dim = 512
-    cache_manager.tokens_per_block = 128
-    cache_manager.dtype = DataType.BF16
-    cache_manager._indexer_k_dtype = "fp8"
-    cache_manager.max_batch_size = max_batch_size
-    cache_manager.max_seq_len = max_seq_len
-    cache_manager.enable_stats = False
-    cache_manager.enable_swa_scratch_reuse = False
-    cache_manager.num_extra_kv_tokens = 0
-
-    return cache_manager._build_cache_config(
-        kv_cache_config,
-        tokens_per_block=128,
-        vocab_size=129280,
-        cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
-    )
-
-
-def test_deepseek_v4_pool_ratio_overrides_typical_step_and_constraints():
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(pool_ratio=[0.2, 0.3, 0.5], avg_seq_len=256)
-    )
-
-    assert config.initial_pool_ratio == [0.2, 0.3, 0.5]
-    assert config.typical_step is None
-    assert config.constraints == []
-
-
-def test_deepseek_v4_avg_seq_len_updates_typical_step():
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(avg_seq_len=256),
-        max_batch_size=3,
-        max_seq_len=1024,
-        max_num_tokens=2048,
-        max_draft_len=2,
-    )
-
-    assert config.initial_pool_ratio is None
-    assert config.typical_step is not None
-    assert config.typical_step.kv_caches[0].capacity == 2048
-    assert config.typical_step.kv_caches[0].history_length == 0
-    assert [kv.capacity for kv in config.typical_step.kv_caches[1:]] == [256, 256]
-    assert [kv.history_length for kv in config.typical_step.kv_caches[1:]] == [253, 253]
-    assert config.constraints[0].kv_caches[0].capacity == 1024
-    assert config.constraints[0].kv_caches[0].history_length == 1023
-
-
-def test_deepseek_v4_avg_seq_len_must_not_exceed_max_seq_len():
-    with pytest.raises(ValueError, match="avg_seq_len"):
-        _build_deepseek_v4_cache_config_for_test(
-            KvCacheConfig(avg_seq_len=2048),
-            max_seq_len=1024,
-        )
-
-
 @pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
 def scratch_reuse_enabled(request) -> bool:
     return request.param
@@ -272,7 +213,6 @@ class TestDeepseekV4CacheManager:
     # indexer quantization config
     indexer_dtype = DataType.FP8
     indexer_scale_dtype = DataType.FLOAT
-    indexer_quant_block_size = 128
 
     # cache manager specific param
     tokens_per_block = 128
@@ -509,15 +449,16 @@ class TestDeepseekV4CacheManager:
                 )
 
             if self._is_sparse_layer(ratio):
-                # indexer kv cache is blockwise FP8 quantized
+                # Indexer KV cache stores raw quantized bytes plus raw scale bytes.
                 indexer_dim = sparse_attn_config.index_head_dim
                 indexer_num_tokens = seq_len // ratio
-                num_scales = indexer_dim // self.indexer_quant_block_size
+                indexer_k_dtype = sparse_attn_config.indexer_k_dtype
+                value_dim, scale_dim, scale_dtype = self._indexer_cache_layout(indexer_k_dtype)
                 indexer_values = self._rand_tensor(
-                    (indexer_num_tokens, indexer_dim), torch.uint8, device
+                    (indexer_num_tokens, value_dim), torch.uint8, device
                 )
                 indexer_scales = self._rand_tensor(
-                    (indexer_num_tokens, num_scales), torch.float32, device
+                    (indexer_num_tokens, scale_dim), scale_dtype, device
                 )
                 cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESS] = (
                     indexer_values,
@@ -536,32 +477,41 @@ class TestDeepseekV4CacheManager:
 
         return cache
 
-    def _split_blockwise_buffer(self, buffer: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Split a blockwise FP8 quantized buffer into value and scale buffers.
+    def _indexer_cache_layout(self, indexer_k_dtype: str) -> Tuple[int, int, torch.dtype]:
+        if indexer_k_dtype == "fp8":
+            return self.index_head_dim, self.index_head_dim // 128, torch.float32
+        if indexer_k_dtype == "fp4":
+            return self.index_head_dim // 2, self.index_head_dim // 32, torch.uint8
+        raise ValueError(f"Unsupported indexer_k_dtype {indexer_k_dtype!r}")
+
+    def _split_blockwise_buffer(
+        self,
+        buffer: torch.Tensor,
+        indexer_k_dtype: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split an indexer K cache buffer into value and scale buffers.
 
         Args:
-            buffer: The blockwise FP8 quantized buffer (shape: [num_blocks, tokens_per_block, bytes_per_token])
+            buffer: The raw indexer K cache buffer.
 
         Returns:
             Tuple of (value_buffer, scale_buffer)
         """
         num_blocks, tokens_per_block, bytes_per_token = buffer.shape
         bytes_per_block = bytes_per_token * tokens_per_block
+        value_dim, scale_dim, scale_dtype = self._indexer_cache_layout(indexer_k_dtype)
+        scale_bytes = scale_dim * scale_dtype.itemsize
 
         # Get value buffer
-        value_shape = (num_blocks, tokens_per_block, self.index_head_dim)
-        value_stride = (bytes_per_block, self.index_head_dim, 1)
+        value_shape = (num_blocks, tokens_per_block, value_dim)
+        value_stride = (bytes_per_block, value_dim, 1)
         value_buffer = buffer.as_strided(value_shape, value_stride, 0).view(torch.uint8)
 
         # Get scale buffer
-        scale_dim = self.index_head_dim // self.indexer_quant_block_size
-        scale_bytes = scale_dim * 4  # float32 = 4 bytes
         scale_shape = (num_blocks, tokens_per_block, scale_bytes)
         scale_stride = (bytes_per_block, scale_bytes, 1)
-        scale_offset = self.index_head_dim * tokens_per_block
-        scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(
-            torch.float32
-        )
+        scale_offset = value_dim * tokens_per_block
+        scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(scale_dtype)
 
         return value_buffer, scale_buffer
 
@@ -812,8 +762,9 @@ class TestDeepseekV4CacheManager:
 
             buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
             if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-                # indexer compress is blockwise FP8 quantized
-                values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                values_buffer, scales_buffer = self._split_blockwise_buffer(
+                    buffer, cache_manager._indexer_k_dtype
+                )
                 self._prefill_write_paged_cache(
                     buffer=values_buffer,
                     block_indices=page_indices,
@@ -867,7 +818,9 @@ class TestDeepseekV4CacheManager:
 
             buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
             if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-                values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                values_buffer, scales_buffer = self._split_blockwise_buffer(
+                    buffer, cache_manager._indexer_k_dtype
+                )
                 self._decode_write_paged_cache(
                     buffer=values_buffer,
                     block_indices=block_indices,
@@ -945,7 +898,9 @@ class TestDeepseekV4CacheManager:
 
                 buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer, attn_type))
                 if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-                    values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                    values_buffer, scales_buffer = self._split_blockwise_buffer(
+                        buffer, cache_manager._indexer_k_dtype
+                    )
                     values = self._read_paged_cache(
                         buffer=values_buffer,
                         block_indices=page_indices,
@@ -1040,8 +995,30 @@ class TestDeepseekV4CacheManager:
                     msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (scales)",
                 )
 
+    def test_max_num_tokens_is_used_by_base_config(self):
+        max_batch_size = 2
+        max_seq_len = 1024
+        max_input_len = 127
+        max_num_tokens = max_batch_size * (max_input_len + 1)
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            max_input_len=max_input_len,
+            compress_ratios=[1, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        assert cache_manager.kv_cache_manager_py_config.typical_step == BatchDesc(
+            [
+                KVCacheDesc(capacity=max_num_tokens, history_length=0),
+                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1),
+            ]
+        )
+
     def test_indexer_cache_layout_default(self):
-        """Indexer compressor cache: FP8 blockwise (128 fp8 + per-128 fp32 scale)."""
+        """DeepSeek-V4 defaults to FP4 indexer K cache on Blackwell+."""
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1049,6 +1026,25 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+        )
+        try:
+            buffer = cache_manager.get_buffers(0, DeepseekV4AttentionType.INDEXER_COMPRESS)
+            assert buffer.dtype == torch.uint8
+            assert buffer.shape[-1] == 64 + 4
+            assert cache_manager.quant_block_size == 32
+        finally:
+            cache_manager.shutdown()
+
+    def test_indexer_cache_layout_fp8(self):
+        """The legacy FP8 blockwise indexer K cache remains available."""
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            indexer_k_dtype="fp8",
         )
         try:
             buffer = cache_manager.get_buffers(0, DeepseekV4AttentionType.INDEXER_COMPRESS)

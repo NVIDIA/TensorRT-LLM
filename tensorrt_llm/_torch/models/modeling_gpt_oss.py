@@ -1,4 +1,7 @@
-from typing import Dict, Optional
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Any, Dict, Literal, Optional
 
 import torch
 from torch import nn
@@ -21,9 +24,8 @@ from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 create_moe)
+from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
+                             TritonFusedMoE, create_moe, is_moe_weight_owner)
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -60,7 +62,10 @@ class AttentionBlock(Attention):
                 beta_fast=pretrained_config.rope_scaling['beta_fast'],
                 beta_slow=pretrained_config.rope_scaling['beta_slow'],
                 duplicate_data=False),
-            is_neox=False,
+            # GPT-OSS applies NeoX-style (rotate-half) RoPE, matching the HF
+            # reference. The fused kernel ignores this flag for yarn (which
+            # masked the wrong value); the unfused path honors it.
+            is_neox=True,
         )
 
         super().__init__(
@@ -549,6 +554,34 @@ class Transformer(DecoderModel):
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for the model's VSWA layout.
+
+        GPT-OSS applies a sliding window to every other layer
+        (see ``AttentionBlock.__init__``), so the KV cache is VSWA: two
+        distinct attention window sizes. V2 groups layers by lifecycle and
+        coalesces buffers within each pool group, which sizes the
+        sliding-window and full-attention pools independently instead of
+        statically dividing memory between them.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Two-model
+        speculative decoding demotes it to V1 because V2 sizes both the target
+        and draft KV cache managers from the full budget; an explicit ``True``
+        is rejected by ``llm_utils._resolve_kv_cache_manager_v2_auto``.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     params_map = {
         # TRTLLM module name : GptOss module name
         "qkv_proj": "qkv",
@@ -663,13 +696,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 try:
                     # For BF16 ckpt.
                     # Deinterleave for gate and up.
@@ -792,13 +825,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 name = name.replace(k, v)
 
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 assert getattr(module, "quant_config", None) is not None and \
                    module.quant_config.quant_mode.has_nvfp4()
                 gate_up = module_weights.get('gate_up_proj', None)

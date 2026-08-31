@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 try:
     from transformers.modeling_attn_mask_utils import AttentionMaskConverter
@@ -17,7 +18,6 @@ except ImportError:
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask, merge_attention_forward_args)
-from .sparse.kernel import triton_index_gather
 from .sparse.params import SparseParams
 
 
@@ -132,46 +132,118 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             **kwargs) -> tuple[Optional[torch.Tensor], int]:
         raise NotImplementedError
 
+    @staticmethod
+    def _gather_paged_kv(kv_cache_tensor, block_ids, kv_idx, num_tokens,
+                         tokens_per_block):
+        """Materialize the first ``num_tokens`` logical K (``kv_idx=0``) or V
+        (``kv_idx=1``) tokens from the paged pool as a contiguous
+        ``[num_tokens, num_kv_heads, head_dim]`` tensor (NHD view).
+
+        A single block returns the contiguous view directly (no copy), which
+        keeps a within-one-page request allocation-free.
+
+        Invalid block IDs produce zeros without changing logical positions.
+        """
+        if num_tokens <= 0:
+            # Empty slice: content is irrelevant, but block_ids[0] may be
+            # BAD_PAGE_INDEX, so index the always-valid block 0.
+            return kv_cache_tensor[0, kv_idx, :0]
+        chunks = []
+        read = 0
+        while read < num_tokens:
+            blk = block_ids[read // tokens_per_block]
+            off = read % tokens_per_block
+            n = min(tokens_per_block - off, num_tokens - read)
+            if blk == BAD_PAGE_INDEX:
+                chunks.append(
+                    kv_cache_tensor.new_zeros((n, *kv_cache_tensor.shape[3:])))
+            else:
+                chunks.append(kv_cache_tensor[blk, kv_idx, off:off + n])
+            read += n
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+
+    @staticmethod
+    def _gather_paged_mla_latent(kv_cache, block_ids, kv_len):
+        """Materialize a request's MLA latent cache as a contiguous
+        ``[kv_len, kv_lora_rank + qk_rope_head_dim]`` tensor from the paged pool
+        (NHD ``[num_pages, 1, tokens_per_block, 1, d_latent]``). A single block
+        returns the view directly (no copy). Invalid block IDs produce zeros
+        without changing logical positions."""
+        tokens_per_block = kv_cache.shape[2]
+        chunks = []
+        read = 0
+        while read < kv_len:
+            blk = block_ids[read // tokens_per_block]
+            off = read % tokens_per_block
+            n = min(tokens_per_block - off, kv_len - read)
+            if blk == BAD_PAGE_INDEX:
+                chunks.append(kv_cache.new_zeros((n, kv_cache.shape[-1])))
+            else:
+                chunks.append(kv_cache[blk, 0, off:off + n, 0, :])
+            read += n
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+
     def _single_request_update_kv_cache(self,
                                         k,
                                         v,
                                         kv_cache_tensor,
                                         past_seen_token,
                                         kv_len,
-                                        cache_idx,
+                                        block_ids,
                                         sparse_kv_indices=None):
+        """Append new K/V tokens and gather the logical paged-cache sequence."""
         # select tokens using the sparse kv indices
         if sparse_kv_indices is not None:
+            from .sparse.rocket.kernels import triton_index_gather
+
             k_selected = triton_index_gather(k, sparse_kv_indices)
             v_selected = triton_index_gather(v, sparse_kv_indices)
         else:
             k_selected, v_selected = k, v
 
-        # get cache position
         seq_len = past_seen_token + kv_len
-        cache_position = torch.arange(past_seen_token,
-                                      seq_len,
-                                      device=kv_cache_tensor.device)
+        tokens_per_block = kv_cache_tensor.shape[2]
 
-        # get kv cache tensor
-        k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
-        v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
-
-        # update kv cache
         if k is not None and v is not None:
             access_type = self._access_type[k_selected.dtype.itemsize]
-            k_out.view(dtype=access_type).index_copy_(
-                1, cache_position, k_selected.view(dtype=access_type))
-            v_out.view(dtype=access_type).index_copy_(
-                1, cache_position, v_selected.view(dtype=access_type))
+            written = 0
+            while written < kv_len:
+                pos = past_seen_token + written
+                blk = block_ids[pos // tokens_per_block]
+                off = pos % tokens_per_block
+                n = min(tokens_per_block - off, kv_len - written)
+                # New tokens must land in a live page; fail loudly rather than
+                # writing into the last page via negative indexing.
+                assert blk != BAD_PAGE_INDEX, (
+                    f"Writing new KV into an evicted/invalid page (pos {pos}); "
+                    "block_ids/metadata are inconsistent.")
+                dst = torch.arange(off, off + n, device=kv_cache_tensor.device)
+                kv_cache_tensor[blk, 0].view(dtype=access_type).index_copy_(
+                    0, dst,
+                    k_selected[0, written:written + n].view(dtype=access_type))
+                kv_cache_tensor[blk, 1].view(dtype=access_type).index_copy_(
+                    0, dst,
+                    v_selected[0, written:written + n].view(dtype=access_type))
+                written += n
 
-        # return past kv and the dense kv tensors for sparse attention
         if sparse_kv_indices is not None:
-            k_states = torch.cat([k_out[:, :past_seen_token, :, :], k], dim=1)
-            v_states = torch.cat([v_out[:, :past_seen_token, :, :], v], dim=1)
+            k_states = torch.cat([
+                self._gather_paged_kv(kv_cache_tensor, block_ids, 0,
+                                      past_seen_token, tokens_per_block)[None],
+                k
+            ],
+                                 dim=1)
+            v_states = torch.cat([
+                self._gather_paged_kv(kv_cache_tensor, block_ids, 1,
+                                      past_seen_token, tokens_per_block)[None],
+                v
+            ],
+                                 dim=1)
         else:
-            k_states, v_states = k_out[:, :seq_len, :, :], v_out[:, :
-                                                                 seq_len, :, :]
+            k_states = self._gather_paged_kv(kv_cache_tensor, block_ids, 0,
+                                             seq_len, tokens_per_block)[None]
+            v_states = self._gather_paged_kv(kv_cache_tensor, block_ids, 1,
+                                             seq_len, tokens_per_block)[None]
         return k_states, v_states
 
     def _single_request_preprocess_inputs(self, q, k, v, kv_dtype):
@@ -252,6 +324,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         """
         # select the key and value states using the sparse indices
         if sparse_indices is not None:
+            from .sparse.rocket.kernels import triton_index_gather
+
             key_states = triton_index_gather(key_states, sparse_indices)
             value_states = triton_index_gather(value_states, sparse_indices)
 
@@ -274,6 +348,57 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             enable_gqa=True,
         )
 
+    @staticmethod
+    def _single_token_sparse_attn_forward(q: torch.Tensor,
+                                          key_states: torch.Tensor,
+                                          value_states: torch.Tensor,
+                                          sparse_indices: torch.Tensor,
+                                          indices_block_size: int,
+                                          qk_scale: float) -> torch.Tensor:
+        """Run one-token GQA over selected sparse units."""
+        if indices_block_size <= 0:
+            raise ValueError("indices_block_size must be positive")
+        if sparse_indices.ndim != 2:
+            raise ValueError(
+                "sparse_indices must have shape [num_kv_heads, topk]")
+        num_kv_heads = key_states.shape[1]
+        if sparse_indices.shape[0] != num_kv_heads:
+            raise ValueError(
+                "sparse_indices and key_states must have matching KV heads")
+        if q.shape[0] % num_kv_heads != 0:
+            raise ValueError("Query heads must be divisible by KV heads")
+        if torch.any(sparse_indices < -1):
+            raise ValueError("Sparse indices may only use -1 as padding")
+
+        heads_per_kv = q.shape[0] // num_kv_heads
+        unit_offsets = torch.arange(indices_block_size,
+                                    device=sparse_indices.device)
+        output = torch.empty_like(q, dtype=torch.float32)
+        for kv_head in range(num_kv_heads):
+            token_indices = (
+                sparse_indices[kv_head, :, None] * indices_block_size +
+                unit_offsets).flatten()
+            token_indices = token_indices[(token_indices >= 0)
+                                          &
+                                          (token_indices < key_states.shape[0])]
+            if token_indices.numel() == 0:
+                raise ValueError("Every KV head must select at least one token")
+            token_indices = torch.unique(token_indices).to(torch.long)
+            selected_keys = key_states.index_select(
+                0, token_indices)[:, kv_head].to(torch.float32)
+            selected_values = value_states.index_select(
+                0, token_indices)[:, kv_head].to(torch.float32)
+            head_start = kv_head * heads_per_kv
+            head_end = head_start + heads_per_kv
+            output[head_start:head_end] = F.scaled_dot_product_attention(
+                q[None, head_start:head_end, None].to(torch.float32),
+                selected_keys[None, None],
+                selected_values[None, None],
+                scale=qk_scale,
+                enable_gqa=True,
+            ).view(heads_per_kv, -1)
+        return output
+
     def _single_request_forward(self,
                                 q,
                                 k,
@@ -281,7 +406,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 attention_mask: AttentionMask,
                                 kv_cache_tensor,
                                 past_seen_token,
-                                cache_idx,
+                                block_ids,
                                 sample_idx,
                                 metadata: AttentionMetadata,
                                 attention_window_size: Optional[int] = None):
@@ -297,7 +422,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         # update kv cache
         key_states, value_states = self._single_request_update_kv_cache(
-            k, v, kv_cache_tensor, past_seen_token, kv_len, cache_idx,
+            k, v, kv_cache_tensor, past_seen_token, kv_len, block_ids,
             sparse_kv_indices)
 
         # predict sparse attn indices
@@ -523,7 +648,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         )
         past = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
+            list(block_ids) for block_ids in metadata.block_ids_per_seq
         ]
 
         # MLA scales by the q/k head_dim (qk_nope + qk_rope), not the latent dim.
@@ -534,12 +659,13 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         offset = 0
         for i, q_len in enumerate(metadata.seq_lens.tolist()):
             past_i = int(past[i])
-            ci = cache_indices[i]
+            blocks_i = cache_indices[i]
             kv_len = past_i + q_len
 
             # K is the full latent ([compressed_kv | k_pe]); V is the kv_lora
             # slice. One latent head broadcast (MQA) to all query heads.
-            latent = kv_cache[ci, 0, :kv_len, 0, :].to(q.dtype)
+            latent = self._gather_paged_mla_latent(kv_cache, blocks_i,
+                                                   kv_len).to(q.dtype)
             k = latent[None, None]  # [1, 1, kv_len, d_latent]
             v = latent[None,
                        None, :, :self.kv_lora_rank]  # [1, 1, kv_len, kv_lora]
@@ -570,6 +696,49 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             offset += q_len
 
         return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _selected_mla_attention(
+        query: torch.Tensor,
+        selected_latent: torch.Tensor,
+        *,
+        value_dim: int,
+        scale: float,
+        attention_sink: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute absorbed MLA over selected latent rows."""
+        if query.ndim != 2 or selected_latent.ndim != 2:
+            raise ValueError("Selected MLA query and latent rows must be 2D")
+        if selected_latent.shape[0] == 0:
+            raise ValueError("Selected MLA requires at least one latent row")
+        if query.shape[1] != selected_latent.shape[1]:
+            raise ValueError(
+                "Selected MLA query and latent dimensions must match, got "
+                f"{query.shape[1]} and {selected_latent.shape[1]}")
+        if value_dim <= 0 or value_dim > selected_latent.shape[1]:
+            raise ValueError(
+                f"Selected MLA value_dim must be in [1, {selected_latent.shape[1]}], "
+                f"got {value_dim}")
+
+        scores = torch.matmul(query.float(), selected_latent.float().T) * scale
+        scores = scores.float()
+        if attention_sink is None:
+            probabilities = F.softmax(scores, dim=-1).to(query.dtype)
+        else:
+            if attention_sink.shape != (query.shape[0], ):
+                raise ValueError(
+                    "Selected MLA attention sink must have shape "
+                    f"[{query.shape[0]}], got {tuple(attention_sink.shape)}")
+            sink = attention_sink.to(device=query.device,
+                                     dtype=torch.float32).unsqueeze(1)
+            max_score = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)
+            score_exp = torch.exp(scores - max_score)
+            denominator = score_exp.sum(dim=-1, keepdim=True)
+            denominator += torch.exp(sink - max_score)
+            probabilities = (score_exp / denominator).to(query.dtype)
+
+        return torch.matmul(probabilities,
+                            selected_latent[:, :value_dim].to(query.dtype))
 
     def _mla_forward_context(self, q: torch.Tensor, k: torch.Tensor,
                              v: torch.Tensor,
@@ -664,7 +833,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
+            list(block_ids) for block_ids in metadata.block_ids_per_seq
         ]
         kv_cache_tensor = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
@@ -688,11 +857,11 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 seq_len_kv] if v is not None and seq_len_kv != 0 else None
 
             past_seen_token = past_seen_tokens[sample_idx]
-            cache_idx = cache_indices[sample_idx]
+            block_ids = cache_indices[sample_idx]
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, forward_args.attention_mask,
-                kv_cache_tensor, past_seen_token, cache_idx, sample_idx,
+                kv_cache_tensor, past_seen_token, block_ids, sample_idx,
                 metadata, forward_args.attention_window_size)
 
             attn_outputs.append(attn_output)

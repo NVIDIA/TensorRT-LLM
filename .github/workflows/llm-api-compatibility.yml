@@ -33,6 +33,8 @@ jobs:
             const referencePrefixes = [
               'tests/unittest/api_stability/references/',
               'tests/unittest/api_stability/references_committed/',
+              'tensorrt_llm/llmapi/llm_args.py',
+              'tensorrt_llm/usage/llm_args_golden_manifest.json',
             ];
             // Keep these names in sync with the PR template and API-change guide.
             const compatibleApiLabel = 'api-compatible';

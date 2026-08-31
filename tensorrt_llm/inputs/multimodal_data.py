@@ -147,32 +147,52 @@ class VideoData(BaseModalityData):
     """Data class for video loading results.
 
     Attributes:
-        frames: List of video frames, either as PIL Images or PyTorch tensors.
+        frames: Video frames as a list of PIL Images, a list of PyTorch
+            tensors, or a single 4D numpy array of shape (N, H, W, 3).
         metadata: Dictionary containing video metadata including:
             - total_num_frames: Total number of frames in the video
             - fps: Original frames per second of the video
             - duration: Duration of the video in seconds
             - frames_indices: List of indices of the sampled frames
         audio: Structured audio payload from the video, when extracted.
+        raw_bytes_hash: BLAKE3 hex digest of the source video bytes when
+            available. Populated by media loaders that hold the source
+            (e.g. `VideoMediaIO`); `None` when the `VideoData` is
+            constructed from a frame list directly. When set, it acts as
+            the source anchor in `update_hash` — combined with the
+            sampling metadata, it uniquely identifies the decoded frame
+            content without walking pixels.
     """
 
-    frames: list[Image.Image] | list[torch.Tensor]
+    frames: list[Image.Image] | list[torch.Tensor] | np.ndarray
     metadata: dict[str, Any]
     audio: AudioData | None = None
+    raw_bytes_hash: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.frames:
-            raise ValueError("frames list cannot be empty")
+        if len(self.frames) == 0:
+            raise ValueError("frames cannot be empty")
         if not isinstance(self.metadata, dict):
             raise TypeError("metadata must be a dictionary")
 
     def update_hash(self, hasher: ContentHasher) -> None:
         hasher.update(b"<video>")
         # Sampling metadata is part of the model-visible cache identity.
+        # `frames_indices` is a deterministic function of source bytes plus
+        # media IO `num_frames`/`fps` kwargs, so per-request kwarg
+        # overrides land here implicitly.
         meta = {k: self.metadata[k] for k in _VIDEO_HASH_METADATA_FIELDS if k in self.metadata}
         hasher.update(serialize_item(meta))
-        for frame in self.frames:
-            hasher.update(b"<frame>")
-            hasher.update(serialize_item(frame))
+        if self.raw_bytes_hash is not None:
+            # Source anchor: metadata + source digest is equivalent to
+            # hashing decoded frames, since cv2 decoding is deterministic
+            # given source bytes and sampling is captured in `meta`.
+            hasher.update(b"<raw_bytes>")
+            hasher.update(self.raw_bytes_hash.encode("utf-8"))
+        else:
+            # No source anchor available (frame list constructed directly).
+            for frame in self.frames:
+                hasher.update(b"<frame>")
+                hasher.update(serialize_item(frame))
         if self.audio is not None:
             self.audio.update_hash(hasher)

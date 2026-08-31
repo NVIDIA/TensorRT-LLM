@@ -19,6 +19,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <tensorrt_llm/common/attentionOp.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
@@ -85,14 +86,15 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
     std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
     std::optional<torch::Tensor> attention_output_orig_quant, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, int64_t layer_idx, int64_t seq_offset, int64_t num_heads,
-    int64_t num_kv_heads, int64_t head_size, int64_t tokens_per_block, int64_t kv_cache_quant_mode,
-    int64_t max_attention_window_size, int64_t cyclic_attention_window_size, int64_t num_tokens, int64_t batch_beam,
-    int64_t input_seq_length, int64_t max_past_kv_length, int64_t rotary_embedding_dim, double rotary_embedding_base,
-    int64_t rotary_embedding_scale_type, double rotary_embedding_scale, int64_t rotary_embedding_max_positions,
-    int64_t position_embedding_type, double bmm1_scale, double bmm2_scale, bool fp8_context_fmha,
-    int64_t predicted_tokens_per_seq, int64_t attention_chunk_size, int64_t multi_processor_count,
-    int64_t total_num_blocks, int64_t kv_factor, bool need_build_kv_cache_metadata, bool cross_attention)
+    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas, int64_t layer_idx,
+    int64_t seq_offset, int64_t num_heads, int64_t num_kv_heads, int64_t head_size, int64_t tokens_per_block,
+    int64_t kv_cache_quant_mode, int64_t max_attention_window_size, int64_t cyclic_attention_window_size,
+    int64_t num_tokens, int64_t batch_beam, int64_t input_seq_length, int64_t max_past_kv_length,
+    int64_t rotary_embedding_dim, double rotary_embedding_base, int64_t rotary_embedding_scale_type,
+    double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
+    double bmm1_scale, double bmm2_scale, bool fp8_context_fmha, int64_t predicted_tokens_per_seq,
+    int64_t attention_chunk_size, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
+    bool need_build_kv_cache_metadata, bool cross_attention)
 {
     auto result = [&]()
     {
@@ -100,8 +102,8 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
         return torch_ext::trtllmGenGenerationPreprocess(qkv_input, workspace, sequence_lengths,
             spec_decoding_generation_lengths, spec_decoding_position_offsets, kv_cache_block_offsets,
             host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_scale_orig_quant, kv_scale_quant_orig,
-            attention_output_orig_quant, rotary_inv_freq, rotary_cos_sin, layer_idx, seq_offset, num_heads,
-            num_kv_heads, head_size, tokens_per_block, kv_cache_quant_mode, max_attention_window_size,
+            attention_output_orig_quant, rotary_inv_freq, rotary_cos_sin, mrope_position_deltas, layer_idx, seq_offset,
+            num_heads, num_kv_heads, head_size, tokens_per_block, kv_cache_quant_mode, max_attention_window_size,
             cyclic_attention_window_size, num_tokens, batch_beam, input_seq_length, max_past_kv_length,
             rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
             rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale, fp8_context_fmha,
@@ -163,7 +165,7 @@ void initBindings(nb::module_& m)
         nb::arg("spec_bl_tree_first_sparse_mask_offset_kv").none(), nb::arg("sparse_kv_indices").none(),
         nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
         nb::arg("sparse_attn_offsets").none(), nb::arg("sparse_attn_indices_block_size"),
-        nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_mla_topk_lens") = std::nullopt,
+        nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_attn_kv_lens") = std::nullopt,
         nb::arg("skip_softmax_threshold_scale_factor_prefill") = std::nullopt,
         nb::arg("skip_softmax_threshold_scale_factor_decode") = std::nullopt,
         nb::arg("skip_softmax_stat") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
@@ -173,16 +175,27 @@ void initBindings(nb::module_& m)
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
+        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("aux_kv_cache_pool_ptr") = std::nullopt,
         nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
         nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
-        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, "Multi-head attention operation",
+        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
+        nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
+        nb::arg("force_prepare_spec_dec_tree_mask") = false, nb::arg("max_num_sequences") = std::nullopt,
+        nb::arg("kv_norm_weight") = std::nullopt, nb::arg("kv_norm_eps") = 1e-6, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",
         [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
         nb::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
+
+    m.def("get_context_mla_workspace_bytes_per_token",
+        &tensorrt_llm::common::op::AttentionOp::contextMlaWorkspaceBytesPerToken, nb::arg("num_attn_heads"),
+        nb::arg("qk_rope_head_dim"), nb::arg("qk_nope_head_dim"), nb::arg("v_head_dim"), nb::arg("fp8_context_mla"),
+        nb::arg("separate_q_and_kv_input"), nb::arg("sparse_mla"),
+        "Per-token byte cost of the context-MLA K/V dequant staging buffers (scales with summed attended KV "
+        "length). Returns 0 outside the fp8 context-MLA separate-Q/KV path. Used by the KV-cache estimator to "
+        "reserve workspace headroom before sizing the KV pool.");
 
     m.def("compute_flash_mla_metadata", &tensorrt_llm::computeFlashMlaMetadata, nb::arg("seqlens_k"),
         nb::arg("tile_scheduler_metadata"), nb::arg("num_splits"), nb::arg("batch_size"), nb::arg("s_q"),
@@ -324,15 +337,16 @@ void initBindings(nb::module_& m)
         nb::arg("host_kv_cache_pool_pointers").none(), nb::arg("host_kv_cache_pool_mapping").none(),
         nb::arg("kv_scale_orig_quant").none(), nb::arg("kv_scale_quant_orig").none(),
         nb::arg("attention_output_orig_quant").none(), nb::arg("rotary_inv_freq").none(),
-        nb::arg("rotary_cos_sin").none(), nb::arg("layer_idx"), nb::arg("seq_offset"), nb::arg("num_heads"),
-        nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block"), nb::arg("kv_cache_quant_mode"),
-        nb::arg("max_attention_window_size"), nb::arg("cyclic_attention_window_size"), nb::arg("num_tokens"),
-        nb::arg("batch_beam"), nb::arg("input_seq_length"), nb::arg("max_past_kv_length"),
-        nb::arg("rotary_embedding_dim"), nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"),
-        nb::arg("rotary_embedding_scale"), nb::arg("rotary_embedding_max_positions"),
-        nb::arg("position_embedding_type"), nb::arg("bmm1_scale"), nb::arg("bmm2_scale"), nb::arg("fp8_context_fmha"),
-        nb::arg("predicted_tokens_per_seq"), nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"),
-        nb::arg("total_num_blocks"), nb::arg("kv_factor"), nb::arg("need_build_kv_cache_metadata") = true,
-        nb::arg("cross_attention") = false, "Fused nanobind generation preprocess for trtllm-gen attention.");
+        nb::arg("rotary_cos_sin").none(), nb::arg("mrope_position_deltas").none(), nb::arg("layer_idx"),
+        nb::arg("seq_offset"), nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
+        nb::arg("tokens_per_block"), nb::arg("kv_cache_quant_mode"), nb::arg("max_attention_window_size"),
+        nb::arg("cyclic_attention_window_size"), nb::arg("num_tokens"), nb::arg("batch_beam"),
+        nb::arg("input_seq_length"), nb::arg("max_past_kv_length"), nb::arg("rotary_embedding_dim"),
+        nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"), nb::arg("rotary_embedding_scale"),
+        nb::arg("rotary_embedding_max_positions"), nb::arg("position_embedding_type"), nb::arg("bmm1_scale"),
+        nb::arg("bmm2_scale"), nb::arg("fp8_context_fmha"), nb::arg("predicted_tokens_per_seq"),
+        nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"), nb::arg("total_num_blocks"),
+        nb::arg("kv_factor"), nb::arg("need_build_kv_cache_metadata") = true, nb::arg("cross_attention") = false,
+        "Fused nanobind generation preprocess for trtllm-gen attention.");
 }
 } // namespace tensorrt_llm::nanobind::thop

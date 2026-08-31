@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Test suite for DeepGEMM indexer kernels and some related utilities.
 
@@ -12,6 +26,7 @@ import builtins
 import random
 import sys
 from pathlib import Path
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,27 +34,48 @@ import torch
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    PositionalEmbeddingParams,
+    RopeParams,
+)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+    DSABackendForwardArgs,
     DSACacheManager,
+    DSACacheManagerV2,
+    DSATrtllmAttention,
     DSAtrtllmAttentionMetadata,
     Indexer,
     _effective_compress_ratio_divisor,
     _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
     split_prefill_chunks,
+    transform_local_topk_and_prepare_pool_view,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
+    _resolve_fp8_ds_mla_head_dim,
+)
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.bindings.executor import KvCacheConfig as BindingKvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    KvCacheConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
 
@@ -50,6 +86,380 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+def test_fp8_ds_mla_layout_resolves_shared_inline_scale_module():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        KvCacheConfig(dtype="fp8_ds_mla"),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is True
+    assert storage_head_dim == 328
+
+
+def test_fp8_ds_mla_layout_treats_binding_config_as_auto():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        BindingKvCacheConfig(),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is False
+    assert storage_head_dim == 576
+
+
+def _set_torch_top_k(indexer: Indexer) -> None:
+    indexer.top_k = TopK(
+        indexer.index_topk,
+        prefill_implementation=TopKImplementation.TORCH,
+        decode_implementation=TopKImplementation.TORCH,
+        compress_ratio=indexer.compress_ratio,
+    )
+
+
+def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        indexer_k_dtype="fp8",
+    )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_metadata_params
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+
+    assert metadata.indexer_head_dim == 96
+    assert metadata.compress_ratios == [1, 4, 128]
+    assert metadata._indexer_compress_ratio == 4
+    assert metadata._tokens_per_block == 64
+
+
+@pytest.mark.parametrize(
+    "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
+    [
+        (True, True, 100, 1, 1, False),
+        (False, True, 100, 1, 1, True),
+        (True, True, 90, 1, 1, True),
+        (False, True, 100, 4, 2, False),
+        (False, False, 100, 1, 1, False),
+    ],
+)
+def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
+    enable_heuristic,
+    use_cute_dsl,
+    sm_version,
+    compress_ratio,
+    next_n,
+    should_warmup,
+):
+    metadata = SimpleNamespace(
+        sparse_metadata_params=SimpleNamespace(
+            enable_heuristic_topk=enable_heuristic,
+        ),
+        use_cute_dsl_topk=use_cute_dsl,
+        num_sparse_topk=512,
+        sparse_mla_topk=384,
+        kv_cache_manager=SimpleNamespace(),
+        _indexer_compress_ratio=compress_ratio,
+        get_indexer_max_seq_len=Mock(return_value=32768),
+        num_sms=148,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(
+            "tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops.warmup_cute_dsl_radix_topk_decode"
+        ) as cute_dsl_radix,
+    ):
+        DSAtrtllmAttentionMetadata.warmup_cute_dsl_radix_topk(metadata, next_n)
+
+    if should_warmup:
+        cute_dsl_radix.assert_called_once_with(
+            top_k=384,
+            num_cols=32768,
+            next_n=next_n,
+            dtype=torch.float32,
+            num_sms=148,
+        )
+    else:
+        cute_dsl_radix.assert_not_called()
+
+
+def test_kv_lens_row_reorder_threshold():
+    """Prepare row order only when CuTe DSL GVR has enough decode rows."""
+    num_sms = 16
+    next_n = 2
+
+    def make_mock(num_generations, kv_lens_list):
+        kv_lens_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+        row_order_buffer = torch.zeros(64, dtype=torch.int32, device="cuda")
+        return SimpleNamespace(
+            enable_gvr_topk=True,
+            use_cute_dsl_topk=True,
+            num_generations=num_generations,
+            num_sms=num_sms,
+            max_draft_tokens=next_n - 1,
+            num_contexts=0,
+            num_seqs=num_generations,
+            kv_lens_cuda=kv_lens_cuda,
+            kv_lens_row_reorder_buffer=row_order_buffer,
+            kv_lens_row_reorder=None,
+        )
+
+    kv_lens = [4, 1, 8, 2, 16, 3, 12, 6, 7, 9, 5, 11, 13, 10, 14, 15]
+
+    metadata_below = make_mock(1, [1000])
+    DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_below)
+    assert metadata_below.kv_lens_row_reorder is None
+
+    metadata_at = make_mock(num_sms, kv_lens)
+    DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_at)
+    row_order = metadata_at.kv_lens_row_reorder.cpu().tolist()
+    assert [kv_lens[i] for i in row_order] == sorted(kv_lens, reverse=True)
+
+
+@skip_pre_hopper
+def test_gvr_prior_writeback_uses_aux_stream():
+    batch_size = 2
+    index_topk = 4
+    cache_manager, sparse_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=64,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    try:
+        request_ids = list(range(batch_size))
+        kv_lens = torch.full((batch_size,), index_topk, dtype=torch.int32)
+        cache_manager.add_dummy_requests(
+            request_ids,
+            kv_lens.tolist(),
+            is_gen=False,
+            prepare_resource=True,
+        )
+        metadata = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            num_contexts=0,
+            num_generations=batch_size,
+            seq_lens=torch.ones(batch_size, dtype=torch.int32),
+            kv_lens=kv_lens,
+            num_cached_tokens=[index_topk - 1] * batch_size,
+            cache_manager=cache_manager,
+            num_ctx_tokens=0,
+            num_tokens=batch_size,
+            index_topk=index_topk,
+            enable_indexer_skip=True,
+        )
+        indexer = create_indexer(sparse_config)
+        indexer._enable_heuristic_topk = True
+        indexer.aux_stream = torch.cuda.Stream()
+        metadata.gvr_prior_indices = torch.zeros(
+            (cache_manager.num_local_layers, batch_size, index_topk),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        hidden_states = torch.empty((batch_size, 1), device="cuda")
+        unused = torch.empty((batch_size, 1), device="cuda")
+
+        with with_multi_stream(True):
+            topk_indices = indexer.sparse_attn_indexer(
+                metadata,
+                hidden_states,
+                unused,
+                unused,
+                unused,
+                unused,
+            )
+            assert indexer._prev_topk_copy_pending
+            indexer.maybe_join_prev_topk_copy()
+
+        local_layer = cache_manager.layer_offsets[indexer.layer_idx]
+        torch.testing.assert_close(
+            metadata.gvr_prior_indices[local_layer, :batch_size],
+            topk_indices,
+        )
+        assert not indexer._prev_topk_copy_pending
+    finally:
+        cache_manager.shutdown()
+
+
+def test_shared_topk_lifecycle():
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_n_heads=1,
+        index_head_dim=8,
+        index_topk=3,
+        skip_indexer_for_short_seqs=False,
+    )
+    pretrained_config = SimpleNamespace(
+        num_hidden_layers=2,
+        index_topk_pattern=["F", "S"],
+    )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(
+        pretrained_config=pretrained_config
+    )
+    assert sparse_metadata_params.has_shared_indexer_layers
+
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_metadata_params
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 4
+    metadata.num_sparse_topk = 3
+    metadata.num_sms = 1
+    metadata.cuda_graph_buffers = None
+    metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
+    metadata.enable_context_mla_with_cached_kv = False
+    metadata.enable_indexer_skip = False
+    metadata.enable_gvr_topk = False
+    metadata.get_empty = Mock(
+        side_effect=lambda _, shape, **kwargs: torch.empty(tuple(shape), dtype=kwargs["dtype"])
+    )
+    metadata._create_kv_lens_2d_buffer = Mock()
+    metadata.create_expanded_buffers = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.prefer_pinned",
+        return_value=False,
+    ):
+        metadata.create_buffers_for_indexer()
+
+    buffer = metadata.shared_topk_indices
+    assert buffer.shape == (4, 3)
+
+    context_topk = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32)
+    generation_topk = torch.tensor([[2, 1, 0], [3, 2, 1]], dtype=torch.int32)
+    full_backend = SimpleNamespace(
+        indexer=SimpleNamespace(
+            forward_from_projected=Mock(side_effect=[context_topk, generation_topk])
+        ),
+        get_local_layer_idx=Mock(return_value=0),
+    )
+    shared_backend = SimpleNamespace(
+        indexer=None,
+        get_local_layer_idx=Mock(return_value=1),
+    )
+    metadata._num_ctx_tokens = context_topk.shape[0]
+    metadata._num_tokens = context_topk.shape[0] + generation_topk.shape[0]
+    backend_args = DSABackendForwardArgs(indexer_intermediates=[])
+
+    def _predict(backend, input_type):
+        return DSATrtllmAttention.sparse_attn_predict(
+            backend,
+            torch.empty((2, 1)),
+            None,
+            metadata,
+            AttentionForwardArgs(
+                attention_input_type=input_type,
+                sparse_backend_args=backend_args,
+            ),
+        )[0]
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.backend."
+        "transform_local_topk_and_prepare_pool_view",
+        side_effect=lambda topk, *_: (topk.clone(), None),
+    ):
+        _predict(full_backend, AttentionInputType.context_only)
+        _predict(full_backend, AttentionInputType.generation_only)
+        torch.testing.assert_close(
+            metadata.shared_topk_indices,
+            torch.cat([context_topk, generation_topk]),
+        )
+        torch.testing.assert_close(
+            _predict(shared_backend, AttentionInputType.context_only),
+            context_topk,
+        )
+        torch.testing.assert_close(
+            _predict(shared_backend, AttentionInputType.generation_only),
+            generation_topk,
+        )
+
+    metadata._invalidate_pool_view_cache = Mock()
+    metadata.kv_cache_manager = None
+    metadata._num_tokens = 0
+    metadata._num_generations = 0
+    metadata.kv_lens_cuda = torch.empty(0, dtype=torch.int32)
+    metadata.prepare_dense_topk_indices = Mock()
+    metadata.on_update_kv_lens()
+
+    assert metadata.shared_topk_indices is buffer
+
+
+def test_indexer_post_load_weights_caches_fused_weight():
+    indexer = Indexer.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.wk = torch.nn.Linear(3, 2, bias=False)
+    indexer.weights_proj = torch.nn.Linear(3, 4, bias=False)
+    indexer.wk.weight.data.fill_(1.0)
+    indexer.weights_proj.weight.data.fill_(2.0)
+
+    indexer.post_load_weights()
+
+    assert indexer._fused_wk_wp_weight.shape == (6, 3)
+    assert torch.equal(indexer._fused_wk_wp_weight[:2], indexer.wk.weight.data)
+    assert torch.equal(indexer._fused_wk_wp_weight[2:], indexer.weights_proj.weight.data)
+    assert not hasattr(indexer, "_weights_transformed")
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "use_cute_dsl,enable_heuristic,expected_decode",
+    [
+        (False, False, TopKImplementation.CUDA_RADIX),
+        (True, False, TopKImplementation.CUTE_DSL_RADIX),
+        (False, True, TopKImplementation.CUDA_GVR),
+        (True, True, TopKImplementation.CUTE_DSL_GVR),
+    ],
+)
+def test_indexer_configures_one_top_k_module(
+    use_cute_dsl,
+    enable_heuristic,
+    expected_decode,
+):
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+        use_cute_dsl_topk=use_cute_dsl,
+        enable_heuristic_topk=enable_heuristic,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            return_value=100,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert isinstance(indexer.top_k, TopK)
+    assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
+    assert indexer.top_k.decode_implementation == expected_decode
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -79,8 +489,10 @@ def create_dsa_cache_manager(
     num_layers: int = 1,
     indexer_k_dtype: str = "fp8",
     index_topk: int = 2048,
+    use_kv_cache_manager_v2: bool = False,
+    pretrained_config=None,
 ):
-    """Helper to create a DSACacheManager for testing."""
+    """Helper to create a DSA cache manager for testing."""
 
     sparse_attn_config = DeepSeekSparseAttentionConfig(
         index_head_dim=head_dim,
@@ -90,7 +502,8 @@ def create_dsa_cache_manager(
     )
 
     # Create KV cache config
-    kv_cache_config = KvCacheConfig(
+    kv_cache_config_cls = KvCacheConfig if use_kv_cache_manager_v2 else BindingKvCacheConfig
+    kv_cache_config = kv_cache_config_cls(
         enable_block_reuse=False,
         max_tokens=max_seq_len * batch_size,
     )
@@ -100,7 +513,8 @@ def create_dsa_cache_manager(
 
     # Create cache manager
     # Use SELFKONLY for DSA (similar to MLA usage in _util.py)
-    cache_manager = DSACacheManager(
+    cache_manager_cls = DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
+    cache_manager = cache_manager_cls(
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELFKONLY,
         num_layers=num_layers,
@@ -112,9 +526,106 @@ def create_dsa_cache_manager(
         mapping=mapping,
         dtype=DataType.HALF,
         sparse_attention_config=sparse_attn_config,
+        pretrained_config=pretrained_config,
     )
 
     return cache_manager, sparse_attn_config
+
+
+def test_transform_local_topk_uses_v2_page_mapping():
+    """Use the V2 pool scale and offset when flattening DSA indices."""
+    cache_manager = SimpleNamespace(
+        _primary_pool_page_index_params=[(3, 1)],
+        get_primary_pool_page_index_params=None,
+    )
+    cache_manager.get_primary_pool_page_index_params = MethodType(
+        DSACacheManagerV2.get_primary_pool_page_index_params,
+        cache_manager,
+    )
+    req_idx = torch.tensor([0], dtype=torch.int32)
+    block_table = torch.tensor([[3, 7]], dtype=torch.int32)
+    topk_indices = torch.tensor([[6]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        kv_cache_manager=cache_manager,
+        _ensure_pool_view_cached=Mock(),
+        _cached_block_table_ctx=block_table,
+        _cached_req_idx_ctx=req_idx,
+        _cached_tokens_per_block=4,
+        _cached_pool_view=torch.empty(0),
+    )
+    expected_indices = torch.tensor([[90]], dtype=torch.int32)
+
+    with patch(
+        "torch.ops.trtllm.convert_req_index_to_global",
+        return_value=expected_indices,
+    ) as convert:
+        actual, _ = transform_local_topk_and_prepare_pool_view(topk_indices, metadata, layer_idx=0)
+
+    torch.testing.assert_close(actual, expected_indices)
+    convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
+
+
+def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
+    """V2 registers INDEX_KEY storage only for layers that own an indexer."""
+    num_layers = 3
+    head_dim = 128
+    tokens_per_block = 16
+    pretrained_config = SimpleNamespace(
+        num_hidden_layers=num_layers,
+        index_topk_pattern=["F", "S", "F"],
+    )
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=head_dim)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        sparse_attention_config=sparse_config,
+    )
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=True),
+        )
+        is DSACacheManagerV2
+    )
+
+    cache_manager, _ = create_dsa_cache_manager(
+        batch_size=2,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=64,
+        num_layers=num_layers,
+        use_kv_cache_manager_v2=True,
+        pretrained_config=pretrained_config,
+    )
+
+    try:
+        assert cache_manager.indexer_k_cache_local_layer_mask == [True, False, True]
+        assert cache_manager.indexer_k_cache_page_scale == 2
+        assert cache_manager.get_indexer_k_cache_buffers(0).shape == (
+            cache_manager.blocks_in_primary_pool * cache_manager.indexer_k_cache_page_scale,
+            tokens_per_block,
+            1,
+            head_dim + 4,
+        )
+
+        indexer_bytes_per_token = head_dim + 4
+        has_indexer_buffers = []
+        for local_layer_idx in range(num_layers):
+            layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
+            has_indexer_buffers.append(
+                any(buffer.role == Role.INDEX_KEY for buffer in layer_config.buffers)
+            )
+        assert has_indexer_buffers == [True, False, True]
+
+        key_bytes = sum(
+            cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
+            for local_layer_idx in range(num_layers)
+        )
+        expected_cache_bytes = key_bytes + 2 * indexer_bytes_per_token
+        assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
+        with pytest.raises(AssertionError, match="shared-indexer layer"):
+            cache_manager.get_indexer_k_cache_buffers(1)
+    finally:
+        cache_manager.shutdown()
 
 
 def create_indexer(sparse_attn_config, layer_idx=0):
@@ -145,7 +656,9 @@ def create_indexer(sparse_attn_config, layer_idx=0):
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
-    with patch("tensorrt_llm._torch.attention_backend.sparse.dsa.RotaryEmbedding") as mock_rope:
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.RotaryEmbedding"
+    ) as mock_rope:
         # Create a mock instance with a simple forward method
         mock_rope_instance = Mock()
         mock_rope_instance.forward = Mock(side_effect=lambda pos_ids, tensors: tensors)
@@ -438,6 +951,7 @@ def _create_mock_metadata(
             self.num_contexts = num_contexts
             self.num_generations = num_generations
             self._num_seqs = num_contexts + num_generations
+            self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
@@ -2073,6 +2587,7 @@ def test_compute_cu_seqlen_bounds_with_cache_compressed_kv():
     ],
     ids=["small_single", "small_multi", "large_chunked", "mixed", "exact_size", "non_zero_start"],
 )
+@pytest.mark.cpu_only
 def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_specs):
     """
     Test split_prefill_chunks covering:
@@ -2379,7 +2894,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
 @pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
 def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_len_range):
     """
-    Test that use_custom_topk=True and use_custom_topk=False produce identical results
+    Test that the production and Torch Top-K modules produce identical results
     in the decode phase of sparse_attn_indexer.
 
     This test validates:
@@ -2525,7 +3040,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -2549,8 +3064,9 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -2577,7 +3093,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
         try:
             topk_indices_skip = indexer.sparse_attn_indexer(
-                metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+                metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
             )
         except Exception as e:
             raise RuntimeError(f"Error when testing indexer skip: {e}")
@@ -2608,12 +3124,170 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+@pytest.mark.parametrize("step0_mode", ["gen", "context"])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
+    """Verify mtp_index_share: draft step 0 stashes each request's last-token
+    Top-K and draft steps > 0 reuse it verbatim (bit-exact), across > 1 draft
+    step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
+    "context" (the first gen round after prefill, which runs the context path).
+    Step-0 Top-K correctness is covered by test_indexer_decode_custom_vs_fallback.
+    """
+    torch.manual_seed(7)
+    heads, head_dim, block_size = 32, 128, 64
+    max_model_len, index_topk, kv_len = 16384, 2048, 4096
+    step0_next_n = 2 if step0_mode == "gen" else 1
+    num_reuse_steps = 2
+    # md=1: on SM100, max_draft_tokens 2/>3 triggers the mock's expanded-MTP-buffer
+    # path, which assumes num_gen_tokens == num_generations * (1 + md).
+    md = 1
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=0)
+    indexer.mtp_index_share = True
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    reserve = (kv_lens + step0_next_n + num_reuse_steps).tolist()
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=reserve,
+        is_gen=False,
+        prepare_resource=True,
+    )
+
+    def make_inputs(n_tokens):
+        q = torch.randn((n_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        k = torch.randn((n_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
+        k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
+        w = torch.randn((n_tokens, heads), device="cuda", dtype=torch.float32)
+        h = torch.randn((n_tokens, 4096), device="cuda", dtype=torch.bfloat16)
+        return h, q, k_fp8, k_scale, w
+
+    # Draft step 0: compute Top-K and stash each request's last-token row.
+    if step0_mode == "gen":
+        # Populate historical context so step 0 is a steady-state gen batch.
+        ctx_k = torch.randn((kv_lens.sum().item(), head_dim), device="cuda", dtype=torch.bfloat16)
+        ctx_k_fp8, ctx_k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(ctx_k)
+        meta_ctx = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            batch_size,
+            0,
+            kv_lens.clone(),
+            kv_lens.clone(),
+            [0] * batch_size,
+            cache_manager,
+            kv_lens.sum().item(),
+            kv_lens.sum().item(),
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta_ctx)
+        indexer._update_k_cache(ctx_k_fp8, ctx_k_scale, meta_ctx)
+
+        step0_tokens = batch_size * step0_next_n
+        meta0 = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            0,
+            batch_size,
+            torch.full((batch_size,), step0_next_n, dtype=torch.int32),
+            (kv_lens + step0_next_n).clone(),
+            kv_lens.tolist(),
+            cache_manager,
+            0,
+            step0_tokens,
+            max_model_len,
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta0)
+    else:  # context: first gen round -- step 0 runs the context/prefill path.
+        step0_tokens = kv_lens.sum().item()
+        meta0 = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            batch_size,
+            0,
+            kv_lens.clone(),
+            kv_lens.clone(),
+            [0] * batch_size,
+            cache_manager,
+            step0_tokens,
+            step0_tokens,
+            max_model_len,
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta0)
+        # context stash branch reads seq_lens_cuda (a read-only property); set its backing field.
+        meta0._seq_lens_cuda = kv_lens.clone().cuda()
+
+    meta0.in_mtp_draft_loop = True
+    # Step 0 computes (does not skip) Top-K; the reuse gate reads this directly.
+    meta0.indexer_skip_topk = False
+    h0, q0, k0_fp8, k0_scale, w0 = make_inputs(step0_tokens)
+    indexer._update_k_cache(k0_fp8, k0_scale, meta0)
+    try:
+        topk0 = indexer.sparse_attn_indexer(meta0, h0, q0, k0_fp8, k0_scale, w0)
+    except Exception as e:
+        pytest.skip(f"Custom topk not available: {e}")
+
+    if step0_mode == "gen":
+        expected_rows = topk0[step0_next_n - 1 :: step0_next_n, :]
+    else:
+        ctx_last = torch.cumsum(kv_lens.to(torch.long), dim=0).cuda() - 1
+        expected_rows = topk0[ctx_last, :]
+
+    stash = meta0.shared_topk_indices
+    assert stash is not None, "Step 0 should stash shared_topk_indices"
+    assert stash.shape[0] == batch_size
+    assert torch.equal(stash, expected_rows), f"{step0_mode} step-0 stash mismatch"
+
+    # Draft steps 1..N: reuse the stash verbatim (next_n=1, skip_topk).
+    for step in range(1, num_reuse_steps + 1):
+        prior = step0_next_n + (step - 1)
+        meta = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            0,
+            batch_size,
+            torch.ones(batch_size, dtype=torch.int32),
+            (kv_lens + prior + 1).clone(),
+            (kv_lens + prior).tolist(),
+            cache_manager,
+            0,
+            batch_size,
+            max_model_len,
+            max_draft_tokens=md,
+        )
+        Indexer.prepare(meta)
+        meta.in_mtp_draft_loop = True
+        meta.shared_topk_indices = stash
+        meta.indexer_skip_topk = True
+        hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
+        indexer._update_k_cache(ks_fp8, ks_scale, meta)
+        topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
+        assert torch.equal(topk, stash[:batch_size, :]), (
+            f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
+        )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("chunk_size", [1024, 2048])
 def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chunk_size):
     """
-    Test chunked prefill: use_custom_topk=True vs use_custom_topk=False
+    Test chunked prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks != None.
 
     This test validates:
@@ -2686,7 +3360,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -2709,8 +3383,9 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Validation
@@ -2730,7 +3405,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 @pytest.mark.parametrize("seq_len_range", [(1, 512)])
 def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, seq_len_range):
     """
-    Test single-pass prefill: use_custom_topk=True vs use_custom_topk=False
+    Test single-pass prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks == None (else branch).
     """
     torch.manual_seed(42)
@@ -2794,7 +3469,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -2820,8 +3495,9 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_fallback.indexer_prefill_chunks = None
 
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -2843,13 +3519,31 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     Indexer.prepare(metadata_skip)
     indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
     metadata_skip.indexer_prefill_chunks = None
+    indexer.top_k = TopK(
+        index_topk,
+        prefill_implementation=TopKImplementation.CUDA_RADIX,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+    )
+    indexer._enable_heuristic_topk = True
+    metadata_skip.gvr_prior_indices = torch.zeros(
+        (cache_manager.num_local_layers, batch_size, index_topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
 
     try:
         topk_indices_skip = indexer.sparse_attn_indexer(
-            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         raise RuntimeError(f"Indexer skip not available: {e}")
+
+    last_rows = torch.cumsum(metadata_skip.seq_lens[:batch_size], dim=0) - 1
+    local_layer = cache_manager.layer_offsets[layer_idx]
+    torch.testing.assert_close(
+        metadata_skip.gvr_prior_indices[local_layer, :batch_size],
+        topk_indices_skip[last_rows],
+    )
 
     # Validation
     ## Custom vs fallback
@@ -2943,16 +3637,20 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     )
 
     Indexer.prepare(metadata)
+    if not enable_indexer_skip:
+        assert metadata.slot_mapping_fp8_fullkv is not metadata.slot_mapping_fp8
+        assert metadata.slot_mapping_scale_fullkv is not metadata.slot_mapping_scale
     indexer._update_k_cache(k_fp8, k_scale, metadata)
 
     # Test custom kernel
     topk_custom = indexer.sparse_attn_indexer(
-        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
-    )
+        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
+    ).clone()
 
     # Test fallback
+    _set_torch_top_k(indexer)
     topk_fallback = indexer.sparse_attn_indexer(
-        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -2976,7 +3674,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(
-            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
 
     # Validate: custom and fallback should match
@@ -3047,6 +3745,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
 
 
+@pytest.mark.cpu_only
 class TestPrepareRestoreAttnMetadataForDraftReplay:
     """Tests for prepare_attn_metadata_for_draft_replay and
     restore_attn_metadata_after_draft_replay."""
@@ -3055,48 +3754,278 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
     def _make_mock_metadata():
         """Create a mock attention metadata object with KV cache block offsets."""
         meta = Mock()
+        meta.enable_flash_mla = False
         meta.kv_cache_manager = Mock(name="target_kv_cache_manager")
         meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        meta.prepare_for_draft_forward.return_value = None
         return meta
 
     @staticmethod
     def _make_mock_draft_manager():
         """Create a mock draft KV cache manager with host block offsets."""
-        mgr = Mock(name="draft_kv_cache_manager")
-        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
-        return mgr
+        return SimpleNamespace(host_kv_cache_block_offsets=torch.tensor([100, 200, 300]))
 
     def test_prepare_swaps_and_restore_recovers(self):
         """Test that prepare swaps KV manager and restore recovers original state."""
-        from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-
         meta = self._make_mock_metadata()
         mgr = self._make_mock_draft_manager()
+        # DeepSeek-V4 metadata inherits DSA metadata, while its manager exposes
+        # index_head_dim without implementing DSA's full page-mapping contract.
+        mgr.index_head_dim = 128
+        mgr.get_pool_block_indices = Mock()
+        mgr.indexer_k_cache_page_scale = 1
         original_kv_mgr = meta.kv_cache_manager
         original_offsets = meta.kv_cache_block_offsets.clone()
         original_host_offsets = meta.host_kv_cache_block_offsets.clone()
 
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
         with patch(
             "tensorrt_llm._torch.speculative.interface.isinstance",
-            side_effect=lambda obj, cls: (
-                obj is meta
-                if cls is TrtllmAttentionMetadata
-                else False
-                if cls.__name__ == "DSAtrtllmAttentionMetadata"
-                else builtins.isinstance(obj, cls)
-            ),
+            side_effect=is_attn_metadata,
         ):
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
         assert saved is not None
         assert saved["target_kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
-        assert "saved_dsa_state" not in saved
+        assert "saved_backend_state" not in saved
+        meta.prepare_for_draft_forward.assert_called_once_with()
 
         restore_attn_metadata_after_draft_replay(meta, saved)
 
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+        meta.restore_after_draft_forward.assert_called_once_with(None)
+
+    def test_native_dsa_replay_swaps_and_restores_buffers(self):
+        """Switch native DSA metadata to draft buffers and restore it."""
+        meta = self._make_mock_metadata()
+        mgr = object.__new__(DSACacheManagerV2)
+        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        meta.enable_context_mla_with_cached_kv = False
+        meta._invalidate_pool_view_cache = Mock()
+        buffer_pairs = {
+            "host_indexer_k_cache_block_offsets": "host_draft_indexer_k_cache_block_offsets",
+            "indexer_k_cache_block_offsets": "draft_indexer_k_cache_block_offsets",
+            "host_slot_mapping_fp8": "host_draft_slot_mapping_fp8",
+            "host_slot_mapping_scale": "host_draft_slot_mapping_scale",
+            "slot_mapping_fp8": "draft_slot_mapping_fp8",
+            "slot_mapping_scale": "draft_slot_mapping_scale",
+            "block_table": "draft_block_table",
+            "block_table_expanded": "draft_block_table_expanded",
+            "host_block_table_expanded": "host_draft_block_table_expanded",
+        }
+        target_buffers = {}
+        draft_buffers = {}
+        for target_name, draft_name in buffer_pairs.items():
+            target_buffers[target_name] = object()
+            draft_buffers[target_name] = object()
+            setattr(meta, target_name, target_buffers[target_name])
+            setattr(meta, draft_name, draft_buffers[target_name])
+        del meta.slot_mapping_fp8_fullkv
+        del meta.slot_mapping_scale_fullkv
+
+        meta.prepare_for_draft_forward.side_effect = (
+            lambda: DSAtrtllmAttentionMetadata.prepare_for_draft_forward(meta)
+        )
+        meta.restore_after_draft_forward.side_effect = (
+            lambda saved_state: DSAtrtllmAttentionMetadata.restore_after_draft_forward(
+                meta, saved_state
+            )
+        )
+
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
+        with (
+            patch(
+                "tensorrt_llm._torch.speculative.interface.isinstance",
+                side_effect=is_attn_metadata,
+            ),
+            patch(
+                "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.torch.cuda.is_current_stream_capturing",
+                return_value=True,
+            ),
+        ):
+            saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
+
+        assert "saved_backend_state" in saved
+        assert meta.slot_mapping_fp8 is draft_buffers["slot_mapping_fp8"]
+        restore_attn_metadata_after_draft_replay(meta, saved)
+        assert meta.slot_mapping_fp8 is target_buffers["slot_mapping_fp8"]
+        assert meta.slot_mapping_fp8_fullkv is target_buffers["slot_mapping_fp8"]
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_blackwell
+def test_cutedsl_mqa_logits_output_buffer_persistent():
+    """Regression: the CuteDSL paged-MQA-logits output must have a STABLE address
+    across calls, not be a per-forward ``torch.empty``.
+
+    At long context the ``[B*next_n, kv_len]`` output is large; as a churning
+    transient it goes stale under CUDA-graph replay when another subsystem
+    co-captured in the same graph (e.g. the MTP / one-model spec sampler)
+    perturbs the shared pool. It must instead be drawn from the reserved
+    ``get_memory_buffers`` arena (like the CuteDSL topk runner), so its address is
+    identical across calls.
+
+    Fails before the fix (two distinct ``torch.empty`` addresses while the first
+    output is kept alive); passes after (same reserved-arena address).
+    """
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+    batch_size, next_n = 4, 1
+    head_dim, block_size, index_topk = 128, 64, 2048
+    heads = 32
+    kv_len = 4096
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=kv_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    create_indexer(sparse_attn_config, layer_idx=0)
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False, prepare_resource=True
+    )
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.full((batch_size,), next_n, dtype=torch.int32),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[kv_len - next_n] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size * next_n,
+        max_draft_tokens=next_n - 1,
+        index_topk=index_topk,
+        use_cute_dsl_paged_mqa_logits=True,
+    )
+    Indexer.prepare(metadata)
+
+    kv_cache = cache_manager.get_indexer_k_cache_buffers(0)
+    q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn((batch_size * next_n, heads), device="cuda", dtype=torch.float32)
+    context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+    block_table = metadata.indexer_k_cache_block_offsets[0:batch_size]
+    sched = metadata.scheduler_metadata_buffer
+
+    def _mqa():
+        return torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+            q, kv_cache, weights, context_lens, block_table, sched, kv_len
+        )
+
+    out1 = _mqa()
+    ptr1 = out1.data_ptr()
+    out2 = _mqa()  # out1 kept alive: a fresh torch.empty would land elsewhere
+    ptr2 = out2.data_ptr()
+
+    assert ptr1 == ptr2, (
+        f"CuteDSL mqa-logits output address changed across calls "
+        f"({ptr1:#x} -> {ptr2:#x}); it must be a persistent reserved-arena buffer "
+        f"to avoid stale-pointer IMA under CUDA-graph replay"
+    )
+    assert "cute_dsl_mqa_logits" in get_memory_buffers().buffers, (
+        "CuteDSL mqa-logits output must be drawn from the get_memory_buffers arena"
+    )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_topk_indices_buffer_cuda_graph():
+    from tensorrt_llm._torch.memory_buffer_utils import Buffers
+
+    batch_size, next_n = 4, 3
+    head_dim, block_size = 128, 64
+    index_topk = 2048
+    kv_len = 512
+    layer_idx = 0
+    num_tokens = batch_size * next_n
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=kv_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.tensor([kv_len] * batch_size, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=kv_lens.tolist(),
+        is_gen=False,
+        prepare_resource=True,
+    )
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.tensor([next_n] * batch_size, dtype=torch.int32),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[kv_len - next_n] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=num_tokens,
+        max_draft_tokens=next_n - 1,
+        index_topk=index_topk,
+        enable_indexer_skip=True,
+    )
+    assert metadata.skip_indexer_for_gen_reqs, (
+        "test setup must hit the skip-indexer path (kv_len <= index_topk)"
+    )
+
+    metadata.is_cuda_graph = True
+    metadata.cuda_graph_buffers = Buffers()
+
+    hidden_states = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.bfloat16)
+    dummy = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.bfloat16)
+
+    def _run_indexer():
+        return indexer.sparse_attn_indexer(
+            metadata,
+            hidden_states,
+            q_fp8=dummy,
+            k_fp8=dummy,
+            k_scale=dummy,
+            weights=dummy,
+        )
+
+    out1 = _run_indexer()
+    ptr1 = out1.data_ptr()
+    out2 = _run_indexer()
+    ptr2 = out2.data_ptr()
+
+    assert ptr1 == ptr2, (
+        f"indexer topk-output buffer address changed across calls "
+        f"({ptr1:#x} -> {ptr2:#x}); under CUDA-graph capture it must be a "
+        f"persistent reserved-arena buffer to avoid stale-pointer IMA"
+    )
+    assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
+        "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
+    )

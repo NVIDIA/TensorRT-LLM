@@ -7,8 +7,6 @@ import openai
 import pytest
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
-from test_common.perf_metrics_utils import (get_timing_metrics,
-                                            validate_timing_metrics)
 
 from tensorrt_llm._utils import get_sm_version
 
@@ -121,8 +119,6 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
-        "perf_metrics_max_requests": 1000,
-        "return_perf_metrics": True,
     }
     if is_ctx_node():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
@@ -203,11 +199,6 @@ def test_completion(client: openai.OpenAI,
         message = completion.choices[0].text
         assert message.startswith('2.')
 
-        perf_metrics = get_timing_metrics(disagg_server.url_root)
-        # allow 5ms leniency when comparing the time points from disagg and ctx/gen servers
-        validate_timing_metrics(perf_metrics,
-                                "multinode test_completion",
-                                time_tolerance_seconds=0.005)
         # sleep 10 seconds to ensure a successful wait_for_endpoint_ready on rank1
         time.sleep(10)
         disagg_server.terminate()

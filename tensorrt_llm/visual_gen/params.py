@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import Field
@@ -32,6 +33,14 @@ class VisualGenParams(StrictBaseModel):
     ``guidance_scale_2``) should be passed via ``extra_params``.
     Use ``VisualGen.extra_param_specs`` to discover valid keys
     for the loaded pipeline.
+
+    **``model_fields_set`` carries caller intent.** Defaults are merged in
+    before a pipeline sees the request, so a non-``None`` field says nothing
+    about who chose it: the merge assigns the pipeline default and then
+    ``discard``s that field, leaving only what the caller supplied. To
+    distinguish the two, test ``"frame_rate" in params.model_fields_set``
+    rather than ``params.frame_rate is not None``. The set is live state --
+    assigning a field re-marks it as caller intent.
     """
 
     # Core — None means "use model default"
@@ -72,7 +81,6 @@ class VisualGenParams(StrictBaseModel):
     image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
         default=None, description="Reference image(s) for I2V/I2I."
     )
-
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")
 
@@ -93,6 +101,8 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
+    "bytes": (bytes,),
+    "bool_or_bytes_or_dict": (bool, bytes, dict),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
@@ -110,6 +120,18 @@ _GENERATION_CONFIG_FIELDS: tuple = (
     "num_frames",
     "frame_rate",
 )
+
+
+def _literal_choices(type_expr: str) -> tuple[Any, ...] | None:
+    if not type_expr.startswith("Literal[") or not type_expr.endswith("]"):
+        return None
+
+    literal_body = type_expr[len("Literal[") : -1]
+    try:
+        choices = ast.literal_eval(f"({literal_body},)")
+    except (SyntaxError, ValueError):
+        return None
+    return choices if isinstance(choices, tuple) else (choices,)
 
 
 def validate_visual_gen_params(
@@ -166,6 +188,18 @@ def validate_visual_gen_params(
             # Skip None values (param left at its None default)
             if value is None:
                 continue
+            literal_choices = _literal_choices(spec.type)
+            if literal_choices is not None:
+                if value not in literal_choices:
+                    messages.append(
+                        f"extra_params['{key}'] expected one of {list(literal_choices)}, "
+                        f"got {value!r}"
+                    )
+                # Terminal on purpose: membership in the literal set already
+                # decides the value, so the type, validator and range checks
+                # below cannot add anything. A literal spec that also declares
+                # one of those has a redundant declaration, not a skipped check.
+                continue
             # Type check
             expected_types = _TYPE_MAP.get(spec.type)
             if expected_types and not isinstance(value, expected_types):
@@ -174,6 +208,18 @@ def validate_visual_gen_params(
                     f"got {type(value).__name__}: {value!r}"
                 )
                 continue  # skip range check if type is wrong
+            # Validator (enums, bounds, tensor shapes) declared on
+            # the spec so deterministic client errors 400 at preflight
+            # instead of failing deep in the worker.
+            validator = getattr(spec, "validator", None)
+            if validator is not None:
+                try:
+                    validator(value)
+                except (TypeError, ValueError) as exc:
+                    # TypeError included: a validator tripping on a wrong-shaped
+                    # value is still a client error, not a server fault.
+                    messages.append(f"extra_params['{key}']: {exc}")
+                    continue
             # Range check (numeric only)
             if spec.range is not None and isinstance(value, (int, float)):
                 lo, hi = spec.range

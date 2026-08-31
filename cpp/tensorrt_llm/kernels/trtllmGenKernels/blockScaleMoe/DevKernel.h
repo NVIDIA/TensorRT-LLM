@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -258,6 +258,14 @@ struct Data
     int32_t numTokens;
     int32_t topK;
     int32_t* expandedIdxToPermutedIdx;
+
+    // Used only to pick between the two activation kernels; see the dispatch
+    // note in DevKernel.cu. The permuted-space kernel sweeps
+    // totalNumPaddedTokens, which carries up to one partial tile of padding per
+    // local expert, so it only pays off when there is enough real work per
+    // expert to amortise that sweep. Both are host-side values.
+    int32_t numExperts{0};
+    int32_t tileTokensDim{0};
 
     int32_t const* totalNumPaddedTokens;
 

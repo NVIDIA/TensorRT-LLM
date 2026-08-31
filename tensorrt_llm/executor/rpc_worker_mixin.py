@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import time
 from queue import Queue
@@ -65,7 +80,7 @@ class RpcWorkerMixin:
                 timeout if timeout is not None else getattr(self, "_fetch_timeout", 0.1)
             )
             responses = super().await_responses(timeout=actual_timeout)
-            self._await_response_helper.responses_handler(responses)
+            responses = self._await_response_helper.process_and_handle_responses(responses)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
         qsize = self._response_queue.qsize()
@@ -146,6 +161,11 @@ class RpcWorkerMixin:
         stats = await asyncio.to_thread(self.fetch_stats)
         # Serialize stats before sending over RPC (IterationStats objects are not picklable)
         return [self._stats_serializer(s) for s in stats]
+
+    async def fetch_kv_cache_capacity_async(self) -> str:
+        """Async version of fetch_kv_cache_capacity using asyncio.to_thread."""
+        capacity = await asyncio.to_thread(self.fetch_kv_cache_capacity)
+        return self._kv_cache_capacity_serializer(capacity)
 
     async def fetch_kv_cache_events_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_kv_cache_events using asyncio.to_thread.

@@ -24,8 +24,8 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.sampler.ops.flashinfer import sample_from_logits_op
 from .eagle3 import Eagle3OneModelWorker
-from .one_model_sampler import sampling_batch_spec_dec_one_model
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -375,7 +375,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 )
 
     @nvtx_range("eagle3_dyn.forward")
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,
@@ -387,11 +387,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         resource_manager=None,
     ):
         """Override to add accepted_draft_tokens_indices to output."""
-        # Initialize spec_tree_manager before super().forward() which calls
+        # Initialize spec_tree_manager before super()._forward_impl() which calls
         # _forward_draft_loop needing spec_tree_manager.
         if resource_manager is not None:
             self._ensure_spec_tree_manager(resource_manager)
-        output = super().forward(
+        output = super()._forward_impl(
             input_ids,
             position_ids,
             hidden_states,
@@ -585,7 +585,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Dynamic tree draft loop with growing context."""
         spec_tree_manager = self.spec_tree_manager
-        self._d2t = getattr(draft_model.model, "d2t", None)
 
         assert batch_size <= self._max_batch_size, (
             f"batch_size {batch_size} exceeds pre-allocated max_batch_size {self._max_batch_size}"
@@ -636,9 +635,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
 
-            new_draft_tokens, new_draft_scores = self.sample(
-                logits, self.K, draft_model=draft_model
-            )
+            new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
 
             previous_draft_scores = self.update_draft_tokens_and_scores(
                 cur_draft_idx=0,
@@ -698,9 +695,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
-                new_draft_tokens, new_draft_scores = self.sample(
-                    logits, self.K, draft_model=draft_model
-                )
+                new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
 
                 # Reshape for update: [batch_size, K, K]
                 new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
@@ -771,20 +766,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_flat_tokens = logits.shape[0]
         if not spec_metadata.is_all_greedy_sample:
             # Non-greedy: sample target tokens with per-request temperature/top_k/top_p.
-            # Lazily initialize RNG tensors for CUDA graph compatibility.
-            if self.seed is None:
-                self.seed = torch.tensor([0], dtype=torch.int64, device=logits.device)
-                self.offset = torch.tensor([0], dtype=torch.int64, device=logits.device)
-            self.seed.add_(1).remainder_(2**31)
             top_ks = spec_metadata.top_ks[:num_flat_tokens]
-            sampled = sampling_batch_spec_dec_one_model(
+            seed, offset = self._rng_state_per_token(spec_metadata, num_flat_tokens)
+            sampled = sample_from_logits_op(
                 logits,
                 spec_metadata.temperatures[:num_flat_tokens],
                 top_ks,
                 spec_metadata.top_ps[:num_flat_tokens],
-                use_flashinfer=self.use_flashinfer,
-                seed=self.seed,
-                offset=self.offset,
+                seed=seed,
+                offset=offset,
             )
             self._target_tokens_buf[:num_flat_tokens].copy_(sampled)
         else:
@@ -868,7 +858,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         N = self.tokens_per_gen_step
         max_path_len = self._max_path_len
         vocab_size = logits.shape[-1]
-        device = logits.device
 
         # Reset output buffers
         self._accepted_tokens_buf[:batch_size].zero_()
@@ -877,23 +866,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
         self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
-        # Lazily initialize RNG tensors (needed by rejection kernel).
-        if self.seed is None:
-            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
-        self.seed.add_(1).remainder_(2**31)
-
         # Context tokens bypass the rejection kernel — sample them directly.
         if num_contexts > 0:
             top_ks_ctx = spec_metadata.top_ks[:num_contexts]
-            sampled_ctx = sampling_batch_spec_dec_one_model(
+            seed_ctx, offset_ctx = self._rng_state_per_token(spec_metadata, num_contexts)
+            sampled_ctx = sample_from_logits_op(
                 logits[:num_contexts],
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,
                 spec_metadata.top_ps[:num_contexts],
-                use_flashinfer=self.use_flashinfer,
-                seed=self.seed,
-                offset=self.offset,
+                seed=seed_ctx,
+                offset=offset_ctx,
             )
             accepted_tokens[:num_contexts, 0].copy_(sampled_ctx)
 
@@ -916,6 +899,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             temps = spec_metadata.request_temperatures[gen_slice]
             top_ks_rej = spec_metadata.request_top_ks[gen_slice]
             top_ps_rej = spec_metadata.request_top_ps[gen_slice]
+            seed_rej, offset_rej = self._rng_state_per_request(
+                spec_metadata, num_contexts, num_contexts + num_gens
+            )
 
             slot_storage = spec_tree_manager.slot_storage
             gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
@@ -937,8 +923,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     top_ps_rej,
                     num_gens,
                     self._max_path_len,
-                    seed=self.seed,
-                    offset=self.offset,
+                    seed=seed_rej,
+                    offset=offset_rej,
                 )
             )
 
@@ -1017,14 +1003,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         ).to(torch.int32)
 
     @nvtx_range("eagle3_dyn.sample")
-    def sample(
-        self, logits: torch.Tensor, max_top_k: int, draft_model=None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, logits: torch.Tensor, max_top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         """TopK sampling with softmax for dynamic tree."""
         topk_indices, topk_values = _sample_softmax_topk(logits, max_top_k)
-        # Apply draft-to-target vocab mapping if the draft model has it
-        if draft_model is not None and hasattr(draft_model.model, "d2t"):
-            d2t = draft_model.model.d2t.data
+        # Apply draft-to-target vocab mapping when draft/target vocabs differ.
+        if self._d2t is not None:
+            d2t = self._d2t.data
             topk_indices = topk_indices + d2t[topk_indices]
         return topk_indices, topk_values
 

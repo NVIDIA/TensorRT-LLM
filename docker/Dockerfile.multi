@@ -1,8 +1,22 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.04-py3
-ARG TRITON_BASE_TAG=26.04-py3
+ARG BASE_TAG=26.05-py3
+ARG TRITON_BASE_TAG=26.05-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -31,7 +45,6 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
@@ -45,21 +58,21 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     echo "Using Python version: ${PYTHON_VERSION}" && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
-    TRT_VER=${TRT_VER} CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
+    CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
-         --tensorrt --polygraphy --mpi4py --pytorch --opencv
+         --cuda_libs --polygraphy --mpi4py --pytorch
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
+# constraints.txt is also consumed as a pip constraint file, which forbids extras.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    # WAR: uninstall dependencies that has vulnerability or need upgrading.
-    apt remove python3-wheel \
-    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy || true && \
+    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+        nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 numpy wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
-    pip3 install -r /tmp/constraints.txt && \
+    pip3 install -r /tmp/constraints.txt "nvidia-cutlass-dsl[cu13]==4.6.2" && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
@@ -78,9 +91,13 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
-# Generate OSS attribution file for devel image
+ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ARG TARGETARCH
+ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
+    TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Generate OSS attribution file for devel image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/tmp/gen_attribution.sh \
     bash /tmp/gen_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
 
@@ -107,36 +124,45 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
-COPY benchmarks benchmarks
 COPY cpp cpp
 COPY docker docker
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
-COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
+COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt requirements-openengine.txt constraints.txt LICENSE README.md ./
 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
+ARG GIT_COMMIT
 ARG GITHUB_MIRROR=""
-ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
+ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
+    TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
+    GITHUB_MIRROR=${GITHUB_MIRROR} \
+    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
 WORKDIR /app/tensorrt_llm
+ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
-    pip install /tmp/wheel/tensorrt_llm*.whl
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
+    TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
+    test -n "${TRTLLM_WHEEL}" && \
+    pip install "${TRTLLM_WHEEL}[mx]"
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \
     --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
     --mount=type=bind,source=examples,target=/mnt/ctx/examples \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/benchmarks,target=/mnt/cpp_benchmarks \
     # Copy build context files
     cp /mnt/ctx/README.md ./ && \
     cp -r /mnt/ctx/docs ./docs && \
@@ -145,25 +171,12 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     chmod -R a+w examples && \
     # Copy wheel stage outputs
     cp /mnt/wheel/tensorrt_llm*.whl ./ && \
-    cp -r /mnt/benchmarks ./benchmarks && \
-    mkdir -p benchmarks/cpp && \
-    cp /mnt/cpp_benchmarks/bertBenchmark \
-       /mnt/cpp_benchmarks/gptManagerBenchmark \
-       /mnt/cpp_benchmarks/disaggServerBenchmark \
-       benchmarks/cpp/ && \
-    rm -v \
-      benchmarks/cpp/bertBenchmark.cpp \
-      benchmarks/cpp/gptManagerBenchmark.cpp \
-      benchmarks/cpp/disaggServerBenchmark.cpp \
-      benchmarks/cpp/CMakeLists.txt && \
-    # Create symlinks to installed package binaries and libraries
-    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
-    test -f bin/executorWorker && \
+    # Create a symlink to installed package libraries
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
-    test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
+    test -f lib/libtensorrt_llm.so && \
     echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
     ldconfig && \
-    ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" ) && \
+    ! ( ldd -v lib/libth_common.so | grep tensorrt_llm | grep -q "not found" ) && \
     # Clean up caches and CVE workarounds
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
@@ -181,21 +194,9 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
     bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
-FROM wheel AS tritonbuild
-
-WORKDIR /src/tensorrt_llm
-RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
-COPY ./triton_backend/ ./triton_backend/
-ARG TRITON_BASE_TAG
-RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
-
-
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm
 COPY ./triton_backend/all_models ./triton_backend/all_models
 COPY ./triton_backend/scripts ./triton_backend/scripts
 COPY ./triton_backend/tools ./triton_backend/tools
-COPY ./triton_backend/inflight_batcher_llm/scripts ./triton_backend/inflight_batcher_llm/scripts
-COPY ./triton_backend/inflight_batcher_llm/client ./triton_backend/inflight_batcher_llm/client
-COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm

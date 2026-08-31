@@ -328,7 +328,7 @@ class MistralConfigLoader(BaseConfigLoader):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        hf_quant_config = pretrained_config.quantization_config
+        hf_quant_config = getattr(pretrained_config, "quantization_config", {}) or {}
         if hf_quant_config.get("quant_method") == "compressed-tensors":
             if "NVFP4" in hf_quant_config.get("config_groups"):
                 quant_config.quant_algo = QuantAlgo.NVFP4
@@ -390,7 +390,14 @@ class MistralConfigLoader(BaseConfigLoader):
         from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
-        model_config.pretrained_config.input_processor_type = "mistral_large_3"
-        model_config.pretrained_config.model_type = "mistral_large_3"
+        # Native (mistral-format) checkpoints are served through the
+        # mistral-common tokenizer/processor, which applies its own chat
+        # template. Tag the config with a dedicated serving model_type so the
+        # serving layer resolves the PASSTHROUGH placeholder/chat-template
+        # metadata (registered under "mistral_common" in modeling_mistral.py)
+        # via the normal config path - i.e. resolve_top_level_model_type() -
+        # instead of having to inspect the live input processor.
+        model_config.pretrained_config.input_processor_type = "mistral_common"
+        model_config.pretrained_config.model_type = "mistral_common"
         model_config._frozen = True
         return model_config

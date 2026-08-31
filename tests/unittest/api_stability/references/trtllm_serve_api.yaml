@@ -207,14 +207,14 @@ models:
         required: false
       length_penalty:
         kind: extension
-        type: float
-        default: 1.0
+        type: Optional[float]
+        default: null
         status: stable
         required: false
       early_stopping:
         kind: extension
-        type: bool
-        default: false
+        type: Optional[Union[bool, Literal['never']]]
+        default: null
         status: stable
         required: false
       stop_token_ids:
@@ -298,6 +298,12 @@ models:
       conversation_params:
         kind: extension
         type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      priority:
+        kind: extension
+        type: Optional[float]
         default: null
         status: prototype
         required: false
@@ -502,6 +508,12 @@ models:
         default: null
         status: stable
         required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -600,7 +612,7 @@ models:
         required: false
       tool_choice:
         kind: openai
-        type: Optional[Union[Literal['none', 'auto'], ChatCompletionNamedToolChoiceParam]]
+        type: Optional[Union[Literal['none', 'auto', 'required'], ChatCompletionNamedToolChoiceParam]]
         default: none
         status: stable
         required: false
@@ -612,9 +624,15 @@ models:
         required: false
       reasoning_effort:
         kind: openai
-        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high']]
+        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high', 'max', 'none']]
         default: "ReasoningEffort.LOW"
         status: stable
+        required: false
+      thinking:
+        kind: extension
+        type: Optional[ChatCompletionThinkingParam]
+        default: null
+        status: prototype
         required: false
       thinking_token_budget:
         kind: extension
@@ -666,14 +684,14 @@ models:
         required: false
       length_penalty:
         kind: extension
-        type: float
-        default: 1.0
+        type: Optional[float]
+        default: null
         status: stable
         required: false
       early_stopping:
         kind: extension
-        type: bool
-        default: false
+        type: Optional[Union[bool, Literal['never']]]
+        default: null
         status: stable
         required: false
       stop_token_ids:
@@ -796,6 +814,12 @@ models:
         default: null
         status: beta
         required: false
+      priority:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponseChoice:
     fields:
@@ -891,6 +915,12 @@ models:
         type: Optional[List[int]]
         default: null
         status: stable
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionResponseStreamChoice:
@@ -1287,7 +1317,7 @@ models:
         required: true
       response_format:
         kind: openai
-        type: Literal['url', 'b64_json']
+        type: Literal['url', 'b64_json', 'path']
         default: url
         status: stable
         required: false
@@ -1425,8 +1455,8 @@ models:
         required: true
       response_format:
         kind: extension
-        type: Literal['url', 'b64_json']
-        default: url
+        type: Literal['file', 'path']
+        default: file
         status: stable
         required: false
       format:

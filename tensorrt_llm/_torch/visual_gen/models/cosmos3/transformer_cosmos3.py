@@ -14,8 +14,9 @@
 # limitations under the License.
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, ContextManager, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -25,7 +26,9 @@ from diffusers.models.embeddings import TimestepEmbedding
 from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -33,6 +36,165 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+# Some Cosmos3OmniTransformer checkpoint configs omit these fields; the values
+# match what other conversions carry explicitly.
+PRETRAINED_CONFIG_COMPAT_DEFAULTS = {
+    "position_embedding_type": "unified_3d_mrope",
+    "max_position_embeddings": 262144,
+    "temporal_compression_factor": 4,
+    "temporal_compression_factor_sound": 1,
+}
+
+
+_PretrainedConfigT = TypeVar("_PretrainedConfigT")
+
+
+def apply_pretrained_config_compat_defaults(
+    pretrained_config: _PretrainedConfigT,
+) -> _PretrainedConfigT:
+    """Fill missing schema fields in place (idempotent); returns the config."""
+    for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
+        if getattr(pretrained_config, key, None) is None:
+            setattr(pretrained_config, key, value)
+    return pretrained_config
+
+
+def _noop_offload_context(_tower_name: str) -> ContextManager:
+    """Default offload context: no staging, used when callers don't offload."""
+    return nullcontext()
+
+
+COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+
+
+def resolve_rope_axes_dim(pretrained_config) -> list:
+    """MRoPE axes: the explicit top-level ``rope_axes_dim`` wins (diffusers
+    precedence); the legacy ``rope_scaling["mrope_section"]`` is the fallback.
+    Both-declared-but-contradictory, wrong length, or a sum that does not
+    cover half the head dim are config errors.
+    """
+    top_level = getattr(pretrained_config, "rope_axes_dim", None)
+    rope_scaling = getattr(pretrained_config, "rope_scaling", None) or {}
+    nested = rope_scaling.get("mrope_section")
+
+    if top_level is not None and nested is not None and list(top_level) != list(nested):
+        raise ValueError(
+            f"Cosmos3 config declares contradictory MRoPE axes: rope_axes_dim="
+            f"{list(top_level)} vs rope_scaling.mrope_section={list(nested)}."
+        )
+    axes = top_level if top_level is not None else nested
+    if axes is None:
+        raise ValueError(
+            "Cosmos3 config declares neither rope_axes_dim nor rope_scaling.mrope_section."
+        )
+    axes = list(axes)
+    half_head_dim = pretrained_config.head_dim // 2
+    if len(axes) != 3 or sum(axes) != half_head_dim:
+        raise ValueError(
+            f"Cosmos3 MRoPE axes {axes} must have 3 entries summing to "
+            f"head_dim/2 = {half_head_dim}."
+        )
+    return axes
+
+
+@dataclass(frozen=True)
+class Cosmos3ArchRecipe:
+    """Complete architecture combination selected by ``backbone_type``.
+
+    Module construction derives from the recipe, never from individual config
+    flags, so a mixed config cannot half-apply.
+    """
+
+    name: str
+    gated_mlp: bool
+    und_qk_norm: bool
+    use_und_k_norm_for_gen: bool
+    nemotron_norms: bool
+
+
+QWEN3_RECIPE = Cosmos3ArchRecipe(
+    name="qwen3",
+    gated_mlp=True,
+    und_qk_norm=True,
+    use_und_k_norm_for_gen=False,
+    nemotron_norms=False,
+)
+
+NEMOTRON_DENSE_RECIPE = Cosmos3ArchRecipe(
+    name="nemotron_dense",
+    gated_mlp=False,
+    und_qk_norm=False,
+    use_und_k_norm_for_gen=True,
+    nemotron_norms=True,
+)
+
+
+def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
+    """Select and validate the architecture recipe declared by the config."""
+    backbone_type = getattr(pretrained_config, "backbone_type", None)
+    if backbone_type is None:
+        recipe = QWEN3_RECIPE
+        expected_flags = {
+            "hidden_act": (None, "silu"),
+            "qk_norm_for_text": (None, True),
+            "use_und_k_norm_for_gen": (None, False),
+        }
+    elif backbone_type == COSMOS3_EDGE_BACKBONE_TYPE:
+        recipe = NEMOTRON_DENSE_RECIPE
+        expected_flags = {
+            "hidden_act": ("relu2",),
+            "qk_norm_for_text": (False,),
+            "use_und_k_norm_for_gen": (True,),
+            "sound_gen": (False,),
+            "attention_bias": (False,),
+            "rms_norm_eps": (1e-5,),
+        }
+    else:
+        raise ValueError(
+            f"Unsupported Cosmos3 transformer backbone_type={backbone_type!r}; "
+            f"supported: absent (Qwen3 family) or {COSMOS3_EDGE_BACKBONE_TYPE!r}."
+        )
+
+    for key, allowed in expected_flags.items():
+        actual = getattr(pretrained_config, key, None)
+        if actual not in allowed:
+            raise ValueError(
+                f"Cosmos3 config contradicts the {recipe.name!r} recipe: "
+                f"{key}={actual!r}, expected one of {allowed}."
+            )
+
+    # Latent-geometry invariants are validated for the Edge recipe only: every
+    # published Edge checkpoint declares 48/2, so a different value means a
+    # wrong or corrupt config. The qwen3 recipe is left unchecked because
+    # long-standing reduced-dimension test fixtures build it with tiny latent
+    # channels; real qwen3 checkpoints are protected by weight-shape checks.
+    if recipe is NEMOTRON_DENSE_RECIPE:
+        invariants = {"latent_channel": 48, "latent_patch_size": 2}
+        for key, expected in invariants.items():
+            actual = getattr(pretrained_config, key, None)
+            if actual != expected:
+                raise ValueError(
+                    f"Unsupported Cosmos3 Edge transformer config: {key}={actual!r}, "
+                    f"expected {expected}."
+                )
+
+    # A declared patch_latent_dim must agree with the latent geometry it is
+    # derived from (the transformer recomputes it and would silently ignore an
+    # inconsistent declaration).
+    declared_patch_dim = getattr(pretrained_config, "patch_latent_dim", None)
+    latent_channel = getattr(pretrained_config, "latent_channel", None)
+    latent_patch_size = getattr(pretrained_config, "latent_patch_size", None)
+    if None not in (declared_patch_dim, latent_channel, latent_patch_size):
+        expected_patch_dim = (latent_patch_size**2) * latent_channel
+        if declared_patch_dim != expected_patch_dim:
+            raise ValueError(
+                f"Inconsistent Cosmos3 transformer config: patch_latent_dim="
+                f"{declared_patch_dim}, but latent_patch_size**2 * latent_channel = "
+                f"{expected_patch_dim}."
+            )
+
+    return recipe
 
 
 class Qwen3VLTextRMSNorm(nn.Module):
@@ -57,6 +219,19 @@ class Qwen3VLTextRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         output = self.weight * hidden_states.to(input_dtype)
         return output
+
+
+class NemotronRMSNorm(Qwen3VLTextRMSNorm):
+    """RMSNorm with the weight multiply in float32 before downcast.
+
+    ``F.rms_norm`` is bit-exact to this flavor for bf16 inputs, unlike the
+    parent's post-downcast bf16 weight multiply.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(
+            hidden_states, (hidden_states.shape[-1],), self.weight, self.variance_epsilon
+        )
 
 
 @dataclass
@@ -102,6 +277,8 @@ def compute_mrope_position_ids_vision(
     base_fps: float = 24.0,
     temporal_compression_factor: int = 4,
     enable_fps_modulation: bool = False,
+    start_frame_offset: int = 0,
+    base_temporal_compression_factor: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -113,23 +290,33 @@ def compute_mrope_position_ids_vision(
     to reflect real time so that videos at different frame rates get comparable
     temporal embeddings.
 
+    ``base_temporal_compression_factor`` sets the temporal grid the scaled
+    positions land on, and defaults to ``temporal_compression_factor``.  Action
+    tokens run at frame rate (``temporal_compression_factor=1``) but must share
+    the vision latent-frame grid, so they pass the vision VAE factor here.
+
     Returns:
         (position_ids [3, grid_t * grid_h * grid_w], next_temporal_offset)
     """
+    if base_temporal_compression_factor is None:
+        base_temporal_compression_factor = temporal_compression_factor
+
     if enable_fps_modulation and fps is not None:
         tps = fps / temporal_compression_factor
-        base_tps = base_fps / temporal_compression_factor
+        base_tps = base_fps / base_temporal_compression_factor
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
         t_index = (
-            (frame_indices / tps * base_tps + temporal_offset)
+            ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
             .expand(-1, grid_h * grid_w)
             .flatten()
         )
     else:
-        t_index = torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(
-            -1, grid_h * grid_w
-        ).flatten() + int(temporal_offset)
+        t_index = (
+            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
+            + int(temporal_offset)
+            + start_frame_offset
+        )
 
     h_index = (
         torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -147,6 +334,94 @@ def compute_mrope_position_ids_vision(
 
     next_offset = math.ceil(mrope_ids.max().item()) + 1
     return mrope_ids, next_offset
+
+
+def compute_mrope_position_ids_action(
+    grid_t: int,
+    temporal_offset: int | float,
+    action_fps: float | None,
+    base_fps: float = 24.0,
+    base_temporal_compression_factor: int = 4,
+    enable_fps_modulation: bool = True,
+    start_frame_offset: int = 1,
+) -> tuple[torch.Tensor, int | float]:
+    """Generate mRoPE IDs for action tokens as a frame-rate (T, 1, 1) grid.
+
+    Action tokens are uncompressed in time, so they advance one source frame per
+    token while vision latent frames advance ``base_temporal_compression_factor``
+    source frames.  Scaling against the vision base rate keeps both streams on
+    one shared timeline.
+    """
+    return compute_mrope_position_ids_vision(
+        grid_t=grid_t,
+        grid_h=1,
+        grid_w=1,
+        temporal_offset=temporal_offset,
+        fps=action_fps,
+        base_fps=base_fps,
+        temporal_compression_factor=1,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=start_frame_offset,
+        base_temporal_compression_factor=base_temporal_compression_factor,
+    )
+
+
+class DomainAwareLinear(nn.Module):
+    """Linear projection with one weight/bias pair per action embodiment domain."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        num_domains: int,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.input_size = int(input_size)
+        self.output_size = int(output_size)
+        self.num_domains = int(num_domains)
+        self.dtype = dtype
+        self.fc = nn.Embedding(self.num_domains, self.output_size * self.input_size, dtype=dtype)
+        self.bias = nn.Embedding(self.num_domains, self.output_size, dtype=dtype)
+
+    def post_load_weights(self) -> None:
+        self.fc.to(self.dtype)
+        self.bias.to(self.dtype)
+
+    def validate_domain_ids(self, domain_id: torch.Tensor) -> None:
+        """Range-check the ids. Reads a device tensor, so call once per request.
+
+        Out-of-range ids index ``nn.Embedding`` out of bounds, which on GPU is a
+        device-side assert with no useful message; this turns it into a real
+        error. Kept out of forward() because the ``if`` on a device predicate is
+        a blocking sync, and forward() runs twice on every denoise step.
+        """
+        if torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
+            raise ValueError(
+                f"Cosmos3 action domain_id must be in [0, {self.num_domains}), "
+                f"got {domain_id.tolist()}."
+            )
+
+    def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+        if domain_id.ndim == 0:
+            domain_id = domain_id.unsqueeze(0)
+        domain_id = domain_id.to(device=x.device, dtype=torch.long).reshape(-1)
+        if x.shape[0] != domain_id.shape[0]:
+            raise ValueError(
+                "Cosmos3 action domain_id batch size must match action batch: "
+                f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
+            )
+
+        weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
+        bias = self.bias(domain_id).view(domain_id.shape[0], self.output_size)
+        if x.ndim == 2:
+            return torch.bmm(x.unsqueeze(1), weight).squeeze(1) + bias
+        if x.ndim == 3:
+            return torch.bmm(x, weight) + bias.unsqueeze(1)
+        raise ValueError(
+            f"Cosmos3 DomainAwareLinear expected rank-2 or rank-3 input, got {tuple(x.shape)}."
+        )
 
 
 class TimestepEmbedder(nn.Module):
@@ -232,6 +507,7 @@ class Cosmos3CausalAttention(Attention):
         num_key_value_heads: int,
         head_dim: int,
         model_config: DiffusionModelConfig,
+        recipe: Cosmos3ArchRecipe,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
@@ -249,14 +525,28 @@ class Cosmos3CausalAttention(Attention):
             module_name=module_name,
             enable_sequence_parallel=False,
         )
-        self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
-        self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
+        # Attention Q/K norms run the fp32-weight-multiply flavor in both
+        # recipes (this path has always been F.rms_norm); only the layernorms
+        # differ per recipe.
+        eps = model_config.pretrained_config.rms_norm_eps
+        if recipe.und_qk_norm:
+            self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+            self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        else:
+            self.norm_q = None
+            self.norm_k = None
+        if recipe.use_und_k_norm_for_gen:
+            self.k_norm_und_for_gen = NemotronRMSNorm(
+                hidden_size=head_dim, eps=eps, dtype=torch.bfloat16
+            )
+        else:
+            self.k_norm_und_for_gen = None
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
-        return q, k
+        if self.norm_q is None:
+            return q, k
+        return self.norm_q(q), self.norm_k(k)
 
     def forward_with_kv(
         self,
@@ -273,8 +563,19 @@ class Cosmos3CausalAttention(Attention):
         k = k.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
 
+        # The gen tower consumes a separately normed view of the raw und keys;
+        # the und self-attention below must not see that norm.
+        k_for_gen = None
+        if self.k_norm_und_for_gen is not None:
+            k_for_gen = self.k_norm_und_for_gen(k)
+
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+
+        if k_for_gen is not None:
+            _, k_for_gen = qwen3_apply_rotary_pos_emb(q, k_for_gen, freqs_cos, freqs_sin)
+        else:
+            k_for_gen = k
 
         out = self._attn_impl(
             q,
@@ -284,7 +585,7 @@ class Cosmos3CausalAttention(Attention):
             timestep=timestep,
         )
 
-        return self.to_out[0](out), k, v
+        return self.to_out[0](out), k_for_gen, v
 
     def forward(self):
         raise NotImplementedError(
@@ -310,6 +611,7 @@ class Cosmos3CrossAttention(Attention):
         num_key_value_heads: int,
         head_dim: int,
         model_config: DiffusionModelConfig,
+        recipe: Cosmos3ArchRecipe,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
@@ -317,6 +619,13 @@ class Cosmos3CrossAttention(Attention):
         if model_config.attention.backend == "TRTLLM":
             # TRTLLM backend is not supported for Cosmos3CrossAttention
             model_config.attention.backend = "VANILLA"
+            # Warn once per (module class, requested, resolved) triple so the
+            # fallback is visible without per-module-instance log spam.
+            logger.warning_once(
+                f"{type(self).__name__}: requested attention backend {original_backend} is not "
+                f"supported for Cosmos3 cross-attention; falling back to VANILLA.",
+                key=(type(self).__name__, original_backend, "VANILLA"),
+            )
 
         super().__init__(
             hidden_size=hidden_size,
@@ -334,14 +643,15 @@ class Cosmos3CrossAttention(Attention):
         )
         model_config.attention.backend = original_backend
 
-        self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
-        self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
+        # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
+        # fp32-weight-multiply in both recipes.
+        eps = model_config.pretrained_config.rms_norm_eps
+        self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
-        return q, k
+        return self.norm_q(q), self.norm_k(k)
 
     def forward(
         self,
@@ -406,35 +716,13 @@ class Cosmos3CrossAttention(Attention):
         return self.to_out[0](out)
 
 
-class Cosmos3UndDecoderLayer(nn.Module):
-    """Understanding pathway decoder layer: causal self-attention + MLP."""
-
-    def __init__(self, model_config: DiffusionModelConfig, layer_idx: int):
-        super().__init__()
-        self.layer_idx = layer_idx
-        hidden_size = model_config.pretrained_config.hidden_size
-        intermediate_size = model_config.pretrained_config.intermediate_size
-
-        self.self_attn = Cosmos3CausalAttention(
-            hidden_size=hidden_size,
-            num_attention_heads=model_config.pretrained_config.num_attention_heads,
-            num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
-            head_dim=model_config.pretrained_config.head_dim,
-            model_config=model_config,
-            layer_idx=layer_idx,
-            module_name=f"layers.{layer_idx}.self_attn",
-        )
-        self.input_layernorm = Qwen3VLTextRMSNorm(
-            hidden_size=hidden_size,
-            eps=model_config.pretrained_config.rms_norm_eps,
-            dtype=torch.bfloat16,
-        )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
-            hidden_size=hidden_size,
-            eps=model_config.pretrained_config.rms_norm_eps,
-            dtype=torch.bfloat16,
-        )
-        self.mlp = GatedMLP(
+def _build_cosmos3_mlp(
+    model_config: DiffusionModelConfig, recipe: Cosmos3ArchRecipe, layer_idx: int
+) -> nn.Module:
+    hidden_size = model_config.pretrained_config.hidden_size
+    intermediate_size = model_config.pretrained_config.intermediate_size
+    if recipe.gated_mlp:
+        return GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             bias=False,
@@ -443,6 +731,54 @@ class Cosmos3UndDecoderLayer(nn.Module):
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
         )
+    return MLP(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        bias=False,
+        activation=relu2,
+        dtype=torch.bfloat16,
+        config=model_config,
+        layer_idx=layer_idx,
+        reduce_output=model_config.mapping.tp_size > 1,
+    )
+
+
+def _layer_norm_cls(recipe: Cosmos3ArchRecipe):
+    return NemotronRMSNorm if recipe.nemotron_norms else Qwen3VLTextRMSNorm
+
+
+class Cosmos3UndDecoderLayer(nn.Module):
+    """Understanding pathway decoder layer: causal self-attention + MLP."""
+
+    def __init__(
+        self, model_config: DiffusionModelConfig, layer_idx: int, recipe: Cosmos3ArchRecipe
+    ):
+        super().__init__()
+        self.layer_idx = layer_idx
+        hidden_size = model_config.pretrained_config.hidden_size
+
+        self.self_attn = Cosmos3CausalAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=model_config.pretrained_config.num_attention_heads,
+            num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
+            head_dim=model_config.pretrained_config.head_dim,
+            model_config=model_config,
+            recipe=recipe,
+            layer_idx=layer_idx,
+            module_name=f"layers.{layer_idx}.self_attn",
+        )
+        norm_cls = _layer_norm_cls(recipe)
+        self.input_layernorm = norm_cls(
+            hidden_size=hidden_size,
+            eps=model_config.pretrained_config.rms_norm_eps,
+            dtype=torch.bfloat16,
+        )
+        self.post_attention_layernorm = norm_cls(
+            hidden_size=hidden_size,
+            eps=model_config.pretrained_config.rms_norm_eps,
+            dtype=torch.bfloat16,
+        )
+        self.mlp = _build_cosmos3_mlp(model_config, recipe, layer_idx)
 
     def forward(
         self,
@@ -479,11 +815,12 @@ class Cosmos3UndDecoderLayer(nn.Module):
 class Cosmos3GenDecoderLayer(nn.Module):
     """Generation pathway decoder layer: cross-attention (to UND K/V) + MLP."""
 
-    def __init__(self, model_config: DiffusionModelConfig, layer_idx: int):
+    def __init__(
+        self, model_config: DiffusionModelConfig, layer_idx: int, recipe: Cosmos3ArchRecipe
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         hidden_size = model_config.pretrained_config.hidden_size
-        intermediate_size = model_config.pretrained_config.intermediate_size
 
         self.cross_attention = Cosmos3CrossAttention(
             hidden_size=hidden_size,
@@ -491,28 +828,22 @@ class Cosmos3GenDecoderLayer(nn.Module):
             num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
             head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
+            recipe=recipe,
             layer_idx=layer_idx,
             module_name=f"layers.{layer_idx}.cross_attention",
         )
-        self.input_layernorm = Qwen3VLTextRMSNorm(
+        norm_cls = _layer_norm_cls(recipe)
+        self.input_layernorm = norm_cls(
             hidden_size=hidden_size,
             eps=model_config.pretrained_config.rms_norm_eps,
             dtype=torch.bfloat16,
         )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
+        self.post_attention_layernorm = norm_cls(
             hidden_size=hidden_size,
             eps=model_config.pretrained_config.rms_norm_eps,
             dtype=torch.bfloat16,
         )
-        self.mlp = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            bias=False,
-            dtype=torch.bfloat16,
-            config=model_config,
-            layer_idx=layer_idx,
-            reduce_output=model_config.mapping.tp_size > 1,
-        )
+        self.mlp = _build_cosmos3_mlp(model_config, recipe, layer_idx)
 
     def forward(
         self,
@@ -593,11 +924,16 @@ def _compute_default_rope_parameters(
 class Qwen3VLTextRotaryEmbedding(nn.Module):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
-        self.rope_type = model_config.pretrained_config.rope_scaling["rope_type"]
+        # Edge checkpoints omit rope_type from rope_scaling, and a checkpoint
+        # declaring the axes via top-level ``rope_axes_dim`` may omit the block
+        # entirely -- ``resolve_rope_axes_dim`` below supports that, so read it
+        # with the same tolerance rather than failing before reaching it.
+        rope_scaling = getattr(model_config.pretrained_config, "rope_scaling", None) or {}
+        self.rope_type = rope_scaling.get("rope_type", "default")
         self.max_seq_len_cached = model_config.pretrained_config.max_position_embeddings
         self.original_max_seq_len = model_config.pretrained_config.max_position_embeddings
 
-        self.mrope_section = model_config.pretrained_config.rope_scaling["mrope_section"]
+        self.mrope_section = resolve_rope_axes_dim(model_config.pretrained_config)
 
         inv_freq, self.attention_scaling = _compute_default_rope_parameters(model_config)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -654,7 +990,7 @@ class Cosmos3LanguageModel(nn.Module):
     computed once and reused across all sampling steps.
     """
 
-    def __init__(self, model_config: DiffusionModelConfig):
+    def __init__(self, model_config: DiffusionModelConfig, recipe: Cosmos3ArchRecipe):
         super().__init__()
         hidden_size = model_config.pretrained_config.hidden_size
         num_hidden_layers = model_config.pretrained_config.num_hidden_layers
@@ -667,7 +1003,10 @@ class Cosmos3LanguageModel(nn.Module):
         )
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(model_config)
         self.layers = nn.ModuleList(
-            [Cosmos3UndDecoderLayer(model_config, layer_idx=i) for i in range(num_hidden_layers)]
+            [
+                Cosmos3UndDecoderLayer(model_config, layer_idx=i, recipe=recipe)
+                for i in range(num_hidden_layers)
+            ]
         )
 
     def forward(
@@ -702,9 +1041,15 @@ class Cosmos3LanguageModel(nn.Module):
 class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
-        pretrained_config = model_config.pretrained_config
+        self.temporal_compression_factor_declared = (
+            getattr(model_config.pretrained_config, "temporal_compression_factor", None) is not None
+        )
+        pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
+        self.recipe = resolve_arch_recipe(pretrained_config)
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
         self.action_gen = getattr(pretrained_config, "action_gen", False)
+        # Config-fact alias kept for callers that predate action support.
+        self.has_action_weights = self.action_gen
 
         self.hidden_size = pretrained_config.hidden_size
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -714,8 +1059,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.timestep_scale = pretrained_config.timestep_scale
         self.base_fps = pretrained_config.base_fps
 
-        # Comes from VAE. Updated after VAE is loaded.
-        self.temporal_compression_factor = 4
+        # Config-declared (compat default 4); cross-checked against the VAE
+        # after component loading.
+        self.temporal_compression_factor = pretrained_config.temporal_compression_factor
 
         self.unified_3d_mrope_temporal_modality_margin = (
             pretrained_config.unified_3d_mrope_temporal_modality_margin
@@ -730,6 +1076,29 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             self.temporal_compression_factor_audio = (
                 pretrained_config.temporal_compression_factor_sound
             )
+
+        if self.action_gen:
+            action_dim_value = getattr(pretrained_config, "action_dim", None)
+            if action_dim_value is None:
+                action_dim_value = getattr(pretrained_config, "max_action_dim", 64)
+            self.action_dim = int(action_dim_value)
+            self.num_embodiment_domains = int(
+                getattr(pretrained_config, "num_embodiment_domains", 32)
+            )
+            dtype = torch.bfloat16
+            self.action_proj_in = DomainAwareLinear(
+                self.action_dim,
+                self.hidden_size,
+                self.num_embodiment_domains,
+                dtype=dtype,
+            )
+            self.action_proj_out = DomainAwareLinear(
+                self.hidden_size,
+                self.action_dim,
+                self.num_embodiment_domains,
+                dtype=dtype,
+            )
+            self.action_modality_embed = nn.Parameter(torch.zeros(self.hidden_size, dtype=dtype))
 
         if pretrained_config.position_embedding_type != "unified_3d_mrope":
             raise ValueError(
@@ -764,7 +1133,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "Ring parallelism is not supported for Cosmos3 cross-attention."
             )
 
-        self.language_model = Cosmos3LanguageModel(model_config)
+        self.language_model = Cosmos3LanguageModel(model_config, self.recipe)
 
         self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
@@ -780,18 +1149,20 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         self.gen_layers = nn.ModuleList(
             [
-                Cosmos3GenDecoderLayer(model_config, layer_idx=i)
+                Cosmos3GenDecoderLayer(model_config, layer_idx=i, recipe=self.recipe)
                 for i in range(self.num_hidden_layers)
             ]
         )
 
-        self.norm_moe_gen = Qwen3VLTextRMSNorm(
+        self.norm_moe_gen = _layer_norm_cls(self.recipe)(
             hidden_size=self.hidden_size,
             eps=pretrained_config.rms_norm_eps,
         )
 
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_freqs_gen_combined = None
+        self.domain_ids_validated = False
 
         self.__post_init__()
 
@@ -870,6 +1241,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         fps: float | None,
         device: torch.device,
         dtype: torch.dtype,
+        num_vision_items: int = 1,
+        share_vision_temporal_positions: bool = False,
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND (text) and GEN (visual) pathways."""
         B = text_mask.shape[0]
@@ -882,16 +1255,39 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         for b in range(B):
             real_len = int(text_lengths[b].item())
             t_pos, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
-            v_pos, _ = compute_mrope_position_ids_vision(
-                T,
-                Hp,
-                Wp,
-                temporal_offset=t_offset + self.unified_3d_mrope_temporal_modality_margin,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-                enable_fps_modulation=self.enable_fps_modulation,
-            )
+            media_temporal_offset = t_offset + self.unified_3d_mrope_temporal_modality_margin
+            gen_positions = []
+            if num_vision_items == 1 or share_vision_temporal_positions:
+                v_pos, _ = compute_mrope_position_ids_vision(
+                    T,
+                    Hp,
+                    Wp,
+                    temporal_offset=media_temporal_offset,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                    enable_fps_modulation=self.enable_fps_modulation,
+                )
+                gen_positions.extend([v_pos] * num_vision_items)
+            else:
+                vision_offset: int | float = media_temporal_offset
+                for _ in range(num_vision_items):
+                    v_pos, vision_offset = compute_mrope_position_ids_vision(
+                        T,
+                        Hp,
+                        Wp,
+                        temporal_offset=vision_offset,
+                        fps=effective_fps,
+                        base_fps=self.base_fps,
+                        temporal_compression_factor=self.temporal_compression_factor,
+                        enable_fps_modulation=self.enable_fps_modulation,
+                    )
+                    gen_positions.append(v_pos)
+
+            pos_dtype = gen_positions[0].dtype
+            for pos in gen_positions[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in gen_positions], dim=1)
             if real_len < S_text:
                 t_pos = torch.cat(
                     [t_pos, torch.zeros(3, S_text - real_len, dtype=t_pos.dtype)], dim=1
@@ -964,21 +1360,117 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         """[B, T_audio, audio_dim] → [B, audio_dim, T_audio]."""
         return hidden_audio.permute(0, 2, 1)
 
+    # -------------------------------------------------------------------------
+    # Action helpers
+    # -------------------------------------------------------------------------
+
+    def _compute_action_rope_freqs(
+        self,
+        T_action: int,
+        text_mask: torch.Tensor,
+        action_fps: float,
+        action_start_frame_offset: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = text_mask.shape[0]
+        text_lengths = text_mask.sum(dim=1).long()
+
+        action_pos_list = []
+        for b in range(B):
+            real_len = int(text_lengths[b].item())
+            _, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
+            a_pos, _ = compute_mrope_position_ids_action(
+                T_action,
+                temporal_offset=t_offset + self.unified_3d_mrope_temporal_modality_margin,
+                action_fps=action_fps,
+                base_fps=self.base_fps,
+                base_temporal_compression_factor=self.temporal_compression_factor,
+                enable_fps_modulation=self.enable_fps_modulation,
+                start_frame_offset=action_start_frame_offset,
+            )
+            action_pos_list.append(a_pos)
+
+        action_pos_ids = torch.stack(action_pos_list, dim=1).to(device)
+        rotary_emb = self.language_model.rotary_emb
+        _dummy = torch.tensor([], dtype=dtype, device=device)
+        cos_a, sin_a = rotary_emb(_dummy, position_ids=action_pos_ids)
+        return cos_a.unsqueeze(2), sin_a.unsqueeze(2)
+
+    def pack_action(self, action_latents: torch.Tensor) -> torch.Tensor:
+        if action_latents.ndim != 3:
+            raise ValueError(
+                f"Cosmos3 action latents must have shape [B, T, D], got {tuple(action_latents.shape)}."
+            )
+        if action_latents.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Cosmos3 action latent dimension mismatch: expected {self.action_dim}, "
+                f"got {action_latents.shape[-1]}."
+            )
+        return action_latents.contiguous()
+
+    @staticmethod
+    def unpack_action(tokens: torch.Tensor) -> torch.Tensor:
+        return tokens
+
+    def register_cuda_graph_extra_key_fns(self, runner) -> None:
+        """Make the position-determining scalars part of the graph key.
+
+        The base key is tensor shapes only, but the rotary tables are built
+        from Python scalars that leave every shape unchanged: the frame rate,
+        the action clock, and the offset of the first action step. Two requests
+        differing only in these produce different positions at identical
+        shapes, so without them one captured graph would be replayed for both.
+        Each returns ``None`` when absent, which drops that part of the key --
+        a video-only request keys exactly as it did before.
+        """
+        super().register_cuda_graph_extra_key_fns(runner)
+
+        def _float_key(name):
+            def fn(*args, **kwargs):
+                value = kwargs.get(name)
+                return None if value is None else float(value)
+
+            return fn
+
+        def _int_key(name):
+            def fn(*args, **kwargs):
+                value = kwargs.get(name)
+                return None if value is None else int(value)
+
+            return fn
+
+        runner.register_extra_key_fn("fps", _float_key("fps"))
+        runner.register_extra_key_fn("action_fps", _float_key("action_fps"))
+        runner.register_extra_key_fn(
+            "action_start_frame_offset", _int_key("action_start_frame_offset")
+        )
+
     def reset_cache(self):
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_freqs_gen_combined = None
+        self.domain_ids_validated = False
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         timestep: Optional[torch.Tensor] = None,
-        attention_timestep: Optional[torch.Tensor] = None,
+        raw_timestep: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         video_shape: Optional[Tuple[int, int, int]] = None,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         audio_latents: Optional[torch.Tensor] = None,
+        action_latents: Optional[torch.Tensor] = None,
+        action_domain_ids: Optional[torch.Tensor] = None,
+        action_noisy_mask: Optional[torch.Tensor] = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> "TransformerOutput":
         """
@@ -986,12 +1478,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
-            timestep: Raw scheduler diffusion timestep, shape [B]
-            attention_timestep: Normalized diffusion timestep in [0, 1], shape [B],
-                for attention backends that use timestep-dependent behavior.
+            timestep: Normalized diffusion timestep in [0, 1], shape [B].
+            raw_timestep: Raw scheduler diffusion timestep, shape [B], used by
+                the Cosmos3 time embedding path.
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
+            offload_context: Callable supplied by the pipeline that maps a tower
+                name ("reasoner" for the understanding pathway, "generator" for
+                the generation pathway) to a context manager staging that tower's
+                weights onto the GPU for the duration of its execution. The
+                pipeline returns a no-op context for towers that are not being
+                offloaded, so the transformer itself stays offload-agnostic.
             fps: video frame rate; when provided, temporal mRoPE positions are
                  scaled to reflect real time (FPS modulation).
             noisy_frame_mask: Optional [B, 1, T, 1, 1] mask where 1=noisy (add
@@ -1002,13 +1500,35 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 When provided, audio tokens are appended to the generation
                 sequence and an audio velocity is returned alongside the video
                 velocity.  Requires ``audio_gen=True`` in the pretrained config.
+            control_latents: Optional transfer-control latents. Controls are
+                clean (un-noised) vision context and are packed before the
+                noisy target; their outputs are discarded.
+            transfer_share_vision_temporal_positions: When True (the default),
+                control tokens reuse the target frames' mRoPE temporal
+                coordinates, so a control patch sits at zero displacement from
+                the output patch it governs and the shared coordinate carries
+                the correspondence. When False they take their own positions.
 
         Returns:
             TransformerOutput with video (and image alias) always set.
             audio is set to the predicted audio velocity when audio_latents is
-            provided; otherwise None.  action is always None for now.
+            provided; otherwise None.  action is set when action_latents is provided.
         """
         del kwargs  # Kept for diffusers API compatibility.
+        if timestep is None:
+            raise ValueError("Cosmos3VFMTransformer.forward requires normalized timestep.")
+        if raw_timestep is None:
+            raise ValueError("Cosmos3VFMTransformer.forward requires raw_timestep.")
+
+        if action_latents is not None and audio_latents is not None:
+            raise ValueError(
+                "Cosmos3 transformer does not support joint action and audio generation."
+            )
+        if action_latents is not None and not self.action_gen:
+            raise ValueError(
+                "Cosmos3 action generation was requested, but this transformer "
+                "was initialized without action modules."
+            )
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
@@ -1017,8 +1537,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
         with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder((timestep * self.timestep_scale))
+            time_embed = self.time_embedder((raw_timestep * self.timestep_scale))
         time_embed = time_embed.to(hidden_states.dtype)
+
+        if control_latents is None:
+            control_lantent_list: list[torch.Tensor] = []
+        elif isinstance(control_latents, torch.Tensor):
+            control_lantent_list = [control_latents]
+        else:
+            control_lantent_list = list(control_latents)
 
         if noisy_frame_mask is not None:
             # Build per-token mask from per-frame mask.
@@ -1043,13 +1570,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 fps,
                 hidden_states.device,
                 hidden_states.dtype,
+                num_vision_items=len(control_lantent_list) + 1,
+                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
-            cached_kv_full = self.language_model(
-                text_ids,
-                text_mask,
-                freqs_und,
-                timestep=attention_timestep,
-            )
+            with offload_context("reasoner"):
+                cached_kv_full = self.language_model(
+                    text_ids,
+                    text_mask,
+                    freqs_und,
+                    timestep=timestep,
+                )
             self.cached_freqs_gen = freqs_gen
 
             if self.sharder.is_active:
@@ -1071,28 +1601,116 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             else:
                 self.cached_kv = cached_kv_full
 
-        # --- Audio token injection -------------------------------------------------
+        # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
+        T_action = 0
         T_audio = 0
-        if audio_latents is not None and self.audio_gen:
+        T_control = 0
+        hidden_controls: list[torch.Tensor] = []
+        has_control = len(control_lantent_list) > 0
+
+        if has_control and audio_latents is not None:
+            raise ValueError(
+                "Cosmos3 transfer control latents cannot be combined with sound latents"
+            )
+        if has_control and action_latents is not None:
+            raise ValueError(
+                "Cosmos3 transfer control latents cannot be combined with action latents"
+            )
+
+        action_domain_ids_tensor = action_domain_ids
+        if action_latents is not None and self.action_gen:
+            # FUTURE(action+audio): concat order is control|video|action|audio; adjust slices below.
+            if action_domain_ids_tensor is None:
+                action_domain_ids_tensor = torch.zeros(
+                    action_latents.shape[0], dtype=torch.long, device=action_latents.device
+                )
+            if not self.domain_ids_validated:
+                # Once per request, alongside the other first-step host work.
+                self.action_proj_in.validate_domain_ids(
+                    action_domain_ids_tensor.to(dtype=torch.long).reshape(-1)
+                )
+                self.domain_ids_validated = True
+            T_action = action_latents.shape[1]
+            # Checked, not cast: bmm in DomainAwareLinear needs the latents to
+            # match the projection weights, and silently converting a whole
+            # stream every step would hide the misconfiguration that produced
+            # the mismatch.
+            if action_latents.dtype != self.action_proj_in.dtype:
+                raise ValueError(
+                    "Cosmos3 action latents must match the action projection dtype: "
+                    f"latents={action_latents.dtype}, projection={self.action_proj_in.dtype}."
+                )
+            hidden_action = self.action_proj_in(
+                self.pack_action(action_latents), action_domain_ids_tensor
+            )
+            hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
+            if action_noisy_mask is None:
+                hidden_action = hidden_action + time_embed.unsqueeze(1)
+            else:
+                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(
+                    hidden_action.dtype
+                )
+            hidden_gen = torch.cat([hidden_gen, hidden_action], dim=1)
+            # The rotary table is request-invariant: chunk size, prompt lengths,
+            # fps and the frame offset are all fixed once the request starts.
+            # Recomputing it per step costs a device-to-host sync per batch
+            # element (the prompt-length readback), an H2D copy of the position
+            # ids, and two concatenations -- all for the same numbers.
+            if self.cached_freqs_gen_combined is None:
+                effective_action_fps = (
+                    action_fps if action_fps is not None else (fps or self.base_fps)
+                )
+                cos_a, sin_a = self._compute_action_rope_freqs(
+                    T_action,
+                    text_mask,
+                    float(effective_action_fps),
+                    action_start_frame_offset,
+                    hidden_states.device,
+                    hidden_gen.dtype,
+                )
+                cos_v, sin_v = self.cached_freqs_gen
+                self.cached_freqs_gen_combined = (
+                    torch.cat([cos_v, cos_a], dim=1),
+                    torch.cat([sin_v, sin_a], dim=1),
+                )
+            freqs_gen_combined = self.cached_freqs_gen_combined
+        elif audio_latents is not None and self.audio_gen:
             T_audio = audio_latents.shape[2]
             hidden_audio = self.pack_audio_latents(audio_latents).to(hidden_gen.dtype)
             hidden_audio = self.audio2llm(hidden_audio) + self.audio_modality_embed
             hidden_audio = hidden_audio + time_embed.unsqueeze(1)
-            cos_a, sin_a = self._compute_audio_rope_freqs(
-                T_audio,
-                text_mask,
-                float(self.audio_latent_fps),
-                hidden_states.device,
-                hidden_gen.dtype,
-            )
-            # [B, T_vid+T_audio, hidden_size]
             hidden_gen = torch.cat([hidden_gen, hidden_audio], dim=1)
-            cos_v, sin_v = self.cached_freqs_gen
-            freqs_gen_combined = (
-                torch.cat([cos_v, cos_a], dim=1),
-                torch.cat([sin_v, sin_a], dim=1),
-            )
+            if self.cached_freqs_gen_combined is None:
+                cos_a, sin_a = self._compute_audio_rope_freqs(
+                    T_audio,
+                    text_mask,
+                    float(self.audio_latent_fps),
+                    hidden_states.device,
+                    hidden_gen.dtype,
+                )
+                cos_v, sin_v = self.cached_freqs_gen
+                self.cached_freqs_gen_combined = (
+                    torch.cat([cos_v, cos_a], dim=1),
+                    torch.cat([sin_v, sin_a], dim=1),
+                )
+            freqs_gen_combined = self.cached_freqs_gen_combined
+        elif has_control:
+            for idx, control in enumerate(control_lantent_list):
+                if control.shape != hidden_states.shape:
+                    raise ValueError(
+                        "Cosmos3 transfer control latent shape must match target latent shape: "
+                        f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
+                    )
+                hidden_control = self.vae2llm(
+                    self.patchify(
+                        control.to(device=hidden_gen.device, dtype=hidden_gen.dtype), T, H, W
+                    )
+                )
+                hidden_controls.append(hidden_control)
+                T_control += hidden_control.shape[1]
+            hidden_gen = torch.cat([*hidden_controls, hidden_gen], dim=1)
+            freqs_gen_combined = self.cached_freqs_gen
         else:
             freqs_gen_combined = self.cached_freqs_gen
         # --------------------------------------------------------------------------
@@ -1104,45 +1722,63 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
 
-        for i, layer in enumerate(self.gen_layers):
-            k_und, v_und = self.cached_kv[i]
-            if not self.sharder.is_active:
-                k_und = k_und[:, :max_real_len]
-                v_und = v_und[:, :max_real_len]
-                hidden_gen = layer(
-                    hidden_gen,
-                    k_und,
-                    v_und,
-                    freqs_gen,
-                    timestep=attention_timestep,
-                    real_text_lens=real_text_lens,
-                )
-            else:
-                hidden_gen = layer(
-                    hidden_gen,
-                    k_und,
-                    v_und,
-                    freqs_gen,
-                    timestep=attention_timestep,
-                )
+        with offload_context("generator"):
+            for i, layer in enumerate(self.gen_layers):
+                k_und, v_und = self.cached_kv[i]
+                if not self.sharder.is_active:
+                    k_und = k_und[:, :max_real_len]
+                    v_und = v_und[:, :max_real_len]
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        freqs_gen,
+                        timestep=timestep,
+                        real_text_lens=real_text_lens,
+                    )
+                else:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        freqs_gen,
+                        timestep=timestep,
+                    )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
         # --- Decode video velocity ------------------------------------------------
-        video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, :T_vid_tokens]), T, H, W)
+        video_vel = self.unpatchify(
+            self.llm2vae(hidden_gen[:, T_control : T_control + T_vid_tokens]), T, H, W
+        )
 
-        # --- Decode audio velocity (if requested) ---------------------------------
+        # --- Decode extra-modality velocity (action XOR audio; follows video) ---
+        # Sequence layout is control|video|action-or-audio. Controls are prepended
+        # and are mutually exclusive with both action and audio, so T_control is
+        # zero whenever this span is non-empty; carrying it keeps the offset right
+        # if that exclusion is ever relaxed.
+        extra_start = T_control + T_vid_tokens
         audio_vel = None
         if T_audio > 0 and audio_latents is not None and self.audio_gen:
-            # hidden_gen[:, T_vid_tokens:] → [B, T_audio, hidden_size]
-            # → llm2audio → [B, T_audio, audio_dim] → unpack → [B, audio_dim, T_audio]
             audio_vel = self.unpack_audio_latents(
-                self.llm2audio(hidden_gen[:, T_vid_tokens : T_vid_tokens + T_audio])
+                self.llm2audio(hidden_gen[:, extra_start : extra_start + T_audio])
             )
 
-        return TransformerOutput(video=video_vel, image=video_vel, audio=audio_vel)
+        action_vel = None
+        if T_action > 0 and action_latents is not None and self.action_gen:
+            assert action_domain_ids_tensor is not None
+            action_vel = self.unpack_action(
+                self.action_proj_out(
+                    hidden_gen[:, extra_start : extra_start + T_action],
+                    action_domain_ids_tensor,
+                )
+            )
+
+        return TransformerOutput(
+            video=video_vel, image=video_vel, audio=audio_vel, action=action_vel
+        )
 
     def load_weights(self, weights: dict) -> None:
         """Load weights with key remapping from Cosmos3-Nano / Diffusers checkpoints.
@@ -1154,21 +1790,23 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         remapped = {}
         skip_prefixes = (
             "lm_head.",
-            "action_modality_embed",
-            "action_proj_",
+            "action_pos_embed.",
         )
+        skipped_keys = []
 
         for key, value in weights.items():
             k = key
 
-            if k.startswith(skip_prefixes):
-                continue
-
-            # Normalize a leading "model." prefix up front so every remap below
-            # matches whether or not the checkpoint namespaces top-level tensors
-            # (e.g. "model.audio_proj_in.weight") under "model.".
+            # Normalize a leading "model." prefix up front so every skip and
+            # remap below matches whether or not the checkpoint namespaces
+            # top-level tensors (e.g. "model.audio_proj_in.weight") under
+            # "model.".
             if k.startswith("model."):
                 k = k[len("model.") :]
+
+            if k.startswith(skip_prefixes):
+                skipped_keys.append(k)
+                continue
 
             if k.startswith("proj_in."):
                 remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
@@ -1190,15 +1828,29 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 remapped[k] = value
                 continue
 
+            if k.startswith("action_modality_embed"):
+                remapped[k] = value
+                continue
+
+            if k.startswith("action_proj_in.") or k.startswith("action_proj_out."):
+                remapped[k] = value
+                continue
+
             if k.startswith("time_embedder.linear"):
                 k = k.replace("time_embedder.linear_1.", "time_embedder.mlp.linear_1.")
                 k = k.replace("time_embedder.linear_2.", "time_embedder.mlp.linear_2.")
                 remapped[k] = value
                 continue
 
-            # embed_tokens and norm → language_model.*
-            if k.startswith("embed_tokens.") or k.startswith("norm."):
+            # embed_tokens → language_model.*
+            if k.startswith("embed_tokens."):
                 remapped[f"language_model.{k}"] = value
+                continue
+
+            # Und final norm: normalizes the und hidden state consumed only by
+            # lm_head; the generation path uses per-layer und K/V exclusively.
+            if k.startswith("norm."):
+                skipped_keys.append(k)
                 continue
 
             # norm_moe_gen stays at top level
@@ -1227,6 +1879,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "self_attn.to_out.": f"{und_lp}.self_attn.to_out.0.",
                 "self_attn.norm_q.": f"{und_lp}.self_attn.norm_q.",
                 "self_attn.norm_k.": f"{und_lp}.self_attn.norm_k.",
+                "self_attn.k_norm_und_for_gen.": f"{und_lp}.self_attn.k_norm_und_for_gen.",
             }
 
             # --- GEN attention → gen_layers.{i}.cross_attention.* ---
@@ -1278,35 +1931,78 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         }
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
-        for param_name, param in self._parameters.items():
-            if param is not None and param_name in remapped:
-                param.data.copy_(remapped[param_name].to(param.dtype))
+        # Coverage is default-fail in both directions: every parameter of every
+        # constructed module must receive a checkpoint tensor, and every mapped
+        # checkpoint tensor must land on a parameter. The remap-stage skip list
+        # above is the only source of intentional omissions.
+        missing = []
+        consumed = set()
 
-        loaded_linear = 0
-        loaded_other = 0
-        skipped_modules = []
+        for param_name, param in self._parameters.items():
+            if param is None:
+                continue
+            if param_name in remapped:
+                param.data.copy_(remapped[param_name].to(param.dtype))
+                consumed.add(param_name)
+            else:
+                missing.append(param_name)
+
+        def _linear_source_prefixes(module: Linear, name: str) -> list:
+            weights_config = getattr(module, "weights_loading_config", None)
+            weight_mode = getattr(weights_config, "weight_mode", None)
+            if weight_mode in (WeightMode.FUSED_QKV_LINEAR, WeightMode.FUSED_GATE_UP_LINEAR):
+                parent = name.rsplit(".", 1)[0]
+                for suffix, sources in loader.params_map.items():
+                    if name == suffix or name.endswith("." + suffix):
+                        return [f"{parent}.{source}." for source in sources]
+            return [f"{name}."]
+
         for name, module in self.named_modules():
-            if len(module._parameters) == 0:
+            if not name or len(module._parameters) == 0:
                 continue
 
             if isinstance(module, Linear):
                 weight_dicts = loader.get_linear_weights(module, name, remapped)
-                if weight_dicts:
+                # Fused sources yield one dict each; an empty dict means that
+                # source is absent, so a partially covered fusion also fails.
+                if weight_dicts and all(weight_dicts):
                     loader.load_linear_weights(module, name, weight_dicts)
-                    loaded_linear += 1
+                    prefixes = _linear_source_prefixes(module, name)
+                    consumed.update(k for k in remapped if any(k.startswith(p) for p in prefixes))
                 else:
-                    skipped_modules.append(f"{name}(Linear)")
+                    missing.append(f"{name}(Linear)")
             else:
                 module_weights = loader.filter_weights(name, remapped)
-                if module_weights:
-                    loaded_other += 1
-                else:
-                    has_params = any(p is not None for p in module._parameters.values())
-                    if has_params and name:
-                        skipped_modules.append(f"{name}({type(module).__name__})")
                 for param_name, param in module._parameters.items():
-                    if param is not None and param_name in module_weights:
+                    if param is None:
+                        continue
+                    if param_name in module_weights:
                         param.data.copy_(module_weights[param_name].to(param.dtype))
+                        consumed.add(f"{name}.{param_name}")
+                    else:
+                        missing.append(f"{name}.{param_name}")
+
+        if missing:
+            preview = ", ".join(missing[:10])
+            suffix = " ..." if len(missing) > 10 else ""
+            raise ValueError(
+                f"Cosmos3 checkpoint is missing weights for {len(missing)} constructed "
+                f"parameter(s)/module(s): {preview}{suffix}"
+            )
+        unconsumed = [k for k in remapped if k not in consumed]
+        if unconsumed:
+            preview = ", ".join(unconsumed[:10])
+            suffix = " ..." if len(unconsumed) > 10 else ""
+            logger.warning(
+                f"{len(unconsumed)} mapped checkpoint tensor(s) matched no constructed "
+                f"parameter: {preview}{suffix}"
+            )
+        if skipped_keys:
+            logger.info(
+                f"Skipped {len(skipped_keys)} intentionally unused checkpoint tensors "
+                f"(lm_head / und final norm / action heads): "
+                f"{', '.join(sorted(set(k.split('.')[0] for k in skipped_keys)))}"
+            )
 
     def post_load_weights(self) -> None:
         """Post-load processing: dtype conversion and Linear finalization."""
@@ -1321,6 +2017,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             self.audio2llm.to(target_dtype)
             self.llm2audio.to(target_dtype)
             self.audio_modality_embed.data = self.audio_modality_embed.data.to(target_dtype)
+
+        if self.action_gen:
+            self.action_modality_embed.data = self.action_modality_embed.data.to(target_dtype)
+            self.action_proj_in.post_load_weights()
+            self.action_proj_out.post_load_weights()
 
         for _, module in self.named_modules():
             if isinstance(module, Linear) or isinstance(module, Qwen3VLTextRMSNorm):

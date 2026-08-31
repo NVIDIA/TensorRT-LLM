@@ -201,6 +201,7 @@ class ADPRouter(ABC):
                 dist=dist,
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
+                new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
             )
 
         if (
@@ -797,10 +798,11 @@ class KVCacheAwareADPRouter(ADPRouter):
 
 class ConversationAwareADPRouter(ADPRouter):
     """Pins each conversation to a single attention-DP rank: the first request
-    of a conversation is round-robined, and every later request with the same
+    of a conversation is placed by ``new_conv_placement`` (round-robin by
+    default, or least-queued), and every later request with the same
     ``conversation_id`` returns to that rank, keeping the conversation's
-    KV-cache prefix on one rank. Falls back to load-balanced round-robin when no
-    ``conversation_id`` is present.
+    KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
+    back to the same ``new_conv_placement`` policy.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
@@ -812,11 +814,15 @@ class ConversationAwareADPRouter(ADPRouter):
         dist: "Distributed",
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
+        new_conv_placement: str = "round_robin",
     ):
         super().__init__(dist)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
+        self._new_conv_placement = (
+            "least_queued" if new_conv_placement == "least_queued" else "round_robin"
+        )
         self._round_robin_cursor = 0
 
     def create_rank_state(
@@ -851,6 +857,42 @@ class ConversationAwareADPRouter(ADPRouter):
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
 
+    def _assign_new_conversation_explicit_dp_ranks(
+        self,
+        requests: List["RequestQueueItem"],
+        all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
+        all_ranks_num_active_requests: List[int],
+        max_num_active_requests: int,
+    ) -> List["RequestQueueItem"]:
+        """Place explicit first turns and establish their affinity binding.
+
+        Once a conversation is bound, its recorded rank takes precedence over
+        later explicit rank hints. Requests whose explicit target is full remain
+        eligible for the normal affinity/load-balanced path below.
+        """
+        remaining: List["RequestQueueItem"] = []
+        for req_item in requests:
+            conv_id = self._conversation_id(req_item)
+            if conv_id is not None and conv_id in self._conv_to_rank:
+                remaining.append(req_item)
+                continue
+
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            target_dp_rank = (
+                scheduling_params.attention_dp_rank if scheduling_params is not None else None
+            )
+            if (
+                target_dp_rank is not None
+                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+            ):
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+                if conv_id is not None:
+                    self._record_target_rank(conv_id, target_dp_rank)
+            else:
+                remaining.append(req_item)
+        return remaining
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -871,21 +913,25 @@ class ConversationAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
-        # 1) Honour an explicit attention_dp_rank first (strict placement).
-        remaining_unscheduled = self._assign_explicit_dp_ranks(
+        # 1) Honour an explicit attention_dp_rank for a new conversation and
+        #    record that placement. Existing conversations keep their binding.
+        remaining_unscheduled = self._assign_new_conversation_explicit_dp_ranks(
             sorted_requests,
             all_ranks_new_requests,
             all_ranks_num_active_requests,
             max_num_active_requests,
         )
 
-        # 2) Loose soft cap for spreading new conversations across ranks; sticky
-        #    returns may exceed it (hard cap), so it is re-bumped after the loop.
+        # 2) Soft cap for spreading new conversations across ranks, clamped to
+        #    per-rank slot capacity so no placement path can overfill a rank.
+        #    Sticky returns gate on the hard cap and may still exceed this cap,
+        #    so the returned value is re-bumped after the loop.
         expected_num_active_requests = self._expected_num_active_requests(
             all_ranks_num_active_requests,
             len(remaining_unscheduled),
             tp_size,
             multiplier=self._fair_share_multiplier,
+            hard_cap=max_num_active_requests,
         )
 
         def _least_loaded(soft_cap: int) -> int:
@@ -923,8 +969,13 @@ class ConversationAwareADPRouter(ADPRouter):
 
             if rank is None:
                 # First turn of a new conversation, sticky-overflow, or no
-                # conversation_id -> round-robin spread under the soft cap.
-                rank = _next_rr(expected_num_active_requests)
+                # conversation_id -> spread under the soft cap: round-robin
+                # (count-uniform) or least-queued (steers away from ranks kept
+                # busy by heavy pinned conversations).
+                if self._new_conv_placement == "least_queued":
+                    rank = _least_loaded(expected_num_active_requests)
+                else:
+                    rank = _next_rr(expected_num_active_requests)
                 if conv_id is not None and conv_id not in self._conv_to_rank:
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)

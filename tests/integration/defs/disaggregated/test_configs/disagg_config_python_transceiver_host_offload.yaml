@@ -1,0 +1,58 @@
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+hostname: localhost
+port: 8000
+backend: "pytorch"
+cuda_graph_config: null
+free_gpu_memory_fraction: 0.2
+context_servers:
+  num_instances: 1
+  max_batch_size: 4
+  max_num_tokens: 4096
+  max_seq_len: 2048
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    # Pin primary pool capacity deterministically. 1024 tokens /
+    # tokens_per_block(32) = 32 primary blocks. Each post_client_test
+    # prompt is ~200 tokens ≈ 6-7 blocks, and we send 6 distinct ones
+    # (~36-42 blocks total) — guaranteeing eviction to host and forcing
+    # block-id != primary-slot divergence on reuse-driven onboard.
+    # Smaller blocks (32 vs 64) make the primary pool divide into more
+    # slots, making block-id reassignment after free/reuse much more
+    # likely to land on a non-original slot.
+    max_tokens: 1024
+    tokens_per_block: 32
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    # 256 MiB host cache: must be > 0 to actually allocate the secondary
+    # pool, and large enough to absorb the offloaded prefixes.
+    host_cache_size: 268435456
+    # Default secondary_offload_min_priority is 50; lowering it makes any
+    # priority-50 (default) committed block eligible for offload as soon
+    # as primary memory is contended.
+    secondary_offload_min_priority: 0
+    event_buffer_max_size: 1024
+  disable_overlap_scheduler: True
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_batch_size: 16
+  max_num_tokens: 4096
+  max_seq_len: 2048
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    tokens_per_block: 32
+  disable_overlap_scheduler: False
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+  urls:
+      - "localhost:8002"

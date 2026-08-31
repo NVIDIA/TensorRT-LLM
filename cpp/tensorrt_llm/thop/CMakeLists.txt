@@ -31,8 +31,11 @@ endif()
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
-                                      ${CURAND_LIB})
+# Declare the dependency on the main shared library explicitly so consumers
+# (e.g. thUtilsTest) place it after th_utils on the link line; this was
+# previously satisfied transitively via the removed TensorRT plugin target.
+target_link_libraries(th_utils PUBLIC ${SHARED_TARGET} ${TORCH_LIBRARIES}
+                                      ${CUBLAS_LIB} ${CURAND_LIB})
 
 # TODO This does not compile with internal cutlass MOE gemm
 add_library(
@@ -70,7 +73,12 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
+  deepseekV4BlockTableOp.cpp
+  inverseRopeFp8QuantOp.cpp
+  kdaDecodeOp.cpp
+  attnResOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
@@ -80,6 +88,7 @@ add_library(
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
+  rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
@@ -107,6 +116,9 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  sparseKvCacheCompactOp.cpp
+  minimaxM3Fp8IndexerOp.cpp
+  minimaxM3SelectBlocksOp.cpp
   mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
@@ -116,6 +128,7 @@ add_library(
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
+  localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp

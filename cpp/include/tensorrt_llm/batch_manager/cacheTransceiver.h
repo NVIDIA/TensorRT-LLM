@@ -22,15 +22,20 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <atomic>
+#include <cstddef>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <pybind11/pybind11.h>
+#include <string>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/custom_class.h>
 #include <torch/python.h>
@@ -54,6 +59,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+class ContextTransferCoordinator;
 
 class CacheTransceiverComm
 {
@@ -148,6 +154,25 @@ public:
         TLLM_THROW("Input arguments only supported in mpi");
     }
 
+    [[nodiscard]] std::unique_ptr<mpi::MpiRequest> sendAsync(
+        void const* buffer, std::size_t size, mpi::MpiType dtype, int dest, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->sendAsync(buffer, size, dtype, dest, tag);
+    }
+
+    [[nodiscard]] bool iprobe(int source, mpi::MpiTag tag, MPI_Status* status) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->iprobe(source, tag, status);
+    }
+
+    void recv(void* buffer, std::size_t size, mpi::MpiType dtype, int source, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        static_cast<void>(mMpiComm->recv(buffer, size, dtype, source, tag));
+    }
+
     CacheTransceiverComm split(int color, int key)
     {
         if (isMpi())
@@ -226,6 +251,17 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    /// Get the serialized DataTransceiverState (CacheState + CommState) for this transceiver.
+    [[nodiscard]] virtual std::vector<char> getSerializedDataTransceiverState() const
+    {
+        return {};
+    }
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -233,24 +269,23 @@ class CacheTransceiver : public BaseCacheTransceiver
 public:
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
         executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {});
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, std::vector<SizeType32> const& indexerLayerNumPerPP = {});
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {})
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP,
+            indexerLayerNumPerPP)
     {
     }
 
@@ -273,10 +308,50 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
+
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
+    /// Return a human-readable dump of transceiver state for debugging hangs.
+    std::string getStatusDump() const;
+
 private:
+    struct StatusSnapshot
+    {
+        size_t senderAsyncActive{0};
+        size_t requesterAsyncActive{0};
+        size_t timedOutSenders{0};
+        size_t timedOutRequesters{0};
+        size_t cancelingSenders{0};
+        size_t cancelingRequesters{0};
+        size_t completedSenders{0};
+        size_t completedRequesters{0};
+        size_t failedSenders{0};
+        size_t failedRequesters{0};
+        size_t sendersAwaitingConsensus{0};
+        size_t requestersAwaitingConsensus{0};
+    };
+
+    class SyncRequesterStatusGuard
+    {
+    public:
+        explicit SyncRequesterStatusGuard(CacheTransceiver& transceiver);
+        ~SyncRequesterStatusGuard() noexcept;
+
+        SyncRequesterStatusGuard(SyncRequesterStatusGuard const&) = delete;
+        SyncRequesterStatusGuard& operator=(SyncRequesterStatusGuard const&) = delete;
+
+    private:
+        CacheTransceiver& mTransceiver;
+    };
+
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
+
+    // Append one row per completed request to the gen-side transfer summary CSV. Opens the file
+    // lazily on first use; expects timing to already be synced across ranks by the caller.
+    void writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests);
+    void publishStatusSnapshot() noexcept;
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
@@ -285,19 +360,29 @@ private:
     // request while a C++ status check still dereferences it.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
-    // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
+    // Dedup timeout logs separately from accepted cancellation requests so a
+    // backend that initially declines cancellation is retried on later polls.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCancelRequestedSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCancelRequestedRequesterIds;
     std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedSenderRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mSenderRequestsAwaitingConsensus;
     std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
+    std::atomic_size_t mSyncRequesterActive{0};
+    // Live transfer containers are owned by the executor worker thread. Synchronous receive threads update only the
+    // atomic count above. The executor publishes snapshots after state transitions, while the hang-detector thread only
+    // copies the snapshot under this short lock.
+    mutable std::mutex mStatusSnapshotMutex;
+    StatusSnapshot mStatusSnapshot;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
+    std::unique_ptr<ContextTransferCoordinator> mContextTransferCoordinator;
 
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
@@ -306,9 +391,15 @@ private:
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
 
-    rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
     std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
+
+    // Unique instance identifier for CSV file naming (avoids collisions across gen instances)
+    std::string mInstanceId;
+
+    // Gen-side transfer summary CSV (written after timing sync)
+    std::ofstream mGenTransferSummaryFile;
+    std::mutex mGenTransferSummaryMutex;
 
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.

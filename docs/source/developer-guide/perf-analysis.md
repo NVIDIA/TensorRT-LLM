@@ -55,6 +55,37 @@ Append “python-gil” to Nsys “-t” option.
 1. Set environment variable `TLLM_PROFILE_START_STOP=A-B` to specify the range of the iterations to be collected.
 2. Set environment variable `TLLM_TORCH_PROFILE_TRACE=<path>`, and the results will be saved to `<path>`.
 
+For VisualGen, use `TLLM_PROFILE_VISUAL_GEN_START_STOP` instead. Numeric ranges select
+per-request denoise steps, while `predenoise`, `postdenoise`, and `all` select the
+corresponding generation phases. For example:
+
+```bash
+TLLM_PROFILE_VISUAL_GEN_START_STOP=0-4 \
+TLLM_TORCH_PROFILE_TRACE=/tmp/visual-gen-trace.json \
+python examples/visual_gen/quickstart_example.py
+```
+
+Each process writes its trace to a rank-specific path such as
+`/tmp/visual-gen-trace-rank-0.json`. If a process captures more than one
+window, later traces add a window suffix such as
+`/tmp/visual-gen-trace-rank-0-window-1.json`.
+
+These ranges use the existing VisualGen CUDA/Nsight boundaries. `all` captures
+the complete request from text encoding through VAE decode. `predenoise`
+captures text encoding, latent preparation, and denoise-loop setup;
+`postdenoise` captures VAE decode and the remaining request work.
+
+Two contracts worth knowing: a numeric range never extends past the denoise loop
+it selects (a stop index beyond the last step closes at the last step instead),
+and on a pipeline that runs more than one denoise loop per request, the per-loop
+modes apply to each loop — a numeric range writes one trace per loop, while
+`postdenoise` arms after the first loop rather than the last. All windows open at
+the pipeline's inference entry point, so executor-side request preparation falls
+outside them even though it counts toward the reported `generation` latency.
+
+For the per-mode specifics, see `parse_profile_range` in
+`tensorrt_llm/_torch/visual_gen/profiler.py`.
+
 ### Visualize the PyTorch profiler results
 
 Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.

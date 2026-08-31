@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import List, Optional
 
+import pytest
 import torch
 import transformers
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -15,11 +16,15 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models import Qwen3_5MoeVLModel
+from tensorrt_llm._torch.models import Qwen3_5MoeForCausalLM, Qwen3_5MoeVLModel
 from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-from tensorrt_llm._torch.models.modeling_qwen3_5 import _normalize_qwen35_moe_vl_config
+from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+    _filter_language_model_weights,
+    _normalize_qwen35_moe_vl_config,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
     load_pretrained_config,
@@ -27,6 +32,13 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import (
+    _resolve_kv_cache_manager_v2_auto,
+    apply_model_defaults_to_llm_args,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def _write_qwen35_moe_vl_config(tmp_path: Path) -> Path:
@@ -125,15 +137,24 @@ def test_qwen35_moe_vl_resolves_mamba_ssm_cache_dtype(
     config = load_pretrained_config(str(_write_qwen35_moe_vl_config(tmp_path)))
     model_config = ModelConfig(pretrained_config=config)
 
+    # "auto" keeps the SSM cache in the model weights dtype for performance:
+    # the checkpoint's mamba_ssm_dtype=float32 expresses SSM compute intent,
+    # and honoring it for cache allocation disables the FlashInfer bf16-state
+    # GDN decode kernel and doubles state memory traffic.
     validate_and_set_mamba_ssm_cache_dtype(model_config, "auto")
-    assert model_config.quant_config.mamba_ssm_cache_dtype is torch.float32
+    assert model_config.quant_config.mamba_ssm_cache_dtype is torch.bfloat16
 
     mamba_params = extract_mamba_kv_cache_params(
         config.text_config,
         quant_config=model_config.quant_config,
     )
     assert mamba_params.dtype is torch.bfloat16
-    assert mamba_params.mamba_ssm_cache_dtype is torch.float32
+    assert mamba_params.mamba_ssm_cache_dtype is torch.bfloat16
+
+    # Explicit opt-in honors the checkpoint's fp32 SSM state intent.
+    opt_in_config = ModelConfig(pretrained_config=config)
+    validate_and_set_mamba_ssm_cache_dtype(opt_in_config, "float32")
+    assert opt_in_config.quant_config.mamba_ssm_cache_dtype is torch.float32
 
 
 def test_qwen35_moe_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
@@ -145,6 +166,57 @@ def test_qwen35_moe_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
         AutoCheckpointMapper.get("HF", "Qwen3_5MoeForConditionalGeneration"),
         Qwen3_5MoeHfWeightMapper,
     )
+
+
+@pytest.mark.parametrize(
+    ("quant_algo", "sm_version", "use_marlin"),
+    [
+        pytest.param(QuantAlgo.NVFP4, 90, True, id="hopper-nvfp4"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 90, True, id="hopper-mixed-precision"),
+        pytest.param(QuantAlgo.NVFP4, 100, False, id="blackwell-nvfp4"),
+    ],
+)
+def test_qwen35_moe_model_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo,
+    sm_version: int,
+    use_marlin: bool,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: sm_version,
+    )
+
+    expected_moe_backend = "MARLIN" if use_marlin else "AUTO"
+    expected_gemm_backends = ["marlin"] if use_marlin else ["cutlass", "cublaslt", "cuda_core"]
+    for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeVLModel):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        llm_args.quant_config = QuantConfig(quant_algo=quant_algo)
+        defaults = model_cls.get_model_defaults(llm_args)
+        apply_model_defaults_to_llm_args(llm_args, defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
+
+        assert llm_args.kv_cache_config.enable_block_reuse is False
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+        assert llm_args.moe_config.backend == expected_moe_backend
+        assert llm_args.nvfp4_gemm_config.allowed_backends == expected_gemm_backends
+
+
+def test_qwen35_vl_filter_preserves_consumable_weights() -> None:
+    language_weight = torch.tensor([1.0])
+    weights = ConsumableWeightsDict(
+        {
+            "model.language_model.layers.0.weight": language_weight,
+            "model.visual.patch_embed.weight": torch.tensor([2.0]),
+        }
+    )
+
+    filtered_weights = _filter_language_model_weights(weights)
+
+    assert isinstance(filtered_weights, ConsumableWeightsDict)
+    assert len(weights) == 0
+    assert len(filtered_weights) == 1
+    assert filtered_weights["model.language_model.layers.0.weight"] is language_weight
 
 
 def test_qwen35_moe_vl_placeholder_metadata_registered() -> None:

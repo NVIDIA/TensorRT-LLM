@@ -34,6 +34,9 @@ import importlib
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 # Each entry is (module_path, symbol_name).  The test ID shows both.
 DYNAMO_IMPORTS = [
     # -- top-level --
@@ -41,7 +44,6 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm", "MultimodalEncoder"),
     ("tensorrt_llm", "logger"),
     # -- llmapi --
-    ("tensorrt_llm.llmapi", "BuildConfig"),
     ("tensorrt_llm.llmapi", "CapacitySchedulerPolicy"),
     ("tensorrt_llm.llmapi", "DynamicBatchConfig"),
     ("tensorrt_llm.llmapi", "KvCacheConfig"),
@@ -52,6 +54,7 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm.tokenizer", "TOKENIZER_ALIASES"),
     ("tensorrt_llm.llmapi.llm_args", "KvCacheConnectorConfig"),
     ("tensorrt_llm.llmapi.llm_args", "TorchLlmArgs"),
+    ("tensorrt_llm.llmapi.llm_args", "BaseLlmArgs"),
     ("tensorrt_llm.llmapi.llm_utils", "update_llm_args_with_extra_options"),
     ("tensorrt_llm.llmapi.tokenizer", "tokenizer_factory"),
     ("tensorrt_llm.llmapi.disagg_utils", "get_global_disagg_request_id"),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ namespace Routing
 {
 
 // The type of method in top-K routing, for use in torch custom op
-// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/modules/fused_moe/routing.py
+// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/moe/fused_moe/routing.py
 enum class RoutingMethodType : int64_t
 {
     // Default: Softmax -> TopK
@@ -157,6 +157,24 @@ inline int32_t getMaxPermutedPaddedCount(
     return maxCgas * padding;
 }
 
+// Number of int32 elements to allocate for the route map (permutedIdxToTokenIdx).
+//
+// The trtllm-gen fused-permute gemm1 cubins (bmm_*_swiGlu_dynB_sm100f) speculatively load one
+// element past the end of the route map: the last CTA in the batch dimension issues a 4-byte read
+// of permutedIdxToTokenIdx[getMaxPermutedPaddedCount(...)]. The loaded value is never consumed --
+// padding rows are clamped away downstream -- but the access itself is out of bounds. It only
+// faults when the allocation happens to end on a page boundary, so whether it manifests depends on
+// the caching allocator's layout, which is what makes the resulting illegal-memory-access
+// intermittent and seemingly shape- and tactic-dependent (nvbugs/6165866).
+//
+// Until the kernels are regenerated with a guarded load, over-allocate the route map by one element
+// so the speculative read always lands inside the allocation. Only this buffer needs the padding;
+// the padded token counts that size the GEMM tensors are deliberately left untouched.
+inline int32_t getRouteMapAllocCount(int32_t maxPermutedPaddedCount)
+{
+    return maxPermutedPaddedCount + 1;
+}
+
 class Runner
 {
 public:
@@ -165,13 +183,13 @@ public:
     explicit Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim = 1);
 
     void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-        int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
-        float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
-        int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert,
-        int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-        batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-        RoutingMethodType routingMethodType, cudaStream_t stream,
+        int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
+        int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
+        int32_t* expertCountHistogram, int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx,
+        int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* expertIds,
+        int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+        int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput,
+        bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
         batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16,
         batchedGemm::trtllm::gen::Dtype dtypeRoutingBias = batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
@@ -297,6 +315,7 @@ struct MoERunnerArgs
 
     int32_t num_tokens{0};
     int32_t num_experts{0};
+    int32_t num_fused_shared_experts{0};
     // Hidden dimension input of MoE block. It might be padded.
     int32_t hidden_size{0};
     // Hidden dimension output of MoE block. It might be padded.
@@ -418,6 +437,9 @@ private:
     PermuteGemm1::Runner mPermuteGemm1;
     Gemm2::Runner mGemm2;
     ActType mActType;
+    // Kept so setOpsData can tell the activation launcher how much per-expert
+    // tile padding the permuted row space carries.
+    int32_t mTileTokensDim;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately

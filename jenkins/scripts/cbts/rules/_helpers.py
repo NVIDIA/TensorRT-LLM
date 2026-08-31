@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -72,6 +72,11 @@ def stages_by_yaml_stem(stages: dict[str, Stage]) -> dict[str, list[tuple[str, S
     for stage_name, stage in stages.items():
         out.setdefault(stage.yaml_stem, []).append((stage_name, stage))
     return out
+
+
+def is_perf_stem(stem: str) -> bool:
+    """Return whether a test-db stem belongs to perf or perf-sanity."""
+    return stem == "l0_perf" or "perf_sanity" in stem
 
 
 def iter_diff_changes(diff: str) -> Iterator[tuple[str, str]]:

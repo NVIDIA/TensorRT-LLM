@@ -187,13 +187,13 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
 // CUDA-graph capture: cuTensorMapEncodeTiled is a pure host function that does
 // not record any stream operation, so cache miss inside capture is safe. The
 // descriptor is passed by value as __grid_constant__; the recorded graph node
-// holds those bytes and replays correctly under workspace-stable replay
-// (already enforced by _FusedHcWorkspaceCache in mhc_cuda.py).
+// holds those bytes and replays correctly while captured tensor addresses
+// remain stable for the lifetime of the graph.
 //
 // Eviction: LRU bounded to kTmaDescCacheCap entries per thread. Eager mode
 // without CUDA-graph capture sees the PyTorch caching allocator hand out
-// fresh `base` pointers when the workspace cache misses, so the unbounded
-// version would grow on every shape transition. 128 entries × ~256 B = ~32 KB
+// fresh `base` pointers as public outputs are allocated, so the unbounded
+// version would grow across shape transitions. 128 entries × ~256 B = ~32 KB
 // per host thread — fits in L1, sized to cover the working set of any single
 // model (~4-8 distinct shapes × 4 descriptors each = O(20) live, with
 // headroom for shape transitions).

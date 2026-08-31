@@ -444,7 +444,12 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
         pytest.fail("cuTile returned empty output but PyTorch returned valid output")
     else:
         out_reshaped = kv_comp.view(batch_size, num_chunks, head_dim)
-        assert torch.allclose(out_py.to(kv_comp.dtype), out_reshaped, rtol=2e-3, atol=5e-3), (
+        # CUDA and PyTorch reductions can land on adjacent BF16 values near a tie;
+        # allow two ulps so the comparison is not sitting on the edge.
+        output_rtol = max(2e-3, 2 * torch.finfo(kv_comp.dtype).eps)
+        assert torch.allclose(
+            out_py.to(kv_comp.dtype), out_reshaped, rtol=output_rtol, atol=5e-3
+        ), (
             f"Output mismatch: max diff = {(out_py.to(kv_comp.dtype) - out_reshaped).abs().max():.6f}"
         )
 
@@ -1223,8 +1228,12 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
 
         if valid_outputs:
             out_kernel_valid = torch.cat(valid_outputs, dim=0)
+            # The CUDA and PyTorch reductions can land on adjacent BF16 values near a
+            # tie. One BF16 ulp is eps*|x|, so a 1-ulp rtol sits exactly on the edge of
+            # passing; allow two, which still fails far below any functional error.
+            output_rtol = max(2e-3, 2 * torch.finfo(out_kernel_valid.dtype).eps)
             assert torch.allclose(
-                out_py.to(out_kernel_valid.dtype), out_kernel_valid, rtol=2e-3, atol=5e-3
+                out_py.to(out_kernel_valid.dtype), out_kernel_valid, rtol=output_rtol, atol=5e-3
             ), (
                 f"Output mismatch: max diff = {(out_py.to(out_kernel_valid.dtype) - out_kernel_valid).abs().max():.6f}"
             )
@@ -1322,8 +1331,11 @@ def test_prefill_then_decode(
     if out_py_prefill is not None and kv_comp.numel() > 0:
         num_chunks = prefill_len // compress_ratio
         out_reshaped = kv_comp.view(batch_size, num_chunks, head_dim)
+        # CUDA and PyTorch reductions can land on adjacent BF16 values near a tie;
+        # allow two ulps so the comparison is not sitting on the edge.
+        output_rtol = max(2e-3, 2 * torch.finfo(kv_comp.dtype).eps)
         assert torch.allclose(
-            out_py_prefill.to(kv_comp.dtype), out_reshaped, rtol=2e-3, atol=5e-3
+            out_py_prefill.to(kv_comp.dtype), out_reshaped, rtol=output_rtol, atol=5e-3
         ), (
             f"Prefill output mismatch: {(out_py_prefill.to(kv_comp.dtype) - out_reshaped).abs().max():.6f}"
         )
@@ -1393,10 +1405,14 @@ def test_prefill_then_decode(
             for b in range(batch_size):
                 out_idx = cu_outputs_decode[b].item()
                 diff = out_py[b, 0, :head_dim].to(kv_comp_decode.dtype) - kv_comp_decode[out_idx, :]
+                # CUDA and PyTorch reductions can land on adjacent BF16 values
+                # near a tie; allow two ulps so the comparison is not sitting
+                # on the edge.
+                output_rtol = max(2e-3, 2 * torch.finfo(kv_comp_decode.dtype).eps)
                 assert torch.allclose(
                     out_py[b, 0, :head_dim].to(kv_comp_decode.dtype),
                     kv_comp_decode[out_idx, :],
-                    rtol=2e-3,
+                    rtol=output_rtol,
                     atol=5e-3,
                 ), (
                     f"Decode step {i} (token_idx={token_idx}), Batch {b}: mismatch diff={(diff).abs().max():.6f}"
@@ -1407,8 +1423,13 @@ def test_prefill_then_decode(
 MTP_CONFIGS = [
     pytest.param(1, 4, 128, True, 4, id="overlap_hd128_next4"),
     pytest.param(1, 4, 512, True, 3, id="overlap_hd512_next3"),
+    pytest.param(1, 4, 512, True, 8, id="overlap_hd512_next8"),
     pytest.param(2, 128, 128, False, 4, id="basic_hd128_multi_batch_next4"),
     pytest.param(1, 128, 512, False, 4, id="basic_hd512_next4"),
+    pytest.param(1, 128, 512, False, 5, id="basic_hd512_next5"),
+    pytest.param(1, 128, 512, False, 6, id="basic_hd512_next6"),
+    pytest.param(1, 128, 512, False, 7, id="basic_hd512_next7"),
+    pytest.param(1, 128, 512, False, 8, id="basic_hd512_next8"),
 ]
 
 
@@ -1524,6 +1545,54 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
                     ), f"Token {token_idx}, Batch {b}: mismatch diff={(diff).abs().max():.6f}"
 
         step += actual_n
+
+
+@pytest.mark.parametrize(
+    "next_n,storage_next_n",
+    [
+        pytest.param(0, 1, id="zero"),
+        pytest.param(9, 9, id="above_max"),
+        pytest.param((1 << 32) + 1, 1, id="large_int64"),
+    ],
+)
+def test_decode_rejects_unsupported_next_n(next_n, storage_next_n):
+    """Decode rejects next_n outside the supported range before narrowing."""
+    batch_size, compress_ratio, head_dim = 1, 4, 128
+    state_dim = 2 * head_dim
+    page_size = 8
+    max_blocks = (storage_next_n + page_size - 1) // page_size
+    num_outputs = max(1, (storage_next_n + compress_ratio - 1) // compress_ratio)
+
+    kv_score = torch.zeros(storage_next_n, 2 * state_dim, device="cuda")
+    ape = torch.zeros(compress_ratio, state_dim, device="cuda")
+    paged_kv = torch.zeros(max_blocks, page_size, state_dim, device="cuda")
+    paged_score = torch.zeros_like(paged_kv)
+    block_table = torch.arange(max_blocks, device="cuda", dtype=torch.int32).unsqueeze(0)
+    output = torch.empty(num_outputs, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_lens = torch.tensor([storage_next_n], device="cuda", dtype=torch.int32)
+    start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    cu_seq_lens = torch.tensor([0, storage_next_n], device="cuda", dtype=torch.int32)
+    cu_outputs = torch.tensor([0, num_outputs], device="cuda", dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match=r"next_n.*\[1, 8\]"):
+        decode_kernel(
+            kv_score,
+            ape,
+            kv_lens,
+            start_pos,
+            cu_seq_lens,
+            cu_outputs,
+            output,
+            paged_kv,
+            paged_score,
+            block_table,
+            block_table,
+            compress_ratio,
+            head_dim,
+            page_size,
+            next_n=next_n,
+        )
+        torch.cuda.synchronize()
 
 
 CHUNKED_PREFILL_CONFIGS = [

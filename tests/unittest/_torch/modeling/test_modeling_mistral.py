@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import os
 import re
@@ -19,10 +22,11 @@ from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
-from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
+from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -170,6 +174,43 @@ def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
 
     assert "_image_token_ids" in dict(model.named_buffers())
     assert "_image_token_ids" not in model.state_dict()
+    assert model._vision_tower is not None
+    assert model._multi_modal_projector is not None
+
+
+def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1_24b_config):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 1
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
+        disable_mm_encoder=True,
+    )
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert model._vision_tower is None
+    assert model._multi_modal_projector is None
+    assert not any(
+        name.startswith(("_vision_tower", "_multi_modal_projector"))
+        for name, _ in model.named_parameters()
+    )
+
+    with mock.patch.object(model.llm, "load_weights") as load_llm_weights:
+        model.load_weights({})
+    load_llm_weights.assert_called_once()
+
+    multimodal_params = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.empty(1, 3, _PATCH_SIZE, _PATCH_SIZE),
+                "image_sizes": [[_PATCH_SIZE, _PATCH_SIZE]],
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="require a local multimodal encoder"):
+        model.encode_multimodal_inputs([multimodal_params])
 
 
 @pytest.mark.parametrize("quant_algo", [None, "FP8"])
@@ -540,7 +581,7 @@ def test_processor_get_num_tokens_per_image(
     with mock.patch(
         "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
     ) as mocked_auto_processor:
-        input_processor = modeling_mistral.Mistral3InputProcessor(
+        input_processor = modeling_mistral.MistralHFInputProcessor(
             model_path=str(tmp_path),
             config=mistral_3_config,
             tokenizer=mock.MagicMock(),
@@ -637,7 +678,7 @@ def test_mistral_attention_swa_layer_types():
 # Deterministic dummy-input sizing (Mistral3 / Pixtral input processor).
 #
 # CPU-only unit tests for the encoder-profiling dummy contract: reach into
-# Mistral3InputProcessor directly (no model load) and stub the geometry the
+# MistralHFInputProcessor directly (no model load) and stub the geometry the
 # dummy math reads. The ViT token unit is the pre-merge patch count
 # ``(h//patch)*(w//patch)`` -- deliberately *not* the hashing path's LLM-side
 # Pixtral count with framing tokens.
@@ -649,7 +690,7 @@ def _make_dummy_processor(*, patch_size=14, spatial_merge_size=2, image_size=154
     ``_processor`` forces ``_vision_geometry`` to fall back to ``vision_config``
     (the HF ``mistral3`` path).
     """
-    instance = Mistral3InputProcessor.__new__(Mistral3InputProcessor)
+    instance = MistralHFInputProcessor.__new__(MistralHFInputProcessor)
     instance._config = SimpleNamespace(
         vision_config=SimpleNamespace(
             patch_size=patch_size, image_size=image_size, num_channels=num_channels
@@ -667,6 +708,26 @@ def test_dummy_mm_max_tokens_per_item_is_image_only():
     assert set(demand) == {"image"}
     # max square = 1540 (a multiple of patch*merge=28); patches = (1540/14)^2.
     assert demand["image"] == (1540 // 14) ** 2 == 110**2
+
+
+def test_attention_metadata_capacity_uses_token_budget():
+    proc = _make_dummy_processor(spatial_merge_size=2)
+
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=100) == {"attention": 25}
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=12) == {"attention": 3}
+
+
+def test_mistral_item_metadata_separates_patch_and_embedding_units():
+    processor = object.__new__(MistralHFInputProcessor)
+    processor._vision_geometry = lambda: (14, 2, 3, 1024)
+
+    metadata = processor.get_mm_encoder_item_metadata(
+        [], {"image": {"image_sizes": [[28, 56], [56, 56]]}}
+    )
+
+    assert metadata.item_refs == [("image", 0), ("image", 1)]
+    assert metadata.encoder_token_lengths == [8, 16]
+    assert metadata.output_embedding_lengths == [2, 4]
 
 
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
@@ -689,24 +750,68 @@ def test_dummy_get_size_rejects_non_positive_budget():
         proc.get_size_for_max_tokens(max_tokens=0)
 
 
-@pytest.mark.parametrize("budget", [4096, 8192])
-def test_dummy_get_dummy_mm_data_for_tokens_shapes_and_saturation(budget):
-    proc = _make_dummy_processor(num_channels=3)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float16
-    )
-    image = data["image"]
-    pv = image["pixel_values"]
-    sizes = image["image_sizes"]
-    n, c, h, w = pv.shape
-    assert c == 3 and pv.dtype == torch.float16
-    assert sizes == [[h, w]] * n
-    # The batch saturates the budget: total patches <= budget, within one image.
-    per_image = (h // 14) * (w // 14)
-    assert n * per_image <= budget
-    assert n * per_image + per_image > budget
-
-
-def test_dummy_for_tokens_empty_without_image_budget():
+def test_dummy_get_dummy_mm_data_rejects_negative_item_count():
     proc = _make_dummy_processor()
-    assert proc.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"audio": 1024}) == {}
+    with pytest.raises(ValueError, match=r"item counts must be nonnegative"):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": -1})
+
+
+@pytest.mark.parametrize("budget", [4096, 8192])
+def test_dummy_get_dummy_mm_data_saturates_budget(budget):
+    proc = _make_dummy_processor()
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": 1},
+        dtype=torch.float16,
+    )["image"]
+    pixel_values = image["pixel_values"]
+    num_images, channels, height, width = pixel_values.shape
+    assert num_images == 1
+    assert channels == 3
+    assert image["image_sizes"] == [[height, width]]
+    per_image = (height // 14) * (width // 14)
+    assert per_image <= budget
+    assert 2 * per_image > budget
+
+
+def test_dummy_get_dummy_mm_data_respects_requested_item_count():
+    proc = _make_dummy_processor(image_size=448)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"image": 3},
+        dtype=torch.float16,
+    )["image"]
+
+    assert image["pixel_values"].shape[0] == 3
+
+
+def test_dummy_mm_data_satisfies_the_encoder_input_contract():
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real batching step instead of restating its
+    expectations here, so a change on either side fails this test.
+    """
+    proc = _make_dummy_processor()
+    budget = 8192
+    tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
+    num_images = min(8, budget // tokens_per_image)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": num_images},
+        dtype=torch.float16,
+    )["image"]
+
+    # `_vision_forward` collects one entry per request and converts the sizes to
+    # tensors before batching; mirror that, then run the real batching step.
+    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values=[image["pixel_values"]],
+        image_sizes=[torch.tensor(image["image_sizes"])],
+    )
+
+    num_images = image["pixel_values"].shape[0]
+    assert batched_pixel_values.shape[0] == num_images
+    assert batched_sizes.shape == (num_images, 2)
+    assert batched_pixel_values.dtype == torch.float16

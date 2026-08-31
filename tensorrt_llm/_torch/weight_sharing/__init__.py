@@ -14,6 +14,23 @@
 # limitations under the License.
 """Backend-agnostic weight-sharing utilities (MX, GMS, ...)."""
 
+from tensorrt_llm._torch.weight_sharing.artifact_identity import (
+    ARTIFACT_IDENTITY_FORMAT_VERSION,
+    ArtifactIdentity,
+)
+from tensorrt_llm._torch.weight_sharing.post_transform_profiles import (
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PostTransformConfigIdentity,
+    PostTransformFeature,
+    PostTransformProfile,
+    PostTransformProfileRegistry,
+    PostTransformQualificationDecision,
+    PostTransformQualificationReason,
+    PostTransformRuntimeConfig,
+    PostTransformRuntimeConstraints,
+    PostTransformTransferScope,
+)
 from tensorrt_llm._torch.weight_sharing.source_identity import (
     SOURCE_IDENTITY_FORMAT_VERSION,
     IdentityCheckDecision,
@@ -25,7 +42,20 @@ from tensorrt_llm._torch.weight_sharing.source_identity import (
 )
 
 __all__ = [
+    "ARTIFACT_IDENTITY_FORMAT_VERSION",
+    "ArtifactIdentity",
+    "LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1",
+    "QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",
     "SOURCE_IDENTITY_FORMAT_VERSION",
+    "PostTransformConfigIdentity",
+    "PostTransformFeature",
+    "PostTransformProfile",
+    "PostTransformProfileRegistry",
+    "PostTransformQualificationDecision",
+    "PostTransformQualificationReason",
+    "PostTransformRuntimeConfig",
+    "PostTransformRuntimeConstraints",
+    "PostTransformTransferScope",
     "SourceIdentity",
     "IdentityMatchResult",
     "IdentityCheckPolicy",

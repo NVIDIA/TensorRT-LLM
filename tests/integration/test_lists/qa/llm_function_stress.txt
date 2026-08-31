@@ -7,6 +7,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-outp
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_5_4b_fp8_stress]
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-glm5_nvfp4_tp4_ep4_dp_stress]
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress]
+disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req10k-conc512-qwen3_32b_fp8_mixed_stress]
 stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml] TIMEOUT (45)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_fp8_8gpus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_nvfp4_4gpus

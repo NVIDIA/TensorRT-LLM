@@ -315,7 +315,10 @@ class DisaggClusterWorker:
         return get_worker_key(self._config.cluster_name, self._role,
                               self._worker_id)
 
-    async def register_worker(self, validator=None, retry_interval=5) -> bool:
+    async def register_worker(self,
+                              validator=None,
+                              retry_interval=5,
+                              overwrite_if_exists=False) -> bool:
         self._stop = False
         await self._cluster_storage.start()
         if validator and not validator():
@@ -330,6 +333,7 @@ class DisaggClusterWorker:
         success = await self._cluster_storage.set(
             self.worker_key,
             json.dumps(asdict(worker_info)),
+            overwrite_if_exists=overwrite_if_exists,
             ttl=self._config.inactive_timeout_sec)
         if not success:
             if retry_interval > 0:
@@ -337,7 +341,11 @@ class DisaggClusterWorker:
                     f"Worker {self.worker_info.worker_id} registration failed, retry in {retry_interval} seconds"
                 )
                 await asyncio.sleep(retry_interval)
-                return await self.register_worker(validator, retry_interval)
+                return await self.register_worker(
+                    validator,
+                    retry_interval,
+                    overwrite_if_exists=overwrite_if_exists)
+            return False
         else:
             logger.info(
                 f"Worker {self.worker_info.worker_id} registration successful")
@@ -383,7 +391,10 @@ class DisaggClusterWorker:
                 logger.warning(
                     f"Worker {self.worker_info.worker_id} heartbeat failed, re-registering {key_time()}"
                 )
-                await self.register_worker(validator)
+                # The failed refresh may race with storage expiry. Upsert this
+                # worker's unique key so recovery succeeds whether the stale
+                # registration still exists or has just expired.
+                await self.register_worker(validator, overwrite_if_exists=True)
             else:
                 logger.debug(
                     f"Worker {self.worker_info.worker_id} heartbeat successful {key_time()}"

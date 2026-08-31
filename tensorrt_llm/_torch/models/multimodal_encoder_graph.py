@@ -22,7 +22,6 @@ Design highlights:
 
 from __future__ import annotations
 
-import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -40,16 +39,11 @@ from typing import (
 import torch
 
 from ...logger import logger
-from ..utils import make_weak_ref
+from ..utils import make_weak_ref, torch_compiling
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
     from ..attention_backend import AttentionMetadata
-
-# Public env var that toggles the multimodal side-stream prefetch path. The value is read at runner
-# construction time; the runner refuses to start when the prefetch is on because graph replay would
-# potentially race on the static buffers.
-_MM_SIDE_STREAM_ENV = "TLLM_MM_SIDE_STREAM_MAX_AHEAD"
 
 # Single token kept aside for the dummy padding context when `enable_padding=True`.
 # The attention backend rejects zero-length contexts, so the dummy must contain at least one token
@@ -187,8 +181,6 @@ class MultimodalEncoderGraphRunner:
         self._config = config
         # Adopted from the first captured graph so subsequent bucket captures share the pool.
         self._memory_pool = None
-
-        self._check_side_stream_compatibility()
 
         if not config.buckets:
             raise ValueError(
@@ -391,7 +383,13 @@ class MultimodalEncoderGraphRunner:
             capture_kwargs["pool"] = self._memory_pool
 
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode():
+        # `torch_compiling(False)` for the same reason as `inference_mode`: ambient state the encoder
+        # region must not inherit from whoever called us. Capture can be driven from `load_weights`,
+        # outside any engine forward, so the process-global compile flag may still carry a previous
+        # engine's value. `encoder_fn` is handed its metadata explicitly, so its layers must take
+        # the eager path rather than the custom op, which resolves metadata from `extra_attrs` that
+        # only an engine forward binds.
+        with torch.inference_mode(), torch_compiling(False):
             for _ in range(self._config.warmup_steps):
                 self._encoder_fn(static_inputs, metadata)
             torch.cuda.synchronize()
@@ -516,21 +514,6 @@ class MultimodalEncoderGraphRunner:
         if tensor.shape[token_dim] == real_tokens:
             return tensor
         return tensor.narrow(token_dim, 0, real_tokens)
-
-    @staticmethod
-    def _check_side_stream_compatibility() -> None:
-        raw = os.environ.get(_MM_SIDE_STREAM_ENV)
-        if raw is None:
-            return
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"{_MM_SIDE_STREAM_ENV} must be an integer, got {raw!r}.") from exc
-        if value > 0:
-            raise RuntimeError(
-                f"MM CUDA graph capture is incompatible with {_MM_SIDE_STREAM_ENV} > 0. "
-                "Disable side-stream MM prefetch or disable MM CUDA graphs."
-            )
 
     def _log_cuda_graph_memory_warning(self) -> None:
         max_total_tokens = max(bucket.total_tokens for bucket in self._buckets)

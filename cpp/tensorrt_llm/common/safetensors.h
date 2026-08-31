@@ -18,7 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -34,13 +34,13 @@ public:
     [[nodiscard]] virtual void const* data() const = 0;
     [[nodiscard]] virtual int ndim() const = 0;
     [[nodiscard]] virtual std::vector<int64_t> const& dims() const = 0;
-    [[nodiscard]] virtual nvinfer1::DataType dtype() const = 0;
+    [[nodiscard]] virtual tensorrt_llm::DataType dtype() const = 0;
 
-    [[nodiscard]] nvinfer1::Dims trtDims() const
+    [[nodiscard]] tensorrt_llm::Dims trtDims() const
     {
-        nvinfer1::Dims dims;
+        tensorrt_llm::Dims dims;
         dims.nbDims = ndim();
-        TLLM_CHECK(dims.nbDims <= nvinfer1::Dims::MAX_DIMS);
+        TLLM_CHECK(dims.nbDims <= tensorrt_llm::Dims::MAX_DIMS);
         memset(dims.d, 0, sizeof(dims.d));
         for (int i = 0; i < dims.nbDims; ++i)
         {

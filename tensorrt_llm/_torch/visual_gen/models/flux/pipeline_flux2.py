@@ -18,15 +18,19 @@ Key differences from FLUX.1:
 - 4-axis RoPE: (32, 32, 32, 32) instead of 3-axis
 """
 
+import io
 import json
 import os
 import time
-from typing import List, Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
+import PIL.Image
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
+from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import (
     AutoModelForCausalLM,
@@ -92,10 +96,10 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
 @register_pipeline(
     "Flux2Pipeline",
     hf_ids=["black-forest-labs/FLUX.2-dev"],
-    doc="Black Forest Labs FLUX.2 family (text-to-image).",
+    doc="Black Forest Labs FLUX.2 family (text-to-image and reference-image generation).",
 )
 class Flux2Pipeline(BasePipeline):
-    """FLUX.2 Text-to-Image Pipeline.
+    """FLUX.2 text-to-image and reference-image pipeline.
 
     Supports FLUX.2 model variants:
     - FLUX.2-dev (35B): guidance_embeds=True, embedded guidance
@@ -104,6 +108,9 @@ class Flux2Pipeline(BasePipeline):
     Uses Mistral3 for text encoding and native Flux2Transformer2DModel.
     Follows WAN pipeline pattern for DiffusionModelLoader integration.
     """
+
+    supports_image_edit = True
+    derive_output_size_from_reference = True
 
     # Hidden state layers per text encoder type (auto-detected at load time)
     _TEXT_ENCODER_CONFIG = {
@@ -126,6 +133,14 @@ class Flux2Pipeline(BasePipeline):
         ):
             raise ValueError(
                 "Flux2Pipeline does not support CFG parallelism. Please set cfg_size to 1."
+            )
+
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for FLUX.2."
             )
 
         super().__init__(pipeline_config)
@@ -185,6 +200,17 @@ class Flux2Pipeline(BasePipeline):
 
     def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
         return (height, width)
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        cache_key = super().request_warmup_cache_key(req)
+        condition_images = req.prepared_inputs.get("condition_images")
+        if condition_images is None:
+            return cache_key
+
+        reference_shapes = tuple(
+            (int(image.shape[-2]), int(image.shape[-1])) for image in condition_images
+        )
+        return (*cache_key, len(condition_images), reference_shapes)
 
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
@@ -276,6 +302,7 @@ class Flux2Pipeline(BasePipeline):
             )
 
             self.vae_scale_factor = 8  # FLUX.2 uses scale_factor=8
+            self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
 
         # Scheduler
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -325,11 +352,13 @@ class Flux2Pipeline(BasePipeline):
                         guidance_param_name=guidance_param,
                         forward_params=forward_params,
                         return_dict_default=False,
+                        return_tuple_when_return_dict_false=True,
                     )
                 )
 
+            # Cache acceleration itself is enabled by the loader after
+            # torch.compile (see PipelineLoader.load).
             self._apply_teacache_coefficients(FLUX2_TEACACHE_COEFFICIENTS)
-            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):
@@ -340,6 +369,20 @@ class Flux2Pipeline(BasePipeline):
             "guidance_scale": 3.5,
             "max_sequence_length": 512,
         }
+
+    def prepare_request(self, req: Any) -> None:
+        """Load and preprocess reference images before warmup bookkeeping."""
+        if req.params.image is None:
+            return
+
+        reference_images = self._load_reference_images(req.params.image)
+        condition_images = self._preprocess_reference_images(reference_images)
+        req.params.height, req.params.width = self._resolve_target_dimensions(
+            req.params.height,
+            req.params.width,
+            condition_images,
+        )
+        req.prepared_inputs["condition_images"] = condition_images
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
@@ -352,6 +395,8 @@ class Flux2Pipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             num_images_per_prompt=req.params.num_images_per_prompt,
+            image=req.params.image,
+            _condition_images=req.prepared_inputs.get("condition_images"),
         )
 
     @torch.inference_mode()
@@ -359,21 +404,32 @@ class Flux2Pipeline(BasePipeline):
         self,
         prompt: Union[str, List[str]],
         seed: int,
-        height: int = 1024,
-        width: int = 1024,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 3.5,
         max_sequence_length: int = 512,
         num_images_per_prompt: int = 1,
+        image: Optional[
+            Union[
+                PIL.Image.Image,
+                str,
+                bytes,
+                List[Union[PIL.Image.Image, str, bytes]],
+            ]
+        ] = None,
+        _condition_images: Optional[List[torch.Tensor]] = None,
     ):
-        """Generate image(s) from text prompt(s).
+        """Generate image(s) from text and optional reference images.
 
         Args:
             prompt: Text prompt or list of prompts for image generation.
                 When a list is provided, generates one image per prompt in a
                 single batched forward pass.
-            height: Output image height (default: 1024)
-            width: Output image width (default: 1024)
+            height: Output image height. Defaults to the first processed
+                reference image's height, or 1024 without a reference.
+            width: Output image width. Defaults to the first processed
+                reference image's width, or 1024 without a reference.
             num_inference_steps: Number of denoising steps
             guidance_scale: Embedded guidance scale
             seed: Random seed for reproducibility.
@@ -381,6 +437,9 @@ class Flux2Pipeline(BasePipeline):
             num_images_per_prompt: Number of images to generate per prompt.
                 Each prompt's embeddings are repeated and independent noise is
                 sampled, producing N different images per prompt.
+            image: Reference image or shared list of reference images for
+                image conditioning. Public ``VisualGenParams`` requests use
+                file paths or encoded bytes; direct calls may also use PIL images.
 
         Returns:
             PipelineOutput with image tensor (B, H, W, C) where
@@ -409,8 +468,34 @@ class Flux2Pipeline(BasePipeline):
         if num_images_per_prompt > 1:
             prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
+        condition_images = _condition_images
+        if condition_images is None and image is not None:
+            reference_images = self._load_reference_images(image)
+            condition_images = self._preprocess_reference_images(reference_images)
+
+        height, width = self._resolve_target_dimensions(height, width, condition_images)
         latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
         logger.info(f"Latents shape: {latents.shape}")
+
+        image_latents = None
+        image_latent_ids = None
+        if condition_images is not None:
+            image_latents, image_latent_ids = self._prepare_image_latents(
+                condition_images,
+                batch_size=batch_size,
+            )
+            image_latents = image_latents.to(device=latents.device, dtype=latents.dtype)
+            image_latent_ids = image_latent_ids.to(device=latent_ids.device, dtype=latent_ids.dtype)
+            self._validate_reference_sequence_length(
+                target_seq_len=latents.shape[1],
+                reference_seq_len=image_latents.shape[1],
+                sharder=getattr(self.transformer, "sharder", None),
+            )
+            logger.info(
+                "Prepared %d FLUX.2 reference image(s), %d tokens total",
+                len(condition_images),
+                image_latents.shape[1],
+            )
 
         # Prepare timesteps with dynamic shifting
         # Use explicit linear sigmas (matches HF diffusers exactly)
@@ -447,25 +532,39 @@ class Flux2Pipeline(BasePipeline):
             extra_tensors,
         ):
             """Forward function for FLUX.2 transformer."""
-            return self.transformer(
-                hidden_states=latents,
+            transformer_latents = latents
+            transformer_latent_ids = latent_ids
+            if image_latents is not None:
+                transformer_latents = torch.cat([latents, image_latents], dim=1)
+                transformer_latent_ids = torch.cat([latent_ids, image_latent_ids], dim=0)
+
+            noise_pred = self.transformer(
+                hidden_states=transformer_latents,
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep / 1000,  # FLUX.2 expects normalized timesteps
-                img_ids=latent_ids,
+                img_ids=transformer_latent_ids,
                 txt_ids=text_ids,
                 guidance=guidance,
                 return_dict=False,
             )[0]
+            if image_latents is None:
+                return noise_pred
+            return noise_pred[:, : latents.shape[1]]
 
         timer.mark_denoise_start()
-        latents = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=prompt_embeds,
-            guidance_scale=1.0,  # No CFG: guidance is embedded
-            forward_fn=forward_fn,
-            timesteps=timesteps,
-        )
+        # Reference count and dimensions change the transformer sequence length.
+        # Run those requests outside CUDA graphs so a long-lived process does not
+        # retain one graph per reference shape. torch.compile remains active and
+        # may compile a new sequence shape; text-only requests still use graphs.
+        with self._temporarily_disable_cuda_graphs(disable=image_latents is not None):
+            latents = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=prompt_embeds,
+                guidance_scale=1.0,  # No CFG: guidance is embedded
+                forward_fn=forward_fn,
+                timesteps=timesteps,
+            )
         timer.mark_post_start()
 
         # Decode
@@ -479,6 +578,23 @@ class Flux2Pipeline(BasePipeline):
 
         timer.mark_end()
         return timer.fill(PipelineOutput(image=image))
+
+    @contextmanager
+    def _temporarily_disable_cuda_graphs(self, disable: bool) -> Iterator[None]:
+        """Bypass CUDA graphs for a request without discarding captured graphs."""
+        runners = list(getattr(self, "_cuda_graph_runners", {}).values())
+        if not disable or not runners:
+            yield
+            return
+
+        previous_states = [runner.enabled for runner in runners]
+        for runner in runners:
+            runner.enabled = False
+        try:
+            yield
+        finally:
+            for runner, enabled in zip(runners, previous_states):
+                runner.enabled = enabled
 
     def _encode_prompt(
         self,
@@ -620,6 +736,151 @@ class Flux2Pipeline(BasePipeline):
         latent_ids = torch.cartesian_prod(t_dim, h_dim, w_dim, l_dim).float()
 
         return latent_ids  # [seq_len, 4]
+
+    @staticmethod
+    def _load_reference_images(
+        image: Union[
+            PIL.Image.Image,
+            str,
+            bytes,
+            List[Union[PIL.Image.Image, str, bytes]],
+        ],
+    ) -> List[PIL.Image.Image]:
+        """Normalize supported reference-image inputs to materialized RGB images."""
+        inputs = image if isinstance(image, list) else [image]
+        if not inputs:
+            raise ValueError("`image` must contain at least one reference image.")
+
+        images = []
+        for index, item in enumerate(inputs):
+            try:
+                if isinstance(item, PIL.Image.Image):
+                    images.append(item.convert("RGB"))
+                elif isinstance(item, str):
+                    with PIL.Image.open(item) as loaded:
+                        images.append(loaded.convert("RGB"))
+                elif isinstance(item, bytes):
+                    with PIL.Image.open(io.BytesIO(item)) as loaded:
+                        images.append(loaded.convert("RGB"))
+                else:
+                    raise ValueError(
+                        "Reference images must be PIL images, file paths, or encoded bytes; "
+                        f"item {index} has type {type(item).__name__}."
+                    )
+            except OSError as exc:
+                raise ValueError(f"Unable to load reference image {index}: {exc}") from exc
+        return images
+
+    def _preprocess_reference_images(self, images: List[PIL.Image.Image]) -> List[torch.Tensor]:
+        """Apply the upstream FLUX.2 area, crop, and normalization rules."""
+        condition_images = []
+        multiple_of = self.vae_scale_factor * 2
+        for image in images:
+            self.image_processor.check_image_input(image)
+            image = self.image_processor._resize_if_exceeds_area(image)
+            image_width, image_height = image.size
+            image_width = (image_width // multiple_of) * multiple_of
+            image_height = (image_height // multiple_of) * multiple_of
+            condition_images.append(
+                self.image_processor.preprocess(
+                    image,
+                    height=image_height,
+                    width=image_width,
+                    resize_mode="crop",
+                )
+            )
+        return condition_images
+
+    @staticmethod
+    def _prepare_image_ids(
+        image_latents: List[torch.Tensor],
+        scale: int = 10,
+    ) -> torch.Tensor:
+        """Create reference-image position IDs with distinct FLUX.2 T offsets."""
+        image_ids = []
+        for index, latent in enumerate(image_latents):
+            _batch_size, _channels, height, width = latent.shape
+            device = latent.device
+            t_dim = torch.tensor([scale * (index + 1)], device=device)
+            h_dim = torch.arange(height, device=device)
+            w_dim = torch.arange(width, device=device)
+            l_dim = torch.arange(1, device=device)
+            image_ids.append(torch.cartesian_prod(t_dim, h_dim, w_dim, l_dim))
+        return torch.cat(image_ids, dim=0).float()
+
+    @staticmethod
+    def _validate_reference_sequence_length(
+        target_seq_len: int,
+        reference_seq_len: int,
+        sharder: Any,
+    ) -> None:
+        """Fail before denoising when sequence parallelism cannot shard image tokens."""
+        if sharder is None or not sharder.is_active:
+            return
+
+        combined_seq_len = target_seq_len + reference_seq_len
+        if combined_seq_len % sharder.size != 0:
+            raise ValueError(
+                "FLUX.2 reference-image conditioning produced "
+                f"{combined_seq_len} image tokens ({target_seq_len} target + "
+                f"{reference_seq_len} reference), which is not divisible by the configured "
+                f"sequence-parallel size {sharder.size}. Adjust the target/reference image "
+                "dimensions or disable sequence parallelism."
+            )
+
+    @staticmethod
+    def _resolve_target_dimensions(
+        height: Optional[int],
+        width: Optional[int],
+        condition_images: Optional[List[torch.Tensor]],
+    ) -> Tuple[int, int]:
+        """Match Diffusers defaults: first reference dimensions, then 1024 fallback."""
+        if condition_images:
+            height = height or condition_images[0].shape[-2]
+            width = width or condition_images[0].shape[-1]
+        return height or 1024, width or 1024
+
+    @staticmethod
+    def _patchify_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Patchify VAE latents from 32 channels to FLUX.2's packed 128 channels."""
+        batch_size, channels, height, width = latents.shape
+        latents = latents.reshape(batch_size, channels, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 1, 3, 5, 2, 4)
+        return latents.reshape(batch_size, channels * 4, height // 2, width // 2)
+
+    def _encode_vae_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Encode one preprocessed reference image deterministically."""
+        if image.ndim != 4:
+            raise ValueError(f"Expected reference image rank 4, got {image.ndim}.")
+
+        encoded = self.vae.encode(image)
+        image_latents = encoded.latent_dist.mode()
+        image_latents = self._patchify_latents(image_latents)
+
+        bn_eps = getattr(self.vae.config, "batch_norm_eps", 1e-5)
+        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + bn_eps).to(
+            image_latents.device, image_latents.dtype
+        )
+        return (image_latents - latents_bn_mean) / latents_bn_std
+
+    def _prepare_image_latents(
+        self,
+        images: List[torch.Tensor],
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """VAE-encode, pack, and concatenate a shared reference-image set."""
+        image_latents_4d = []
+        for image in images:
+            image = image.to(device=self.device, dtype=self.vae.dtype)
+            image_latents_4d.append(self._encode_vae_image(image))
+
+        image_ids = self._prepare_image_ids(image_latents_4d)
+        packed_latents = [self._pack_latents(latent) for latent in image_latents_4d]
+        image_latents = torch.cat(packed_latents, dim=1).repeat(batch_size, 1, 1)
+        return image_latents, image_ids
 
     def _prepare_latents(
         self,

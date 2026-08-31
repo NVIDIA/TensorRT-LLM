@@ -1,9 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import re
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
 from transformers import PretrainedConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantAlgo
 
 from ...inputs import (
     ContentFormat,
@@ -13,9 +35,10 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
+from ..utils import is_nvfp4_marlin_supported_sm
+from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
-from .modeling_multimodal_utils import _is_mm_disagg
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -34,6 +57,40 @@ _MTP_TOP_TO_TRTLLM = {
     "pre_fc_norm_embedding": "pre_fc_norm_embedding",
     "pre_fc_norm_hidden": "pre_fc_norm_hidden",
 }
+
+
+def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
+    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    quant_config = getattr(llm_args, "quant_config", None)
+    if getattr(quant_config, "quant_algo", None) in (
+        QuantAlgo.NVFP4,
+        QuantAlgo.MIXED_PRECISION,
+    ) and is_nvfp4_marlin_supported_sm(get_sm_version()):
+        # CUTLASS W4A4 requires Blackwell; use Marlin's W4A16 path instead.
+        defaults.update(
+            {
+                "moe_config": {
+                    "backend": "MARLIN",
+                },
+                "nvfp4_gemm_config": {
+                    "allowed_backends": ["marlin"],
+                },
+            }
+        )
+    return defaults
+
+
+def _filter_language_model_weights(weights: Dict[str, torch.Tensor]):
+    """Drop vision weights without disabling incremental weight consumption.
+
+    Ownership: a ConsumableWeightsDict input is emptied, since the returned
+    mapping aliases its tensors. The caller must use only the return value.
+    """
+    filtered_weights = {
+        key: value for key, value in weights.items() if not key.startswith("model.visual.")
+    }
+    return ConsumableWeightsDict.take_ownership(weights, filtered_weights)
 
 
 def _translate_mtp_pattern(name, n_hidden_layers):
@@ -330,16 +387,33 @@ def _normalize_qwen35_quantization_config(model_config) -> None:
     quantization_config["modules_to_not_convert"] = sorted(set(normalized_modules))
 
 
-def _normalize_qwen35_moe_vl_config(model_config) -> None:
-    """Adapt HF Qwen3.5-MoE VLM config to TRT-LLM runtime conventions."""
+# Map the inner (text) causal-LM arch to the outer VLM arch, used only for the
+# defensive fallback when a config arrives without an `architectures` field.
+_INNER_TO_OUTER_VL_ARCH = {
+    "Qwen3_5MoeForCausalLM": "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3_5ForCausalLM": "Qwen3_5ForConditionalGeneration",
+}
+
+
+def _normalize_qwen35_vl_config(model_config, inner_arch: str) -> None:
+    """Adapt an HF Qwen3.5 VLM config (MoE or dense) to TRT-LLM conventions.
+
+    Shared by both the MoE (`Qwen3_5MoeForConditionalGeneration` ->
+    `Qwen3_5MoeForCausalLM`) and dense (`Qwen3_5ForConditionalGeneration` ->
+    `Qwen3_5ForCausalLM`) VLM paths. The only difference between the two is the
+    inner causal-LM arch string written onto `text_config`; everything else
+    (mRoPE flattening, Qwen3Next text aliases, quantization exclude-module
+    rewrite) is identical. `_normalize_qwen35_qwen3next_text_aliases` is a no-op
+    for dense (its native `intermediate_size` is already present).
+    """
     if not getattr(model_config, "architectures", None):
-        model_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+        model_config.architectures = [_INNER_TO_OUTER_VL_ARCH.get(inner_arch, inner_arch)]
 
     text_config = getattr(model_config, "text_config", None)
     if text_config is None:
-        raise ValueError("Qwen3.5-MoE VLM config is missing text_config")
+        raise ValueError("Qwen3.5 VLM config is missing text_config")
 
-    text_config.architectures = ["Qwen3_5MoeForCausalLM"]
+    text_config.architectures = [inner_arch]
     _normalize_qwen35_qwen3next_text_aliases(text_config)
     _normalize_qwen35_mrope_config(text_config)
 
@@ -347,7 +421,47 @@ def _normalize_qwen35_moe_vl_config(model_config) -> None:
     _normalize_qwen35_quantization_config(model_config)
 
 
-def _normalize_qwen35_exclude_modules(model_config):
+def _normalize_qwen35_moe_vl_config(model_config) -> None:
+    """Adapt HF Qwen3.5-MoE VLM config to TRT-LLM runtime conventions."""
+    _normalize_qwen35_vl_config(model_config, inner_arch="Qwen3_5MoeForCausalLM")
+
+
+def _lm_head_nvfp4_enabled(model_config):
+    """Whether the checkpoint's quantized lm_head should stay quantized.
+
+    ModelOpt MIXED_PRECISION exports for Qwen3.5/3.6 quantize lm_head to
+    W4A16_NVFP4 (packed FP4 weight + per-group FP8 scales).  Both the SM100/103
+    NVFP4 (W4A4) Linear path and the SM120 Marlin W4A16 path consume it
+    directly, cutting the lm_head GEMM's weight traffic 4x vs the bf16 dequant
+    fallback -- the decode lm_head is purely weight-bandwidth-bound.
+    Conditions mirror what the quantized LMHead supports (see LMHead.__init__
+    guards) plus the paths that bypass the Linear machinery entirely:
+
+    - tie_word_embeddings shares the weight with the embedding lookup, which
+      needs a dense bf16 weight;
+    - ADP builds a TP-less LMHead (or slices the raw weight for the
+      spec-decoding head), assuming bf16;
+    - COLUMN TP pads the vocab shard when it doesn't divide evenly, which the
+      quantized path does not support (vocab 248320 divides all common tp).
+
+    Must be evaluated BEFORE _normalize_qwen35_quant_config_dict runs (it
+    promotes the entry to NVFP4 or drops it).
+    """
+    qcd = getattr(model_config, "quant_config_dict", None) or {}
+    cfg = qcd.get("lm_head")
+    pretrained = model_config.pretrained_config
+    mapping = model_config.mapping
+    return (
+        cfg is not None
+        and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        and get_sm_version() in (100, 103, 120)
+        and not getattr(pretrained, "tie_word_embeddings", False)
+        and not mapping.enable_attention_dp
+        and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0
+    )
+
+
+def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
     """Normalize NVFP4/FP8 exclude_modules from HF naming to TRT-LLM naming.
 
     hf_quant_config.json stores exclude patterns in HF checkpoint namespace
@@ -356,6 +470,9 @@ def _normalize_qwen35_exclude_modules(model_config):
     map the MTP layer to ``model.layers.<num_hidden_layers>.*``.  This
     function translates the patterns so that
     ``apply_quant_config_exclude_modules`` can match them.
+
+    ``keep_lm_head_quant`` (see _lm_head_nvfp4_enabled) skips the lm_head
+    force-exclusion so the quantized LMHead path can engage.
     """
     qc = model_config.quant_config
     if qc is None or qc.exclude_modules is None:
@@ -390,7 +507,132 @@ def _normalize_qwen35_exclude_modules(model_config):
     # but conv1d is not a proper linear module and should be excluded from quant
     normalized.add("*linear_attn.conv1d")
 
+    # By default LMHead allocates an unquantized (bf16) weight, so a quantized
+    # lm_head (e.g. NVFP4 in some ModelOpt MIXED_PRECISION exports) must be
+    # excluded from quant and the weight mapper dequantizes it to bf16.  When
+    # the quantized LMHead path is enabled (_lm_head_nvfp4_enabled), lm_head
+    # must NOT be excluded so DecoderModelForCausalLM builds it quantized.
+    if not keep_lm_head_quant:
+        normalized.add("lm_head")
+
     qc.exclude_modules = sorted(normalized)
+
+
+def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
+    """Normalize MIXED_PRECISION per-layer quant config keys from HF naming.
+
+    ModelOpt MIXED_PRECISION checkpoints key ``quant_config_dict`` by HF names
+    (``model.language_model.layers.N...``, ``mtp.layers.N...``), but
+    ``apply_layerwise_quant_config`` matches them against TRT-LLM module names
+    (``model.layers.N...``).  Without this translation the per-layer entries
+    never match, so quantized modules (MoE experts, shared_expert, attention,
+    linear_attn.out_proj) silently fall back to the MIXED_PRECISION global
+    config -> unquantized, and their quantized checkpoint weights fail to load.
+
+    On SM100/SM103, W4A16_NVFP4 routed experts AND dense MLP projections
+    (gate_proj/up_proj/down_proj) are promoted to NVFP4 so the CuteDSL/TRTLLM
+    GEMM path can consume the checkpoint's packed FP4 weights and static input
+    scales. Dense MLP keys are additionally re-pathed to the doubled
+    ``.mlp.mlp.`` form to match the ``_DenseMlpAdapter`` runtime module tree.
+    Other W4A16_NVFP4 modules retain their original algorithm.
+
+    Mutates ``quant_config_dict`` in place (model_config is frozen).
+
+    Split linear-attn in_proj projections (in_proj_qkv/in_proj_z or fully
+    split q/k/v/z) are fused into a single ``in_proj_qkvz`` Linear at runtime.
+    When the checkpoint quantizes every one of them per-tensor FP8, a single
+    FP8 entry is synthesized under the fused module name so the Linear is
+    built FP8; the weight mapper then requantizes the split weights onto one
+    shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
+    sets get no fused entry, and the mapper dequantizes them to bf16 instead.
+
+    The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
+    _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103, left
+    W4A16_NVFP4 on SM120 -- and dropped otherwise:
+    a leftover entry would make DecoderModelForCausalLM build a quantized
+    LMHead whose weights the mapper had already dequantized to bf16.
+    """
+    qcd = getattr(model_config, "quant_config_dict", None)
+    if not qcd:
+        return
+
+    n_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
+    convert_to_nvfp4 = get_sm_version() in (100, 103)
+
+    normalized = {}
+    in_proj_fp8 = {}
+    for name, cfg in qcd.items():
+        if name.startswith(_LANG_PREFIX):
+            name = "model." + name[len(_LANG_PREFIX) :]
+        if name.startswith("model.visual"):
+            continue
+        if name == "lm_head":
+            if keep_lm_head_quant:
+                # SM120 keeps W4A16_NVFP4 (Marlin); SM100/103 promotes to W4A4.
+                if convert_to_nvfp4:
+                    cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                normalized[name] = cfg
+            else:
+                # Make the fallback visible: the checkpoint quantizes lm_head
+                # but this configuration can't keep it quantized (see
+                # _lm_head_nvfp4_enabled), so it dequantizes to bf16 at load.
+                logger.info(
+                    f"lm_head quant entry ({cfg.quant_algo}) dropped: "
+                    "unsupported configuration for quantized LMHead "
+                    "(requires SM100/103/SM120, untied embeddings, no attention-DP, "
+                    "vocab divisible by tp_size); lm_head runs bf16"
+                )
+            continue
+        from_mtp = name.startswith("mtp.")
+        if from_mtp:
+            if n_hidden_layers is None:
+                continue
+            translated = _translate_mtp_pattern(name, n_hidden_layers)
+            if translated is None:
+                continue
+            name = translated
+        # Collect split linear-attn in_proj FP8 entries for fusion below.
+        # MTP-origin entries are excluded: the weight mapper requantizes by
+        # checkpoint prefix (mtp.layers.N), which never matches the translated
+        # model.layers.{offset+N} key, so a fused entry would build an FP8
+        # module whose weights load as bf16.
+        in_proj_match = re.search(r"^(.+\.linear_attn)\.in_proj_(qkv|q|k|v|z)$", name)
+        if in_proj_match and not from_mtp and cfg.quant_algo == QuantAlgo.FP8:
+            in_proj_fp8.setdefault(in_proj_match.group(1), {})[in_proj_match.group(2)] = cfg
+            continue
+        if (
+            convert_to_nvfp4
+            and name.endswith(".mlp.experts")
+            and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        ):
+            cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+        else:
+            # Dense MLP (gate_proj/up_proj/down_proj directly under ``.mlp``) is
+            # wrapped by ``_DenseMlpAdapter``, so the runtime module path has a
+            # doubled ``.mlp.mlp.`` segment
+            # (layer.mlp[adapter].mlp[GatedMLP].{gate_up_proj,down_proj}).
+            # Translate the per-layer key to that path so
+            # ``apply_layerwise_quant_config`` matches it; otherwise the dense
+            # MLP silently falls back to the global MIXED_PRECISION config and
+            # its quantized checkpoint weights fail to load. On SM100/SM103 also
+            # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
+            # consume the checkpoint's packed FP4 weights and static input scales.
+            dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
+            if dense_mlp_match and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
+                if convert_to_nvfp4:
+                    cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                proj = dense_mlp_match.group(1)
+                name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
+        normalized[name] = cfg
+
+    # Synthesize one FP8 entry per fused in_proj_qkvz whose split projections
+    # are all FP8; the weight mapper requantizes them onto a shared scale.
+    for prefix, projs in in_proj_fp8.items():
+        if set(projs) in ({"qkv", "z"}, {"q", "k", "v", "z"}):
+            normalized[f"{prefix}.in_proj_qkvz"] = next(iter(projs.values()))
+
+    qcd.clear()
+    qcd.update(normalized)
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")
@@ -415,8 +657,14 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     class that serves the vanilla Qwen3NextForCausalLM architecture.
     """
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_moe_model_defaults(llm_args)
+
     def __init__(self, model_config):
-        _normalize_qwen35_exclude_modules(model_config)
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=keep_lm_head_quant)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
 
@@ -431,29 +679,62 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     """
 
     def __init__(self, model_config):
-        _normalize_qwen35_exclude_modules(model_config)
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=keep_lm_head_quant)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
 
-# TODO: Add tests for disaggregated support.
-@support_multimodal_disaggregated
-@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
-@register_auto_model("Qwen3_5MoeForConditionalGeneration")
-@register_input_processor(
-    Qwen3VLInputProcessorBase,
-    model_type="qwen3_5_moe",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "<|vision_start|><|image_pad|><|vision_end|>",
-            "video": "<|vision_start|><|video_pad|><|vision_end|>",
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        placeholders_separator="",
-        content_format=ContentFormat.STRING,
-    ),
+# Shared placeholder metadata for both Qwen3.5 VLM variants. The image/video
+# placeholder layout is identical for MoE and dense; only the registration
+# `model_type` differs (set per concrete class below).
+_QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
+    placeholder_map={
+        "image": "<|vision_start|><|image_pad|><|vision_end|>",
+        "video": "<|vision_start|><|video_pad|><|vision_end|>",
+    },
+    placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    placeholders_separator="",
+    content_format=ContentFormat.STRING,
 )
-class Qwen3_5MoeVLModel(Qwen3VLModelBase):
-    """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
+
+
+class _Qwen3_5VLModel(Qwen3VLModelBase):
+    """Shared VLM wrapper composing the Qwen3 vision encoder with a Qwen3.5
+    (Qwen3Next-based) text decoder.
+
+    MoE and dense differ only in the inner causal-LM the config normalizer
+    selects (`Qwen3_5MoeForCausalLM` vs `Qwen3_5ForCausalLM`) — both reuse the
+    same vision tower, weight mapper, and forward path, so the wrapper body is
+    shared here. The concrete subclasses below carry only the registration
+    decorators (outer arch string + input-processor `model_type`).
+    """
+
+    supports_encoder_cache = True
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        # `ModelLoader` applies `get_model_defaults()` on the resolved outer
+        # model class (this VLM wrapper), not on the inner decoder. Both
+        # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
+        # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
+        # keep block reuse disabled until a recurrent-state snapshot policy is
+        # configured.
+        return Qwen3NextForCausalLM.get_model_defaults(llm_args)
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Match the hybrid text decoder's KV cache manager preference."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Match the hybrid text decoder's Python disaggregated route."""
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
@@ -470,14 +751,73 @@ class Qwen3_5MoeVLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_deltas",
         ]
 
-    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if not _is_mm_disagg():
-            self.mm_encoder.load_weights(weights)
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        weight_mapper: BaseWeightMapper,
+        allow_partial_loading: bool = False,
+    ):
+        # None under MM E/P disagg or disable_mm_encoder.
+        if self.mm_encoder is not None:
+            self.mm_encoder.load_weights(weights, allow_partial_loading=allow_partial_loading)
 
-        weight_mapper = Qwen3_5MoeHfWeightMapper()
-        weight_mapper.init_model_and_config(self.llm, self.model_config)
-        filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+        # Hand the persistent mapper the inner LM's model_config, not the VLM wrapper's:
+        # only the inner config went through the Qwen3.5 quant-dict
+        # normalization applied in the inner LM's __init__ (HF->TRT-LLM key
+        # translation + synthesis of the fused in_proj_qkvz FP8 entry). With
+        # the wrapper's un-normalized copy the mapper misses that FP8 entry,
+        # dequantizes the GDN in_proj projections to bf16 and drops their
+        # calibrated scales; the FP8-built module then re-casts with
+        # weight_scale=1.0 and quantizes activations dynamically every step.
+        if not isinstance(weight_mapper, Qwen3_5MoeHfWeightMapper):
+            raise TypeError(
+                f"Qwen3.5 VLM requires Qwen3_5MoeHfWeightMapper, got {type(weight_mapper).__name__}"
+            )
+        if weight_mapper.model is not self.llm:
+            weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
+        filtered_weights = _filter_language_model_weights(weights)
         params_map = {
             r"^model\.language_model\.(.*)$": r"model.\1",
         }
-        self.llm.load_weights(filtered_weights, weight_mapper, params_map=params_map)
+        self.llm.load_weights(
+            filtered_weights,
+            weight_mapper,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
+
+
+# TODO(TRTLLM-13417): Add tests for disaggregated support.
+@support_multimodal_disaggregated
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
+@register_auto_model("Qwen3_5MoeForConditionalGeneration")
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="qwen3_5_moe",
+    placeholder_metadata=_QWEN3_5_VL_PLACEHOLDER_METADATA,
+)
+class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
+    """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_moe_model_defaults(llm_args)
+
+
+# TODO(TRTLLM-13417): Add tests for disaggregated support.
+@support_multimodal_disaggregated
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
+@register_auto_model("Qwen3_5ForConditionalGeneration")
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="qwen3_5",
+    placeholder_metadata=_QWEN3_5_VL_PLACEHOLDER_METADATA,
+)
+class Qwen3_5VLModel(_Qwen3_5VLModel):
+    """VLM wrapper composing Qwen3 vision encoder with dense Qwen3.5 text decoder.
+
+    Dense sibling of `Qwen3_5MoeVLModel` (arch `Qwen3_5ForConditionalGeneration`,
+    `model_type="qwen3_5"`). Same hybrid Qwen3Next runtime, with `GatedMLP`
+    instead of `SparseMoeBlock` (the dense text config has a native `intermediate_size`
+    and no `num_experts`).
+    """

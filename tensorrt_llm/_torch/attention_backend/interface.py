@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import weakref
 from collections import namedtuple
@@ -10,6 +13,7 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -27,7 +31,8 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .sparse.params import SparseMetadataParams
+from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
+                            SparseRuntimeParams)
 
 try:
     # Transformers v5
@@ -411,10 +416,14 @@ class AttentionMetadata:
         return cuda_graph_metadata
 
     def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0
+        assert len(self._saved_tensors) == 0, (
+            "prepare_for_spec_dec called while fields "
+            f"{list(self._saved_tensors)} are still saved; a previous "
+            "forward likely raised between prepare_for_spec_dec and "
+            "restore_from_spec_dec")
         for f in fields:
             v = getattr(self, f)
-            assert isinstance(v, torch.Tensor)
+            assert isinstance(v, torch.Tensor), f"{f} is not a torch.Tensor"
             self._saved_tensors[f] = v
             setattr(self, f, v.clone())
 
@@ -422,6 +431,11 @@ class AttentionMetadata:
         for f, v in self._saved_tensors.items():
             setattr(self, f, v)
         self._saved_tensors.clear()
+
+    @property
+    def has_spec_dec_saved_state(self) -> bool:
+        """True when prepare_for_spec_dec state has not been restored yet."""
+        return bool(self._saved_tensors)
 
     def update_spec_dec_param(
             self,
@@ -431,7 +445,6 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
             num_contexts: int = 0):
@@ -665,6 +678,7 @@ class RopeParams:
         rope_params = RopeParams()
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        normalized_rope_parameters = hf_rope_parameters
         if hf_rope_parameters is not None:
             if set(hf_rope_parameters.keys()).issubset(
                     ALLOWED_ATTENTION_LAYER_TYPES):
@@ -672,17 +686,17 @@ class RopeParams:
                 # Pick "full_attention" as the default; callers override theta
                 # for sliding-window layers independently.
                 if "full_attention" in hf_rope_parameters:
-                    flat = hf_rope_parameters["full_attention"]
+                    normalized_rope_parameters = hf_rope_parameters[
+                        "full_attention"]
                 else:
                     fallback_key = next(iter(hf_rope_parameters))
                     logger.warning(
                         f"Per-layer-type rope_parameters has no 'full_attention' entry; "
                         f"falling back to '{fallback_key}'. Available layer types: "
                         f"{list(hf_rope_parameters.keys())}.")
-                    flat = hf_rope_parameters[fallback_key]
-                config.update(flat)
-            else:
-                config.update(hf_rope_parameters)
+                    normalized_rope_parameters = hf_rope_parameters[
+                        fallback_key]
+            config.update(normalized_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -691,6 +705,8 @@ class RopeParams:
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
+        if rope_scaling is None and normalized_rope_parameters is not None:
+            rope_scaling = normalized_rope_parameters
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)
@@ -878,27 +894,6 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
-class SparsePrediction:
-    """Sparse KV / attention indices predicted by the framework backends.
-
-    RocketKV and DSA produce these from ``sparse_kv_predict`` /
-    ``sparse_attn_predict``, telling the attention op which KV tokens to keep
-    and which blocks to attend to. Backends that don't predict leave
-    ``AttentionForwardArgs.sparse_prediction`` at its default-constructed value
-    (all-``None`` / ``0`` fields).
-    """
-    sparse_kv_indices: Optional[torch.Tensor] = None
-    sparse_kv_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices: Optional[torch.Tensor] = None
-    sparse_attn_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices_block_size: int = 0
-    # DeepSeek-V4 sparse-MLA only: per-token compressed top-k lengths and the
-    # base pointer of the compressed KV cache pool (compress_ratio > 1).
-    sparse_mla_topk_lens: Optional[torch.Tensor] = None
-    compressed_kv_cache_pool_ptr: Optional[int] = None
-
-
-@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -938,21 +933,33 @@ class AttentionForwardArgs:
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None
     quant_q_buffer: Optional[torch.Tensor] = None
+    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
+    # When non-None alongside `quant_q_buffer`, the C++ op skips
+    # `quantizeCopyInputToFp8Kernel`.
+    quant_scale_qkv: Optional[torch.Tensor] = None
+
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    enable_dsv4_epilogue_fusion: bool = False
+
+    # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
+    # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
+    # paged write, so the caller drops its own RMSNorm and concat.
+    kv_norm_weight: Optional[torch.Tensor] = None
+    kv_norm_eps: float = 1e-6
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    topk_indices: Optional[torch.Tensor] = None
-
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
 
-    sparse_prediction: SparsePrediction = field(
-        default_factory=SparsePrediction)
+    sparse_backend_args: Optional[SparseBackendForwardArgs] = None
+    sparse_runtime_params: SparseRuntimeParams = field(
+        default_factory=SparseRuntimeParams)
 
     @property
     def mask_type(self) -> int:
@@ -1068,6 +1075,21 @@ class AttentionBackend(Generic[TMetadata]):
     @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
+
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
+                                          mapping: Mapping) -> int:
+        """Per-token bytes to reserve for a workspace this backend stages whose size scales with a
+        runtime quantity the KV-cache estimator does not drive to its serving maximum while profiling
+        (e.g. ``total_kv_len``, inflated by KV-cache reuse). Default ``0`` -- correct for every backend
+        except fp8 context-MLA today.
+
+        A non-zero rate is reserved from the KV budget by the estimator, and the scheduler caps the
+        driving sum at what that reserve covers, so the declared buffer stays within its reservation
+        (buffers the backend does not declare are still unaccounted for). Keep the rate identical to the
+        runtime allocation's per-token cost. See ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
+        """
+        return 0
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

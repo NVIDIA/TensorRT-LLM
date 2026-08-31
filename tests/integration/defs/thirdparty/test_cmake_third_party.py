@@ -21,9 +21,6 @@ IGNORE_PATTERNS = [
     "3rdparty/CMakeLists.txt",
     # Historical use of ExternalProject_Add that is not yet migrated to 3rdparty
     "cpp/tensorrt_llm/deep_ep/CMakeLists.txt",
-    # Historical build that is not included in the wheel build and thus exempt
-    # from the third-party process.
-    "triton_backend/inflight_batcher_llm/*",
     "build",  # Default build directory
     "cpp/build",  # Default extension module build directory
 ]

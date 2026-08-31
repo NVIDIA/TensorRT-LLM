@@ -49,7 +49,7 @@ make all
 
 ### Debug Mode
 
-Set `TLLM_KV_CACHE_MANAGER_V2_DEBUG=1` to enable debug assertions (`NDEBUG=False`). Default is release mode (`NDEBUG=True`).
+Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is release mode (`NDEBUG=True`).
 
 ## Architecture
 
@@ -71,7 +71,7 @@ The test file uses `find_spec("kv_cache_manager_v2")` to detect whether the pack
 
 6. **`_life_cycle_registry.py`** — Maps `LayerGroupId`→`LifeCycleId`. Each layer group has either `AttnLifeCycle` (with optional sliding window + sink tokens) or `SsmLifeCycle`. Controls which blocks are "stale" and eligible for eviction.
 
-7. **`_block_radix_tree.py`** — Radix tree for prefix sharing across sequences. Blocks store pages and token IDs. Supports multi-modal tokens via `gen_multi_modal_tokens`.
+7. **`_block_radix_tree.py`** — Radix tree for prefix sharing across sequences. Blocks store pages and token IDs. Supports multi-modal tokens via `gen_multimodal_cache_key_tokens`.
 
 8. **`_eviction_controller/`** — Decides which pages to evict when memory is low, per cache level.
 

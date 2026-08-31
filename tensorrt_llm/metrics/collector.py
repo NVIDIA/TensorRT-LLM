@@ -804,9 +804,25 @@ class MetricsCollector:
             "kvCacheIterationStatsByLifecycle")
         kv_iter_by_pool_group = iteration_stats.get(
             "kvCacheIterationStatsByPoolGroup")
-        if kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group:
-            reuse_stats = kv_iter_by_lifecycle or kv_iter or {}
+        kv_iter_by_cold_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByColdPoolGroup")
+        if (kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group
+                or kv_iter_by_cold_pool_group):
+            # Prefer lifecycle-level attention stats when present. An SSM-only
+            # lifecycle report must not hide the legacy/window-level attention
+            # aggregate. Missing kind remains attention-compatible.
+            attention_lifecycle_stats = {
+                key: stats
+                for key, stats in (kv_iter_by_lifecycle or {}).items()
+                if stats.get("kind", "attention") == "attention"
+            }
+            reuse_stats = attention_lifecycle_stats or kv_iter or {}
             pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
+            # Host/disk blocks come from the cold pool-group view, the only V2 view that reports them:
+            # cold levels group lifecycles independently of the hot level, so a hot pool group cannot
+            # own a cold one, and this view accounts for every cold block exactly once. Legacy V1 has
+            # no such view and keeps its cold counters on the window stats, hence the fallback.
+            secondary_stats = kv_iter_by_cold_pool_group or pool_group_stats
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
@@ -824,9 +840,13 @@ class MetricsCollector:
                 total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
                 total_missed += stats.get("iterMissedBlocks", 0)
 
-            for stats in pool_group_stats.values():
+            for stats in secondary_stats.values():
                 total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
                 total_secondary_used += stats.get("secondaryUsedNumBlocks", 0)
+
+            # The cold view deliberately omits the per-iteration delta fields, so these stay on the
+            # hot pool-group view where they are actually tracked.
+            for stats in pool_group_stats.values():
                 total_gen_alloc += stats.get("iterGenAllocBlocks", 0)
                 total_onboard_bytes += stats.get("iterOnboardBytes", 0)
                 total_offload_bytes += stats.get("iterOffloadBytes", 0)

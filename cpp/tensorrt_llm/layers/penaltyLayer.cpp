@@ -18,6 +18,7 @@
 #include "penaltyLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
@@ -84,11 +85,11 @@ void PenaltyLayer<T>::allocateWorkspace()
 
         auto const workspaceSize = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxDecodingTokens()
             * mConfiguredBeamWidth * mDecoderDomain.getVocabSize() * 2;
-        mPenaltyWorkspaceDevice = mBufferManager->gpu(workspaceSize, nvinfer1::DataType::kINT32);
+        mPenaltyWorkspaceDevice = mBufferManager->gpu(workspaceSize, tensorrt_llm::DataType::kINT32);
 
         if (mDecodingMode.isBeamSearch())
         {
-            mPenaltyWorkspacePrevDevice = mBufferManager->gpu(workspaceSize, nvinfer1::DataType::kINT32);
+            mPenaltyWorkspacePrevDevice = mBufferManager->gpu(workspaceSize, tensorrt_llm::DataType::kINT32);
         }
     }
 
@@ -111,27 +112,27 @@ void PenaltyLayer<T>::allocateBuffer()
 
     if (mDecodingMode.isUseTemperature())
     {
-        mTemperatureDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kFLOAT);
+        mTemperatureDevice = mBufferManager->gpu(batchSizeShape, tensorrt_llm::DataType::kFLOAT);
     }
     if (mDecodingMode.isUseRepetitionPenalty())
     {
-        mRepetitionPenaltyDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kFLOAT);
+        mRepetitionPenaltyDevice = mBufferManager->gpu(batchSizeShape, tensorrt_llm::DataType::kFLOAT);
     }
     if (mDecodingMode.isUsePresencePenalty())
     {
-        mPresencePenaltyDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kFLOAT);
+        mPresencePenaltyDevice = mBufferManager->gpu(batchSizeShape, tensorrt_llm::DataType::kFLOAT);
     }
     if (mDecodingMode.isUseFrequencyPenalty())
     {
-        mFrequencyPenaltyDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kFLOAT);
+        mFrequencyPenaltyDevice = mBufferManager->gpu(batchSizeShape, tensorrt_llm::DataType::kFLOAT);
     }
     if (mDecodingMode.isUseMinLength())
     {
-        mMinLengthDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kINT32);
+        mMinLengthDevice = mBufferManager->gpu(batchSizeShape, tensorrt_llm::DataType::kINT32);
     }
     if (mDecodingMode.isUseOccurrencePenalty())
     {
-        mPromptIgnoreLengthDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kINT32);
+        mPromptIgnoreLengthDevice = mBufferManager->gpu(batchSizeShape, tensorrt_llm::DataType::kINT32);
     }
 
     auto const logitsPtrDeviceDesc = std::make_pair(batchSizeShape, TRTDataType<T*>::value);
