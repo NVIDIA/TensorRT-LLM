@@ -23,13 +23,15 @@ property rather than a specific teardown step.
 import types
 import unittest
 
+import torch
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.model_engine import NON_GREEDY_CAPTURE_SAMPLING_PARAMS
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 # The synthetic params the refactored capture path warms up with.
@@ -254,6 +256,83 @@ class TestScanOneModelSamplingMinP(unittest.TestCase):
         )
         self.assertFalse(need_request)
         self.assertFalse(need_expanded)
+
+
+def _populate_meta(mode):
+    """Stand-in with just enough of SpecMetadata to run populate_sampling_params_for_one_model.
+
+    Same style as test_rejection_buffers_guard.py: SpecMetadata methods called unbound on a
+    namespace, with the parts not under test stubbed out.
+    """
+    meta = types.SimpleNamespace(
+        runtime_draft_len=1,
+        dummy_slot_row=0,
+        group_all_greedy_sample=None,
+        max_num_requests=4,
+        max_draft_len=1,
+        max_total_draft_tokens=1,
+        is_spec_dec_tree=False,
+        advanced_sampling_mode=mode,
+        use_rejection_sampling=False,
+        enable_penalty=False,
+        batch_slot_ids=None,
+        temperatures=None,
+        top_ks=None,
+        top_ps=None,
+        min_ps=None,
+        request_temperatures=None,
+        request_top_ks=None,
+        request_top_ps=None,
+        request_min_ps=None,
+        top_k_max=0,
+        _sampling_params_signature=[None, None],
+        spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
+        # Not under test.
+        prepare_rejection_sampling_buffers=lambda: None,
+        prepare_penalty_buffers=lambda: None,
+        _populate_request_rng_state=lambda requests, normalized: None,
+        _populate_penalty_params=lambda requests: None,
+    )
+    for name in (
+        "_scan_one_model_sampling",
+        "_sampling_params_buffers_need_update",
+        "invalidate_sampling_params_cache",
+    ):
+        setattr(
+            meta, name, (lambda fn: lambda *a, **k: fn(meta, *a, **k))(getattr(SpecMetadata, name))
+        )
+    return meta
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "populate allocates CUDA buffers")
+class TestMinPBufferFillIsGatedOnUniversal(unittest.TestCase):
+    """Only UNIVERSAL reads the min_p buffers, so only UNIVERSAL should fill them.
+
+    The cheap direction of a mistake here is wasted host work on every existing deploy.
+    The expensive direction is silent: if UNIVERSAL stopped filling them, every request's
+    min_p would read as the 0.0 sentinel and the filter would vanish without an error.
+    """
+
+    def test_universal_fills_the_min_p_buffers(self):
+        meta = _populate_meta(AdvancedSamplingMode.UNIVERSAL)
+        SpecMetadata.populate_sampling_params_for_one_model(
+            meta, [_request(temperature=1.0, min_p=0.25)]
+        )
+        self.assertAlmostEqual(meta.request_min_ps[0].item(), 0.25, places=6)
+        self.assertAlmostEqual(meta.min_ps[0].item(), 0.25, places=6)
+
+    def test_full_leaves_them_at_the_disable_sentinel(self):
+        # A min_p request cannot reach populate under FULL -- validate_request rejects it
+        # -- so the buffers must stay at the 0.0 they were allocated with, and the fill
+        # must not run.
+        meta = _populate_meta(AdvancedSamplingMode.FULL)
+        SpecMetadata.populate_sampling_params_for_one_model(
+            meta, [_request(temperature=1.0, top_p=0.9)]
+        )
+        self.assertEqual(meta.request_min_ps[0].item(), 0.0)
+        self.assertEqual(meta.min_ps[0].item(), 0.0)
+        # The other buffers are still filled, i.e. the gate is narrow.
+        self.assertAlmostEqual(meta.request_top_ps[0].item(), 0.9, places=6)
 
 
 if __name__ == "__main__":

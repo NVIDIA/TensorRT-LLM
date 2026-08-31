@@ -1301,6 +1301,12 @@ class SpecMetadata:
         # forward, so skip whichever group is already current.
         need_update_sampler_param, need_update_expanded_sampler_param = (
             self._sampling_params_buffers_need_update(per_request_normalized))
+        # Only UNIVERSAL reads the min_p buffers. Under every other mode a min_p
+        # request is rejected at admission, so every entry would be the 0.0 sentinel
+        # the buffers were allocated with -- the list build and the H2D copy would
+        # write zeros over zeros. This runs on the host critical path ahead of the
+        # forward, so the existing modes must not pay for a filter they cannot use.
+        fill_min_p = self.advanced_sampling_mode.is_universal
         if not (need_update_sampler_param
                 or need_update_expanded_sampler_param):
             return
@@ -1314,7 +1320,8 @@ class SpecMetadata:
                 request_temperatures.append(temp_val)
                 request_top_ks.append(tk_val)
                 request_top_ps.append(tp_val)
-                request_min_ps.append(mp_val)
+                if fill_min_p:
+                    request_min_ps.append(mp_val)
 
             self.request_temperatures[:len(request_temperatures)].copy_(
                 torch.tensor(request_temperatures,
@@ -1333,12 +1340,13 @@ class SpecMetadata:
                              pin_memory=prefer_pinned()),
                 non_blocking=True,
             )
-            self.request_min_ps[:len(request_min_ps)].copy_(
-                torch.tensor(request_min_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            if fill_min_p:
+                self.request_min_ps[:len(request_min_ps)].copy_(
+                    torch.tensor(request_min_ps,
+                                 dtype=torch.float32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1359,7 +1367,8 @@ class SpecMetadata:
                 temperatures.extend(temp_val for _ in range(num_tokens))
                 top_ks.extend(tk_val for _ in range(num_tokens))
                 top_ps.extend(tp_val for _ in range(num_tokens))
-                min_ps.extend(mp_val for _ in range(num_tokens))
+                if fill_min_p:
+                    min_ps.extend(mp_val for _ in range(num_tokens))
 
             self.temperatures[:len(temperatures)].copy_(torch.tensor(
                 temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -1370,9 +1379,10 @@ class SpecMetadata:
             self.top_ps[:len(top_ps)].copy_(torch.tensor(
                 top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                             non_blocking=True)
-            self.min_ps[:len(min_ps)].copy_(torch.tensor(
-                min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            if fill_min_p:
+                self.min_ps[:len(min_ps)].copy_(torch.tensor(
+                    min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                non_blocking=True)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]

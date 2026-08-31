@@ -246,7 +246,11 @@ def available_impls() -> dict[str, Impl]:
     """
     impls: dict[str, Impl] = {}
     if IS_FLASHINFER_AVAILABLE:
+        # Every mode EXCEPT universal, which does not route to the flashinfer chain at
+        # all -- registering it here would measure the wrong backend under its name.
         for mode in AdvancedSamplingMode:
+            if mode.is_universal:
+                continue
             impl = _flashinfer_impl(mode)
             impls[impl.name] = impl
 
@@ -272,6 +276,32 @@ def available_impls() -> dict[str, Impl]:
         raise ValueError(f"unknown call shape: {shape}")
 
     impls["universal"] = Impl(name="universal", call=call, supports_min_p=True)
+
+    # The op as production reaches it. interface.py does not call ops/universal.py
+    # directly -- it goes through the dispatcher, which adds a Python call and a mode
+    # lookup per call site per step. Measuring only the bare op would report a number
+    # nothing in the executor can actually observe.
+    from tensorrt_llm._torch.pyexecutor.sampler.ops import spec_dispatch as disp
+
+    universal_mode = AdvancedSamplingMode.UNIVERSAL
+
+    def call_dispatch(shape: str, inp: Inputs) -> Callable[[], Any]:
+        args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)
+        if shape == "tokens":
+            return lambda: disp.spec_sample_from_logits(
+                mode, *args, seed=inp.seed, offset=inp.offset
+            )
+        if shape == "probs":
+            return lambda: disp.spec_compute_probs_from_logits(universal_mode, *args)
+        if shape == "tokens_probs":
+            return lambda: disp.spec_sample_from_logits_with_probs(
+                universal_mode, *args, seed=inp.seed, offset=inp.offset
+            )
+        raise ValueError(f"unknown call shape: {shape}")
+
+    impls["universal_dispatch"] = Impl(
+        name="universal_dispatch", call=call_dispatch, supports_min_p=True
+    )
     return impls
 
 
