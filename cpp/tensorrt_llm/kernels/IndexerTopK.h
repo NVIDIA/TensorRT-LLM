@@ -27,21 +27,28 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-// Number of blocks-per-row used by the multi-block split + merge dispatch path of
-// invokeIndexerTopKDecode. Returns 1 when the single-block path is preferred.
-// Callers that allocate aux buffers must use this same helper to size them, and
-// must pass the same splitWorkThreshold they will pass to invokeIndexerTopKDecode
-// (a value <= 0 selects the internal default).
+// Number of blocks-per-row used by the multi-block split + merge dispatch path
+// of invokeIndexerTopKDecode. Returns 1 when the single-block path is
+// preferred. Callers that allocate aux buffers must use this same helper to
+// size them, and must pass the same splitWorkThreshold they will pass to
+// invokeIndexerTopKDecode (a value <= 0 selects the internal default).
 int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitWorkThreshold = 0);
 
 /// fp32 indexer TopK decode — three dispatch tiers:
 ///   - Insertion sort   (N < kSortingAlgorithmThreshold)
 ///   - Radix sort       (kSortingAlgorithmThreshold ≤ N < splitWork)
 ///   - Radix split-work (N ≥ splitWork — uses outLogitsAux / outIndicesAux)
+///
+/// @param rowKvLens  optional [numRows] per-row causal KV extent, in
+/// uncompressed
+///   token space. Non-null selects the ragged layout: rows no longer map to
+///   requests by `rowIdx / next_n`, so the extent every row may attend to is
+///   supplied directly instead of being reconstructed from `next_n`. Null keeps
+///   the uniform arithmetic, bit-identical to before.
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK = 2048, int const compressRatio = 1,
-    cudaStream_t const stream = 0);
+    int const* rowKvLens = nullptr, cudaStream_t const stream = 0);
 
 /// bf16 indexer TopK decode — same dispatch tiers as the fp32 entry, except
 /// the split-work tier is unsupported (the bf16/fp16 entry does not expose
@@ -53,12 +60,14 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 /// that regime must use the fp32 entry.
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
-    int const next_n, int const topK = 2048, int const compressRatio = 1, cudaStream_t const stream = 0);
+    int const next_n, int const topK = 2048, int const compressRatio = 1,
+    int const* rowKvLens = nullptr, cudaStream_t const stream = 0);
 
 /// fp16 indexer TopK decode — see bf16 overload for dispatcher contract.
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n,
-    int const topK = 2048, int const compressRatio = 1, cudaStream_t const stream = 0);
+    int const topK = 2048, int const compressRatio = 1, int const* rowKvLens = nullptr,
+    cudaStream_t const stream = 0);
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,
