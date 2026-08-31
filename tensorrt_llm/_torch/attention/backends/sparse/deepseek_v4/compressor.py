@@ -222,7 +222,12 @@ class Compressor(nn.Module):
 
         if num_generations > 0:
             gen_kv_lens = kv_lens[num_contexts:]
+            # Uniform batches: every request appended next_n tokens. Ragged
+            # batches: next_n is only the batch maximum (the kernel's loop
+            # bound) and the real per-request counts come through
+            # new_tokens_per_seq.
             next_n = metadata.num_gen_tokens_per_seq
+            new_tokens_per_seq = metadata.gen_new_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
             torch.ops.trtllm.compressor_paged_kv_compress(
@@ -241,6 +246,7 @@ class Compressor(nn.Module):
                 self.head_dim,
                 self.compress_ratio,
                 next_n,
+                new_tokens_per_seq,
             )
 
         # Scatter to cache with appropriate quantization (all modes fused)

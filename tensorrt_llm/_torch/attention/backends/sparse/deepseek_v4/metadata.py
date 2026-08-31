@@ -40,6 +40,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def _invalidate_mla_scheduler_buffers(self) -> None:
+        """Invalidate request- and token-prefix buffers derived from sequence lengths."""
+        super()._invalidate_mla_scheduler_buffers()
+        self._fused_q_gen_cu_seqlens_valid = False
+
     def __post_init__(self):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
@@ -102,6 +107,33 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cu_seq_lens_cuda, device="cpu", pin_memory=prefer_pinned()
         )
         self.cu_seq_lens[0] = 0
+
+        # Request-major token prefixes for the fused Q-RoPE kernel. Unlike the
+        # token-major sparse-MLA view, this kernel can consume one arbitrary
+        # query length per request through cu_q_seqlens. Keep separate storage
+        # from both the compressor's prefixes and MLA's Q-row prefixes: those
+        # buffers can be read concurrently or use a different presentation.
+        self.fused_q_gen_cu_seqlens = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences + 1,),
+            cache_name="fused_q_gen_cu_seqlens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.fused_q_gen_cu_seqlens[:1].zero_()
+        self._fused_q_gen_cu_seqlens_valid = False
+
+        # Tokens each generation request appends this step. Only populated for
+        # ragged verification; uniform batches continue to use the scalar
+        # ``num_gen_tokens_per_seq`` loop bound.
+        self.gen_new_tokens_per_seq_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences,),
+            dtype=torch.int,
+            cache_name="gen_new_tokens_per_seq_cuda",
+            capture_graph=capture_graph,
+        )
+        self.gen_new_tokens_per_seq: Optional[torch.Tensor] = None
 
         # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
         self.new_comp_kv_lens_cuda = {
@@ -287,6 +319,47 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Draft-sized sparse buffers for one-model MTP separate draft KV cache.
         self._init_draft_sparse_buffers()
+
+    def mla_prepare_fused_q_gen_cu_seqlens(self) -> Optional[torch.Tensor]:
+        """Return stable request-major query prefixes for ragged fused Q-RoPE.
+
+        The fused Q normalization op accepts token prefixes (not Q rows), so
+        this deliberately uses request-major ``seq_lens_cuda`` rather than the
+        one-row-per-token presentation used by sparse MLA. The cumsum writes
+        into graph-owned storage once per iteration; device-window graph
+        replay therefore updates values without changing the captured address.
+        """
+        if not self.is_ragged_verify or self.num_generations <= 0:
+            return None
+
+        num_contexts = self.num_contexts
+        num_generations = self.num_generations
+        cu_seqlens = getattr(self, "fused_q_gen_cu_seqlens", None)
+        seq_lens_cuda = getattr(self, "seq_lens_cuda", None)
+        if cu_seqlens is None or seq_lens_cuda is None or num_generations + 1 > cu_seqlens.shape[0]:
+            return None
+
+        if not self._fused_q_gen_cu_seqlens_valid:
+            torch.cumsum(
+                seq_lens_cuda[num_contexts : num_contexts + num_generations],
+                0,
+                dtype=torch.int32,
+                out=cu_seqlens[1 : num_generations + 1],
+            )
+            self._fused_q_gen_cu_seqlens_valid = True
+        return cu_seqlens[: num_generations + 1]
+
+    def apply_device_ragged_layout(
+        self,
+        verify_lens: torch.Tensor,
+        req_idx: torch.Tensor,
+        kv_correction: torch.Tensor,
+    ) -> None:
+        """Install device-selected windows and invalidate derived Q prefixes."""
+        super().apply_device_ragged_layout(verify_lens, req_idx, kv_correction)
+        # This call precedes the first model layer. Its fixed-address cumsum is
+        # therefore captured once after the layout update and replayed in order.
+        self._invalidate_mla_scheduler_buffers()
 
     def prepare_for_indexer_k_cache(self):
         """Prepare the shared indexer K-cache decode table for DSA kernels."""
@@ -512,7 +585,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         for field in self._DRAFT_SPARSE_FIELDS:
             setattr(self, field, saved_state[field])
 
-    def prepare(self):
+    def _prepare_impl(self) -> None:
+        # DSAtrtllmAttentionMetadata.prepare() owns the overlap-scheduler guard
+        # for pinned staging buffers and dispatches here.
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
 
@@ -549,6 +624,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_token_lens = self.cached_token_lens_cpu
         kv_lens = cached_token_lens[:num_requests] + self.seq_lens_kv[:num_requests]
 
+        if self.device_windows_mode and self.is_ragged_verify:
+            # The host split only chooses the captured shape.  Until the
+            # device prologue installs the freshly ranked windows, every
+            # host-side consumer must see a full-window upper bound rather
+            # than stale per-request shape values.  Keep this identical to the
+            # native DSA metadata contract.
+            nc, ns = self.num_contexts, self.num_seqs
+            kv_lens = kv_lens.clone()
+            kv_lens[nc:ns] += (1 + self.max_draft_tokens) - self.seq_lens_kv[nc:ns]
+            self.kv_lens[nc:ns] = kv_lens[nc:ns]
+
         self.cached_token_lens_cuda[:num_requests].copy_(
             cached_token_lens[:num_requests], non_blocking=True
         )
@@ -584,10 +670,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # --- Per-ratio metadata ---
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
         # 2) CUDA-side: fill *_cuda buffers via prepare_compressed_kv_metadata()
-        num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
-        )
-        self.num_gen_tokens_per_seq = num_gen_tokens_per_seq
+        num_gen_tokens_per_seq = self._sync_gen_tokens_per_seq(num_gen_tokens)
         num_contexts = self.num_contexts
         num_generations = self.num_generations
         kv_lens_slice = kv_lens[:num_requests]
@@ -641,6 +724,30 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.num_total_compressed_tokens,
             self._compress_ratios_sorted,
         )
+
+    def _sync_gen_tokens_per_seq(self, num_gen_tokens: int) -> int:
+        """Synchronize the compressor's scalar and per-request token counts.
+
+        The compressor uses ``num_gen_tokens_per_seq`` as a compile-time loop
+        bound. A ragged batch therefore uses the configured global maximum,
+        while exact request lengths travel in a device vector. The vector is
+        copied device-to-device from ``_seq_lens_cuda`` so CUDA-graph replay
+        observes device-window rewrites instead of reloading the captured host
+        shape split.
+        """
+        if self.is_ragged_verify and self.num_generations > 0:
+            self.num_gen_tokens_per_seq = 1 + self.max_draft_tokens
+            num_contexts = self.num_contexts
+            num_generations = self.num_generations
+            gen_new_tokens = self.gen_new_tokens_per_seq_cuda[:num_generations]
+            gen_new_tokens.copy_(self._seq_lens_cuda[num_contexts : num_contexts + num_generations])
+            self.gen_new_tokens_per_seq = gen_new_tokens
+        else:
+            self.num_gen_tokens_per_seq = (
+                num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+            )
+            self.gen_new_tokens_per_seq = None
+        return self.num_gen_tokens_per_seq
 
     def prepare_compressed_kv_metadata(
         self,
@@ -717,9 +824,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens = kv_lens - seq_lens
 
         num_gen_tokens = num_tokens - self.num_ctx_tokens
-        self.num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
-        )
+        self._sync_gen_tokens_per_seq(num_gen_tokens)
 
         # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
         # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on
