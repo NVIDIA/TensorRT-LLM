@@ -15,6 +15,7 @@
 from typing import Optional
 
 import click
+import yaml
 
 import tensorrt_llm.profiler as profiler
 
@@ -26,9 +27,11 @@ from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         SciCode)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
-from ..llmapi.llm_utils import update_llm_args_with_extra_options
+from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
+from ..usage import apply_usage_session_config
 from ..usage import config as _telemetry_config
+from ._telemetry import TelemetryGroup, apply_raw_config_telemetry_opt_out
 from .utils import collect_explicit_cli_keys
 
 # CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
@@ -46,7 +49,11 @@ _CLICK_TO_LLM_ARG = {
 }
 
 
-@click.group()
+@click.group(
+    cls=TelemetryGroup,
+    telemetry_usage_context=_telemetry_config.UsageContext.CLI_EVAL,
+    telemetry_component="llm",
+)
 @click.option(
     "--model",
     required=True,
@@ -196,11 +203,33 @@ def main(ctx, model: str, tokenizer: Optional[str],
             f"{backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
+    # Pre-check YAML telemetry settings before full config validation.
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_extra_dict = yaml.safe_load(f)
+        if llm_args_extra_dict is None:
+            llm_args_extra_dict = {}
+        elif not isinstance(llm_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+        apply_raw_config_telemetry_opt_out(
+            llm_args_extra_dict,
+            usage_context=_telemetry_config.UsageContext.CLI_EVAL,
+            component="llm",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+        llm_args = update_llm_args_with_extra_dict(
             llm_args,
+            llm_args_extra_dict,
             extra_llm_api_options,
             explicit_cli_keys=explicit_cli_keys)
+
+    # Update telemetry state or disable the early session.
+    apply_usage_session_config(
+        llm_args.get("telemetry_config"),
+        default_usage_context=_telemetry_config.UsageContext.CLI_EVAL.value,
+        component="llm",
+        lifecycle_phase="config_validation",
+    )
 
     profiler.start("trtllm init")
     llm = llm_cls(**llm_args)
