@@ -718,3 +718,74 @@ index 306b416..a564d47 100644
          out.copy_(result)
          return out, None
      return result, None
+diff --git a/python/fmha_sm100/cute/src/common/cute_dsl_utils.py b/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
+index e3473fb..40a42f1 100644
+--- a/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
++++ b/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
+@@ -28,7 +28,7 @@ StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None)
+ 
+ 
+ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
+-cute_compile_og = cute.compile
++cute_compile_og = getattr(cute.compile, "_minimax_compile_callable", cute.compile)
+ 
+ 
+ torch2cute_dtype_map = {
+@@ -90,7 +90,7 @@ def load_cubin_module_data_patched(cubin_data, filepath):
+     return load_cubin_module_data_og(cubin_data)
+ 
+ 
+-def cute_compile_patched(*args, **kwargs):
++def _compile_with_timing(compile_callable, *args, **kwargs):
+     """A patched version of cute.compile.
+ 
+     Behaviour:
+@@ -109,7 +109,7 @@ def cute_compile_patched(*args, **kwargs):
+     kernel_obj = args[0] if args else kwargs.get("op")
+     kernel_name = type(kernel_obj).__name__ if kernel_obj is not None else "<unknown>"
+     t0 = time.time()
+-    output = cute_compile_og(*args, **kwargs)
++    output = compile_callable(*args, **kwargs)
+     dt = time.time() - t0
+     logger.debug("[%s] compiled in %.1fs", kernel_name, dt)
+     if cubin_path is not None:
+@@ -120,6 +120,28 @@ def cute_compile_patched(*args, **kwargs):
+     return output
+ 
+ 
++def cute_compile_patched(*args, **kwargs):
++    return _compile_with_timing(cute_compile_og, *args, **kwargs)
++
++
++class _TimedCompileCallable:
++    """Preserve CUTLASS compile options while timing every compilation."""
++
++    _minimax_timed_compile = True
++
++    def __init__(self, compile_callable):
++        self._minimax_compile_callable = compile_callable
++
++    def __call__(self, *args, **kwargs):
++        return _compile_with_timing(self._minimax_compile_callable, *args, **kwargs)
++
++    def __getitem__(self, options):
++        return type(self)(self._minimax_compile_callable[options])
++
++    def __getattr__(self, name):
++        return getattr(self._minimax_compile_callable, name)
++
++
+ if os.getenv("MINIMAX_LOG_COMPILE", "0") == "1":
+     if not logger.handlers:
+         _h = logging.StreamHandler()
+@@ -130,8 +152,8 @@ if os.getenv("MINIMAX_LOG_COMPILE", "0") == "1":
+ 
+ # Monkey-patch cute.compile so every JIT compile across the repo gets timed
+ # without touching individual call sites.  Idempotent: only patches once.
+-if cute.compile is not cute_compile_patched:
+-    cute.compile = cute_compile_patched
++if not getattr(cute.compile, "_minimax_timed_compile", False):
++    cute.compile = _TimedCompileCallable(cute_compile_og)
+ 
+ 
+ def assume_strides_aligned(t):

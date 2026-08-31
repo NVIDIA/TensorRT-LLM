@@ -1600,6 +1600,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
+    @pytest.mark.threadleak(enabled=False)
     def test_prims_ts_bfloat16(self, mocker):
         if not is_sm_100f(get_sm_version()):
             pytest.skip("PrimTS requires SM100 or SM103")

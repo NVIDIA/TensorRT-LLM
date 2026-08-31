@@ -21,3 +21,4 @@ docs/source/blogs/media/tech_blog26_deepseek_v4_hybrid_attention.png filter=lfs 
 docs/source/blogs/media/tech_blog26_deepseek_v4_mhc_moe.png filter=lfs diff=lfs merge=lfs -text
 docs/source/blogs/media/tech_blog28_video_*.gif filter=lfs diff=lfs merge=lfs -text
 3rdparty/vendor_patches/*.patch -whitespace
+3rdparty/patches/*.patch -whitespace
