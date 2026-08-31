@@ -347,6 +347,13 @@ yourself.
      `acceptance-criteria.md` as a safety re-check (final close in
      either mode; earlier Stages may have regressed since their
      own APPROVE).
+   - Subsections whose header carries an `(INTERRUPTED iter <k> —
+     superseded by feedback)` annotation are **always out of scope**,
+     including during the final safety re-check: their Stage was
+     preempted by a feedback-triggered replan, and each still-needed
+     item was either carried forward into a later Stage's subsection
+     (where it gets verified normally) or explicitly dropped by the
+     PlanDrafter. Do not verify or fail their items.
 
 5. Run your verification commands against the scoped item list.
    Apply the same evidence rules as the base prompt (you ran the
@@ -396,6 +403,9 @@ depend on the scoping above. Items outside this turn's QA scope
 should appear in the report with their last-known status (the value
 recorded the most recent QA turn that verified them, or `Not
 measured — pending Stage <M>` for items in still-`PENDING` Stages).
+Items in an `(INTERRUPTED ...)`-annotated subsection appear as
+`Skipped — superseded by feedback (see Stage <M>)`, pointing at the
+Stage that carries their re-planned replacement when one exists.
 
 ### Replan-mode bookkeeping is not your problem
 

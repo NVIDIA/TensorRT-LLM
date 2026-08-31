@@ -24,6 +24,20 @@ add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
 add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
 add_gtest(kvCacheManagerTest kvCacheManagerTest.cpp)
 add_gtest(kvCacheManagerFabricMemoryTest kvCacheManagerFabricMemoryTest.cpp)
+add_gtest(kvCacheManagerV2DefaultColdPageCodecTest
+          kvCacheManagerV2DefaultColdPageCodecTest.cpp)
+target_include_directories(
+  kvCacheManagerV2DefaultColdPageCodecTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2ColdPageTest kvCacheManagerV2ColdPageTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ColdPageTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheManagerV2ColdPageCopyTest kvCacheManagerV2ColdPageCopyTest.cu)
+target_include_directories(
+  kvCacheManagerV2ColdPageCopyTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(kvCacheManagerV2TypedIndexTest kvCacheManagerV2TypedIndexTest.cpp)
 target_include_directories(
   kvCacheManagerV2TypedIndexTest
@@ -31,6 +45,11 @@ target_include_directories(
 add_gtest(kvCacheManagerV2HostMemTest kvCacheManagerV2HostMemTest.cpp)
 target_include_directories(
   kvCacheManagerV2HostMemTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2StagingBufferTest
+          kvCacheManagerV2StagingBufferTest.cu)
+target_include_directories(
+  kvCacheManagerV2StagingBufferTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(kvCacheManagerV2StatsTest kvCacheManagerV2StatsTest.cpp)
 target_include_directories(

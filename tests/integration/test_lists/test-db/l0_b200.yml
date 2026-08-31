@@ -16,6 +16,7 @@ l0_b200:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
+  - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
@@ -51,6 +52,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] # Cover nvbugs 5461712 and 5505402
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
@@ -79,6 +81,7 @@ l0_b200:
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
+  - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
@@ -95,17 +98,19 @@ l0_b200:
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
-  - unittest/_torch/modeling/test_kimi_kda_fused_verify_parity.py
-  - unittest/_torch/modeling/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
-  - unittest/_torch/modules/moe/test_kimi_k3_mlp.py
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py
+  - unittest/_torch/moe/test_kimi_k3_mlp.py
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
@@ -122,34 +127,38 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
-  - unittest/_torch/modules/test_moe_load_balancer.py
-  - unittest/_torch/modules/test_moe_routing.py
-  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
-  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
+  - unittest/_torch/moe/test_moe_load_balancer.py
+  - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/modules/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
-  - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
+  - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
+  - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
+  - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
+  - unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
+  - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
@@ -157,7 +166,7 @@ l0_b200:
   # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
-  # UUID KV-event tests hardcode Qwen2.5-VL (no model_dir fixture id), so they
+  # UUID KV-event tests hardcode Qwen3-VL-2B (no model_dir fixture id), so they
   # are excluded by the qwen3_30b_a3b_fp8 filter above; select them explicitly.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "test_kv_event_mm_keys and uuid"
   # test_speculative_d2h_parity_real_predictor (both no_stop_token and
@@ -169,9 +178,9 @@ l0_b200:
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
@@ -224,14 +233,16 @@ l0_b200:
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_media_decode.py
+  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
+  - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
-  - unittest/_torch/visual_gen/test_fa4_key_padding_mask.py
+  - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
@@ -260,9 +271,12 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan22_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_action.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_transfer.py
+  - unittest/_torch/visual_gen/test_control_kernels.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_transformer.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_pipeline.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
@@ -309,6 +323,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_non_greedy_cuda_graph_matches_eager
 - condition:
     ranges:
       system_gpu_count:
@@ -327,7 +342,6 @@ l0_b200:
   # Covered by H100 pre_merge for primary HW-agnostic signal; keep B200 runtime
   # canary in post_merge for CUDA IPC / virtual memory / profiling paths.
   - unittest/_torch/misc
-  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1_block_reuse-cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
@@ -419,75 +433,12 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ---- non-quantized (quant=None) moved to post-merge ----
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
-# ------------- AutoDeploy Backend Stages ---------------
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: autodeploy
-  tests:
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
-  # ------------- AutoDeploy unit tests ---------------
-  # B-tier keeps only Blackwell-meaningful tests (NVFP4 / FP4 / TRTLLM-Gen /
-  # SM100+-gated). HW-agnostic tests (compile, models, shim, utils, plus most
-  # custom_ops, smoke, transformations files) and pure-FP8 tests are covered
-  # on Hopper (l0_h100.yml) and not duplicated here.
-  - unittest/auto_deploy/singlegpu/custom_ops/attention/test_triton_attention.py::TestSDPADispatch
-  - unittest/auto_deploy/singlegpu/custom_ops/mamba/test_flashinfer_mamba_cached_op.py
-  - unittest/auto_deploy/singlegpu/custom_ops/moe/test_ad_moe_op.py
-  - unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py
-  - unittest/auto_deploy/singlegpu/custom_ops/quantization/test_quant.py
-  - unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py -k "Nemotron-3-Nano-30B-A3B-FP8 or Nemotron-Nano-3-30B-A3.5B-dev or Llama-4-Scout"
-  - unittest/auto_deploy/singlegpu/smoke/test_ad_speculative_decoding.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_fuse_relu2_quant_nvfp4.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_moe_fusion.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_nvfp4_swiglu.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quant_fusion.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quant_moe.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quantization.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_trtllm_gen_diag.py
-
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: autodeploy
-  tests:
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_nvfp4[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
-  # ------------- AutoDeploy Perf Sanity ---------------
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"

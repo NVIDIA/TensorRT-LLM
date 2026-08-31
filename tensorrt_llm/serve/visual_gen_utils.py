@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import os
+from collections.abc import Mapping
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -121,6 +122,39 @@ def _read_reference_payload(reference) -> bytes:
             # binascii.Error subclasses ValueError.
             raise ValueError("input_reference is not valid base64 data.") from exc
     return reference.file.read()
+
+
+def _decode_inline_media(extra_params: dict | None, specs) -> None:
+    """Turn base64 strings into bytes for extra params declared as media.
+
+    JSON has no byte type, so a client can only inline binary as base64. Any
+    extra param whose spec accepts ``bytes`` is decoded here, at the HTTP
+    boundary, so pipelines keep a bytes-only contract and never parse
+    transport encodings. Values that already arrived as bytes (multipart)
+    pass through.
+    """
+    if not extra_params:
+        return
+    for key, value in list(extra_params.items()):
+        spec = specs.get(key) if specs else None
+        if spec is None or "bytes" not in getattr(spec, "type", ""):
+            continue
+        if isinstance(value, Mapping):
+            inner = value.get("control")
+            if isinstance(inner, str):
+                extra_params[key] = {**value, "control": _b64(key, inner)}
+        elif isinstance(value, str):
+            extra_params[key] = _b64(key, value)
+
+
+def _b64(key: str, value: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError(
+            f"extra_params['{key}'] must be base64-encoded media bytes; "
+            "it is not valid base64 data."
+        ) from exc
 
 
 def _decode_base64_media(value: str) -> Optional[bytes]:
@@ -430,6 +464,7 @@ def parse_visual_gen_params(
                 )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
+    _decode_inline_media(request.extra_params, generator.extra_param_specs)
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
 
     return params

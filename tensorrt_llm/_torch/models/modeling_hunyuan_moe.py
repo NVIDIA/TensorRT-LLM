@@ -17,12 +17,12 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, RenormalizeMoeRoutingMethod,
-                                 VanillaMoE, create_moe, is_moe_weight_owner)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (RenormalizeMoeRoutingMethod, VanillaMoE,
+                             create_moe, is_moe_weight_owner)
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, register_auto_model)
@@ -408,7 +408,9 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                     original_name = name
                     name = name.replace('gate', 'gate.wg')
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, CutlassFusedMoE) or isinstance(
+                    # VanillaMoE is named separately: it owns expert weights as
+                    # an nn.ModuleList and so is outside is_moe_weight_owner.
+                    if is_moe_weight_owner(module) or isinstance(
                             module, VanillaMoE):
                         # model.layers.{idx}.mlp.experts
                         updated_module_weights = {}

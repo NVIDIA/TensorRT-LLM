@@ -693,21 +693,20 @@ def test_openai_post_processor(llm_root, llm_venv):
          str(test_root / "_test_openai_post_processor.py")])
 
 
-@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
-def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
+def test_openai_completions_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_completions.py"), "-k", sampler
+        str(test_root / "_test_openai_completions.py"), "-k",
+        "logit_bias_effect"
     ])
 
 
-@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
-def test_openai_chat_with_logit_bias(llm_root, llm_venv, sampler: str):
+def test_openai_chat_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_chat.py"), "-k", sampler
+        str(test_root / "_test_openai_chat.py"), "-k", "logit_bias_effect"
     ])
 
 
@@ -904,12 +903,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Nemotron-Super-49B-v1-FP8',
                  'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8',
                  marks=skip_pre_hopper),
-    pytest.param('Mixtral-8x7B-NVFP4',
-                 'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
-                 marks=skip_pre_blackwell),
-    pytest.param('Mixtral-8x7B-FP8',
-                 'Mixtral-8x7B-Instruct-v0.1-fp8',
-                 marks=skip_pre_blackwell),
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
@@ -930,12 +923,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  marks=skip_pre_blackwell),
     pytest.param('Nemotron-Super-49B-v1-BF16',
                  'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1',
-                 marks=skip_pre_blackwell),
-    pytest.param('Mixtral-8x7B-BF16',
-                 'Mixtral-8x7B-Instruct-v0.1',
-                 marks=skip_pre_blackwell),
-    pytest.param('Mistral-Nemo-12b-Base',
-                 'Mistral-Nemo-Base-2407',
                  marks=skip_pre_blackwell),
     pytest.param('GPT-OSS-20B', 'gpt_oss/gpt-oss-20b',
                  marks=skip_pre_blackwell),
@@ -997,8 +984,10 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ]
         if "Qwen3" in model_name:
             cmds.append("--kv_cache_fraction=0.6")
-        if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
+        if "Llama3.3-70B" in model_name:
             cmds.append("--max_num_tokens=1024")
+        if "Llama-4" in model_name:
+            cmds.append("--max_seq_len=8192")
         llm_venv.run_cmd(cmds)
 
 
@@ -1418,11 +1407,6 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
-    pytest.param('Mixtral-8x7B-NVFP4',
-                 'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
-                 8,
-                 marks=skip_pre_blackwell),
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  8,
@@ -1441,10 +1425,8 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
         "Llama3.1-70B-BF16": 24.6,
-        "Mixtral-8x7B-BF16": 16.5,
         "Llama3.1-70B-FP8": 58.5,
         "Llama3.1-405B-FP8": 63.2,
-        "Mixtral-8x7B-NVFP4": 9.9,
         "Nemotron-Ultra-253B": 72.3,
         "DeepSeek-V3-671B-FP8": 83.8
     }
@@ -1535,7 +1517,6 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
 @pytest.mark.parametrize("model_name,model_path", [
     ('Nemotron-Super-49B-v1-BF16',
      'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
-    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
                                              model_path):
@@ -1897,6 +1878,7 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
             backend='pytorch',
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
+            max_seq_len=8192 if "Llama-4" in model_path else None,
             max_num_tokens=4096,
             max_batch_size=1,
             cuda_graph_config=CudaGraphConfig(),
@@ -1965,8 +1947,23 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
         CudaGraphConfig(),
     }
 
-    # Test prompt
-    prompt = "Who are you?"
+    # Test prompt. It has to go through the chat template: a bare string makes
+    # the model continue arbitrary text instead of answering a turn, so it
+    # never emits <|im_end|> and keeps generating until it hits max_tokens --
+    # by which point it is looping over whatever it last said. That
+    # degeneration comes from the prompt, not from Eagle3, and it is what made
+    # this test flaky (nvbugs/6627979).
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(target_model_dir)
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "Who are you?"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
     sampling_params = SamplingParams(max_tokens=1024, temperature=0)
 
     # Run with Eagle3
