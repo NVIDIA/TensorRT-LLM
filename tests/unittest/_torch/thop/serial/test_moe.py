@@ -15,8 +15,7 @@
 
 import os
 import sys
-from contextlib import contextmanager
-from typing import Iterator, Tuple
+from typing import Tuple
 
 import pytest
 import torch
@@ -37,25 +36,6 @@ from tensorrt_llm._torch.moe.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
-
-
-@contextmanager
-def fine_grained_sync_env(enabled: bool) -> Iterator[None]:
-    """Toggle TLLM_USE_FINE_GRAINED_SYNC for the duration of a test case.
-
-    C++ side reads this env var fresh on each kernel-option construction
-    (envUtils.cpp::getEnvUseFineGrainedSync), so per-test parametrization works
-    within a single process.
-    """
-    prev = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC")
-    os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = "1" if enabled else "0"
-    try:
-        yield
-    finally:
-        if prev is None:
-            os.environ.pop("TLLM_USE_FINE_GRAINED_SYNC", None)
-        else:
-            os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = prev
 
 
 # Keep this in sync with the ActType in cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
@@ -1192,12 +1172,8 @@ class TestMoeFp4:
                 id="RoutingRenormalize_large_experts"),
         ],
     )
-    @pytest.mark.parametrize("use_fine_grained", [False, True],
-                             ids=["non_fine_grained", "fine_grained"])
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
-                      act_type, routing_info, use_fine_grained):
-        if use_fine_grained and getSMVersion() != 107:
-            pytest.skip("fine-grained sync requires SM107")
+                      act_type, routing_info):
 
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
@@ -1205,8 +1181,7 @@ class TestMoeFp4:
                               routing_info,
                               use_autotune=True,
                               use_topk_as_input=False,
-                              act_type=act_type,
-                              use_fine_grained=use_fine_grained)
+                              act_type=act_type)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1294,21 +1269,15 @@ class TestMoeFp4:
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
                              ids=["use_score_as_input", "use_topk_as_input"])
-    @pytest.mark.parametrize("use_fine_grained", [False, True],
-                             ids=["non_fine_grained", "fine_grained"])
     def test_no_autotune(self, num_tokens, hidden_size, intermediate_size,
-                         act_type, routing_info, use_topk_as_input,
-                         use_fine_grained):
-        if use_fine_grained and getSMVersion() != 107:
-            pytest.skip("fine-grained sync requires SM107")
+                         act_type, routing_info, use_topk_as_input):
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
                               intermediate_size,
                               routing_info,
                               use_autotune=False,
                               use_topk_as_input=use_topk_as_input,
-                              act_type=act_type,
-                              use_fine_grained=use_fine_grained)
+                              act_type=act_type)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [512])
@@ -1421,8 +1390,7 @@ class TestMoeFp4:
                          swiglu_alpha: float = None,
                          swiglu_beta: float = None,
                          swiglu_limit: float = None,
-                         act_type: ActType = ActType.SwiGlu,
-                         use_fine_grained: bool = False) -> None:
+                         act_type: ActType = ActType.SwiGlu) -> None:
 
         torch.random.manual_seed(0)
 
@@ -1743,7 +1711,7 @@ class TestMoeFp4:
             topk_weights = None
 
         AutoTuner.get().clear_cache()
-        with fine_grained_sync_env(use_fine_grained), autotune(use_autotune):
+        with autotune(use_autotune):
             output = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 expert_logits,
                 routing_bias,
@@ -2045,7 +2013,7 @@ class TestMoeFp4:
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
-    reason="The kernel only supports Blackwell/SM107. Current SM is %d." %
+    reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 1024])
@@ -2053,8 +2021,6 @@ class TestMoeFp4:
 @pytest.mark.parametrize("intermediate_size", [2048])
 @pytest.mark.parametrize("use_topk_as_input", [False, True],
                          ids=["use_score_as_input", "use_topk_as_input"])
-@pytest.mark.parametrize("use_fine_grained", [False, True],
-                         ids=["non_fine_grained", "fine_grained"])
 @pytest.mark.parametrize(
     "routing_info",
     [
@@ -2107,10 +2073,7 @@ class TestMoeFp4:
     ],
 )
 def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
-                                  use_topk_as_input, use_fine_grained,
-                                  routing_info):
-    if use_fine_grained and getSMVersion() != 107:
-        pytest.skip("fine-grained sync requires SM107")
+                                  use_topk_as_input, routing_info):
     torch.random.manual_seed(0)
     num_experts = routing_info["num_experts"]
     top_k = routing_info["top_k"]
@@ -2256,14 +2219,13 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
         expert_logits = None
 
     AutoTuner.get().clear_cache()
-    with fine_grained_sync_env(use_fine_grained):
-        output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-            expert_logits, routing_bias, hidden_states_quant,
-            gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
-            gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k,
-            n_groups, top_k_groups, intermediate_size, 0, num_experts,
-            routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
-            routing_method_type, topk_weights, topk_ids)
+    output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
+        expert_logits, routing_bias, hidden_states_quant,
+        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
+        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
+        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+        use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
+        topk_weights, topk_ids)
     torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
 
@@ -2279,8 +2241,8 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
     "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
-    getSMVersion() != 100 and getSMVersion() != 107,
-    reason="The kernel only supports Blackwell/SM107. Current SM is %d." %
+    getSMVersion() != 100,
+    reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 256, 1024])
@@ -2330,11 +2292,9 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                          ids=["autotune", "no_autotune"])
 @pytest.mark.parametrize("use_topk_as_input", [False, True],
                          ids=["use_score_as_input", "use_topk_as_input"])
-@pytest.mark.parametrize("use_fine_grained", [False, True],
-                         ids=["non_fine_grained", "fine_grained"])
 def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                             routing_info, dtype_activation, act_type_str,
-                            use_autotune, use_topk_as_input, use_fine_grained):
+                            use_autotune, use_topk_as_input):
     torch.random.manual_seed(0)
 
     #
@@ -2385,12 +2345,6 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             )
         else:
             test_invalid_topk_input = True
-    if use_fine_grained:
-        if getSMVersion() != 107:
-            pytest.skip("fine-grained sync requires SM107")
-        if dtype_activation == "fp8":
-            pytest.skip(
-                "FineGrained not supported for fp8 (e4m3_mxe2m1) precision")
 
     assert top_k <= num_experts
     assert top_k <= 10
@@ -2676,7 +2630,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     if test_invalid_topk_input:
         top_k = top_k + 1
     AutoTuner.get().clear_cache()
-    with fine_grained_sync_env(use_fine_grained), autotune(use_autotune):
+    with autotune(use_autotune):
         if dtype_activation == "mxfp8":
             # Test fused unpadding by checking only half of the output.
             output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(

@@ -17,6 +17,8 @@
 import importlib
 import itertools
 import logging
+import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
@@ -238,7 +240,6 @@ def create_test_backend(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
     n_shared_experts: int = 0,
-    use_fine_grained_sync: bool = False,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -265,7 +266,6 @@ def create_test_backend(
         quant_config=quant_config,
         mapping=mapping,
         moe_backend=moe_backend_value,
-        use_fine_grained_sync=use_fine_grained_sync,
     )
     if n_shared_experts > 0:
         # The shared-expert-fusion gate runs after the eager create_weights()
@@ -2076,6 +2076,25 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.M
             )
 
 
+@contextmanager
+def fine_grained_sync_env(enabled: bool):
+    """Toggle TLLM_USE_FINE_GRAINED_SYNC for the duration of a test case.
+
+    The C++ side reads this env var fresh on each kernel-option construction
+    (envUtils.cpp getEnvUseFineGrainedSync), so per-test scoping works within
+    a single process.
+    """
+    prev = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC")
+    os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("TLLM_USE_FINE_GRAINED_SYNC", None)
+        else:
+            os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = prev
+
+
 @pytest.mark.parametrize("num_tokens", [1, 1024])
 def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
     if not torch.cuda.is_available():
@@ -2099,7 +2118,10 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
-    with torch.device(f"cuda:{mapping.rank}"):
+    # The C++ runner reads TLLM_USE_FINE_GRAINED_SYNC at kernel-option
+    # construction time, so the env must be set for backend creation and the
+    # forward pass alike.
+    with fine_grained_sync_env(True), torch.device(f"cuda:{mapping.rank}"):
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
 
@@ -2139,7 +2161,6 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             quant_config=quant_config,
             mapping=mapping,
             activation_type=activation_type,
-            use_fine_grained_sync=True,
         )
         backend.load_weights([weights])
         backend.post_load_weights()

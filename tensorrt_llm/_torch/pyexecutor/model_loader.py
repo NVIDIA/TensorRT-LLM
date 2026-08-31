@@ -1569,7 +1569,6 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
-            use_fine_grained_sync=self.llm_args.use_fine_grained_sync,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
