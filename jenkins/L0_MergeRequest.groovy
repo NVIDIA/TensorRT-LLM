@@ -580,10 +580,8 @@ def launchReleaseCheck(pipeline, globalVars)
             // This avoids git history depth issues with shallow clones.
             def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
             echo "Changed file count from API: ${changedFileList ? changedFileList.size() : 0}"
-            // GitHub's PR Files API caps out at 3000 entries even with pagination, so a huge
-            // PR (e.g. large cubin/LFS updates) can silently truncate the list and hide real
-            // source changes from the check (see PR #18183 main break). Fail closed by
-            // falling back to a full scan instead of trusting a possibly-truncated list.
+            // GitHub's PR Files API caps out at 3000 entries, silently truncating the
+            // list for huge PRs. Fail closed above that.
             if (changedFileList && !changedFileList.isEmpty() && changedFileList.size() < 3000) {
                 def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
                 writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
