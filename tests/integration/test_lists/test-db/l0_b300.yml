@@ -36,49 +36,54 @@ l0_b300:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
-  - unittest/_torch/modules/test_moe_load_balancer.py
-  - unittest/_torch/modules/test_moe_routing.py
-  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
-  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
+  - unittest/_torch/moe/test_moe_load_balancer.py
+  - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- Kimi K3 NVFP4: expert loading + SiTU ---------------
   # Listed test-by-test on purpose. The rest of this file has 19 failures that
   # predate this work (verified by running the base revision's copy against the
   # same source), so registering the whole module would import them into CI as
   # if they were ours. Those are reported separately; these are green.
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_expert_ckpt_spec_selection
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_block_scaled_dequantization
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_materialize_handles_scalar_lazy_safetensors
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads1]
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads4]
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_w1_w3_order_is_load_bearing
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_rejects_duplicate_slot
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_drains_staging_per_expert
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_forward_runs
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_match_situ_reference[static_1.0]
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_megamoe_overrides_finalize_streamed_expert
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_mega_format_transform_is_slot_blockwise
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_expert_ckpt_spec_selection
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_fp8_block_scaled_dequantization
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_materialize_handles_scalar_lazy_safetensors
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads1]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads4]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_w1_w3_order_is_load_bearing
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_rejects_duplicate_slot
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_drains_staging_per_expert
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_forward_runs
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTLASS]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[TRTLLM]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[CUTLASS-static_1.0]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[TRTLLM-static_1.0]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_megamoe_overrides_finalize_streamed_expert
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_mega_format_transform_is_slot_blockwise
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (specific quant per backend) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=W4A8_MXFP4_MXFP8-routing=Renormalize]
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=W8A16-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=W4A8_MXFP4_MXFP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=W8A16-routing=Renormalize]
   # TRTLLM backend: NVFP4, FP8_BLOCK_SCALES, W4A8_NVFP4_FP8, W4A16_MXFP4
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize]
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_NVFP4_FP8-routing=Renormalize]
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A16_MXFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_NVFP4_FP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A16_MXFP4-routing=Renormalize]
   # CUTEDSL backend: NVFP4
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4-routing=Renormalize]
   # DEEPGEMM backend: FP8_BLOCK_SCALES
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
   # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
@@ -102,7 +107,7 @@ l0_b300:
       backend: pytorch
   tests:
   # ---- moved to post-merge (MoE CI optimization) ----
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"

@@ -397,6 +397,107 @@ def test_cute_dsl_gvr_topk_decode_seqlen_sorted(
 
 
 # ===========================================================================
+# Degenerate-hint bracket-rewrite race regressions. A straggler warp reading
+# a leader-rewritten smem scalar (Phase-1 bracket, Phase-2 ``done`` flags,
+# Phase-4 bin-search publish) could skip a guarded barrier and corrupt the
+# row. Degenerate hints are reachable: CUDA-graph capture-warmup rows,
+# disagg gen-side first decode, stale or position-shifted priors, and
+# value-collision ties. Timing race: each test launches repeatedly over a
+# poisoned output buffer.
+# ===========================================================================
+
+
+@skip_not_sm100
+def test_cute_dsl_gvr_topk_decode_all_zeros_pre_idx(tie_aware_check) -> None:
+    """All-zeros ``pre_idx`` (CUDA-graph capture warmup, disagg gen-side
+    first decode) gathers one value per row: every CTA takes the degenerate
+    bracket rewrite — the race site. Pre-fix: wrong sets, unwritten slots,
+    out-of-range indices on most launches."""
+    top_k = 1024
+    num_rows, N = 4096, 4096
+    torch.manual_seed(7)
+    logits = torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0
+    pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    ref_cache: dict = {}
+
+    for _ in range(40):
+        # Poison: any output slot the kernel fails to write stays negative
+        # and trips the checker's range assertion.
+        out_indices = torch.full((num_rows, top_k), -777777, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_indices,
+            top_k=top_k,
+            next_n=1,
+            compress_ratio=1,
+            cluster_size=1,
+        )
+        torch.cuda.synchronize()
+        tie_aware_check(
+            out_indices,
+            logits,
+            seq_lens,
+            top_k,
+            1,
+            compress_ratio=1,
+            ref_vals_cache=ref_cache,
+        )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("scenario", ["quantized", "plateau_wider_than_kc"])
+def test_cute_dsl_gvr_topk_decode_tie_degenerate_hint(scenario, tie_aware_check) -> None:
+    """Tie-heavy rows collide the gathered hint values bitwise, arming the
+    degenerate rewrite despite a real hint. ``quantized``: 0.25-step logits
+    (pre-fix: intermittent illegal memory access); ``plateau_wider_than_kc``:
+    0.0 tie class wider than ``kC`` (pins the plateau-collapse terminal and
+    plateau fill)."""
+    top_k = 512
+    num_rows, N = 1024, 16384
+    if scenario == "quantized":
+        torch.manual_seed(11)
+        logits = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 8.0).round() / 4.0
+    else:
+        n_win = 100
+        logits = torch.zeros(num_rows, N, dtype=torch.float32, device="cuda")
+        # Winners beyond column top_k+1 at stride >= 2: every hint-gathered
+        # column (offset +1) stays on the 0.0 plateau.
+        stride = (N - top_k - 2) // n_win
+        win_cols = top_k + 2 + stride * torch.arange(n_win, device="cuda")
+        logits[:, win_cols] = 1.0
+    pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    pre_idx[:, 0] = logits.argmax(dim=-1).int()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    ref_cache: dict = {}
+
+    for _ in range(60):
+        out_indices = torch.full((num_rows, top_k), -777777, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_indices,
+            top_k=top_k,
+            next_n=1,
+            compress_ratio=1,
+            cluster_size=1,
+        )
+        torch.cuda.synchronize()
+        tie_aware_check(
+            out_indices,
+            logits,
+            seq_lens,
+            top_k,
+            1,
+            compress_ratio=1,
+            ref_vals_cache=ref_cache,
+        )
+
+
+# ===========================================================================
 # GVR top-K multi-CTA short-row degrade boundary tests.
 #
 # For cluster_size > 1 each row is owned by a cluster of CTAs.  When the

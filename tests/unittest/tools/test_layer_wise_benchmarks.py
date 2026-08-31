@@ -15,8 +15,6 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell
 
-_LAYER_WISE_BENCHMARKS_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337228")
-
 
 @pytest.fixture(scope="module", autouse=True)
 def require_nsys_cuda_tracing():
@@ -133,15 +131,11 @@ def require_nsys_cuda_tracing():
         )
 
 
-# The pinned DeepSeek FP4 checkpoint requires SM100+.
+# The pinned DeepSeek FP4 checkpoint requires SM100+, so this is guarded with
+# skip_pre_blackwell like its siblings below. https://nvbugs/6337228 was exactly
+# this test aborting (rc 134/1) on the A10 pre-merge stage.
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
-        4,
-    ],
-)
+@pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_r1_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -170,13 +164,7 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
 
 # The pinned DeepSeek FP4 checkpoint requires SM100+.
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
-        4,
-    ],
-)
+@pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_r1_ctx_tep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -207,13 +195,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
 
 # The pinned config (DeepSeek-V3.2 with the DEEPGEMM MoE backend) targets SM100+.
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
-        4,
-    ],
-)
+@pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_v32_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")

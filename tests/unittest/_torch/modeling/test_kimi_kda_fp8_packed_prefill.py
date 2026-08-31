@@ -55,6 +55,7 @@ pytestmark = pytest.mark.skipif(
 def _make_attention() -> KimiKDALinearAttention:
     attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
     assert _convert_kda_projections_to_fp8_weight_read(_Model(attention)) == 5
+    attention.finalize_decode_weights_fp8()
     return attention
 
 
@@ -110,10 +111,12 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
     metadata = SimpleNamespace(
         use_initial_states=use_initial_states,
         has_initial_states=torch.tensor(has_initial_states, device="cuda", dtype=torch.bool),
+        state_indices=slot_indices.to(torch.int32),
+        query_start_loc=cu_seqlens.to(torch.int32),
     )
     hidden = torch.randn(num_tokens, _Cfg.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.05
     hidden_pristine = hidden.clone()
-    conv_seed = torch.randn(slots, 3 * d, conv_size, device="cuda", dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, conv_size - 1, device="cuda", dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device="cuda", dtype=torch.float32) * 0.01
     )

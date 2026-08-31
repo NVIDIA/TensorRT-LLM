@@ -7,11 +7,15 @@ There are multiple ways to install and run TensorRT LLM. The options below are o
 
 **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
+Nightly releases are development builds identified by a `.dev` segment in the version. They provide early access to
+the latest changes, but their quality is not guaranteed and they may contain bugs or regressions.
+
 ## Option 1: Pre-built Release Container
 
 Pre-built TensorRT LLM releases are available as [container images on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release). This is the simplest way to obtain TensorRT LLM.
 
-Replace `x.y.z` with the desired version tag. Browse the [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) to find the latest release.
+Replace `x.y.z` with the desired version tag. The [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)
+include both regular and `.dev` nightly releases.
 
 ```bash
 docker pull nvcr.io/nvidia/tensorrt-llm/release:x.y.z
@@ -21,6 +25,12 @@ docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=671
 
 {{container_tag_admonition}}
 
+View the source commit recorded in the image by running the following inside the container:
+
+```bash
+printenv TRT_LLM_GIT_COMMIT
+```
+
 Sanity check the installation by running the following inside the container:
 
 ```bash
@@ -29,6 +39,9 @@ python3 -c "import tensorrt_llm"
 
 (linux)=
 ## Option 2: Install on Linux via `pip`
+
+> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
+> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel is located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
 
 Tested on Ubuntu 24.04.
 
@@ -76,16 +89,37 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
 ```
 
-> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
->
-> ```bash
-> # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container
-> pip3 install tensorrt_llm==1.3.0rc16+ngcpytorch2602
-> ```
->
-> If the NGC PyTorch container-specific wheel is not available, you can instead install the pre-built wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
+#### Install a nightly release
+
+Nightly wheels are published to a dedicated package index. Query that index to list compatible versions, and use
+`--extra-index-url` when installing to keep PyPI available for dependency resolution.
+
+List the nightly releases compatible with the current environment:
+
+```bash
+pip3 index versions tensorrt_llm --pre \
+    --index-url https://pypi.nvidia.com/trtllm_nightly/
+```
+
+Choose a version from the list and install it explicitly:
+
+```bash
+pip3 install "tensorrt_llm==<version-from-the-list>" \
+    --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
+```
+
+If needed, browse the [raw nightly wheel index](https://pypi.nvidia.com/trtllm_nightly/tensorrt-llm/) to inspect
+builds for other Python versions or platforms.
 
 ### Sanity check
+
+View the source commit recorded in the wheel metadata:
+
+```bash
+pip3 show --verbose tensorrt_llm | grep "Source Commit"
+```
+
+Run a quick start example on supported environment:
 
 ```{literalinclude} ../../../examples/llm-api/quickstart_example.py
     :language: python

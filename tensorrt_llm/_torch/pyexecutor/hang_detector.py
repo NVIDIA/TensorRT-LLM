@@ -328,9 +328,23 @@ def start_rank_crash_kill_watchdog(
 class HangDetector:
     """Watchdog that fires when the executor loop stops checkpointing.
 
-    When ``timeout`` seconds pass without a ``checkpoint()``, all thread stacks
-    are dumped for diagnosis and ``on_detected`` runs (the hard-kill +
-    cross-rank propagation path).
+    Contract:
+
+    - ``timeout`` seconds without a ``checkpoint()`` dumps all thread stacks for
+      diagnosis and runs ``on_detected`` (the hard-kill + cross-rank
+      propagation path).
+    - Continued checkpointing never fires it. A false positive hard-kills a
+      healthy job, so this bound is as load-bearing as detection itself.
+    - ``start()`` leaves detection disarmed; the first ``checkpoint()`` arms it,
+      so the start-to-first-checkpoint window is not hang-eligible.
+    - ``pause()`` suppresses detection in scope and re-arms on exit. It does
+      not nest: leaving an inner ``pause()`` re-arms while an outer one is
+      still open.
+    - Detection never stops while active: not after firing, and not if
+      ``on_detected`` raises an ``Exception``. ``on_detected`` is not
+      idempotent, so a single lapse invokes it once.
+    - ``checkpoint()`` is one clock read and one float store, and does no
+      cross-thread work. The executor loop calls it three times per iteration.
     """
 
     def __init__(
@@ -346,6 +360,9 @@ class HangDetector:
         self.active = False
         self._detected = False
         self._status_providers: list[Callable[[], str]] = []
+        # Monotonic stamp the watcher compares against; ``inf`` means disarmed.
+        # A plain float store is the entire cost of ``checkpoint()``.
+        self._deadline = math.inf
 
     def start(self):
         """Enable hang detection."""
@@ -354,18 +371,80 @@ class HangDetector:
             asyncio.set_event_loop(self.loop)
             self.loop.run_forever()
 
-        self.active = True
+        with self.lock:
+            # Locked, not a bare check: concurrent callers could both observe
+            # ``active`` false and schedule a watcher, and watchers share
+            # ``_deadline``, so a second one reports the same lapse twice and
+            # propagates two hard kills.
+            if self.active:
+                _best_effort_log_error(
+                    "HangDetector.start() called while already active; ignoring."
+                )
+                return
+            # Disarmed until the first checkpoint so startup does not lapse.
+            # Stored before ``active`` is published so a checkpoint racing this
+            # call cannot have its arm overwritten here.
+            self._deadline = math.inf
+            self.active = True
+
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=run_loop, daemon=True, name="hang_detector_loop")
         self.loop_thread.start()
+        # One long-lived watcher, scheduled once; the hot path only moves
+        # ``_deadline``.
+        self.task = asyncio.run_coroutine_threadsafe(self._watch(), self.loop)
 
     def register_status_provider(self, provider: Callable[[], str]) -> None:
         """Register a nonblocking callable that returns status to dump on hang detection."""
         with self.lock:
             self._status_providers.append(provider)
 
-    async def _detect_hang(self) -> None:
-        await asyncio.sleep(self.timeout)
+    async def _watch(self) -> None:
+        """Sleep until the deadline lapses, report, and keep watching.
+
+        Waking early is normal: ``checkpoint()`` pushes ``_deadline`` forward
+        without touching this task, so each wake-up either finds time left and
+        sleeps again, or finds the deadline passed and reports. Every sleep is
+        clamped to ``timeout`` because ``checkpoint()`` only stores a float and
+        never wakes this loop, so an unclamped sleep would not notice a later
+        arm.
+
+        This task never writes ``_deadline``; the lapse it last reported is
+        watcher-local.
+
+        This task outlives a report, and outlives a report that raises. A
+        watchdog that quietly stopped watching would be the exact failure it
+        exists to catch, and ``on_detected`` is the cross-rank hard kill, which
+        can itself fail on an already-degraded job.
+        """
+        # The deadline whose lapse already ran ``on_detected``. Compared by
+        # identity, not equality: ``checkpoint()`` publishes a fresh float, so a
+        # re-arm that lands on the same value still reports.
+        reported = None
+        while self.active:
+            # Clock first: a checkpoint can land between these two reads, and
+            # whichever is read first is the stale one. A stale deadline fires
+            # at work that was checkpointed in time; a stale clock only defers.
+            now = time.monotonic()
+            deadline = self._deadline
+            remaining = deadline - now
+            if remaining > 0:
+                await asyncio.sleep(min(remaining, self.timeout))
+                continue
+            if deadline is reported:
+                # ``on_detected`` is not idempotent, so one lapse runs it once.
+                # Nothing wakes this loop, so poll for the next arm.
+                await asyncio.sleep(self.timeout)
+                continue
+            reported = deadline
+            try:
+                await self._report_hang()
+            except Exception as error:  # noqa: BLE001 - the watcher must survive
+                _best_effort_log_error(
+                    f"HangDetector: reporting failed with {type(error).__name__}: {error}"
+                )
+
+    async def _report_hang(self) -> None:
         with self.lock:
             status_providers = tuple(self._status_providers)
 
@@ -399,21 +478,28 @@ class HangDetector:
 
     def checkpoint(self):
         """Reset hang detection timer."""
-        self.cancel_task()
         if self.active:
-            self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
+            self._deadline = time.monotonic() + self.timeout
 
-    def cancel_task(self):
-        """Cancel the hang detection task."""
-        if self.task is not None and not self.task.done():
-            self.task.cancel()
-            self.task = None
+    def disarm(self) -> None:
+        """Disarm hang detection until the next checkpoint."""
+        self._deadline = math.inf
+
+    def cancel_task(self) -> None:
+        """Compatibility alias for :meth:`disarm`.
+
+        The watcher is long-lived and has no task to cancel, but the old name is
+        load-bearing for the cache-transceiver precheck and its SLURM example.
+        Delegating rather than aliasing keeps a subclass override of ``disarm``
+        effective through this name.
+        """
+        self.disarm()
 
     @contextmanager
     def pause(self):
         """Pause hang detection in scope."""
+        self.disarm()
         try:
-            self.cancel_task()
             yield
         finally:
             self.checkpoint()
@@ -421,7 +507,7 @@ class HangDetector:
     def stop(self):
         """Stop hang detection."""
         self.active = False
-        self.cancel_task()
+        self.disarm()
         if self.loop is not None:
             # Cancel all pending tasks before stopping the loop
             def cancel_all_tasks():

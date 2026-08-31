@@ -26,16 +26,20 @@ from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
+from ..attention_backend import (
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttentionMetadata,
+)
 from ..attention_backend.interface import (
     AttentionMask,
     CustomAttentionMask,
@@ -223,6 +227,17 @@ class Gemma4Attention(QKNormRoPEAttention):
         self.is_kv_shared = is_kv_shared
         config = model_config.pretrained_config
 
+        # Native TRTLLM's SM100 FP8-KV path consumes BF16 Q/K/V and quantizes
+        # while appending to the cache. Keep RoPE at the model layer so the
+        # fused Gemma4 prep kernel can produce those BF16 inputs for both
+        # sliding and full-attention layers.
+        self._use_trtllm_fused_qkv_prep = (
+            not is_kv_shared
+            and model_config.attn_backend == "TRTLLM"
+            and model_config.get_quant_config().layer_quant_mode.has_fp8_kv_cache()
+            and is_sm_100f()
+        )
+
         # Per-layer head_dim and kv heads
         # Note: num_global_key_value_heads is only used when K=V (alternative
         # attention). For non-K=V full layers, use regular num_key_value_heads.
@@ -299,6 +314,11 @@ class Gemma4Attention(QKNormRoPEAttention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
+            # Full-attention layers use proportional RoPE whose active
+            # frequencies are paired across the full head. Apply it at the
+            # module layer because fused preprocessing cannot represent that
+            # pairing with only the logical rotary dimension.
+            rope_fusion=is_sliding and not self._use_trtllm_fused_qkv_prep,
         )
 
         # Restore original config head_dim
@@ -347,10 +367,11 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
-        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
-        # multimodal custom masks then use FlashInfer's native mask planning.
-        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
+        # When FlashInfer is explicitly selected, use trtllm-gen only on
+        # datacenter Blackwell. The default TRTLLM backend selects phased FMHA
+        # directly and does not expose this FlashInfer option.
+        if hasattr(self.attn, "flashinfer_backend"):
+            self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -391,24 +412,26 @@ class Gemma4Attention(QKNormRoPEAttention):
             has_weights=False,
         )
 
-        # Fused QKV prep (norm+rope+FP8 quant in one Triton kernel).  Decided
-        # lazily on first apply_rope because attn.flashinfer_backend and
-        # has_fp8_kv_cache are finalized after __init__.  The unfused path
-        # below stays as the reference / fallback.
+        # Fused QKV prep (norm+rope with optional FP8 output in one Triton
+        # kernel). Decided lazily on first apply_rope because the attention
+        # backend's quantization state is finalized after __init__. The
+        # unfused path below stays as the reference / fallback.
         self._fused_qkv_prep: Optional[bool] = None
+        self._fused_qkv_prep_out_fp8 = False
         self._fused_prep_blocked = False
 
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
+            use_flashinfer_fp8 = getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+            use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
-                # The kernel emits KV-cache-dtype FP8 and replicates the
-                # flashinfer 2-target rope; only the profiled trtllm-gen +
-                # FP8-KV serving path is routed through it.
-                and getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+                # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
+                # TRTLLM instead consumes the kernel's packed BF16 output.
+                and (use_flashinfer_fp8 or use_trtllm_bf16)
                 and getattr(self.attn, "has_fp8_kv_cache", False)
                 and rot is not None
                 and getattr(rot, "is_neox", False)
@@ -419,11 +442,15 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and rot.rotary_cos_sin.shape[1] == 2
                 and rot.rotary_cos_sin.shape[2] * 2 == self.head_dim
                 and rot.rotary_cos_sin.is_contiguous()
+                # Triton's reduction and tile ranges require powers of two.
+                and self.head_dim > 0
+                and self.head_dim & (self.head_dim - 1) == 0
                 and self.q_norm.weight.shape == (self.head_dim,)
                 and self.k_norm.weight.shape == (self.head_dim,)
                 and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
                 and self.q_norm.variance_epsilon == self.v_norm.variance_epsilon
             )
+            self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8
         return self._fused_qkv_prep
 
     def apply_rope(
@@ -452,9 +479,9 @@ class Gemma4Attention(QKNormRoPEAttention):
 
             # Fused path: one Triton kernel reads the packed QKV GEMM output
             # (strided per-head views), applies q/k/v RMSNorm + RoPE, and
-            # emits FP8 Q/K/V directly — replacing the reshape copies, three
-            # norms, the rope launch, and the backend's three
-            # .to(float8_e4m3fn) casts.
+            # emits Q/K/V directly — replacing the reshape copies, three
+            # norms, and the rope launch. The FlashInfer trtllm-gen path also
+            # emits FP8 here instead of launching three backend casts.
             if (
                 k is None
                 and v is None
@@ -474,7 +501,8 @@ class Gemma4Attention(QKNormRoPEAttention):
                     self.num_heads,
                     self.num_key_value_heads,
                     self.head_dim,
-                    out_fp8=True,
+                    out_fp8=self._fused_qkv_prep_out_fp8,
+                    packed_output=self._use_trtllm_fused_qkv_prep,
                 )
 
             q, k, v = self.split_qkv(q, k, v)
@@ -515,9 +543,10 @@ class Gemma4Attention(QKNormRoPEAttention):
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask_data is not None:
-            assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-                "Only FlashInfer backend supports custom attention mask currently."
-            )
+            assert isinstance(
+                attn_metadata,
+                (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
+            ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
         # Custom-mask (multimodal) prefill uses the Triton prefill fallback,
         # which consumes BF16 q/k/v — keep the unfused prep for those calls.
@@ -1270,12 +1299,17 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        FlashInfer backend is required for hybrid attention (per-layer
-        head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
-        bidirectional attention masks for multimodal tokens.
+        The TRTLLM attention backend uses trtllm-gen for the regular attention
+        phases and a Triton context phase for bidirectional multimodal masks.
+        External shared-KV MTP still requires FlashInfer attention metadata.
         """
+        speculative_config = getattr(llm_args, "speculative_config", None)
+        spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)
+        uses_external_shared_kv = (
+            spec_dec_mode is not None and spec_dec_mode.is_mtp_eagle_one_model()
+        )
         return {
-            "attn_backend": "FLASHINFER",
+            "attn_backend": "FLASHINFER" if uses_external_shared_kv else "TRTLLM",
         }
 
     @classmethod
@@ -1339,11 +1373,10 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """Build context mask with causal + bidirectional for MM tokens.
 
         Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) are True for
-          all rows. SWA window enforcement is delegated to the kernel's
-          window_left clip. Bidirectional MM across the prefix/extend
-          boundary is NOT supported here; callers must ensure chunk
-          boundaries do not split a multimodal block.
+        - The first `prefix_len` columns (cached/paged history) apply the
+          sliding window using absolute token positions. Bidirectional MM
+          across the prefix/extend boundary is NOT supported here; callers
+          must ensure chunk boundaries do not split a multimodal block.
         - The last `extend_len` columns follow the original causal +
           (optional) sliding window + MM-bidirectional logic.
         """
@@ -1360,23 +1393,30 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
 
         if prefix_len > 0:
-            prefix_block = torch.ones(
-                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-            )
+            if (
+                effective_sliding_window is not None
+                and effective_sliding_window < prefix_len + extend_len
+            ):
+                query_pos = prefix_len + pos
+                prefix_pos = torch.arange(prefix_len, device=device)
+                prefix_block = (
+                    prefix_pos.unsqueeze(0) > query_pos.unsqueeze(1) - effective_sliding_window
+                )
+            else:
+                prefix_block = torch.ones(
+                    extend_len, prefix_len, dtype=causal_mask.dtype, device=device
+                )
             causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
 
         return causal_mask
 
-    def get_flashinfer_attention_mask(
+    def get_attention_mask(
         self,
         mm_token_type_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         effective_sliding_window: Optional[int] = None,
     ) -> torch.Tensor:
-        """Build FlashInfer custom mask for context requests."""
-        assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-            "Only FlashInfer backend supports custom mask currently."
-        )
+        """Build a custom attention mask for context requests."""
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 
@@ -1465,7 +1505,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
         if mm_token_type_ids is not None and use_bidir == "vision":
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
+            local_attention_mask_data = self.get_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,

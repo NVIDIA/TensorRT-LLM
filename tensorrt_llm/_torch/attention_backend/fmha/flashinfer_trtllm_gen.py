@@ -60,6 +60,12 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase, _CuteDslMlaStagingKey
 from .phased import FmhaParams, PhasedFmha
+from .utils import (
+    get_attention_chunk_size,
+    get_bmm1_scale,
+    get_multi_processor_count_for_device,
+    get_trtllm_gen_context_workspace_size,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -327,52 +333,6 @@ def _prepare_cute_dsl_mla_buffers(
 
 
 @lru_cache(maxsize=128)
-def _get_context_workspace_layout(
-    dtype: torch.dtype,
-    batch_size: int,
-    num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> dict[str, int]:
-    return thop.get_trtllm_gen_context_workspace_layout(
-        dtype,
-        batch_size,
-        num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        True,
-        fp8_context_fmha,
-    )
-
-
-@lru_cache(maxsize=128)
-def _get_context_workspace_size(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> int:
-    if max_num_tokens == 0:
-        return 0
-    layout = _get_context_workspace_layout(
-        dtype,
-        max_num_seq,
-        max_num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        fp8_context_fmha,
-    )
-    return int(layout["total_size"])
-
-
-@lru_cache(maxsize=128)
 def _get_generation_workspace_layout(
     dtype: torch.dtype,
     batch_beam: int,
@@ -431,7 +391,7 @@ def _get_workspace_size(
     rotary_embedding_dim: int,
     fp8_context_fmha: bool,
 ) -> int:
-    context_size = _get_context_workspace_size(
+    context_size = get_trtllm_gen_context_workspace_size(
         dtype,
         max_num_requests,
         num_tokens,
@@ -614,14 +574,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return kv_cache_manager.dtype
         return None
 
-    @staticmethod
-    def _get_bmm1_scale(attn: "TrtllmAttention") -> float:
-        return 1.0 / (math.sqrt(attn.head_dim) * attn.q_scaling)
-
-    @staticmethod
-    def _get_attention_chunk_size(attn: "TrtllmAttention") -> int:
-        return attn.attention_chunk_size if attn.attention_chunk_size is not None else 0
-
     @classmethod
     def _check_mla_generation_support(
         cls,
@@ -729,6 +681,32 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         else:
             return False, f"invalid FMHA phase: {phase}."
 
+        if has_context_phase and q.dtype == torch.bfloat16 and 0 < meta.num_contexts <= 4:
+            # NVBug 6579626: the per-layer host overhead of the FlashInfer
+            # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
+            # Let the FMHA selector choose the fallback implementation only
+            # for that affected regime.
+            return False, (
+                "small-batch BF16 context attention uses the fallback FMHA for "
+                "performance because the FlashInfer TRTLLM-Gen context path "
+                "regresses TTFT due to per-layer host overhead."
+            )
+
+        if (
+            has_context_phase
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and meta.num_contexts > 0
+            and get_sm_version() == 103
+        ):
+            # NVBugs 6641268 and 6668773: on SM103, the FlashInfer
+            # TRTLLM-Gen persistent context path can read unused paged-KV tail
+            # elements, so stale values can corrupt valid FP16/BF16 output.
+            return False, (
+                "FP16/BF16 context attention uses the fallback FMHA on SM103 "
+                "because the FlashInfer TRTLLM-Gen persistent context path can "
+                "read unused paged-KV cache tails."
+            )
+
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
@@ -777,6 +755,24 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         tokens_per_block = meta.tokens_per_block
         if tokens_per_block is None:
             tokens_per_block = 0
+
+        if not is_mla_enable and not meta.is_cross:
+            q_hidden_size = attn.num_heads * attn.head_dim
+            qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
+            has_fused_qkv = (
+                fwd.is_fused_qkv and k is None and v is None and q.size(-1) == qkv_hidden_size
+            )
+            has_q_only = (
+                not fwd.is_fused_qkv
+                and not fwd.update_kv_cache
+                and k is None
+                and v is None
+                and q.size(-1) == q_hidden_size
+            )
+            if not has_fused_qkv and not has_q_only:
+                return False, "self attention requires fused QKV or Q-only cached-KV input."
+            if has_q_only and q.dtype == torch.float8_e4m3fn:
+                return False, "Q-only cached-KV preprocessing supports FP16 or BF16 input."
 
         q_dtype = q.dtype
         o_dtype = output.dtype
@@ -883,11 +879,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    @staticmethod
-    @lru_cache(maxsize=None)
-    def _get_multi_processor_count_for_device(device_index: int) -> int:
-        return torch.cuda.get_device_properties(device_index).multi_processor_count
-
     def _get_multi_processor_count(self, device: torch.device) -> int:
         device = torch.device(device)
         if device.type != "cuda":
@@ -895,7 +886,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         device_index = device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        return self._get_multi_processor_count_for_device(device_index)
+        return get_multi_processor_count_for_device(device_index)
 
     def _use_fp8_context_fmha(
         self,
@@ -1078,8 +1069,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        bmm1_scale_static = self._get_bmm1_scale(attn)
-        attention_chunk_size = self._get_attention_chunk_size(attn)
+        bmm1_scale_static = get_bmm1_scale(attn)
+        attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         (
@@ -1236,8 +1227,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        bmm1_scale_static = self._get_bmm1_scale(attn)
-        attention_chunk_size = self._get_attention_chunk_size(attn)
+        bmm1_scale_static = get_bmm1_scale(attn)
+        attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.num_requests * meta.beam_width
@@ -1362,7 +1353,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise NotImplementedError(
                 "Sliding-window attention is not supported by MLA decode path."
             )
-        if self._get_attention_chunk_size(attn) != 0:
+        if get_attention_chunk_size(attn) != 0:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * meta.beam_width

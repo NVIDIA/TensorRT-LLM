@@ -79,6 +79,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _introspection,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
+from tensorrt_llm.sampling_params import SamplingParams
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -212,7 +213,7 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     params = extract_mamba_kv_cache_params(config)
 
     assert params.state_size == 8
-    assert params.conv_kernel == 5
+    assert params.conv_kernel == 4
     assert params.num_heads == 4
     assert params.n_groups == 4
     assert params.head_dim == 8
@@ -300,7 +301,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert isinstance(kwargs, dict)
     assert args[:9] == (
         8,
-        5,
+        4,
         4,
         4,
         8,
@@ -907,20 +908,25 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
     kv_slice = transceiver._create_kv_slice(request)
 
-    assert kv_slice.mamba_state_index is None
+    # No mamba layer group → no STATE entries in block_ids
+    assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
+    # Provide a mamba layer group so _create_kv_slice places the slot ID
+    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = SimpleNamespace(layer_groups=[])
+    transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
     request = SimpleNamespace(
         is_generation_only_request=lambda: False,
         prompt_len=0,
@@ -929,7 +935,8 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 
     kv_slice = transceiver._create_kv_slice(request)
 
-    assert kv_slice.mamba_state_index == 7
+    # Slot index 7 should be in the STATE group's block_ids
+    assert kv_slice.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 
@@ -1938,6 +1945,31 @@ def test_v2_hybrid_add_dummy_requests_forwards_encoder_output_lens(mocker):
     mgr.add_dummy_requests([123], encoder_output_lens=[17])
 
     assert base_add_dummy_requests.call_args.kwargs["encoder_output_lens"] == [17]
+
+
+@pytest.mark.parametrize(
+    "manager_cls,base_cls",
+    [
+        (MambaHybridCacheManagerV2, KVCacheManagerV2),
+        (CppMambaHybridCacheManager, KVCacheManager),
+    ],
+    ids=["v2", "cpp"],
+)
+def test_add_dummy_requests_forwards_capture_sampling_params(mocker, manager_cls, base_cls):
+    """Regression test: model_engine.py's CUDA graph warmup path always
+    passes capture_sampling_params (None on the greedy pass, a real
+    SamplingParams on non-greedy passes) to whatever concrete
+    kv_cache_manager is active. An override with an explicit signature
+    that doesn't accept/forward this kwarg breaks warmup for that
+    manager type with a TypeError.
+    """
+    mgr = object.__new__(manager_cls)
+    base_add_dummy_requests = mocker.patch.object(base_cls, "add_dummy_requests", return_value=[])
+    sampling_params = SamplingParams(temperature=0.9, top_p=0.95)
+
+    mgr.add_dummy_requests([123], capture_sampling_params=sampling_params)
+
+    assert base_add_dummy_requests.call_args.kwargs["capture_sampling_params"] is sampling_params
 
 
 @pytest.mark.parametrize(

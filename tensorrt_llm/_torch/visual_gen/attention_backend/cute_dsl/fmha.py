@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-CuTe DSL (NVIDIA kernels) Dense FMHA Backend for Visual Generation Models
+CuTe DSL (NVIDIA kernels) FMHA Backend for Visual Generation Models
 
-JIT-compiles the dense FMHA kernel and caches the compiled artifact for each kernel configuration.
-Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16 inputs. The VSA sparse path uses
-VSAAttention from vsa.py instead.
+JIT-compiles dense or SkipSoftmax FMHA and caches the compiled artifact for each kernel
+configuration. Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16 inputs. The VSA
+sparse path uses VSAAttention from vsa.py instead.
 """
 
 import math
@@ -25,6 +25,7 @@ from typing import Any, NamedTuple, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -62,6 +63,34 @@ SUPPORTED_GPU_ARCHS: Tuple[str, ...] = ("sm_100a", "sm_103a")
 # ============================================================================
 # Runtime helpers
 # ============================================================================
+
+
+def _resolve_skip_softmax_threshold_scale_factor(
+    threshold_scale_factor: float | None,
+    sparse_params: SkipSoftmaxParams | None,
+    timestep: Any,
+) -> float | None:
+    """Resolve the active CuTeDSL threshold for the current denoising phase."""
+    if sparse_params is not None:
+        if timestep is None and sparse_params.scheduler.disabled_until_timestep is not None:
+            # Fail-open: a missing timestep resolves to the full (unthrottled)
+            # threshold, i.e. skip-softmax runs during the high-noise steps
+            # `disabled_until_timestep` exists to protect. This is silent
+            # elsewhere (a quality regression, not an error), so surface it
+            # once per process instead of only in this function's return value.
+            logger.warning_once(
+                "SkipSoftmax scheduler has disabled_until_timestep="
+                f"{sparse_params.scheduler.disabled_until_timestep} configured, but no "
+                "`timestep` was passed to the CuTeDSL attention forward call. Skip-softmax "
+                "will run unthrottled (as if past the cutoff) until `timestep` is threaded "
+                "through.",
+                key="cute_dsl_skip_softmax_missing_timestep",
+            )
+        runtime_params = sparse_params.scheduler.get_runtime_params(timestep=timestep)
+        threshold_scale_factor = runtime_params.threshold_scale_factor_prefill
+    if threshold_scale_factor is None or threshold_scale_factor <= 0.0:
+        return None
+    return threshold_scale_factor
 
 
 def _check_cute_runtime_available() -> None:
@@ -239,6 +268,8 @@ def cute_dsl_fmha_fwd(
     scale_o: float | torch.Tensor = 1.0,
     is_persistent: bool = True,
     skip_softmax_threshold_scale_factor: float | None = None,
+    sparse_params: SkipSoftmaxParams | None = None,
+    timestep: Any = None,
     qk_sf_vec: int = 0,
     q_sf: torch.Tensor | None = None,
     k_sf: torch.Tensor | None = None,
@@ -252,7 +283,14 @@ def cute_dsl_fmha_fwd(
     When `qk_sf_vec` is non-zero, dispatches to the block-scaled kernel class:
     32 selects MXFP8 (Q/K stored as FP8 e4m3, SFs as Float8E8M0FNU uint8 storage);
     16 selects NVFP4 (Q/K stored as packed FP4 in torch.uint8, SFs as Float8E4M3FN in uint8 storage).
+    When `sparse_params` is set, its timestep-aware scheduler overrides the direct threshold.
     """
+    skip_softmax_threshold_scale_factor = _resolve_skip_softmax_threshold_scale_factor(
+        skip_softmax_threshold_scale_factor,
+        sparse_params,
+        timestep,
+    )
+
     _check_cute_runtime_available()
     _validate_inputs(q, k, v, o)
     if qk_sf_vec != 0:
@@ -583,7 +621,13 @@ class CuTeDSLAttention(AttentionBackend):
         num_kv_heads: int | None = None,
         dtype: torch.dtype | None = None,
         quant_attention_config: QuantAttentionConfig | None = None,
+        # Legacy static threshold, superseded by `sparse_params`'s timestep-aware
+        # scheduler for every in-tree construction path (`create_attention` never
+        # forwards this). Kept only for direct-construction debug/testing use
+        # (e.g. unit tests that want a fixed threshold without a scheduler);
+        # mutually exclusive with `sparse_params` below.
         skip_softmax_threshold_scale: float | None = None,
+        sparse_params: SkipSoftmaxParams | None = None,
         **kwargs,
     ):
         self.layer_idx = layer_idx
@@ -592,7 +636,10 @@ class CuTeDSLAttention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.quant_attention_config = quant_attention_config
+        if skip_softmax_threshold_scale is not None and sparse_params is not None:
+            raise ValueError("Set either skip_softmax_threshold_scale or sparse_params, not both.")
         self.skip_softmax_threshold_scale = skip_softmax_threshold_scale
+        self.sparse_params = sparse_params
         self.scale = 1.0 / math.sqrt(head_dim)
 
         # CuTe DSL expects [B, S, H, D] format
@@ -727,6 +774,8 @@ class CuTeDSLAttention(AttentionBackend):
             scale_v_channels=scale_v_channels,
             scale_o=kwargs.get("scale_o", 1.0),
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale,
+            sparse_params=self.sparse_params,
+            timestep=kwargs.get("timestep"),
             qk_sf_vec=qk_sf_vec,
             q_sf=q_sf,
             k_sf=k_sf,

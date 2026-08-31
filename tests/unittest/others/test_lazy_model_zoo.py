@@ -109,7 +109,7 @@ def test_placeholder_registry_resolves_in_fresh_process():
         assert MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid("llama4", "image")
         assert MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
             "llama4", "image")
-        assert "qwen2_vl" in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()
+        assert "qwen3_vl" in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()
         """)
     )
 
@@ -175,6 +175,61 @@ def test_arch_index_matches_decorators():
         mt: (MULTIMODAL_MODEL_TYPE_TO_MODULE[mt], model_type_truth[mt])
         for mt in MULTIMODAL_MODEL_TYPE_TO_MODULE
         if MULTIMODAL_MODEL_TYPE_TO_MODULE[mt] not in model_type_truth[mt]
+    }
+    assert not wrong, f"index points at the wrong module: {wrong}"
+
+
+def _decorated_draft_model_registrations():
+    """AST-scan the modeling files for ``@register_draft_model`` decorators.
+
+    Source scan rather than a registry walk on purpose: the registry is only
+    populated by importing a provider, and a built-in builder that lost its
+    slot to an external registration would be missing from it entirely, so a
+    registry walk would pass while the index is stale.
+    """
+    mode_to_modules = {}
+    for path in sorted(_MODELS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name != "register_draft_model" or not node.args:
+                continue
+            arg = node.args[0]
+            # ``register_draft_model(SpeculativeDecodingMode.DFLASH)``
+            if isinstance(arg, ast.Attribute):
+                mode_to_modules.setdefault(arg.attr, set()).add(path.stem)
+    return mode_to_modules
+
+
+def test_spec_mode_index_matches_decorators():
+    # SPEC_MODE_TO_MODULE is the fourth hand-maintained table in _arch_index,
+    # and every other one already has a drift test here -- MODEL_ARCH_TO_MODULE
+    # and MULTIMODAL_MODEL_TYPE_TO_MODULE in test_arch_index_matches_decorators,
+    # MODEL_CLASS_TO_MODULE in test_class_index_matches_package_all. Keeping the
+    # set complete is the point: without this, the spec-mode table would be the
+    # only index whose entries nothing checks.
+    #
+    # Drift is not silent, but it is misattributed. A builder added without its
+    # index entry (or an index entry whose module stopped declaring the mode)
+    # surfaces as "unsupported speculative decoding mode" to whoever next runs
+    # that mode -- which reads as "this algorithm is not implemented", not as
+    # "someone forgot a line in _arch_index". The person who sees it is rarely
+    # the person who caused it.
+    from tensorrt_llm._torch.models._arch_index import SPEC_MODE_TO_MODULE
+
+    mode_truth = _decorated_draft_model_registrations()
+
+    missing = set(mode_truth) - set(SPEC_MODE_TO_MODULE)
+    assert not missing, f"spec modes missing from _arch_index: {missing}"
+    stale = set(SPEC_MODE_TO_MODULE) - set(mode_truth)
+    assert not stale, f"stale spec modes in _arch_index: {stale}"
+    wrong = {
+        mode: (SPEC_MODE_TO_MODULE[mode], mode_truth[mode])
+        for mode in SPEC_MODE_TO_MODULE
+        if SPEC_MODE_TO_MODULE[mode] not in mode_truth[mode]
     }
     assert not wrong, f"index points at the wrong module: {wrong}"
 

@@ -10,7 +10,7 @@ CutlassFusedMoE.run_moe path.
 These CPU-only tests (no GPU or built C++ op required) assert, at each hop,
 that a non-empty lora_params is forwarded:
 
-  1. QwenMoE.forward to the routed self.experts call (legacy wrapper).
+  1. MixtralMoE.forward to the routed self.experts call.
   2. ConfigurableMoE.forward_impl to scheduler.forward.
   3. ExternalCommMoEScheduler._build_run_context to the CutlassFusedMoE
      run_moe context, and not to backends that cannot carry LoRA.
@@ -22,11 +22,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_qwen_moe import QwenMoE
-from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+from tensorrt_llm._torch.models.modeling_mixtral import MixtralMoE
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
 pytestmark = pytest.mark.cpu_only
@@ -37,15 +37,13 @@ pytestmark = pytest.mark.cpu_only
 _LORA_PARAMS_SENTINEL = {"num_seqs": 1, "_marker": object()}
 
 
-def test_qwen_moe_forward_passes_lora_params_to_routed_experts():
-    """QwenMoE.forward must forward lora_params to the routed self.experts
-    call, not only to the shared expert."""
+def test_mixtral_moe_forward_passes_lora_params_to_routed_experts():
+    """MixtralMoE.forward must forward lora_params to routed experts."""
     num_tokens, hidden_dim = 4, 8
 
     hidden_states = torch.randn(num_tokens, hidden_dim)
     router_logits = torch.randn(num_tokens, 2)
     expert_out = torch.randn(num_tokens, hidden_dim)
-    shared_out = torch.randn(num_tokens, hidden_dim)
 
     experts = MagicMock(return_value=expert_out)
 
@@ -55,12 +53,10 @@ def test_qwen_moe_forward_passes_lora_params_to_routed_experts():
         hidden_dim=hidden_dim,
         gate=MagicMock(return_value=router_logits),
         experts=experts,
-        shared_expert=MagicMock(return_value=shared_out),
-        shared_expert_gate=MagicMock(return_value=torch.zeros(num_tokens, 1)),
     )
     attn_metadata = SimpleNamespace(all_rank_num_tokens=[num_tokens])
 
-    QwenMoE.forward(
+    MixtralMoE.forward(
         fake_self,
         hidden_states,
         attn_metadata,
@@ -69,7 +65,7 @@ def test_qwen_moe_forward_passes_lora_params_to_routed_experts():
 
     experts.assert_called_once()
     assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL, (
-        "QwenMoE.forward dropped lora_params on the routed-expert call; "
+        "MixtralMoE.forward dropped lora_params on the routed-expert call; "
         "routed-expert MoE LoRA would be silently disabled."
     )
 

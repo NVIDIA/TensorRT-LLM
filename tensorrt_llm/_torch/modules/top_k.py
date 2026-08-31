@@ -9,6 +9,8 @@ from enum import Enum
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
+
 from ..memory_buffer_utils import get_memory_buffers
 
 
@@ -20,11 +22,13 @@ class TopKImplementation(str, Enum):
     CUTE_DSL_RADIX = "cute_dsl_radix"
     CUDA_GVR = "cuda_gvr"
     CUTE_DSL_GVR = "cute_dsl_gvr"
+    CUTE_DSL_GVR_V2 = "cute_dsl_gvr_v2"
 
 
 _GVR_IMPLEMENTATIONS = {
     TopKImplementation.CUDA_GVR,
     TopKImplementation.CUTE_DSL_GVR,
+    TopKImplementation.CUTE_DSL_GVR_V2,
 }
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 
@@ -265,7 +269,57 @@ class TopK(nn.Module):
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert gvr_prior_indices is not None
-        if self.decode_implementation == TopKImplementation.CUDA_GVR:
+        if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR_V2:
+            assert max_seq_len is not None
+            if (
+                # engine hardware-format gate (falls through otherwise):
+                # fp32 row-major scores with a float4-aligned row stride and
+                # a 16B-aligned base (the DSL paged-MQA arena view — column-
+                # sliced from a 256-aligned buffer — satisfies this; odd
+                # max_seq_len DeepGEMM layouts do not). Single-row batches
+                # derive their row window from shape[1] (arena last-row
+                # safety), so that width must satisfy the same float4 rule —
+                # otherwise run_varlen raises instead of falling through.
+                scores.dtype == torch.float32
+                and scores.stride(1) == 1
+                and scores.stride(0) % 4 == 0
+                and scores.data_ptr() % 16 == 0
+                and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
+            ):
+                from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
+
+                logger.info_once(
+                    "self-sampling GVR top-K engaged "
+                    f"(K={self.top_k}, cr={self.compress_ratio}, "
+                    f"next_n={next_n}).",
+                    key="selfsampling_topk_engaged",
+                )
+                # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
+                # one launch for the batch; per-row n from device kv_lens,
+                # capture-stable tuning from the max-seq-len engine constant
+                # (no host reads — CUDA-graph safe). Hints are consumed raw
+                # (offset-free contract). The module receives max_seq_len in
+                # COMPRESSED index space; run_varlen's max_seq_len is in
+                # kv-token space like sequence_lengths — multiply back.
+                selfsampling_topk_run_varlen(
+                    scores,
+                    gvr_prior_indices,
+                    sequence_lengths,
+                    output_indices,
+                    next_n=next_n,
+                    compress_ratio=self.compress_ratio,
+                    max_seq_len=max_seq_len * self.compress_ratio,
+                )
+                return output_indices
+            logger.warning_once(
+                "TRTLLM_GVR_SELF_SAMPLING=1 but the decode scores do not "
+                "satisfy the engine's hardware-format gate "
+                f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
+                "falling through to the CUDA GVR top-K path.",
+                key="selfsampling_topk_fallthrough",
+            )
+        if self.decode_implementation != TopKImplementation.CUTE_DSL_GVR:
+            # CUDA_GVR, or the V2 hardware-format fall-through above
             workspace = self._get_workspace(
                 scores,
                 (scores.shape[0], self.top_k),
