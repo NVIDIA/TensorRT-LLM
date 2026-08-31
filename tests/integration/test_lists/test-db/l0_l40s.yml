@@ -21,6 +21,7 @@ l0_l40s:
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3vl_init_preserves_caller_quant_config
   - unittest/_torch/modeling/test_modeling_cosmos3.py::TestCosmos3::test_all
+  - unittest/_torch/modeling/test_modeling_cosmos3.py::test_cosmos3_preserves_prepared_video_frame_count
   - unittest/_torch/modeling/test_modeling_step3p7vl.py
   - unittest/llmapi/apps/_test_openai_chat_multimodal.py::test_single_chat_session_image_embeds -m needs_l40s
   # Encoder-only /v1/embeddings dynamic batching (BERT classifier + PRM-7B reward + Qwen3-Embedding)
