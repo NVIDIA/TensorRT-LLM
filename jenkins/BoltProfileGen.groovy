@@ -69,14 +69,10 @@ TARGET_ARCH   = params.targetArch   ?: env.targetArch ?: AARCH64_TRIPLE
 BOLT_REF      = params.boltRef      ?: (env.artifactCommit ?: env.gitlabCommit ?: "unknown")
 BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
 // SBSA multi-node: flexible node count (sbatch sets --nodes itself).
-// gb300-flex-aws-cmh -> gb300-aws-trtllm-cmh (clusterName aws-cmh). We default to
-// aws-cmh (GB300): in cross-cluster comparison it had the best disagg completion
-// rate (7/8), vs GB200/aws-dfw and oci-aga (whose disagg all failed the
-// cache-transceiver network precheck -- a cluster infra issue, not ours). The
-// intermittent GEN IPC-spawn hang is hardware-independent (seen on both GB200 and
-// GB300), so this is about picking the healthiest cluster, not fixing the hang.
-// Override via params.slurmPlatform for a different cluster.
-SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb300-flex-aws-cmh" : "")
+// Default aarch64 platform: gb300-flex-oci-jhb. Override via params.slurmPlatform
+// for a different cluster; the parent postmerge launch does not pass
+// slurmPlatform, so this default governs every run.
+SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb300-flex-oci-jhb" : "")
 BOLT_TARNAME  = params.boltTarName  ?: (TARGET_ARCH == AARCH64_TRIPLE ? "TensorRT-LLM-GH200.tar.gz" : "TensorRT-LLM.tar.gz")
 NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (unused by fan-out)
 // promote: publish the packaged bundle to the branch-keyed Artifactory path
@@ -662,7 +658,7 @@ pipeline {
         string(
             name: "slurmPlatform",
             defaultValue: "",
-            description: "SlurmConfig platform for the collect and merge jobs. Empty -> gb300-flex-aws-cmh for aarch64, unset for x86_64."
+            description: "SlurmConfig platform for the collect and merge jobs. Empty -> gb300-flex-oci-jhb for aarch64, unset for x86_64."
         )
         string(
             name: "numNodes",
