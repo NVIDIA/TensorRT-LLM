@@ -577,6 +577,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For DeepSeek-V4 indices
         self.prepare_for_deepseek_v4_indices()
 
+        # This override bypasses DSAtrtllmAttentionMetadata.prepare(), so the
+        # GVR prior realignment must be invoked explicitly before the indexer
+        # consumes the prior rows.
+        self.prepare_for_gvr_prior()
+
         # Prepare metadata for indexer (only needed when sparse layers exist)
         if has_sparse_layers:
             DeepseekV4Indexer.prepare(metadata=self)
