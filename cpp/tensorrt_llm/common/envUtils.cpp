@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
