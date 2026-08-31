@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Test PipelineLoader with VisualGenArgs API."""
 
 import json
@@ -127,6 +130,7 @@ def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
 
 def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig, VisualGenArgs
 
@@ -138,9 +142,13 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
         def __init__(self, config):
             super().__init__()
             self.pipeline_config = config
+            self.offloader = PipelineOffloader(self)
 
         def to(self, device):
             return self
+
+        def offload_pipeline_components(self):
+            return {}
 
         def load_transformer_weights(self, checkpoint_dir):
             events.append("load_transformer_weights")
@@ -157,6 +165,9 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
 
         def _setup_runtime_lora(self):
             events.append("runtime_lora")
+
+        def initialize_offload_pipeline(self):
+            self.offloader.initialize()
 
         def torch_compile(self):
             pass
@@ -181,7 +192,11 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
         "tensorrt_llm._torch.visual_gen.pipeline_loader.AutoPipeline.from_config",
         lambda config, checkpoint_dir: FakePipeline(config),
     )
-    monkeypatch.setattr(PipelineLoader, "_materialize_meta_tensors", lambda self, pipeline: None)
+    monkeypatch.setattr(
+        PipelineLoader,
+        "_materialize_meta_tensors",
+        lambda self, pipeline, cpu_offload_modules=None: None,
+    )
 
     PipelineLoader(args, device="cpu").load(skip_warmup=True)
 

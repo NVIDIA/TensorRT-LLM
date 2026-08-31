@@ -65,7 +65,7 @@ namespace Routing
 {
 
 // The type of method in top-K routing, for use in torch custom op
-// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/modules/fused_moe/routing.py
+// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/moe/fused_moe/routing.py
 enum class RoutingMethodType : int64_t
 {
     // Default: Softmax -> TopK
