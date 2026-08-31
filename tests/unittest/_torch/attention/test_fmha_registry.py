@@ -30,8 +30,8 @@ def _enabled_names() -> tuple[str, ...]:
     return tuple(names_by_class[cls] for cls in classes)
 
 
-def test_prims_ts_is_registered_first() -> None:
-    assert _canonical_names()[0] == PRIMS_TS
+def test_prims_ts_follows_custom_mask_in_canonical_order() -> None:
+    assert _canonical_names()[:2] == ("triton_custom_mask", PRIMS_TS)
 
 
 def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
