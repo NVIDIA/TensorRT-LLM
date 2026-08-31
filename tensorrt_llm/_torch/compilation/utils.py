@@ -14,7 +14,12 @@ from ..utils import get_model_extra_attrs
 
 
 class _PhaseSelectiveForward:
-    """Dispatch context/mixed batches to a compiled decoder."""
+    """
+    This utility class is used to selectively bypass torch.compile
+    for operations that do not need it (attention warmup, auto-tuning),
+    as well as for generation-only forwards, where the ordinary CUDA
+    graph machinery is deemed sufficient.
+    """
 
     def __init__(self, eager_forward: Callable[..., object],
                  compiled_forward: Callable[..., object]) -> None:
@@ -23,6 +28,11 @@ class _PhaseSelectiveForward:
         self._bypass_active = False
 
     def __call__(self, *args, **kwargs) -> object:
+        """
+        The wrapper will enforce the eager forward function if:
+        1) The torch compile bypass is active (e.g., for auto-tuning), or
+        2) The batch is generation-only (rely on ordinary CUDA graphs)
+        """
         attrs = get_model_extra_attrs()
         attn_metadata_ref = attrs.get("attention_metadata") if attrs else None
         attn_metadata = (attn_metadata_ref()
@@ -36,6 +46,9 @@ class _PhaseSelectiveForward:
 
     @contextlib.contextmanager
     def bypass(self) -> Iterator[None]:
+        """
+        Disable torch.compile for all forwards under this ctxt manager.
+        """
         previous = self._bypass_active
         self._bypass_active = True
         try:
