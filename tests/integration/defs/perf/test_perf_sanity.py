@@ -40,6 +40,13 @@ from defs.trt_test_alternative import print_info
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
 from .perf_regression_utils import _percentile, process_and_upload_test_results
+from .time_breakdown_metrics import ALL_METRICS as TIME_BREAKDOWN_METRIC_NAMES
+from .time_breakdown_metrics import STATS as TIME_BREAKDOWN_STATS
+from .time_breakdown_metrics import (
+    compute_time_breakdown_metrics,
+    discover_perf_metrics_files,
+    format_metric_log_lines,
+)
 
 # Sanity-side path differs from test_perf for this key; preserve historical value.
 MODEL_PATH_DICT = {
@@ -263,31 +270,30 @@ E2E_TIME_BREAKDOWN_CONFIGS = (
     "gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL",
 )
 
-# The 12 contiguous lifecycle spans emitted by
-# tensorrt_llm/serve/scripts/time_breakdown, in lifecycle order, x 4 statistics.
-# Uploaded as d_tb_<span>_<stat>; see TIME_BREAKDOWN_METRIC_LOG_QUERY.
+# The names and statistics come from .time_breakdown_metrics, which is the single
+# source of truth for both -- it computes them and formats the log lines this
+# module parses back, so the producer and consumer cannot drift.
 #
-# Listed here (rather than imported from TimingMetricsConfig) only so that
-# collecting this module never has to import tensorrt_llm, which pulls in
-# plotly and the compiled extension. tests/unittest/others/test_perf_sanity_time_breakdown.py
-# pins this tuple against TimingMetricsConfig so the two cannot drift.
-TIME_BREAKDOWN_SPANS = (
-    "disagg_preprocessing",
-    "ctx_preprocessing",
-    "ctx_queue",
-    "ctx_processing",
-    "ctx_postprocessing",
-    "disagg_relay",
-    "gen_preprocessing",
-    "gen_queue_wait",
-    "gen_kv_transfer",
-    "gen_post_transfer",
-    "gen_postprocessing",
-    "disagg_postprocessing",
-)
-TIME_BREAKDOWN_STATS = ("mean", "median", "p75", "p99")
+# 27 metrics x 4 statistics = 108 fields, uploaded as d_tb_<metric>_<stat>:
+# the per-request lifecycle spans (context, generation, disagg-server) plus the
+# per-chunk prefill and per-step decode breakdowns. Which subset is populated
+# depends on the case type; the rest upload as 0.0. See MODE_GROUPS there.
+#
+# .time_breakdown_metrics is deliberately stdlib-only, so importing it here
+# never pulls in tensorrt_llm (and with it plotly and the compiled extension)
+# during collection.
 
-# One regex with capture groups instead of 48 literal patterns, for two reasons.
+# The harness's benchmark_mode is not the parser's case type: e2e_time_breakdown
+# is an e2e case that additionally publishes the breakdown. Mapped explicitly,
+# with no default, because a mode that silently fell through to an unsupported
+# case type would upload 108 zeros and look like a run that measured nothing.
+TIME_BREAKDOWN_CASE_TYPE = {
+    E2E_TIME_BREAKDOWN_MODE: "e2e",
+    "gen_only": "gen_only",
+    "ctx_only": "ctx_only",
+}
+
+# One regex with capture groups instead of 108 literal patterns, for two reasons.
 # It cannot participate in the leading-word shadowing hazard described above
 # parse_metrics_from_output -- it is matched outside that first-match-wins loop.
 # And a span this file does not know about still reaches OpenSearch (just
@@ -304,8 +310,8 @@ def time_breakdown_metric_name(span: str, stat: str) -> str:
 
 
 TIME_BREAKDOWN_METRICS = tuple(
-    time_breakdown_metric_name(span, stat)
-    for span in TIME_BREAKDOWN_SPANS
+    time_breakdown_metric_name(name, stat)
+    for name in TIME_BREAKDOWN_METRIC_NAMES
     for stat in TIME_BREAKDOWN_STATS
 )
 
@@ -620,10 +626,12 @@ def add_perf_metric_value(
       disagg gen_only mode (the only mode that emits them). Of these the mean
       and the median are regression-gated (GEN_ONLY_REGRESSION_METRICS); the
       rest are uploaded for diagnosis.
-    - Adds the `d_tb_<span>_<stat>` family only for e2e_time_breakdown. Every
-      parsed span is forwarded, including one this module does not list in
-      TIME_BREAKDOWN_SPANS: an unlisted span loses its baseline comparison but
-      still reaches OpenSearch, which is strictly better than dropping it.
+    - Adds the `d_tb_<metric>_<stat>` family only for e2e_time_breakdown. Every
+      parsed metric is forwarded, including one this module does not list in
+      TIME_BREAKDOWN_METRIC_NAMES: an unlisted metric loses its baseline
+      comparison but still reaches OpenSearch, which beats dropping it. A metric
+      the case type does not support arrives as 0.0 rather than absent, so the
+      column exists on every row of the series.
 
     A missing or non-numeric gen_only statistic is omitted rather than
     forwarded: typeCheckForOpenSearchDB rejects both None and int for a `d_`
@@ -691,8 +699,12 @@ MINIMIZE_METRICS = [
     "d_std_gen_worker_per_iter_device_step_time",
     "d_p75_gen_worker_per_iter_device_step_time",
     "d_p99_gen_worker_per_iter_device_step_time",
-    # e2e_time_breakdown-only: per-request lifecycle spans. Every one is a
-    # duration, so lower is better for all 48. Registered here -- and NOT in
+    # e2e_time_breakdown-only: the lifecycle spans plus the per-chunk and
+    # per-step breakdowns. Every one is a duration, so lower is better for all
+    # 108 -- including tb_step_preprocessing_*, which is legitimately negative
+    # when the overlap scheduler is on (step N forwards before step N-1's token
+    # is emitted), and where more negative genuinely is more overlap.
+    # Registered here -- and NOT in
     # REGRESSION_METRICS -- so each gets a baseline and a diff line in
     # s_regression_info (that is what makes a TTFT regression attributable to a
     # phase) without any of them being able to fail a build. check_regression
@@ -1969,6 +1981,58 @@ class DisaggTestCmds(NamedTuple):
             idx = record["output_index"]
             outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
 
+    def _append_time_breakdown_metrics(
+        self,
+        pending_time_breakdown: List[dict],
+        outputs: List[str],
+    ) -> None:
+        """Aggregate the per-request time breakdown and append it to each client's log.
+
+        Deferred to after benchmark_status is written, for the same reason the
+        gen_only device step time is (nvbugs 6487036 / 6487040): the ctx and gen
+        workers keep appending to their perf_metrics JSONLs until their srun
+        exits, and reading early would silently aggregate a truncated run.
+
+        Reads the worker JSONLs rather than the client's copy of the disagg
+        combined file, because the per-chunk and per-step detail exists only in
+        the worker files -- the worker->disagg header transport carries
+        durations, not the absolute timestamps those breakdowns need. The
+        lifecycle spans are computed from the same records either way.
+
+        A parse failure is reported and left to check_test_failure, which fails
+        the run before anything is uploaded. It must not raise here: the
+        measurement itself already succeeded and its ordinary metrics are worth
+        keeping for triage.
+        """
+        if not pending_time_breakdown:
+            return
+
+        breakdown_dir = self.time_breakdown_dir()
+        for record in pending_time_breakdown:
+            case_type = TIME_BREAKDOWN_CASE_TYPE[record["benchmark_mode"]]
+            paths = discover_perf_metrics_files(breakdown_dir)
+            if not paths:
+                print_info(
+                    f"No perf_metrics-*.jsonl under {breakdown_dir}; "
+                    "skipping time breakdown aggregation"
+                )
+                continue
+            try:
+                metrics, info = compute_time_breakdown_metrics(paths, case_type)
+            except (OSError, ValueError, KeyError) as exc:
+                print_info(f"Time breakdown aggregation failed for {breakdown_dir}: {exc}")
+                continue
+
+            for warning in info["warnings"]:
+                print_info(f"Time breakdown: {warning}")
+            print_info(f"Time breakdown ({case_type}) from {len(paths)} file(s): {info['counts']}")
+
+            summary_lines = "\n".join(format_metric_log_lines(metrics))
+            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+                benchmark_ctx.write(f"\n{summary_lines}\n")
+            idx = record["output_index"]
+            outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
+
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
         for i in range(self.num_ctx_servers):
@@ -2137,6 +2201,13 @@ class DisaggTestCmds(NamedTuple):
             collect_device_step_time = (
                 configs_for_idx is not None and configs_for_idx[2].benchmark_mode == "gen_only"
             )
+            # Same deferral, same reason: the worker perf_metrics JSONLs are
+            # still being written until the workers stop.
+            pending_time_breakdown: List[dict] = []
+            benchmark_mode_for_idx = (
+                configs_for_idx[2].benchmark_mode if configs_for_idx is not None else None
+            )
+            collect_time_breakdown = benchmark_mode_for_idx == E2E_TIME_BREAKDOWN_MODE
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -2205,6 +2276,14 @@ class DisaggTestCmds(NamedTuple):
                                     "start_offsets": gen_log_start_offsets,
                                 }
                             )
+                        if collect_time_breakdown:
+                            pending_time_breakdown.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "benchmark_mode": benchmark_mode_for_idx,
+                                }
+                            )
                     else:
                         print_info(
                             f"Skipping perf benchmark for client {client_idx}: "
@@ -2246,6 +2325,7 @@ class DisaggTestCmds(NamedTuple):
             # Only gen_only runs populate this queue; other modes skip both the
             # sentinel wait and device-step-time parsing.
             self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
+            self._append_time_breakdown_metrics(pending_time_breakdown, outputs)
 
         return outputs
 
@@ -2628,16 +2708,22 @@ class PerfSanityTestConfig:
                 f"expected '' or {AGENTX_BENCHMARK_CLIENT!r}."
             )
 
-        # The external bench_serving client has no --save-request-time-breakdown
-        # equivalent, so it cannot produce the lifecycle spans. Fail here with the
-        # reason rather than at upload time with 48 missing metrics.
+        # Only benchmark_serving accepts --save-request-time-breakdown. The
+        # external bench_serving client and the AgentX trace-replay client are
+        # both different programs with no equivalent flag, so neither can produce
+        # the lifecycle spans. Fail here naming the reason rather than at upload
+        # time with a row of zeros, which reads as "this case has no breakdown".
         save_request_time_breakdown = self.time_breakdown_dir()
-        if save_request_time_breakdown and use_nv_sa_benchmark:
-            raise ValueError(
-                f"{E2E_TIME_BREAKDOWN_MODE} requires benchmark.use_nv_sa_benchmark: false "
-                "(only tensorrt_llm.serve.scripts.benchmark_serving can emit the "
-                "per-request time breakdown)"
-            )
+        if save_request_time_breakdown:
+            unsupported = "use_nv_sa_benchmark: true" if use_nv_sa_benchmark else ""
+            if benchmark_client:
+                unsupported = f"benchmark_client: {benchmark_client}"
+            if unsupported:
+                raise ValueError(
+                    f"{E2E_TIME_BREAKDOWN_MODE} is incompatible with benchmark.{unsupported}; "
+                    "only tensorrt_llm.serve.scripts.benchmark_serving can emit the "
+                    "per-request time breakdown"
+                )
 
         if benchmark_mode == "ctx_only":
             spec_decoding = bool(ctx_server_config.spec_decoding_type)
@@ -2946,13 +3032,23 @@ class PerfSanityTestConfig:
             }
             for line in output.split("\n"):
                 # Handled outside the first-match-wins loop below on purpose:
-                # one regex covers all 12 spans x 4 statistics, so it cannot
+                # one regex covers every metric x statistic, so it cannot
                 # shadow (or be shadowed by) a fixed pattern, and a span this
                 # module does not know about is still captured.
                 tb_match = TIME_BREAKDOWN_METRIC_LOG_QUERY.search(line)
                 if tb_match:
                     span, stat, value = tb_match.groups()
-                    metrics.setdefault(time_breakdown_metric_name(span, stat), float(value))
+                    # Last match wins, unlike every other metric here. Two
+                    # producers write these lines: benchmark_serving prints the
+                    # lifecycle spans it can derive from the client's copy of the
+                    # disagg combined file, and _append_time_breakdown_metrics
+                    # then appends the full set aggregated from the worker files.
+                    # The two agree on the spans they share, but taking the
+                    # appended set wholesale keeps every uploaded field from a
+                    # single computation, so the spans still tile TTFT exactly on
+                    # the dashboard. If that aggregation did not run, the
+                    # client-derived lines remain as the fallback.
+                    metrics[time_breakdown_metric_name(span, stat)] = float(value)
                     continue
                 for metric_type, regex in all_queries.items():
                     if metric_type in metrics:
