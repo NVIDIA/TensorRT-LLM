@@ -76,11 +76,31 @@ build a baseline. They are the same for every deployment mode
 
 A case is identified by its **name**, not by the config values it happens to run
 with today. Server/client config fields such as `l_max_batch_size`,
-`s_kv_cache_dtype`, `s_spec_decoding_type`, `l_force_num_accepted_tokens`,
-`l_iterations` or `b_streaming` are *tunables* — they are adjusted to improve perf
-on the same test. Keying on them forked the case and reset its baseline, hiding the
-very effect the tuning was meant to have. They are still recorded on each document
-for filtering and analysis; they just do not participate in matching.
+`s_kv_cache_dtype`, `s_spec_decoding_type`, `l_force_num_accepted_tokens` or
+`b_streaming` are *tunables* — they are adjusted to improve perf on the same test.
+Keying on them forked the case and reset its baseline, hiding the very effect the
+tuning was meant to have. They are still recorded on each document for filtering
+and analysis; they just do not participate in matching.
+
+**A value that feeds the case name still forks the case.** Dropping a field from
+the match key only stops it forking if the name does not encode it, and
+`l_iterations` is the one field where that distinction bites:
+
+- Aggregated configs all set an explicit client `name:` (190 of 190 blocks in
+  `tests/scripts/perf-sanity/`), so changing `iterations` there keeps the case and
+  its history. 93 of those names contain a stale `iter<N>` for that reason.
+- Disagg configs set no client name, so `ClientConfig` derives
+  `con<C>_iter<N>_isl<I>_osl<O>`. `benchmark.multi_round` becomes `iterations`,
+  which lands in that name and therefore in `s_test_case_name` — so changing
+  `multi_round` renames the case, and the renamed case starts with no history.
+
+That is intended rather than a gap to close: `iterations` sets how long the
+measurement runs, and a longer run amortizes warmup differently, so `iter10` and
+`iter12` do not measure the same quantity and should not share a baseline. It is
+also not a regression — `l_iterations` was previously a match key in its own
+right, so it forked the case before this change too. What matters is that renaming
+a case silently costs it its history and its next pre-merge regression check, so
+`multi_round` should be treated as a workload parameter, not a knob to sweep.
 
 `s_benchmark_mode` is deliberately excluded: it is null on every aggregated record
 and exactly equals the test case name's prefix on every disaggregated one, so it

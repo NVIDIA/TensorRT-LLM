@@ -205,7 +205,7 @@ def test_unparsable_global_vars_does_not_raise(monkeypatch):
 _MATCH_KEYS = ["s_test_case_name", "s_gpu_type", "s_runtime", "s_branch"]
 
 
-def _new_data_dict():
+def _new_data_dict() -> dict[int, dict[str, object]]:
     return {
         0: {
             "s_test_case_name": "example_model_fp8_tp8-con32_iter10_1k1k",
@@ -216,27 +216,38 @@ def _new_data_dict():
     }
 
 
-def _run_pipeline(monkeypatch, build_branch, job_url, match_keys=None):
+def _run_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    build_branch: str,
+    job_url: str,
+    match_keys: list[str] | None = None,
+) -> dict[str, dict[int, str]]:
     """Run the real pipeline, recording the s_branch each seam observes.
 
     Only the three OpenSearch seams are replaced. Everything between them --
     get_job_info, the enrichment loop, the branch routing, the regression pass --
     is the production code path, so a regression in the wiring shows up here.
     """
-    observed = {}
+    observed: dict[str, dict[int, str]] = {}
 
-    def fake_get_common_values(data_dict, keys):
+    def fake_get_common_values(
+        data_dict: dict[int, dict[str, object]], keys: list[str]
+    ) -> dict[str, object]:
         observed["common_values"] = {idx: d["s_branch"] for idx, d in data_dict.items()}
         return {}
 
-    def fake_get_history_data(data_dict, keys, common_values_dict):
+    def fake_get_history_data(
+        data_dict: dict[int, dict[str, object]],
+        keys: list[str],
+        common_values_dict: dict[str, object],
+    ) -> tuple[dict[int, object], dict[int, object], dict[int, object]]:
         observed["history_query"] = {idx: d["s_branch"] for idx, d in data_dict.items()}
         observed["history_query_names"] = {
             idx: d["s_test_case_name"] for idx, d in data_dict.items()
         }
         return {}, {}, {}
 
-    def fake_post_new_perf_data(data_dict):
+    def fake_post_new_perf_data(data_dict: dict[int, dict[str, object]]) -> None:
         observed["uploaded"] = {idx: d["s_branch"] for idx, d in data_dict.items()}
 
     monkeypatch.setattr(_perf_regression_utils, "get_common_values", fake_get_common_values)
@@ -261,7 +272,9 @@ def _run_pipeline(monkeypatch, build_branch, job_url, match_keys=None):
     return observed
 
 
-def test_pre_merge_history_is_queried_against_the_baseline_branch(monkeypatch):
+def test_pre_merge_history_is_queried_against_the_baseline_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The queries see "main"; the uploaded document keeps "github-pr-<N>".
 
     get_common_values must see the substituted branch too: it folds
@@ -276,7 +289,7 @@ def test_pre_merge_history_is_queried_against_the_baseline_branch(monkeypatch):
     assert observed["new_data_dict"] == {0: "github-pr-18408"}
 
 
-def test_pre_merge_baseline_branch_is_configurable(monkeypatch):
+def test_pre_merge_baseline_branch_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PERF_BASELINE_BRANCH", "release/1.3.0rc22.post1")
     observed = _run_pipeline(monkeypatch, "github-pr-18408", _GITHUB_PR_JOB_URL)
 
@@ -284,14 +297,16 @@ def test_pre_merge_baseline_branch_is_configurable(monkeypatch):
     assert observed["uploaded"] == {0: "github-pr-18408"}
 
 
-def test_substitution_only_replaces_the_branch(monkeypatch):
+def test_substitution_only_replaces_the_branch(monkeypatch: pytest.MonkeyPatch) -> None:
     """The lookup copy is the real data with one field changed, not a stub."""
     observed = _run_pipeline(monkeypatch, "github-pr-18408", _GITHUB_PR_JOB_URL)
 
     assert observed["history_query_names"] == {0: "example_model_fp8_tp8-con32_iter10_1k1k"}
 
 
-def test_post_merge_history_is_queried_against_its_own_branch(monkeypatch):
+def test_post_merge_history_is_queried_against_its_own_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A release-branch post-merge run must not be rebased onto main."""
     observed = _run_pipeline(monkeypatch, "release/1.3.0rc22.post1", _RELEASE_BUILD_JOB_URL)
 
@@ -300,14 +315,14 @@ def test_post_merge_history_is_queried_against_its_own_branch(monkeypatch):
     assert observed["uploaded"] == {0: "release/1.3.0rc22.post1"}
 
 
-def test_post_merge_ignores_the_baseline_branch_override(monkeypatch):
+def test_post_merge_ignores_the_baseline_branch_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PERF_BASELINE_BRANCH", "main")
     observed = _run_pipeline(monkeypatch, "release/1.3.0rc22.post1", _RELEASE_BUILD_JOB_URL)
 
     assert observed["history_query"] == {0: "release/1.3.0rc22.post1"}
 
 
-def test_no_substitution_when_branch_is_not_a_match_key(monkeypatch):
+def test_no_substitution_when_branch_is_not_a_match_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Callers keying on other fields keep their own semantics untouched."""
     observed = _run_pipeline(
         monkeypatch,
