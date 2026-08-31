@@ -702,6 +702,14 @@ class PyTorchModelEngine(ModelEngine):
                 apply_llm_torch_compile = getattr(self.model,
                                                   "apply_llm_torch_compile",
                                                   None)
+
+                if compile_only_piecewise_graphs and not isinstance(
+                        self.model, DecoderModelForCausalLM):
+                    raise ValueError(
+                        "TorchCompileConfig."
+                        "compile_only_piecewise_graphs=True is "
+                        "only supported for DecoderModelForCausalLM models.")
+
                 if isinstance(self.model, DecoderModelForCausalLM):
                     eager_model = self.model.model
                     compiled_model = torch.compile(
@@ -716,24 +724,12 @@ class PyTorchModelEngine(ModelEngine):
                         _PrefillCompiledModel(eager_model, compiled_model)
                         if self._torch_compile_prefill_only else compiled_model)
                 elif callable(apply_llm_torch_compile):
-                    if compile_only_piecewise_graphs:
-                        raise ValueError(
-                            "TorchCompileConfig."
-                            "compile_only_piecewise_graphs=True is "
-                            "only supported for DecoderModelForCausalLM models."
-                        )
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
                     # scope through the mixin.
                     apply_llm_torch_compile(backend=self._torch_compile_backend,
                                             fullgraph=torch_compile_fullgraph)
                 else:
-                    if compile_only_piecewise_graphs:
-                        raise ValueError(
-                            "TorchCompileConfig."
-                            "compile_only_piecewise_graphs=True is "
-                            "only supported for DecoderModelForCausalLM models."
-                        )
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
