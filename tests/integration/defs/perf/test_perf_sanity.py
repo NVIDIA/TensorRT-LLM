@@ -191,23 +191,24 @@ SPEC_DECODING_PERF_METRIC_LOG_QUERIES = {
     "al": re.compile(r"Mean Avg Decoded Tokens per Iter:\s+(-?[\d\.]+)"),
 }
 
-# gen_only-only metrics: appended to each trtllm-benchmark log by
-# DisaggTestCmds.run_cmd after parsing gen_server_*.log; only forwarded to
-# the database for gen_only mode.
+# Gen-worker device-step-time metrics: appended to each trtllm-benchmark log by
+# DisaggTestCmds.run_cmd after parsing gen_server_*.log, and forwarded to the
+# database for every mode in DEVICE_STEP_TIME_MODES.
 #
 # The distribution is published, not just the mean, because the mean alone is
 # not self-diagnosing: a single anomalous iteration can move it by >30% while
 # the workload is unchanged (nvbugs 6627789), and the only way a reader can
-# tell that from a real regression is to see the spread next to it. The mean
-# and median are both regression-gated (see regression_metrics in the gen_only
-# branch) because they fail on different shapes of slowdown; std/p75/p99 are
-# uploaded for diagnosis only.
+# tell that from a real regression is to see the spread next to it. In gen_only
+# the mean and median are both regression-gated (see GEN_ONLY_REGRESSION_METRICS)
+# because they fail on different shapes of slowdown; std/p75/p99 are uploaded for
+# diagnosis only. In every other mode all five are diagnostic -- see
+# DEVICE_STEP_TIME_MODES.
 #
 # One statistic per line, and the leading words must stay mutually exclusive:
 # parse_metrics_from_output breaks out of the regex loop on the first match per
 # line, so a shared prefix would silently shadow whichever pattern lost the
 # ordering race.
-GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
+DEVICE_STEP_TIME_LOG_QUERIES = {
     "mean_gen_worker_per_iter_device_step_time": re.compile(
         r"Average Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
     ),
@@ -225,10 +226,14 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
     ),
 }
 
-# Every gen_only device-step-time metric, in log-line order. The mean is first
-# because it is the one check_test_failure keys on; mean and median are both
-# regression-gated, std/p75/p99 are diagnostic.
-GEN_ONLY_DEVICE_STEP_TIME_METRICS = (
+# Every gen-worker device-step-time metric, in log-line order. The mean is first
+# because it is the one check_test_failure keys on.
+#
+# The `gen_worker` in the uploaded names is deliberate and frozen: these are live
+# OpenSearch columns with baseline history, and renaming one would fork every
+# gen_only series and discard its baselines. They describe the *gen worker*, which
+# is what emits them, not the gen_only *mode*, which no longer has them to itself.
+DEVICE_STEP_TIME_METRICS = (
     "mean_gen_worker_per_iter_device_step_time",
     "median_gen_worker_per_iter_device_step_time",
     "std_gen_worker_per_iter_device_step_time",
@@ -246,6 +251,15 @@ GEN_ONLY_DEVICE_STEP_TIME_METRICS = (
 # Every name here must also appear in MINIMIZE_METRICS (or MAXIMIZE_METRICS):
 # check_regression only iterates those two lists, so a gated name absent from
 # both is silently never checked. test_perf_sanity_helpers.py pins that.
+#
+# gen_only ONLY. The other modes in DEVICE_STEP_TIME_MODES upload the same five
+# statistics but keep the default REGRESSION_METRICS (throughput), so for them
+# these names get a baseline and an s_regression_info diff line and can never set
+# b_is_regression. That asymmetry is the point: in gen_only the token-throughput
+# numbers are dominated by KV-cache transfer and are not a useful signal, so
+# device step time is all there is to gate on; in e2e throughput is meaningful and
+# already gates, and device step time is there to attribute a regression rather
+# than to declare one.
 GEN_ONLY_REGRESSION_METRICS = (
     "d_mean_gen_worker_per_iter_device_step_time",
     "d_median_gen_worker_per_iter_device_step_time",
@@ -260,6 +274,21 @@ GEN_ONLY_REGRESSION_METRICS = (
 # detail, which measurably changes throughput -- the two cases' aggregate
 # numbers are deliberately not comparable.
 E2E_TIME_BREAKDOWN_MODE = "e2e_time_breakdown"
+
+# Benchmark modes whose gen workers produce a per-iter device step time worth
+# uploading. Defined after E2E_TIME_BREAKDOWN_MODE because it references it.
+#
+# Not ctx_only: it runs aggregated from a disagg yaml with no gen worker at all,
+# so there is no gen_server_*.log to read. Not the aggregated lanes either --
+# they call add_perf_metric_value without a benchmark_mode, and None is not in
+# this tuple.
+#
+# Only gen_only gates on these (GEN_ONLY_REGRESSION_METRICS); for e2e and
+# e2e_time_breakdown they are uploaded and baselined but cannot fail a build.
+# In e2e the gen worker still does pure decode -- the ctx workers do the prefill
+# -- so the statistic means the same thing it does in gen_only and is comparable
+# within its own s_test_case_name series.
+DEVICE_STEP_TIME_MODES = ("gen_only", "e2e", E2E_TIME_BREAKDOWN_MODE)
 
 # Config stems that get an e2e_time_breakdown test id. Deliberately an allowlist
 # rather than "every disagg yaml": get_disagg_test_cases is a cartesian product,
@@ -404,8 +433,9 @@ def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
     """Current byte size of each gen_server_{i}.log (0 if missing).
 
     Used to delimit per-client segments in DisaggTestCmds.run_cmd: snapshot
-    sizes before launching a client, then pass the snapshot as start_offsets
-    to parse_gen_worker_device_step_time after the client exits.
+    sizes before launching a client, then pass the snapshot as that client's
+    start_offsets -- and as the *previous* client's end_offsets -- to
+    parse_gen_worker_device_step_time once the gen logs are flushed.
     """
     sizes: List[int] = []
     for i in range(num_gen_servers):
@@ -418,8 +448,15 @@ def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
+    end_offsets: Optional[List[int]] = None,
 ) -> List[List[_IterRow]]:
     """Single-pass scan of the gen logs.
+
+    start_offsets/end_offsets delimit a half-open byte window per file; either
+    may be None (start of file / end of file). Both bounds are needed, not just
+    the start: a mode that runs several clients against one gen worker appends
+    every client's iterations to the same log, so an unbounded window would
+    make the first client's stats describe the whole run.
 
     Returns one list of _IterRow per file that produced at least one usable
     row. A row is usable when iter >= 5, prev_device_step_time is numeric, and
@@ -455,9 +492,15 @@ def _scan_gen_worker_device_step_time(
     the percentile and stdev statistics need the whole sample, unlike the
     streaming mean this replaced.
 
-    errors="replace" guards against invalid UTF-8: tqdm progress bars
-    (model load) write partial multibyte sequences that would otherwise raise
-    UnicodeDecodeError mid-scan.
+    The file is read in binary and decoded per line, for two reasons. It makes
+    the byte accounting for end_offsets exact and comparable to the
+    os.path.getsize snapshots that produce the bounds (a text stream cannot be
+    asked its position mid-iteration -- TextIOWrapper.tell raises "telling
+    position disabled by next() call" -- and re-encoding a decoded line does not
+    reliably recover its byte length). It also confines the errors="replace"
+    guard, still needed because tqdm progress bars during model load write
+    partial multibyte sequences that would otherwise raise UnicodeDecodeError
+    mid-scan, to the lines actually parsed.
     """
     per_file_rows: List[List[_IterRow]] = []
     for i in range(num_gen_servers):
@@ -470,19 +513,30 @@ def _scan_gen_worker_device_step_time(
             if start_offsets is not None and i < len(start_offsets) and start_offsets[i]
             else 0
         )
+        stop_at = end_offsets[i] if end_offsets is not None and i < len(end_offsets) else None
 
         rows: List[_IterRow] = []
         # rank -> (iter, num_scheduled_requests) of that rank's previous line.
         prev_by_rank: Dict[Optional[int], Tuple[Optional[int], Optional[int]]] = {}
-        with open(log_path, errors="replace") as f:
+        with open(log_path, "rb") as f:
             if seek_to:
                 f.seek(seek_to)
-            for line in f:
+            pos = seek_to
+            for raw_line in f:
+                pos += len(raw_line)
+                if stop_at is not None and pos > stop_at:
+                    # This line ends past the window, so it either belongs to a
+                    # later client or was still being flushed when the bound was
+                    # taken. Dropping one boundary line is the safe direction:
+                    # everything after it belongs to another client's segment.
+                    break
                 # Every iteration line carries this literal, including the ones
                 # whose value is 'N/A', so this fast-reject cannot skip a line
-                # the num_scheduled_requests tracking below needs to see.
-                if "prev_device_step_time" not in line:
+                # the num_scheduled_requests tracking below needs to see. Done on
+                # bytes so unparsed lines are never decoded.
+                if b"prev_device_step_time" not in raw_line:
                     continue
+                line = raw_line.decode(errors="replace")
                 # Snapshot this rank's predecessor before this line overwrites it.
                 rank_m = _ITER_RANK_RE.search(line)
                 rank = int(rank_m.group(1)) if rank_m is not None else None
@@ -573,6 +627,7 @@ def parse_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
+    end_offsets: Optional[List[int]] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Per-iter prev_device_step_time statistics (ms) across all gen workers.
 
@@ -592,9 +647,12 @@ def parse_gen_worker_device_step_time(
     _scan_gen_worker_device_step_time for the empty-iteration exclusion and
     _stats_at_mode_ngen for the bucket selection.
 
-    When start_offsets is provided, only the bytes from start_offsets[i] to
-    end-of-file are considered for gen_server_{i}.log — used to slice out a
-    single client's iteration segment.
+    start_offsets[i] and end_offsets[i] delimit the byte window read from
+    gen_server_{i}.log, slicing out a single client's iteration segment; either
+    may be None for start-of-file / end-of-file. A mode with more than one
+    client appends every client's iterations to the same worker log, so an
+    open-ended window would silently attribute the whole run to the first
+    client.
 
     The log is read exactly once. The caller (DisaggTestCmds.run_cmd) normally
     waits for the gen_server_{i}.done sentinels first, so every gen srun has
@@ -605,7 +663,9 @@ def parse_gen_worker_device_step_time(
     accept a truncated prefix while the log was still flushing across NFS
     (nvbugs 6487036 / 6487040 / 6487038).
     """
-    per_file_rows = _scan_gen_worker_device_step_time(output_dir, num_gen_servers, start_offsets)
+    per_file_rows = _scan_gen_worker_device_step_time(
+        output_dir, num_gen_servers, start_offsets, end_offsets
+    )
     return _stats_at_mode_ngen(per_file_rows)
 
 
@@ -653,8 +713,8 @@ def add_perf_metric_value(
         al = metrics.get("al")
         if al is not None:
             new_data["d_al"] = al
-    if benchmark_mode == "gen_only":
-        for metric_name in GEN_ONLY_DEVICE_STEP_TIME_METRICS:
+    if benchmark_mode in DEVICE_STEP_TIME_MODES:
+        for metric_name in DEVICE_STEP_TIME_METRICS:
             value = metrics.get(metric_name)
             if value is None:
                 continue
@@ -689,11 +749,13 @@ MINIMIZE_METRICS = [
     "d_mean_e2el",
     "d_median_e2el",
     "d_p99_e2el",
-    # gen_only-only: per-iter device step time across gen workers. Lower is
+    # Per-iter device step time across gen workers, uploaded for every mode in
+    # DEVICE_STEP_TIME_MODES (gen_only, e2e, e2e_time_breakdown). Lower is
     # better for all five, including the spread statistics -- a tighter
     # distribution is a more trustworthy measurement as well as a steadier
-    # workload. Mean and median are listed in regression_metrics; std/p75/p99
-    # get baselines but cannot fail a build (see check_regression).
+    # workload. Only in gen_only do mean and median reach regression_metrics
+    # (GEN_ONLY_REGRESSION_METRICS); in the other modes all five, and in gen_only
+    # std/p75/p99, get baselines but cannot fail a build (see check_regression).
     "d_mean_gen_worker_per_iter_device_step_time",
     "d_median_gen_worker_per_iter_device_step_time",
     "d_std_gen_worker_per_iter_device_step_time",
@@ -1946,10 +2008,12 @@ class DisaggTestCmds(NamedTuple):
         A sentinel timeout is a bounded teardown fallback, not a reason to
         discard metrics that are already present in the GEN logs. If the
         fallback parse finds no usable metric, check_test_failure still fails
-        the gen_only run before results are uploaded.
+        the gen_only run before results are uploaded. Other modes in
+        DEVICE_STEP_TIME_MODES treat the family as diagnostic, so a fallback
+        parse that finds nothing simply omits the columns there.
 
         Five lines are written, one statistic each -- see
-        GEN_ONLY_PERF_METRIC_LOG_QUERIES for why they must not share a leading
+        DEVICE_STEP_TIME_LOG_QUERIES for why they must not share a leading
         word. The mean keeps its original wording and 2 decimals so existing
         log readers and dashboards are unaffected; the four new lines use 4
         decimals because the stdev of a healthy run is O(0.1 ms) and would
@@ -1964,6 +2028,7 @@ class DisaggTestCmds(NamedTuple):
                 self.test_output_dir,
                 self.num_gen_servers,
                 start_offsets=record["start_offsets"],
+                end_offsets=record.get("end_offsets"),
             )
             if stats is None:
                 continue
@@ -2198,15 +2263,13 @@ class DisaggTestCmds(NamedTuple):
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
-            collect_device_step_time = (
-                configs_for_idx is not None and configs_for_idx[2].benchmark_mode == "gen_only"
-            )
-            # Same deferral, same reason: the worker perf_metrics JSONLs are
-            # still being written until the workers stop.
-            pending_time_breakdown: List[dict] = []
             benchmark_mode_for_idx = (
                 configs_for_idx[2].benchmark_mode if configs_for_idx is not None else None
             )
+            collect_device_step_time = benchmark_mode_for_idx in DEVICE_STEP_TIME_MODES
+            # Same deferral, same reason: the worker perf_metrics JSONLs are
+            # still being written until the workers stop.
+            pending_time_breakdown: List[dict] = []
             collect_time_breakdown = benchmark_mode_for_idx == E2E_TIME_BREAKDOWN_MODE
             try:
                 disagg_server_hostname, disagg_server_port = (
@@ -2239,15 +2302,28 @@ class DisaggTestCmds(NamedTuple):
                         )
                         print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                        # Snapshot gen_server log sizes so the gen_only
-                        # per-client average covers only iterations driven by
-                        # this client. Other modes do not emit this metric and
-                        # must not wait for the GEN teardown sentinel.
+                        # Snapshot gen_server log sizes so each client's stats
+                        # cover only iterations driven by that client. This is
+                        # also the *end* bound of the previous client's window
+                        # (see the fixup below): taken here, it is necessarily
+                        # after that client returned, so it absorbs whatever
+                        # the gen workers flushed late. Modes outside
+                        # DEVICE_STEP_TIME_MODES skip this and must not wait for
+                        # the GEN teardown sentinel.
                         gen_log_start_offsets = None
                         if collect_device_step_time:
                             gen_log_start_offsets = gen_worker_log_sizes(
                                 self.test_output_dir, self.num_gen_servers
                             )
+                            if pending_device_step_time:
+                                # Close the previous client's window here rather
+                                # than at its own return: this snapshot is the
+                                # first byte of the current client's segment, so
+                                # it cannot exclude an iteration the previous
+                                # client drove, however late it flushed. The
+                                # final record keeps end_offsets None and reads
+                                # to EOF.
+                                pending_device_step_time[-1]["end_offsets"] = gen_log_start_offsets
 
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
@@ -2274,6 +2350,7 @@ class DisaggTestCmds(NamedTuple):
                                     "output_index": len(outputs) - 1,
                                     "benchmark_file_path": benchmark_file_path,
                                     "start_offsets": gen_log_start_offsets,
+                                    "end_offsets": None,
                                 }
                             )
                         if collect_time_breakdown:
@@ -3028,7 +3105,7 @@ class PerfSanityTestConfig:
             all_queries = {
                 **PERF_METRIC_LOG_QUERIES,
                 **SPEC_DECODING_PERF_METRIC_LOG_QUERIES,
-                **GEN_ONLY_PERF_METRIC_LOG_QUERIES,
+                **DEVICE_STEP_TIME_LOG_QUERIES,
             }
             for line in output.split("\n"):
                 # Handled outside the first-match-wins loop below on purpose:
@@ -3149,6 +3226,15 @@ class PerfSanityTestConfig:
                 # so a missing value must hard-fail rather than silently upload. Checking
                 # the mean alone is sufficient: all five statistics come from the same
                 # _DeviceStepTimeStats, so the mean is absent only if all of them are.
+                #
+                # Deliberately gen_only and not every mode in
+                # DEVICE_STEP_TIME_MODES. In gen_only this family is the only
+                # regression signal, so losing it makes the run pointless. In e2e
+                # it is diagnostic and throughput still gates, so an absent value
+                # costs five columns on one row; hard-failing there would turn a
+                # diagnostic addition into a new red-build mode for every e2e
+                # case on every cluster, gated on log-scrape plumbing rather than
+                # on performance.
                 if (
                     self.runtime == "multi_node_disagg_server"
                     and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
@@ -3330,6 +3416,13 @@ class PerfSanityTestConfig:
             # until enough runs accrue -- it cannot fail a build before then.
             regression_metrics = list(GEN_ONLY_REGRESSION_METRICS)
         else:
+            # e2e and e2e_time_breakdown land here and keep the throughput
+            # metrics. They upload the same five device-step-time statistics, but
+            # no gen_worker name is in REGRESSION_METRICS, so there they can only
+            # ever earn a baseline and an s_regression_info diff line -- never set
+            # b_is_regression. That is deliberate: in e2e throughput is a
+            # meaningful signal and already gates, and device step time is there
+            # to attribute a regression rather than to declare one.
             regression_metrics = list(REGRESSION_METRICS)
             has_spec_decoding = any(
                 cc.spec_decoding
