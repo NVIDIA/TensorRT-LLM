@@ -30,6 +30,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
 
@@ -99,8 +100,8 @@ class MockBenchmarkExecutor:
             benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
         )
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
-        self._sync_disagg_transfer_made_progress = False
-        self._benchmark_sync_progress_global = False
+        self._disagg_gen_transfer_made_progress = False
+        self._benchmark_transfer_progress_global = False
         self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
         self.max_num_active_requests = max_num_active_requests
@@ -130,6 +131,7 @@ class MockBenchmarkExecutor:
     _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
+    _check_disagg_gen_cache_transfer_status = PyExecutor._check_disagg_gen_cache_transfer_status
     _fail_if_fill_gate_stalled = PyExecutor._fail_if_fill_gate_stalled
 
 
@@ -460,7 +462,7 @@ class TestCheckBenchmarkDisaggGate:
         mock_time.sleep.assert_called_once_with(0.1)
 
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
-    def test_gate_retries_without_sleep_after_sync_transfer_progress(self, mock_time):
+    def test_gate_retries_without_sleep_after_transfer_progress(self, mock_time):
         reqs = [_make_active_request(in_init=True)]
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=4,
@@ -468,14 +470,57 @@ class TestCheckBenchmarkDisaggGate:
             num_fetch_requests=2,
             active_requests=reqs,
         )
-        ex._sync_disagg_transfer_made_progress = True
+        ex._disagg_gen_transfer_made_progress = True
 
         can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
 
         assert can_forward is False
         assert should_retry is True
-        assert ex._sync_disagg_transfer_made_progress is False
+        assert ex._disagg_gen_transfer_made_progress is False
         mock_time.sleep.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "completed_request_ids",
+        [
+            pytest.param([17], id="python_runtime"),
+            pytest.param([], id="cpp_runtime"),
+        ],
+    )
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    def test_async_completion_resets_fill_stall_watchdog(self, mock_time, completed_request_ids):
+        completed_req = _make_active_request(in_transfer=True)
+        completed_req.py_request_id = 17
+        blocked_req = _make_active_request(in_init=True)
+        transceiver = _make_transceiver(transfer_complete=False)
+
+        def complete_request(_at_least_num):
+            completed_req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            completed_req.is_disagg_generation_transmission_in_progress = False
+            return GenTransferStatus(completed_request_ids, [], [])
+
+        transceiver.check_gen_transfer_status.side_effect = complete_request
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=2,
+            kv_cache_transceiver=transceiver,
+            num_fetch_requests=2,
+            active_requests=[completed_req, blocked_req],
+        )
+        ex._benchmark_fill_stall_timeout_sec = 5.0
+        ex._benchmark_fill_stall_since = 1000.0
+        ex.canceled_req_ids = []
+        ex._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        ex._check_cache_transfer_errors = Mock()
+        mock_time.monotonic.return_value = 1006.0
+
+        ex._check_disagg_gen_cache_transfer_status(0)
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        assert can_forward is False
+        assert should_retry is True
+        assert ex._benchmark_fill_stall_since is None
+        assert ex._disagg_gen_transfer_made_progress is False
+        mock_time.sleep.assert_not_called()
+        transceiver.check_gen_transfer_status.assert_called_once_with(0)
 
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
     def test_gate_skips_sleep_on_all_adp_ranks_when_peer_makes_progress(self, mock_time):

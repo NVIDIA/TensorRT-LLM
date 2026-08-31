@@ -1081,7 +1081,7 @@ class TestDisaggTransferIdleProgress:
         executor.kv_cache_transceiver.request_and_receive_async.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
-        assert executor._sync_disagg_transfer_made_progress
+        assert executor._disagg_gen_transfer_made_progress
 
     def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1098,7 +1098,7 @@ class TestDisaggTransferIdleProgress:
         ]
         executor._handle_errors = Mock()
         executor._check_cache_transfer_errors = Mock()
-        executor._sync_disagg_transfer_made_progress = False
+        executor._disagg_gen_transfer_made_progress = False
         error_request = Mock(
             py_request_id=1,
             state=LlmRequestState.DISAGG_GENERATION_INIT,
@@ -1131,7 +1131,7 @@ class TestDisaggTransferIdleProgress:
         executor.kv_cache_transceiver.cancel_request.assert_not_called()
         executor._handle_errors.assert_not_called()
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
-        assert executor._sync_disagg_transfer_made_progress
+        assert executor._disagg_gen_transfer_made_progress
 
         PyExecutor._handle_disagg_cache_errors_synced(executor)
 
