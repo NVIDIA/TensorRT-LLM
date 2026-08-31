@@ -55,6 +55,7 @@ from tensorrt_llm.serve.router import Router
 # The forwarded orchestrator->worker request body is encoded as msgspec
 # msgpack and flagged with the X-TRTLLM-Msgpack header.
 _msgpack_encoder = msgspec.msgpack.Encoder()
+MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 
 
 def _metrics_phase(role: ServerRole) -> str:
@@ -233,7 +234,7 @@ class OpenAIHttpClient(OpenAIClient):
             # Content-Type stays application/json so FastAPI still routes the
             # body through Request.json(); the header picks the decoder.
             body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
-            headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+            headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
