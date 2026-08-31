@@ -7514,7 +7514,7 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                    moe_backend, max_draft_len, mocker):
         model_path = f"{llm_models_root()}/Inferact-Qwen3.8-2.4T-A95B-NVFP4"
         if not os.path.exists(model_path):
-            pytest.skip(f"Model directory {model_path} does not exist")
+            pytest.fail(f"Model directory {model_path} does not exist")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False,
