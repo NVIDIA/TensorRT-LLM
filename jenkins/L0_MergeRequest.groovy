@@ -581,15 +581,15 @@ def launchReleaseCheck(pipeline, globalVars)
             def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
             echo "Changed file count from API: ${changedFileList ? changedFileList.size() : 0}"
             // GitHub's PR Files API caps out at 3000 entries, silently truncating the
-            // list for huge PRs. Fail closed above that.
-            if (changedFileList && !changedFileList.isEmpty() && changedFileList.size() < 3000) {
+            // list for huge PRs. Fail closed with a 2500 margin below that cap.
+            if (changedFileList && !changedFileList.isEmpty() && changedFileList.size() < 2500) {
                 def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
                 writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
                 // Script runs after "cd ${LLM_ROOT}", so use relative path
                 precommitArgs = "--files-from changed_files.txt"
                 echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
-            } else if (changedFileList && changedFileList.size() >= 3000) {
-                echo "Changed file list hit the 3000-file API cap, falling back to all files"
+            } else if (changedFileList && changedFileList.size() >= 2500) {
+                echo "Changed file list hit the 2500-file safety margin, falling back to all files"
             } else {
                 echo "Could not determine changed files, falling back to all files"
             }

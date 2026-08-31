@@ -60,8 +60,8 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             count="${{ steps.changed-files.outputs.count }}"
             # GitHub's PR Files API caps out at 3000 entries, silently truncating the
-            # list for huge PRs. Fail closed above that.
-            if [ -n "$count" ] && [ "$count" -gt 0 ] && [ "$count" -lt 3000 ]; then
+            # list for huge PRs. Fail closed with a 2500 margin below that cap.
+            if [ -n "$count" ] && [ "$count" -gt 0 ] && [ "$count" -lt 2500 ]; then
               echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
               args="--files-from changed_files.txt"
             fi
