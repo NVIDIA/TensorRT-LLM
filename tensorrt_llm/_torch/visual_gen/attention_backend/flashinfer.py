@@ -14,7 +14,6 @@ from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
-_LN_2 = math.log(2.0)
 _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
 
 
@@ -145,7 +144,7 @@ class FlashInferAttention(AttentionBackend):
             return_lse=True,
         )
         # Single prefill reports log2 LSE; VisualGen exposes natural-log LSE.
-        return output.unsqueeze(0), lse.transpose(0, 1).unsqueeze(0) * _LN_2
+        return output.unsqueeze(0), lse.transpose(0, 1).unsqueeze(0) * math.log(2.0)
 
     @torch.compiler.disable
     def _run_batch_prefill(
@@ -252,7 +251,7 @@ class FlashInferAttention(AttentionBackend):
         output = output.view(batch_size, query_length, self.num_heads, self.head_dim)
         lse = lse.view(batch_size, query_length, self.num_heads).transpose(1, 2)
         # Batch prefill reports log2 LSE; VisualGen exposes natural-log LSE.
-        return output, lse * _LN_2
+        return output, lse * math.log(2.0)
 
     @staticmethod
     def _quantize_fp8_per_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -276,16 +275,8 @@ class FlashInferAttention(AttentionBackend):
                 "FlashInfer SM100/SM103 block-scaled attention requires head_dim=128, "
                 f"got {self.head_dim}."
             )
-        try:
-            from flashinfer.attention.cute_dsl.fmha_blockscaled import (
-                cute_dsl_fmha_blockscaled_prefill,
-            )
-            from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
-        except ImportError as exc:
-            raise ImportError(
-                "VisualGen FLASHINFER block-scaled attention on SM100/SM103 requires "
-                "FlashInfer's CuTe DSL block-scaled FMHA APIs."
-            ) from exc
+        from flashinfer.attention.cute_dsl.fmha_blockscaled import cute_dsl_fmha_blockscaled_prefill
+        from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
 
         q_store, k_store, q_sf, k_sf, q_scale, k_scale = quantize_blockscaled_qk(q, k, qk_mode)
         v_store, v_scale = self._quantize_fp8_per_tensor(v)
@@ -311,7 +302,7 @@ class FlashInferAttention(AttentionBackend):
             scale_v=v_scale,
         )
         # CuTe DSL reports log2 LSE; VisualGen exposes natural-log LSE.
-        return output, lse.transpose(1, 2).contiguous() * _LN_2
+        return output, lse.transpose(1, 2).contiguous() * math.log(2.0)
 
     def _run_nvfp4_sm12x(
         self,
