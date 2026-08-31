@@ -227,8 +227,8 @@ class MsaPrefillFmha(PhasedFmha):
         metadata = params.meta
         write_msa_phase_kv(
             params.attn,
-            params.key_input,
-            params.value_input,
+            params.k,
+            params.v,
             metadata,
             params.fwd.attention_input_type,
             token_offset=params.token_offset,
@@ -244,9 +244,9 @@ class MsaPrefillFmha(PhasedFmha):
             ]
         run_msa_prefill_gqa(
             params.attn,
-            params.attention_input,
+            params.qkv_or_q,
             metadata,
-            params.context_buf,
+            params.output,
             kv_block_indexes=kv_block_indexes,
             plan=(
                 metadata.msa_prefill_gqa_plan

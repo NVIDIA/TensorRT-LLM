@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakePhasedFmha
+from fmha_test_utils import FakeAttention, FakePhasedFmha, make_fake_metadata
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
@@ -53,7 +53,7 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
     )
     combined_fmha = CombinedFmha(attn)
     combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
-    metadata = SimpleNamespace(
+    metadata = make_fake_metadata(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
         num_contexts=2,

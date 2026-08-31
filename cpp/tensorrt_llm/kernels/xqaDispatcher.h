@@ -23,8 +23,9 @@
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
 
+#include <memory>
+
 using namespace tensorrt_llm::common;
-using tensorrt_llm::common::op::UniqPtrWNullCopy;
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -107,9 +108,9 @@ private:
     // The multi-processor count.
     int mMultiProcessorCount;
     // Runner for decoder XQA kernels (for SM <= 90)
-    UniqPtrWNullCopy<DecoderXQARunner> mDecoderXqaRunner;
+    std::unique_ptr<DecoderXQARunner> mDecoderXqaRunner;
     // Runner for trtllm-gen XQA kernels (for SM == 100)
-    UniqPtrWNullCopy<TllmGenFmhaRunner> mTllmGenFMHARunner;
+    std::unique_ptr<TllmGenFmhaRunner> mTllmGenFMHARunner;
 
 protected:
     template <typename T, typename KVCacheBuffer>

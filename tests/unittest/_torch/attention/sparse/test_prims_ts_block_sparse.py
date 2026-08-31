@@ -428,9 +428,9 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
         meta=metadata,
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=q,
-        context_buf=args.output,
-        sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
+        qkv_or_q=q,
+        output=args.output,
+        sequence_length=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
         num_requests=2,
@@ -453,7 +453,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
     first_inputs = _get_block_sparse_inputs(args)
     fmha.run_generation(params)
     block_tables[:, 0].add_(10)
-    params.sequence_lengths = torch.tensor([130, 194], dtype=torch.int32)
+    params.sequence_length = torch.tensor([130, 194], dtype=torch.int32)
     _set_block_sparse_inputs(
         args,
         BlockSparseForwardInputs(
@@ -504,9 +504,9 @@ def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None
         meta=metadata,
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=q,
-        context_buf=args.output,
-        sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
+        qkv_or_q=q,
+        output=args.output,
+        sequence_length=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
         num_requests=2,
@@ -554,7 +554,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
 
     with pytest.raises(RuntimeError, match="workspace must be sized"):
-        fmha.prepare_workspace(q, None, None, metadata, _args, workspace)
+        fmha.prepare_workspace(FmhaParams(qkv_or_q=q, fwd=_args, workspace=workspace), metadata)
 
     device_scope.assert_called_once_with(query_device)
     assert workspace.numel() == 0
@@ -568,7 +568,7 @@ def test_prepare_workspace_skips_generation_layout_for_contiguous_requests(monke
     fmha._multi_processor_count = 1
     workspace = torch.empty(0, dtype=torch.uint8)
 
-    fmha.prepare_workspace(q, None, None, metadata, args, workspace)
+    fmha.prepare_workspace(FmhaParams(qkv_or_q=q, fwd=args, workspace=workspace), metadata)
 
     layout.assert_not_called()
     assert workspace.numel() == 0

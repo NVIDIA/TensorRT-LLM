@@ -159,13 +159,11 @@ class TritonCustomMaskFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
+        params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
     ) -> None:
+        q = params.qkv_or_q
+        workspace = params.workspace
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 
@@ -212,9 +210,9 @@ class TritonCustomMaskFmha(PhasedFmha):
             _,
             window_left,
         ) = thop.trtllm_gen_context_preprocess(
-            params.qkv_input,
+            params.qkv_or_q,
             params.workspace,
-            params.sequence_lengths,
+            params.sequence_length,
             params.context_lengths,
             meta.kv_cache_block_offsets,
             meta.host_kv_cache_pool_pointers,
@@ -230,17 +228,17 @@ class TritonCustomMaskFmha(PhasedFmha):
             attn.num_kv_heads,
             attn.head_dim,
             params.tokens_per_block,
-            int(AttentionMaskType.causal),
+            AttentionMaskType.causal,
             attn.quant_mode,
             params.max_attention_window_size,
             params.cyclic_attention_window_size,
             params.num_tokens,
-            params.batch_size,
+            params.num_seqs,
             params.input_seq_length,
             params.max_past_kv_length,
             rope_params.dim,
             rope_params.theta,
-            int(rope_params.scale_type),
+            rope_params.scale_type,
             rope_params.scale,
             rope_params.max_positions,
             attn.position_embedding_type,
@@ -260,39 +258,38 @@ class TritonCustomMaskFmha(PhasedFmha):
 
         if block_tables is None:
             raise RuntimeError("Custom-mask TRT-LLM attention requires paged KV metadata.")
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_or_q is None or params.output is None:
             raise RuntimeError(
                 "Custom-mask TRT-LLM attention requires context QKV and output buffers."
             )
-        if params.sequence_lengths is None or params.context_lengths is None:
+        if params.sequence_length is None or params.context_lengths is None:
             raise RuntimeError("Custom-mask TRT-LLM attention requires context sequence lengths.")
 
         q_size = attn.num_heads * attn.head_dim
         kv_size = attn.num_kv_heads * attn.head_dim
-        k_processed = params.qkv_input.narrow(1, q_size, kv_size).view(
+        k_processed = params.qkv_or_q.narrow(1, q_size, kv_size).view(
             params.num_tokens,
             attn.num_kv_heads,
             attn.head_dim,
         )
-        v_processed = params.qkv_input.narrow(1, q_size + kv_size, kv_size).view(
+        v_processed = params.qkv_or_q.narrow(1, q_size + kv_size, kv_size).view(
             params.num_tokens,
             attn.num_kv_heads,
             attn.head_dim,
         )
 
-        block_tables = block_tables[: params.batch_size]
+        block_tables = block_tables[: params.num_seqs]
         blocks_per_sequence = block_tables.size(-1)
         page_table_indptr = (
             torch.arange(
-                params.batch_size + 1,
+                params.num_seqs + 1,
                 dtype=torch.int32,
                 device=block_tables.device,
             )
             * blocks_per_sequence
         )
         prefix_lens = (
-            params.sequence_lengths[: params.batch_size]
-            - params.context_lengths[: params.batch_size]
+            params.sequence_length[: params.num_seqs] - params.context_lengths[: params.num_seqs]
         )
 
         if meta.kv_cache_manager is None:
@@ -320,7 +317,7 @@ class TritonCustomMaskFmha(PhasedFmha):
             q=q_processed,
             k=k_processed,
             v=v_processed,
-            output=params.context_buf,
+            output=params.output,
             qo_indptr=cu_q_seqlens,
             kv_cache=kv_cache,
             prefix_lens=prefix_lens,

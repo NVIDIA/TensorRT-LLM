@@ -443,14 +443,11 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
 
     def prepare_workspace(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
+        params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
     ) -> None:
-        del k, v, forward_args
+        q = cast(torch.Tensor, params.qkv_or_q)
+        workspace = cast(torch.Tensor, params.workspace)
         with torch.cuda.device(q.device):
             # Contiguous requests run without a KV cache and never touch the
             # generation preprocessing workspace.
@@ -472,9 +469,9 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
                 self._multi_processor_count = get_multi_processor_count_for_device(q.device.index)
 
     def run_generation(self, params: FmhaParams) -> None:
-        q = params.qkv_input
-        output_buffer = params.context_buf
-        sequence_lengths = params.sequence_lengths
+        q = params.qkv_or_q
+        output_buffer = params.output
+        sequence_lengths = params.sequence_length
         assert q is not None and output_buffer is not None and sequence_lengths is not None
         metadata = params.meta
         forward_args = params.fwd

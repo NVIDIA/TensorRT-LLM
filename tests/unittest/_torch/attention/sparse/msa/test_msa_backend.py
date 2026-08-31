@@ -1090,8 +1090,8 @@ def _generation_params(
     params.seq_offset = seq_offset
     params.input_seq_length = input_seq_length
     params.token_offset = token_offset
-    params.key_input = key_input
-    params.value_input = key_input
+    params.k = key_input
+    params.v = key_input
     return params
 
 
