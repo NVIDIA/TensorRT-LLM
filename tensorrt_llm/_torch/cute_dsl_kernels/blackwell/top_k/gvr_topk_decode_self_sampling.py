@@ -3344,7 +3344,7 @@ class GvrTopkRegKernel:
         # hint-free: bracket = min/max fold of the first k row values
         # (already in registers); the hint-gather bracket arms are forced off
         self.hf = bool(hf)
-        self.use_bm = ((not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hf))
+        self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hf)
         self.use_img = img and vpt == 1 and (not hf)
         self.brl = (minb * blk <= 1024) or (vpt == 1)
 
@@ -3660,8 +3660,9 @@ class GvrTopkRegKernel:
                 lmn = cutlass.Float32(_POS_INF)
                 lmx = cutlass.Float32(_NEG_INF__reg)
                 for s in cutlass.range_constexpr(S):
-                    pos = ((tid + cutlass.Int32((s // 4) * self.blk))
-                           << cutlass.Int32(2)) + cutlass.Int32(s % 4)
+                    pos = (
+                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                    ) + cutlass.Int32(s % 4)
                     if pos < k:
                         v = _val(frags, s)
                         lmn = fmin_f32(lmn, v)
@@ -5591,13 +5592,32 @@ def get_compiled__clus(
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
     reachable route has 8192/2048 — asserted by run__clus())."""
-    key = (tuple(tpl), scap, cmp_, options_extra, bool(varlen), int(next_n), int(cr_shift), bool(hf))
+    key = (
+        tuple(tpl),
+        scap,
+        cmp_,
+        options_extra,
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        bool(hf),
+    )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
         return hit
     blk, u, minb, nbs, cs = tpl
     kern = GvrClusKernel(
-        blk, u, minb, nbs, cs, scap=scap, cmp_=cmp_, varlen=varlen, next_n=next_n, cr_shift=cr_shift, hf=hf
+        blk,
+        u,
+        minb,
+        nbs,
+        cs,
+        scap=scap,
+        cmp_=cmp_,
+        varlen=varlen,
+        next_n=next_n,
+        cr_shift=cr_shift,
+        hf=hf,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6496,7 +6516,9 @@ class GvrRegClusKernel:
 _COMPILE_CACHE__regclus: dict = {}
 
 
-def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, hf=False):
+def get_compiled__regclus(
+    tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, hf=False
+):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
     key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), bool(hf))
     compiled = _COMPILE_CACHE__regclus.get(key)

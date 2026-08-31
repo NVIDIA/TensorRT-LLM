@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the reusable sparse index-selection Top-K module."""
 
+import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -199,6 +201,59 @@ def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
     )
 
     assert gvr.call_args.kwargs["order_row"] is row_order
+
+
+def _install_fake_selfsampling_runner(monkeypatch) -> Mock:
+    """Replace the lazily imported self-sampling varlen entry with a Mock."""
+    runner = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k",
+        SimpleNamespace(selfsampling_topk_run_varlen=runner),
+    )
+    return runner
+
+
+def _run_gvr_v2_decode(top_k: TopK, prior_indices: torch.Tensor) -> None:
+    scores = torch.randn(1, 8)  # satisfies the V2 hardware-format gate
+    top_k(
+        scores,
+        torch.empty(1, 2, dtype=torch.int32),
+        is_prefill=False,
+        sequence_lengths=torch.tensor([32], dtype=torch.int32),
+        scan_lengths=torch.tensor([8], dtype=torch.int32),
+        next_n=1,
+        max_seq_len=16,
+        gvr_ext_kwargs={"gvr_prior_indices": prior_indices},
+    )
+
+
+def test_gvr_v2_decode_defaults_to_hint_free(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    monkeypatch.delenv("TRTLLM_GVR_V2_HINTED", raising=False)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        compress_ratio=4,
+    )
+    prior_indices = torch.zeros(1, 2, dtype=torch.int32)
+
+    _run_gvr_v2_decode(top_k, prior_indices)
+
+    args, kwargs = runner.call_args
+    assert args[1] is None
+    assert kwargs == {"next_n": 1, "compress_ratio": 4, "max_seq_len": 64}
+
+
+def test_gvr_v2_decode_hinted_env_restores_prior(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    monkeypatch.setenv("TRTLLM_GVR_V2_HINTED", "1")
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2)
+    prior_indices = torch.zeros(1, 2, dtype=torch.int32)
+
+    _run_gvr_v2_decode(top_k, prior_indices)
+
+    assert runner.call_args.args[1] is prior_indices
 
 
 def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:

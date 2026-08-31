@@ -1313,9 +1313,7 @@ def run_varlen(
     batch = num_rows // nn
     if kv_lens.shape[0] != batch:
         raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
-    if pre_idx is not None and (
-        len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch
-    ):
+    if pre_idx is not None and (len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch):
         raise RuntimeError(
             f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
         )
@@ -1342,8 +1340,10 @@ def run_varlen(
         hf = pre_idx is None
         if not (logits.is_cuda and indices.is_cuda and (hf or pre_idx.is_cuda)):
             raise RuntimeError("all tensors must be CUDA")
-        if logits.dtype is not _F32 or indices.dtype is not _I32 or (
-            not hf and pre_idx.dtype is not _I32
+        if (
+            logits.dtype is not _F32
+            or indices.dtype is not _I32
+            or (not hf and pre_idx.dtype is not _I32)
         ):
             raise RuntimeError("logits must be float32; pre_idx/indices int32")
         if len(indices.shape) != 2 or indices.shape[0] != num_rows:
@@ -1353,7 +1353,9 @@ def run_varlen(
         k = indices.shape[1] if hf else pre_idx.shape[1]
         if indices.shape[1] < k:
             raise RuntimeError(f"indices width {indices.shape[1]} < k={k}")
-        if not ((hf or pre_idx.is_contiguous()) and indices.is_contiguous() and kv_lens.is_contiguous()):
+        if not (
+            (hf or pre_idx.is_contiguous()) and indices.is_contiguous() and kv_lens.is_contiguous()
+        ):
             raise RuntimeError("pre_idx/indices/kv_lens must be contiguous")
         # logits: accept row-major views with a wider row stride (the DSL
         # paged-MQA logits arena is 256-aligned and column-sliced — a legal
@@ -1512,6 +1514,7 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    hint_free: bool = False,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -1527,6 +1530,10 @@ def warmup_varlen(
     producer layout (e.g. the DSL paged-MQA arena's 256-element rounding)
     must pass it; the 64-element default only matches producers that round
     the same way.
+
+    ``hint_free`` must match the mode dispatch will launch (the launcher key
+    includes the hint-free bit): warm with ``hint_free=True`` when serving
+    calls ``run_varlen(pre_idx=None)``.
     """
     dev = torch.cuda.current_device()
     nn = max(1, int(next_n))
@@ -1576,7 +1583,16 @@ def warmup_varlen(
             raise RuntimeError(
                 f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
             )
-    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list), npad)
+    key = (
+        dev,
+        int(top_k),
+        int(max_seq_len),
+        int(compress_ratio),
+        nn,
+        tuple(rows_list),
+        npad,
+        bool(hint_free),
+    )
     with _VARLEN_WARMUP_LOCK:
         if key in _VARLEN_WARMUP_DONE:
             return
@@ -1585,13 +1601,17 @@ def warmup_varlen(
     # contiguous prefix views (compile keys depend on shapes only)
     logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
     kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
-    pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
+    pre_idx = (
+        None
+        if hint_free
+        else torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
+    )
     out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
     for rows in rows_list:
         batch = rows // nn
         run_varlen(
             logits[:rows],
-            pre_idx[:batch],
+            None if pre_idx is None else pre_idx[:batch],
             kv_lens[:batch],
             out[:rows],
             next_n=nn,
@@ -1606,6 +1626,6 @@ def warmup_varlen(
     # CUDA-graph capture at any requested geometry finds its key immediately.
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
-        _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
+        _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf=bool(hint_free))
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 
 import torch
@@ -59,6 +60,9 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
+        # GVR V2 decode is hint-free by default; TRTLLM_GVR_V2_HINTED=1
+        # restores prev-step hint consumption.
+        self._gvr_v2_hinted = os.environ.get("TRTLLM_GVR_V2_HINTED", "0") == "1"
 
     def forward(
         self,
@@ -88,7 +92,9 @@ class TopK(nn.Module):
             max_seq_len: Maximum decode score width used for GVR kernel tuning.
             gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
                 is the required caller-owned int32 previous selection with
-                shape ``[num_requests, top_k]`` on ``scores.device``.
+                shape ``[num_requests, top_k]`` on ``scores.device``
+                (``CUTE_DSL_GVR_V2`` launches hint-free by default and reads
+                it only under ``TRTLLM_GVR_V2_HINTED=1``).
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
 
@@ -284,19 +290,23 @@ class TopK(nn.Module):
                 logger.info_once(
                     "self-sampling GVR top-K engaged "
                     f"(K={self.top_k}, cr={self.compress_ratio}, "
-                    f"next_n={next_n}).",
+                    f"next_n={next_n}, "
+                    f"{'hinted' if self._gvr_v2_hinted else 'hint-free'}).",
                     key="selfsampling_topk_engaged",
                 )
                 # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
                 # one launch for the batch; per-row n from device kv_lens,
                 # capture-stable tuning from the max-seq-len engine constant
-                # (no host reads — CUDA-graph safe). Hints are consumed raw
-                # (offset-free contract). The module receives max_seq_len in
-                # COMPRESSED index space; run_varlen's max_seq_len is in
-                # kv-token space like sequence_lengths — multiply back.
+                # (no host reads — CUDA-graph safe). Hint-free by default
+                # (pre_idx=None: the kernel brackets from the current row);
+                # TRTLLM_GVR_V2_HINTED=1 restores raw prev-step hint
+                # consumption (offset-free contract). The module receives
+                # max_seq_len in COMPRESSED index space; run_varlen's
+                # max_seq_len is in kv-token space like sequence_lengths —
+                # multiply back.
                 selfsampling_topk_run_varlen(
                     scores,
-                    gvr_prior_indices,
+                    gvr_prior_indices if self._gvr_v2_hinted else None,
                     sequence_lengths,
                     output_indices,
                     next_n=next_n,

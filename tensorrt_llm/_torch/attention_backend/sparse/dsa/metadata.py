@@ -398,7 +398,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             if row_stride % 4:
                 return
         # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
-        # is compressed — same multiply-back as the dispatch seam)
+        # is compressed — same multiply-back as the dispatch seam). The
+        # hint-free bit must mirror the TopK module's launch mode: the
+        # launcher key includes it, so warming the wrong arm leaves capture
+        # uncompiled.
         try:
             _ss_host.warmup_varlen(
                 int(top_k),
@@ -407,6 +410,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
+                hint_free=os.environ.get("TRTLLM_GVR_V2_HINTED", "0") != "1",
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines

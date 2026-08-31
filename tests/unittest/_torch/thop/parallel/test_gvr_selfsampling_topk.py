@@ -228,7 +228,9 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
-def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="auto", hint_free=False):
+def _run_varlen_case(
+    kv, next_n, cr, top_k, seed, with_values=False, engine="auto", hint_free=False
+):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
     batch, rows = len(kv), len(kv) * next_n
@@ -689,6 +691,36 @@ def test_selfsampling_warmup_row_stride_matches_arena():
     assert torch.equal(ref, got)
 
 
+def test_selfsampling_warmup_hint_free_matches_dispatch():
+    """warmup_varlen(hint_free=True) must compile the launcher key the
+    hint-free dispatch (pre_idx=None) looks up: the key includes the
+    hint-free bit, so a hinted warmup would leave capture uncompiled."""
+    k, msl = 512, 8300
+    stride = (msl + 255) // 256 * 256
+    rows = 2
+    ss_host.warmup_varlen(
+        k,
+        msl,
+        compress_ratio=1,
+        next_n=1,
+        num_rows_list=(rows,),
+        row_stride=stride,
+        hint_free=True,
+    )
+    arena = torch.randn(rows, stride, dtype=torch.float32, device=_DEV)
+    logits = arena[:, :msl]
+    kv = torch.full((rows,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(logits, None, kv, out, max_seq_len=msl)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = torch.topk(arena[:, :msl], k, dim=1).values.sort(dim=1).values
+    got = arena.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(ref, got)
+
+
 def test_selfsampling_varlen_regclus_parity_and_oracle():
     """The varlen launcher must admit the clustered register-resident family
     exactly where the free route picks it (route() parity tier 1), and the
@@ -707,7 +739,7 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-    key = (rows, npad, k, msl_c, nn, cr)
+    key = (rows, npad, k, msl_c, nn, cr, False)
     assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
     ss_host.run_varlen(
         lg,
@@ -784,7 +816,7 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
-        key = (rows, npad, k, msl_c, nn, cr)
+        key = (rows, npad, k, msl_c, nn, cr, False)
         assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
         ss_host.run_varlen(
             lg,
@@ -835,7 +867,7 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-        key = (rows, npad, k, msl_c, nn, cr)
+        key = (rows, npad, k, msl_c, nn, cr, False)
         assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
         ss_host.run_varlen(
             lg,
@@ -872,7 +904,7 @@ def test_selfsampling_varlen_clus_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr)
+    key = (rows, msl_c, k, msl_c, 1, cr, False)
     assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
@@ -899,7 +931,7 @@ def test_selfsampling_varlen_reg_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr)
+    key = (rows, msl_c, k, msl_c, 1, cr, False)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
@@ -928,7 +960,7 @@ def test_selfsampling_varlen_full_row_range():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
         torch.cuda.synchronize()
-        key = (rows, msl_c, k, msl_c, 1, cr)
+        key = (rows, msl_c, k, msl_c, 1, cr, False)
         assert key in ss_host._VARLEN_CACHE, "row count must dispatch in-engine"
         ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
         got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
