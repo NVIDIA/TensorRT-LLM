@@ -12,11 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Optional-dependency and lifecycle tests for the SMG gRPC adapter.
+"""Optional-dependency and lifecycle tests for the gRPC gateway adapters.
 
-These run correctly with or without the dependency installed: the "missing" case is
+These run correctly with or without the dependencies installed: the "missing" case is
 simulated so it is meaningful in every environment, and the "present" case is
-guarded with ``importorskip``.
+guarded with ``importorskip``. That matters most for OpenEngine, whose bindings
+resolve only from a custom index and are therefore installed on just one CI stage
+(see the gateway install guard in jenkins/L0_Test.groovy) -- the simulated case
+below is the OpenEngine coverage that every other stage still gets.
 """
 
 import asyncio
@@ -132,3 +135,31 @@ def test_smg_server_startup_failure_cleans_up(monkeypatch, failure_point):
 
     grpc_server.stop.assert_awaited_once_with(grace=5.0)
     llm.shutdown.assert_called_once_with()
+
+
+def test_openengine_server_missing_bindings_raises_import_error(monkeypatch):
+    """Absent bindings surface as ImportError, which is what serve.py catches.
+
+    ``trtllm-serve --grpc --grpc_protocol openengine`` wraps the import of
+    ``tensorrt_llm.grpc.openengine.server`` in ``except ImportError`` to
+    re-raise it as a ClickException carrying the
+    ``pip install "tensorrt_llm[openengine]"`` hint. If the module ever fails
+    with something outside that hierarchy, the hint silently stops reaching
+    users, so pin the contract the handler depends on.
+    """
+    real_import = builtins.__import__
+
+    def import_without_openengine(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("openengine"):
+            raise ModuleNotFoundError("No module named 'openengine'", name="openengine")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "openengine", raising=False)
+    monkeypatch.delitem(sys.modules, "openengine.v1", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_openengine)
+
+    with pytest.raises(ImportError) as exc_info:
+        importlib.import_module("tensorrt_llm.grpc.openengine.server")
+
+    assert exc_info.value.name == "openengine"

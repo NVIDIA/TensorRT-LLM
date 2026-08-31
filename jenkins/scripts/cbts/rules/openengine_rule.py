@@ -15,41 +15,15 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from typing import Optional
 
 from blocks import Stage, YAMLIndex, _entry_target
 
-from ._helpers import iter_diff_changes, resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 _OPENENGINE_SOURCE_PREFIX = "tensorrt_llm/grpc/openengine/"
 _OPENENGINE_TEST_PREFIX = "unittest/grpc/openengine/"
-_OPENENGINE_CI_ADDITIONS = {
-    "jenkins/L0_MergeRequest.groovy": {
-        "scopes: data.scopes ?: [],",
-    },
-    "jenkins/L0_Test.groovy": {
-        "def cbtsScopes = testFilter[(CBTS_RESULT)]?.scopes ?: []",
-        'if (cbtsScopes.contains("openengineonly")) {',
-        'trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && '
-        'pip3 install -r requirements-openengine.txt")',
-        "}",
-    },
-}
-
-
-def _is_openengine_ci_setup_diff(path: str, diff: str) -> bool:
-    """Recognize only the dedicated OpenEngine CBTS setup edits."""
-    expected = _OPENENGINE_CI_ADDITIONS.get(path)
-    if expected is None:
-        return False
-    changes = Counter(
-        (sign, body.strip())
-        for sign, body in iter_diff_changes(diff)
-        if not body.lstrip().startswith("//")
-    )
-    return changes == Counter(("+", line) for line in expected)
 
 
 def _is_openengine_claim(path: str) -> bool:
@@ -59,7 +33,7 @@ def _is_openengine_claim(path: str) -> bool:
 
 class OpenEngineRule(Rule):
     name = "openengine"
-    needs_diff_for = tuple(_OPENENGINE_CI_ADDITIONS)
+    needs_diff_for: tuple[str, ...] = ()
 
     def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
         self.yaml_index = yaml_index
@@ -67,11 +41,6 @@ class OpenEngineRule(Rule):
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         claimed = {path for path in pr.changed_files if _is_openengine_claim(path)}
-        for path in _OPENENGINE_CI_ADDITIONS:
-            if path in pr.changed_files and _is_openengine_ci_setup_diff(
-                path, pr.diffs.get(path, "")
-            ):
-                claimed.add(path)
         if not claimed:
             return None
 

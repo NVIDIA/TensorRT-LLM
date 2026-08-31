@@ -1173,7 +1173,6 @@ def _cbtsParseSelectionResult(String text)
     def data = new groovy.json.JsonSlurper().parseText(text)
     return [
         scope: data.scope,
-        scopes: data.scopes ?: [],
         affected_stages: data.affected_stages ?: [],
         reasons: data.reasons ?: [],
         test_db_dir_override: data.test_db_dir_override,
