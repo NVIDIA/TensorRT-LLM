@@ -34,6 +34,10 @@ from types import SimpleNamespace
 
 import pytest
 
+# These tests are CPU-only (no GPU, engine or sockets) and run in the
+# CPU-Generic CI stage, which selects with `-m cpu_only`.
+pytestmark = pytest.mark.cpu_only
+
 SCRIPT = Path(__file__).parents[4] / "examples" / "serve" / "anthropic_compatibility" / "gateway.py"
 SPEC = importlib.util.spec_from_file_location("anthropic_gateway", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None

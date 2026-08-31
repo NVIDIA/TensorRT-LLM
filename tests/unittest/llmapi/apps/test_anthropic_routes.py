@@ -38,6 +38,10 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
+# These tests are CPU-only (no GPU, engine or sockets) and run in the
+# CPU-Generic CI stage, which selects with `-m cpu_only`.
+pytestmark = pytest.mark.cpu_only
+
 MODEL = "test-model"
 
 
