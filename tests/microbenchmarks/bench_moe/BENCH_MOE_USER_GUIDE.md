@@ -53,7 +53,7 @@ For single-rank sanity checks:
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model qwen1.5_moe \
+  --model deepseek_v4_flash \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -87,7 +87,7 @@ every MPI rank to execute the benchmark worker.
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model qwen1.5_moe \
+  --model deepseek_v4_flash \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
