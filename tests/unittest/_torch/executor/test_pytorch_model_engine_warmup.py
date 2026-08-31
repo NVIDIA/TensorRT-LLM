@@ -179,6 +179,7 @@ class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
     def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
+        """Enc-dec encoder warmup is deferred and runs as two passes."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.cuda_graph_runner = SimpleNamespace(
             enabled=True,
@@ -196,6 +197,7 @@ class TestWarmupCleanup(unittest.TestCase):
             enabled=True,
             is_encoder_decoder=True,
             is_warmup_only=False,
+            feature_mode=False,
             allow_capture=allow_capture,
         )
         model_engine.encoder_cuda_graph_runner = runner

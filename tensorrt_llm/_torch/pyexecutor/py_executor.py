@@ -6103,19 +6103,38 @@ class PyExecutor:
 
         encoder_max_batch_size = self.llm_args.encoder_max_batch_size
         encoder_cuda_graph_config = self.llm_args.encoder_cuda_graph_config
+        # A fixed-shape feature encoder has no token/seq-len buckets to gate on.
+        runner = getattr(self.model_engine, 'encoder_cuda_graph_runner', None)
+        is_feature_encoder = bool(getattr(runner, 'feature_mode', False))
         if (encoder_max_batch_size is not None
                 and encoder_cuda_graph_config is not None
-                and bool(encoder_cuda_graph_config.num_tokens)
-                and bool(encoder_cuda_graph_config.seq_lens)):
+                and (is_feature_encoder or
+                     (bool(encoder_cuda_graph_config.num_tokens)
+                      and bool(encoder_cuda_graph_config.seq_lens)))):
             encoder_batch_size_limit = min(encoder_max_batch_size,
                                            self.max_batch_size)
-            configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
-                                      or [])
+            if is_feature_encoder:
+                # Feature batch sizes may have been derived rather than
+                # configured, so take the ones the runner actually resolved.
+                # They stay populated even when capture was declined, so
+                # waiting on them would delay a batch that can only run eager.
+                configured_batch_sizes = (list(runner.supported_batch_sizes)
+                                          if runner.enabled else [])
+            else:
+                configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
+                                          or [])
             supported_batch_sizes = [
                 batch_size for batch_size in configured_batch_sizes
                 if batch_size <= encoder_batch_size_limit
             ]
-            if (encoder_cuda_graph_config.enable_padding
+            # Targeting a size the runner never captured only pays off on the
+            # token path, where the pads are single tokens and the batch still
+            # rounds up into a captured bucket. A feature pad slot is a whole
+            # fixed_seq_len request, so `pad_batch` refuses any gap wider than
+            # 12.5% and such a batch would run eager; target the largest
+            # captured size within the limit instead.
+            if (not is_feature_encoder
+                    and encoder_cuda_graph_config.enable_padding
                     and any(batch_size > encoder_batch_size_limit
                             for batch_size in configured_batch_sizes) and
                 (not supported_batch_sizes
