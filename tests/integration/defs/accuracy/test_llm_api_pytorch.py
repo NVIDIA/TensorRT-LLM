@@ -44,9 +44,9 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..conftest import (check_device_contain, get_device_count,
                         get_mpi_world_size, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
-                        skip_no_mxfp4_swizzle, skip_post_blackwell,
-                        skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray, skip_x86)
+                        skip_no_mxfp4_swizzle, skip_no_sm120,
+                        skip_post_blackwell, skip_post_hopper, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length)
@@ -2125,7 +2125,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip(
         reason="CuteDslFusedMoE declines FP8 block scales: it has no FP8 "
         "block-scale kernel, only a torch.einsum reference. See the ‡ footnote "
-        "in tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md. "
+        "in tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md. "
         "Re-enable against DEEPGEMM / TRTLLM once this checkpoint has an "
         "owner backend on SM100.")
     @skip_pre_blackwell
@@ -5061,6 +5061,73 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "attention_backend",
+        ["VANILLA", pytest.param("TRTLLM", marks=skip_pre_blackwell)])
+    def test_dspark(self, attention_backend):
+        """Standalone DSpark drafter on Qwen3-8B, 0-shot chat.
+
+        Acceptance length is the gate here. DSpark drafters are distilled on
+        the target's own chat-mode generations, so the harness default (5-shot
+        completion) is out of distribution for the drafter and understates
+        acceptance: 4.42 there against 6.26 here, on the same checkpoints.
+        GSM8K accuracy is not meaningful in this regime and is not gated --
+        see the extra_acc_spec entry in references/gsm8k.yaml.
+
+        Both block-decode backends run: TRTLLM is what deployments use, and
+        it is the one the acceptance number above was measured on, but it
+        needs SM100/SM103 so H100 only covers VANILLA. The two differ
+        numerically (GSM8K 28.9 vs 28.1) while landing the same acceptance
+        length, so they share one reference.
+        """
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+
+        # DeepSeek's official DSpark head for this target (block_size 7,
+        # markov_rank 256, confidence head). Head tensors are named after the
+        # submodules that own them (markov_head.*, confidence_head.proj.*),
+        # which is the spelling the drafter loader has to resolve.
+        dspark_model_dir = (
+            f"{llm_models_root()}/dspark/dspark_qwen3_8b_block7")
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+
+        spec_config = DSparkDecodingConfig(max_draft_len=7,
+                                           speculative_model=dspark_model_dir,
+                                           attention_backend=attention_backend)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            # 0-shot chat, not the harness default 5-shot completion: a DSpark
+            # drafter is distilled on the target's chat-mode output, so the
+            # default prompt is out of distribution for it and understates
+            # acceptance (4.42 vs 6.26 on these same checkpoints). Only the AL
+            # is gated -- extra_acc_spec selects a gsm8k.yaml entry whose
+            # reference accuracy is 0, i.e. run the task, do not gate on it.
+            task.evaluate(llm,
+                          extra_acc_spec="zero_shot_al_only",
+                          extra_evaluator_kwargs=dict(
+                              num_fewshot=0,
+                              apply_chat_template=True,
+                              chat_template_kwargs={"enable_thinking": False},
+                          ))
+            acceptance_length = _compute_acceptance_length(llm)
+            print(f"[AL] test_dspark[{attention_backend}] acceptance_length "
+                  f"= {acceptance_length:.3f}")
+            assert_acceptance_length("TestQwen3_8B::test_dspark",
+                                     acceptance_length)
+
     @skip_pre_blackwell
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp",
                              [(1, 1, 1, False)],
@@ -6885,16 +6952,10 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
     )
     GSM8K_MAX_OUTPUT_LEN = 512
 
-    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
-    def test_nvfp4(self, moe_backend, mocker):
-        # Qwen3.6-35B-A3B NVFP4 MoE checkpoint. The TRTLLM-Gen / CuteDSL NVFP4
-        # MoE backends only support the SM100 family (B200/B300); RTX 6000
-        # (SM120) uses a different MoE path, so restrict this test to SM100/103.
-        if get_sm_version() not in (100, 103):
-            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
-
-        if not os.path.exists(self.MODEL_PATH):
-            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+    def _run_gsm8k(self, model_path, moe_backend, chunked_prefill, mocker):
+        """Run single-GPU GSM8K on an NVFP4 checkpoint."""
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
@@ -6902,20 +6963,34 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                                             max_batch_size=128)
         moe_config = MoeConfig(backend=moe_backend)
 
-        with LLM(self.MODEL_PATH,
+        with LLM(model_path,
                  trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
                  max_batch_size=128,
+                 max_num_tokens=512 if chunked_prefill else 8192,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
+                 enable_chunked_prefill=chunked_prefill,
                  moe_config=moe_config) as llm:
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
+    def test_nvfp4(self, moe_backend, mocker):
+        # TRTLLM-Gen / CuteDSL NVFP4 MoE backends only support SM100/103 family
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
+
+        self._run_gsm8k(self.MODEL_PATH, moe_backend, False, mocker)
+
+    @skip_no_sm120
+    def test_nvfp4_w4a16(self, mocker):
+        self._run_gsm8k(self.MODEL_PATH, "CUTEDSL", True, mocker)
 
     @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA", "TRTLLM"])
     def test_nvfp4_dflash(self, mocker, dflash_attention_backend):

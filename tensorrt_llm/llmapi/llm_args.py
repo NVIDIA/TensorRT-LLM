@@ -2965,6 +2965,19 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
+    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+        default="VANILLA",
+        description=
+        "Attention backend for the pooled-context cross-attention of a "
+        "standalone DSpark drafter (one shipped as its own checkpoint rather "
+        "than inside the target's mtp.* namespace). Ignored by the embedded "
+        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
+        "This is independent of the backend used to construct the drafter's "
+        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
+        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
+        "with a private paged context cache; VANILLA uses FlashAttention with "
+        "a contiguous cache.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
@@ -2981,6 +2994,62 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    @functools.cached_property
+    def draft_is_embedded_in_target(self) -> bool:
+        """True for the embedded (DeepSeek-V4-Pro) flavour of the DSpark draft.
+
+        DSpark ships in two shapes, and they need different runtime plumbing:
+
+        - embedded: the draft is the ``mtp.*`` namespace of the *target*
+          checkpoint, built from full target decoder blocks, and served by
+          ``DSv4DSparkWorker`` with its own rolling captured-context window.
+        - standalone: the draft is its own checkpoint with a registry-resolved
+          backbone, served by ``DFlashWorker`` and its paged draft KV cache.
+
+        Both are ``decoding_type: DSpark``, so every dispatch that must tell
+        them apart -- draft-model builder, worker, spec metadata, and the
+        separate-draft-KV-cache decision -- reads this one flag instead of
+        re-deriving it. That is what keeps those decisions from drifting apart:
+        a builder and a worker that disagree produce a draft model whose
+        attributes the worker does not have.
+
+        The probe is the weight index rather than a config field because the
+        index is authoritative and cannot be left unset; ``model_type`` is the
+        fallback for a checkpoint whose index file is absent. Resolution is
+        memoized here and warmed during ``TorchLlmArgs`` validation, so the
+        filesystem probe happens once in the main process -- not per rank, and
+        never at forward or CUDA-graph-capture time.
+        """
+        ckpt_dir = self.speculative_model
+        if ckpt_dir is None:
+            return False
+        ckpt_dir = str(ckpt_dir)
+
+        for name in ("model.safetensors.index.json",
+                     "pytorch_model.bin.index.json"):
+            index = os.path.join(ckpt_dir, name)
+            if not os.path.isfile(index):
+                continue
+            try:
+                with open(index, encoding="utf-8") as f:
+                    weight_map = json.load(f).get("weight_map", {})
+            except (OSError, ValueError):
+                break
+            # An index that parsed is authoritative both ways. Falling through
+            # to model_type here would classify a standalone V4-shaped drafter
+            # as embedded, and that only surfaces much later, inside
+            # count_dspark_stages.
+            return any(re.match(r"^mtp\.\d+\.", key) for key in weight_map)
+
+        config_path = os.path.join(ckpt_dir, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    return json.load(f).get("model_type") == "deepseek_v4"
+            except (OSError, ValueError):
+                return False
+        return False
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -3967,7 +4036,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
-        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
@@ -5138,13 +5208,6 @@ class GmsConfig(StrictBaseModel):
         return self
 
 
-class SamplerType(StrEnum):
-    """Enum for sampler type options."""
-    TRTLLMSampler = "TRTLLMSampler"
-    TorchSampler = "TorchSampler"
-    auto = "auto"
-
-
 class PrefillCudaGraphBackend(StrEnum):
     """CUDA graph implementation used for prefill requests."""
 
@@ -5354,17 +5417,6 @@ class TorchLlmArgs(BaseLlmArgs):
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
-
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.auto,
-        description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
-        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
-        status="deprecated",
-        deprecated=
-        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler.",
-        telemetry=TelemetryField.categorical('TRTLLMSampler', 'TorchSampler',
-                                             'auto'))
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -5990,34 +6042,55 @@ class TorchLlmArgs(BaseLlmArgs):
                 if not spec_cfg.max_draft_len:
                     raise ValueError("DSpark max_draft_len must be > 0; got "
                                      f"{spec_cfg.max_draft_len}")
-                # The DSpark draft weights live in the ``mtp.*`` namespace of a
-                # local checkpoint directory; without ``speculative_model``
-                # neither the draft weights nor the ``dspark_*`` config
-                # defaults can be located, and engine construction would fail
-                # much later with an opaque error.
+                # Same convention as MTP (see resolve_mtp_checkpoint_source):
+                # an unset speculative_model means "the draft lives in the
+                # target checkpoint". For DSpark that is the embedded
+                # DeepSeek-V4-Pro flavour, whose draft is the target's mtp.*
+                # namespace. Defaulting rather than rejecting keeps the
+                # spec-dec API consistent across algorithms; pointing
+                # speculative_model at the target explicitly is equivalent.
                 if spec_cfg.speculative_model is None:
-                    raise ValueError(
-                        "DSpark requires speculative_config.speculative_model "
-                        "to point at the checkpoint directory containing the "
-                        "mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this "
-                        "is the target checkpoint directory itself).")
+                    spec_cfg.speculative_model = self.model
+                    if not spec_cfg.draft_is_embedded_in_target:
+                        raise ValueError(
+                            "speculative_config.speculative_model is unset, "
+                            "which means 'load the draft from the target "
+                            "checkpoint', but the target has no mtp.* draft "
+                            "weights. Point speculative_model at a standalone "
+                            "DSpark drafter checkpoint directory.")
+                # Warm the embedded-vs-standalone probe here, while we are in
+                # the main process and the checkpoint path is known local. The
+                # flag then travels with the config, so no rank repeats the
+                # filesystem read and nothing probes at forward time.
+                _ = spec_cfg.draft_is_embedded_in_target
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
-                # DSpark ships these as top-level ``dspark_*`` keys in the
-                # DeepSeek-V4-Pro config.json; also accept a nested
-                # ``dspark_config`` dict for forward compatibility.
+                # Three checkpoint spellings are in the wild for the same knobs
+                # and all are accepted here, because a key the reader misses is
+                # not an error -- it silently falls back to a default and the
+                # drafter degrades (a markov_rank read as 0 skips the Markov
+                # head entirely, costing acceptance with no warning):
+                #   - top-level ``dspark_*``  (DeepSeek-V4-Pro)
+                #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
+                #   - nested ``dspark_config``  (forward compatibility)
+                #   - plain top-level keys  (TorchSpec drafters)
                 draft_config_path = os.path.join(spec_cfg.speculative_model,
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config", {})
+                    dspark_cfg = draft_cfg.get("dspark_config") or {}
+                    dflash_cfg = draft_cfg.get("dflash_config") or {}
 
                     def _dspark_get(key, top_level_key):
-                        value = dspark_cfg.get(key)
-                        if value is None:
-                            value = draft_cfg.get(top_level_key)
-                        return value
+                        for source, name in ((dspark_cfg, key), (dflash_cfg,
+                                                                 key),
+                                             (draft_cfg,
+                                              top_level_key), (draft_cfg, key)):
+                            value = source.get(name)
+                            if value is not None:
+                                return value
+                        return None
 
                     # The checkpoint's ``dspark_target_layer_ids`` is
                     # authoritative: it fixes both which target hidden states

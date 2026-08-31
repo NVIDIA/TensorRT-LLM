@@ -1021,7 +1021,7 @@ pipeline {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
                             def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {

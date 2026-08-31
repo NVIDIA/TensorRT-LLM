@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
+from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
 from tensorrt_llm.math_utils import pad_up
 

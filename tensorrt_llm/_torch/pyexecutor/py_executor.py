@@ -57,11 +57,11 @@ from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
 from ..disaggregation.executor.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..expert_statistic import ExpertStatistic
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
@@ -96,7 +96,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
-                      SampleStateTensors, TRTLLMSampler)
+                      SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -726,15 +726,6 @@ class PyExecutor:
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
-        if (self.dist.pp_size > 1 and self.pp_multi_stream_sample
-                and isinstance(self.sampler, TRTLLMSampler)):
-            # TRTLLM sampler uses default stream for store and algorithms.
-            # To enable multi-stream sampling, we need to re-initialize
-            # the sampler store and algorithms on the sample stream.
-            with torch.cuda.stream(self.sample_stream):
-                self.sampler._initialize_store()
-                self.sampler._instantiate_algorithms()
-
         # Set of request IDs that are currently in flight across all micro batches
         # or waiting for synchronized PP resource teardown. The scheduler avoids
         # these requests until their prior execution state is safe to reuse.

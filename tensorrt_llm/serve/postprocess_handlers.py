@@ -91,8 +91,10 @@ class ChatPostprocArgs(PostprocArgs):
     model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
-                                ChatCompletionNamedToolChoiceParam]] = "none"
+    # None means "not specified": only an explicit client "none" (always set
+    # by from_request) suppresses parsed tool calls in apply_tool_parser.
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
+                                ChatCompletionNamedToolChoiceParam]] = None
     return_logprobs: bool = False
     top_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -240,6 +242,11 @@ def apply_tool_parser(args: ChatPostprocArgs,
                 result = StreamingParseResult(
                     normal_text=result.normal_text + finish_result.normal_text,
                     calls=result.calls + finish_result.calls)
+        if args.tool_choice == "none":
+            # tool_choice="none": still run the parser (including the finish
+            # flush above) so tool-call markup is stripped from content, but
+            # never surface tool calls.
+            return result.normal_text, []
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
@@ -347,7 +354,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
-    prompt_tokens = args.num_prompt_tokens
+    prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
@@ -678,7 +685,7 @@ def chat_response_post_processor(
             full_message = args.last_message_content + choice.message.content
             choice.message.content = full_message
 
-    num_prompt_tokens = args.num_prompt_tokens
+    num_prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
     num_generated_tokens = sum(len(output.token_ids) for output in rsp.outputs)
     usage = UsageInfo(
         prompt_tokens=num_prompt_tokens,
@@ -883,7 +890,7 @@ def completion_response_post_processor(
 class ChatCompletionPostprocArgs(PostprocArgs):
     model: str
     tools: Optional[List[ChatCompletionToolsParam]]
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
     stream_options: Optional[StreamOptions] = None
