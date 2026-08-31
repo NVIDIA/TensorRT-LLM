@@ -518,20 +518,32 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     if (rp.needTopP)
     {
         // The mass top-p takes its fraction of: post-min-p, post-top-k.
-        float localSurviving = 0.0f;
-        forEachLogit(rowLogits, vocabSize,
-            [&](int, float logit)
-            {
-                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                if (w >= threshold)
-                {
-                    localSurviving += w;
-                }
-            });
-        float const survivingMass = BlockReduceF(temp.reduceF).Sum(localSurviving);
-        if (tid == 0)
+        //
+        // When neither of those ran the threshold is still 0, nothing has been removed,
+        // and that mass is the total pass 1 already produced -- so the sweep is pure
+        // waste. That is exactly the top-p-only row, which measurement left as the worst
+        // remaining case.
+        if (threshold > 0.0f)
         {
-            sSurvivingMass = survivingMass;
+            float localSurviving = 0.0f;
+            forEachLogit(rowLogits, vocabSize,
+                [&](int, float logit)
+                {
+                    float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                    if (w >= threshold)
+                    {
+                        localSurviving += w;
+                    }
+                });
+            float const survivingMass = BlockReduceF(temp.reduceF).Sum(localSurviving);
+            if (tid == 0)
+            {
+                sSurvivingMass = survivingMass;
+            }
+        }
+        else if (tid == 0)
+        {
+            sSurvivingMass = sTotalMass;
         }
         __syncthreads();
 
