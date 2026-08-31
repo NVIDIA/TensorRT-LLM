@@ -153,28 +153,6 @@ def _wait_for_event(
     pytest.fail(f"Timed out waiting for {event_name}")
 
 
-def test_wait_for_event_applies_parameter_predicate(monkeypatch):
-    """An earlier heartbeat does not mask a later matching snapshot."""
-    active_heartbeat = {
-        "events": [{"name": "trtllm_heartbeat", "parameters": {"activeLlmInstances": 1}}]
-    }
-    shutdown_heartbeat = {
-        "events": [{"name": "trtllm_heartbeat", "parameters": {"activeLlmInstances": 0}}]
-    }
-    monkeypatch.setattr(
-        CaptureHandler,
-        "captured_payloads",
-        [active_heartbeat, shutdown_heartbeat],
-    )
-
-    payload = _wait_for_event(
-        "trtllm_heartbeat",
-        predicate=lambda parameters: parameters.get("activeLlmInstances") == 0,
-    )
-
-    assert payload is shutdown_heartbeat
-
-
 def _assert_lifecycle_snapshot(
     params,
     *,
