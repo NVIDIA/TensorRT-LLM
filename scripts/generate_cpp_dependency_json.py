@@ -271,6 +271,21 @@ def main():
         if result is not None:
             oss_url, project_id = result
             logger.info("%s -> found in oss-components: %s", package_name, oss_url)
+        elif not TOKEN:
+            logger.warning(
+                "%s -> NOT found in oss-components and no GITLAB_TOKEN provided; "
+                "skipping mirror creation, keeping upstream url",
+                package_name,
+            )
+            third_party_packages.append(
+                {
+                    "name": package_name,
+                    "tag": source_info["tag"],
+                    "upstream_url": source_info["url"],
+                    "mirror_url": source_info["url"],
+                }
+            )
+            continue
         else:
             logger.info("%s -> NOT found in oss-components, creating repo", package_name)
             if namespace_id is None:
