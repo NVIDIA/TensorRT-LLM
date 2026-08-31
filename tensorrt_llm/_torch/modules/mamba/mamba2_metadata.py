@@ -366,8 +366,8 @@ class Mamba2Metadata:
                                              dtype=torch.int32,
                                              pin_memory=prefer_pinned())
         self.state_indices = torch.zeros(max_batch_size,
-                                          dtype=torch.int32,
-                                          device="cuda")
+                                         dtype=torch.int32,
+                                         device="cuda")
         # state_indices may be rebound to a cache-manager buffer (see
         # prepare()); keep the buffer this object owns so a later step that
         # has to stage indices itself does not write through the alias.
@@ -531,7 +531,7 @@ class Mamba2Metadata:
                         self.state_indices[:batch_size])
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
-                                         num_contexts)
+                                        num_contexts)
 
         if num_contexts > 0:
             torch.cumsum(context_lens,

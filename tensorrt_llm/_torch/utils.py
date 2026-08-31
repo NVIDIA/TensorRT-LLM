@@ -8,7 +8,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import functional as F

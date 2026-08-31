@@ -557,9 +557,7 @@ class MambaPolicy:
             ):
                 _check_global(f"conv_section_bytes[{i}]", s, p)
 
-        from tensorrt_llm._torch.disaggregation.resource.utils import (
-            get_pool_view_global_layer_ids,
-        )
+        from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 
         self_globals = {ll.global_layer_id for ll in self_mlg.local_layers}
         peer_globals = {ll.global_layer_id for ll in peer_mlg.local_layers}

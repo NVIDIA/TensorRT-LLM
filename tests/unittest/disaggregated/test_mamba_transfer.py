@@ -33,8 +33,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource import page
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -452,9 +452,7 @@ def test_mamba_policy_transfers_replicated_recurrent_side_state():
     assert region_pair.src.memory.ptrs.tolist() == [1000 + 512 + 32]
     assert region_pair.dst.memory.ptrs.tolist() == [10000 + 512 + 2 * 32]
     assert region_pair.src.memory.bytes_per_region == 8
-    assert peer.mamba_receiver_payload_bytes(
-        self_page_table, peer_page_table, dst_slot=2
-    ) == 72
+    assert peer.mamba_receiver_payload_bytes(self_page_table, peer_page_table, dst_slot=2) == 72
 
 
 def test_mamba_policy_rejects_incompatible_recurrent_side_state():

@@ -386,9 +386,7 @@ def _build_layer_group_for_v2_mamba(
     layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         local_layers=local_layers,
-        pool_views=_build_mamba_pool_views(
-            conv_pool, ssm_pool, local_layers, side_pool_specs
-        ),
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, local_layers, side_pool_specs),
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
         slot_major_layout=True,

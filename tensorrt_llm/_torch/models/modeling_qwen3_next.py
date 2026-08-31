@@ -54,11 +54,12 @@ from ..modules.low_m_gemm import apply_direct_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_shared_expert import PendingSharedExpertGate, fused_sigmoid_gate_mul_add
 from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                              RenormalizeMoeRoutingMethod,
                              RenormalizeNaiveMoeRoutingMethod,
                              RoutingMethodType, create_moe)
+from ..moe.fused_shared_expert import (PendingSharedExpertGate,
+                                       fused_sigmoid_gate_mul_add)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
