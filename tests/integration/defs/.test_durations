@@ -931,7 +931,6 @@
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_eplb0_mtp1_ccb-NIXL]": 7666.37925,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-r1-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp1_ccb-NIXL]": 2542.9724666666666,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL]": 5400.0,
-   "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL]": 5400.0,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL]": 3729.2565,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL]": 1731.7142,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_nemotron-ultra-v3-fp4_50k2k_con178_ctx5_dep4_gen1_dep4_eplb0_mtp6_ccb-NIXL]": 1023.3791666666666,
