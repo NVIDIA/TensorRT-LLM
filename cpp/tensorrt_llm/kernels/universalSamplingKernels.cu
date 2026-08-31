@@ -41,6 +41,10 @@ constexpr int kBlockSize = 512;
 constexpr int kRadixBits = 8;
 constexpr int kRadixBuckets = 1 << kRadixBits;
 constexpr int kRadixPasses = 32 / kRadixBits;
+//! Private histogram copies, one per group of warps, to cut shared-atomic contention.
+//! 8 copies is 16 KB of shared memory -- affordable, and enough to spread the few buckets
+//! a softmax actually lands in across separate addresses.
+constexpr int kHistCopies = 8;
 //! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
 constexpr float kTempEpsilon = 1e-6f;
 
@@ -221,12 +225,23 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             *sFired = false;
         }
 
-        for (int b = tid; b < kRadixBuckets; b += kBlockSize)
+        for (int b = tid; b < kRadixBuckets * kHistCopies; b += kBlockSize)
         {
             sCount[b] = 0;
             sMass[b] = 0.0f;
         }
         __syncthreads();
+
+        // Which private copy this thread accumulates into. Contention, not bandwidth, is
+        // what makes a shared-memory histogram slow here: w lies in (0, 1], so the top 8
+        // bits only ever take ~64 of the 256 values, and a softmax concentrates most of a
+        // 128k-element row into a handful of those. Every element issues two atomics, so a
+        // single shared histogram serializes the whole pass on a few addresses. Splitting
+        // by warp group divides that contention by kHistCopies at the cost of one cheap
+        // fold afterwards.
+        int const copy = (tid >> 5) & (kHistCopies - 1);
+        int* const myCount = sCount + copy * kRadixBuckets;
+        float* const myMass = sMass + copy * kRadixBuckets;
 
         forEachLogit(rowLogits, vocabSize,
             [&](int, float logit)
@@ -242,9 +257,26 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
                     return;
                 }
                 uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
-                atomicAdd(&sCount[digit], 1);
-                atomicAdd(&sMass[digit], w);
+                atomicAdd(&myCount[digit], 1);
+                atomicAdd(&myMass[digit], w);
             });
+        __syncthreads();
+
+        // Fold the private copies into copy 0, one bucket per thread. 256 buckets against
+        // a vocabSize-long histogram pass -- not what this costs.
+        for (int b = tid; b < kRadixBuckets; b += kBlockSize)
+        {
+            int totalCount = sCount[b];
+            float totalMass = sMass[b];
+#pragma unroll
+            for (int c = 1; c < kHistCopies; ++c)
+            {
+                totalCount += sCount[c * kRadixBuckets + b];
+                totalMass += sMass[c * kRadixBuckets + b];
+            }
+            sCount[b] = totalCount;
+            sMass[b] = totalMass;
+        }
         __syncthreads();
 
         // The bucket walk is serial on one thread: 256 steps against vocabSize/512
@@ -316,8 +348,8 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
         typename BlockScanF::TempStorage scanF;
     } temp;
 
-    __shared__ int sCount[kRadixBuckets];
-    __shared__ float sMass[kRadixBuckets];
+    __shared__ int sCount[kRadixBuckets * kHistCopies];
+    __shared__ float sMass[kRadixBuckets * kHistCopies];
     __shared__ int sChosen;
     __shared__ long long sCountHi;
     __shared__ float sMassHi;
