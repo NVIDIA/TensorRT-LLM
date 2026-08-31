@@ -170,6 +170,11 @@ def build_google_tests(request, build_type):
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         extra_make_targets=["google-tests"],
+        # The DLFW base image ships no libnvrtc_static.a, so the default
+        # CUDA::nvrtc_static target does not exist. The wheel builds get
+        # NVRTC_DYNAMIC_LINKING=ON implicitly (via ENABLE_BOLT_COMPATIBLE);
+        # this test-time build has no BOLT, so ask for it explicitly.
+        nvrtc_dynamic_linking=True,
     )
 
 
