@@ -788,7 +788,7 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
         w3_weight: torch.Tensor,
         dst_w3_w1_weight: torch.Tensor,
         allow_partial_loading: bool = False,
-    ):
+    ) -> None:
         super().load_expert_w3_w1_weight(
             module,
             w1_weight,

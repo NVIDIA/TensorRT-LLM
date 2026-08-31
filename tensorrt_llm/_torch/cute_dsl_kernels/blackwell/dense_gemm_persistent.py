@@ -232,6 +232,11 @@ class PersistentDenseGemmKernel:
             raise ValueError(
                 "workspace split-K reduction is not wired up; use use_direct_split_k_reduce=True"
             )
+        if fp8_quantize_1x128 and split_k_slices > 1:
+            raise ValueError(
+                "fp8_quantize_1x128 cannot be combined with split-K: the reduction "
+                "would sum already-quantized partials"
+            )
         if fp8_quantize_1x128 and mma_tiler_mn[1] % 128 != 0:
             raise ValueError(
                 f"fp8_quantize_1x128 requires mma_tiler_mn[1] to be a multiple of 128, "
