@@ -32,7 +32,8 @@ namespace kernels::compressor
 //
 // Grid: (batch_size, cdiv(state_dim, block_size))
 // One thread per state_dim element across all phases.
-// state_dim is a constexpr derived from COMPRESS_RATIO and HEAD_DIM inside the kernel.
+// state_dim is a constexpr derived from COMPRESS_RATIO and HEAD_DIM inside the
+// kernel.
 void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or fp32)
     float const* ape,                            // [compress_ratio, state_dim]
     void* paged_kv,                              // [num_blocks, page_size, state_dim]
@@ -47,11 +48,16 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     int kv_score_elem_bytes,                     // bytes per element for kv_score (2=bf16, 4=fp32)
     int state_elem_bytes,                        // bytes per element for paged state (2=bf16, 4=fp32)
     int out_elem_bytes,                          // bytes per element for output
+    int32_t const* new_tokens_per_seq,           // [bsz] or nullptr; per-request tokens appended
+                                                 // this step. nullptr means every request appended
+                                                 // next_n (the uniform case); non-null makes next_n
+                                                 // an upper bound only, for DSpark ragged
+                                                 // verification.
     cudaStream_t stream);
 
-// Prefill kernel: bulk compression with per-token gather/scatter + state update.
-// Writes all newly seen token states to paged cache for block reuse, then performs
-// online softmax reduction.
+// Prefill kernel: bulk compression with per-token gather/scatter + state
+// update. Writes all newly seen token states to paged cache for block reuse,
+// then performs online softmax reduction.
 //
 // Grid: (batch_size, max_outputs_per_batch, num_head_chunks)
 // Each block computes one compressed output for one head_dim chunk.
@@ -75,7 +81,8 @@ void prefillReductionLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or 
 // Grid:  (total_tokens) -- one block per compressed token
 // Block: (head_dim / VEC), always >= 32
 void postProcessScatterLaunch(void const* kv_comp, // [total_tokens, head_dim] input
-    void* kv_out,                                  // [total_tokens, head_dim] postprocessed output (nullptr to skip)
+    void* kv_out,                                  // [total_tokens, head_dim] postprocessed output (nullptr to
+                                                   // skip)
     void const* rms_weight,                        // [head_dim]
     float rms_eps,
     float const* cos_sin_table,                    // [max_pos, 2, rope_dim/2]
@@ -90,9 +97,11 @@ void postProcessScatterLaunch(void const* kv_comp, // [total_tokens, head_dim] i
     int batch_size, int tokens_per_block, int head_dim, int max_blocks_per_seq, int elem_bytes, int total_tokens,
     int cache_scale_type,                          // 0=none (bf16/fp32 by elem_bytes), 1=fp8_pertensor,
                                                    // 2=fp8_blockwise, 3=mxfp4 (packed FP4)
-    bool rotate_activation,                        // whether to apply Hadamard transform (false to skip)
+    bool rotate_activation,                        // whether to apply Hadamard transform (false to
+                                                   // skip)
     void* quant_output,                            // optional fp8/fp4 packed output (nullptr if unused)
-    void* scale_output,                            // optional scale output (float* for fp8, uint8_t* for fp4)
+    void* scale_output,                            // optional scale output (float* for fp8, uint8_t* for
+                                                   // fp4)
     cudaStream_t stream);
 
 } // namespace kernels::compressor

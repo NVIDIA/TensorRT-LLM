@@ -1139,7 +1139,7 @@ class Indexer(nn.Module):
         )
         metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
         if not metadata.use_expanded_buffers_for_mtp:
-            next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
+            next_n_cap = min(metadata.gen_token_stride, metadata.kv_lens_cuda_2d.shape[1])
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
                 gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap)
             )
@@ -1148,8 +1148,15 @@ class Indexer(nn.Module):
             )
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
             if metadata.max_draft_tokens > 0:
+                scheduler_context_lens = metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap]
+                # A runtime width below the persistent allocation width leaves
+                # a strided view, while DeepGEMM requires contiguous rows. The
+                # full K5 path stays allocation-free because its view already
+                # spans the complete inner dimension.
+                if not scheduler_context_lens.is_contiguous():
+                    scheduler_context_lens = scheduler_context_lens.contiguous()
                 scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap],
+                    scheduler_context_lens,
                     _DG_SCHEDULE_BLOCK_KV,
                     metadata.num_sms,
                 )
@@ -1159,7 +1166,7 @@ class Indexer(nn.Module):
         else:
             # Expand schedule metadata buffer (only generation). The DeepGEMM
             # API requires 2D; each expanded token becomes a (1,) row.
-            num_tokens = metadata.num_generations * (1 + metadata.max_draft_tokens)
+            num_tokens = sum(metadata.gen_token_repeat_list())
             scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                 metadata.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
                 _DG_SCHEDULE_BLOCK_KV,
@@ -1639,11 +1646,12 @@ class Indexer(nn.Module):
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, (
-                "max_decode_len != min_decode_len, we need padding"
-            )
+            if not metadata.is_ragged_verify:
+                max_decode_len = gen_seq_lens.max().item()
+                min_decode_len = gen_seq_lens.min().item()
+                assert max_decode_len == min_decode_len, (
+                    "max_decode_len != min_decode_len, we need padding"
+                )
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[token_offset : token_offset + num_gen_tokens, ...]
@@ -1652,7 +1660,11 @@ class Indexer(nn.Module):
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
+            if metadata.is_ragged_verify:
+                take_strided_path = False
+            else:
+                take_strided_path = not metadata.use_expanded_buffers_for_mtp or next_n == 1
+            if take_strided_path:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 # 2D context_lens slice from the pre-allocated buffer; matches
                 # q_decode's (batch, next_n) layout required by the new
@@ -1680,7 +1692,13 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
-            assert num_gen_tokens == batch_size * next_n
+            if metadata.is_ragged_verify:
+                assert num_gen_tokens == sum(metadata.ragged_verify_lens), (
+                    f"ragged gen tokens {num_gen_tokens} != "
+                    f"sum(verify_lens) {sum(metadata.ragged_verify_lens)}"
+                )
+            else:
+                assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[token_offset : token_offset + num_gen_tokens, ...]
 
             # Get k cache and call fp8_paged_mqa_logits / fp8_fp4_paged_mqa_logits
@@ -1689,7 +1707,7 @@ class Indexer(nn.Module):
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
             indexer_max_seq_len = metadata.get_indexer_max_seq_len()
 
-            if self.use_cute_dsl_paged_mqa_logits:
+            if self.use_cute_dsl_paged_mqa_logits and not metadata.is_ragged_verify:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
                 # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
@@ -1842,7 +1860,8 @@ class Indexer(nn.Module):
                 is_prefill=False,
                 sequence_lengths=gen_kv_lens_cuda,
                 scan_lengths=scan_lengths,
-                next_n=next_n,
+                row_scan_lengths=metadata.ragged_row_kv_lens(num_gen_tokens),
+                next_n=1 if metadata.is_ragged_verify else next_n,
                 max_seq_len=indexer_max_seq_len,
                 gvr_ext_kwargs=gvr_ext_kwargs,
             )
@@ -1855,9 +1874,18 @@ class Indexer(nn.Module):
 
         # Keep the GVR prior current for computed, reused, and dense-skip TopK.
         if gvr_prior_indices is not None and has_decode:
-            next_n = num_gen_tokens // num_generations
             decode_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
-            last_mtp_topk = decode_topk[next_n - 1 :: next_n]
+            if metadata.is_ragged_verify:
+                last_rows = (
+                    torch.cumsum(metadata.gen_token_repeats_cuda[:num_generations], dim=0).to(
+                        torch.long
+                    )
+                    - 1
+                )
+                last_mtp_topk = decode_topk[last_rows]
+            else:
+                next_n = num_gen_tokens // num_generations
+                last_mtp_topk = decode_topk[next_n - 1 :: next_n]
             prev_topk_dst = gvr_prior_indices[:num_generations]
             if do_multi_stream() and self.aux_stream is not None:
                 # Overlap the GVR prior write-back with this layer's sparse attention.

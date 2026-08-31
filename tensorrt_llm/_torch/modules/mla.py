@@ -1432,8 +1432,17 @@ class MLA(nn.Module):
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
         num_seqs = attn_metadata.num_seqs
 
-        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
-        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+        # The rope kernel writes seqQOffset[batch_idx + 1] for every
+        # batch_idx < batch_size, and CUB-scans total_s_len / seq_len entries
+        # into seqKVOffsets (mlaKernels.cu:579, :650). `batch_size` there is the
+        # count of presented rows, which equals num_seqs only while every
+        # request contributes the same number of query tokens. Under the
+        # token-major presentation a row is a token, so size these by the token
+        # count -- which is also an upper bound on num_seqs on every other path,
+        # so this is safe rather than merely sufficient.
+        cu_seqlens_rows = max(num_seqs, num_tokens) + 1
+        cu_q_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
+        cu_kv_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
         use_fp8_mla = getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
             self.mqa, "has_fp4_kv_cache", False
