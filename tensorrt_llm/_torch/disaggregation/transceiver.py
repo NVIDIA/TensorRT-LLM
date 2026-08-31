@@ -912,6 +912,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         wait_num: int,
         poll_interval_ms: Optional[int],
     ) -> None:
+        # The exit condition can only ever count in-flight sessions, so a
+        # target above len(sessions) is unsatisfiable and the loop would sleep
+        # out the whole interval for nothing. The idle executor loop hits
+        # exactly that: check_context_transfer_status(1) with no in-flight
+        # sends burns a full kv_transfer_sender_future_timeout_ms per
+        # iteration and delays scheduling of newly arrived requests
+        # (nvbugs 6647405). Clamping is safe under rank-divergent session
+        # counts because this helper is purely local (no collectives).
+        wait_num = min(wait_num, len(sessions))
+        if wait_num <= 0:
+            return
         poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:
