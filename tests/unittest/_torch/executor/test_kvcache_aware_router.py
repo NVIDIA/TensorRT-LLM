@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     KVCacheAwareADPRouter,
@@ -115,6 +116,63 @@ class TestKVCacheAwareADPRouter:
         assert state.rank == 0
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 300
+
+    def test_gather_all_rank_states_excludes_retiring(self):
+        dist = _mock_dist(tp_rank=0)
+        mgr = _mock_kv_cache_manager()
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+
+        req1 = Mock(
+            py_orig_prompt_len=100,
+            cached_tokens=0,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+        )
+        req2 = Mock(
+            py_orig_prompt_len=200,
+            cached_tokens=0,
+            state=LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states([req1, req2])
+
+        assert states[0].num_active_requests == 1
+        assert states[0].num_retiring_requests == 1
+        assert states[0].num_active_tokens == 100
+
+    def test_gather_all_rank_states_retiring_and_in_transfer(self):
+        # In-transfer requests have already left active_requests, so this router
+        # adds them back as load; retiring requests are still in it and are
+        # filtered out. The two corrections are independent and must compose.
+        dist = _mock_dist(tp_rank=0)
+        mgr = _mock_kv_cache_manager()
+        transfer_mgr = MagicMock()
+        in_transfer_req = Mock(py_orig_prompt_len=70, cached_tokens=0)
+        transfer_mgr.requests_in_transfer.return_value = {1: in_transfer_req}
+        router = KVCacheAwareADPRouter(
+            dist=dist,
+            kv_cache_manager=mgr,
+            async_transfer_manager=transfer_mgr,
+            account_for_in_transfer=True,
+        )
+
+        req1 = Mock(
+            py_orig_prompt_len=100,
+            cached_tokens=0,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+        )
+        req2 = Mock(
+            py_orig_prompt_len=200,
+            cached_tokens=0,
+            state=LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states([req1, req2])
+
+        assert states[0].num_active_requests == 2  # 1 routable + 1 in transfer
+        assert states[0].num_retiring_requests == 1
+        assert states[0].num_active_tokens == 170
 
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)

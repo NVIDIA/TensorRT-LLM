@@ -452,7 +452,16 @@ class BindCapacityScheduler(CapacityScheduler):
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=no_schedule_until_state,
-            no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
+            # Stop the window one state early, at GENERATION_TO_COMPLETE. That
+            # state means "final token produced, teardown deferred by the overlap
+            # scheduler": no micro-batch scheduler will ever forward such a
+            # request again, yet the C++ capacity loop's
+            # `numAdmittedRequests >= mMaxNumRequests` break sits after the state
+            # gate and before classification, so each one consumed a slot in
+            # mMaxNumRequests and shortened the real forward batch by one
+            # (nvbug-6627795). Their KV cache is released by the teardown that is
+            # already queued, so keeping them inside the window bought nothing.
+            no_schedule_after_state=LlmRequestState.GENERATION_TO_COMPLETE,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 

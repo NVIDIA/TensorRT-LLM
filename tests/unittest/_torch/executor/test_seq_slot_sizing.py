@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Disaggregated attention-DP seq-slot sizing includes overlap headroom.
+"""Attention-DP seq-slot sizing includes overlap headroom.
 
 Under the overlap scheduler, requests finished in the previous iteration
 still hold their sequence slots when the next iteration's
-prepare_resources runs, while the V2 scheduler has already dropped them
-from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and
+prepare_resources runs, while the capacity scheduler has already dropped
+them from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and
 backfilled their seats. Transient slot demand is therefore
 2 * max_batch_size, regardless of whether speculative decoding is enabled.
 The headroom is selected from runtime topology rather than model architecture.
@@ -21,11 +21,10 @@ from tensorrt_llm._torch.pyexecutor._util import (
     compute_max_num_sequences,
     create_torch_sampler_args,
     should_enable_adp_dummy_fixes,
-    should_enable_disagg_adp_overlap_headroom,
+    should_enable_adp_overlap_seq_slot_headroom,
     should_enable_non_overlap_adp_forward_intent,
     should_enable_scheduler_aware_adp_dummy,
 )
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 SIZING_CASES = [
@@ -33,7 +32,7 @@ SIZING_CASES = [
     (1, False, True, 2),
     (1, False, False, 1),
     (1, True, True, 1),
-    # Existing PP sizing is preserved regardless of the DSv4 opt-in.
+    # Existing PP sizing is preserved regardless of the headroom opt-in.
     (2, False, True, 2),
     (4, False, True, 4),
     (4, True, False, 4),
@@ -41,17 +40,19 @@ SIZING_CASES = [
 
 
 @pytest.mark.parametrize(
-    "enable_attention_dp,is_disagg,pp_size,disable_overlap,expected",
+    "enable_attention_dp,pp_size,disable_overlap,expected",
     [
-        (True, True, 1, False, True),
-        (False, True, 1, False, False),
-        (True, False, 1, False, False),
-        (True, True, 2, False, False),
-        (True, True, 1, True, False),
+        # No cache-transceiver term: the gate no longer looks at disaggregation
+        # at all, because nvbug-6627795 reproduced on an aggregated context-only
+        # run with no transceiver configured.
+        (True, 1, False, True),
+        (False, 1, False, False),
+        (True, 2, False, False),
+        (True, 1, True, False),
     ],
 )
-def test_disagg_adp_overlap_headroom_gate(
-    enable_attention_dp, is_disagg, pp_size, disable_overlap, expected
+def test_adp_overlap_seq_slot_headroom_gate(
+    enable_attention_dp, pp_size, disable_overlap, expected
 ):
     mapping = Mapping(
         world_size=pp_size,
@@ -59,12 +60,8 @@ def test_disagg_adp_overlap_headroom_gate(
         pp_size=pp_size,
         enable_attention_dp=enable_attention_dp,
     )
-    cache_config = CacheTransceiverConfig(backend="NIXL") if is_disagg else None
 
-    assert (
-        should_enable_disagg_adp_overlap_headroom(mapping, cache_config, disable_overlap)
-        is expected
-    )
+    assert should_enable_adp_overlap_seq_slot_headroom(mapping, disable_overlap) is expected
 
 
 @pytest.mark.parametrize("pp_size,expected", [(1, True), (2, False)])

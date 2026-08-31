@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
+from ..llm_request import LlmRequestState
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -45,6 +47,58 @@ def _num_input_tokens(request) -> int:
     if isinstance(num_input_tokens, int):
         return num_input_tokens
     return len(getattr(request, "input_token_ids", []))
+
+
+def is_retiring_request(request) -> bool:
+    """True if ``request`` has produced its final token and is being torn down.
+
+    A request in ``GENERATION_TO_COMPLETE`` has produced its final token; the
+    next ``_update_request_states`` tears it down, and no scheduler will ever
+    put it in a forward batch again (every micro-batch scheduler bounds its
+    window at ``GENERATION_TO_COMPLETE``). Without the overlap scheduler that
+    teardown happens in-line, so such requests are gone before the ADP router
+    next runs. With overlap enabled it is deferred by one iteration, leaving
+    them in ``active_requests`` when the router builds its load vector -- where
+    they inflate per-rank load *and* consume global admission capacity that
+    nothing can use (nvbug-6627795).
+
+    ``GENERATION_TO_COMPLETE`` is the only state treated this way. The disagg
+    limbo states -- ``DISAGG_CONTEXT_WAIT_SCHEDULER``,
+    ``DISAGG_GENERATION_INIT``, ``DISAGG_GENERATION_TRANS_IN_PROGRESS``,
+    ``DISAGG_CONTEXT_TRANS_IN_PROGRESS`` and ``DISAGG_TRANS_ERROR`` -- also
+    linger in ``active_requests``, but they still own a sequence slot and KV
+    cache, so they must keep counting as load.
+    """
+    return request.state == LlmRequestState.GENERATION_TO_COMPLETE
+
+
+def build_active_requests_for_overlap(active_requests):
+    """Return ``active_requests`` minus the requests that are already retiring.
+
+    This is the ADP router's view of the active list, and *only* the router's:
+    the requests are dropped from the load vector, not from the executor. Under
+    the overlap scheduler ``_process_previous_batch`` -- the only thing that
+    removes a finished request from ``PyExecutor.active_requests`` -- runs some
+    two hundred lines *after* ``_fetch_new_requests`` in the same
+    ``_executor_loop_overlap`` body, so the router would otherwise route
+    against a list that is one teardown stale (nvbug-6627795).
+
+    Filtering the list at the single ``gather_all_rank_states`` choke point
+    rather than adjusting a count inside each ``create_rank_state`` corrects
+    ``num_active_requests`` *and* ``num_active_tokens`` for every router
+    implementation at once, and keeps the routers ignorant of overlap.
+    """
+    return [req for req in active_requests if not is_retiring_request(req)]
+
+
+def count_retiring_requests(active_requests) -> int:
+    """Count the requests that ``build_active_requests_for_overlap`` filters out.
+
+    Used where only the size of the correction is needed, not the list itself
+    (the dummy-request pad path, which compares the router's ``expected``
+    against a rank's routable active count).
+    """
+    return sum(1 for req in active_requests if is_retiring_request(req))
 
 
 @dataclass
@@ -97,8 +151,16 @@ class RankState:
     """
 
     rank: int
+    # Routable load only. ``gather_all_rank_states`` hands ``create_rank_state``
+    # the overlap-corrected list, so retiring requests are absent from both
+    # counts below (see ``build_active_requests_for_overlap``). This is what the
+    # router balances on and what bounds admission.
     num_active_requests: int = 0
     num_active_tokens: int = 0
+    # Requests filtered out of the two counts above because they are retiring.
+    # Reported so the inference loop can tell "nothing routable" from "nothing
+    # at all" and keep its idle-fetch wait collective (nvbug-6627795).
+    num_retiring_requests: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
@@ -112,6 +174,7 @@ class RankState:
             self.rank,
             self.num_active_requests,
             self.num_active_tokens,
+            self.num_retiring_requests,
             *self.iter_stats.serialize(),
         ]
 
@@ -119,7 +182,7 @@ class RankState:
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_prefix_field_count = 3
+        rank_state_prefix_field_count = 4
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
         max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
         if len(values) < 1:
@@ -140,6 +203,7 @@ class RankState:
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
+            num_retiring_requests=rank_values[3],
             iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
         )
 
@@ -256,7 +320,20 @@ class ADPRouter(ABC):
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
         """
-        local_state = self.create_rank_state(active_requests, new_requests or [])
+        # Route on the overlap-corrected list: a request whose teardown the
+        # overlap scheduler has merely deferred is not load, and must not hold
+        # admission capacity that nothing can spend (nvbug-6627795). Applied
+        # here rather than in each create_rank_state so every router -- and both
+        # num_active_requests and num_active_tokens -- is corrected at once.
+        active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
+        num_retiring_requests = len(active_requests) - len(active_requests_for_overlap)
+        local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
+        # The retiring requests are still resident, so the executor loop is NOT
+        # idle while any of them exists. Report the count so the idle-fetch wait
+        # stays collective: liveness is a global property, and a rank that
+        # reported zero would block on the untimed request-queue wait while its
+        # peers blocked in the allgather.
+        local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
@@ -985,8 +1062,9 @@ class ConversationAwareADPRouter(ADPRouter):
 
         # Sticky returns use the hard cap, so a rank may now exceed the pre-loop
         # soft `expected`. Re-bump so the returned value covers the actual
-        # per-rank max -- _pad_attention_dp_dummy_request asserts
-        # expected >= len(active_requests) on every rank.
+        # per-rank max -- _pad_attention_dp_dummy_request compares `expected`
+        # against each rank's routable active count (retiring requests excluded,
+        # matching create_rank_state) and warns if it comes up short.
         expected_num_active_requests = max(
             expected_num_active_requests, max(all_ranks_num_active_requests)
         )

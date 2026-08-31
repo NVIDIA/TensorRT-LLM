@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
@@ -22,6 +23,9 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankIterStatsPayload,
     RankState,
     _num_input_tokens,
+    build_active_requests_for_overlap,
+    count_retiring_requests,
+    is_retiring_request,
 )
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.scheduling_params import SchedulingParams
@@ -130,6 +134,74 @@ def all_ranks_num_active_tokens():
     return [10, 5, 15, 8]
 
 
+def _retiring_request(prompt_len=100):
+    """Active request that has produced its final token (state 14)."""
+    return Mock(
+        py_orig_prompt_len=prompt_len,
+        cached_tokens=0,
+        state=LlmRequestState.GENERATION_TO_COMPLETE,
+    )
+
+
+class TestBuildActiveRequestsForOverlap:
+    # Retiring requests linger in active_requests for one extra iteration when
+    # the overlap scheduler is on. They must not be charged against ADP
+    # admission capacity, because no scheduler can ever forward them again
+    # (nvbug-6627795). Every other lingering state still owns a seat and KV, so
+    # it must keep counting.
+    def test_empty(self):
+        assert build_active_requests_for_overlap([]) == []
+        assert count_retiring_requests([]) == 0
+
+    def test_drops_generation_to_complete(self):
+        reqs = [_retiring_request(), _retiring_request(), _retiring_request()]
+        assert build_active_requests_for_overlap(reqs) == []
+        assert count_retiring_requests(reqs) == 3
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_IN_PROGRESS,
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS,
+            LlmRequestState.DISAGG_TRANS_ERROR,
+        ],
+    )
+    def test_other_states_still_count_as_load(self, state):
+        req = Mock(state=state)
+        assert is_retiring_request(req) is False
+        assert build_active_requests_for_overlap([req]) == [req]
+        assert count_retiring_requests([req]) == 0
+
+    def test_mixed_preserves_order_of_survivors(self):
+        keep_a = Mock(state=LlmRequestState.GENERATION_IN_PROGRESS)
+        keep_b = Mock(state=LlmRequestState.DISAGG_GENERATION_INIT)
+        reqs = [keep_a, _retiring_request(), keep_b, _retiring_request()]
+        assert build_active_requests_for_overlap(reqs) == [keep_a, keep_b]
+        assert count_retiring_requests(reqs) == 2
+
+    def test_returns_a_new_list(self):
+        # The filtered list is the ROUTER's view only; mutating it must never
+        # disturb PyExecutor.active_requests, whose teardown ordering is what
+        # created the bug in the first place.
+        reqs = [Mock(state=LlmRequestState.GENERATION_IN_PROGRESS)]
+        filtered = build_active_requests_for_overlap(reqs)
+        assert filtered is not reqs
+        filtered.clear()
+        assert len(reqs) == 1
+
+    def test_bare_mock_is_not_retiring(self):
+        # Router tests build requests with bare Mocks that never set `state`.
+        # Identity comparison against the enum keeps those routable; a truthy
+        # bound-property check would drop every one of them.
+        req = Mock(py_orig_prompt_len=10)
+        assert build_active_requests_for_overlap([req]) == [req]
+        assert count_retiring_requests([req]) == 0
+
+
 class TestRankState:
     # RankState is the wire payload shared across attention-DP ranks. Keep its
     # serialization stable because iter-stats now ride on the same allgather.
@@ -141,7 +213,7 @@ class TestRankState:
 
     def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, -1, 0, 0, 0, 0, 0, 0, 0]
+        assert state.serialize() == [0, 5, 100, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -154,10 +226,22 @@ class TestRankState:
         restored = RankState.deserialize(data=original.serialize())
         assert original == restored
 
+    def test_roundtrip_with_retiring_requests(self):
+        original = RankState(
+            rank=1,
+            num_active_requests=10,
+            num_active_tokens=200,
+            num_retiring_requests=3,
+        )
+        restored = RankState.deserialize(data=original.serialize())
+        assert original == restored
+        assert restored.num_retiring_requests == 3
+
     def test_defaults(self):
         state = RankState(rank=0)
         assert state.num_active_requests == 0
         assert state.num_active_tokens == 0
+        assert state.num_retiring_requests == 0
         assert state.iter_stats.has_iter_stats == 0
         assert state.iter_stats.iter_stats_iter == -1
 
@@ -277,6 +361,57 @@ class TestDefaultADPRouter:
         assert state.rank == 0
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 300
+
+    def test_create_rank_state_does_not_filter_retiring_itself(self):
+        # create_rank_state stays overlap-agnostic: it reports what it is given.
+        # The correction lives in gather_all_rank_states, so a router author
+        # cannot forget it.
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
+        router = DefaultADPRouter(dist=dist)
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=200),
+        ]
+        state = router.create_rank_state(active_requests=active, new_requests=[])
+        assert state.num_active_requests == 2
+        assert state.num_active_tokens == 300
+
+    def test_gather_all_rank_states_excludes_retiring(self):
+        # Two of three requests are retiring, so only one is routable load --
+        # and the tokens of the retiring pair go with them, because the filtered
+        # list is what create_rank_state sums.
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
+        router = DefaultADPRouter(dist=dist)
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=200),
+            _retiring_request(prompt_len=300),
+        ]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert len(states) == 1
+        assert states[0].num_active_requests == 1
+        assert states[0].num_retiring_requests == 2
+        assert states[0].num_active_tokens == 100
+        # The executor's own list is untouched -- only the router's view narrows.
+        assert len(active) == 3
+
+    def test_gather_all_rank_states_reports_zero_when_all_retiring(self):
+        # Nothing routable, but the rank is NOT idle: the retiring requests are
+        # still resident. num_retiring_requests carries that fact to every peer
+        # so the idle-fetch wait stays collective (nvbug-6627795).
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
+        router = DefaultADPRouter(dist=dist)
+        active = [_retiring_request(), _retiring_request()]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert states[0].num_active_requests == 0
+        assert states[0].num_active_tokens == 0
+        assert states[0].num_retiring_requests == 2
 
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)
@@ -1253,6 +1388,23 @@ class TestConversationAwareADPRouter:
         assert state.rank == 2
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 150
+
+    def test_gather_all_rank_states_excludes_retiring(self):
+        # The filter sits in the shared ADPRouter.gather_all_rank_states, so it
+        # applies to this router without a line of router-specific code.
+        dist = _mock_dist(tp_rank=2)
+        router = ConversationAwareADPRouter(dist=dist)
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=50),
+        ]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert states[0].num_active_requests == 1
+        assert states[0].num_retiring_requests == 1
+        assert states[0].num_active_tokens == 100
 
     def test_factory_selects_conversation_router(self):
         cfg = MagicMock()

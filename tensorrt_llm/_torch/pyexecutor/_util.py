@@ -2852,14 +2852,24 @@ def should_enable_non_overlap_adp_forward_intent(
             and disable_overlap_scheduler)
 
 
-def should_enable_disagg_adp_overlap_headroom(
-        mapping: Mapping,
-        cache_transceiver_config: Optional[CacheTransceiverConfig],
-        disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to non-PP disaggregated attention-DP."""
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
-    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
+def should_enable_adp_overlap_seq_slot_headroom(
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to non-PP attention-DP with overlap enabled.
+
+    The overlap scheduler defers a finished request's teardown by one iteration,
+    so its sequence slot is still held when the ADP router admits the batch that
+    replaces it. Without spare slots the router cannot backfill and the forward
+    batch runs short (nvbug-6627795); a second set of slots lets admission reach
+    max_batch_size on every rank every iteration.
+
+    Requiring attention DP -- rather than merely overlap -- is deliberate: with
+    a single scheduling domain the executor's own admission bound already tracks
+    the pool, whereas ADP admits against an allgathered load vector that the
+    deferred teardown desynchronizes. Not gated on disaggregation: the mechanism
+    is a property of overlap plus ADP admission, and was measured on an
+    aggregated context-only run with no cache transceiver configured.
+    """
+    return (mapping.enable_attention_dp and not mapping.has_pp()
             and not disable_overlap_scheduler)
 
 
