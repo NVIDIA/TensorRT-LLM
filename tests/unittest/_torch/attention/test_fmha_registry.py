@@ -30,8 +30,14 @@ def _enabled_names() -> tuple[str, ...]:
     return tuple(names_by_class[cls] for cls in classes)
 
 
-def test_prims_ts_follows_custom_mask_in_canonical_order() -> None:
-    assert _canonical_names()[:2] == ("triton_custom_mask", PRIMS_TS)
+def test_prims_ts_precedes_trtllm_gen_in_canonical_order() -> None:
+    names = _canonical_names()
+    prims_ts_index = names.index(PRIMS_TS)
+    assert names[prims_ts_index - 1 : prims_ts_index + 2] == (
+        "flashinfer_sparse_mla",
+        PRIMS_TS,
+        "flashinfer_trtllm_gen",
+    )
 
 
 def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
