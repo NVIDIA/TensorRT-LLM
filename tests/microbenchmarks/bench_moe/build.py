@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.interface import (
+from tensorrt_llm._torch.moe.fused_moe.interface import (
     MoESchedulerKind,
     MoEWeightLoadingMode,
     _compute_ep_partition,
@@ -184,7 +184,7 @@ def _situ_kwargs(
 
 def _create_moe_for_benchmark(**kwargs):
     ensure_cute_dsl_importable_for_benchmark()
-    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 
     return create_moe(**kwargs)
 

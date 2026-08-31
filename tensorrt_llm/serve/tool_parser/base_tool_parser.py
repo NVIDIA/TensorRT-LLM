@@ -1,7 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -85,7 +85,7 @@ class BaseToolParser(ABC):
                         -1,  # Caller should update this based on the actual tools array called
                         name=name,
                         parameters=json.dumps(
-                            act.get("parameters") or act.get("arguments", {}),
+                            act.get("parameters") or act.get("arguments") or {},
                             ensure_ascii=False,
                         ),
                     ))
@@ -239,7 +239,19 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                # A finished call may carry no "arguments" key at all, or an
+                # explicit null. Both mean "no arguments" and are normalized to
+                # {} so the call still completes, matching what parse_base_json
+                # returns on the non-streaming path. While the JSON is still
+                # partial a missing key only means "not streamed yet", so it is
+                # left alone and the elif prev_arguments branch keeps handling it.
+                if is_current_complete and cur_arguments is None:
+                    cur_arguments = {}
+
+                # An empty argument object is falsy but still has to be streamed and
+                # completed, otherwise a zero-argument tool call never finishes and its
+                # text stays in the buffer forever.
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
@@ -316,6 +328,17 @@ class BaseToolParser(ABC):
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True
+
+    def build_strict_structural_tag_format(
+            self, tools: List[Tool]) -> Optional[Dict[str, Any]]:
+        """Build a complete structural-tag format for strict-tool decoding.
+
+        Override on parsers whose wire format cannot be expressed through
+        the `structure_info` begin/end/trigger triples (e.g. kimi_k3's
+        XTML call tags). Returns the xgrammar structural-tag format dict,
+        or None to fall back to the `structure_info` path.
+        """
+        return None
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:

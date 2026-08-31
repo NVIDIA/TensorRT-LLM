@@ -27,6 +27,7 @@ server_configs:
       free_gpu_memory_fraction: 0.75
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
       max_tokens_in_buffer: 8448
     client_configs:
       - name: "con128_iter5_2k1k"

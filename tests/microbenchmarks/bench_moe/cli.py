@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=sorted(BUILT_IN_MODELS.keys()),
         help=(
-            "Built-in model shape. Examples: deepseek_v3, qwen1.5_moe. "
+            "Built-in model shape. Example: deepseek_v3. "
             "Omit only when passing all custom shape fields below."
         ),
     )

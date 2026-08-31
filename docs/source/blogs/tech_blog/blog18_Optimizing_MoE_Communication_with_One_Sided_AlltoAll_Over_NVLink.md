@@ -84,7 +84,7 @@ Rank-major layout has two advantages:
 - **Smaller buffer.** The pre-allocated recv buffer is `1 / num_experts_per_rank` of an expert-major buffer.
 - **Save duplicated communication.** When `top_k > ep_size` it is impossible to avoid duplication in an expert-major layout.
 
-The MoE module consumes the rank-major recv buffer directly, and it is up to the MoE module to decide whether explicit expert permutation is needed for GroupGEMM. For example, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py) can efficiently load tokens from the raw rank-major buffer without additional permutation.
+The MoE module consumes the rank-major recv buffer directly, and it is up to the MoE module to decide whether explicit expert permutation is needed for GroupGEMM. For example, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/fused_moe_trtllm_gen.py) can efficiently load tokens from the raw rank-major buffer without additional permutation.
 
 
 ### Interface Between Communication and MoE
@@ -107,7 +107,7 @@ Here `hidden_states` is the (possibly quantized) activation tensor with `hidden_
 
 The dispatch outputs are **tensor views** into symmetric memory — no allocation, no copy. The recv buffer is pre-allocated with `ep_size * max_tokens_per_rank` slots to accommodate the maximum number of tokens from all ranks, as described in [Rank-Major Buffer Layout](#rank-major-buffer-layout). The MoE module then performs GroupGEMM on the received payloads. Two points are worth noting:
 - The MoE module only computes the experts on the local rank. For example, if a token's `token_selected_experts` is `[0, 1, 4, 7]` and only experts `[0, 1, 2, 3]` reside locally, the MoE output for that token is the weighted sum of experts `[0, 1]` only.
-- Some slots are empty after dispatch. The dispatch kernel sets `token_selected_experts` of empty slots to an invalid expert id (`-1`), so the MoE module knows to skip them. (For instance, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py) consumes the raw-token recv buffer directly without re-permutation.)
+- Some slots are empty after dispatch. The dispatch kernel sets `token_selected_experts` of empty slots to an invalid expert id (`-1`), so the MoE module knows to skip them. (For instance, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/fused_moe_trtllm_gen.py) consumes the raw-token recv buffer directly without re-permutation.)
 
 The MoE module writes its output for each token to the same slot in the recv buffer. To obtain the final result, each rank combines the partial results from peer ranks.
 

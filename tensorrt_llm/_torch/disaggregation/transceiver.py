@@ -42,7 +42,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -263,6 +263,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
+    def _get_mamba_slot_for_request(self, req: LlmRequest) -> Optional[int]:
+        """Get the mamba state slot index for a request, or None."""
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
+            if self._kv_cache_manager.local_num_mamba_layers > 0:
+                return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
+        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
+        return None
+
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
@@ -291,8 +300,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         groups = []
         for idx, lg in enumerate(layer_groups):
-            if isinstance(lg, MambaLayerGroup):
-                groups.append(np.array([], dtype=np.int64))
+            if lg.kind == CacheKind.STATE:
+                slot = self._get_mamba_slot_for_request(req)
+                groups.append(
+                    np.array([slot], dtype=np.int64)
+                    if slot is not None
+                    else np.array([], dtype=np.int64)
+                )
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
@@ -354,19 +368,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
             groups.append(block_ids)
 
-        mamba_state_index = None
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
-            if self._kv_cache_manager.local_num_mamba_layers > 0:
-                mamba_state_index = self._kv_cache_manager._request_id_to_state_index[
-                    req.py_request_id
-                ]
-        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
-
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
-            mamba_state_index=mamba_state_index,
             token_range=token_range,
         )
 
@@ -384,28 +388,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return 0
         total = 0
         for lg_id, block_ids in enumerate(slice.block_ids_per_layer_groups):
-            lg = pt.layer_groups[lg_id]
-            if isinstance(lg, MambaLayerGroup):
-                # Fixed-size recurrent state (mamba/KDA): one slot per layer in
-                # each of the conv and ssm pools, independent of token count.
-                # For hybrid models (e.g. Kimi K3) this blob can dominate
-                # short-prompt transfers, so it must be counted. The caller's
-                # tp_size scaling then yields total bytes moved across ranks
-                # (exact for sharded state; for replicated state every rank
-                # pair moves a full copy, so it matches bytes on the wire).
-                if slice.mamba_state_index is not None:
-                    total += len(lg.mamba_layer_offsets) * (
-                        lg.conv_states.slot_bytes + lg.ssm_states.slot_bytes
-                    )
-                continue
             if block_ids is None or block_ids.size == 0:
                 continue
             n = int((block_ids >= 0).sum())
             if n == 0:
                 continue
+            lg = pt.layer_groups[lg_id]
             for pv in lg.pool_views:
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
-                total += n * pool.slot_bytes
+                if lg.kind == CacheKind.STATE:
+                    # STATE: n=1 (one slot), but transfer covers all layers.
+                    num_layers = len(lg.local_layers)
+                    total += num_layers * pool.slot_bytes
+                else:
+                    # Attention: n blocks, each slot covers all layers.
+                    total += n * pool.slot_bytes
         return total
 
     @staticmethod
@@ -915,6 +912,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         wait_num: int,
         poll_interval_ms: Optional[int],
     ) -> None:
+        # The exit condition can only ever count in-flight sessions, so a
+        # target above len(sessions) is unsatisfiable and the loop would sleep
+        # out the whole interval for nothing. The idle executor loop hits
+        # exactly that: check_context_transfer_status(1) with no in-flight
+        # sends burns a full kv_transfer_sender_future_timeout_ms per
+        # iteration and delays scheduling of newly arrived requests
+        # (nvbugs 6647405). Clamping is safe under rank-divergent session
+        # counts because this helper is purely local (no collectives).
+        wait_num = min(wait_num, len(sessions))
+        if wait_num <= 0:
+            return
         poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:

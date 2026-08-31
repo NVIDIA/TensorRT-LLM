@@ -261,17 +261,34 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         = at::detail::empty_cuda({size_of_expert_count_histogram}, at::ScalarType::Int, routing_device, std::nullopt);
 
     // allocate workspace for activation/gemm/finalize kernels
-    at::Tensor gemm1_output = at::detail::empty_cuda({max_num_padded_tokens_gemm1, 2 * intermediate_size},
-        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    //
+    // The "rgTma" TMA-OOB descriptors run in OOB_ADDR_GEN_MODE_BASE_128kB on Blackwell, so the TMA
+    // unit may probe up to a 128 KiB-aligned boundary past the base. The
+    // three GEMM workspaces on that path (gemm1_output, activation_output, gemm2_output) must thus
+    // be 128 KiB-aligned with >= 128 KiB mapped headroom; empty_cuda only gives 512 B alignment, so
+    // a pool slice near a block end faults sporadically. SF buffers are exempt (loaded via LDGSTS).
+    static constexpr int64_t kTmaOob128k = 128 * 1024;
+    std::vector<at::Tensor> tmaOobKeepAlive; // owns the backing storage for the aligned pointers
+    auto allocTmaOobWorkspace = [&](int64_t dataBytes) -> void*
+    {
+        int64_t const allocBytes = dataBytes + 2 * kTmaOob128k; // up-align slack + tail headroom
+        at::Tensor buf = at::detail::empty_cuda({allocBytes}, at::ScalarType::Byte, routing_device, std::nullopt);
+        uint64_t const base = reinterpret_cast<uint64_t>(buf.data_ptr());
+        uint64_t const aligned = (base + kTmaOob128k - 1) & ~(static_cast<uint64_t>(kTmaOob128k) - 1);
+        tmaOobKeepAlive.push_back(std::move(buf));
+        return reinterpret_cast<void*>(aligned);
+    };
+    void* gemm1_output_ptr
+        = allocTmaOobWorkspace(static_cast<int64_t>(max_num_padded_tokens_gemm1) * (2 * intermediate_size)); // e4m3
     at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
         at::ScalarType::Float, routing_device, std::nullopt);
-    at::Tensor activation_output = at::detail::empty_cuda({max_num_padded_tokens_activation, intermediate_size},
-        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    void* activation_output_ptr
+        = allocTmaOobWorkspace(static_cast<int64_t>(max_num_padded_tokens_activation) * intermediate_size); // e4m3
     at::Tensor activation_output_scale
         = at::detail::empty_cuda({intermediate_size / 128, max_num_padded_tokens_activation}, at::ScalarType::Float,
             routing_device, std::nullopt);
-    at::Tensor gemm2_output = at::detail::empty_cuda(
-        {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
+    void* gemm2_output_ptr
+        = allocTmaOobWorkspace(static_cast<int64_t>(max_num_padded_tokens_gemm2) * args.hidden_size * 2); // bf16 = 2 B
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
@@ -369,13 +386,13 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     workspace.num_non_exiting_ctas = num_non_exiting_ctas.data_ptr<int>();
 
     // gemm1 intermediate ws
-    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output = gemm1_output_ptr;
     workspace.gemm1_output_scale = gemm1_output_scale.data_ptr<float>();
     // activation intermediate ws
-    workspace.activation_output = activation_output.data_ptr();
+    workspace.activation_output = activation_output_ptr;
     workspace.activation_output_scale = activation_output_scale.data_ptr<float>();
     // gemm2 intermediate ws
-    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.gemm2_output = gemm2_output_ptr;
     workspace.gemm2_output_scale = nullptr;
     args.output = output.data_ptr();
     args.output_scale = nullptr;
