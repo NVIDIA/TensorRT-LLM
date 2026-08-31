@@ -356,11 +356,14 @@ class FusedMoEMethodBase(ABC):
                 w2_bias_shape = w2_weight_shape[:2]
             bias_dtype = bias_dtype or module.dtype
             w3_w1_bias = nn.Parameter(torch.empty(w3_w1_bias_shape,
-                                                  dtype=bias_dtype),
+                                                  dtype=bias_dtype,
+                                                  device=device),
                                       requires_grad=False)
             module.register_parameter("w3_w1_bias", w3_w1_bias)
 
-            w2_bias = nn.Parameter(torch.empty(w2_bias_shape, dtype=bias_dtype),
+            w2_bias = nn.Parameter(torch.empty(w2_bias_shape,
+                                               dtype=bias_dtype,
+                                               device=device),
                                    requires_grad=False)
             module.register_parameter("w2_bias", w2_bias)
         else:

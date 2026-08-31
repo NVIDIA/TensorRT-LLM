@@ -228,6 +228,15 @@ class PersistentDenseGemmKernel:
             raise ValueError(f"split_k_slices must be >= 1, got {split_k_slices}")
         if use_direct_split_k_reduce and split_k_slices > 1 and not use_tma_store:
             raise ValueError("direct split-K reduction requires a TMA store epilogue")
+        if split_k_slices > 1 and not use_direct_split_k_reduce:
+            raise ValueError(
+                "workspace split-K reduction is not wired up; use use_direct_split_k_reduce=True"
+            )
+        if fp8_quantize_1x128 and mma_tiler_mn[1] % 128 != 0:
+            raise ValueError(
+                f"fp8_quantize_1x128 requires mma_tiler_mn[1] to be a multiple of 128, "
+                f"got {mma_tiler_mn[1]}"
+            )
         self.split_k_slices = split_k_slices
         self.use_direct_split_k_reduce = use_direct_split_k_reduce
         self.fp8_quantize_1x128 = fp8_quantize_1x128
