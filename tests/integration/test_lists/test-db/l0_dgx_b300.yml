@@ -24,7 +24,7 @@ l0_dgx_b300:
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
   # The sparse/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
