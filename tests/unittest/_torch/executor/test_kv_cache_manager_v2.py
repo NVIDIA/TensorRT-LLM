@@ -950,6 +950,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         cache_tier_list=[object()],
         get_and_reset_iteration_stats=lambda: {},
         get_and_reset_ssm_snapshot_iteration_stats=lambda: {3: snapshot_delta},
+        get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
