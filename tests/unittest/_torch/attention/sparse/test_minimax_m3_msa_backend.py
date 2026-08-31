@@ -51,6 +51,43 @@ def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeyp
         msa_package_available.cache_clear()
 
 
+def test_msa_import_preserves_cute_compile_option_selection() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
+    import cutlass.cute as cute
+    from fmha_sm100.cute import interface as sparse_interface
+
+    del sparse_interface
+    assert callable(cute.compile)
+    selected_compile = cute.compile[cute.FrontendNext]
+    assert callable(selected_compile)
+    assert callable(selected_compile._minimax_compile_callable)
+    assert selected_compile._minimax_compile_callable is not cute.compile._minimax_compile_callable
+
+    selected_options = []
+    selected_calls = []
+
+    class FakeCompile:
+        def __call__(self, *args, **kwargs):
+            selected_calls.append((args, kwargs))
+            return "compiled"
+
+        def __getitem__(self, options):
+            selected_options.append(options)
+            return self
+
+    option = object()
+    profiled_compile = type(cute.compile)(FakeCompile())[option]
+    assert profiled_compile("kernel", flag=True) == "compiled"
+    assert selected_options == [option]
+    assert selected_calls == [(("kernel",), {"flag": True})]
+
+
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
     import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability as avail
 
