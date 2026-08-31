@@ -677,6 +677,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
 
+    @staticmethod
+    def _has_multi_token_stop_word(request: LlmRequest) -> bool:
+        """Whether any stop word spans more than one token.
+
+        A single-token stop word is decided by comparing the token just sampled,
+        exactly like ``py_end_id``; a multi-token one has to be matched against
+        the generated history. ``meet_stop_token_criteria`` draws the same
+        distinction, and models routinely produce the single-token kind: only
+        one EOS can be ``py_end_id``, so the rest spill into the stop-word list.
+        """
+        if not request.py_stop_words_list:
+            return False
+        _, prefix_sum = request.py_stop_words_list
+        if not prefix_sum:
+            return False
+        lengths = [prefix_sum[0]] + [
+            prefix_sum[i] - prefix_sum[i - 1] for i in range(1, len(prefix_sum))
+        ]
+        return any(length > 1 for length in lengths)
+
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
         """
         Check if we can use the fast argmax path for greedy sampling.
@@ -1219,9 +1239,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # this qualified path; completion is derived from compact host tokens.
         assert state.host.finish_reasons is None
         for request, new_token in zip(requests, new_tokens):
-            # The stable greedy path excludes stop words. Keep EOS ahead of the
-            # length check so a terminal EOS at the token limit is reported as
-            # END_ID, matching _handle_stop_criteria.
+            # Only single-token stop words reach this path (multi-token ones
+            # need history matching, so they take the finish-reason kernel).
+            # Order matches handle_stop_criteria: END_ID, then LENGTH, then
+            # STOP_WORDS, so a terminal EOS at the token limit is reported as
+            # END_ID.
             if new_token == request.py_end_id:
                 request.finish_by(FinishReason.END_ID, DEFAULT_BEAM_IDX)
             elif (
@@ -1230,6 +1252,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
+            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+                request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0
             request.py_decoding_iter += 1
@@ -2032,7 +2056,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     and not has_occurrence_penalty(request)
                     and not request.py_min_length
                     and not request.py_return_log_probs
-                    and not request.py_stop_words_list
+                    # Single-token stop words are checked on the host by
+                    # _update_requests_single_beam_single_step, like py_end_id;
+                    # only multi-token ones need the finish-reason kernel.
+                    and not self._has_multi_token_stop_word(request)
                     and _request_strategy(request, vocab_size=2**31) == GREEDY
                     for request in generation_requests
                 )
