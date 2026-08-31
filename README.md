@@ -318,6 +318,8 @@ deployment, and not linked to users. The data we collect includes:
 - TRT-LLM version and backend
 - Feature summary flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
 - Disaggregated serving metadata (role and deployment ID)
+- Process-local LLM lifecycle counts (initialization attempts, successful and active instances, peak concurrency, and initialization failures)
+- Bounded terminal status for instrumented processes (known exit code or signal, termination category, lifecycle phase, component, and reporting source)
 - Selected LLM API configuration values: parallelism, dtype, KV cache, scheduler, CUDA graph, and compile settings
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 
@@ -331,6 +333,13 @@ To disable telemetry data collection, use any of the following methods:
 - **File-based**: Create the file `~/.config/trtllm/do_not_track`
 - **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
+
+CLI terminal telemetry may report that an argument or YAML configuration was
+invalid. The terminal event records only categorical termination and lifecycle
+metadata, never the raw argument or YAML text. Other telemetry events collect
+the selected, sanitized configuration fields listed above. The
+environment-variable, file-based, and CLI-flag opt-outs are all applied before
+CLI and YAML validation.
 
 The telemetry collection code is fully open source and auditable at
 [`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field
