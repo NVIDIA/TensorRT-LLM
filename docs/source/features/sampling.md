@@ -147,8 +147,11 @@ modes.
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
-* Positive Min-P is not supported in combination with one-model speculative decoding. Such
-  requests are rejected at admission.
+* With one-model speculative decoding, positive Min-P requires
+  `advanced_sampling_mode: universal` in the speculative decoding config (see
+  [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)). That mode's
+  fused kernel is the only one that applies `min_p`; under the other modes such a request
+  is rejected at admission rather than decoded without it.
 
 * Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and
   `frequency_penalty` discourage (or encourage) the model from reusing tokens it has
@@ -220,12 +223,28 @@ speculative config) lets you skip those redundant kernels for a fixed deploy
 config. The output is identical to `FULL` whenever the skipped filter is already
 disabled, so this is a lossless throughput optimization for advanced use cases:
 
-| Mode | `top_k` kernel | `top_p` kernel |
-|---|---|---|
-| `full` (default) | applied | applied |
-| `no_topk` | **skipped** | applied |
-| `no_topp` | applied | **skipped** |
-| `no_topk_no_topp` | **skipped** | **skipped** |
+| Mode | `top_k` kernel | `top_p` kernel | `min_p` |
+|---|---|---|---|
+| `full` (default) | applied | applied | not supported |
+| `no_topk` | **skipped** | applied | not supported |
+| `no_topp` | applied | **skipped** | not supported |
+| `no_topk_no_topp` | **skipped** | **skipped** | not supported |
+| `universal` | per row | per row | **supported** |
+
+`universal` works differently from the other four. Those each name one *combination* of
+enabled filters, chosen for the whole deployment, so every additional sampling parameter
+doubles the number of modes. `universal` instead runs a single fused kernel that takes
+`temperature`, `min_p`, `top_k` and `top_p` together as per-request tensors and decides
+**per row, on device**, which of them to do any work for. A row that leaves a filter at its
+neutral value (`top_k = 0`, `top_p = 1`, `min_p = 0`) does not pay for it.
+
+Two consequences:
+
+* It is the only mode that supports `min_p`, because it is the only one whose kernel has a
+  `min_p` input.
+* It suits deployments whose requests are *heterogeneous* — a batch mixing filtered and
+  unfiltered requests — which a per-deploy mode cannot express: `full` would pay for every
+  filter on every row, and the `no_*` modes would disable a filter some requests wanted.
 
 Notes:
 
@@ -240,6 +259,8 @@ Notes:
   sampling batches without a special case.
 * `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
   graph key, so it adds no extra warmup graphs.
+* `universal` is lossless in the same sense as the others: it reproduces the standard
+  sampler's distribution, applying `min_p` first, then `top_k`, then `top_p`.
 
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig
