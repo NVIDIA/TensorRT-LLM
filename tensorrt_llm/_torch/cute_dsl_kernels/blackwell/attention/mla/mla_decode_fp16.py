@@ -2835,8 +2835,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                             common_params.blk_coord[2] * self.seq_len_q +
                             q_tok_c]
                     else:
-                        k_bound = common_params.K - (self.seq_len_q -
-                                                     1) + q_tok
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,
@@ -2887,8 +2886,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                             common_params.blk_coord[2] * self.seq_len_q +
                             q_tok_c]
                     else:
-                        k_bound = common_params.K - (self.seq_len_q -
-                                                     1) + q_tok
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,

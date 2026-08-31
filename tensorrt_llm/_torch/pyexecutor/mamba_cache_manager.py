@@ -44,10 +44,6 @@ from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
-
-# Shared with the KV budget estimator so allocator and budgeting can never
-# diverge on the sharding rule (config_utils is import-cycle-free).
-from .config_utils import mamba_effective_tp_size as _mamba_effective_tp_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
                                                       BatchDesc, BufferConfig,
@@ -56,6 +52,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       SsmLayerConfig)
+
+# Shared with the KV budget estimator so allocator and budgeting can never
+# diverge on the sharding rule (config_utils is import-cycle-free).
+from .config_utils import mamba_effective_tp_size as _mamba_effective_tp_size
 
 GB = 1 << 30
 

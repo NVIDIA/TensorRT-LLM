@@ -83,10 +83,12 @@ class FallbackFmha(Fmha):
         # gate both assume the new KV entries are the trailing slots of one
         # rank's kv_len. Reject rather than run it silently wrong; being last
         # in the library list, this makes dispatch raise.
-        if (metadata.helix_position_offsets is not None
-                and metadata._helix_spec_tokens_valid
-                and metadata.num_generations > 0
-                and q.shape[0] > metadata.num_seqs):
+        if (
+            metadata.helix_position_offsets is not None
+            and metadata._helix_spec_tokens_valid
+            and metadata.num_generations > 0
+            and q.shape[0] > metadata.num_seqs
+        ):
             return False
         return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
             forward_args.update_kv_cache or metadata.is_cross

@@ -447,8 +447,8 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool const* helix_is_inactive_rank, int32_t const* helix_local_slots = nullptr,
-    bool precomputed_cu_seqlens = false, bool precomputed_fmha_scheduler = false)
+    bool const* helix_is_inactive_rank, int32_t const* helix_local_slots = nullptr, bool precomputed_cu_seqlens = false,
+    bool precomputed_fmha_scheduler = false)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -1705,8 +1705,8 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
         quant_scale_q_eff, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank,
-        params.helix_local_slots, params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
+        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank, params.helix_local_slots,
+        params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
 }
 
 template <typename T, typename KVCacheBuffer>

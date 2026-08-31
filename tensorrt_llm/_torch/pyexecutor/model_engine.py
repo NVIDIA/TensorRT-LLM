@@ -4027,15 +4027,17 @@ class PyTorchModelEngine(ModelEngine):
                         restore=True,
                     )
 
-                if (self.mapping.has_cp_helix()
-                        and isinstance(inputs['attn_metadata'],
-                                       TrtllmAttentionMetadata)
+                if (self.mapping.has_cp_helix() and isinstance(
+                        inputs['attn_metadata'], TrtllmAttentionMetadata)
                         and inputs['attn_metadata']._helix_spec_tokens_valid):
                     # Mirrors the correction in _preprocess_inputs. Only
                     # the offsets need reversing: the recompute's other
                     # outputs are rewritten from host state next prepare.
-                    inputs['attn_metadata'].helix_position_offsets[:previous_batch_tokens] -= (
-                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                    inputs[
+                        'attn_metadata'].helix_position_offsets[:previous_batch_tokens] -= (
+                            self.
+                            previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                        )
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -5640,8 +5642,8 @@ class PyTorchModelEngine(ModelEngine):
 
             def _helix_local_len_host(global_len: int) -> int:
                 full, rem = divmod(global_len, _helix_ledger)
-                return full * _helix_phys + min(
-                    max(rem - _helix_rank_off, 0), _helix_phys)
+                return full * _helix_phys + min(max(rem - _helix_rank_off, 0),
+                                                _helix_phys)
 
             def _helix_pack_extend(request, group: int) -> int:
                 # A helix gen worker's token list is the rank-LOCAL
@@ -5848,7 +5850,6 @@ class PyTorchModelEngine(ModelEngine):
 
             # update batch index
             request.py_batch_idx = request.py_seq_slot
-
 
         _n_gen = len(generation_requests)
         # One-shot batch-level flag — True iff any generation request actually
