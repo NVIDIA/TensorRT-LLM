@@ -27,7 +27,7 @@ Because GLM-5 reuses the DeepSeek V3.2 code path, other features supported by `D
 * OS: Linux
 * Drivers: CUDA Driver 575 or later
 * Docker with NVIDIA Container Toolkit installed
-* Minimum TensorRT LLM version: 1.3.0rc8
+* Minimum TensorRT LLM version: 1.3.0rc9
 
 ## Models
 
@@ -68,7 +68,7 @@ docker run --rm -it \
     -p 8000:8000 \
     -v /path/to/your/models:/models \
     --name tensorrt_llm \
-    nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc8 \
+    nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc9 \
     /bin/bash
 ```
 
