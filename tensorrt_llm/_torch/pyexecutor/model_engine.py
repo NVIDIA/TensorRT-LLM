@@ -808,6 +808,14 @@ class PyTorchModelEngine(ModelEngine):
                 apply_llm_torch_compile = getattr(self.model,
                                                   "apply_llm_torch_compile",
                                                   None)
+
+                if compile_only_piecewise_graphs and not isinstance(
+                        self.model, DecoderModelForCausalLM):
+                    raise ValueError(
+                        "TorchCompileConfig."
+                        "compile_only_piecewise_graphs=True is "
+                        "only supported for DecoderModelForCausalLM models.")
+
                 if isinstance(self.model, DecoderModelForCausalLM):
                     eager_decoder = self.model.model
                     self.model.model = torch.compile(
@@ -817,10 +825,10 @@ class PyTorchModelEngine(ModelEngine):
                     if compile_only_piecewise_graphs:
                         compiled_decoder = self.model.model
                         compiled_forward = compiled_decoder.forward
-                        logger.info(
-                            "torch.compile is limited to context and mixed "
-                            "execution graphs")
 
+                        # The wrapper below will enforce the eager forward function if:
+                        # 1) The torch compile bypass is active (e.g., for auto-tuning)
+                        # 2) The batch is generation-only (rely on ordinary CUDA graphs)
                         def phase_selective_forward(*args, **kwargs):
                             attrs = get_model_extra_attrs()
                             attn_metadata_ref = attrs.get(
@@ -838,24 +846,12 @@ class PyTorchModelEngine(ModelEngine):
 
                         compiled_decoder.forward = phase_selective_forward
                 elif callable(apply_llm_torch_compile):
-                    if compile_only_piecewise_graphs:
-                        raise ValueError(
-                            "TorchCompileConfig."
-                            "compile_only_piecewise_graphs=True is "
-                            "only supported for DecoderModelForCausalLM models."
-                        )
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
                     # scope through the mixin.
                     apply_llm_torch_compile(backend=self._torch_compile_backend,
                                             fullgraph=torch_compile_fullgraph)
                 else:
-                    if compile_only_piecewise_graphs:
-                        raise ValueError(
-                            "TorchCompileConfig."
-                            "compile_only_piecewise_graphs=True is "
-                            "only supported for DecoderModelForCausalLM models."
-                        )
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
