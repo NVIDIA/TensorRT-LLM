@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
+    DeepseekV4MoE,
     DeepseekV4MTP,
     DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.mla import MLA
+from tensorrt_llm._torch.moe.fused_moe import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -567,6 +569,123 @@ def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
 
     assert ModelConfig.resolve_moe_backend("AUTO", "DeepseekV4ForCausalLM") == "TRTLLM"
+
+
+_SWIGLU_LIMIT = 7.0
+
+
+class _StopMoEInit(Exception):
+    """Raised from a patched create_moe to end DeepseekV4MoE.__init__ early."""
+
+
+def _capture_moe_swiglu_limit(
+    quant_algo,
+    *,
+    moe_backend="TRTLLM",
+    sm=100,
+    num_experts=8,
+    num_slots=None,
+):
+    """Build DeepseekV4MoE far enough to see what it hands to create_moe.
+
+    No GPU required: the gate and the swiglu_limit tensor are built on CPU, and
+    the patched create_moe raises before any device work happens.
+    """
+    from tensorrt_llm._torch.models import modeling_deepseekv4
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import override_moe_environment
+    from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
+
+    config = DeepseekV4Config(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=64,
+        n_routed_experts=num_experts,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        # Keep layer 1 unhashed so the gate does not build a vocab-sized table.
+        n_hash_layers=0,
+        swiglu_limit=_SWIGLU_LIMIT,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        moe_backend=moe_backend,
+        quant_config=QuantConfig(quant_algo=quant_algo, group_size=16),
+        moe_load_balancer=(
+            MoeLoadBalancerConfig(num_slots=num_slots) if num_slots is not None else None
+        ),
+    )
+
+    captured = {}
+    real_resolve_moe_cls = modeling_deepseekv4.resolve_moe_cls
+
+    def spy_resolve_moe_cls(*args, **kwargs):
+        # Record which backend the layer actually resolved to. Without this, a
+        # `swiglu_limit is None` assertion would also pass when the backend simply
+        # does not support swiglu_limit, instead of pinning the intended reason.
+        cls = real_resolve_moe_cls(*args, **kwargs)
+        captured["resolved_moe_cls"] = cls
+        return cls
+
+    def fake_create_moe(**kwargs):
+        captured.update(kwargs)
+        raise _StopMoEInit
+
+    with (
+        override_moe_environment(MoEEnvironment(sm=sm)),
+        patch.object(modeling_deepseekv4, "resolve_moe_cls", spy_resolve_moe_cls),
+        patch("tensorrt_llm._torch.models.modeling_deepseekv4.create_moe", fake_create_moe),
+        pytest.raises(_StopMoEInit),
+    ):
+        DeepseekV4MoE(
+            num_experts=num_experts,
+            top_k=2,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            shared_expert_intermediate_size=config.moe_intermediate_size,
+            aux_stream_dict={AuxStreamType.MoeShared: None},
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            layer_idx=1,
+        )
+    return captured
+
+
+def test_deepseek_v4_nvfp4_moe_keeps_per_expert_swiglu_limit():
+    """NVFP4 on TRTLLM-Gen consumes the per-expert tensor.
+
+    Dropping it silently disables the routed swiglu clamp instead of failing,
+    so nothing else in the suite notices. Pin the tensor here.
+    """
+    captured = _capture_moe_swiglu_limit(QuantAlgo.NVFP4)
+
+    assert captured["resolved_moe_cls"] is TRTLLMGenFusedMoE
+    limit = captured["swiglu_limit"]
+    assert limit is not None
+    assert limit.shape == (8,)
+    assert limit.dtype == torch.float32
+    assert torch.all(limit == _SWIGLU_LIMIT)
+    assert captured["swiglu_limit_scalar"] == _SWIGLU_LIMIT
+
+
+def test_deepseek_v4_nvfp4_moe_sizes_swiglu_limit_by_local_slots():
+    """The tensor is one entry per local slot, so EPLB slot padding must grow it."""
+    captured = _capture_moe_swiglu_limit(QuantAlgo.NVFP4, num_experts=8, num_slots=12)
+
+    assert captured["swiglu_limit"].shape == (12,)
+    assert torch.all(captured["swiglu_limit"] == _SWIGLU_LIMIT)
+
+
+def test_deepseek_v4_fp8_block_scales_moe_passes_scalar_swiglu_limit_only():
+    """The TRTLLM-Gen FP8 path takes the scalar and rejects the redundant tensor."""
+    captured = _capture_moe_swiglu_limit(QuantAlgo.FP8_BLOCK_SCALES)
+
+    # The scalar-only rule is specific to TRTLLM-Gen; assert the backend so this
+    # cannot pass merely because some other backend ignores swiglu_limit.
+    assert captured["resolved_moe_cls"] is TRTLLMGenFusedMoE
+    assert captured["swiglu_limit"] is None
+    assert captured["swiglu_limit_scalar"] == _SWIGLU_LIMIT
 
 
 def test_deepseek_v4_nvfp4_mixed_precision_config():

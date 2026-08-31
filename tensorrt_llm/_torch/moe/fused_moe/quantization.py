@@ -5248,9 +5248,15 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
         # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
         # output domain (i.e. divided by fc31_alpha / fc2_alpha).
-        if getattr(module, 'w3_w1_bias', None) is not None:
+        #
+        # The bias division is gated on module.bias to stay consistent with
+        # _shuffle_all_experts() below. Hoisting this block into the base method
+        # deliberately widens it to W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, which
+        # auto-creates all-zero bias tensors that its kernel
+        # (fp8_fp4_block_scale_moe_runner) never consumes; those must not be
+        # divided, because a zero alpha would turn them into NaN.
+        if module.bias:
             module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
-        if getattr(module, 'w2_bias', None) is not None:
             module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
         if getattr(module, 'swiglu_beta', None) is not None:
             module.swiglu_beta.data.div_((module.fc31_alpha.data))
