@@ -14,3 +14,8 @@ l0_gb300_multi_nodes_node4_gpu16:
       backend: pytorch
   tests:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_adp16_cutedsl TIMEOUT (90)
+  # Kimi K3 GSM8K accuracy guard (DEP16). The reuse and MMMU legs stay
+  # QA-weekly-only via qa/llm_function_multinode.txt, which also keeps
+  # running the two legs below.
+  - accuracy/test_llm_api_pytorch.py::TestKimiK3::test_w4a16_mxfp4[baseline] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestKimiK3::test_w4a16_mxfp4[sa] TIMEOUT (120)
