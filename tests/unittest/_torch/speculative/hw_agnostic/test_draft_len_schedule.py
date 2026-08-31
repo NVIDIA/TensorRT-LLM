@@ -48,7 +48,9 @@ def enforce_single_worker(monkeypatch):
     ],
 )
 @pytest.mark.high_cuda_memory
-def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
+def test_correctness_across_batch_sizes(
+    enforce_single_worker, monkeypatch, drafter_type: str, schedule: dict
+):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 30 if drafter_type == "model_drafter" else 20
     if total_mem_gb < memory_required:
@@ -115,27 +117,63 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         )
         for i in range(len(prompts))
     ]
+
+    if drafter_type == "model_drafter":
+        prompts = ["The capital of France is"] * max_batch_size
+        sampling_params_list = [
+            SamplingParams(
+                max_tokens=max_tokens,
+                temperature=0,
+                seed=42,
+                ignore_eos=True,
+                top_k=1,
+                top_p=1.0,
+            )
+            for max_tokens in [4] * 4 + [8] * 3 + [12]
+        ]
+
     # With dynamic draft_len_schedule
     llm_with_schedule = LLM(**llm_common_config, speculative_config=spec_config)
+
+    runtime_schedule = []
+    if drafter_type == "model_drafter":
+        executor = llm_with_schedule._executor.engine
+        original_handle_dynamic_draft_len = executor._handle_dynamic_draft_len
+
+        def instrumented_handle_dynamic_draft_len(scheduled_batch):
+            original_handle_dynamic_draft_len(scheduled_batch)
+            runtime_schedule.append(
+                (scheduled_batch.batch_size, executor.model_engine.runtime_draft_len)
+            )
+
+        monkeypatch.setattr(
+            executor, "_handle_dynamic_draft_len", instrumented_handle_dynamic_draft_len
+        )
+
     results_with_schedule = llm_with_schedule.generate(prompts, sampling_params_list)
     generated_text_with_schedule = [result.outputs[0].text for result in results_with_schedule]
     llm_with_schedule.shutdown()
+
+    if drafter_type == "model_drafter":
+        runtime_transitions = [
+            observation
+            for index, observation in enumerate(runtime_schedule)
+            if index == 0 or observation != runtime_schedule[index - 1]
+        ]
+        assert runtime_transitions == [(8, 1), (4, 2), (1, 3)], (
+            f"DraftTarget runtime schedule did not follow {schedule}: got {runtime_transitions}"
+        )
+        return
+
     # Reference: spec decode with fixed max_draft_len (no schedule)
-    if drafter_type == "ngram":
-        spec_config_fixed = NGramDecodingConfig(
-            max_draft_len=max_draft_len,
-            max_matching_ngram_size=2,
-            draft_len_schedule=None,  # No schedule - fixed draft length
-            is_keep_all=True,
-            is_use_oldest=True,
-            is_public_pool=False,
-        )
-    else:
-        spec_config_fixed = DraftTargetDecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=str(draft_model),
-            draft_len_schedule=None,  # No schedule - fixed draft length
-        )
+    spec_config_fixed = NGramDecodingConfig(
+        max_draft_len=max_draft_len,
+        max_matching_ngram_size=2,
+        draft_len_schedule=None,  # No schedule - fixed draft length
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=False,
+    )
     llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
     results_fixed = llm_fixed.generate(prompts, sampling_params_list)
     generated_text_fixed = [result.outputs[0].text for result in results_fixed]
