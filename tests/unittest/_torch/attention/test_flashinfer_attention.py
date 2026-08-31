@@ -4,7 +4,7 @@
 import random
 import unittest
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import List, Optional, Union
 from unittest import mock
@@ -18,7 +18,7 @@ from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
 from tensorrt_llm._torch.attention_backend import \
     flashinfer as flashinfer_backend
 from tensorrt_llm._torch.attention_backend.flashinfer import (
-    FlashInferWrappers, PlanParams)
+    FlashInferMultiItemParams, FlashInferWrappers, PlanParams)
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -190,18 +190,21 @@ class TestFlashInferAttention(unittest.TestCase):
                                wraps=torch.empty_like) as allocate_workspace:
             global_workspace_1 = graph_batch_1._get_plan_workspace(
                 global_batch_1)
-            self.assertEqual(allocate_workspace.call_count, 0)
+            self.assertEqual(allocate_workspace.call_count, 1)
             sliding_workspace_1 = graph_batch_1._get_plan_workspace(
                 sliding_batch_1)
-            self.assertEqual(allocate_workspace.call_count, 1)
+            self.assertEqual(allocate_workspace.call_count, 2)
             global_workspace_4 = graph_batch_4._get_plan_workspace(
                 global_batch_4)
             sliding_workspace_4 = graph_batch_4._get_plan_workspace(
                 sliding_batch_4)
-            self.assertEqual(allocate_workspace.call_count, 1)
+            self.assertEqual(allocate_workspace.call_count, 2)
 
         self.assertNotEqual(global_workspace_1.data_ptr(),
                             sliding_workspace_1.data_ptr())
+        self.assertNotEqual(global_workspace_1.data_ptr(), workspace.data_ptr())
+        self.assertNotEqual(sliding_workspace_1.data_ptr(),
+                            workspace.data_ptr())
         self.assertEqual(global_workspace_1.data_ptr(),
                          global_workspace_4.data_ptr())
         self.assertEqual(sliding_workspace_1.data_ptr(),
@@ -230,8 +233,67 @@ class TestFlashInferAttention(unittest.TestCase):
                                wraps=torch.empty_like) as allocate_workspace:
             single_workspace = single_metadata._get_plan_workspace(
                 global_batch_1)
-        self.assertEqual(allocate_workspace.call_count, 0)
-        self.assertEqual(single_workspace.data_ptr(), workspace.data_ptr())
+        self.assertEqual(allocate_workspace.call_count, 1)
+        self.assertNotEqual(single_workspace.data_ptr(), workspace.data_ptr())
+
+    def test_cuda_graph_persistent_plan_workspace_isolated_from_ephemeral(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        workspace = torch.empty(1024, dtype=torch.uint8, device="cuda")
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            max_num_requests=1,
+            max_num_tokens=1,
+            workspace_buffer=workspace,
+        ).create_cuda_graph_metadata(1)
+        persistent_plan = PlanParams(
+            num_heads=8,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+            num_generations=1,
+        )
+        custom_mask_plan = replace(
+            persistent_plan,
+            attention_mask_data=torch.ones(1, dtype=torch.bool, device="cuda"),
+        )
+        multi_item_plan = replace(
+            persistent_plan,
+            multi_item_params=FlashInferMultiItemParams(
+                prefix_len_ptr=torch.zeros(1, dtype=torch.int32, device="cuda"),
+                max_item_len_ptr=torch.zeros(1,
+                                             dtype=torch.int32,
+                                             device="cuda"),
+                token_pos_in_items_ptr=torch.zeros(1,
+                                                   dtype=torch.int32,
+                                                   device="cuda"),
+                token_pos_in_items_len=1,
+            ),
+        )
+
+        persistent_workspace = metadata._get_plan_workspace(persistent_plan)
+        ephemeral_workspaces = [
+            metadata._get_plan_workspace(custom_mask_plan),
+            metadata._get_plan_workspace(multi_item_plan),
+        ]
+
+        registered_addresses = {
+            registered.data_ptr()
+            for registered in metadata._plan_workspace_buffers.values()
+        }
+        ephemeral_addresses = {
+            ephemeral.data_ptr()
+            for ephemeral in ephemeral_workspaces
+        }
+        self.assertEqual(registered_addresses,
+                         {persistent_workspace.data_ptr()})
+        self.assertEqual(ephemeral_addresses, {workspace.data_ptr()})
+        self.assertTrue(registered_addresses.isdisjoint(ephemeral_addresses))
 
     def test_generation_page_table_keeps_logical_positions(self):
         if not torch.cuda.is_available():
@@ -1026,6 +1088,9 @@ class TestFlashInferAttention(unittest.TestCase):
                 wrapper.workspace_buffer.data_ptr()
                 for wrapper in graph_wrappers
             }), num_layers)
+        self.assertTrue(
+            all(wrapper.workspace_buffer.data_ptr() != workspace.data_ptr()
+                for wrapper in graph_wrappers))
 
         eager_wrappers = list(
             attn_metadata_ref._plan_params_to_wrappers.values())

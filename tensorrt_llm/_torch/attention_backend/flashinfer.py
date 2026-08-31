@@ -362,9 +362,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         )
         workspace = self._plan_workspace_buffers.get(workspace_key)
         if workspace is None:
-            workspace = (self.workspace_buffer
-                         if not self._plan_workspace_buffers else
-                         torch.empty_like(self.workspace_buffer))
+            # Keep the original workspace for plans outside this registry. A
+            # persistent graph plan must not alias it or another plan can
+            # overwrite the schedule that graph replay expects to remain.
+            workspace = torch.empty_like(self.workspace_buffer)
             self._plan_workspace_buffers[workspace_key] = workspace
         return workspace
 
