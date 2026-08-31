@@ -15,7 +15,7 @@ l0_b200:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - cpp/test_unit_tests.py::test_unit_tests[kv_cache_compression-100]
+  - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[100]
 - condition:
     ranges:
       system_gpu_count:

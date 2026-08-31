@@ -173,6 +173,48 @@ def build_google_tests(request, build_type):
     )
 
 
+@pytest.fixture(scope="session")
+def build_kv_cache_compression_tests(request, build_type):
+    """Build only the standalone KV-cache compression gtests.
+
+    Both binaries use NO_TLLM_LINKAGE, so this skips the full-library
+    build that build_google_tests pays for.
+    """
+    cuda_arch = f"{request.param}-real"
+
+    _logger.info(f"Using CUDA arch: {cuda_arch}")
+
+    build_trt_llm(
+        build_type=build_type,
+        cuda_architectures=cuda_arch,
+        job_count=12,
+        use_ccache=True,
+        generator="Ninja",
+        nixl_root="/opt/nvidia/nvda_nixl",
+        skip_building_wheel=True,
+        configure_only=True,
+    )
+
+    build_dir = _cpp.find_build_dir(build_type)
+    _cpp.run_command(
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--config",
+            build_type,
+            "--parallel",
+            "12",
+            "--target",
+            "coldPageCodecTest",
+            "nvfp4ColdPageKernelsTest",
+        ],
+        cwd=build_dir,
+        env=_os.environ,
+        timeout=1800,
+    )
+
+
 @pytest.fixture(scope="function", autouse=True)
 def keep_log_files(build_dir):
     """Backup previous cpp test results when run multiple ctest invocations."""
