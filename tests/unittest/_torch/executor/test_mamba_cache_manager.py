@@ -351,7 +351,8 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The V1 managers have no `conv_state_layout` parameter; they must keep
-    getting `model_type='qwen3_next'` (TRTLLM-15216 regression guard)."""
+    getting `model_type='qwen3_next'` and must not receive V2 KDA replay
+    parameters (TRTLLM-15216 regression guard)."""
     captured: dict[str, object] = {}
 
     class RecordingV1Manager(CppMambaHybridCacheManager):
@@ -359,6 +360,10 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
             captured["kwargs"] = kwargs
 
     model_config = _kimi_model_config()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        lambda: True,
+    )
     _create_kv_cache_manager(
         model_engine=None,
         kv_cache_manager_cls=RecordingV1Manager,
@@ -367,7 +372,7 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
         tokens_per_block=64,
         max_seq_len=2048,
         max_batch_size=4,
-        spec_config=None,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
         sparse_attention_config=None,
         max_num_tokens=256,
         max_beam_width=1,
@@ -379,6 +384,7 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
     kwargs = captured["kwargs"]
     assert kwargs["model_type"] == "qwen3_next"
     assert "conv_state_layout" not in kwargs
+    assert "kda_replay_num_spec" not in kwargs
 
 
 def test_v2_manager_rejects_model_type_kwarg() -> None:

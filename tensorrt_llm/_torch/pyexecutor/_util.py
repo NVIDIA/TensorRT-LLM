@@ -2441,7 +2441,10 @@ def _create_kv_cache_manager(
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
         kimi_extra_kwargs = {}
-        if spec_config is not None:
+        kda_replay_manager_types = (MixedMambaHybridCacheManager,
+                                    KDAHybridCacheManagerV2)
+        if (spec_config is not None
+                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
