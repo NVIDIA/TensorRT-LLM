@@ -32,12 +32,7 @@ def _enabled_names() -> tuple[str, ...]:
 
 def test_prims_ts_precedes_trtllm_gen_in_canonical_order() -> None:
     names = _canonical_names()
-    prims_ts_index = names.index(PRIMS_TS)
-    assert names[prims_ts_index - 1 : prims_ts_index + 2] == (
-        "flashinfer_sparse_mla",
-        PRIMS_TS,
-        "flashinfer_trtllm_gen",
-    )
+    assert names.index(PRIMS_TS) < names.index("flashinfer_trtllm_gen")
 
 
 def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:

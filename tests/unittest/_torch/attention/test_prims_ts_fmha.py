@@ -995,8 +995,8 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     )
     context_preprocess.assert_called_once()
     context_postprocess.assert_called_once()
-    assert context_preprocess.call_args.kwargs["skip_workspace"] is True
-    assert context_postprocess.call_args.kwargs["skip_workspace"] is True
+    assert context_preprocess.call_args.kwargs["skip_fmha_workspace"] is True
+    assert context_postprocess.call_args.kwargs["skip_fmha_workspace"] is True
 
     block_tables[:, 0].add_(1)
     cu_kv_seqlens.copy_(torch.tensor([0, 64, 97], dtype=torch.int32))
@@ -1187,7 +1187,7 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
     preprocess_args = generation_preprocess.call_args.args
     assert preprocess_args[15] == params.seq_offset
     assert preprocess_args[39] == total_num_blocks
-    assert generation_preprocess.call_args.kwargs["skip_workspace"] is True
+    assert generation_preprocess.call_args.kwargs["skip_fmha_workspace"] is True
     get_page_index_upper_bound.assert_called_once()
 
     block_tables[:, 0].add_(20)

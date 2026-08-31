@@ -896,7 +896,7 @@ class PrimsTSFmha(PhasedFmha):
                 self.attn.rope_dim,
                 True,
                 False,
-                skip_workspace=True,
+                skip_fmha_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(context_layout["total_size"])
@@ -917,7 +917,7 @@ class PrimsTSFmha(PhasedFmha):
                 self.attn.num_kv_heads,
                 0,
                 False,
-                skip_workspace=True,
+                skip_fmha_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(generation_layout["total_size"])
@@ -1122,7 +1122,7 @@ class PrimsTSFmha(PhasedFmha):
             True,
             fwd.cross_kv,
             False,
-            skip_workspace=True,
+            skip_fmha_workspace=True,
         )
         if fmha_workspace.numel() != 0:
             raise RuntimeError("PrimTS context preprocessing returned an FMHA workspace.")
@@ -1206,7 +1206,7 @@ class PrimsTSFmha(PhasedFmha):
             False,
             attention_chunk_size,
             self._multi_processor_count,
-            skip_workspace=True,
+            skip_fmha_workspace=True,
         )
 
     def run_generation(self, params: FmhaParams) -> None:
@@ -1280,7 +1280,7 @@ class PrimsTSFmha(PhasedFmha):
             params.kv_factor,
             True,
             False,
-            skip_workspace=True,
+            skip_fmha_workspace=True,
         )
         if fmha_workspace.numel() != 0:
             raise RuntimeError("PrimTS generation preprocessing returned an FMHA workspace.")
