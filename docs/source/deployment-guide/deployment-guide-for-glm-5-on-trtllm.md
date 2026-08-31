@@ -6,7 +6,7 @@ This deployment guide provides step-by-step instructions for running the GLM-5 m
 
 GLM-5 uses Multi-Latent Attention (MLA) with DeepSeek Sparse Attention (DSA). It shares the same architecture as DeepSeek V3.2 (with minor changes) and is served through the `GlmMoeDsaForCausalLM` model, which reuses the DeepSeek V3.2 code path in TensorRT LLM. GLM-5 natively supports Multi-Token Prediction (MTP) for speculative decoding.
 
-This guide applies to the GLM-5 family, including GLM-5.2 and GLM-5.3. GLM-5.3 is a weight update over GLM-5.2 with the same architecture and code path, so the server configurations and deployment steps below are identical across versions. Note that GLM-5.3 ships a revised chat template: the `enable_thinking` template kwarg is replaced by `clear_thinking`, and `reasoning_effort` accepts `low`/`high` (default `max`). Clients controlling reasoning behavior via `chat_template_kwargs` should update accordingly.
+This guide applies to the GLM-5 family, including GLM-5.2 and GLM-5.3. GLM-5.3 is a weight update over GLM-5.2 with the same architecture and code path, so the server configurations and deployment steps below are identical across versions. Note that GLM-5.3 ships a revised chat template with different reasoning controls. Unlike GLM-5.2, there is no `enable_thinking` kwarg and thinking cannot be turned off; generation always begins with `<think>`. Reasoning depth is set with `reasoning_effort`, which accepts `low`, `high`, or `max` (default `max`). The separate `clear_thinking` kwarg controls whether reasoning from earlier turns is retained in multi-turn conversations; it does not disable thinking. Clients that controlled reasoning behavior via `chat_template_kwargs` on GLM-5.2 should update accordingly.
 
 The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA's accelerated stack.
 
@@ -149,6 +149,7 @@ Below is an example command to launch the TensorRT LLM server with GLM-5 from wi
 ```bash
 trtllm-serve \
   /models/GLM-5.3 \
+  --served_model_name zai-org/GLM-5.3 \
   --host 0.0.0.0 \
   --port 8000 \
   --max_batch_size 128 \
