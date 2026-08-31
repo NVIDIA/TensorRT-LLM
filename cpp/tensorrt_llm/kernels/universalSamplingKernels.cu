@@ -301,8 +301,9 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
         }
         __syncthreads();
 
-        // Fold the private copies into copy 0, one bucket per thread. 256 buckets against
-        // a vocabSize-long histogram pass -- not what this costs.
+        // Fold the private copies into copy 0, one bucket per thread, keeping the raw
+        // per-bucket totals in the space copy 1 occupied -- the suffix scan below runs in
+        // place and the chosen bucket's own count is still needed afterwards.
         for (int b = tid; b < kRadixBuckets; b += blockDim.x)
         {
             int totalCount = sCount[b];
@@ -315,36 +316,70 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             }
             sCount[b] = totalCount;
             sMass[b] = totalMass;
+            sCount[kRadixBuckets + b] = totalCount;
+            sMass[kRadixBuckets + b] = totalMass;
         }
         __syncthreads();
 
-        // The bucket walk is serial on one thread: 256 steps against vocabSize/512
-        // steps of the histogram pass above, so it is not what this costs.
+        // Descending suffix sums, Hillis-Steele: 8 parallel steps instead of the 256
+        // dependent shared-memory reads a serial walk costs.
+        //
+        // This walk was originally one thread stepping bucket 255 down to 0 while the
+        // other 1023 idled, four times per descent. At 64 rows the kernel moves ~32 MB
+        // total -- microseconds of bandwidth -- yet took ~75us, so it was never
+        // bandwidth-bound there; this dependent chain was the reason.
+#pragma unroll
+        for (int offset = 1; offset < kRadixBuckets; offset <<= 1)
+        {
+            int addCount = 0;
+            float addMass = 0.0f;
+            bool const active = tid < kRadixBuckets && tid + offset < kRadixBuckets;
+            if (active)
+            {
+                addCount = sCount[tid + offset];
+                addMass = sMass[tid + offset];
+            }
+            __syncthreads();
+            if (active)
+            {
+                sCount[tid] += addCount;
+                sMass[tid] += addMass;
+            }
+            __syncthreads();
+        }
+
+        // sCount[b] is now the count of everything in buckets >= b, so "the criterion has
+        // fired by the time the walk reaches b" is a per-bucket predicate. It holds for a
+        // suffix of small b, so the bucket the serial walk would have stopped at is simply
+        // the largest b where it holds.
         if (tid == 0)
         {
-            long long c = countHi;
-            float m = massHi;
-            int chosen = 0;
-            for (int b = kRadixBuckets - 1; b >= 0; --b)
+            *sChosen = -1;
+        }
+        __syncthreads();
+        if (tid < kRadixBuckets)
+        {
+            bool const fired = byCount ? countHi + sCount[tid] >= targetCount : massHi + sMass[tid] > targetMass;
+            if (fired)
             {
-                long long const c2 = c + sCount[b];
-                float const m2 = m + sMass[b];
-                bool const fired = byCount ? c2 >= targetCount : m2 > targetMass;
-                if (fired)
-                {
-                    chosen = b;
-                    *sFired = true;
-                    break;
-                }
-                c = c2;
-                m = m2;
+                atomicMax(sChosen, tid);
             }
-            *sChosen = chosen;
-            *sCountHi = c;
-            *sMassHi = m;
-            // How many survivors the next pass has to look at. Captured now, before the
-            // next iteration zeroes the histogram.
-            *sBucketCount = sCount[chosen];
+        }
+        __syncthreads();
+
+        if (tid == 0)
+        {
+            int const chosen = *sChosen;
+            *sFired = chosen >= 0;
+            int const b = chosen < 0 ? 0 : chosen;
+            *sChosen = b;
+            // Everything strictly above the chosen bucket, i.e. what the serial walk had
+            // accumulated before it stopped.
+            *sCountHi = countHi + (b + 1 < kRadixBuckets ? sCount[b + 1] : 0);
+            *sMassHi = massHi + (b + 1 < kRadixBuckets ? sMass[b + 1] : 0.0f);
+            // How many survivors the next pass has to look at. Read from the raw copy,
+            // since sCount now holds suffix sums.
+            *sBucketCount = sCount[kRadixBuckets + b];
         }
         __syncthreads();
 
