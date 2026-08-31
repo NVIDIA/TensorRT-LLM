@@ -63,7 +63,10 @@ def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
         "The capital of France is",
         "The president of the United States is",
     ]
-    sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
+    # Eight tokens require at least two DraftTarget iterations while avoiding
+    # later shape-sensitive BF16 greedy ties observed on L40S.
+    max_tokens = 8
+    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)
@@ -76,8 +79,8 @@ def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
     for prompt, result_spec, result_ref in zip(prompts, results_spec, results_ref, strict=True):
         spec_output = result_spec.outputs[0]
         ref_output = result_ref.outputs[0]
-        assert spec_output.token_ids
-        assert ref_output.token_ids
+        assert len(spec_output.token_ids) == max_tokens
+        assert len(ref_output.token_ids) == max_tokens
         assert spec_output.token_ids == ref_output.token_ids, (
             f"DraftTarget output tokens differ from greedy reference for prompt {prompt!r}: "
             f"speculative={spec_output.token_ids}, reference={ref_output.token_ids}"
