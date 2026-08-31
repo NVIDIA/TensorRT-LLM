@@ -8,6 +8,7 @@ Key Components:
 - Flux2ParallelSelfAttention: Fused QKV+MLP for FLUX.2 single-stream blocks
 """
 
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -85,6 +86,31 @@ class FluxJointAttention(Attention):
             module_name=module_name,
         )
 
+        quant_attention_config = (
+            config.attention.quant_attention_config if config is not None else None
+        )
+        self.requires_static_e4m3_attention = bool(
+            self.attn_backend == "CUTEDSL"
+            and quant_attention_config is not None
+            and quant_attention_config.qk_dtype == "fp8"
+            and quant_attention_config.v_dtype == "fp8"
+            and quant_attention_config.q_block_size == 0
+            and quant_attention_config.k_block_size == 0
+            and quant_attention_config.v_block_size == 0
+        )
+        self.register_buffer(
+            "_static_q_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_static_k_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_static_v_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
+        )
+        self._static_q_dequant_scale_value: Optional[float] = None
+        self._static_k_dequant_scale_value: Optional[float] = None
+        self._static_v_dequant_scale_value: Optional[float] = None
+
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
 
@@ -148,6 +174,53 @@ class FluxJointAttention(Attention):
                 reduce_output=True,
                 override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
+
+    @staticmethod
+    def _validated_e4m3_dequant_scale(amax: torch.Tensor, operand_name: str) -> float:
+        if not isinstance(amax, torch.Tensor) or amax.numel() != 1:
+            shape = tuple(amax.shape) if isinstance(amax, torch.Tensor) else None
+            raise ValueError(
+                f"ModelOpt {operand_name} attention amax must be a scalar tensor; got {shape}."
+            )
+        amax_value = float(amax.float().item())
+        if not math.isfinite(amax_value) or amax_value <= 0.0:
+            raise ValueError(
+                f"ModelOpt {operand_name} attention amax must be finite and positive; "
+                f"got {amax_value}."
+            )
+        return amax_value / 448.0
+
+    def load_static_e4m3_attention_scales(
+        self,
+        q_amax: torch.Tensor,
+        k_amax: torch.Tensor,
+        v_amax: torch.Tensor,
+    ) -> None:
+        """Install calibrated ModelOpt Q/K/V scales before CUDA Graph capture."""
+        scale_values = {
+            "q": self._validated_e4m3_dequant_scale(q_amax, "Q"),
+            "k": self._validated_e4m3_dequant_scale(k_amax, "K"),
+            "v": self._validated_e4m3_dequant_scale(v_amax, "V"),
+        }
+        target_device = self.norm_q.weight.device
+        for operand_name, scale_value in scale_values.items():
+            setattr(
+                self,
+                f"_static_{operand_name}_dequant_scale",
+                torch.tensor(scale_value, dtype=torch.float32, device=target_device),
+            )
+            setattr(self, f"_static_{operand_name}_dequant_scale_value", scale_value)
+
+    @property
+    def static_e4m3_attention_scales_loaded(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self._static_q_dequant_scale_value,
+                self._static_k_dequant_scale_value,
+                self._static_v_dequant_scale_value,
+            )
+        )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Override: use F.rms_norm for per-head norm
@@ -266,6 +339,7 @@ class FluxJointAttention(Attention):
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
+        qkv_hidden_states: Optional[Union[torch.Tensor, Fp4QuantizedTensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of joint attention.
 
@@ -282,11 +356,32 @@ class FluxJointAttention(Attention):
         is_dual_stream = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
         txt_seq_len = encoder_hidden_states.shape[1] if is_dual_stream else 0
 
+        projection_hidden_states = (
+            qkv_hidden_states if qkv_hidden_states is not None else hidden_states
+        )
         query, key, value = self._prepare_qkv(
-            hidden_states, encoder_hidden_states, image_rotary_emb
+            projection_hidden_states, encoder_hidden_states, image_rotary_emb
         )
 
-        hidden_states = self._attn_impl(query, key, value, timestep=timestep)
+        attention_kwargs = {"timestep": timestep}
+        if self.requires_static_e4m3_attention:
+            if not self.static_e4m3_attention_scales_loaded:
+                raise RuntimeError(
+                    "Static CUTEDSL FP8 attention scales were not loaded. Quantize the "
+                    "checkpoint with ModelOpt --quantize-mha and preserve the Q/K/V amax tensors."
+                )
+            attention_kwargs.update(
+                {
+                    "static_q_scale": self._static_q_dequant_scale,
+                    "static_k_scale": self._static_k_dequant_scale,
+                    "static_v_scale": self._static_v_dequant_scale,
+                    "scale_q": self._static_q_dequant_scale_value,
+                    "scale_k": self._static_k_dequant_scale_value,
+                    "scale_v": self._static_v_dequant_scale_value,
+                }
+            )
+
+        hidden_states = self._attn_impl(query, key, value, **attention_kwargs)
         hidden_states = hidden_states.to(query.dtype)
 
         if is_dual_stream:

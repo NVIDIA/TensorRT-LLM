@@ -485,6 +485,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        scale_v_tensor: Optional[cute.Tensor],
         scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -613,6 +614,14 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             sink = cute.make_tensor(sink_tensor.iterator, sink_layout)
         else:
             sink = None
+
+        if cutlass.const_expr(scale_v_tensor is not None):
+            # One device-resident tensor-wide V dequantization scale, broadcast to all output
+            # elements. This remains dynamic across CUDA Graph replays.
+            scale_v_tensor_layout = cute.make_layout((1,), stride=(1,))
+            m_scale_v_tensor = cute.make_tensor(scale_v_tensor.iterator, scale_v_tensor_layout)
+        else:
+            m_scale_v_tensor = None
 
         if cutlass.const_expr(scale_v_channels is not None):
             # scale_v_channels is per (h_k, dv): shape (h_k * dv,) row-major.
@@ -898,6 +907,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             scale_softmax_log2,
             scale_softmax,
             scale_output,
+            m_scale_v_tensor,
             m_scale_v_channels,
             skip_softmax_threshold_log2,
             window_size_left,
@@ -947,6 +957,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        m_scale_v_tensor: Optional[cute.Tensor],
         m_scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -2063,6 +2074,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                     sO[None, None, 0],
                                     mLSE,
                                     mSink,
+                                    m_scale_v_tensor,
                                     m_scale_v_channels,
                                 ),
                                 (
@@ -2086,6 +2098,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                     sO[None, None, 1],
                                     mLSE,
                                     mSink,
+                                    m_scale_v_tensor,
                                     m_scale_v_channels,
                                 ),
                                 (
@@ -2128,6 +2141,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                 gO0,
                                 mLSE,
                                 mSink,
+                                m_scale_v_tensor,
                                 m_scale_v_channels,
                             ),
                             (s0_corr_consumer, mma_corr_consumer),
@@ -2145,6 +2159,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                 gO1,
                                 mLSE,
                                 mSink,
+                                m_scale_v_tensor,
                                 m_scale_v_channels,
                             ),
                             (s1_corr_consumer, mma_corr_consumer),
@@ -3533,6 +3548,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             dest_O,
             mLSE,
             mSink,
+            m_scale_v_tensor,
             m_scale_v_channels,
         ) = tensor_args
         row_idx, cuseqlen_q, seqlen_q, blk_coord, scale_softmax, scale_output = value_args
@@ -3599,6 +3615,8 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             )
             row_sum = row_sum + sink_exp
         scale = scale_output / row_sum
+        if cutlass.const_expr(m_scale_v_tensor is not None):
+            scale = scale * m_scale_v_tensor[0]
 
         if cutlass.const_expr(m_scale_v_channels is not None):
             scale_v_ch_h = m_scale_v_channels[None, blk_coord[2]]

@@ -37,6 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CpuOffloadConfig,
     CudaGraphConfig,
+    Nvfp4GemmConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
     TeaCacheConfig,
@@ -118,6 +119,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    nvfp4_gemm_config: Nvfp4GemmConfig = PydanticField(default_factory=Nvfp4GemmConfig)
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
@@ -185,6 +187,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    nvfp4_gemm_config: Nvfp4GemmConfig = PydanticField(default_factory=Nvfp4GemmConfig)
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
@@ -251,6 +254,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             dynamic_weight_quant=_model_config_value(self.dynamic_weight_quant),
             quant_config=_model_config_value(self.quant_config),
             quant_config_dict=_model_config_value(self.quant_config_dict),
+            nvfp4_gemm_config=_model_config_value(self.nvfp4_gemm_config),
             compilation=_model_config_value(self.compilation),
             torch_compile=_model_config_value(self.torch_compile),
             cuda_graph=_model_config_value(self.cuda_graph),
@@ -477,14 +481,15 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         Args:
             checkpoint_dir: Path to checkpoint
             args: VisualGenArgs containing user config
-                - (compilation_config, torch_compile_config, cuda_graph_config,
-                   cpu_offload_config, pipeline_config, attention_config, parallel_config,
-                   cache_config)
+                - (nvfp4_gemm_config, compilation_config, torch_compile_config,
+                   cuda_graph_config, cpu_offload_config, pipeline_config,
+                   attention_config, parallel_config, cache_config)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
 
         # Extract sub-configs from args or use defaults.
+        nvfp4_gemm_cfg = args.nvfp4_gemm_config if args else Nvfp4GemmConfig()
         compilation_cfg = args.compilation_config if args else CompilationConfig()
         torch_compile_cfg = args.torch_compile_config if args else TorchCompileConfig()
         cuda_graph_cfg = args.cuda_graph_config if args else CudaGraphConfig()
@@ -499,7 +504,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
-        extra_attrs: Dict[str, Any] = {}
+        extra_attrs: Dict[str, Any] = {
+            "nvfp4_gemm_allowed_backends": list(nvfp4_gemm_cfg.allowed_backends)
+        }
 
         # LTX-2 stage-2 paths (spatial_upsampler_path, distilled_lora_path)
         # are surfaced to the LTX2 pipeline consumer via extra_attrs. The
@@ -648,6 +655,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         pipeline_config = cls(
             quant_config=quant_config,
+            nvfp4_gemm_config=nvfp4_gemm_cfg,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,

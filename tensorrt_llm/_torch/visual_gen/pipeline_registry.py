@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -150,8 +151,11 @@ class AutoPipeline:
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
-        # Instantiate pipeline with DiffusionPipelineConfig
-        return pipeline_class(config)
+        # Bind the per-model attributes while modules are constructed. Linear
+        # uses this context to resolve optional GEMM backends, matching the LLM
+        # model-construction path.
+        with model_extra_attrs(config.extra_attrs):
+            return pipeline_class(config)
 
     @staticmethod
     def _detect_from_checkpoint(checkpoint_dir: str) -> str:

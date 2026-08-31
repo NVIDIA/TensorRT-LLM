@@ -128,6 +128,43 @@ def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
     assert transformer_2_config.pretrained_config.num_attention_heads == 32
 
 
+def test_nvfp4_gemm_config_propagates_to_model_extra_attrs(tmp_path):
+    """VisualGen reuses the LLM config and exposes its backend list to Linear."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.llmapi.llm_args import Nvfp4GemmConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "FluxPipeline",
+                "transformer": ["diffusers", "FluxTransformer2DModel"],
+            }
+        )
+    )
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text(
+        json.dumps({"_class_name": "FluxTransformer2DModel"})
+    )
+
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path),
+        args=VisualGenArgs(
+            model=str(tmp_path),
+            nvfp4_gemm_config={"allowed_backends": ["cutedsl", "cutlass"]},
+        ),
+    )
+
+    assert isinstance(config.nvfp4_gemm_config, Nvfp4GemmConfig)
+    assert config.nvfp4_gemm_config.allowed_backends == ["cutedsl", "cutlass"]
+    assert config.extra_attrs["nvfp4_gemm_allowed_backends"] == ["cutedsl", "cutlass"]
+    assert config.primary_model_config.extra_attrs["nvfp4_gemm_allowed_backends"] == [
+        "cutedsl",
+        "cutlass",
+    ]
+
+
 def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
