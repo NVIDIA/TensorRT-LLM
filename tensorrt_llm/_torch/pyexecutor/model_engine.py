@@ -1325,6 +1325,11 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextmanager
     def _without_torch_compile(self):
+        """
+        When compile_only_piecewise_graphs is enabled in TorchCompileConfig,
+        this ctxt manager bypasses torch.compile invocation anywhere outside
+        of piecewise CUDA graph capture and warmup.
+        """
         if self._phase_selective_forward is None:
             yield
             return
