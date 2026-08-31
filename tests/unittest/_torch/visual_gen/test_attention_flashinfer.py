@@ -229,14 +229,16 @@ def test_flashinfer_rejects_causal_attention_with_padding_mask() -> None:
         pytest.param(1, PredefinedAttentionMask.CAUSAL, id="causal_gqa"),
     ),
 )
+@pytest.mark.parametrize("qk_dtype", ("mxfp8", "nvfp4"))
 @pytest.mark.usefixtures("require_flashinfer_cuda")
-def test_flashinfer_nvfp4_attention_sm100_matches_sdpa(
+def test_flashinfer_blockscaled_attention_sm10x_matches_sdpa(
+    qk_dtype: str,
     num_kv_heads: int,
     attention_mask: PredefinedAttentionMask,
 ) -> None:
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
-        pytest.skip("This FlashInfer NVFP4 recipe requires SM100 or SM103.")
+        pytest.skip("This FlashInfer block-scaled recipe requires SM100 or SM103.")
 
     torch.manual_seed(2)
     q = torch.randn((1, 129, 2, 128), device="cuda", dtype=torch.bfloat16) * 0.2
@@ -246,7 +248,7 @@ def test_flashinfer_nvfp4_attention_sm100_matches_sdpa(
         num_heads=2,
         num_kv_heads=num_kv_heads,
         head_dim=128,
-        quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8"),
+        quant_attention_config=QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype="fp8"),
     )
 
     output, lse = attention.forward_with_lse(q, k, v, attention_mask=attention_mask)
@@ -309,4 +311,21 @@ def test_flashinfer_nvfp4_attention_sm12x_rejects_unaligned_sequence_length() ->
     )
 
     with pytest.raises(ValueError, match="multiple of 128"):
+        attention(q, q, q)
+
+
+@pytest.mark.usefixtures("require_flashinfer_cuda")
+def test_flashinfer_mxfp8_attention_is_rejected_on_sm12x() -> None:
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((12, 0), (12, 1)):
+        pytest.skip("This FlashInfer MXFP8 rejection test requires SM120 or SM121.")
+
+    q = torch.randn((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    attention = FlashInferAttention(
+        num_heads=2,
+        head_dim=128,
+        quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="fp8"),
+    )
+
+    with pytest.raises(RuntimeError, match="qk_dtype='mxfp8'.*SM100/SM103"):
         attention(q, q, q)

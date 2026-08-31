@@ -4,7 +4,7 @@
 
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -15,15 +15,16 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _LN_2 = math.log(2.0)
+_BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
 
 
 class FlashInferAttention(AttentionBackend):
     """Dense FlashInfer attention without an LLM KV cache.
 
     The backend accepts the VisualGen NHD layout ``[B, S, H, D]``. The FP16/BF16
-    path uses FlashInfer's single-request or batched ragged prefill kernel. NVFP4
-    dispatches to FlashInfer's SM100/SM103 block-scaled FMHA or its SM120/SM121
-    dense NVFP4 FMHA, according to the validated YAML recipe.
+    path uses FlashInfer's single-request or batched ragged prefill kernel. Block-scaled
+    MXFP8 or NVFP4 Q/K dispatches to FlashInfer's SM100/SM103 FMHA with FP8 V. The
+    SM120/SM121 path supports dense NVFP4 Q/K/V, according to the validated YAML recipe.
     """
 
     def __init__(
@@ -51,9 +52,12 @@ class FlashInferAttention(AttentionBackend):
 
         self._single_prefill = self._load_flashinfer_api("single_prefill_with_kv_cache")
         self._batch_prefill_cls = self._load_flashinfer_api("BatchPrefillWithRaggedKVCacheWrapper")
-        if quant_attention_config is not None and quant_attention_config.qk_dtype != "nvfp4":
+        if quant_attention_config is not None and quant_attention_config.qk_dtype not in (
+            "mxfp8",
+            "nvfp4",
+        ):
             raise ValueError(
-                "FlashInfer quantized attention supports qk_dtype='nvfp4', "
+                "FlashInfer quantized attention supports qk_dtype='mxfp8' or 'nvfp4', "
                 f"got {quant_attention_config.qk_dtype!r}."
             )
 
@@ -258,17 +262,18 @@ class FlashInferAttention(AttentionBackend):
         quantized = (tensor / scale).clamp(min=fp8_info.min, max=fp8_info.max)
         return quantized.to(fp8_dtype).contiguous(), scale
 
-    def _run_nvfp4_sm100(
+    def _run_blockscaled_sm10x(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         *,
+        qk_mode: _BlockScaledQKMode,
         is_causal: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.head_dim != 128:
             raise ValueError(
-                "FlashInfer SM100/SM103 NVFP4 attention requires head_dim=128, "
+                "FlashInfer SM100/SM103 block-scaled attention requires head_dim=128, "
                 f"got {self.head_dim}."
             )
         try:
@@ -278,11 +283,11 @@ class FlashInferAttention(AttentionBackend):
             from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
         except ImportError as exc:
             raise ImportError(
-                "VisualGen FLASHINFER NVFP4 attention on SM100/SM103 requires "
+                "VisualGen FLASHINFER block-scaled attention on SM100/SM103 requires "
                 "FlashInfer's CuTe DSL block-scaled FMHA APIs."
             ) from exc
 
-        q_store, k_store, q_sf, k_sf, q_scale, k_scale = quantize_blockscaled_qk(q, k, "nvfp4")
+        q_store, k_store, q_sf, k_sf, q_scale, k_scale = quantize_blockscaled_qk(q, k, qk_mode)
         v_store, v_scale = self._quantize_fp8_per_tensor(v)
         output = torch.empty_like(q)
         lse = torch.empty(
@@ -297,7 +302,7 @@ class FlashInferAttention(AttentionBackend):
             k_sf,
             v_store,
             output,
-            qk_mode="nvfp4",
+            qk_mode=qk_mode,
             is_causal=is_causal,
             sm_scale=self.scale,
             lse=lse,
@@ -402,17 +407,34 @@ class FlashInferAttention(AttentionBackend):
                 key_padding_mask=key_padding_mask,
             )
         if key_padding_mask is not None:
-            raise ValueError("FlashInfer NVFP4 attention does not support key padding masks.")
+            raise ValueError("FlashInfer quantized attention does not support key padding masks.")
 
         capability = torch.cuda.get_device_capability(q.device)
-        if capability in ((10, 0), (10, 3)) and quant_config.v_dtype == "fp8":
-            return self._run_nvfp4_sm100(q, k, v, is_causal=is_causal)
-        if capability in ((12, 0), (12, 1)) and quant_config.v_dtype == "nvfp4":
+        qk_dtype = quant_config.qk_dtype
+        if (
+            capability in ((10, 0), (10, 3))
+            and qk_dtype in ("mxfp8", "nvfp4")
+            and quant_config.v_dtype == "fp8"
+        ):
+            return self._run_blockscaled_sm10x(
+                q,
+                k,
+                v,
+                qk_mode=qk_dtype,
+                is_causal=is_causal,
+            )
+        if (
+            capability in ((12, 0), (12, 1))
+            and qk_dtype == "nvfp4"
+            and quant_config.v_dtype == "nvfp4"
+        ):
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
         raise RuntimeError(
-            "Unsupported FlashInfer NVFP4 attention recipe for "
-            f"SM{capability[0]}{capability[1]}: v_dtype={quant_config.v_dtype!r}. "
-            "Use v_dtype='fp8' on SM100/SM103 or v_dtype='nvfp4' on SM120/SM121."
+            "Unsupported FlashInfer quantized attention recipe for "
+            f"SM{capability[0]}{capability[1]}: qk_dtype={qk_dtype!r}, "
+            f"v_dtype={quant_config.v_dtype!r}. Use qk_dtype='mxfp8' or 'nvfp4' with "
+            "v_dtype='fp8' on SM100/SM103, or qk_dtype='nvfp4' with "
+            "v_dtype='nvfp4' on SM120/SM121."
         )
 
     @property
