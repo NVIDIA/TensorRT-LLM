@@ -305,7 +305,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._prioritize_first_token_gen:
             requests_list.sort(
                 key=lambda req: (
-                    0 if (req.is_generation_only_request() and req.py_decoding_iter == 0) else 1
+                    0 if (req.is_generation_only_request and req.py_decoding_iter == 0) else 1
                 )
             )
 
@@ -550,6 +550,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
         """
+        # No `should_add_sequence` gate here, unlike V1. That predicate stays
+        # false from the moment an asynchronous load completes until
+        # `request_finished`, which only runs at the end of generation, so V2
+        # would SKIP the request forever and never run the prefill the load was
+        # for. What keeps a loading request out of the batch instead is its
+        # DISAGG_GENERATION_TRANS_IN_PROGRESS state, and what stops the
+        # connector being asked or told twice is the per-request query state
+        # (see KVCacheManagerV2._connector_prefix_position).
         if self.chunking_enabled:
             return self._try_schedule_context_chunked(req, budget)
         return self._try_schedule_context_full(req, budget)
