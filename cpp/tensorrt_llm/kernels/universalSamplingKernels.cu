@@ -456,10 +456,16 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
 
     // --- Pass 4: kept mass. Skipped when no filter can have removed anything, in which
     //     case pass 2's total already is the kept mass.
+    //
+    //     The per-thread partial is kept in a register rather than discarded: the sampling
+    //     pass below needs exactly this sum, over exactly this traversal, to seed its
+    //     scan. Recomputing it there cost a second full sweep of the row on every
+    //     filtered tokens call -- which is precisely the case that was missing its gate.
     float keptMass = sTotalMass;
+    float localKept = 0.0f;
+    bool haveLocalKept = false;
     if (threshold > 0.0f)
     {
-        float localKept = 0.0f;
         forEachLogit(rowLogits, vocabSize,
             [&](int, float logit)
             {
@@ -469,6 +475,7 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
                     localKept += w;
                 }
             });
+        haveLocalKept = true;
         float const blockKept = BlockReduceF(temp.reduceF).Sum(localKept);
         if (tid == 0)
         {
@@ -483,6 +490,10 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     {
         keptMass = sTotalMass;
         threshold = 0.0f;
+        // The cached partial was summed against the threshold just abandoned, so it no
+        // longer describes the set the sampler is about to walk.
+        localKept = 0.0f;
+        haveLocalKept = false;
     }
 
     // --- Pass 5: the renormalized distribution.
@@ -544,16 +555,20 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
         // Each thread sums its own strided elements, an exclusive scan gives it the mass
         // below it, and then only the thread whose span contains the target re-walks --
         // in the same order, so the two accumulations agree.
-        float localKept = 0.0f;
-        forEachLogit(rowLogits, vocabSize,
-            [&](int, float logit)
-            {
-                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                if (w >= threshold)
+        // Already summed by pass 4 whenever a filter ran; only an unfiltered row still
+        // owes this sweep.
+        if (!haveLocalKept)
+        {
+            forEachLogit(rowLogits, vocabSize,
+                [&](int, float logit)
                 {
-                    localKept += w;
-                }
-            });
+                    float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                    if (w >= threshold)
+                    {
+                        localKept += w;
+                    }
+                });
+        }
         float base = 0.0f;
         BlockScanF(temp.scanF).ExclusiveSum(localKept, base);
         __syncthreads();
