@@ -27,6 +27,7 @@ from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from tensorrt_llm._torch.configs.nemotron_h import NemotronHConfig
 
 
 def _register_custom_configs_with_transformers() -> None:
@@ -83,6 +84,16 @@ def _register_custom_configs_with_transformers() -> None:
             continue
         CONFIG_MAPPING.register(model_type, config_class, exist_ok=True)
 
+    # `nemotron_h` is the one model_type we override rather than gap-fill.
+    # transformers 5.5.x ships a native NemotronHConfig, but it cannot represent
+    # dense Nemotron-H checkpoints: `hybrid_override_pattern` strings containing
+    # "-" (MLP) layers raise `KeyError: '-'` during config construction, so
+    # AutoConfig -- and therefore AutoTokenizer -- fails outright. Our
+    # NemotronHConfig.from_dict delegates straight back to the native class for
+    # every pattern transformers can express, so this only affects checkpoints
+    # that cannot be loaded at all today.
+    CONFIG_MAPPING.register("nemotron_h", NemotronHConfig, exist_ok=True)
+
 
 _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
@@ -102,4 +113,5 @@ __all__ = [
     "LagunaConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "NemotronHConfig",
 ]

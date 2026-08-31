@@ -28,6 +28,7 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHForCausalLM
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
+from tensorrt_llm._torch.configs import NemotronHConfig
 
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 
@@ -107,6 +108,24 @@ def _set_gate_weights(module):
         if type(mod).__name__ == "NemotronHTopkRouter":
             if hasattr(mod, "weight"):
                 mod.weight = torch.nn.Parameter(torch.randn_like(mod.weight))
+
+
+@pytest.mark.cpu_only
+def test_custom_model_accepts_factory_model_kwargs():
+    config = NemotronHConfig(
+        hybrid_override_pattern="-",
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+    )
+
+    model = NemotronHForCausalLM._from_config(config, use_cache=False)
+
+    assert isinstance(model, NemotronHForCausalLM)
+    assert model.config is config
 
 
 @pytest.mark.parametrize(
