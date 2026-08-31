@@ -55,35 +55,23 @@ constexpr int kOffloadStages = static_cast<int>(kOffloadInFlightBytes / kStageBy
 constexpr int kOnboardStages = static_cast<int>(kOnboardInFlightBytes / kStageBytesPerCta);
 static_assert(kOffloadStages >= 2 && kOnboardStages >= 2, "thread count too large for these depths");
 
-//! Per-CTA throughput of THIS kernel on a coherent link; the `lambda` of a Little's Law
-//! concurrency estimate. Only C2C platforms reach the kernel path, so this is a C2C figure.
+//! Per-CTA throughput of this kernel, the `lambda` of a Little's Law concurrency estimate.
+//! Profiled on GH200 at 1 MiB pages and fitted to `X = min(N*lambda, Xmax)` (0.78% RMS).
 //!
-//! A simple contiguous copy with no page indirection sustains ~45 GB/s per CTA, and that figure
-//! was used here originally -- but it does not transfer. Measured on GH200 at 1 MiB pages this
-//! kernel sustains ~30 GB/s per CTA, so sizing from 45 under-provisions the grid by ~1.5x (8 CTAs
-//! where ~12 are wanted) and leaves roughly 30% of the link unused.
-//!
-//! Note this constant is link-latency dependent, not purely a property of the kernel: per-CTA
-//! bandwidth is in-flight/latency, so PCIe measures ~13.5 GB/s per CTA for the same 32 KiB depth.
-//! If the PCIe path is ever revisited it needs its own value, not this one.
-//!
-//! The difference is executed instruction count, not bandwidth: for the same 256 MiB this kernel
-//! retires 462.5M thread-instructions against the contiguous kernel's 360.8M (1.28x, about 6 extra
-//! per 16-byte element) for the cursor advance, range predicates and address forms. That ratio was
-//! 1.72x before cp.async's source-size operand allowed the issue to become unconditional. Closing
-//! the remainder is open work; if it lands, this constant should move back toward 45.
-constexpr double kPerCtaGBs = 30.0;
+//! C2C figure: per-CTA bandwidth is in-flight/latency, so a PCIe path would need its own value.
+//! Keep branches and selects out of the page-base load's address computation; one there cost 29%.
+constexpr double kPerCtaGBs = 43.0;
 //! Fraction of nominal link bandwidth actually achieved (measured 79%-86%).
 constexpr double kLinkEfficiency = 0.80;
 //! Sustained per-socket host bandwidth on Grace, direction-symmetric: GH200 peaks at 355 GB/s
 //! writing and 351 GB/s reading against a 447 GB/s link that does not bind. ~69% of the 512 GB/s
 //! LPDDR5X spec. PCIe hosts are never limited by this, so it is applied only on coherent links.
 constexpr double kHostSustainedGBs = 355.0;
-//! Grid multipliers targeting ~85% of plateau. Offload scales linearly to its knee, so 0.90 of
-//! the Little's Law count lands just below it. Onboard rolls off gradually and needs 1.25x; that
-//! value is pinned by GH200, the softest knee measured.
+//! Grid multipliers. The directions differ in curve shape, not per-CTA throughput: offload is
+//! linear then hard-clamps, onboard rolls off gradually (soft knee, p = 2.2) and must overshoot.
+//! Selects 8 and 12 CTAs on GH200, at 97% and 94% of plateau.
 constexpr double kOffloadGridMult = 0.90;
-constexpr double kOnboardGridMult = 1.25;
+constexpr double kOnboardGridMult = 1.45;
 
 //! Conservative link bandwidths used when NVML is unavailable.
 constexpr double kFallbackCoherentGBs = 223.6; //!< the narrower (2 GPUs per Grace) C2C config
@@ -161,16 +149,13 @@ __device__ __forceinline__ void waitAsyncGroup()
 //! element costs roughly half the achievable bandwidth.
 __device__ __forceinline__ void pageBasesFor(CopyArgs const& args, uint32_t page, char const*& srcPage, char*& dstPage)
 {
-    if (page >= args.numPairs)
-    {
-        srcPage = nullptr;
-        dstPage = nullptr;
-        return;
-    }
+    // Plain index: any select here would sit in the dependency chain of this load, which is the
+    // only global read on the address path and therefore latency-critical. Callers guarantee the
+    // page is in range instead, checked here in debug builds only.
+    assert(page < args.numPairs);
     PageIndexPair const pair = args.pairs[page];
-    // Indices are signed, so a stale or out-of-band pair would sign-extend into a huge unsigned
-    // offset and produce a wild address rather than a clean fault. Debug builds only: this is on
-    // the per-page address path, and the release build must not pay for it.
+    // A negative index would sign-extend into a huge unsigned offset and produce a wild address
+    // rather than a clean fault.
     assert(pair.src >= 0 && pair.dst >= 0);
     srcPage = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
     dstPage = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
@@ -222,9 +207,12 @@ public:
         char* dstPage = nullptr;
         pageBasesFor(mArgs.common, cursor.page, srcPage, dstPage);
         uint64_t const chunkBytes = static_cast<uint64_t>(cursor.chunk) * kStageBytes;
-        cursor.srcTile = srcPage == nullptr ? nullptr : srcPage + chunkBytes;
-        cursor.dstTile = dstPage == nullptr ? nullptr : dstPage + chunkBytes;
-        setChunkBound(cursor);
+        cursor.srcTile = srcPage + chunkBytes;
+        cursor.dstTile = dstPage + chunkBytes;
+        if constexpr (!Exact)
+        {
+            setChunkBound(cursor);
+        }
         return cursor;
     }
 
@@ -234,14 +222,26 @@ public:
         {
             cursor.chunk = 0;
             ++cursor.page;
-            pageBasesFor(mArgs.common, cursor.page, cursor.srcTile, cursor.dstTile);
+            if (cursor.page < mArgs.common.numPairs)
+            {
+                pageBasesFor(mArgs.common, cursor.page, cursor.srcTile, cursor.dstTile);
+            }
+            // Past the end the cursor keeps the previous page's bases. It is never resolved, so
+            // the stale value is unused; leaving it alone keeps the range test off the hot path.
         }
-        else if (cursor.srcTile != nullptr)
+        else
         {
+            // Unconditional: pageBasesFor never yields null, so the old null test was dead. With
+            // tilesPerPage large this is the dominant path (255 of 256 advances at 1 MiB pages).
             cursor.srcTile += kStageBytes;
             cursor.dstTile += kStageBytes;
         }
-        setChunkBound(cursor);
+        if constexpr (!Exact)
+        {
+            // Exact never reads elemsThisChunk (resolve returns true unconditionally), so the
+            // per-tile bound computation is dead there.
+            setChunkBound(cursor);
+        }
     }
 
     __device__ bool resolve(Cursor const& cursor, int item, char const*& src, char*& dst) const
@@ -432,35 +432,29 @@ __device__ __forceinline__ void runCopyPipeline(Mapper const& mapper, uint32_t t
         mapper.advance(load);
     }
 
-    for (uint32_t tile = begin; tile < end; ++tile)
+    // The last `Stages` tiles have no successor to prefetch, so they need a shallower wait and no
+    // issue. Hoisting that split out of the loop makes the steady-state body branch-free: both the
+    // wait depth and the issue become unconditional, which is worth ~2 branches per element.
+    uint32_t const tail = static_cast<uint32_t>(Stages);
+    uint32_t const steadyEnd = (end - begin > tail) ? end - tail : begin;
+
+    // Stages is a compile-time constant, and at the default 128 threads it is a power of two
+    // (8 or 16), so this lowers to a mask. A thread-count override that makes it non-power-of-two
+    // (e.g. 192 threads gives 5) still compiles, but pays a real division here.
+    auto stageBufferFor = [&](uint32_t tile) -> char*
     {
-        uint32_t const nextTile = tile + static_cast<uint32_t>(Stages);
-        if (nextTile < end)
-        {
-            waitAsyncGroup<Stages - 1>();
-        }
-        else
-        {
-            waitAsyncGroup<0>();
-        }
-
-        // Stages is a compile-time constant, and at the default 128 threads it is a power of two
-        // (8 or 16), so this lowers to a mask. A thread-count override that makes it non-power-of-
-        // two (e.g. HDC_THREADS=192 gives 5) still compiles, but pays a real division here.
         int const stage = static_cast<int>((tile - begin) % static_cast<uint32_t>(Stages));
-        char* const stageBuffer = sharedMemory + static_cast<size_t>(stage) * kStageBytes;
+        return sharedMemory + static_cast<size_t>(stage) * kStageBytes;
+    };
 
-        // Drain the stage into registers before it is reused by the prefetch below.
-        //
-        // This is a WAR on the stage buffer with no barrier, which is safe on both counts:
-        // across threads there is no hazard (each thread owns its own 16-byte slot), and within a
-        // thread the reissue cannot be hoisted above these loads because asyncCopy16's asm carries
-        // a "memory" clobber, which is a full compiler-ordering barrier. No fence instruction is
-        // needed -- a membar here would cost issue slots for an ordering the clobber already
-        // guarantees.
-        uint4 values[Ilp];
-        bool active[Ilp];
-        char* targets[Ilp];
+    // Drain a stage into registers. Must happen before the buffer is reused by the prefetch.
+    //
+    // This is a WAR on the stage buffer with no barrier, which is safe on both counts: across
+    // threads there is no hazard (each thread owns its own 16-byte slot), and within a thread the
+    // reissue cannot be hoisted above these loads because asyncCopy16's asm carries a "memory"
+    // clobber, a full compiler-ordering barrier. No fence instruction is needed.
+    auto drain = [&](char* stageBuffer, uint4(&values)[Ilp], bool(&active)[Ilp], char*(&targets)[Ilp])
+    {
 #pragma unroll
         for (int item = 0; item < Ilp; ++item)
         {
@@ -474,13 +468,10 @@ __device__ __forceinline__ void runCopyPipeline(Mapper const& mapper, uint32_t t
                     stageBuffer + static_cast<size_t>(item * Threads + threadIdx.x) * 16u);
             }
         }
+    };
 
-        if (nextTile < end)
-        {
-            issue(load, stageBuffer);
-        }
-        mapper.advance(load);
-
+    auto writeOut = [&](uint4 const(&values)[Ilp], bool const(&active)[Ilp], char* const(&targets)[Ilp])
+    {
 #pragma unroll
         for (int item = 0; item < Ilp; ++item)
         {
@@ -489,6 +480,36 @@ __device__ __forceinline__ void runCopyPipeline(Mapper const& mapper, uint32_t t
                 *reinterpret_cast<uint4*>(targets[item]) = values[item];
             }
         }
+    };
+
+    // Steady state: every tile has a successor `Stages` ahead, so the pipeline stays exactly
+    // `Stages` groups deep and nothing here is conditional on the tile index.
+    for (uint32_t tile = begin; tile < steadyEnd; ++tile)
+    {
+        waitAsyncGroup<Stages - 1>();
+        char* const stageBuffer = stageBufferFor(tile);
+        uint4 values[Ilp];
+        bool active[Ilp];
+        char* targets[Ilp];
+        drain(stageBuffer, values, active, targets);
+        issue(load, stageBuffer);
+        mapper.advance(load);
+        writeOut(values, active, targets);
+        mapper.advance(store);
+    }
+
+    // Epilogue: drain the remaining in-flight stages. `load` is dead from here, so it is not
+    // advanced. waitAsyncGroup<0> is over-strict (it retires every outstanding group on the first
+    // iteration rather than one at a time) but this runs at most `Stages` times.
+    for (uint32_t tile = steadyEnd; tile < end; ++tile)
+    {
+        waitAsyncGroup<0>();
+        char* const stageBuffer = stageBufferFor(tile);
+        uint4 values[Ilp];
+        bool active[Ilp];
+        char* targets[Ilp];
+        drain(stageBuffer, values, active, targets);
+        writeOut(values, active, targets);
         mapper.advance(store);
     }
 }
