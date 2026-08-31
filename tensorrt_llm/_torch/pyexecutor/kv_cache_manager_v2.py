@@ -1248,6 +1248,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
         self._allocated_draft_lens: dict[int, int] = {}
 
+        # Draft mirror only: tokens this scheduling pass has already promised
+        # via can_reserve_draft_generation.  Each probe grows the mirror and
+        # immediately restores it, so it reserves nothing; without a running
+        # tally N requests could each pass against the same free pages and then
+        # collectively exhaust the mirror in _prepare_draft_resources.  Charging
+        # every probe against this total closes that window.  Reset per
+        # scheduling pass by begin_draft_admission_pass().
+        self._probed_draft_gen_tokens: int = 0
+
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -2616,6 +2625,110 @@ class KVCacheManagerV2(BaseResourceManager):
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
+    def _ensure_draft_mirror(self, req: LlmRequest):
+        """Create the request's draft mirror if needed and reactivate it.
+
+        Returns the mirror, or None when it could not be created (saturated
+        IndexMapper) or resumed.  Both are back-pressure, not errors, and the
+        caller must defer the request rather than schedule one whose mirror is
+        missing: its spec-dec forward would then read an absent entry.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            kv_cache = self._create_kv_cache(
+                req.py_request_id,
+                req.lora_task_id,
+                None,
+                cache_salt=req.cache_salt,
+                is_dummy=req.is_dummy,
+            )
+            if kv_cache is None:
+                return None
+            # The old draft path omitted this; the mirror must carry the
+            # manager's stream like every other cache this class creates (cf.
+            # _prepare_context_impl and _try_schedule_cross_context_v2).
+            kv_cache.cuda_stream = self._stream.cuda_stream
+            kv_cache.stop_committing()
+        if not self._resume_and_restore(req.py_request_id, kv_cache):
+            return None
+        return kv_cache
+
+    def _mirror_context_capacity(self, req: LlmRequest, capacity: int) -> bool:
+        """Mirror *req* and grow it to *capacity*; False if either step failed."""
+        kv_cache = self._ensure_draft_mirror(req)
+        if kv_cache is None:
+            return False
+        return kv_cache.resize(max(kv_cache.capacity, capacity))
+
+    def _draft_gen_growth(self, req: LlmRequest) -> int:
+        """Tokens the mirror must gain for one decode step of *req*.
+
+        The same 1 + draft tokens the primary pool grows by, padded up to
+        _kv_reserve_draft_tokens (see __init__); the padding is a no-op when
+        reserve == draft_token_length.
+        """
+        return self._required_gen_capacity(req, 0) + max(
+            self._kv_reserve_draft_tokens - get_draft_token_length(req), 0
+        )
+
+    def reserve_draft_context(self, req: LlmRequest, num_tokens: int) -> bool:
+        """Reserve draft-mirror context capacity during admission.
+
+        The mirror is otherwise only touched in ``_prepare_draft_resources``,
+        which runs after scheduling where a shortfall can no longer be deferred.
+        Reserving here lets the scheduler treat mirror exhaustion the way it
+        already treats primary exhaustion (skip and retry next iteration), as
+        ``_try_schedule_cross_context_v2`` does for the enc-dec cross pool.  The
+        caller releases the pages held by a refused chunk.
+
+        *num_tokens* is the target-side chunk size (plus draft tokens on the
+        last chunk), i.e. the same value passed to ``resize_context``.
+        """
+        target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
+        return self._mirror_context_capacity(req, target)
+
+    def begin_draft_admission_pass(self) -> None:
+        """Clear the per-pass probe tally before a scheduling pass admits requests."""
+        self._probed_draft_gen_tokens = 0
+
+    def can_reserve_draft_generation(self, req: LlmRequest) -> bool:
+        """Whether the mirror can afford this request's next decode step.
+
+        A *probe*, not a reservation: the growth is undone before returning, so
+        the mirror is left exactly as it was and ``_prepare_draft_resources``
+        still performs the real allocation. Probing rather than pre-allocating
+        keeps ``update_resources``' capacity/history bookkeeping — which assumes
+        the mirror grows once per decode step — untouched.
+
+        Every failure mode ``_prepare_draft_resources`` can hit for a generation
+        request must be covered here, because that call site runs after
+        scheduling where deferral is no longer possible.  That includes a
+        *missing* mirror and a *suspended* one: ``resume()`` returning False is a
+        documented refusal under GPU pressure (see ``resume_request``), not an
+        error, so it has to become a scheduling deferral rather than a raise.
+        """
+        # _ensure_draft_mirror covers both: a mirror missing because creation was
+        # deferred while the IndexMapper was saturated, and a suspended one whose
+        # resume() is refused.
+        kv_cache = self._ensure_draft_mirror(req)
+        if kv_cache is None:
+            return False
+
+        pre_cap = kv_cache.capacity
+        growth = self._draft_gen_growth(req)
+        # Charge the growth this pass has already promised to other requests, so
+        # sequential probes cannot all pass against the same free pages.
+        target = pre_cap + growth + self._probed_draft_gen_tokens
+        if not kv_cache.resize(target):
+            return False
+        if not kv_cache.resize(pre_cap):
+            raise RuntimeError(
+                f"Failed to undo draft KV cache generation probe for request "
+                f"{req.py_request_id} from {target} to {pre_cap}"
+            )
+        self._probed_draft_gen_tokens += growth
+        return True
+
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
@@ -2725,62 +2838,49 @@ class KVCacheManagerV2(BaseResourceManager):
         its IndexMapper contains the correct request IDs for
         copy_batch_block_offsets().
         """
+        # Snapshot the chunking cursors *before* request_context flips
+        # use_draft_model: that flag switches context_current_position and
+        # context_chunk_size to a second, draft-side cursor pair that is
+        # initialized to prompt_len and only ever written by a two-model drafter.
+        # A one-model mirror has no prefill of its own, so reading it inside the
+        # block would size the mirror to the whole prompt on the first chunk.
+        ctx_capacities = [
+            req.context_current_position
+            + req.context_chunk_size
+            + get_draft_token_length(req)
+            + self.num_extra_kv_tokens
+            for req in scheduled_batch.context_requests
+        ]
+
+        # This runs after scheduling, so a shortfall can no longer be deferred.
+        # reserve_draft_context / can_reserve_draft_generation already secured
+        # each request's capacity at admission, making the resizes below normally
+        # no-ops.  If one still cannot be sized we warn and carry on with
+        # whatever capacity the mirror has (the same tolerance
+        # add_dummy_requests already applies to a draft resize failure) rather
+        # than raising, which would kill the executor loop on every rank.
         with request_context(True, scheduled_batch):
-            for req in scheduled_batch.context_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
-                if kv_cache is None:
-                    kv_cache = self._create_kv_cache(
+            for req, capacity in zip(scheduled_batch.context_requests, ctx_capacities):
+                if not self._mirror_context_capacity(req, capacity):
+                    logger.warning(
+                        "Draft KV cache context mirroring deferred for request %s "
+                        "(target %d tokens); retrying next iteration.",
                         req.py_request_id,
-                        req.lora_task_id,
-                        None,
-                        cache_salt=req.cache_salt,
-                        is_dummy=req.is_dummy,
-                    )
-                    if kv_cache is None:
-                        # Saturated IndexMapper (e.g. slots held by disagg
-                        # generation transfers in flight): skip mirroring this
-                        # request for now; it is retried next iteration once
-                        # slots free up, before the request runs any spec-dec
-                        # forward that needs the mirror.
-                        continue
-                    kv_cache.stop_committing()
-                if not self._resume_and_restore(req.py_request_id, kv_cache):
-                    raise RuntimeError(
-                        f"Failed to resume draft KV cache for request {req.py_request_id}"
-                    )
-                draft_len = get_draft_token_length(req)
-                capacity = (
-                    req.context_current_position
-                    + req.context_chunk_size
-                    + draft_len
-                    + self.num_extra_kv_tokens
-                )
-                if not kv_cache.resize(capacity):
-                    raise RuntimeError(
-                        f"Draft KV cache context resize failed for request "
-                        f"{req.py_request_id}: could not resize to {capacity} tokens"
+                        capacity,
                     )
 
             for req in scheduled_batch.generation_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
-                if kv_cache is None:
-                    raise RuntimeError(
-                        f"Missing draft KV cache for generation request {req.py_request_id}"
-                    )
-                if not self._resume_and_restore(req.py_request_id, kv_cache):
-                    raise RuntimeError(
-                        f"Failed to resume draft KV cache for request {req.py_request_id}"
-                    )
-                new_cap = self._required_gen_capacity(req, kv_cache.capacity)
-                # Pad the resize up to _kv_reserve_draft_tokens (see __init__);
-                # no-op when reserve == draft_token_length.
-                reserve_slack = self._kv_reserve_draft_tokens - get_draft_token_length(req)
-                if reserve_slack > 0:
-                    new_cap += reserve_slack
-                if not kv_cache.resize(new_cap):
-                    raise RuntimeError(
-                        f"Draft KV cache generation resize failed for request "
-                        f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                # A missing mirror is created rather than skipped: the request is
+                # already scheduled, and copy_batch_block_offsets resolves its ID
+                # through the IndexMapper, which aborts on an unknown ID.
+                growth = self._draft_gen_growth(req)
+                kv_cache = self._ensure_draft_mirror(req)
+                if kv_cache is None or not kv_cache.resize(kv_cache.capacity + growth):
+                    logger.warning(
+                        "Draft KV cache generation mirroring deferred for request %s "
+                        "(+%d tokens); retrying next iteration.",
+                        req.py_request_id,
+                        growth,
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:

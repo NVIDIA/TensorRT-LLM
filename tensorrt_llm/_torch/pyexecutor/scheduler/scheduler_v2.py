@@ -244,6 +244,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        if self.draft_kv_cache_manager is not None:
+            self.draft_kv_cache_manager.begin_draft_admission_pass()
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -596,6 +598,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.kv_cache_manager.resize_context(req, context_tokens + draft_len):
             return ScheduleAction.SKIP, 0, False
 
+        if not self._try_reserve_draft_context(req, context_tokens + draft_len):
+            self._suspend_request(req)
+            return ScheduleAction.SKIP, 0, False
+
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
             self._suspend_request(req)
@@ -696,6 +702,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
         if not self.kv_cache_manager.resize_context(req, resize_tokens):
+            return ScheduleAction.SKIP, 0, False
+
+        if not self._try_reserve_draft_context(req, resize_tokens):
+            self._suspend_request(req)
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -962,6 +972,36 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return True
 
+    def _try_reserve_draft_context(self, req: LlmRequest, num_tokens: int) -> bool:
+        """Reserve one-model draft-mirror context capacity at admission time.
+
+        The mirror otherwise only allocates in ``prepare_resources``, after
+        scheduling, where a shortfall can no longer be deferred.  Consulting it
+        here lets the caller SKIP the request as it already does when the
+        primary pool is short.
+        """
+        if self.draft_kv_cache_manager is None:
+            return True
+        return self.draft_kv_cache_manager.reserve_draft_context(req, num_tokens)
+
+    def _try_allocate_generation(self, req: LlmRequest) -> bool:
+        """Allocate a decode step in the primary pool, gated on the draft mirror.
+
+        Both must be satisfiable for the request to be schedulable; the caller
+        retries this after eviction frees pages. The mirror check is a
+        non-mutating probe — it still allocates in ``prepare_resources``.
+        """
+        if not self.kv_cache_manager.try_allocate_generation(req):
+            return False
+        if (
+            self.draft_kv_cache_manager is None
+            or self.draft_kv_cache_manager.can_reserve_draft_generation(req)
+        ):
+            return True
+        # Undo the primary growth so the retry/eviction path sees a clean slate.
+        self.kv_cache_manager.revert_allocate_generation(req)
+        return False
+
     def _try_schedule_generation(
         self,
         req: LlmRequest,
@@ -991,7 +1031,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
-        success = self.kv_cache_manager.try_allocate_generation(req)
+        success = self._try_allocate_generation(req)
 
         if not success:
             if self.has_cp_helix:
@@ -1137,7 +1177,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             evicted.append(victim)
             req_it_end = victim_idx
 
-            if self.kv_cache_manager.try_allocate_generation(req):
+            if self._try_allocate_generation(req):
                 return req_it_end, True
 
         return req_it_end, False
