@@ -8266,7 +8266,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     def test_nvfp4_kv_eagle3_smoke(self):
-        """Generate through MSA with a true NVFP4 KV cache and linear Eagle3."""
+        """Generate through MSA with a true NVFP4 KV cache and GQA Eagle3."""
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
             msa_package_available
 
@@ -8276,7 +8276,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         spec_config = Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
         kv_cache_config = KvCacheConfig(
             dtype="nvfp4",
