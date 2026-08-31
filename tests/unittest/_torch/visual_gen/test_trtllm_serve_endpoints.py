@@ -1060,6 +1060,47 @@ class TestImageEdit:
         assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
         assert content.headers["content-type"] == "image/png"
 
+    def test_image_edit_response_format_path_returns_on_disk_path(self, tmp_path, monkeypatch):
+        """``response_format='path'`` returns the server-side output path
+        instead of a fetchable URL, matching ``/v1/images/generations``."""
+        client, _ = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "response_format": "path",
+            },
+        )
+
+        assert resp.status_code == 200
+        item = resp.json()["data"][0]
+        assert item["url"] is None
+        assert item["path"].startswith(str(tmp_path))
+        assert os.path.exists(item["path"])
+
+    def test_image_edit_response_format_path_rejected_when_disabled(self, tmp_path, monkeypatch):
+        """``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` gates the edit route too,
+        so the path transport cannot leak server-side paths on shared
+        deployments."""
+        client, _ = self._client(tmp_path, monkeypatch)
+        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "response_format": "path",
+            },
+        )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        _assert_llm_envelope(body, code=400)
+        assert "path" in body["message"] and "disabled" in body["message"]
+
     def test_image_edit_rejects_json_array_body(self, tmp_path, monkeypatch):
         """Non-object JSON bodies are client errors, not server errors."""
         client, gen = self._client(tmp_path, monkeypatch)

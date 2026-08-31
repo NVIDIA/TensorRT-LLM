@@ -3247,13 +3247,15 @@ class OpenAIServer(_VideoRoutesMixin):
             )
         return None
 
-    def _image_object(self, request: ImageGenerationRequest,
+    def _image_object(self, request: Union[ImageGenerationRequest,
+                                           ImageEditRequest],
                       raw_request: Request, image_id: str, i: int,
                       path: Path) -> ImageObject:
         """Build the per-item ``ImageObject`` for the ``path``/``url`` transports.
 
-        ``b64_json`` is handled separately. Shared by the tensor and encoder
-        branches so they cannot drift when a transport changes.
+        ``b64_json`` is handled separately. Shared by the generation
+        (tensor + encoder) and edit routes so they cannot drift when a
+        transport changes.
         """
         if request.response_format == "path":
             return ImageObject(path=str(path), revised_prompt=request.prompt)
@@ -3327,6 +3329,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
             try:
                 request = await self._parse_image_edit_request(raw_request)
+                path_error = self._reject_disabled_path(request.response_format)
+                if path_error is not None:
+                    return path_error
                 params = parse_visual_gen_params(
                     request,
                     image_id,
@@ -3382,11 +3387,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     path = self.media_storage_path / f"{image_id}_{i}{ext}"
                     path.write_bytes(image_to_bytes(image, format=pil_format))
                     data.append(
-                        ImageObject(
-                            url=self._build_image_content_url(
-                                raw_request, image_id, i),
-                            revised_prompt=request.prompt,
-                        ))
+                        self._image_object(request, raw_request, image_id, i,
+                                           path))
 
             response = ImageGenerationResponse(
                 created=int(time.time()),

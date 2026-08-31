@@ -1939,7 +1939,7 @@ class ImageEditRequest(OpenAIBaseModel):
         description=
         "Optional edit mask. Currently accepted for compatibility but unsupported.",
     )
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     output_format: Literal["png", "webp", "jpeg"] = Field(
         default="png",
         validation_alias=AliasChoices("output_format", "format"),
