@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -66,6 +67,25 @@ def test_rank_info_msgpack_roundtrip():
     assert restored.tp_size == ri.tp_size
     assert restored.transfer_engine_info == ri.transfer_engine_info
     assert restored.aux_meta is None
+
+
+def test_rank_info_omits_disabled_retirement_protocol_from_wire() -> None:
+    ri = RankInfo(
+        instance_name="gen_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+
+    payload = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+
+    assert "transfer_retirement_protocol" not in payload
 
 
 def test_rank_info_roundtrip_with_aux_meta():
@@ -123,6 +143,15 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.attention.kv_heads_per_rank == 8
+    assert info.transfer_retirement_protocol == 0
+
+    retirement_info = RankInfo.from_kv_cache_manager(
+        "ctx",
+        manager,
+        device_id=0,
+        transfer_retirement_protocol=1,
+    )
+    assert retirement_info.transfer_retirement_protocol == 1
 
 
 def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(

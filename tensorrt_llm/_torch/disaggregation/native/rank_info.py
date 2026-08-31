@@ -44,6 +44,11 @@ class RankInfo:
     cp_size: int = 1
     cp_rank: int = 0
     device_id: int = 0
+    # Version 1 advertises the context-first DONE-backed retirement contract.
+    # Generation-first requests are rejected while version 1 is enabled until
+    # their KV/AUX destination lifetimes are independently qualified. Endpoint
+    # versions must match so rolling upgrades fail before publication.
+    transfer_retirement_protocol: int = 0
 
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
@@ -57,6 +62,11 @@ class RankInfo:
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
+        # Preserve the legacy wire shape when retirement is disabled so a new
+        # endpoint can still interoperate with an older binary. Protocol 1 is
+        # intentionally explicit and requires matching endpoint versions.
+        if self.transfer_retirement_protocol == 0:
+            data.pop("transfer_retirement_protocol")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
@@ -69,6 +79,7 @@ class RankInfo:
         kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        transfer_retirement_protocol: int = 0,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
@@ -98,6 +109,7 @@ class RankInfo:
             cp_size=m.cp_size,
             cp_rank=m.cp_rank,
             device_id=device_id,
+            transfer_retirement_protocol=transfer_retirement_protocol,
             layer_num_per_pp=[len(kvm.pp_layers)],
             sender_endpoints=[],
             self_endpoint="",

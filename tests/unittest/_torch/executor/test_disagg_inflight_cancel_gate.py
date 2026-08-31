@@ -243,6 +243,33 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     executor._end_transfer_and_maybe_terminate.assert_not_called()
 
 
+def test_retirement_context_timeout_fails_after_quiescence():
+    request = _make_timeout_request()
+    request.py_kv_transfer_start_time = 1.0
+    request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
+    executor.kv_cache_transceiver.cancel_request.return_value = True
+    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
+    executor.kv_cache_transceiver.supports_transfer_retirement_monitoring.return_value = True
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {
+        request.py_request_id: request
+    }
+    executor._disagg_timed_out_ctx_cancelled_ids = set()
+    executor._disagg_inflight_cancel_unsupported_logged = False
+    executor._end_transfer_and_maybe_terminate = Mock()
+    executor._check_cache_transfer_errors = Mock()
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+    assert request.py_kv_transfer_start_time is None
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor._end_transfer_and_maybe_terminate.assert_called_once_with(request)
+
+
 def test_context_transfer_error_keeps_request_active_until_all_owners_release():
     request = SimpleNamespace(
         state=LlmRequestState.DISAGG_TRANS_ERROR,

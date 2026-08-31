@@ -266,6 +266,12 @@ class KvCacheTransceiver(ABC):
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
 
+    def supports_transfer_retirement_monitoring(self) -> bool:
+        return False
+
+    def get_transfer_retirement_error(self) -> Optional[str]:
+        return None
+
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
         """

@@ -43,6 +43,11 @@ class BindingsNixlTransferStatus(TransferStatus):
         """Check if transfer is completed (releases GIL)."""
         return self._cpp_status.is_completed()
 
+    def is_failed(self) -> bool:
+        """Report a logical NIXL error while retaining the transfer handle."""
+        self._cpp_status.is_completed()
+        return self.last_status_str() not in ("NIXL_SUCCESS", "NIXL_IN_PROG")
+
     @nvtx_range("BindingsNixlTransferStatus.wait")
     def wait(self, timeout_ms=None) -> bool:
         """Wait for transfer to complete (releases GIL)."""

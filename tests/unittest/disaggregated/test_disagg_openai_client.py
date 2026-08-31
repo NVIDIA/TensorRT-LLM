@@ -649,6 +649,38 @@ class TestDisaggIdRegenOnRetry:
 
         assert req.disaggregated_params.disagg_request_id == 42
 
+    @pytest.mark.asyncio
+    async def test_retirement_profile_disables_all_disaggregated_retries(self, monkeypatch):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, disagg_id_generator=next_id)
+        session.post.side_effect = [
+            aiohttp.ServerDisconnectedError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+        monkeypatch.setenv(
+            "TRTLLM_ENABLE_CONTEXT_FIRST_NO_RETRY_KV_TRANSFER_RETIREMENT",
+            "1",
+        )
+
+        with pytest.raises(aiohttp.ServerDisconnectedError):
+            await client.send_request(req)
+
+        assert session.post.call_count == 1
+        assert req.disaggregated_params.disagg_request_id == 42
+
 
 class TestSelectiveTransientTcpRetry:
     """Selective retry budget for transient TCP race symptoms.

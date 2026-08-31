@@ -60,6 +60,14 @@ class NixlTransferStatus(TransferStatus):
         status = TransferState(self.agent.check_xfer_state(self.handle))
         return status == TransferState.DONE
 
+    def is_failed(self) -> bool:
+        """Report a logical backend error without treating it as quiescence."""
+        status = TransferState(self.agent.check_xfer_state(self.handle))
+        return status == TransferState.ERROR
+
+    def last_status_str(self) -> str:
+        return TransferState(self.agent.check_xfer_state(self.handle)).value
+
     def wait(self, timeout_ms=None):
         start_time = time.time()
         status = TransferState.PENDING

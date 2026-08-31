@@ -60,9 +60,9 @@ class Settlement:
 @dataclass
 class TransferContext:
     """Lifetime state machine for one bounced receive region. The region is released only after every
-    writer reports (success or failure both mean its write has drained); a writer given up on (a
-    cancelled or timed-out transfer, whose one-sided write cannot be aborted) makes it quarantined
-    instead of reused."""
+    writer reports (success or failure both mean its write has drained). Legacy orphaning quarantines
+    the region; deadline-bounded retirement keeps it live for late writer evidence and lets process
+    replacement retire registration and memory together if that evidence never arrives."""
 
     rid_slice: Tuple[int, int]
     slot_id: int
@@ -75,7 +75,10 @@ class TransferContext:
     _writer_ok: Dict[int, bool] = field(default_factory=dict)
     # per successful writer: where it wrote, plus the fragments to scatter back
     _scatter_descs: List[tuple] = field(default_factory=list)
+    _writer_cohort: Optional[frozenset[int]] = None
+    _publication_failed: bool = False
     _orphaned: bool = False
+    _retain_orphaned: bool = False
     scatter_state: ScatterState = ScatterState.IDLE
     state: TransferState = TransferState.INIT
     settled: bool = False
@@ -93,10 +96,16 @@ class TransferContext:
         )
 
     def _all_writers_reported(self) -> bool:
+        if self._writer_cohort is not None:
+            return self._writer_cohort.issubset(self._writer_ok)
         return len(self._writer_ok) >= self.num_writers
 
     def _all_writers_succeeded(self) -> bool:
-        return self._all_writers_reported() and all(self._writer_ok.values())
+        if not self._all_writers_reported():
+            return False
+        if self._writer_cohort is not None:
+            return all(self._writer_ok[rank] for rank in self._writer_cohort)
+        return all(self._writer_ok.values())
 
     # Mutations: call only while holding the transport's reservation lock.
     def record_writer_result(
@@ -115,6 +124,8 @@ class TransferContext:
         # notification, or a stray failure that would flip a good transfer to failed; drop it.
         if self._writers_final() or peer_rank in self._writer_ok:
             return
+        if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
+            raise RuntimeError(f"writer {peer_rank} is outside the published bounce cohort")
         self._writer_ok[peer_rank] = succeeded
         if succeeded and dst_ptrs is not None and int(dst_ptrs.size) > 0:
             self._scatter_descs.append(
@@ -124,11 +135,37 @@ class TransferContext:
             self.state = TransferState.ACTIVE
 
     def mark_orphaned(self) -> None:
-        """Give up on writers that never reported (cancel, timeout, shutdown): a one-sided write
-        cannot be aborted, so the region is quarantined on settle. No-op once scattering or done."""
+        """Legacy cancellation: settle now and quarantine possible late writes."""
         if self._writers_final():
             return
         self._orphaned = True
+        self._retain_orphaned = False
+
+    def retain_orphaned(self) -> None:
+        """Keep the live region until every published writer proves it drained."""
+        if self._writers_final():
+            return
+        self._orphaned = True
+        self._retain_orphaned = True
+
+    def abort_publication(self, published_writers: set[int]) -> None:
+        """Close a failed fan-out around only the writers that were published.
+
+        Published writers still have to report terminal evidence. Successful
+        partial data is intentionally not scattered because the request is
+        already incomplete.
+        """
+        if self._writers_final():
+            return
+        published = frozenset(published_writers)
+        if len(published) > self.num_writers or not self._writer_ok.keys() <= published:
+            raise RuntimeError(
+                "published bounce cohort is inconsistent with terminal evidence: "
+                f"reported={sorted(self._writer_ok)} published={sorted(published)} "
+                f"reserved_count={self.num_writers}"
+            )
+        self._writer_cohort = published
+        self._publication_failed = True
 
     def begin_scatter(self) -> None:
         self.state = TransferState.SCATTERING
@@ -146,6 +183,7 @@ class TransferContext:
         return (
             self.state is TransferState.ACTIVE
             and not self._orphaned
+            and not self._publication_failed
             and self._all_writers_succeeded()
             and bool(self._scatter_descs)
         )
@@ -154,9 +192,11 @@ class TransferContext:
         if self.settled:
             return False
         if self._orphaned:
-            return True  # in doubt: settle now and quarantine
+            return self._all_writers_reported() if self._retain_orphaned else True
         if not self._all_writers_reported():
             return False  # a writer has not reported yet
+        if self._publication_failed:
+            return True  # every published writer drained; incomplete data is discarded
         if self._all_writers_succeeded() and self._scatter_descs:
             return self.scatter_state in (ScatterState.DONE, ScatterState.FAILED)
         return True  # nothing to scatter, or a failure among them: either way drained
@@ -168,9 +208,16 @@ class TransferContext:
             return None
         self.settled = True
         if self._orphaned:
+            if self._retain_orphaned:
+                self.state = TransferState.FAILED
+                return Settlement(self.slot_id, Disposition.RELEASE, False, self.on_done)
             self.state = TransferState.QUARANTINED
             return Settlement(self.slot_id, Disposition.QUARANTINE, False, self.on_done)
-        success = self._all_writers_succeeded() and self.scatter_state is not ScatterState.FAILED
+        success = (
+            not self._publication_failed
+            and self._all_writers_succeeded()
+            and self.scatter_state is not ScatterState.FAILED
+        )
         self.state = TransferState.COMPLETED if success else TransferState.FAILED
         return Settlement(self.slot_id, Disposition.RELEASE, success, self.on_done)
 
@@ -181,6 +228,11 @@ class BounceTransport(ABC):
 
     #: True for a real transport, False for the disabled null object.
     enabled: bool = False
+
+    @property
+    def has_unresolved_accessors(self) -> bool:
+        """Whether teardown must retain the transport's registered memory."""
+        return False
 
     @abstractmethod
     def build_request(self, write_meta):
@@ -218,7 +270,15 @@ class BounceTransport(ABC):
 
     @abstractmethod
     def orphan_reservation(self, rid_slice) -> None:
-        """Give up on an in-flight reservation (cancel/timeout/lost result); quarantine, don't leak."""
+        """Legacy path: settle and quarantine an in-flight reservation."""
+
+    @abstractmethod
+    def retain_orphaned_reservation(self, rid_slice) -> None:
+        """Retain an in-flight reservation until every published writer reports."""
+
+    @abstractmethod
+    def abort_publication(self, rid_slice, published_writers: set[int]) -> None:
+        """Limit a failed fan-out to writers whose REQUEST_DATA was queued."""
 
     @abstractmethod
     def record_result(

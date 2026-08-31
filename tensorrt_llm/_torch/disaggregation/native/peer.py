@@ -152,6 +152,13 @@ class PeerRegistrar:
         return name + str(rank)
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
+        if self._ri.transfer_retirement_protocol != peer_ri.transfer_retirement_protocol:
+            logger.error(
+                "KV transfer retirement protocol mismatch: local=%s peer=%s",
+                self._ri.transfer_retirement_protocol,
+                peer_ri.transfer_retirement_protocol,
+            )
+            return False
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 
