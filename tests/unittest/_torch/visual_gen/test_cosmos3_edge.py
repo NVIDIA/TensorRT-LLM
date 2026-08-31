@@ -247,11 +247,10 @@ class TestArchRecipe:
         cfg = SimpleNamespace(hidden_act="silu", qk_norm_for_text=True)
         assert resolve_arch_recipe(cfg) is QWEN3_RECIPE
 
-    def test_edge_signature_without_backbone_type_is_rejected(self):
+    def test_edge_export_resolves_from_complete_signature_without_backbone_type(self):
         cfg = _reduced_edge_config()
         cfg.backbone_type = None
-        with pytest.raises(ValueError, match="hidden_act"):
-            resolve_arch_recipe(cfg)
+        assert resolve_arch_recipe(cfg) is NEMOTRON_DENSE_RECIPE
 
     def test_unknown_backbone_raises(self):
         cfg = _reduced_edge_config()
