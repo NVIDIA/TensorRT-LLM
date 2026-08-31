@@ -59,6 +59,50 @@ __device__ inline float toFloat(__nv_bfloat16 v)
     return __bfloat162float(v);
 }
 
+//! Bytes moved by one vector load. 16 is the widest a single instruction issues.
+constexpr int kVecBytes = 16;
+
+//! \brief Sweep one row, 16 bytes per thread per step, calling ``fn(index, logit)``.
+//!
+//! Every stage of this kernel is a full sweep of [vocabSize], so how efficiently one
+//! sweep reads memory multiplies through all of them. Scalar 4-byte loads leave most of
+//! the achievable bandwidth on the table; measurement put a two-pass neutral row at ~1.5x
+//! of flashinfer's two-pass softmax, which is a per-pass efficiency gap, not a pass-count
+//! one.
+//!
+//! Falls back to scalar when the row is not 16-byte aligned or not a whole number of
+//! vectors. Both are properties of the base pointer and vocabSize, so the branch is
+//! uniform across the block -- no divergence.
+template <typename T, typename Fn>
+__device__ inline void forEachLogit(T const* row, int vocabSize, Fn fn)
+{
+    constexpr int kWidth = kVecBytes / sizeof(T);
+    if ((reinterpret_cast<uintptr_t>(row) % kVecBytes) != 0)
+    {
+        for (int i = threadIdx.x; i < vocabSize; i += kBlockSize)
+        {
+            fn(i, toFloat(row[i]));
+        }
+        return;
+    }
+
+    int const vecCount = vocabSize / kWidth;
+    for (int v = threadIdx.x; v < vecCount; v += kBlockSize)
+    {
+        int4 const packed = reinterpret_cast<int4 const*>(row)[v];
+        T const* elems = reinterpret_cast<T const*>(&packed);
+#pragma unroll
+        for (int j = 0; j < kWidth; ++j)
+        {
+            fn(v * kWidth + j, toFloat(elems[j]));
+        }
+    }
+    for (int i = vecCount * kWidth + threadIdx.x; i < vocabSize; i += kBlockSize)
+    {
+        fn(i, toFloat(row[i]));
+    }
+}
+
 //! Row-local view of one request's sampling parameters, resolved once per block.
 struct RowParams
 {
@@ -184,22 +228,23 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
         }
         __syncthreads();
 
-        for (int i = tid; i < vocabSize; i += kBlockSize)
-        {
-            float const w = weightOf(rowLogits, i, tempInv, maxScaled);
-            if (w < floorValue)
+        forEachLogit(rowLogits, vocabSize,
+            [&](int, float logit)
             {
-                continue;
-            }
-            uint32_t const bits = __float_as_uint(w);
-            if ((bits & fixedMask) != prefix)
-            {
-                continue;
-            }
-            uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
-            atomicAdd(&sCount[digit], 1);
-            atomicAdd(&sMass[digit], w);
-        }
+                float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
+                if (w < floorValue)
+                {
+                    return;
+                }
+                uint32_t const bits = __float_as_uint(w);
+                if ((bits & fixedMask) != prefix)
+                {
+                    return;
+                }
+                uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
+                atomicAdd(&sCount[digit], 1);
+                atomicAdd(&sMass[digit], w);
+            });
         __syncthreads();
 
         // The bucket walk is serial on one thread: 256 steps against vocabSize/512
@@ -291,10 +336,10 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     //     neutral `probs` row at ~1.5x of flashinfer's two-pass softmax. The argmax rides
     //     along for free and is the fallback if the inverse-CDF walk falls off the end.
     OnlineSoftmax local{-FLT_MAX, 0.0f, 0};
-    for (int i = tid; i < vocabSize; i += kBlockSize)
-    {
-        local = combineOnlineSoftmax(local, OnlineSoftmax{scaledLogit(rowLogits, i, rp.tempInv), 1.0f, i});
-    }
+    forEachLogit(rowLogits, vocabSize,
+        [&](int i, float logit) {
+            local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
+        });
     OnlineSoftmax const rowStats = BlockReduceOnline(temp.reduceOnline).Reduce(local, OnlineSoftmaxOp());
     if (tid == 0)
     {
@@ -315,14 +360,15 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     if (rp.needMinP)
     {
         float localMass = 0.0f;
-        for (int i = tid; i < vocabSize; i += kBlockSize)
-        {
-            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
-            if (w >= rp.minP)
+        forEachLogit(rowLogits, vocabSize,
+            [&](int, float logit)
             {
-                localMass += w;
-            }
-        }
+                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                if (w >= rp.minP)
+                {
+                    localMass += w;
+                }
+            });
         float const filteredMass = BlockReduceF(temp.reduceF).Sum(localMass);
         if (tid == 0)
         {
@@ -355,14 +401,15 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     {
         // The mass top-p takes its fraction of: post-min-p, post-top-k.
         float localSurviving = 0.0f;
-        for (int i = tid; i < vocabSize; i += kBlockSize)
-        {
-            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
-            if (w >= threshold)
+        forEachLogit(rowLogits, vocabSize,
+            [&](int, float logit)
             {
-                localSurviving += w;
-            }
-        }
+                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                if (w >= threshold)
+                {
+                    localSurviving += w;
+                }
+            });
         float const survivingMass = BlockReduceF(temp.reduceF).Sum(localSurviving);
         if (tid == 0)
         {
@@ -381,14 +428,15 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     if (threshold > 0.0f)
     {
         float localKept = 0.0f;
-        for (int i = tid; i < vocabSize; i += kBlockSize)
-        {
-            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
-            if (w >= threshold)
+        forEachLogit(rowLogits, vocabSize,
+            [&](int, float logit)
             {
-                localKept += w;
-            }
-        }
+                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                if (w >= threshold)
+                {
+                    localKept += w;
+                }
+            });
         float const blockKept = BlockReduceF(temp.reduceF).Sum(localKept);
         if (tid == 0)
         {
@@ -408,11 +456,38 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     // --- Pass 5: the renormalized distribution.
     if (NEED_PROBS)
     {
+        // Read vectorized, and write vectorized too: probs is float32 and as wide as the
+        // logits, so the store side is just as much traffic as the load side.
         float const scale = 1.0f / keptMass;
-        for (int i = tid; i < vocabSize; i += kBlockSize)
+        int const probVecCount = vocabSize / 4;
+        bool const probsAligned = (reinterpret_cast<uintptr_t>(rowProbs) % kVecBytes) == 0;
+        if (probsAligned)
         {
-            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
-            rowProbs[i] = w >= threshold ? w * scale : 0.0f;
+            for (int v = tid; v < probVecCount; v += kBlockSize)
+            {
+                float4 out;
+                float* outElems = reinterpret_cast<float*>(&out);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = weightOf(rowLogits, v * 4 + j, rp.tempInv, maxScaled);
+                    outElems[j] = w >= threshold ? w * scale : 0.0f;
+                }
+                reinterpret_cast<float4*>(rowProbs)[v] = out;
+            }
+            for (int i = probVecCount * 4 + tid; i < vocabSize; i += kBlockSize)
+            {
+                float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+                rowProbs[i] = w >= threshold ? w * scale : 0.0f;
+            }
+        }
+        else
+        {
+            for (int i = tid; i < vocabSize; i += kBlockSize)
+            {
+                float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+                rowProbs[i] = w >= threshold ? w * scale : 0.0f;
+            }
         }
     }
 
@@ -438,35 +513,45 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
         // below it, and then only the thread whose span contains the target re-walks --
         // in the same order, so the two accumulations agree.
         float localKept = 0.0f;
-        for (int i = tid; i < vocabSize; i += kBlockSize)
-        {
-            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
-            if (w >= threshold)
+        forEachLogit(rowLogits, vocabSize,
+            [&](int, float logit)
             {
-                localKept += w;
-            }
-        }
+                float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                if (w >= threshold)
+                {
+                    localKept += w;
+                }
+            });
         float base = 0.0f;
         BlockScanF(temp.scanF).ExclusiveSum(localKept, base);
         __syncthreads();
 
         if (target >= base && target < base + localKept)
         {
+            // Same traversal as the accumulation above -- forEachLogit, not a raw strided
+            // loop -- because the two float sums must agree term for term. A different
+            // order here would put the crossing at a different element.
             float running = base;
-            for (int i = tid; i < vocabSize; i += kBlockSize)
-            {
-                float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
-                if (w < threshold)
+            bool found = false;
+            forEachLogit(rowLogits, vocabSize,
+                [&](int i, float logit)
                 {
-                    continue;
-                }
-                running += w;
-                if (running > target)
-                {
-                    sToken = i;
-                    break;
-                }
-            }
+                    if (found)
+                    {
+                        return;
+                    }
+                    float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
+                    if (w < threshold)
+                    {
+                        return;
+                    }
+                    running += w;
+                    if (running > target)
+                    {
+                        sToken = i;
+                        found = true;
+                    }
+                });
         }
         __syncthreads();
 
