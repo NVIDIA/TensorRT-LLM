@@ -100,7 +100,9 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
-from .sampler.ops.flashinfer import warmup_sampling_module
+from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
+                                     warmup_sampling_module)
+from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
@@ -392,6 +394,14 @@ class PyTorchModelEngine(ModelEngine):
 
         self.forward_pass_callable = None
         self._cleanup_done = False
+        # Optional in-graph sampling hook, registered by PyExecutor. Called at
+        # the tail of _forward_step -- i.e. right after the LM head, and inside
+        # capture_forward_fn -- so that for graph-capturable sampling tiers the
+        # sampling lands at the end of the captured forward graph instead of
+        # costing a separate launch. Left None when the sampler does not opt in.
+        self.sample_in_graph_callable = None
+        # Stages (or clears) in-graph sampling state once the batch is settled.
+        self._stage_in_graph_sampling = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -453,6 +463,12 @@ class PyTorchModelEngine(ModelEngine):
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
         self.llm_args = llm_args
+        # Opt-in tiered sampling captured into the forward graph. Off by
+        # default: it captures one extra graph per enabled tier, which costs
+        # startup time and memory that deployments not bound by sampling
+        # overhead should not pay.
+        self.enable_fast_sampler = bool(
+            getattr(llm_args, "enable_fast_sampler", False))
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
             spec_config.tokens_per_gen_step -
@@ -524,6 +540,18 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.model = model
         self._validate_breakable_cuda_graph_compatibility()
+        # In-graph sampling needs the full vocabulary: top-k / top-p over a
+        # tensor-parallel shard would rank against a slice of the logits and
+        # emit the wrong token, silently. The LM head gathers by default, but
+        # the draft models of some speculation modes turn that off, so refuse
+        # the fast path rather than sample a sharded row.
+        if self.enable_fast_sampler and not getattr(
+                self.model.model_config, "lm_head_gather_output", True):
+            logger.warning(
+                "Disabling enable_fast_sampler: this model's LM head does not "
+                "gather its output, so the logits are sharded across tensor "
+                "parallel ranks and cannot be sampled in-graph.")
+            self.enable_fast_sampler = False
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
         self._enable_scheduler_aware_adp_dummy = (
@@ -1024,6 +1052,7 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
             enable_encoder_decoder_mixed_cuda_graph=(
                 enable_encoder_decoder_mixed_cuda_graph),
+            enable_fast_sampler=self.enable_fast_sampler,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
         self.breakable_cuda_graph_runner = None
@@ -1041,6 +1070,9 @@ class PyTorchModelEngine(ModelEngine):
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
+        # Sampling tier pinned during a fast-sampler capture pass; None outside
+        # capture, where the tier comes from the batch instead.
+        self._capture_sample_type: Optional[SampleType] = None
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -1064,6 +1096,17 @@ class PyTorchModelEngine(ModelEngine):
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
+
+    def register_sample_in_graph_callable(self, callable: Optional[Callable]):
+        """Register the hook that samples at the tail of the forward graph."""
+        self.sample_in_graph_callable = callable
+
+    def register_sample_type_resolver(self,
+                                      resolver: Optional[Callable],
+                                      stage: Optional[Callable] = None):
+        """Register how a batch maps to its sampling tier, for the graph key."""
+        self.cuda_graph_runner.register_sample_type_resolver(resolver)
+        self._stage_in_graph_sampling = stage
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
@@ -1394,6 +1437,12 @@ class PyTorchModelEngine(ModelEngine):
         # exercises the non-greedy sampler, so with cuda_graph_config=None
         # flashinfer's sampling kernels would be JIT-built mid-serving.
         warmup_sampling_module()
+        if self.enable_fast_sampler:
+            # The fast tier samples inside the captured graph via a
+            # torch.compile'd op; compile it now so capture does not.
+            warmup_sample_from_logits_op(self.model.config.vocab_size,
+                                         torch.device('cuda'), self.dtype,
+                                         self._cuda_graph_batch_sizes or [])
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -2684,10 +2733,20 @@ class PyTorchModelEngine(ModelEngine):
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
 
-        def _run_capture_pass(force_non_greedy: bool, label: str,
-                              force_lora_graph: bool) -> None:
+        def _run_capture_pass(force_non_greedy: bool,
+                              label: str,
+                              force_lora_graph: bool,
+                              sample_type: Optional[SampleType] = None) -> None:
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
+            # Pin the sampling tier for this pass. maybe_get_cuda_graph reads
+            # it to build the graph key, so every graph captured below records
+            # the kernels of this tier and nothing else. Passes that do not name
+            # a tier capture FULL graphs -- ones carrying no sampling at all --
+            # which is what a batch resolving to FULL replays.
+            pinned_tier = sample_type or SampleType.FULL
+            self._capture_sample_type = pinned_tier
+            self.cuda_graph_runner.set_capture_sample_type(pinned_tier)
             try:
                 for bs, draft_len in graphs_to_capture:
                     if bs > self.batch_size:
@@ -2730,6 +2789,8 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
+                self._capture_sample_type = None
+                self.cuda_graph_runner.set_capture_sample_type(None)
 
         if self.cuda_graph_lora_manager is None:
             lora_graph_cases = [False]
@@ -2740,32 +2801,62 @@ class PyTorchModelEngine(ModelEngine):
         else:
             lora_graph_cases = [True]
 
-        # Pass 1: greedy fast-path (dummy requests carry no sampling params,
-        # so is_all_greedy_sample is naturally True).
-        for use_lora_graph in lora_graph_cases:
-            label = "greedy"
-            if self.cuda_graph_lora_manager is not None:
-                label += ", LoRA" if use_lora_graph else ", base-only"
-            _run_capture_pass(force_non_greedy=False,
-                              label=label,
-                              force_lora_graph=use_lora_graph)
-        # Pass 2: advanced sampling variant. Required because on-the-fly capture
-        # is disabled outside warmup, so any inference batch that contains a
-        # non-greedy request would otherwise fall back to eager. Only meaningful
-        # for one-engine spec dec (where is_all_greedy_sample participates in
-        # the graph key); other paths default to True and would never key into
-        # this variant.
-        needs_non_greedy_capture = (
+        # Which variants to capture depends on which sampler this engine will
+        # actually run, and the two are mutually exclusive: a spec-decoding mode
+        # in a one-engine mode samples inside its worker and gets a dedicated
+        # sampler from get_spec_decoder, so TorchSampler -- the only sampler
+        # implementing in-graph sampling -- never runs. Capturing the other
+        # branch's variants would spend warmup on graphs whose keys no batch can
+        # ever produce.
+        #
+        # The predicate is use_one_engine() rather than has_spec_decoder(): the
+        # two-model eagle3 / mtp_eagle modes also "have a spec decoder", but
+        # get_spec_decoder hands them a plain TorchSampler, so they belong on
+        # the TorchSampler branch and do need the FAST graphs.
+        uses_own_spec_decoder = (
             self.spec_config is not None
             and self.spec_config.spec_dec_mode.use_one_engine())
-        if needs_non_greedy_capture:
+
+        def _capture_variant(label: str,
+                             force_non_greedy: bool = False,
+                             sample_type: Optional[SampleType] = None) -> None:
             for use_lora_graph in lora_graph_cases:
-                label = "advanced sampling"
+                variant_label = label
                 if self.cuda_graph_lora_manager is not None:
-                    label += ", LoRA" if use_lora_graph else ", base-only"
-                _run_capture_pass(force_non_greedy=True,
-                                  label=label,
-                                  force_lora_graph=use_lora_graph)
+                    variant_label += (", LoRA"
+                                      if use_lora_graph else ", base-only")
+                _run_capture_pass(force_non_greedy=force_non_greedy,
+                                  label=variant_label,
+                                  force_lora_graph=use_lora_graph,
+                                  sample_type=sample_type)
+
+        if uses_own_spec_decoder:
+            # One-engine spec branch: the greedy argmax fast path plus the
+            # advanced-sampling variant. The latter is needed because on-the-fly
+            # capture is disabled outside warmup, so a batch containing a
+            # non-greedy request would otherwise fall back to eager.
+            #
+            # Dummy warmup requests carry no sampling params, so the greedy pass
+            # needs no override while the advanced one has to force the flag.
+            _capture_variant("greedy")
+            _capture_variant("advanced sampling", force_non_greedy=True)
+        else:
+            # TorchSampler branch: FULL carries no sampling in the graph and is
+            # what every batch replays unless the fast sampler is enabled, so it
+            # is always captured. FAST adds the in-graph sampling kernels and is
+            # captured only when opted in, since it costs extra warmup time and
+            # memory.
+            _capture_variant("full", sample_type=SampleType.FULL)
+            if self.enable_fast_sampler:
+                # Give the warmup requests real non-greedy sampling params:
+                # dummies otherwise carry none, resolve to greedy, and the
+                # capture would record argmax rather than the fast tier's
+                # top-k/top-p kernels. Same substitution the advanced-sampling
+                # pass relies on.
+                _capture_variant("fast",
+                                 force_non_greedy=True,
+                                 sample_type=SampleType.FAST)
+
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
         # update_is_all_greedy_sample inside each forward call during the
@@ -7543,6 +7634,17 @@ class PyTorchModelEngine(ModelEngine):
                 execution_requests = scheduled_requests
                 execution_promoted_context_ids = frozenset()
 
+            # Stage in-graph sampling now that the batch is settled: the staged
+            # scatter width has to match the batch the forward actually runs on,
+            # which differs between the graph (padded) and eager (unpadded)
+            # branches above. Falling back to eager also means no graph replays,
+            # so the tier is dropped and the sampler runs after the forward.
+            if self._stage_in_graph_sampling is not None:
+                self._stage_in_graph_sampling(
+                    execution_requests,
+                    key.sample_type if can_run_graph else SampleType.FULL,
+                )
+
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
@@ -7709,6 +7811,13 @@ class PyTorchModelEngine(ModelEngine):
         # If we have special gather_ids, gather the logits
         if gather_ids is not None:
             outputs['logits'] = logits[gather_ids]
+
+        # Sample at the tail of the forward pass, so that under CUDA graph
+        # capture the sampling kernels are recorded as part of this graph. The
+        # hook is a no-op unless the sampler staged a graph-capturable tier for
+        # this batch.
+        if self.sample_in_graph_callable is not None:
+            self.sample_in_graph_callable(outputs)
 
         return outputs
 

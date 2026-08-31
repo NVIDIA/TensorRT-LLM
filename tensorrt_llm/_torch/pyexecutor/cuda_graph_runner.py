@@ -27,6 +27,7 @@ from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
+from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
@@ -44,6 +45,12 @@ class KeyType(NamedTuple):
     is_first_draft: bool
     short_seq_len_mode: bool = False
     is_all_greedy_sample: bool = True
+    # Sampling tier captured into this graph. FULL means the graph carries no
+    # sampling at all and the sampler runs eagerly after the forward, which is
+    # what every graph holds unless enable_fast_sampler is set; FAST means the
+    # sampling kernels are part of the graph. The two record different kernel
+    # sequences, so they cannot share a graph.
+    sample_type: SampleType = SampleType.FULL
     # Primarily used for mixed batches of encoder-decoder models.
     num_contexts: int = 0
     context_query_len: int = 0
@@ -125,6 +132,7 @@ class CUDAGraphRunnerConfig:
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
+    enable_fast_sampler: bool = False
 
 
 class CUDAGraphRunner:
@@ -151,6 +159,13 @@ class CUDAGraphRunner:
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
+        self.enable_fast_sampler = config.enable_fast_sampler
+        # Set by the engine while capturing a fast-sampler tier pass.
+        self._capture_sample_type: Optional[SampleType] = None
+        # Resolves a runtime batch to its tier; registered by the engine so the
+        # graph runner does not need to know about the sampler.
+        self._sample_type_resolver: Optional[Callable[
+            [ScheduledRequests, Optional[SampleType]], SampleType]] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -334,6 +349,11 @@ class CUDAGraphRunner:
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
 
+        # Sampling tier this graph must contain. Only meaningful when the fast
+        # sampler is enabled; otherwise it stays None so every batch shares one
+        # graph and sampling runs eagerly after the forward, as before.
+        sample_type = self._resolve_sample_type(batch)
+
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
             # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
@@ -344,6 +364,7 @@ class CUDAGraphRunner:
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
                           is_all_greedy_sample=is_all_greedy_sample,
+                          sample_type=sample_type,
                           peft_cache_data_type=peft_cache_data_type,
                           use_lora_graph=use_lora_graph)
         else:
@@ -372,12 +393,44 @@ class CUDAGraphRunner:
                           is_first_draft=False,
                           short_seq_len_mode=short_seq_len_mode,
                           is_all_greedy_sample=is_all_greedy_sample,
+                          sample_type=sample_type,
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
                           num_encoder_tokens=num_encoder_tokens,
                           peft_cache_data_type=peft_cache_data_type,
                           use_lora_graph=use_lora_graph)
         return key
+
+    def set_capture_sample_type(self,
+                                sample_type: Optional[SampleType]) -> None:
+        """Pin the tier captured by the current pass; None restores runtime resolution."""
+        self._capture_sample_type = sample_type
+
+    def register_sample_type_resolver(
+        self,
+        resolver: Optional[Callable[[ScheduledRequests, Optional[SampleType]],
+                                    SampleType]]
+    ) -> None:
+        """Register how a runtime batch maps to its sampling tier."""
+        self._sample_type_resolver = resolver
+
+    def _resolve_sample_type(self, batch: ScheduledRequests) -> SampleType:
+        """Sampling tier the graph for this batch must contain.
+
+        FULL when the fast sampler is off, so the key -- and the graphs it
+        selects -- match the pre-tier engine.
+
+        Only resolves; the buffers the in-graph step reads are staged later, by
+        the engine, once it has settled which batch the forward runs on. The
+        tier has to be known here because it is part of the key that decides
+        which graph is replayed.
+        """
+        if not self.config.enable_fast_sampler or self._sample_type_resolver is None:
+            return SampleType.FULL
+        # During a capture pass the tier is pinned, so the graph records that
+        # tier's kernels rather than the one the all-dummy warmup batch would
+        # resolve to on its own.
+        return self._sample_type_resolver(batch, self._capture_sample_type)
 
     def _get_compatible_mixed_encoder_decoder_key(self,
                                                   key: KeyType) -> KeyType:
