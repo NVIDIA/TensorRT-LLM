@@ -49,8 +49,9 @@ class QuantAttentionConfig(StrictBaseModel):
     Specifies Q/K and V quantization formats and their optional block sizes.
 
     Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
-    backend-specific; FLASHINFER requires NVFP4 Q/K with FP8 or NVFP4 V.
-    Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
+    backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
+    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. Unsupported recipes are rejected
+    by AttentionConfig's validator with a ValueError.
     """
 
     qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
@@ -142,6 +143,7 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 1)),
         }
         FLASHINFER_RECIPES = {
+            ("mxfp8", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),
         }

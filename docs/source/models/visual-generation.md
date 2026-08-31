@@ -14,7 +14,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
 - Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
-- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100), and FlashInfer NVFP4 on `FLASHINFER`.
+- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100), and FlashInfer block-scaled MXFP8/NVFP4 on `FLASHINFER`.
 - Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
@@ -178,7 +178,7 @@ In addition to linear-layer quantization, VisualGen supports several **attention
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
 - **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
 
-- **FlashInfer NVFP4** (`FLASHINFER` backend): Uses FlashInfer's architecture-specific block-scaled FMHA. Set `v_dtype: fp8` for Q/K NVFP4 and V FP8 on SM100/SM103, or `v_dtype: nvfp4` for dense Q/K/V NVFP4 self-attention on SM120/SM121. The SM120/SM121 path requires a sequence length divisible by 128.
+- **FlashInfer block-scaled attention** (`FLASHINFER` backend): Uses FlashInfer's architecture-specific FMHA. On SM100/SM103 (B200/B300), set `qk_dtype` to `mxfp8` or `nvfp4` with `v_dtype: fp8`. On SM120/SM121 (RTX PRO 6000), only dense Q/K/V NVFP4 self-attention is supported, using `qk_dtype: nvfp4` and `v_dtype: nvfp4`; this path requires a sequence length divisible by 128.
 
 Python API for SageAttention:
 
@@ -218,7 +218,7 @@ args = VisualGenArgs(
 )
 ```
 
-Python API for FlashInfer NVFP4:
+Python API for FlashInfer MXFP8 on B200/B300:
 
 ```python
 from tensorrt_llm import VisualGenArgs
@@ -228,7 +228,7 @@ args = VisualGenArgs(
     attention_config={
         "backend": "FLASHINFER",
         "quant_attention_config": {
-            "qk_dtype": "nvfp4",
+            "qk_dtype": "mxfp8",
             "v_dtype": "fp8",
         },
     },

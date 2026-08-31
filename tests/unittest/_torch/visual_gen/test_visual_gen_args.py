@@ -157,7 +157,7 @@ class TestAttentionConfigQuantValidation:
 
     @pytest.mark.parametrize(
         ("qk_dtype", "v_dtype"),
-        [("nvfp4", "fp8"), ("nvfp4", "nvfp4")],
+        [("mxfp8", "fp8"), ("nvfp4", "fp8"), ("nvfp4", "nvfp4")],
     )
     def test_supported_quant_config_flashinfer(self, qk_dtype: str, v_dtype: str) -> None:
         attention = AttentionConfig(
@@ -170,15 +170,28 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("qk_dtype", ("mxfp8", "nvfp4"))
     @pytest.mark.parametrize("block_field", ("q_block_size", "k_block_size", "v_block_size"))
-    def test_nvfp4_block_size_rejected_on_flashinfer(self, block_field: str) -> None:
+    def test_blockscaled_block_size_rejected_on_flashinfer(
+        self, qk_dtype: str, block_field: str
+    ) -> None:
         with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
             AttentionConfig(
                 backend="FLASHINFER",
                 quant_attention_config=QuantAttentionConfig(
-                    qk_dtype="nvfp4",
+                    qk_dtype=qk_dtype,
                     v_dtype="fp8",
                     **{block_field: 1},
+                ),
+            )
+
+    def test_mxfp8_with_nvfp4_v_rejected_on_flashinfer(self) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="mxfp8",
+                    v_dtype="nvfp4",
                 ),
             )
 
