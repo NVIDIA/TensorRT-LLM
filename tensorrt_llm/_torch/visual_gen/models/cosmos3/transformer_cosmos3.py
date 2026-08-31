@@ -124,10 +124,9 @@ NEMOTRON_DENSE_RECIPE = Cosmos3ArchRecipe(
 )
 
 
-def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
-    """Select and validate the architecture recipe declared by the config."""
-    backbone_type = getattr(pretrained_config, "backbone_type", None)
-    if backbone_type is None and all(
+def backbone_type_heuristic(pretrained_config: object) -> str | None:
+    """Infer Nemotron-dense for the initial Policy-DROID export that omitted the field."""
+    if all(
         (
             getattr(pretrained_config, "hidden_act", None) == "relu2",
             getattr(pretrained_config, "qk_norm_for_text", None) is False,
@@ -137,10 +136,15 @@ def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
             getattr(pretrained_config, "rms_norm_eps", None) == 1e-5,
         )
     ):
-        # The initial Cosmos3-Edge-Policy-DROID Diffusers export omitted
-        # ``backbone_type``. Recognize its complete Nemotron-dense signature so
-        # downloaded and pinned copies of that release remain loadable.
-        backbone_type = COSMOS3_EDGE_BACKBONE_TYPE
+        return COSMOS3_EDGE_BACKBONE_TYPE
+    return None
+
+
+def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
+    """Select and validate the architecture recipe declared by the config."""
+    backbone_type = getattr(pretrained_config, "backbone_type", None)
+    if backbone_type is None:
+        backbone_type = backbone_type_heuristic(pretrained_config)
     if backbone_type is None:
         recipe = QWEN3_RECIPE
         expected_flags = {
