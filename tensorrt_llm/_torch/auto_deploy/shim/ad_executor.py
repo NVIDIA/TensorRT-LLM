@@ -546,7 +546,11 @@ class ADEngine(ModelEngine):
             PyTorchModelEngine._execute_logit_post_processors, self
         )
 
-    def _release_cuda_graphs(self) -> None:
+    def _release_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ) -> None:
         def _reset_cuda_graph(graph: object) -> None:
             if isinstance(graph, torch.cuda.CUDAGraph):
                 graph.reset()
@@ -584,8 +588,9 @@ class ADEngine(ModelEngine):
                         entries.clear()
                     module._graph_pool = None
 
-        for graph_pool in graph_pools:
-            release_nccl_window_graph_owner(graph_pool)
+        if release_nccl_window_owners:
+            for graph_pool in graph_pools:
+                release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
     def _store_prefill_multimodal_metadata(

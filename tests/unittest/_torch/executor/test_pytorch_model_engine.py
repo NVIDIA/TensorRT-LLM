@@ -343,6 +343,51 @@ def create_model_engine_and_kvcache(
     return model_engine, kv_cache_manager
 
 
+class GraphOwnerTeardownTestCase(unittest.TestCase):
+
+    def test_cuda_graph_runner_destructor_does_not_release_window_owner(
+            self) -> None:
+        runner = Mock()
+
+        CUDAGraphRunner.__del__(runner)
+
+        runner.clear.assert_called_once_with(release_nccl_window_owners=False)
+
+    def test_engine_graph_ownership_is_split(self) -> None:
+        clear_blocks_graph = Mock()
+        model = Mock()
+        model.modules.return_value = [
+            SimpleNamespace(clear_blocks_cuda_graph=clear_blocks_graph)
+        ]
+        backend = Mock()
+        cuda_runner = Mock()
+        breakable_runner = Mock()
+        encoder_runner = Mock()
+        engine = SimpleNamespace(
+            model=model,
+            _torch_compile_backend=backend,
+            cuda_graph_runner=cuda_runner,
+            breakable_cuda_graph_runner=breakable_runner,
+            encoder_cuda_graph_runner=encoder_runner,
+        )
+
+        PyTorchModelEngine._release_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_not_called()
+        backend.clear_piecewise_cuda_graphs.assert_called_once_with(
+            release_nccl_window_owners=False)
+        for runner in (cuda_runner, breakable_runner, encoder_runner):
+            runner.clear.assert_called_once_with(
+                release_nccl_window_owners=False)
+
+        PyTorchModelEngine._release_model_owned_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_called_once_with(
+            release_nccl_window_owners=False)
+
+
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_generation_only_is_identity(self) -> None:

@@ -2471,6 +2471,16 @@ def _(
     return None
 
 
+@torch.library.register_fake("trtllm::begin_nccl_window_tensor_scope")
+def _(inputs: List[torch.Tensor]) -> None:
+    return None
+
+
+@torch.library.register_fake("trtllm::end_nccl_window_tensor_scope")
+def _(outputs: List[torch.Tensor], failed: bool) -> None:
+    return None
+
+
 # Host-side predicate for custom-op implementations only. Do not call this
 # directly from model forward code or compiled graphs; it returns a Python bool
 # and is intended only to let another custom op gate its setup logic.

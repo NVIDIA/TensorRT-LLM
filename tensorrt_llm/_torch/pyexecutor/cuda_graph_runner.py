@@ -442,7 +442,9 @@ class CUDAGraphRunner:
         return CUDAGraphRunner._get_mrope_position_delta(request) is not None
 
     def __del__(self):
-        self.clear()
+        # GC timing is not rank-symmetric, so destructor cleanup must not make
+        # graph-owned NCCL windows eligible for reuse.
+        self.clear(release_nccl_window_owners=False)
 
     def maybe_get_cuda_graph(
         self,
@@ -1065,7 +1067,7 @@ class CUDAGraphRunner:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
 
-    def clear(self):
+    def clear(self, *, release_nccl_window_owners: bool = True):
         """Releases all captured graphs and the associated memory pool."""
         graph_pool = self.memory_pool
         for graph in self.graphs.values():
@@ -1076,7 +1078,7 @@ class CUDAGraphRunner:
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
-        if graph_pool is not None:
+        if release_nccl_window_owners and graph_pool is not None:
             release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
@@ -2161,7 +2163,7 @@ class EncoderCUDAGraphRunner:
     def get_graph_pool(self):
         return self.memory_pool
 
-    def clear(self):
+    def clear(self, *, release_nccl_window_owners: bool = True):
         graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
@@ -2170,6 +2172,6 @@ class EncoderCUDAGraphRunner:
         self.graph_metadata.clear()
         del self.memory_pool
         self.memory_pool = None
-        if graph_pool is not None:
+        if release_nccl_window_owners and graph_pool is not None:
             release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()

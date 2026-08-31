@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -118,6 +121,12 @@ def inplace_info():
         },
         torch.ops.trtllm.pp_send_tensors.default: {
             1: "tensors"
+        },
+        torch.ops.trtllm.begin_nccl_window_tensor_scope.default: {
+            1: "inputs"
+        },
+        torch.ops.trtllm.end_nccl_window_tensor_scope.default: {
+            1: "outputs"
         },
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
             1: "output"

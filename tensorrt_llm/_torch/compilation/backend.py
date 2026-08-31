@@ -32,6 +32,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..nccl_window_graph import release_nccl_window_graph_owner
 from .multi_stream.auto_multi_stream import multi_stream_schedule
+from .nccl_window import insert_nccl_window_tensor_scopes
 from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import (register_add_norm,
@@ -120,13 +121,17 @@ class Backend:
                 torch.cuda.Event() for _ in range(num_events - len(self.events))
             ]
 
-    def clear_piecewise_cuda_graphs(self) -> None:
+    def clear_piecewise_cuda_graphs(self,
+                                    *,
+                                    release_nccl_window_owners: bool = True
+                                    ) -> None:
         runners = list(self._piecewise_runners)
         old_pools = {runner.graph_pool_handle for runner in runners}
         for runner in runners:
             runner.clear_cuda_graphs()
-        for graph_pool in old_pools:
-            release_nccl_window_graph_owner(graph_pool)
+        if release_nccl_window_owners:
+            for graph_pool in old_pools:
+                release_nccl_window_graph_owner(graph_pool)
 
         # CUDACachingAllocator does not allow a private pool handle to be
         # reused after its last graph is reset. Preserve the sharing between
@@ -222,6 +227,9 @@ class Backend:
             ), "Cannot detect input_num_tokens. Cannot use piecewise CUDA graph. What is the name of `input_ids`?"
 
         gm = recover_pass(gm)
+        # Python layer wrappers specialize once per module in Dynamo. Insert
+        # opaque runtime scope operations into the traced graph instead.
+        gm = insert_nccl_window_tensor_scopes(gm)
 
         return aot_module_simplified(
             gm,
