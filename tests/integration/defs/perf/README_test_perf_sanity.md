@@ -293,6 +293,32 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{disagg config file base na
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
 ```
 
+#### Connection warmup
+
+Before the measured clients, the harness (`DisaggTestCmds._run_connection_warmup`)
+sends `2 x (ctx servers x ctx attention-DP size) x (gen servers x gen attention-DP size)`
+short requests (ISL 100, OSL 10), where a server's attention-DP size is its TP size with
+attention DP and 1 without. They open the ctx<->gen KV-cache transfer connections
+outside the measured window. `examples/disaggregated/slurm/benchmark/submit.py` sizes
+the same warmup as `ucx_warmup_requests`. Without it, each ctx rank loads a gen rank's
+transfer agent the first time that gen rank requests KV from its ctx server, one agent
+at a time on a single listener thread, and the first measured requests wait behind that
+queue (nvbugs/6564113). Notes:
+- e2e only, and skipped when every client is AgentX (which runs its own warmup) or
+  accuracy-only.
+- If only some warmup requests fail, the harness logs a warning and the measured
+  clients still run. The test fails instead, rather than letting the lane run cold or
+  hang, if the warmup's benchmark_serving exits non-zero, runs past
+  `CONNECTION_WARMUP_TIMEOUT` (capped by the test timeout), or every warmup request
+  fails.
+- Client log: `trtllm-connection-warmup.<server_idx>.log`, not parsed for metrics.
+  The servers' perf_metrics records of the warmup requests are excluded from the time
+  breakdown (see below).
+- Iteration-based nsys ranges (`local/submit.py --ctx-nsys-start-stop` /
+  `--gen-nsys-start-stop`) count from server start, so they begin with the
+  connection-warmup iterations; start the range later to profile only measured
+  iterations.
+
 ### The optional instrumentation modifier
 
 The three shapes that read a disaggregated config (2, 3 and 4 above) take one
@@ -363,6 +389,14 @@ row uploads green. For the same reason a malformed line (a partial write caught
 mid-record) costs only that line, never the whole file: dropping the disagg server's
 file would silently reroute the per-request groups to same-role worker fallbacks,
 which produce plausible values for the wrong phase.
+
+The servers also append records of the e2e connection warmup's requests to these
+files. The harness therefore notes each file's line count once those records have
+settled, and the aggregation skips those leading lines and leaves them out of the
+census. The log line `Time breakdown: excluded connection-warmup records from {...}`
+prints the counts as JSON. To reproduce the uploaded numbers offline, run
+`time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
+--drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
 
 ## CI Test Database
 

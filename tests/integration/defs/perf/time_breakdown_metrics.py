@@ -71,7 +71,7 @@ import os
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 STATS = ("mean", "median", "p75", "p99")
 METRIC_PREFIX = "d_tb_"
@@ -264,8 +264,12 @@ def _classify(path: str, records: List[Dict[str, Any]]) -> str:
     return "ctx_worker"
 
 
-def _read_jsonl(path: str) -> Tuple[List[Dict[str, Any]], int]:
+def _read_jsonl(path: str, num_leading_lines_to_skip: int = 0) -> Tuple[List[Dict[str, Any]], int]:
     """Parse a JSONL file, skipping unparsable lines. Returns ``(records, skipped)``.
+
+    The first ``num_leading_lines_to_skip`` lines are ignored without being parsed and are not
+    counted in ``skipped``, which counts unparsable lines only; see
+    ``compute_time_breakdown_metrics`` for why they are ignored.
 
     A malformed line is expected rather than exceptional: the client and every worker
     append to these files while the run is live, so the final line can be a partial
@@ -279,7 +283,9 @@ def _read_jsonl(path: str) -> Tuple[List[Dict[str, Any]], int]:
     out: List[Dict[str, Any]] = []
     skipped = 0
     with open(path) as handle:
-        for line in handle:
+        for line_idx, line in enumerate(handle):
+            if line_idx < num_leading_lines_to_skip:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -486,6 +492,7 @@ def compute_time_breakdown_metrics(
     paths: Sequence[str],
     benchmark_mode: str,
     drop_warmup_request: bool = False,
+    leading_lines_to_skip: Optional[Mapping[str, int]] = None,
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """Reduce per-request JSONLs to ``{d_tb_<metric>_<stat>: value_ms}``.
 
@@ -501,6 +508,11 @@ def compute_time_breakdown_metrics(
             ``--no-test-input`` for ``e2e`` and ``ctx_only``). Discards that request's record
             so the breakdown covers the same population as every other metric on the row; see
             :func:`_drop_warmup_record`. Reported as ``info["warmup_dropped"]``.
+        leading_lines_to_skip: per file basename, the number of leading lines to ignore
+            because they record traffic sent before the measured clients (perf-sanity's
+            connection warmup). The servers append every request to the same files, so
+            those records would otherwise join the population. Reported as
+            ``info["leading_lines_skipped"]``.
 
     Returns:
         ``(metrics, info)``. ``metrics`` always has exactly ``len(ALL_METRICS) * 4`` keys;
@@ -527,12 +539,17 @@ def compute_time_breakdown_metrics(
     gen_workers: List[Tuple[str, List[Dict[str, Any]]]] = []
 
     skipped_lines: Dict[str, int] = {}
+    leading_lines_skipped: Dict[str, int] = {}
+    leading_lines_to_skip = leading_lines_to_skip or {}
     for path in paths:
+        num_leading_lines = leading_lines_to_skip.get(os.path.basename(path), 0)
         try:
-            records, skipped = _read_jsonl(path)
+            records, skipped = _read_jsonl(path, num_leading_lines_to_skip=num_leading_lines)
         except OSError as exc:
             warnings.append(f"{os.path.basename(path)}: unreadable ({exc})")
             continue
+        if num_leading_lines:
+            leading_lines_skipped[os.path.basename(path)] = num_leading_lines
         if skipped:
             skipped_lines[os.path.basename(path)] = skipped
             warnings.append(
@@ -650,6 +667,9 @@ def compute_time_breakdown_metrics(
         "warmup_dropped": warmup_dropped,
         # Per file, non-empty only when a line failed to parse (usually a partial write).
         "skipped_lines": skipped_lines,
+        # Per file, how many leading lines were ignored as pre-measurement traffic (the
+        # connection warmup).
+        "leading_lines_skipped": leading_lines_skipped,
         "sample_counts": {
             name: len(
                 (per_instance if name in CHUNK_METRICS + STEP_METRICS else per_request).get(
@@ -730,6 +750,7 @@ def wait_for_perf_metrics_files(
     poll_seconds: float = COMPLETION_POLL_SECONDS,
     sleep=time.sleep,
     monotonic=time.monotonic,
+    leading_lines_to_skip: Optional[Mapping[str, int]] = None,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """Wait for the perf_metrics JSONLs to stop growing, then return them.
 
@@ -744,7 +765,9 @@ def wait_for_perf_metrics_files(
     (new files appearing counts as growth), bounded by ``timeout_seconds``. Then, if
     ``expected_requests`` is known, compare it against the largest file's complete-line
     count -- the disagg server and the aggregated server each write one record per request,
-    so that file is the run's census -- and report a shortfall.
+    so that file is the run's census -- and report a shortfall. Each file's
+    ``leading_lines_to_skip`` entry is subtracted from its count first, so earlier traffic
+    cannot mask a shortfall. ``info["line_counts"]`` stays raw (before the subtraction).
 
     ``sleep`` / ``monotonic`` are injected so the unit tests can drive this without wall
     time.
@@ -808,7 +831,10 @@ def wait_for_perf_metrics_files(
             warnings.append(f"{os.path.basename(path)}: could not count lines ({exc})")
 
     if expected_requests and line_counts:
-        census = max(line_counts.values())
+        leading_lines_to_skip = leading_lines_to_skip or {}
+        census = max(
+            count - leading_lines_to_skip.get(name, 0) for name, count in line_counts.items()
+        )
         if census < expected_requests:
             warnings.append(
                 f"the largest perf_metrics file holds {census} complete record(s) but the "
@@ -870,6 +896,16 @@ def main() -> int:
         help="discard the client's un-measured warmup request (perf-sanity runs one for "
         "e2e and ctx_only); pass this to match what the harness uploads",
     )
+    parser.add_argument(
+        "--leading-lines-to-skip",
+        type=json.loads,
+        default=None,
+        metavar="JSON",
+        help="per-file leading lines to ignore, as a JSON object of basename -> count; for "
+        "a disagg e2e run, pass the dict the harness logged after 'Time breakdown: excluded "
+        "connection-warmup records from' (with --drop-warmup-request) to match what it "
+        "uploads",
+    )
     args = parser.parse_args()
 
     paths = list(args.input)
@@ -879,7 +915,10 @@ def main() -> int:
         parser.error("no input: pass --input and/or --output-dir")
 
     metrics, info = compute_time_breakdown_metrics(
-        paths, args.mode, drop_warmup_request=args.drop_warmup_request
+        paths,
+        args.mode,
+        drop_warmup_request=args.drop_warmup_request,
+        leading_lines_to_skip=args.leading_lines_to_skip,
     )
 
     if args.log_lines:

@@ -68,6 +68,9 @@ SUPPORTED_GPU_MAPPING = {
 # (agentx_client.py). Any other non-empty value is rejected at parse time.
 AGENTX_BENCHMARK_CLIENT = "agentx"
 
+# Modes whose measured client sends benchmark_serving's single un-measured test
+# request (it omits --no-test-input). Unrelated to the connection warmup
+# (DisaggTestCmds._run_connection_warmup).
 WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 
@@ -174,6 +177,19 @@ GEN_LOG_SENTINEL_TIMEOUT = 120
 # rather than call-site literals so a test can shorten the window.
 PERF_METRICS_SETTLE_SECONDS = _TB_SETTLE_SECONDS
 PERF_METRICS_SETTLE_TIMEOUT = _TB_SETTLE_TIMEOUT
+# Connection warmup for disagg e2e lanes; see DisaggTestCmds._run_connection_warmup.
+# Shape and count follow ucx_warmup_requests in
+# examples/disaggregated/slurm/benchmark/{submit.py,run_benchmark.sh}.
+CONNECTION_WARMUP_ISL = 100
+CONNECTION_WARMUP_OSL = 10
+CONNECTION_WARMUP_REQUESTS_PER_RANK_PAIR = 2
+# A healthy warmup takes about a minute even on the largest lanes (768 requests to a
+# cold 32-rank gen server finished in 42 s on oci-jhb), so reaching this bound means
+# the servers are wedged.
+CONNECTION_WARMUP_TIMEOUT = 600
+# benchmark_serving's "Failed requests:" summary line, its only failure signal:
+# benchmark_serving exits 0 even when requests fail.
+_FAILED_REQUESTS_RE = re.compile(r"^Failed requests:\s+(\d+)", re.MULTILINE)
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1626,8 +1642,24 @@ def publish_addr_file(path: str, host: str, port: int) -> None:
             os.unlink(tmp_path)
 
 
-def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
-    """Run a benchmark while streaming its combined output to an artifact log."""
+def _run_benchmark_with_log(
+    cmd: List[str], env: Dict[str, str], log_path: str, timeout: float = DEFAULT_TIMEOUT
+) -> str:
+    """Run a benchmark while streaming its combined output to an artifact log.
+
+    Args:
+        cmd: Benchmark command line.
+        env: Subprocess environment; PYTHONUNBUFFERED=1 is added if unset.
+        log_path: File that receives the combined stdout and stderr.
+        timeout: Seconds before the benchmark is killed.
+
+    Returns:
+        The combined output, decoded as UTF-8.
+
+    Raises:
+        subprocess.CalledProcessError: The benchmark exited non-zero.
+        subprocess.TimeoutExpired: The benchmark ran longer than ``timeout``.
+    """
     benchmark_env = env.copy()
     benchmark_env.setdefault("PYTHONUNBUFFERED", "1")
     with open(log_path, "wb") as log_file:
@@ -1637,7 +1669,7 @@ def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) 
             stdout=log_file,
             stderr=subprocess.STDOUT,
             check=False,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=timeout,
         )
 
     with open(log_path, "rb") as log_file:
@@ -2344,6 +2376,7 @@ def append_time_breakdown_metrics(
     pending_time_breakdown: List[dict],
     outputs: List[str],
     breakdown_dir: str,
+    leading_lines_to_skip: Optional[Dict[str, int]] = None,
 ) -> None:
     """Aggregate the workers' perf_metrics JSONLs into log lines the parser reads.
 
@@ -2365,6 +2398,10 @@ def append_time_breakdown_metrics(
     parsed ``Time Breakdown ...`` lines is what check_test_failure hard-fails on,
     which keeps the diagnosis in one place instead of tearing down the whole
     session from inside a post-benchmark hook.
+
+    ``leading_lines_to_skip`` maps a JSONL basename to the number of lines it held
+    before the measured clients started (the connection warmup's records); those lines
+    are left out of both the census and the breakdown.
     """
     if not pending_time_breakdown:
         return
@@ -2379,6 +2416,7 @@ def append_time_breakdown_metrics(
         expected_requests=expected_requests or None,
         stable_seconds=PERF_METRICS_SETTLE_SECONDS,
         timeout_seconds=PERF_METRICS_SETTLE_TIMEOUT,
+        leading_lines_to_skip=leading_lines_to_skip,
     )
     for warning in wait_info["warnings"]:
         print_info(f"Time breakdown: {warning}")
@@ -2407,7 +2445,10 @@ def append_time_breakdown_metrics(
             # The client's warmup request is un-measured and absent from every other
             # metric on the row, so it is excluded here too -- see _drop_warmup_record.
             metrics, info = compute_time_breakdown_metrics(
-                paths, case_type, drop_warmup_request=bool(record.get("warmup"))
+                paths,
+                case_type,
+                drop_warmup_request=bool(record.get("warmup")),
+                leading_lines_to_skip=leading_lines_to_skip,
             )
         except (OSError, ValueError, KeyError) as exc:
             print_info(f"Time breakdown aggregation failed for {breakdown_dir}: {exc}")
@@ -2418,6 +2459,11 @@ def append_time_breakdown_metrics(
         print_info(f"Time breakdown ({case_type}) from {len(paths)} file(s): {info['counts']}")
         if info["warmup_dropped"]:
             print_info(f"Time breakdown: excluded the warmup request from {info['warmup_dropped']}")
+        if info["leading_lines_skipped"]:
+            print_info(
+                "Time breakdown: excluded connection-warmup records from "
+                f"{json.dumps(info['leading_lines_skipped'])}"
+            )
 
         summary_lines = "\n".join(format_metric_log_lines(metrics))
         with open(record["benchmark_file_path"], "a") as benchmark_ctx:
@@ -2587,6 +2633,11 @@ class AggrTestCmds(NamedTuple):
 
     def get_cmd_str(self, server_idx: int) -> List[str]:
         return ["aggr_server tests, please check config files"]
+
+
+def _attention_dp_size(config: "ServerConfig") -> int:
+    """Attention-DP ranks per worker: its TP size with attention DP, else 1."""
+    return config.tp if config.enable_attention_dp else 1
 
 
 class DisaggTestCmds(NamedTuple):
@@ -2955,6 +3006,7 @@ class DisaggTestCmds(NamedTuple):
         self,
         pending_time_breakdown: List[dict],
         outputs: List[str],
+        leading_lines_to_skip: Optional[Dict[str, int]] = None,
     ) -> None:
         """Disagg entry point for the shared aggregation; see the module function.
 
@@ -2968,7 +3020,9 @@ class DisaggTestCmds(NamedTuple):
         not a method here. Calling the method on self would raise AttributeError
         after the whole benchmark has already run.
         """
-        append_time_breakdown_metrics(pending_time_breakdown, outputs, self.perf_metrics_output_dir)
+        append_time_breakdown_metrics(
+            pending_time_breakdown, outputs, self.perf_metrics_output_dir, leading_lines_to_skip
+        )
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -2993,6 +3047,11 @@ class DisaggTestCmds(NamedTuple):
                 )
             )
         )
+        # Listed only when present, like the benchmark logs above. If the connection warmup
+        # fails, report_error then shows its log: the only client-side log at that point.
+        connection_warmup_log = self._connection_warmup_log_path(server_idx)
+        if os.path.exists(connection_warmup_log):
+            server_logs.append(connection_warmup_log)
         return server_logs
 
     @staticmethod
@@ -3007,6 +3066,209 @@ class DisaggTestCmds(NamedTuple):
                 )
             print_info(f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s")
             time.sleep(1)
+
+    def _connection_warmup_log_path(self, server_idx: int) -> str:
+        return os.path.join(self.test_output_dir, f"trtllm-connection-warmup.{server_idx}.log")
+
+    def _remove_stale_connection_warmup_log(self, server_idx: int) -> None:
+        """Delete a previous attempt's connection-warmup log.
+
+        A retry reuses test_output_dir, and get_server_logs feeds this log to the readiness
+        wait's error scan, so an error line left by the previous attempt would fail the new
+        attempt before it starts.
+        """
+        log_path = self._connection_warmup_log_path(server_idx)
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
+    def _measured_client_for_connection_warmup(self, server_idx: int) -> Optional["ClientConfig"]:
+        """The measured client whose env, backend and trust_remote_code the warmup reuses.
+
+        Returns None to skip the warmup. Only e2e lanes warm up, as in
+        examples/disaggregated/slurm/benchmark/submit.py; gen_only lanes start measuring
+        only after the gen queue fills, and warmup requests would count toward that fill.
+        AgentX clients run their own warmup phase, and accuracy-only clients measure no
+        performance, so a lane with only those skips it.
+        """
+        configs_for_idx = (
+            self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
+        )
+        if configs_for_idx is None or configs_for_idx[2].benchmark_mode != "e2e":
+            return None
+        return next(
+            (
+                client
+                for client in self.client_configs.get(server_idx, [])
+                if not client.only_run_accuracy
+                and client.benchmark_client != AGENTX_BENCHMARK_CLIENT
+            ),
+            None,
+        )
+
+    def _connection_warmup_num_requests(self, server_idx: int) -> int:
+        """Two connection-warmup requests per (ctx attention-DP rank, gen attention-DP rank) pair.
+
+        This is the count submit.py sends. The router does not guarantee every pair gets
+        one. What matters is that every (gen attention-DP rank, ctx server) pair gets at
+        least one: the first such request makes each rank of that ctx server load the gen
+        rank's transfer agent. This count averages 2 x (ctx attention-DP size) requests per
+        such pair.
+        """
+        ctx_config, gen_config, _ = self.server_configs[server_idx]
+        num_ctx_dp_ranks = self.num_ctx_servers * _attention_dp_size(ctx_config)
+        num_gen_dp_ranks = self.num_gen_servers * _attention_dp_size(gen_config)
+        return CONNECTION_WARMUP_REQUESTS_PER_RANK_PAIR * num_ctx_dp_ranks * num_gen_dp_ranks
+
+    def _connection_warmup_cmd(
+        self, measured_client: "ClientConfig", num_requests: int
+    ) -> List[str]:
+        """benchmark_serving command that sends all warmup requests at once.
+
+        Uses the lane's model and the measured client's backend and trust_remote_code,
+        and tokenizes random ids on the client as the measured client does on the random
+        dataset, so it hits the same endpoint the same way; --no-test-input keeps the
+        request count exact. The caller adds host and port.
+        """
+        model_dir = get_model_dir(self.model_name)
+        model_path = model_dir if os.path.exists(model_dir) else self.model_name
+        cmd = [
+            "python",
+            "-m",
+            "tensorrt_llm.serve.scripts.benchmark_serving",
+            "--model",
+            model_path,
+            "--tokenizer",
+            model_path,
+            "--dataset-name",
+            "random",
+            "--random-ids",
+            "--tokenize-on-client",
+            "--random-input-len",
+            str(CONNECTION_WARMUP_ISL),
+            "--random-output-len",
+            str(CONNECTION_WARMUP_OSL),
+            "--num-prompts",
+            str(num_requests),
+            "--ignore-eos",
+            "--non-streaming",
+            "--no-test-input",
+        ]
+        if measured_client.backend:
+            cmd += ["--backend", measured_client.backend]
+        if measured_client.trust_remote_code:
+            cmd.append("--trust-remote-code")
+        return cmd
+
+    def _run_connection_warmup(
+        self, server_idx: int, hostname: str, port: int, measured_client: "ClientConfig"
+    ) -> int:
+        """Open the KV-cache transfer connections before the measured clients run.
+
+        Each ctx rank loads a gen rank's transfer agent the first time that gen rank
+        requests KV from its ctx server, and it loads agents one at a time on a single
+        listener thread. On a large lane the first measured requests would otherwise wait
+        tens of seconds behind that queue (nvbugs/6564113: 32 gen ranks, about 1.4 s each
+        on oci-jhb). benchmark_serving's single test request (WARMUP_BENCHMARK_MODES)
+        reaches only one ctx/gen pair, so it cannot replace this.
+
+        If only some requests fail, the warmup still opened the connections it reached,
+        so it logs a warning and the measured clients decide whether the test passes. The
+        test fails instead of letting the lane run cold or hang if benchmark_serving exits
+        non-zero, runs past CONNECTION_WARMUP_TIMEOUT (capped by the test timeout), or
+        every request fails.
+
+        Args:
+            server_idx: Index of the disagg server under test.
+            hostname: Disagg server host.
+            port: Disagg server port.
+            measured_client: The client from _measured_client_for_connection_warmup.
+
+        Returns:
+            The number of warmup requests that succeeded.
+
+        Raises:
+            RuntimeError: benchmark_serving exited non-zero, timed out, or had every
+                request fail.
+            OSError: benchmark_serving could not be started or its log could not be opened.
+        """
+        num_requests = self._connection_warmup_num_requests(server_idx)
+        cmd = add_host_port_to_cmd(
+            self._connection_warmup_cmd(measured_client, num_requests), hostname, port
+        )
+        log_path = self._connection_warmup_log_path(server_idx)
+        timeout_seconds = min(CONNECTION_WARMUP_TIMEOUT, self.timeout)
+        # Reuse the measured client's env (proxy settings, HF offline flags, ...):
+        # without it the warmup may not reach the server or load the tokenizer.
+        env = copy.deepcopy(os.environ)
+        env.update(measured_client.to_env())
+
+        print_info(f"Connection warmup: sending {num_requests} short requests. cmd is {cmd}")
+        start = time.monotonic()
+        try:
+            output = _run_benchmark_with_log(cmd, env, log_path, timeout=timeout_seconds)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Connection warmup: benchmark_serving exited with code {e.returncode}. "
+                f"See {log_path}"
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"Connection warmup: {num_requests} short requests did not finish within "
+                f"{timeout_seconds}s, so the servers look wedged. See {log_path}"
+            ) from e
+        elapsed = time.monotonic() - start
+        failed_match = _FAILED_REQUESTS_RE.search(output)
+        failed_count = int(failed_match.group(1)) if failed_match else 0
+        if failed_count >= num_requests:
+            raise RuntimeError(
+                f"Connection warmup: all {num_requests} requests failed. See {log_path}"
+            )
+        if failed_count:
+            print_warning(
+                f"Connection warmup: {failed_count} of {num_requests} requests failed "
+                f"({elapsed:.0f}s); connections they missed will open during the measured "
+                f"run. See {log_path}"
+            )
+        else:
+            print_info(f"Connection warmup: {num_requests} requests done in {elapsed:.0f}s")
+        return num_requests - failed_count
+
+    def _wait_for_connection_warmup_line_counts(
+        self, num_succeeded_requests: int
+    ) -> Dict[str, int]:
+        """Wait for the warmup's perf_metrics records to settle; return per-file line counts.
+
+        The time breakdown skips this many leading lines per file. The servers queue each
+        record before answering its request, so once the files stop growing, every
+        successful warmup request's record is on disk.
+
+        Args:
+            num_succeeded_requests: Warmup requests that succeeded. The disagg server
+                writes one record per request, so the largest file should hold this many
+                lines.
+
+        Returns:
+            Line count per perf_metrics JSONL basename.
+        """
+        _, settle_info = wait_for_perf_metrics_files(
+            self.perf_metrics_output_dir,
+            stable_seconds=PERF_METRICS_SETTLE_SECONDS,
+            timeout_seconds=PERF_METRICS_SETTLE_TIMEOUT,
+        )
+        line_counts = settle_info["line_counts"]
+        census = max(line_counts.values(), default=0)
+        consequence = "warmup records written after this count as measured in d_tb_*"
+        if not settle_info["stable"]:
+            print_warning(
+                "Connection warmup: perf_metrics files were still growing at the settle "
+                f"timeout; {consequence}"
+            )
+        elif census < num_succeeded_requests:
+            print_warning(
+                f"Connection warmup: the largest perf_metrics file holds {census} of "
+                f"{num_succeeded_requests} warmup records; {consequence}"
+            )
+        return line_counts
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
@@ -3143,7 +3405,10 @@ class DisaggTestCmds(NamedTuple):
             # is the single master switch), so there is no second predicate to
             # keep in sync with it.
             collect_time_breakdown = bool(self.perf_metrics_output_dir)
+            # Filled only when the connection warmup ran with the time breakdown on.
+            connection_warmup_line_counts: Dict[str, int] = {}
             try:
+                self._remove_stale_connection_warmup_log(server_idx)
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
@@ -3157,6 +3422,18 @@ class DisaggTestCmds(NamedTuple):
                 )
                 observations = self._collect_worker_startup_observations(server_idx)
                 write_startup_observations(self.test_output_dir, server_idx, observations)
+
+                measured_client = self._measured_client_for_connection_warmup(server_idx)
+                if measured_client is not None:
+                    num_succeeded_connection_warmup_requests = self._run_connection_warmup(
+                        server_idx, disagg_server_hostname, disagg_server_port, measured_client
+                    )
+                    if collect_time_breakdown:
+                        connection_warmup_line_counts = (
+                            self._wait_for_connection_warmup_line_counts(
+                                num_succeeded_connection_warmup_requests
+                            )
+                        )
 
                 client_configs = self.client_configs.get(server_idx, [])
 
@@ -3299,7 +3576,11 @@ class DisaggTestCmds(NamedTuple):
             # instead of rescanning the log. Modes outside the tuple leave the
             # queue empty and skip both steps.
             self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
-            self._append_time_breakdown_metrics(pending_time_breakdown, outputs)
+            self._append_time_breakdown_metrics(
+                pending_time_breakdown,
+                outputs,
+                leading_lines_to_skip=connection_warmup_line_counts,
+            )
 
         return outputs
 
