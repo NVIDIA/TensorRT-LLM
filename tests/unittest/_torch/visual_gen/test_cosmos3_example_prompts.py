@@ -252,7 +252,7 @@ class TestShippedPromptFiles:
 
     def test_edge_policy_prompt_matches_checkpoint_defaults(self):
         data = cosmos3.load_prompt_file("prompts/action_edge_policy_droid.json")
-        prompt = data["prompt"]
+        prompt = json.loads(data["prompt"])
         policy_defaults = resolve_checkpoint_policy_defaults(
             {
                 "action_chunk_size": 32,
