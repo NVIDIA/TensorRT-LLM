@@ -345,6 +345,15 @@ def get_spec_metadata(spec_config,
     # the per-mode constructors are easy to miss one of.
     if metadata is not None:
         metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+        # advanced_sampling_mode has exactly that property, and the warning above was
+        # already earned once: it was threaded through two of the per-mode constructors
+        # and missed by the rest, including eagle3_one_model. The metadata then kept its
+        # FULL default while SpecSampler.validate_request read the real mode off the
+        # config -- so a min_p request was admitted, its buffers were never filled
+        # (fill_min_p reads this field), and the dispatcher routed to the flashinfer
+        # chain, which has no min_p argument at all. min_p was silently ignored end to
+        # end while every unit test passed. Set it in one place so no mode can miss it.
+        metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
     return metadata
 
 
@@ -383,7 +392,6 @@ def _build_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
-            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
             num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
@@ -483,7 +491,6 @@ def _build_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
-            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
