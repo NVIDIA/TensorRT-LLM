@@ -43,6 +43,7 @@ if TYPE_CHECKING:
         CacheConfig,
         CacheDiTConfig,
         CompilationConfig,
+        CpuOffloadConfig,
         CudaGraphConfig,
         ParallelConfig,
         QuantAttentionConfig,
@@ -68,6 +69,7 @@ _LAZY_ATTRS = {
     "CacheConfig": "tensorrt_llm.visual_gen.args",
     "CacheDiTConfig": "tensorrt_llm.visual_gen.args",
     "CompilationConfig": "tensorrt_llm.visual_gen.args",
+    "CpuOffloadConfig": "tensorrt_llm.visual_gen.args",
     "CudaGraphConfig": "tensorrt_llm.visual_gen.args",
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
     "QuantAttentionConfig": "tensorrt_llm.visual_gen.args",
@@ -119,6 +121,7 @@ __all__ = [
     # Cross-cutting sub-configs
     "CompilationConfig",
     "CudaGraphConfig",
+    "CpuOffloadConfig",
     "TorchCompileConfig",
     "ParallelConfig",
     "AttentionConfig",

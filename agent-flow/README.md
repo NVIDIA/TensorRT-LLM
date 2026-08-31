@@ -68,7 +68,7 @@ python examples/quick_start.py
 
 ## Workflows
 
-Two ready-to-run multi-agent workflows ship as subpackages of
+Ready-to-run multi-agent workflows ship as subpackages of
 `agent_flow.workflows`:
 
 - [`agent_flow.workflows.agent_team`](agent_flow/workflows/agent_team) —
@@ -80,12 +80,36 @@ Two ready-to-run multi-agent workflows ship as subpackages of
   verbatim, and only swaps the prompt bundle (source boundary, validation
   policy, attention/MoE/full-model scope, accuracy-gate framework).
   Launch via `modeling-bringup`.
+- [`agent_flow.workflows.perf_analyze`](agent_flow/workflows/perf_analyze) —
+  one-shot **diagnosis** of a `trtllm-serve` deployment (Benchmarker →
+  Projector → Analyzer → Reporter): it serves the checkpoint, benchmarks one
+  operating point, derives an analytical speed-of-light ceiling, profiles the
+  same load under nsys / the torch profiler / ncu, and reports the single
+  dominant bottleneck. It applies nothing and never mutates the TensorRT-LLM
+  checkout. Launch via `perf-analyze`.
+- [`agent_flow.workflows.perf_optimize`](agent_flow/workflows/perf_optimize) —
+  the **applying** counterpart: it shares perf-analyze's benchmark, SOL
+  projection and analysis stages, then iterates Optimizer ↔ Evaluator rounds
+  that apply the top-ranked roadmap item (serving config and/or TRT-LLM source
+  on a dedicated git branch) and gate each attempt on measured gain, before a
+  stateless QA re-measurement and a final report. Launch via `perf-optimize`.
+
+The `agent-team` / `modeling-bringup` pipeline:
 
 ```
 PlanDrafter ⇄ PlanReviewer [⇄ Human]  →  Coder ⇄ Reviewer  →  QA  ✔
 ```
 
 ![Agent-team workflow](./agent_flow/workflows/agent_team/docs/agent-team.svg)
+
+The `perf-analyze` / `perf-optimize` pipeline (the optimize rounds are the
+part perf-analyze does not have):
+
+```
+Benchmarker  →  [Projector]  →  Analyzer  →  Reporter  ✔
+                                     ↓
+                   (Optimizer ⇄ Evaluator) × items × rounds  →  QA
+```
 
 ### Run the modeling-bringup workflow
 
@@ -114,6 +138,35 @@ the run (`plan.md`, `acceptance-criteria.md`, `progress.yaml`, `status.md`,
 and the resume checkpoint). If the run is interrupted, rerun the same
 command — it auto-resumes from the checkpoint. Pass `--clean` to wipe the
 checkpoint and start over.
+
+### Run the perf-analyze / perf-optimize workflows
+
+Both take a `task.yaml` describing the deployment to measure. Ready-to-edit
+templates live at
+[`agent_flow/workflows/perf_analyze/task.example.yaml`](agent_flow/workflows/perf_analyze/task.example.yaml)
+and
+[`agent_flow/workflows/perf_optimize/task.example.yaml`](agent_flow/workflows/perf_optimize/task.example.yaml) —
+copy one, fill in `checkpoint_path` and `trtllm_repo_path`, and run:
+
+```bash
+perf-analyze  --task task.yaml --workspace workspace/perf-analyze
+perf-optimize --task task.yaml --workspace workspace/perf-optimize
+```
+
+Both need GPUs where the server runs: either the local node has them, or the
+task carries a `slurm-environment` block that routes the server and the
+benchmark through a Slurm-launched container. Like the workflows above, the
+workspace holds all shared state and a rerun of the same command auto-resumes
+from the checkpoint.
+
+perf-analyze is read-only with respect to the TensorRT-LLM checkout.
+perf-optimize is not — it applies accepted changes on a dedicated git branch,
+so read
+[`agent_flow/workflows/perf_optimize/README.md`](agent_flow/workflows/perf_optimize/README.md)
+(branch and revert semantics, the roadmap contract, the evaluator's three-way
+verdict) before pointing it at a checkout you care about.
+[`agent_flow/workflows/perf_analyze/README.md`](agent_flow/workflows/perf_analyze/README.md)
+covers the diagnosis pipeline, task schema and workspace layout that both share.
 
 ### Steering a live run
 

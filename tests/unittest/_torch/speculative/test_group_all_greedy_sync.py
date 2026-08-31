@@ -32,13 +32,12 @@ def _fake_request(temperature=None, top_k=None, top_p=None, slot=0):
     )
 
 
-def _fake_meta(group_all_greedy_sample=None, force_capture=False):
+def _fake_meta(group_all_greedy_sample=None):
     return types.SimpleNamespace(
         runtime_draft_len=2,
         dummy_slot_row=0,
         spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
         group_all_greedy_sample=group_all_greedy_sample,
-        _force_non_greedy_for_capture=force_capture,
     )
 
 
@@ -82,15 +81,6 @@ def test_group_override_true_keeps_greedy():
     meta = _fake_meta(group_all_greedy_sample=True)
     _scan(meta, [_fake_request()])
     assert meta.is_all_greedy_sample is True
-
-
-def test_capture_override_composes_with_group_sync():
-    # Warmup forces the advanced variant to capture its CUDA graph; the group
-    # value is derived from capture-forced locals (all False), so the final
-    # flag stays False regardless of composition order.
-    meta = _fake_meta(group_all_greedy_sample=False, force_capture=True)
-    _scan(meta, [_fake_request()])
-    assert meta.is_all_greedy_sample is False
 
 
 def test_refresh_discards_warmup_group_value_for_real_request():

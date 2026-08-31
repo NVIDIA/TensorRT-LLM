@@ -56,6 +56,42 @@ def _video_content_type(suffix: str) -> str:
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
 
 
+def _resolve_tensor_only_format(fmt, extra_params, extra_param_specs):
+    """Resolve ``format`` for a request whose result an encoder cannot carry.
+
+    A pipeline marks such parameters with ``requires_tensor_output`` on their
+    :class:`ExtraParamSchema` (Cosmos3 does so for ``action_mode``: a predicted
+    trajectory has no representation in a video container). The rule keeps this
+    route model-agnostic -- it reads the declaration, never the parameter's
+    meaning:
+
+    * ``auto`` resolves to ``safetensors``, so the default request returns
+      everything it generated instead of silently dropping a modality;
+    * an explicit tensor format passes through;
+    * an explicit encoder format is a contradiction the caller stated -- two
+      incompatible things in one request -- so it is rejected rather than
+      guessed at.
+    """
+    if not extra_params or not extra_param_specs:
+        return fmt
+    triggered = sorted(
+        key
+        for key, spec in extra_param_specs.items()
+        if getattr(spec, "requires_tensor_output", False) and extra_params.get(key) is not None
+    )
+    if not triggered:
+        return fmt
+    if is_tensor_format(fmt):
+        return fmt
+    if fmt == "auto":
+        return _DEFAULT_TENSOR_FORMAT
+    raise ValueError(
+        f"format={fmt!r} cannot carry the result of {', '.join(triggered)}: a "
+        f"video container holds only video. Use format='safetensors' or 'pt', "
+        f"or omit format so 'auto' selects a payload that carries everything."
+    )
+
+
 def _preflight_encoder_format(fmt):
     """Pre-flight an encoder format string before any GPU work.
 
@@ -72,6 +108,9 @@ def _preflight_encoder_format(fmt):
         return resolve_video_format(fmt)[0]
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
+
+
+_DEFAULT_TENSOR_FORMAT = "safetensors"
 
 
 def _path_json_video_response(
@@ -125,7 +164,10 @@ class _VideoRoutesMixin:
                     self.generator,
                     media_storage_path=str(self.media_storage_path),
                 )
-                resolved_encoder_fmt = _preflight_encoder_format(request.format)
+                request_format = _resolve_tensor_only_format(
+                    request.format, request.extra_params, self.generator.extra_param_specs
+                )
+                resolved_encoder_fmt = _preflight_encoder_format(request_format)
                 logger.info(
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -153,8 +195,8 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            if is_tensor_format(request.format):
-                ext = f".{request.format}"
+            if is_tensor_format(request_format):
+                ext = f".{request_format}"
                 media_type = "application/octet-stream"
                 # Match the encoder-format path: persist one file per batch
                 # item, ship the first as the route's primary download
@@ -164,7 +206,7 @@ class _VideoRoutesMixin:
                 tensor_paths = [
                     self.media_storage_path / f"{video_id}_{i}{ext}" for i in range(batch_size)
                 ]
-                saved_paths = output.save(tensor_paths, format=request.format)
+                saved_paths = output.save(tensor_paths, format=request_format)
                 target = saved_paths[0]
                 latency = time.perf_counter() - sync_video_start
                 logger.info(
@@ -361,7 +403,10 @@ class _VideoRoutesMixin:
                 declared_defaults=self.generator.executor.default_generation_params,
                 extra_param_specs=self.generator.executor.extra_param_specs,
             )
-            _preflight_encoder_format(request.format)
+            request_format = _resolve_tensor_only_format(
+                request.format, request.extra_params, self.generator.extra_param_specs
+            )
+            _preflight_encoder_format(request_format)
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
@@ -388,6 +433,7 @@ class _VideoRoutesMixin:
                     video_id=video_id,
                     request=request,
                     params=params,
+                    request_format=request_format,
                 )
             )
             self.video_gen_tasks[video_id] = task
@@ -413,8 +459,15 @@ class _VideoRoutesMixin:
         video_id: str,
         request: VideoGenerationRequest,
         params: VisualGenParams,
+        request_format: str,
     ):
-        """Background task to generate video and save to storage."""
+        """Background task to generate video and save to storage.
+
+        ``request_format`` is the format already resolved by the route (see
+        :func:`_resolve_tensor_only_format`), not ``request.format``: the
+        resolution happens before the job is queued so a rejected request never
+        becomes a background task.
+        """
         try:
             background_start = time.perf_counter()
             job = await VIDEO_STORE.get(video_id)
@@ -441,18 +494,18 @@ class _VideoRoutesMixin:
                 job.status = "postprocessing"
                 await VIDEO_STORE.upsert(video_id, job)
 
-            if is_tensor_format(request.format):
+            if is_tensor_format(request_format):
                 # One tensor file per batch item, mirroring the encoder
                 # path; the async job records all paths on
                 # ``output_paths`` so subsequent GETs can find each item.
                 batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
                 tensor_paths = [
-                    self.media_storage_path / f"{video_id}_{i}.{request.format}"
+                    self.media_storage_path / f"{video_id}_{i}.{request_format}"
                     for i in range(batch_size)
                 ]
-                saved_paths = output.save(tensor_paths, format=request.format)
+                saved_paths = output.save(tensor_paths, format=request_format)
             else:
-                resolved_fmt, _ = resolve_video_format(request.format)
+                resolved_fmt, _ = resolve_video_format(request_format)
                 batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
                 paths_in = [self.media_storage_path / f"{video_id}_{i}" for i in range(batch_size)]
                 _save_kwargs = dict(
