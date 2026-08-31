@@ -460,6 +460,13 @@ def kda_mtp_decode_impl(
         out = torch.zeros(1, T_total, HV, V_dim, dtype=x_q.dtype, device=x_q.device)
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+    # Mixed context/generation batches pass a view into the shared state-index
+    # buffer.  An int32 view starting after one to three context rows is still
+    # contiguous but may not satisfy the CuTe DLPack bridge's 16-byte pointer
+    # alignment requirement.  The indices are read-only, so materialize only
+    # those misaligned views before creating the CuTe arguments.
+    if ssm_state_indices.data_ptr() % 16 != 0:
+        ssm_state_indices = ssm_state_indices.clone()
 
     _require_stride_layout(
         x_q=x_q,

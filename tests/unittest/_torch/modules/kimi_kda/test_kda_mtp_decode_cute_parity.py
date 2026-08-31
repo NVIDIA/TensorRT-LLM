@@ -534,6 +534,35 @@ def test_zero_accepted_hint_variant(B, H):
         _assert_close(f"{name}(fast vs general)", fast[name], general[name], atol=1e-5)
 
 
+def test_misaligned_state_indices_after_aligned_warmup():
+    """Mixed context/generation metadata remains valid after op warmup."""
+    data = make_conv_data(B=1, H=6, M=M, seed=13)
+    expected = cute_run(data)
+
+    index_storage = torch.empty(2, dtype=torch.int32, device="cuda")
+    index_storage[0] = -1
+    index_storage[1:].copy_(data["ssm_state_indices"])
+    misaligned_indices = index_storage[1:]
+    assert misaligned_indices.is_contiguous()
+    assert misaligned_indices.data_ptr() % 16 != 0
+
+    misaligned_data = dict(data)
+    misaligned_data["ssm_state_indices"] = misaligned_indices
+    actual = cute_run(misaligned_data)
+
+    for name in (
+        "out",
+        "recurrent_state",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        _assert_close(f"{name}(misaligned vs aligned)", actual[name], expected[name], atol=1e-5)
+
+
 if __name__ == "__main__":
     import sys
 
