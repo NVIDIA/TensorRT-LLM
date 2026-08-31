@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import IndexMapper
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -48,6 +49,37 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+def test_index_mapper_replicates_request_scoped_generation_rows() -> None:
+    index_mapper = IndexMapper(
+        max_batch_size=2,
+        max_beam_width=1,
+        max_copy_beam_width=3,
+    )
+    index_mapper.add_new_sequence(10)
+    index_mapper.add_new_sequence(20)
+
+    copy_index = index_mapper.get_copy_index(
+        request_ids=[10, 20],
+        num_context=1,
+        beam_width=3,
+        replicate_beam_zero=True,
+    )
+
+    assert copy_index.tolist() == [0, 1, 1, 1]
+
+
+def test_cross_kv_cache_keeps_one_physical_beam() -> None:
+    cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.kv_cache_type = CacheType.CROSS
+    cache_manager.max_beam_width = 1
+    cache_manager.max_copy_beam_width = 3
+    kv_cache = SimpleNamespace(beam_width=1)
+    request = SimpleNamespace(py_beam_width=3)
+
+    assert cache_manager._ensure_generation_beam_width(request, kv_cache)
+    assert kv_cache.beam_width == 1
 
 
 class _CacheTierInitError(Exception):
@@ -83,8 +115,10 @@ def _make_cache_config_for_test(
     max_num_tokens: int | None = None,
     max_draft_len: int = 0,
     num_extra_kv_tokens: int = 0,
+    max_beam_width: int = 1,
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.max_beam_width = max_beam_width
     cache_manager.kv_cache_type = CacheType.SELFKONLY
     cache_manager.dtype = DataType.HALF
     cache_manager.head_dim_per_layer = [128]
@@ -256,6 +290,21 @@ def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
     config = _make_cache_config_for_test(KvCacheConfig(enable_partial_reuse=enable_partial_reuse))
 
     assert config.enable_partial_reuse is enable_partial_reuse
+
+
+def test_beam_search_disables_only_partial_commit() -> None:
+    # Partial commit publishes the prompt's trailing partial block into the
+    # radix tree and canonicalizes it to beam 0, which is incompatible with the
+    # per-beam writes that follow, so beam search must turn it off. Partial
+    # reuse matches a token prefix inside ordinary full blocks and is copied to
+    # a private page before beams are added, so it stays user-controlled.
+    config = _make_cache_config_for_test(
+        KvCacheConfig(enable_partial_reuse=True),
+        max_beam_width=4,
+    )
+
+    assert config.enable_partial_reuse
+    assert not config.enable_partial_commit
 
 
 def test_pool_ratio_overrides_constraints() -> None:

@@ -1091,14 +1091,14 @@ class _KVCache:
                         break
                 if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
-                    if is_end:
+                    if is_end and self.manager.enable_partial_commit:
                         self._commit_block(
                             partial_ordinal,
                             True,
                             commit_ssm=ssm_lc_id is not None,
                             move_ssm=ssm_lc_id is not None,
                         )
-                    else:
+                    elif not is_end:
                         self._snapshot_partial_block_to_tree(
                             partial_ordinal, commit_ssm=ssm_lc_id is not None
                         )
@@ -1178,7 +1178,10 @@ class _KVCache:
             self._commit_state = self.CommitState.USER_STOP
             return
         assert self._commit_state == self.CommitState.ALLOWED
-        if self.num_committed_tokens % self.tokens_per_block != 0:
+        if (
+            self.num_committed_tokens % self.tokens_per_block != 0
+            and self.manager.enable_partial_commit
+        ):
             ordinal = _KVCache._to_block_ordinal(self.tokens_per_block, self.num_committed_tokens)
             with self._record_event():
                 self._commit_block(ordinal, True)

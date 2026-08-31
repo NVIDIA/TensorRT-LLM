@@ -168,6 +168,8 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    beam_width: int = 1
+    prompt_length: int = 0
 
 @dataclass(slots=True)
 class BatchDesc:
@@ -194,6 +196,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    enable_partial_commit: bool = True
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -553,6 +556,8 @@ class KVCacheManager:
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
+    @property
+    def enable_partial_commit(self) -> bool: ...
     def supports_index_mode(self, mode: PageIndexMode) -> bool | None: ...
     @property
     def num_layers(self) -> int: ...

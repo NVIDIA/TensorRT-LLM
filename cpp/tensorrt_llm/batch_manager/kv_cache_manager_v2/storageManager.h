@@ -259,8 +259,10 @@ public:
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
 
     // Compute lifecycle allocation weights, then project them onto a cache level's pool grouping.
-    TypedVec<LifeCycleId, float> ratioFromLength(
-        CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
+    // `beamWidth` / `promptLength` describe the typical request the weights are derived from; only
+    // the blocks from the prompt tail onward are replicated per beam (see KVCacheDesc).
+    TypedVec<LifeCycleId, float> ratioFromLength(CacheLevel level, int tokensPerBlock, int historyLength, int capacity,
+        int beamWidth = 1, int promptLength = 0) const;
     TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
         CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
 

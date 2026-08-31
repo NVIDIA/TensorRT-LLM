@@ -86,7 +86,8 @@ struct SeqBlock
         bool ret = treeBlock != nullptr;
         if (TLLM_UNLIKELY(gDebug))
         {
-            // When committed: must have 1 beam, all non-null pages must be CommittedPage.
+            // When committed: must have one canonical beam, and all non-null
+            // pages must be CommittedPage.
             if (ret)
             {
                 TLLM_CHECK(pages.size() == BeamIndex{1});
@@ -214,6 +215,8 @@ public:
     // Commit tokens: finalises the oldest uncommitted block and makes it
     // available for reuse by other KvCaches.
     // tokens must contain exactly tokensPerBlock tokens per call (until the last).
+    // For beam search, tokens must already be finalized and their KV data must
+    // be in beam 0. Committing a full block releases the other beam pages.
     // is_end: if true, records a final reusable snapshot and stops committing.
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
@@ -328,6 +331,12 @@ public:
     {
         return mBeamWidth;
     }
+
+    // Beam widths greater than one are generation-only. Increasing the width
+    // copies the prompt tail and live generation state from beam 0; full prompt
+    // blocks remain unmapped for the new beams and are shared through cache
+    // indirection. Decreasing the width discards the removed alternatives.
+    void setBeamWidth(BeamIndex beamWidth);
 
     CUstream cudaStream() const;
 
@@ -495,8 +504,9 @@ private:
         TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration);
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
-    void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
+    void _truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth);
+    void _appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth);
 
     void _evictOutOfWindowBlocks(int historyLength)
     {

@@ -653,7 +653,21 @@ class KvCacheCreator:
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
-            if self._max_beam_width is not None and self._max_beam_width > 1:
+            sparse_attn_config = model_config.sparse_attention_config
+            python_v2_backend = (os.environ.get(
+                "TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python")
+            # Sparse attention: ModelEngine only forwards cache_indirection when
+            # the metadata type is exactly TrtllmAttentionMetadata, and every
+            # sparse backend uses a subclass, so beams would read beam 0's
+            # unmapped prompt rows. The sparse managers' own block tables
+            # (indexer K-cache, pool block indices) are beam-0 only as well.
+            # Disaggregated serving: the context and generation instances own
+            # separate KvCaches and the handoff carries beam 0 only. Beam search
+            # over that handoff is not supported yet — with block reuse it trips
+            # "prepopulatedPromptLen >= promptLen" on the generation side.
+            if (self._max_beam_width is not None and self._max_beam_width > 1
+                    and (python_v2_backend or is_hybrid_linear(config)
+                         or self._is_disagg or sparse_attn_config is not None)):
                 incompat.append("max_beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)
@@ -679,8 +693,9 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "and disable the KV connector.")
+                        "provide a compatible fallback. Disable the "
+                        "incompatible features (e.g. use max_beam_width=1 and "
+                        "no KV connector) to run hybrid Mamba models.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -1947,6 +1962,7 @@ class KvCacheCreator:
             sparse_attention_config=None,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=1,
+            max_copy_beam_width=self._max_beam_width,
             kv_connector_manager=None,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
@@ -2205,6 +2221,7 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        max_copy_beam_width: Optional[int] = None,
         estimating_kv_cache: bool = False,
         enable_kv_cache_stats: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
@@ -2348,6 +2365,7 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

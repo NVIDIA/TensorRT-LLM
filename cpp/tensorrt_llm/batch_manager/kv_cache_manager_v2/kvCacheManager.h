@@ -171,6 +171,10 @@ public:
     int tokensPerBlock() const noexcept;
     bool enablePartialMatch() const noexcept;
 
+    // Partial commit is independent of partial matching so beam search can
+    // retain full-block reuse without publishing a writable prompt tail.
+    bool enablePartialCommit() const noexcept;
+
     bool commitMinSnapshot() const noexcept
     {
         return mConfig.commitMinSnapshot;
@@ -305,6 +309,16 @@ public:
         mAvgSqrHistoryLength.update(v);
     }
 
+    void updateAvgBeamWidth(double v)
+    {
+        mAvgBeamWidth.update(v);
+    }
+
+    void updateAvgPromptLength(double v)
+    {
+        mAvgPromptLength.update(v);
+    }
+
     void incrementNumSampledKvCaches()
     {
         ++mNumSampledKvCaches;
@@ -348,6 +362,10 @@ private:
     MovingAverage mAvgReusedLength;
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
+    // Beam search replicates only the blocks past the prompt tail, so the tuner
+    // needs both the typical beam width and where that tail sits.
+    MovingAverage mAvgBeamWidth;
+    MovingAverage mAvgPromptLength;
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;

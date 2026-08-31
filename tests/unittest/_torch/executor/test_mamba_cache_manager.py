@@ -963,11 +963,94 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
 
     with pytest.raises(NotImplementedError, match=expected):
         creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, model_config, KvCacheConfig()
         )
+
+
+def test_v2_encoder_decoder_beam_uses_v2_cross_kv_mapping():
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["T5ForConditionalGeneration"]),
+        sparse_attention_config=None,
+        is_encoder_decoder=True,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 2
+    creator._is_disagg = False
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+        is KVCacheManagerV2
+    )
+
+
+@pytest.mark.parametrize(
+    "backend, expected_manager",
+    [("cpp", KVCacheManagerV2), ("python", KVCacheManager)],
+)
+def test_v2_beam_fallback_depends_on_backend(monkeypatch, backend, expected_manager):
+    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", backend)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        sparse_attention_config=None,
+        is_encoder_decoder=False,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 2
+    creator._is_disagg = False
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+        is expected_manager
+    )
+
+
+def test_v2_sparse_attention_rejects_beam_search():
+    # Sparse backends subclass TrtllmAttentionMetadata, so ModelEngine never
+    # hands them cache_indirection; beams would read beam 0's unmapped prompt
+    # rows. Fail at startup instead of asserting inside metadata preparation.
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="deepseek_v4"),
+        is_encoder_decoder=False,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 2
+    creator._is_disagg = False
+
+    with pytest.raises(NotImplementedError, match="max_beam_width > 1"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+
+
+def test_v2_sparse_attention_allowed_without_beam_search():
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="deepseek_v4"),
+        is_encoder_decoder=False,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 1
+    creator._is_disagg = False
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+        is KVCacheManagerV2
+    )
 
 
 def _make_mgr(

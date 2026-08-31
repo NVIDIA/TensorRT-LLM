@@ -1122,7 +1122,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         with LLM(
                 model=self.MODEL_PATH,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                              use_kv_cache_manager_v2=True),
                 max_batch_size=max_beam_width,
                 max_seq_len=2048,
                 max_beam_width=max_beam_width,
@@ -1167,7 +1168,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         llm = LLM(
             model=model_path,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                          use_kv_cache_manager_v2=True),
             max_batch_size=max_beam_width,
             max_seq_len=2048,
             max_beam_width=max_beam_width,
