@@ -208,6 +208,8 @@ private:
         {
             return group != nullptr;
         }
+        // Null stream is rejected, not defaulted: cuMemcpyBatchAsync documents "must not be legacy
+        // NULL stream" and returns CUDA_ERROR_INVALID_VALUE for both 0 and CU_STREAM_LEGACY.
         if (group == nullptr || pageIndices == nullptr || (isEncode ? dstBasePtr == nullptr : srcBasePtr == nullptr)
             || stream == nullptr || numBasePages > std::numeric_limits<size_t>::max() / group->copyPlans.stdSize())
         {
