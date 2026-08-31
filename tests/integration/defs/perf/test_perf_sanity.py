@@ -115,6 +115,18 @@ DISAGG_SERVER_READY_TIMEOUT = 3600
 # Keep this well below the whole-test timeout so a stuck multi-node srun cannot
 # turn the optional log-flush synchronization into a pytest/Slurm cancellation.
 GEN_LOG_SENTINEL_TIMEOUT = 120
+# Short-ISL/OSL warmup requests sent before the measured e2e disagg clients so
+# ctx<->gen cache-transfer (UCX/NIXL) connections are established outside the
+# measured window. Request shape mirrors the warmup block in
+# examples/disaggregated/slurm/benchmark/run_benchmark.sh.
+WARMUP_INPUT_LEN = 100
+WARMUP_OUTPUT_LEN = 10
+# Bound on the warmup subprocess. Warmup is best-effort: a hung warmup (e.g.
+# a wedged KV transfer, or a tokenizer fetch on an air-gapped node) must not
+# burn the whole-test timeout that every CTX/GEN rank's benchmark_status wait
+# shares. Even the largest checked-in config (~1k requests at osl=10) drains
+# in minutes, so this bound only trips on genuine hangs.
+WARMUP_TIMEOUT = 1800
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -657,8 +669,14 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
-def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
-    """Run a benchmark while streaming its combined output to an artifact log."""
+def _run_benchmark_with_log(
+    cmd: List[str], env: Dict[str, str], log_path: str, timeout: Optional[float] = None
+) -> str:
+    """Run a benchmark while streaming its combined output to an artifact log.
+
+    Raises subprocess.TimeoutExpired if *timeout* (seconds) elapses first;
+    measured clients pass None and keep relying on the outer test timeout.
+    """
     benchmark_env = env.copy()
     benchmark_env.setdefault("PYTHONUNBUFFERED", "1")
     with open(log_path, "wb") as log_file:
@@ -668,6 +686,7 @@ def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) 
             stdout=log_file,
             stderr=subprocess.STDOUT,
             check=False,
+            timeout=timeout,
         )
 
     with open(log_path, "rb") as log_file:
@@ -1666,6 +1685,10 @@ class DisaggTestCmds(NamedTuple):
                 )
             )
         )
+        # Include the warmup log so a warmup that hangs or fails before any
+        # measured client runs still leaves its story in report_error tails.
+        # Consumers tolerate the file not existing yet (pre-warmup callers).
+        server_logs.append(os.path.join(self.test_output_dir, f"trtllm-warmup.{server_idx}.log"))
         return server_logs
 
     @staticmethod
@@ -1680,6 +1703,109 @@ class DisaggTestCmds(NamedTuple):
                 )
             print_info(f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s")
             time.sleep(1)
+
+    def _warmup_num_requests(self, server_idx: int) -> int:
+        """Warmup request count for the e2e benchmark, 0 for other modes.
+
+        Matches examples/disaggregated/slurm/benchmark/submit.py:
+        2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size, where dp_size is
+        the worker tp size when attention DP is enabled and 1 otherwise --
+        enough small requests to touch every ctx<->gen worker pair.
+        """
+        configs_for_idx = (
+            self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
+        )
+        if configs_for_idx is None:
+            return 0
+        ctx_config, gen_config, disagg_config = configs_for_idx
+        if disagg_config.benchmark_mode != "e2e":
+            return 0
+        ctx_dp_size = ctx_config.tp if ctx_config.enable_attention_dp else 1
+        gen_dp_size = gen_config.tp if gen_config.enable_attention_dp else 1
+        return 2 * self.num_ctx_servers * ctx_dp_size * self.num_gen_servers * gen_dp_size
+
+    def _run_warmup(self, server_idx: int, hostname: str, port: int) -> None:
+        """Warm up cache-transfer connections before the measured clients.
+
+        The log goes to trtllm-warmup.*.log, which the metric parsing never
+        reads (it is not in the trtllm-benchmark.*.log glob), so the measured
+        benchmark results are unaffected; it is listed in get_server_logs()
+        only so failure tails include it. A warmup failure or timeout is
+        logged but does not fail the test; the measured clients decide that
+        against the same server.
+        """
+        num_requests = self._warmup_num_requests(server_idx)
+        if num_requests <= 0:
+            return
+        model_dir = get_model_dir(self.model_name)
+        model_path = model_dir if os.path.exists(model_dir) else self.model_name
+        warmup_cmd = add_host_port_to_cmd(
+            [
+                "python",
+                "-m",
+                "tensorrt_llm.serve.scripts.benchmark_serving",
+                "--model",
+                model_path,
+                "--tokenizer",
+                model_path,
+                "--dataset-name",
+                "random",
+                "--random-ids",
+                "--random-input-len",
+                str(WARMUP_INPUT_LEN),
+                "--random-output-len",
+                str(WARMUP_OUTPUT_LEN),
+                "--num-prompts",
+                str(num_requests),
+                "--ignore-eos",
+                "--non-streaming",
+                "--trust-remote-code",
+            ],
+            hostname,
+            port,
+        )
+        warmup_log = os.path.join(self.test_output_dir, f"trtllm-warmup.{server_idx}.log")
+        print_info(
+            f"Warming up cache-transfer connections with {num_requests} short requests. "
+            f"cmd is {warmup_cmd}"
+        )
+        # Client-side env vars (proxy settings, HF offline flags, ...) can be
+        # required just to reach the endpoint or load the tokenizer; without
+        # them warmup would fail silently on every run and warm nothing.
+        warmup_env = copy.deepcopy(os.environ)
+        client_configs = self.client_configs.get(server_idx, [])
+        if client_configs:
+            warmup_env.update(client_configs[0].to_env())
+        try:
+            output = _run_benchmark_with_log(
+                warmup_cmd,
+                warmup_env,
+                warmup_log,
+                timeout=min(WARMUP_TIMEOUT, self.timeout),
+            )
+            # benchmark_serving exits 0 even when main-run requests fail (only
+            # the initial test request raises), so a "successful" warmup may
+            # still have warmed nothing. Surface that instead of "done".
+            failed_match = re.search(r"Failed requests:\s+(\d+)", output)
+            failed_count = int(failed_match.group(1)) if failed_match else 0
+            if failed_count > 0:
+                print_info(
+                    f"Warmup finished but {failed_count} of {num_requests} warmup "
+                    f"requests failed (see {warmup_log}); connections may be "
+                    "partially unwarmed. Continuing with the measured benchmark"
+                )
+            else:
+                print_info("Warmup done")
+        except subprocess.CalledProcessError as e:
+            print_info(
+                f"Warmup failed with exit code {e.returncode} (see {warmup_log}); "
+                "continuing with the measured benchmark"
+            )
+        except subprocess.TimeoutExpired:
+            print_info(
+                f"Warmup timed out after {min(WARMUP_TIMEOUT, self.timeout)}s and was "
+                f"killed (see {warmup_log}); continuing with the measured benchmark"
+            )
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
@@ -1802,6 +1928,8 @@ class DisaggTestCmds(NamedTuple):
                     ),
                     check_files=self.get_server_logs(server_idx),
                 )
+
+                self._run_warmup(server_idx, disagg_server_hostname, disagg_server_port)
 
                 client_configs = self.client_configs.get(server_idx, [])
 
