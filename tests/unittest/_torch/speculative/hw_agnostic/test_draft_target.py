@@ -27,13 +27,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
 
-def _assert_meaningful_text(text: str) -> None:
-    stripped = text.strip()
-    assert stripped
-    assert "\ufffd" not in stripped
-    assert any(character.isalpha() for character in stripped)
-
-
 @pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"], [True, "TRTLLM"]])
 @pytest.mark.high_cuda_memory
 def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
@@ -80,14 +73,15 @@ def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
     results_ref = llm_ref.generate(prompts, sampling_params)
     llm_ref.shutdown()
 
-    for result_spec, result_ref in zip(results_spec, results_ref, strict=True):
+    for prompt, result_spec, result_ref in zip(prompts, results_spec, results_ref, strict=True):
         spec_output = result_spec.outputs[0]
         ref_output = result_ref.outputs[0]
         assert spec_output.token_ids
         assert ref_output.token_ids
-        assert spec_output.token_ids[0] == ref_output.token_ids[0]
-        _assert_meaningful_text(spec_output.text)
-        _assert_meaningful_text(ref_output.text)
+        assert spec_output.token_ids == ref_output.token_ids, (
+            f"DraftTarget output tokens differ from greedy reference for prompt {prompt!r}: "
+            f"speculative={spec_output.token_ids}, reference={ref_output.token_ids}"
+        )
 
 
 @pytest.mark.high_cuda_memory
