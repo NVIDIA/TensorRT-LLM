@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 from dataclasses import dataclass
@@ -18,6 +21,8 @@ from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
+from ..nccl_window_graph import (nccl_window_graph_capture,
+                                 release_nccl_window_graph_owner)
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -744,7 +749,9 @@ class CUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            self.memory_pool = graph_pool
+            with nccl_window_graph_capture(graph, graph_pool):
                 output = forward_fn(capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
@@ -1205,6 +1212,7 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -1213,6 +1221,8 @@ class CUDAGraphRunner:
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
+        if graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
 
@@ -2102,10 +2112,12 @@ class EncoderCUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph,
-                                  pool=self.memory_pool,
-                                  stream=self._get_capture_stream(),
-                                  capture_error_mode="thread_local"):
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            self.memory_pool = graph_pool
+            with nccl_window_graph_capture(graph,
+                                           graph_pool,
+                                           stream=self._get_capture_stream(),
+                                           capture_error_mode="thread_local"):
                 if capture_h2d is not None:
                     capture_h2d()
                 output = forward_fn(capture_inputs)
@@ -2295,6 +2307,7 @@ class EncoderCUDAGraphRunner:
         return self.memory_pool
 
     def clear(self):
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -2302,4 +2315,6 @@ class EncoderCUDAGraphRunner:
         self.graph_metadata.clear()
         del self.memory_pool
         self.memory_pool = None
+        if graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()

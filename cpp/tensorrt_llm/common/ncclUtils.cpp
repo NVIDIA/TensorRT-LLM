@@ -394,10 +394,50 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
+namespace
+{
+thread_local std::optional<uint64_t> gGraphPoolOwner;
+}
+
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 {
     static NCCLWindowAllocator instance;
     return instance;
+}
+
+void NCCLWindowAllocator::setGraphPoolOwner(int64_t owner)
+{
+    TLLM_CHECK_WITH_INFO(owner >= -1, "NCCL window pool owner must be -1 (eager) or non-negative");
+    gGraphPoolOwner = owner < 0 ? std::nullopt : std::optional<uint64_t>{static_cast<uint64_t>(owner)};
+}
+
+void NCCLWindowAllocator::releaseGraphPoolOwner(int64_t owner)
+{
+    TLLM_CHECK_WITH_INFO(owner >= 0, "NCCL window graph-pool owner must be non-negative");
+    auto const graphPoolOwner = static_cast<uint64_t>(owner);
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (auto& [comm, buffers] : mBufferPool)
+    {
+        for (auto& entry : buffers)
+        {
+            if (entry.graphPoolOwner != graphPoolOwner)
+            {
+                continue;
+            }
+            if (entry.inUse)
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] Deferring release of graph-pool owner %llu for in-use buffer %p on comm %p",
+                    graphPoolOwner, entry.buffer.ptr, static_cast<void*>(comm));
+                entry.releaseOwnerWhenUnused = true;
+            }
+            else
+            {
+                entry.graphPoolOwner.reset();
+                entry.releaseOwnerWhenUnused = false;
+            }
+        }
+    }
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
@@ -410,24 +450,62 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    auto const captureError = cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &captureStatus);
+    if (clearCudaErrorIfCaptureStateUnknown(captureError))
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] CUDA graph capture state is unknown because another thread owns a global capture. "
+            "Falling back to an unregistered buffer.");
+        return NCCLWindowBuffer();
+    }
+    TLLM_CUDA_CHECK(captureError);
+    bool const isCapturing = captureStatus != cudaStreamCaptureStatusNone;
+    if (isCapturing && !gGraphPoolOwner.has_value())
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] NCCL symmetric window requested during CUDA graph capture without a PyTorch graph-pool "
+            "owner. Refusing unsafe window reuse and falling back to an unregistered buffer; wrap this capture "
+            "with nccl_window_graph_capture.");
+        return NCCLWindowBuffer();
+    }
+    TLLM_CHECK_WITH_INFO(isCapturing || !gGraphPoolOwner.has_value(),
+        "NCCL window graph-pool owner leaked into an eager buffer request");
+    uint64_t const graphOwner = gGraphPoolOwner.value_or(0);
+
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Register cleanup callback for this communicator if not already registered
     // This is cheap even if no buffers exist yet - cleanup will just return early
     registerBufferCleanup(comm);
 
-    // Check if we have an available buffer of at least the requested size for this communicator
-    // Use best-fit: find the smallest buffer that's >= requested size
+    // Check if we have an eligible buffer of at least the requested size for this communicator
+    // Use best-fit: find the smallest eligible buffer that's >= requested size
     auto& commBuffers = mBufferPool[comm];
-    auto bestFit = commBuffers.end();
-    size_t bestFitSize = std::numeric_limits<size_t>::max();
-
-    for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
+    auto findBestFit = [&](std::optional<uint64_t> const& graphPoolOwner)
     {
-        if (!it->inUse && it->buffer.size >= size && it->buffer.size < bestFitSize)
+        auto bestFit = commBuffers.end();
+        size_t bestFitSize = std::numeric_limits<size_t>::max();
+        for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
         {
-            bestFit = it;
-            bestFitSize = it->buffer.size;
+            if (!it->inUse && it->graphPoolOwner == graphPoolOwner && it->buffer.size >= size
+                && it->buffer.size < bestFitSize)
+            {
+                bestFit = it;
+                bestFitSize = it->buffer.size;
+            }
+        }
+        return bestFit;
+    };
+
+    // Captures first reuse their pool's buffers, then may claim a free eager buffer.
+    auto bestFit = isCapturing ? findBestFit(graphOwner) : findBestFit(std::nullopt);
+    if (bestFit == commBuffers.end() && isCapturing)
+    {
+        bestFit = findBestFit(std::nullopt);
+        if (bestFit != commBuffers.end())
+        {
+            bestFit->graphPoolOwner = graphOwner;
         }
     }
 
@@ -438,6 +516,20 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
             "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
             static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
         return bestFit->buffer;
+    }
+
+    // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer
+    // must use the existing unregistered fallback path. Safety relies on all ranks for this
+    // communicator executing window requests, releases, and graph-owner transitions in identical
+    // SPMD order. This keeps pool history and the registered/plain decision rank-symmetric; an NCCL
+    // symmetric collective must not mix window-backed and plain pointers across ranks.
+    if (isCapturing)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] No eligible NCCL window buffer for capture owner %llu on comm %p (requested: %zu); "
+            "falling back to unregistered buffer.",
+            graphOwner, static_cast<void*>(comm), size);
+        return NCCLWindowBuffer();
     }
 
     // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
@@ -451,21 +543,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return NCCLWindowBuffer();
     }
 
-    // No available buffer found, avoid registration during CUDA graph capture
-    auto stream = at::cuda::getCurrentCUDAStream();
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
-    if (capture_err != cudaSuccess)
-    {
-        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
-    }
-    if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
-    {
-        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
-            static_cast<void*>(comm), size);
-        return NCCLWindowBuffer();
-    }
-
     // No available buffer found, allocate a new one
     TLLM_LOG_TRACE(
         "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
@@ -476,7 +553,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
     if (buffer.isValid())
     {
-        commBuffers.push_back({buffer, true});
+        commBuffers.push_back({buffer, true, std::nullopt});
     }
     else
     {
@@ -500,6 +577,17 @@ void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, size_t s
     {
         failureIt->second = size;
     }
+}
+
+bool NCCLWindowAllocator::clearCudaErrorIfCaptureStateUnknown(
+    cudaError_t captureError, CudaGetLastErrorFunc getLastError) noexcept
+{
+    if (captureError != cudaErrorStreamCaptureImplicit)
+    {
+        return false;
+    }
+    static_cast<void>(getLastError());
+    return true;
 }
 
 cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
@@ -544,6 +632,11 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
         if (entry.buffer.ptr == ptr)
         {
             entry.inUse = false;
+            if (entry.releaseOwnerWhenUnused)
+            {
+                entry.graphPoolOwner.reset();
+                entry.releaseOwnerWhenUnused = false;
+            }
             TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p: ptr=%p", static_cast<void*>(comm), ptr);
             return;
         }

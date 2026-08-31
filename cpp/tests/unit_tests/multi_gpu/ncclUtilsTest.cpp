@@ -55,6 +55,12 @@ public:
     {
         return NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(localAllocOk, getLastError);
     }
+
+    static bool clearCudaErrorIfCaptureStateUnknown(
+        cudaError_t captureError, NCCLWindowAllocator::CudaGetLastErrorFunc getLastError = cudaGetLastError)
+    {
+        return NCCLWindowAllocator::clearCudaErrorIfCaptureStateUnknown(captureError, getLastError);
+    }
 };
 } // namespace tensorrt_llm::common::nccl_util
 
@@ -341,6 +347,82 @@ TEST_F(NCCLWindowAllocatorTest, BufferReuse)
     allocator.releaseBuffer(*mComm, buffer2.ptr);
 }
 
+TEST_F(NCCLWindowAllocatorTest, CaptureWithoutOwnerUsesUnregisteredFallback)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto const stream = at::cuda::getCurrentCUDAStream().stream();
+    auto marker = torch::empty({1}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kUInt8));
+    cudaGraph_t graph = nullptr;
+
+    allocator.setGraphPoolOwner(-1);
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(marker.data_ptr(), 0, 1, stream));
+    auto buffer = allocator.requestBuffer(*mComm, 512 * 1024);
+    EXPECT_FALSE(buffer.isValid());
+    TLLM_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+}
+
+TEST_F(NCCLWindowAllocatorTest, GraphPoolsReserveAndReuseBuffers)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    constexpr size_t bufferSize = 512 * 1024;
+    auto const stream = at::cuda::getCurrentCUDAStream().stream();
+
+    auto eagerBuffer = allocator.requestBuffer(*mComm, bufferSize);
+    ASSERT_TRUE(eagerBuffer.isValid());
+    void* const firstPtr = eagerBuffer.ptr;
+    allocator.releaseBuffer(*mComm, firstPtr);
+
+    auto captureRequest = [&](int64_t owner, bool release = true)
+    {
+        cudaGraph_t graph = nullptr;
+        allocator.setGraphPoolOwner(owner);
+        TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        auto buffer = allocator.requestBuffer(*mComm, bufferSize);
+        EXPECT_TRUE(buffer.isValid());
+        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.ptr, 0, 1, stream));
+        if (release)
+        {
+            allocator.releaseBuffer(*mComm, buffer.ptr);
+        }
+        TLLM_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+        allocator.setGraphPoolOwner(-1);
+        return buffer.ptr;
+    };
+
+    EXPECT_EQ(captureRequest(101), firstPtr);
+    EXPECT_EQ(captureRequest(101), firstPtr); // A different graph sharing the pool.
+
+    auto secondEagerBuffer = allocator.requestBuffer(*mComm, bufferSize);
+    ASSERT_TRUE(secondEagerBuffer.isValid());
+    void* const secondPtr = secondEagerBuffer.ptr;
+    EXPECT_NE(secondPtr, firstPtr);
+    allocator.releaseBuffer(*mComm, secondPtr);
+
+    EXPECT_EQ(captureRequest(202), secondPtr);
+
+    auto thirdEagerBuffer = allocator.requestBuffer(*mComm, bufferSize);
+    ASSERT_TRUE(thirdEagerBuffer.isValid());
+    EXPECT_NE(thirdEagerBuffer.ptr, firstPtr);
+    EXPECT_NE(thirdEagerBuffer.ptr, secondPtr);
+    allocator.releaseBuffer(*mComm, thirdEagerBuffer.ptr);
+
+    allocator.releaseGraphPoolOwner(101);
+    allocator.releaseGraphPoolOwner(202);
+    auto reclaimedBuffer = allocator.requestBuffer(*mComm, bufferSize);
+    EXPECT_EQ(reclaimedBuffer.ptr, firstPtr);
+    allocator.releaseBuffer(*mComm, reclaimedBuffer.ptr);
+
+    void* const deferredPtr = captureRequest(303, false);
+    allocator.releaseGraphPoolOwner(303);
+    allocator.releaseBuffer(*mComm, deferredPtr);
+    auto deferredReclaimedBuffer = allocator.requestBuffer(*mComm, bufferSize);
+    EXPECT_EQ(deferredReclaimedBuffer.ptr, deferredPtr);
+    allocator.releaseBuffer(*mComm, deferredReclaimedBuffer.ptr);
+}
+
 TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
@@ -446,6 +528,23 @@ TEST_F(NCCLWindowAllocatorTest, ClearsCudaErrorAfterLocalAllocationFailure)
     EXPECT_EQ(gCudaGetLastErrorCallCount, 0);
 
     EXPECT_EQ(clearCudaErrorIfFailed(0), cudaErrorLaunchFailure);
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
+}
+
+TEST_F(NCCLWindowAllocatorTest, CaptureStateUnknownUsesFallbackAndClearsCudaError)
+{
+    auto const clearCudaErrorIfUnknown = [](cudaError_t captureError)
+    {
+        return nccl_util::NCCLWindowAllocatorTestAccess::clearCudaErrorIfCaptureStateUnknown(
+            captureError, fakeCudaGetLastError);
+    };
+
+    gCudaGetLastErrorCallCount = 0;
+    EXPECT_TRUE(clearCudaErrorIfUnknown(cudaErrorStreamCaptureImplicit));
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
+
+    EXPECT_FALSE(clearCudaErrorIfUnknown(cudaSuccess));
+    EXPECT_FALSE(clearCudaErrorIfUnknown(cudaErrorInvalidValue));
     EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
 }
 
