@@ -41,7 +41,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..pyexecutor.config_utils import is_mla
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
-                     get_model_extra_attrs)
+                     get_model_extra_attrs, run_device_work)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -312,24 +312,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         capture_graph = self.is_cuda_graph
 
-        self.prompt_lens_cuda = self.get_empty(
+        # Prompt lens and KV lens are both int32 vectors over the batch and are
+        # both refreshed once per prepare(). Backing them with one buffer lets
+        # that refresh be a single host-to-device transfer rather than two: at
+        # decode batch sizes each transfer moves a handful of bytes and costs a
+        # launch, so the number of transfers is what shows up, not their size.
+        self._seq_lens_stage_cuda = self.get_empty(
             buffers,
-            (self.max_num_sequences, ),
-            cache_name="prompt_lens_cuda",
+            (2, self.max_num_sequences),
+            cache_name="seq_lens_stage_cuda",
             dtype=torch.int,
             capture_graph=capture_graph,
         )
-        self.prompt_lens_cpu = torch.empty_like(
-            self.prompt_lens_cuda,
+        self._seq_lens_stage_cpu = torch.empty_like(
+            self._seq_lens_stage_cuda,
             device='cpu',
             pin_memory=prefer_pinned(),
         )
-        self.kv_lens_cuda = self.get_empty_like(
-            buffers,
-            self.prompt_lens_cuda,
-            cache_name="kv_lens_cuda",
-            capture_graph=capture_graph,
-        )
+        self.prompt_lens_cuda = self._seq_lens_stage_cuda[0]
+        self.kv_lens_cuda = self._seq_lens_stage_cuda[1]
+        self.prompt_lens_cpu = self._seq_lens_stage_cpu[0]
+        # Staging row for the device-side KV lens. It is not self.kv_lens:
+        # that one carries num_extra_kv_tokens, which kv_lens_cuda excludes.
+        self._kv_lens_stage_cpu = self._seq_lens_stage_cpu[1]
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=prefer_pinned())
@@ -704,9 +709,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             dtype=torch.int,
             device='cpu',
         )
+        # Staged only; the upload is issued once, together with the KV lens.
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -733,9 +737,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        self._kv_lens_stage_cpu[:self.num_seqs].copy_(kv_lens[:self.num_seqs])
+        # Both staged rows go up in one transfer. Nothing between the prompt-len
+        # staging above and here reads either buffer on the device, so deferring
+        # the prompt lens to this point does not reorder any dependency. The
+        # columns past num_seqs carry the previous batch's staged values, which
+        # is what the device already held for them and what no consumer reads.
+        run_device_work(self._seq_lens_stage_cuda.copy_,
+                        self._seq_lens_stage_cpu,
+                        non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -773,18 +783,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if not spec_active and self.kv_cache_manager.tokens_per_block:
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets,
-                self.request_ids,
-                self.beam_width,
-                self.num_contexts,
-                self.num_seqs,
-                max_blocks=max_blocks)
+            run_device_work(self.kv_cache_manager.copy_batch_block_offsets,
+                            self.kv_cache_block_offsets,
+                            self.request_ids,
+                            self.beam_width,
+                            self.num_contexts,
+                            self.num_seqs,
+                            max_blocks=max_blocks)
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
                 # Use the wrapper method which works for both V1 and V2
-                self.draft_kv_cache_manager.copy_batch_block_offsets(
+                run_device_work(
+                    self.draft_kv_cache_manager.copy_batch_block_offsets,
                     self.draft_kv_cache_block_offsets,
                     self.request_ids,
                     self.beam_width,

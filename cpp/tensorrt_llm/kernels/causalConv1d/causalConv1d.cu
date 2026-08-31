@@ -20,6 +20,7 @@
  */
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
 
@@ -493,6 +494,14 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     using input_t = typename Ktraits::input_t;
     using weight_t = typename Ktraits::weight_t;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // Wait for the projection that produced x. The launch is programmatic, so
+    // these blocks are scheduled while that producer is still draining rather
+    // than after it retires. The wait stays ahead of every early exit below so
+    // that all threads reach it.
+    cudaGridDependencySynchronize();
+#endif
+
     int const tidx = threadIdx.x;
     int const batch_id = blockIdx.x;
     int const channel_id = blockIdx.y * kNThreads + tidx;
@@ -550,7 +559,8 @@ void causal_conv1d_update_sl1_launch(ConvParamsBase& params, cudaStream_t stream
         [&]
         {
             auto kernel = &causal_conv1d_update_kernel_sl1<Ktraits, kHasCSI>;
-            kernel<<<grid, kNThreads, 0, stream>>>(params);
+            tensorrt_llm::common::launchWithPdlWhenEnabled(
+                "causal_conv1d_update_sl1", kernel, grid, kNThreads, 0, stream, params);
         });
 }
 

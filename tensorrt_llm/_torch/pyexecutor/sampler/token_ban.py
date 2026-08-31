@@ -70,6 +70,27 @@ def _memoizing_tokens_getter(request: LlmRequest, beam_idx: int) -> Callable[[],
     return get
 
 
+def has_min_length(request: LlmRequest) -> bool:
+    """Whether ``request`` actually constrains its generated length.
+
+    ``py_min_length`` mirrors the runtime ``SamplingConfig.minLength``, a list
+    (``[1]`` or ``[batchSize]``) rather than a scalar, and it is populated even
+    when no minimum was asked for: ``min_tokens`` defaults to ``0`` on the
+    OpenAI request models and is forwarded verbatim, so an ordinary served
+    request arrives here holding ``[0]``. ``SamplingParams.min_tokens`` is
+    documented as "values < 1 have no effect", and ``_add_min_length_bans``
+    duly emits no ban for such a value -- but a plain truthiness test sees a
+    non-empty list and reports a constraint anyway, so callers must ask through
+    this predicate instead.
+    """
+    min_length: list[int] | None = getattr(request, "py_min_length", None)
+    if not min_length:
+        return False
+    # Only element 0 is ever consulted (see _add_min_length_bans), so the
+    # predicate keys on the same entry the ban logic reads.
+    return min_length[0] > 0
+
+
 @dataclass(kw_only=True)
 class TokenBans:
     """Accumulated token bans, applied by ``TokenBanHandler.apply_ban_list``.
@@ -258,7 +279,7 @@ class TokenBanHandler(ABC):
             request_offset = current_offset
             current_offset += num_steps[index] * num_beams[index]
 
-            if not r.py_min_length:
+            if not has_min_length(r):
                 continue
             # Use the original end_id (before ignore_eos override) so we
             # suppress the real EOS token, not token -1.
@@ -587,7 +608,7 @@ class SynchronousTokenBanHandler(TokenBanHandler):
         # host history is complete and no length correction applies.
         assert not pending_steps, "synchronous handler has no pending steps"
         bans = TokenBans()
-        if any(getattr(r, "py_min_length", None) for r in requests):
+        if any(has_min_length(r) for r in requests):
             self._add_min_length_bans(bans, requests, num_steps, num_beams)
         if any(getattr(r, "py_bad_words", None) for r in requests):
             self._add_bad_words_bans(bans, requests, num_steps, num_beams, stale_by_one=None)
@@ -630,7 +651,7 @@ class OverlappedTokenBanHandler(TokenBanHandler):
         pending_steps: list[int] | None = None,
     ) -> TokenBans:
         bans = TokenBans()
-        if any(getattr(r, "py_min_length", None) for r in requests):
+        if any(has_min_length(r) for r in requests):
             # No stale *suffix* variant, but the length count must still account
             # for tokens pending write-back; see _add_min_length_bans.
             self._add_min_length_bans(

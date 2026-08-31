@@ -60,6 +60,8 @@ from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
+from .greedy_sample_kernels import supports_greedy_argmax_scatter
+from .greedy_tail_graph import GreedyTailGraph
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
 from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
@@ -99,7 +101,12 @@ from .sampler_strategy import (
     _request_strategy,
 )
 from .seed_manager import _SeedManager
-from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
+from .token_ban import (
+    OverlappedTokenBanHandler,
+    SynchronousTokenBanHandler,
+    TokenBanHandler,
+    has_min_length,
+)
 from .top_p_decay import TopPDecayHandler
 from .two_model_spec_dec import (
     TwoModelSpecDecHandler,
@@ -418,6 +425,10 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    greedy_tail_slot: int | None = None
+    """Ring slot backing `host.new_tokens` when the greedy tail was replayed
+    from a graph. Returned to the ring once this state has been consumed; a
+    slot that is never returned simply leaves the ring one buffer shorter."""
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
@@ -616,6 +627,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._stable_greedy_seq_slots: list[int] = []
         self._stable_greedy_seq_slots_host: Optional[torch.Tensor] = None
         self._stable_greedy_seq_slots_cuda: Optional[torch.Tensor] = None
+        self._greedy_tail = GreedyTailGraph()
+        # Ring slot the current _process_requests took, handed to sample_async
+        # for the sample state that owns the read-back buffer.
+        self._greedy_tail_slot: Optional[int] = None
 
         # BeamSearchHandler owns the lagged first_finish_reasons snapshots the
         # speculative predictor reads, so no separate host mirror is kept here.
@@ -969,6 +984,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @nvtx_range("update_requests")
     @torch.inference_mode()
     def update_requests(
+        self,
+        state: SampleStateTorch,
+        resource_manager: Optional[ResourceManager] = None,
+    ) -> None:
+        try:
+            self._update_requests(state, resource_manager)
+        finally:
+            # The replayed tail wrote its token into a ring buffer that is
+            # reusable only now that this state has been fully consumed.
+            if state.greedy_tail_slot is not None:
+                self._greedy_tail.release(state.greedy_tail_slot)
+                state.greedy_tail_slot = None
+
+    def _update_requests(
         self,
         state: SampleStateTorch,
         resource_manager: Optional[ResourceManager] = None,
@@ -1352,6 +1381,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
         sampler_event = self._record_sampler_event(side_stream_event=side_stream_event)
+        greedy_tail_slot = self._greedy_tail_slot
+        self._greedy_tail_slot = None
         return SampleStateTorch(
             requests=requests,
             device=SampleStateTensors(new_tokens=new_tokens),
@@ -1364,6 +1395,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
+            greedy_tail_slot=greedy_tail_slot,
         )
 
     @nvtx_range("sample_batched_by_strategy")
@@ -2030,7 +2062,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     and not getattr(request, "py_bad_words", None)
                     and not getattr(request, "py_no_repeat_ngram_size", None)
                     and not has_occurrence_penalty(request)
-                    and not request.py_min_length
+                    and not has_min_length(request)
                     and not request.py_return_log_probs
                     and not request.py_stop_words_list
                     and _request_strategy(request, vocab_size=2**31) == GREEDY
@@ -2058,14 +2090,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._stable_greedy_seq_slots_host = seq_slots_host
                 self._stable_greedy_seq_slots_cuda = seq_slots_cuda
 
-            next_tokens = fast_greedy_sample_kernel(
-                raw_logits_cuda[: len(generation_requests)],
-                new_tokens_cuda,
-                seq_slots_cuda,
-                self.max_beam_width,
-                None,
-            )
-            new_tokens_host = self._copy_to_host(next_tokens)
+            logits_cuda = raw_logits_cuda[: len(generation_requests)]
+            new_tokens_host: torch.Tensor | None = None
+            if not self._async_worker_active() and supports_greedy_argmax_scatter(
+                logits_cuda, new_tokens_cuda
+            ):
+                # The whole tail -- sample, scatter, read the token back -- is
+                # replayable from a graph while the batch holds still, which
+                # is the common case for this path.
+                replayed = self._greedy_tail.run(
+                    logits_cuda, new_tokens_cuda, seq_slots_cuda, self.max_beam_width
+                )
+                if replayed is not None:
+                    new_tokens_host, self._greedy_tail_slot = replayed
+            if new_tokens_host is None:
+                next_tokens = fast_greedy_sample_kernel(
+                    logits_cuda,
+                    new_tokens_cuda,
+                    seq_slots_cuda,
+                    self.max_beam_width,
+                    None,
+                )
+                new_tokens_host = self._copy_to_host(next_tokens)
             return (
                 generation_requests,
                 seq_slots_host,
@@ -2134,13 +2180,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
         )
 
-        has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)
+        batch_has_min_length = any(has_min_length(r) for r in sampling_requests)
         has_bad_words = any(getattr(r, "py_bad_words", None) for r in sampling_requests)
         # Normalized in executor_request_to_llm_request: a positive int, or
         # None when the restriction is disabled for the request.
         ngram_sizes = [getattr(r, "py_no_repeat_ngram_size", None) for r in sampling_requests]
         has_no_repeat_ngram = any(size is not None for size in ngram_sizes)
-        if has_min_length or has_bad_words or has_no_repeat_ngram:
+        if batch_has_min_length or has_bad_words or has_no_repeat_ngram:
             # Overlap-scheduler stale flags (per request): True when the host
             # token history lags the device by one token. Only the overlap
             # handler consumes them; computed here as it needs sampler state.
@@ -2158,7 +2204,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # the host history; add back the tokens still pending write-back so
             # the generated length is exact under the overlap scheduler.
             pending_steps = (
-                self._compute_pending_steps(sampling_requests) if has_min_length else None
+                self._compute_pending_steps(sampling_requests) if batch_has_min_length else None
             )
             bans = self._token_ban_handler.generate_ban_list(
                 sampling_requests,

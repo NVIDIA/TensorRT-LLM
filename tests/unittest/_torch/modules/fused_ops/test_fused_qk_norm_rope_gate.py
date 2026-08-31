@@ -15,6 +15,7 @@
 
 import pytest
 import torch
+import triton
 
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
@@ -356,3 +357,58 @@ def test_fused_sigmoid_mul_inplace_supports_torch_compile():
     compiled = torch.compile(apply_gate, backend="eager", fullgraph=True)
     actual = compiled(attention.clone(), gate)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _decode_gate_inputs(num_tokens=1, num_heads=24, head_dim=256, seed=2027):
+    torch.manual_seed(seed)
+    attention = torch.randn((num_tokens, num_heads * head_dim), dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    return attention, gate
+
+
+def test_fused_sigmoid_mul_inplace_pdl_is_bitwise_invariant(monkeypatch):
+    """PDL only reschedules the launch; it must not move a single bit."""
+    from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
+        _multi_processor_count,
+        _pdl_enabled,
+    )
+    from tensorrt_llm._utils import get_sm_version
+
+    attention, gate = _decode_gate_inputs()
+    num_blocks = attention.shape[0] * triton.cdiv(attention.shape[1], 1024)
+    assert num_blocks < _multi_processor_count(attention.device.index)
+
+    outputs = {}
+    for enabled in ("1", "0"):
+        monkeypatch.setenv("TRTLLM_ENABLE_PDL", enabled)
+        assert _pdl_enabled(num_blocks, attention.device.index) == (
+            enabled == "1" and get_sm_version() >= 90
+        )
+        out = attention.clone()
+        fused_sigmoid_mul_inplace(out, gate)
+        outputs[enabled] = out
+    assert torch.equal(outputs["1"], outputs["0"])
+
+
+def test_fused_sigmoid_mul_inplace_under_cuda_graph():
+    """The decode launch is captured into a CUDA graph in production."""
+    attention, gate = _decode_gate_inputs()
+
+    eager = attention.clone()
+    fused_sigmoid_mul_inplace(eager, gate)
+
+    replayed = attention.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        fused_sigmoid_mul_inplace(attention.clone(), gate)
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_sigmoid_mul_inplace(replayed, gate)
+    replayed.copy_(attention)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(replayed, eager)

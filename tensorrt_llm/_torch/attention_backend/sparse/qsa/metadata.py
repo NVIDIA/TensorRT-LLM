@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.utils import run_device_work
 
 from .cache_manager import QSAMambaHybridCacheManagerV2
 from .kernels import triton_qsa_unscale_block_table
@@ -184,11 +185,15 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         generation_lens = self.seq_lens[self.num_contexts : self.num_seqs]
         self.qsa_needs_speculative_snapshot = any(length > 1 for length in generation_lens.tolist())
 
+    def _refresh_qsa_device_state(self) -> None:
+        """Rebuild the device-side block table and token mapping for this step."""
+        self._refresh_qsa_block_table()
+        self._refresh_qsa_token_mapping()
+
     def prepare(self) -> None:
         super().prepare()
         self._refresh_qsa_speculative_snapshot_state()
-        self._refresh_qsa_block_table()
-        self._refresh_qsa_token_mapping()
+        run_device_work(self._refresh_qsa_device_state)
 
     def on_update_kv_lens(self) -> None:
         super().on_update_kv_lens()

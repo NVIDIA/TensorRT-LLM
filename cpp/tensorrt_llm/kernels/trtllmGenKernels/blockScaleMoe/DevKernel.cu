@@ -1195,6 +1195,16 @@ __global__ void finalizeKernel(KernelParams params)
             params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
         }
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // Release the dependent grid here rather than leaving it to this grid's
+    // completion. It cannot move above the loop: the consumer reads outPtr, and
+    // its cudaGridDependencySynchronize() is what orders it after these stores.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
@@ -1277,6 +1287,14 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
         OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
         outElemPtr[elemIndex] = outputElem;
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // See finalizeKernel: the trigger belongs after the stores it publishes.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

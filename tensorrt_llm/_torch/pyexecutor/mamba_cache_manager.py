@@ -2904,6 +2904,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
 
+    # Request ids, in the order their state indices were written into
+    # cuda_state_indices. get_state_indices_device() can hand that buffer back
+    # only for a caller asking in exactly this order. Rebound per batch, never
+    # mutated in place, and defaulted here as well as in __init__ so a manager
+    # that is asked before construction finishes simply reports no device view.
+    _state_index_request_ids: List[int] = []
+
     def __init__(
         self,
         # mamba cache parameters
@@ -3148,6 +3155,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         }
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
+        self._state_index_request_ids = []
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
@@ -3830,6 +3838,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
+        self._state_index_request_ids = [req.py_request_id for req in requests]
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
@@ -3848,16 +3857,50 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             indices = [
                 self._request_id_to_state_index[rid] for rid in request_ids
             ]
-            if is_padding is None:
-                is_padding = [False] * len(request_ids)
-            assert len(request_ids) == len(is_padding)
-            is_dummy = [
-                self._request_id_to_is_dummy.get(rid, False) or padding
-                for rid, padding in zip(request_ids, is_padding)
-            ]
-            self._refresh_dummy_request_mask(is_dummy)
+            self._refresh_dummy_request_mask(
+                self._dummy_flags_for(request_ids, is_padding))
             return indices
         return self.cuda_state_indices
+
+    def _dummy_flags_for(self, request_ids: List[int],
+                         is_padding: Optional[List[bool]]) -> List[bool]:
+        if is_padding is None:
+            is_padding = [False] * len(request_ids)
+        assert len(request_ids) == len(is_padding)
+        return [
+            self._request_id_to_is_dummy.get(rid, False) or padding
+            for rid, padding in zip(request_ids, is_padding)
+        ]
+
+    def get_state_indices_device(
+            self,
+            request_ids: List[int],
+            is_padding: Optional[List[bool]] = None) -> Optional[torch.Tensor]:
+        """The staged state indices as a device view, or None.
+
+        get_state_indices() answers from the host mapping, so a caller that
+        needs the indices on device has to stage them there itself every step.
+        _setup_state_indices has already written the same values into
+        cuda_state_indices, so when the batch is asked for in exactly the order
+        it staged them, that buffer can be read in place instead.
+
+        Returns None whenever it cannot be: the batch was reordered or extended
+        after prepare_resources (disagg serving sorts generation_requests by
+        py_batch_idx; CUDA graph padding appends dummy requests), so the device
+        order no longer describes it. The caller then falls back to
+        get_state_indices(). Refreshes the dummy-request mask exactly as
+        get_state_indices() does, so the two are interchangeable in that
+        respect.
+        """
+        if self.local_num_mamba_layers == 0:
+            return None
+        if not request_ids or request_ids != self._state_index_request_ids:
+            return None
+        self._refresh_dummy_request_mask(
+            self._dummy_flags_for(request_ids, is_padding))
+        # A view from element 0, so it keeps the buffer's data_ptr: callers
+        # that alias it across steps depend on that address being stable.
+        return self.cuda_state_indices[:len(request_ids)]
 
     def get_max_resource_count(self) -> int:
         return self.max_batch_size
