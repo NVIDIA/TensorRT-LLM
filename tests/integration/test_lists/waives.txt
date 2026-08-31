@@ -339,6 +339,7 @@ unittest/_torch/attention/sparse/test_minimax_m3_msa_backend.py::test_msa_paged_
 unittest/_torch/attention/sparse/test_minimax_m3_sparse_attn_decode.py::test_sparse_decode_matches_msa_kernel SKIP (https://nvbugs/6669902)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[exaone_moe_gqa_swa128-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6668773)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
+unittest/_torch/attention/test_combined_fmha.py::test_flashinfer_context_fallback_scope[1-32-100-dtype0] SKIP (https://nvbugs/6697142)
 unittest/_torch/executor/test_overlap_scheduler.py::test_overlap_scheduler_block_reuse_cache_hit SKIP (https://nvbugs/6608387)
 unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy SKIP (https://nvbugs/6607482)
 unittest/_torch/modeling/test_modeling_nemotron_nano_v2_vl.py::test_nemotron_nano_v2_vl_video_batch_equivalence SKIP (https://nvbugs/6625695)
