@@ -205,9 +205,7 @@ __device__ __forceinline__ void cp_async_wait_group_one()
     asm volatile("cp.async.wait_group 1;\n" ::);
 }
 
-template <int kHeads>
-__device__ __forceinline__ void cp_async_state_chunk(
-    float* shared_state, float const* state, int batch_index, int head, int chunk, int stage)
+__device__ __forceinline__ void cp_async_state_chunk(float* shared_state, float const* state_head, int chunk, int stage)
 {
     constexpr int kFloat4PerChunk = kChunkRows * kDim / 4;
     int const row_base = chunk * kChunkRows;
@@ -217,7 +215,7 @@ __device__ __forceinline__ void cp_async_state_chunk(
         int const row = element / kDim;
         int const column = element - row * kDim;
         float* destination = shared_state + (stage * kChunkRows + row) * kDim + column;
-        float const* source = state + ((batch_index * kHeads + head) * kDim + row_base + row) * kDim + column;
+        float const* source = state_head + (row_base + row) * kDim + column;
         cp_async_16b(destination, source);
     }
     cp_async_commit();
@@ -232,7 +230,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     __nv_bfloat16 const* __restrict__ cs_q, __nv_bfloat16 const* __restrict__ cs_k,
     __nv_bfloat16 const* __restrict__ cs_v, float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g,
     float const* __restrict__ dt_bias, __nv_bfloat16 const* __restrict__ beta,
-    __nv_bfloat16 const* __restrict__ onorm_g, float const* __restrict__ onorm_weight, float* __restrict__ state,
+    __nv_bfloat16 const* __restrict__ onorm_g, float const* __restrict__ onorm_weight,
+    int const* __restrict__ ssm_state_indices, float* __restrict__ state, int64_t state_slot_stride,
     __nv_bfloat16* __restrict__ out, float lower_bound, float scale, float onorm_epsilon)
 {
     constexpr int kFlat = kHeads * kDim;
@@ -257,6 +256,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     int const batch_index = kUseCluster ? blockIdx.y : blockIdx.x;
     int const head = kUseCluster ? blockIdx.z : blockIdx.y;
     int const head_offset = head * kDim;
+    int const state_slot = ssm_state_indices == nullptr ? batch_index : ssm_state_indices[batch_index];
+    float* const state_head
+        = state + static_cast<int64_t>(state_slot) * state_slot_stride + static_cast<int64_t>(head) * kDim * kDim;
 
     using StateStage = float[kChunkRows][kDim];
     using StateBarrier = cuda::barrier<cuda::thread_scope_block>;
@@ -293,7 +295,6 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             init(ready, kThreads);
         }
         block.sync();
-        float const* state_head = state + (batch_index * kHeads + head) * kDim * kDim;
 #pragma unroll
         for (int chunk = 0; chunk < kCpAsyncBulkStageCount; ++chunk)
         {
@@ -304,7 +305,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     else
     {
         int const first_chunk = cluster_rank * kClusterChunksPerBlock;
-        cp_async_state_chunk<kHeads>(&shared_state[0][0][0], state, batch_index, head, first_chunk, 0);
+        cp_async_state_chunk(&shared_state[0][0][0], state_head, first_chunk, 0);
     }
 
     if (tid < kDim)
@@ -366,7 +367,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     if constexpr (!kUseCpAsyncBulk && (!kUseCluster || kClusterChunksPerBlock > 1))
     {
         int const second_chunk = cluster_rank * kClusterChunksPerBlock + 1;
-        cp_async_state_chunk<kHeads>(&shared_state[0][0][0], state, batch_index, head, second_chunk, 1);
+        cp_async_state_chunk(&shared_state[0][0][0], state_head, second_chunk, 1);
     }
 
     float const q_square = tid < kDim ? shared_q[tid] * shared_q[tid] : 0.0f;
@@ -467,11 +468,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
                 state_b[component] += k_values[component] * residual_b;
             }
 
-            int const state_index_a = ((batch_index * kHeads + head) * kDim + row_a) * kDim + column_base;
-            int const state_index_b = ((batch_index * kHeads + head) * kDim + row_b) * kDim + column_base;
-            *reinterpret_cast<float4*>(state + state_index_a)
+            int const state_index_a = row_a * kDim + column_base;
+            int const state_index_b = row_b * kDim + column_base;
+            *reinterpret_cast<float4*>(state_head + state_index_a)
                 = make_float4(state_a[0], state_a[1], state_a[2], state_a[3]);
-            *reinterpret_cast<float4*>(state + state_index_b)
+            *reinterpret_cast<float4*>(state_head + state_index_b)
                 = make_float4(state_b[0], state_b[1], state_b[2], state_b[3]);
 
             float const state_q_a = state_a[0] * q_values[0] + state_a[1] * q_values[1] + state_a[2] * q_values[2]
@@ -500,8 +501,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
                 const cg::thread_block block = cg::this_thread_block();
                 // A stage cannot be refilled until every warp has consumed it.
                 block.sync();
-                float const* next_state
-                    = state + ((batch_index * kHeads + head) * kDim + next_chunk * kChunkRows) * kDim;
+                float const* next_state = state_head + next_chunk * kChunkRows * kDim;
                 cuda::memcpy_async(block, &shared_state[stage][0][0], next_state, cuda::aligned_size_t<16>(kChunkBytes),
                     *reinterpret_cast<StateBarrier*>(&barrier_storage.ready[stage]));
             }
@@ -510,8 +510,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         {
             if (chunk + 2 < kChunks)
             {
-                cp_async_state_chunk<kHeads>(
-                    &shared_state[0][0][0], state, batch_index, head, chunk + 2, (chunk + 2) & 1);
+                cp_async_state_chunk(&shared_state[0][0][0], state_head, chunk + 2, (chunk + 2) & 1);
             }
         }
     }
@@ -623,8 +622,8 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
         static_cast<__nv_bfloat16 const*>(params.convStateK), static_cast<__nv_bfloat16 const*>(params.convStateV),
         params.logA, static_cast<__nv_bfloat16 const*>(params.gate), params.dtBias,
         static_cast<__nv_bfloat16 const*>(params.beta), static_cast<__nv_bfloat16 const*>(params.outputNormGate),
-        params.outputNormWeight, params.state, static_cast<__nv_bfloat16*>(params.output), params.lowerBound,
-        params.scale, params.outputNormEps);
+        params.outputNormWeight, params.ssmStateIndices, params.state, params.stateSlotStride,
+        static_cast<__nv_bfloat16*>(params.output), params.lowerBound, params.scale, params.outputNormEps);
     if (launchStatus != cudaSuccess)
     {
         return launchStatus;
@@ -634,14 +633,8 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
 
 void validateBlackwellParams(KdaDecodeParams const& params)
 {
-    TLLM_CHECK_WITH_INFO(params.batchSize > 0, "Blackwell KDA decode requires a non-empty batch");
     TLLM_CHECK_WITH_INFO(
         params.numHeads == params.numValueHeads, "Blackwell KDA decode requires numHeads == numValueHeads");
-    TLLM_CHECK_WITH_INFO(
-        params.ssmStateIndices == nullptr, "Blackwell KDA decode does not yet support indexed recurrent state");
-    TLLM_CHECK_WITH_INFO(params.cuSeqlens != nullptr, "Blackwell KDA decode requires cuSeqlens");
-    TLLM_CHECK_WITH_INFO(params.stateSlotStride == static_cast<int64_t>(params.numHeads) * kDim * kDim,
-        "Blackwell KDA decode requires a contiguous recurrent-state pool");
     TLLM_CHECK_WITH_INFO(params.applyOutputNorm, "Blackwell KDA decode requires output normalization");
     TLLM_CHECK_WITH_INFO(!params.updateConvCache, "Blackwell KDA decode does not yet support updateConvCache=true");
     TLLM_CHECK_WITH_INFO(params.useLowerBound, "Blackwell KDA decode requires the lower-bound gate");
