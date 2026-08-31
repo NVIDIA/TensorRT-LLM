@@ -1,0 +1,511 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// This file is compiled two ways and must stay identical under both: by CMake as part of
+// the wheel, and by torch.utils.cpp_extension during development. So it depends only on
+// CUDA, CUB and curand -- no TensorRT-LLM headers beyond its own.
+
+#include "universalSamplingKernels.h"
+
+#include <cfloat>
+#include <cub/cub.cuh>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <curand_kernel.h>
+
+namespace tensorrt_llm
+{
+namespace kernels
+{
+
+namespace
+{
+
+constexpr int kBlockSize = 512;
+//! Digits per radix pass of the threshold search. 8 bits -> 256 buckets, 4 passes to pin
+//! a float exactly.
+constexpr int kRadixBits = 8;
+constexpr int kRadixBuckets = 1 << kRadixBits;
+constexpr int kRadixPasses = 32 / kRadixBits;
+//! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
+constexpr float kTempEpsilon = 1e-6f;
+
+__device__ inline float toFloat(float v)
+{
+    return v;
+}
+
+__device__ inline float toFloat(__half v)
+{
+    return __half2float(v);
+}
+
+__device__ inline float toFloat(__nv_bfloat16 v)
+{
+    return __bfloat162float(v);
+}
+
+//! Row-local view of one request's sampling parameters, resolved once per block.
+struct RowParams
+{
+    float tempInv;
+    float minP;
+    float topP;
+    int32_t topK;
+    bool needTopK;
+    bool needTopP;
+    bool needMinP;
+};
+
+__device__ inline RowParams loadRowParams(UniversalSamplingParams const& p, int row)
+{
+    RowParams r;
+    float const temperature = p.temperatures != nullptr ? p.temperatures[row] : 1.0f;
+    r.tempInv = 1.0f / (temperature + kTempEpsilon);
+
+    r.minP = p.minPs != nullptr ? p.minPs[row] : 0.0f;
+    r.topP = p.topPs != nullptr ? p.topPs[row] : 1.0f;
+    r.topK = p.topKs != nullptr ? p.topKs[row] : 0;
+
+    // Every "disabled" spelling the callers use collapses here, so the rest of the
+    // kernel tests one boolean instead of re-deriving the sentinel convention:
+    // top_k <= 0 means "all logits" per SamplingParams, and INT32_MAX is the
+    // one-model path's explicit disable value -- both clamp to vocabSize.
+    r.needTopK = r.topK > 0 && r.topK < p.vocabSize;
+    r.needTopP = r.topP < 1.0f;
+    r.needMinP = r.minP > 0.0f;
+    return r;
+}
+
+//! The temperature-scaled logit. __fmul_rn, not `*`, and deliberately so: the compiler is
+//! free to contract `l * tempInv - maxScaled` into an FMA, which rounds once instead of
+//! twice. maxScaled was produced by a separate multiply, so the contracted form does not
+//! cancel to exactly 0 at the argmax -- it lands a few ULP below, w comes out just under
+//! 1.0, and `min_p == 1.0` (keep only p == p_max) then keeps nothing at all and divides by
+//! a zero mass. Forcing the same rounding in both places is what makes that cancellation
+//! exact.
+template <typename T>
+__device__ inline float scaledLogit(T const* rowLogits, int idx, float tempInv)
+{
+    return __fmul_rn(toFloat(rowLogits[idx]), tempInv);
+}
+
+//! w = exp(l/T - maxScaledLogit), i.e. p / p_max before normalization. Recomputed from
+//! the logits on each pass rather than staged in a workspace: the read is the same
+//! bandwidth either way, and a [numRows, vocabSize] scratch buffer would have to be
+//! allocated (and CUDA-graph-pinned) for the tokens-only calls that never want probs.
+template <typename T>
+__device__ inline float weightOf(T const* rowLogits, int idx, float tempInv, float maxScaled)
+{
+    return __expf(scaledLogit(rowLogits, idx, tempInv) - maxScaled);
+}
+
+//! Running (max, mass, argmax) of an online softmax: ``sum`` is the mass of everything
+//! seen so far, expressed relative to ``max``, so it stays finite whatever the logits are.
+struct OnlineSoftmax
+{
+    float max;
+    float sum;
+    int argmax;
+};
+
+//! Merge two partial online-softmax states by rebasing the smaller max onto the larger.
+//! Associative and commutative, so a block reduce over it is order-independent -- which is
+//! what keeps two TP ranks holding identical logits in agreement.
+__device__ inline OnlineSoftmax combineOnlineSoftmax(OnlineSoftmax a, OnlineSoftmax b)
+{
+    if (a.max >= b.max)
+    {
+        return OnlineSoftmax{a.max, a.sum + b.sum * __expf(b.max - a.max), a.argmax};
+    }
+    return OnlineSoftmax{b.max, b.sum + a.sum * __expf(a.max - b.max), b.argmax};
+}
+
+struct OnlineSoftmaxOp
+{
+    __device__ inline OnlineSoftmax operator()(OnlineSoftmax const& a, OnlineSoftmax const& b) const
+    {
+        return combineOnlineSoftmax(a, b);
+    }
+};
+
+//! \brief Find the cutoff value for ONE rank-or-mass criterion, over the weights that
+//!        survived the filters already applied.
+//!
+//! ``byCount``: fire when the running count reaches ``targetCount`` (top-k).
+//! otherwise:   fire when the running mass exceeds ``targetMass``    (top-p).
+//!
+//! ``floor`` excludes what earlier filters already removed, so the count and the mass are
+//! both taken over the surviving set. That is what makes this composable, and it is the
+//! whole reason top-k and top-p need two calls rather than one -- see the caller.
+//!
+//! MSB-first radix over the float bit pattern, which is monotone for non-negative floats
+//! (w is an exp, so it never is). Four 8-bit passes pin the boundary value exactly.
+//!
+//! Returns 0 when the criterion never fires (this filter keeps everything).
+template <typename T>
+__device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv, float maxScaled, float floorValue,
+    long long targetCount, float targetMass, bool byCount, int* sCount, float* sMass, int* sChosen, long long* sCountHi,
+    float* sMassHi, bool* sFired)
+{
+    uint32_t prefix = 0u;
+    uint32_t fixedMask = 0u;
+    long long countHi = 0;
+    float massHi = 0.0f;
+
+    int const tid = threadIdx.x;
+
+    for (int pass = 0; pass < kRadixPasses; ++pass)
+    {
+        int const shift = 32 - kRadixBits * (pass + 1);
+        if (tid == 0)
+        {
+            *sFired = false;
+        }
+
+        for (int b = tid; b < kRadixBuckets; b += kBlockSize)
+        {
+            sCount[b] = 0;
+            sMass[b] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int i = tid; i < vocabSize; i += kBlockSize)
+        {
+            float const w = weightOf(rowLogits, i, tempInv, maxScaled);
+            if (w < floorValue)
+            {
+                continue;
+            }
+            uint32_t const bits = __float_as_uint(w);
+            if ((bits & fixedMask) != prefix)
+            {
+                continue;
+            }
+            uint32_t const digit = (bits >> shift) & (kRadixBuckets - 1);
+            atomicAdd(&sCount[digit], 1);
+            atomicAdd(&sMass[digit], w);
+        }
+        __syncthreads();
+
+        // The bucket walk is serial on one thread: 256 steps against vocabSize/512
+        // steps of the histogram pass above, so it is not what this costs.
+        if (tid == 0)
+        {
+            long long c = countHi;
+            float m = massHi;
+            int chosen = 0;
+            for (int b = kRadixBuckets - 1; b >= 0; --b)
+            {
+                long long const c2 = c + sCount[b];
+                float const m2 = m + sMass[b];
+                bool const fired = byCount ? c2 >= targetCount : m2 > targetMass;
+                if (fired)
+                {
+                    chosen = b;
+                    *sFired = true;
+                    break;
+                }
+                c = c2;
+                m = m2;
+            }
+            *sChosen = chosen;
+            *sCountHi = c;
+            *sMassHi = m;
+        }
+        __syncthreads();
+
+        // Only the first pass can legitimately not fire: it walks the whole range, so
+        // "never fired" means the filters keep everything (top_k >= the number of
+        // survivors; top_p always fires while topP < 1). A later pass descends into a
+        // bucket that is known to contain the crossing, and a non-firing walk there just
+        // means the crossing sits at the bucket's floor, which chosen == 0 already says.
+        if (pass == 0 && !*sFired)
+        {
+            return 0.0f;
+        }
+        prefix |= static_cast<uint32_t>(*sChosen) << shift;
+        fixedMask |= static_cast<uint32_t>(kRadixBuckets - 1) << shift;
+        countHi = *sCountHi;
+        massHi = *sMassHi;
+        __syncthreads();
+    }
+
+    return __uint_as_float(prefix);
+}
+
+//! \brief Fused temperature + min-p + top-k + top-p + (probs | sampling), one block per row.
+template <typename T, bool NEED_TOKENS, bool NEED_PROBS>
+__global__ void universalSamplingKernel(UniversalSamplingParams params)
+{
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const vocabSize = params.vocabSize;
+    T const* rowLogits = static_cast<T const*>(params.logits) + static_cast<size_t>(row) * vocabSize;
+    float* rowProbs = NEED_PROBS ? params.outputProbs + static_cast<size_t>(row) * vocabSize : nullptr;
+
+    RowParams const rp = loadRowParams(params, row);
+
+    using BlockReduceF = cub::BlockReduce<float, kBlockSize>;
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, kBlockSize>;
+    using BlockScanF = cub::BlockScan<float, kBlockSize>;
+
+    __shared__ union
+    {
+        typename BlockReduceF::TempStorage reduceF;
+        typename BlockReduceOnline::TempStorage reduceOnline;
+        typename BlockScanF::TempStorage scanF;
+    } temp;
+
+    __shared__ int sCount[kRadixBuckets];
+    __shared__ float sMass[kRadixBuckets];
+    __shared__ int sChosen;
+    __shared__ long long sCountHi;
+    __shared__ float sMassHi;
+    __shared__ bool sFired;
+    __shared__ float sMaxScaled;
+    __shared__ float sTotalMass;
+    __shared__ float sKeptMass;
+    __shared__ float sSurvivingMass;
+    __shared__ float sTarget;
+    __shared__ int sArgMax;
+    __shared__ int sToken;
+
+    // --- Pass 1: online softmax -- max, total mass and argmax in a SINGLE read of the
+    //     row (Milakov & Gimelshein). The naive form needs two, one for the max and one
+    //     for the sum, and measurement showed that second pass is exactly what put a
+    //     neutral `probs` row at ~1.5x of flashinfer's two-pass softmax. The argmax rides
+    //     along for free and is the fallback if the inverse-CDF walk falls off the end.
+    OnlineSoftmax local{-FLT_MAX, 0.0f, 0};
+    for (int i = tid; i < vocabSize; i += kBlockSize)
+    {
+        local = combineOnlineSoftmax(local, OnlineSoftmax{scaledLogit(rowLogits, i, rp.tempInv), 1.0f, i});
+    }
+    OnlineSoftmax const rowStats = BlockReduceOnline(temp.reduceOnline).Reduce(local, OnlineSoftmaxOp());
+    if (tid == 0)
+    {
+        sMaxScaled = rowStats.max;
+        sArgMax = rowStats.argmax;
+        sTotalMass = rowStats.sum;
+    }
+    __syncthreads();
+    float const maxScaled = sMaxScaled;
+
+    // --- Pass 2: only min-p needs one, and only because its cutoff is relative to the max
+    //     -- which pass 1 does not know until it ends, so the filtered mass cannot be
+    //     accumulated there. Every other row already has its total.
+    //
+    //     min-p itself stays free: w == p / p_max is a value the softmax already produced,
+    //     so the filter is one comparison, not a pass. This pass exists to re-total, not
+    //     to filter.
+    if (rp.needMinP)
+    {
+        float localMass = 0.0f;
+        for (int i = tid; i < vocabSize; i += kBlockSize)
+        {
+            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+            if (w >= rp.minP)
+            {
+                localMass += w;
+            }
+        }
+        float const filteredMass = BlockReduceF(temp.reduceF).Sum(localMass);
+        if (tid == 0)
+        {
+            sTotalMass = filteredMass;
+        }
+        __syncthreads();
+    }
+
+    // --- Pass 3: the rank/mass thresholds, skipped wholesale when neither top-k nor
+    //     top-p is active. This is the only expensive stage, and the only one a neutral
+    //     row -- or a neutral row in a mixed batch -- does not run at all.
+    //
+    // Order matters, and only min-p and top-k are order-free. Both of those are invariant
+    // under renormalization -- min-p thresholds p / p_max, top-k thresholds rank, and
+    // scaling a row by a constant changes neither -- so they compose into one cutoff.
+    // top-p does NOT: its cutoff is a fraction of the mass of whatever survived before it,
+    // and every earlier filter shrinks that denominator. Running it against the raw
+    // softmax mass keeps far too much (measurably: ~0.2 of L1 mass against the
+    // TorchSampler reference at top_k=50, top_p=0.9). Hence a second descent, against the
+    // surviving mass, in the documented min-p -> top-k -> top-p order.
+    float threshold = rp.needMinP ? rp.minP : 0.0f;
+    if (rp.needTopK)
+    {
+        float const topKThreshold
+            = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold, static_cast<long long>(rp.topK),
+                0.0f, /*byCount=*/true, sCount, sMass, &sChosen, &sCountHi, &sMassHi, &sFired);
+        threshold = fmaxf(threshold, topKThreshold);
+    }
+    if (rp.needTopP)
+    {
+        // The mass top-p takes its fraction of: post-min-p, post-top-k.
+        float localSurviving = 0.0f;
+        for (int i = tid; i < vocabSize; i += kBlockSize)
+        {
+            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+            if (w >= threshold)
+            {
+                localSurviving += w;
+            }
+        }
+        float const survivingMass = BlockReduceF(temp.reduceF).Sum(localSurviving);
+        if (tid == 0)
+        {
+            sSurvivingMass = survivingMass;
+        }
+        __syncthreads();
+
+        float const topPThreshold = findThreshold<T>(rowLogits, vocabSize, rp.tempInv, maxScaled, threshold, 0,
+            rp.topP * sSurvivingMass, /*byCount=*/false, sCount, sMass, &sChosen, &sCountHi, &sMassHi, &sFired);
+        threshold = fmaxf(threshold, topPThreshold);
+    }
+
+    // --- Pass 4: kept mass. Skipped when no filter can have removed anything, in which
+    //     case pass 2's total already is the kept mass.
+    float keptMass = sTotalMass;
+    if (threshold > 0.0f)
+    {
+        float localKept = 0.0f;
+        for (int i = tid; i < vocabSize; i += kBlockSize)
+        {
+            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+            if (w >= threshold)
+            {
+                localKept += w;
+            }
+        }
+        float const blockKept = BlockReduceF(temp.reduceF).Sum(localKept);
+        if (tid == 0)
+        {
+            sKeptMass = blockKept;
+        }
+        __syncthreads();
+        keptMass = sKeptMass;
+    }
+    // A degenerate row (every weight filtered away by a pathological threshold) would
+    // divide by zero; fall back to the unfiltered mass rather than emit NaNs.
+    if (!(keptMass > 0.0f))
+    {
+        keptMass = sTotalMass;
+        threshold = 0.0f;
+    }
+
+    // --- Pass 5: the renormalized distribution.
+    if (NEED_PROBS)
+    {
+        float const scale = 1.0f / keptMass;
+        for (int i = tid; i < vocabSize; i += kBlockSize)
+        {
+            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+            rowProbs[i] = w >= threshold ? w * scale : 0.0f;
+        }
+    }
+
+    // --- Pass 6: inverse-CDF sample over the kept weights.
+    if (NEED_TOKENS)
+    {
+        if (tid == 0)
+        {
+            int const rngIdx = params.perRowRng ? row : 0;
+            uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
+            uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
+            curandStatePhilox4_32_10_t state;
+            // The row index is the subsequence, so rows draw independent streams from a
+            // shared seed -- and a seeded request stays reproducible via its own offset.
+            curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+            sTarget = curand_uniform(&state) * keptMass;
+            sToken = -1;
+        }
+        __syncthreads();
+        float const target = sTarget;
+
+        // Each thread sums its own strided elements, an exclusive scan gives it the mass
+        // below it, and then only the thread whose span contains the target re-walks --
+        // in the same order, so the two accumulations agree.
+        float localKept = 0.0f;
+        for (int i = tid; i < vocabSize; i += kBlockSize)
+        {
+            float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+            if (w >= threshold)
+            {
+                localKept += w;
+            }
+        }
+        float base = 0.0f;
+        BlockScanF(temp.scanF).ExclusiveSum(localKept, base);
+        __syncthreads();
+
+        if (target >= base && target < base + localKept)
+        {
+            float running = base;
+            for (int i = tid; i < vocabSize; i += kBlockSize)
+            {
+                float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
+                if (w < threshold)
+                {
+                    continue;
+                }
+                running += w;
+                if (running > target)
+                {
+                    sToken = i;
+                    break;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0)
+        {
+            // Rounding can leave the target just past the last kept element; the argmax
+            // is always in the kept set, so it is a safe answer rather than a wrong one.
+            params.outputTokens[row] = sToken >= 0 ? sToken : sArgMax;
+        }
+    }
+}
+
+} // namespace
+
+template <typename T>
+void invokeUniversalSampling(UniversalSamplingParams const& params, cudaStream_t stream)
+{
+    dim3 const grid(params.numRows);
+    dim3 const block(kBlockSize);
+    bool const needTokens = params.outputTokens != nullptr;
+    bool const needProbs = params.outputProbs != nullptr;
+
+    if (needTokens && needProbs)
+    {
+        universalSamplingKernel<T, true, true><<<grid, block, 0, stream>>>(params);
+    }
+    else if (needTokens)
+    {
+        universalSamplingKernel<T, true, false><<<grid, block, 0, stream>>>(params);
+    }
+    else if (needProbs)
+    {
+        universalSamplingKernel<T, false, true><<<grid, block, 0, stream>>>(params);
+    }
+}
+
+template void invokeUniversalSampling<float>(UniversalSamplingParams const&, cudaStream_t);
+template void invokeUniversalSampling<__half>(UniversalSamplingParams const&, cudaStream_t);
+template void invokeUniversalSampling<__nv_bfloat16>(UniversalSamplingParams const&, cudaStream_t);
+
+} // namespace kernels
+} // namespace tensorrt_llm
