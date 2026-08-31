@@ -71,7 +71,7 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "gitlab-master.nvidia.com:5005/dl/dgx/pytorch:26.08-py3.63802676-devel"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.08-py3"
 
 MODEL_EXPRESS_VERSION = "0.4.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
