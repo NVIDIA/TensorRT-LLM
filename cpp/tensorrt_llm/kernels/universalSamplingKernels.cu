@@ -50,6 +50,9 @@ namespace
 constexpr int kNarrowBlock = 512;
 constexpr int kWideBlock = 1024;
 constexpr int kWideBlockMaxRows = 128;
+//! Architectural limits the occupancy bound below is expressed against.
+constexpr int kMaxThreadsPerBlock = 1024;
+constexpr int kMaxThreadsPerSm = 2048;
 //! Digits per radix pass of the threshold search. 8 bits -> 256 buckets, 4 passes to pin
 //! a float exactly.
 constexpr int kRadixBits = 8;
@@ -469,9 +472,19 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
     return __uint_as_float(prefix);
 }
 
+//! \brief The kernel body, shared by both entry points below.
+//!
+//! A __device__ function rather than the __global__ itself because only ONE of the six
+//! instantiations wants an occupancy bound, and __launch_bounds__ lives on the entry
+//! point. Writing it as a template-dependent expression on a single __global__ does not
+//! work: naming any bound changes what ptxas does even where the expression is the
+//! architectural default. Measured, at 1024 rows / 131072 vocab, `__launch_bounds__(1024,
+//! 1)` on the probs instantiation -- nominally the no-bound assumption -- cost 1.20-1.29x
+//! against no attribute at all. So the bounded case gets its own entry point and every
+//! other instantiation keeps none.
 //! \brief Fused temperature + min-p + top-k + top-p + (probs | sampling), one block per row.
 template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS>
-__global__ void universalSamplingKernel(UniversalSamplingParams params)
+__device__ void universalSamplingBody(UniversalSamplingParams const& params)
 {
     int const row = blockIdx.x;
     int const tid = threadIdx.x;
@@ -971,6 +984,32 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
     }
 }
 
+//! The generic entry point: no __launch_bounds__, so ptxas compiles every instantiation
+//! exactly as it did before the tokens-only path existed.
+template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS>
+__global__ void universalSamplingKernel(UniversalSamplingParams params)
+{
+    universalSamplingBody<T, BLOCK, NEED_TOKENS, NEED_PROBS>(params);
+}
+
+//! The tokens-only narrow-block entry point, and the only one carrying an occupancy bound.
+//!
+//! The rejection loop costs registers: 47 at BLOCK=512 against 32 for the other output
+//! shapes. 512 threads x 47 registers fits 2 blocks in an SM's 65536 where 32 fits 4, and
+//! that halving showed up as a 1.24-1.34x regression at 1024 rows -- on cases that never
+//! enter the loop at all, since top-k rows take the descent. Naming the target trades a
+//! 4-byte spill for the occupancy, which is the right way round for a kernel reading half a
+//! megabyte per row.
+//!
+//! Only the narrow block. The wide block is the few-rows regime, where a block already owns
+//! its SM and capping registers would buy nothing while the spill still cost.
+template <typename T>
+__global__ __launch_bounds__(kNarrowBlock, kMaxThreadsPerSm / kNarrowBlock) void universalSamplingTokensNarrowKernel(
+    UniversalSamplingParams params)
+{
+    universalSamplingBody<T, kNarrowBlock, true, false>(params);
+}
+
 } // namespace
 
 //! Launch one (block size, output shape) specialization. Both are compile-time so the
@@ -989,7 +1028,14 @@ void launchUniversalSampling(UniversalSamplingParams const& params, cudaStream_t
     }
     else if (needTokens)
     {
-        universalSamplingKernel<T, BLOCK, true, false><<<grid, block, 0, stream>>>(params);
+        if constexpr (BLOCK == kNarrowBlock)
+        {
+            universalSamplingTokensNarrowKernel<T><<<grid, block, 0, stream>>>(params);
+        }
+        else
+        {
+            universalSamplingKernel<T, BLOCK, true, false><<<grid, block, 0, stream>>>(params);
+        }
     }
     else if (needProbs)
     {
