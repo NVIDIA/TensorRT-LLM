@@ -29,7 +29,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.interface import (
+    MoESchedulerKind,
+    MoEWeightLoadingMode,
+    _compute_ep_partition,
+)
+from tensorrt_llm._torch.utils import ActivationType, ActType_TrtllmGen
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -83,6 +88,26 @@ def _comm_method_name(moe) -> str:
     return type(comm).__name__
 
 
+def _epilogue_activation_name(moe) -> str:
+    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+
+    The SiTU request can be dropped for reasons the spec cannot see (wrong
+    backend, wrong quant, upstream fallback), so read it back rather than
+    reporting what was asked for. MegaMoE DeepGEMM / CuteDSL store the
+    resolved name; TRTLLM-Gen exposes a predicate; CUTLASS uses
+    ``ActivationType.SiTu``.
+    """
+    backend = getattr(moe, "backend", None) or moe
+    if getattr(backend, "activation", None) == "situ" or getattr(
+        backend, "is_situ_activation", False
+    ):
+        return "situ"
+    activation_type = getattr(backend, "activation_type", None)
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
+        return "situ"
+    return "swiglu"
+
+
 def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[int]:
     """Best-effort lookup of ``num_chunks`` for the case we are about to time."""
     scheduler = getattr(moe, "scheduler", None)
@@ -97,9 +122,69 @@ def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[
         return None
 
 
+def _situ_kwargs(
+    model: ModelSpec,
+    moe_backend: str,
+    quant_algo: Optional[QuantAlgo],
+    mapping: Optional[Mapping] = None,
+) -> Dict:
+    """``create_moe`` kwargs that switch the epilogue to SiTU, or ``{}``.
+
+    Each backend takes SiTU through its own parameters and ``create_moe``
+    REJECTS them on any other backend, so this dispatches instead of passing
+    one set everywhere. Quant is paired with the backend that actually
+    implements the epilogue; a spec carrying SiTU constants falls back to
+    the SwiGLU proxy elsewhere rather than failing the case -- SiTU is
+    gated, so the GEMM shapes and comm volume are the same either way.
+    """
+    if model.situ_beta is None:
+        return {}
+    backend = moe_backend.upper()
+    mega_situ = {
+        "activation": "situ",
+        "situ_beta": model.situ_beta,
+        "situ_linear_beta": model.situ_linear_beta,
+    }
+    if backend == "MEGAMOE_DEEPGEMM" and quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        return mega_situ
+    if backend == "MEGAMOE_CUTEDSL" and quant_algo == QuantAlgo.NVFP4:
+        return mega_situ
+    if backend == "TRTLLM" and quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        # Cubin alpha is the gate-side beta, cubin beta the linear-side one.
+        return {
+            "trtllm_gen_activation_type": ActType_TrtllmGen.SiTu,
+            "trtllm_gen_activation_alpha": model.situ_beta,
+            "trtllm_gen_activation_beta": model.situ_linear_beta,
+        }
+    if backend == "CUTLASS" and quant_algo == QuantAlgo.NVFP4:
+        # CUTLASS takes SiTU as ActivationType plus per-rank alpha/beta
+        # (same packing as modeling_kimi_linear). Size the tensors with
+        # the ceil/floor EP partition so uneven splits stay valid.
+        ep_size = 1 if mapping is None else max(mapping.moe_ep_size, 1)
+        ep_rank = 0 if mapping is None else mapping.moe_ep_rank
+        local_num_experts, _, _ = _compute_ep_partition(model.num_experts, ep_size, ep_rank)
+        device = torch.device("cuda", torch.cuda.current_device())
+        return {
+            "activation_type": ActivationType.SiTu,
+            "swiglu_alpha": torch.full(
+                (local_num_experts,),
+                float(model.situ_beta),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "swiglu_beta": torch.full(
+                (local_num_experts,),
+                float(model.situ_linear_beta),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+    return {}
+
+
 def _create_moe_for_benchmark(**kwargs):
     ensure_cute_dsl_importable_for_benchmark()
-    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 
     return create_moe(**kwargs)
 
@@ -220,6 +305,7 @@ def _build_moe_module(
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
         model.routing_method_cls,
@@ -264,6 +350,7 @@ def _build_moe_module(
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
         swiglu_limit=model.swiglu_limit if swiglu_gptoss_style else None,
         num_local_experts=num_local_experts,
+        activation_type=activation_type,
     )
 
     weight_loading_mode = getattr(
@@ -272,7 +359,8 @@ def _build_moe_module(
 
     swiglu_tensors = quantize_util.get_swiglu_tensors()
 
-    moe = _create_moe_for_benchmark(
+    # Merge then unpack so SiTU can override activation_type / swiglu_alpha-beta.
+    moe_kwargs = dict(
         routing_method=routing_method,
         num_experts=mc.num_experts,
         hidden_size=mc.hidden_size,
@@ -285,7 +373,10 @@ def _build_moe_module(
         swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
         swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
         swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+        activation_type=activation_type,
     )
+    moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo, mapping))
+    moe = _create_moe_for_benchmark(**moe_kwargs)
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(

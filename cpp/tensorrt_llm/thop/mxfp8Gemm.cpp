@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -240,7 +240,8 @@ at::Tensor mxfp8_mxfp8_gemm(at::Tensor const& act, at::Tensor const& actScale, a
         /*useTacticCache=*/true);
 }
 
-//! Profiles native MXFP8 GEMM tactics and registers selected tactics in the serving cache.
+//! Profiles native MXFP8 GEMM tactics and registers selected tactics in the
+//! serving cache.
 class MXFP8GemmRunner : public torch::CustomClassHolder
 {
 public:
@@ -277,7 +278,8 @@ public:
         cacheMxfp8Tactic(m, n, k, mOutputDtype, config, configIdx);
     }
 
-    //! Returns the registered tactic for a serving shape, or the cache-miss sentinel.
+    //! Returns the registered tactic for a serving shape, or the cache-miss
+    //! sentinel.
     int64_t getCachedTactic(int64_t const m, int64_t const n, int64_t const k) const
     {
         auto const entry = findMxfp8TacticCacheEntry(m, n, k, mOutputDtype);
@@ -323,7 +325,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def("clear_tactic_cache", &tensorrt_llm::torch_ext::MXFP8GemmRunner::clearTacticCache);
 
     m.def(
-        "mxfp8_mxfp8_gemm(Tensor act, Tensor actScale, Tensor weight, Tensor weightScale, "
+        "mxfp8_mxfp8_gemm(Tensor act, Tensor actScale, Tensor weight, Tensor "
+        "weightScale, "
         "Tensor globalScale, ScalarType? out_dtype=None) -> Tensor");
 }
 

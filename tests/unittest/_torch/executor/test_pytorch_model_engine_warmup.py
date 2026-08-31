@@ -79,7 +79,10 @@ class _DummyModelEngine(PyTorchModelEngine):
             rank=tensorrt_llm.mpi_rank(),
         )
         super().__init__(
-            model_path="dummy", mapping=mapping, model=_DummyModel(dtype), llm_args=llm_args
+            model_path="dummy",
+            mapping=mapping,
+            model=_DummyModel(dtype),
+            llm_args=llm_args,
         )
 
 
@@ -183,12 +186,15 @@ class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
     def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
+        """Enc-dec encoder warmup is deferred and runs as two passes."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.cuda_graph_runner = SimpleNamespace(
             enabled=True,
             is_warmup_only=True,
         )
+        model_engine.model = SimpleNamespace(modules=lambda: [])
         model_engine._torch_compile_piecewise_cuda_graph = False
+        model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
 
         @contextlib.contextmanager
@@ -199,6 +205,7 @@ class TestWarmupCleanup(unittest.TestCase):
             enabled=True,
             is_encoder_decoder=True,
             is_warmup_only=False,
+            feature_mode=False,
             allow_capture=allow_capture,
         )
         model_engine.encoder_cuda_graph_runner = runner
@@ -233,7 +240,9 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertIn("autotuner", calls)
         autotuner_idx = calls.index("autotuner")
         self.assertLess(
-            autotuner_idx + 1, len(calls), f"Expected something after autotuner; got {calls}"
+            autotuner_idx + 1,
+            len(calls),
+            f"Expected something after autotuner; got {calls}",
         )
         self.assertEqual(
             calls[autotuner_idx + 1],
@@ -260,7 +269,9 @@ class TestWarmupCleanup(unittest.TestCase):
         calls, _ = _run_warmup_tracked(model_engine, resource_manager, force_helix_cp=True)
         self.assertNotIn("autotuner", calls, f"Helix CP should skip autotuner; got {calls}")
         self.assertEqual(
-            calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
+            calls.count("empty_cache"),
+            0,
+            f"Helix CP should skip all warmup cleanup; got {calls}",
         )
 
     def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self):
@@ -385,7 +396,7 @@ class TestWarmupCleanup(unittest.TestCase):
                         contextlib.nullcontext(object()),
                     ]
                 ),
-                _assert_all_tp_ranks_have_warmup_batch=Mock(),
+                _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
                 forward=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
@@ -467,6 +478,7 @@ class TestWarmupCleanup(unittest.TestCase):
             patch.dict(os.environ, {}, clear=False),
         ):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
+            os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=True),
@@ -497,7 +509,7 @@ class TestWarmupCleanup(unittest.TestCase):
                         contextlib.nullcontext(None),
                     ]
                 ),
-                _assert_all_tp_ranks_have_warmup_batch=Mock(),
+                _should_run_warmup_batch=Mock(return_value=False),
                 _release_megamoe_profiling_scratch=Mock(),
                 forward=Mock(),
             )
@@ -588,7 +600,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
-                _assert_all_tp_ranks_have_warmup_batch=Mock(),
+                _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
                 forward=Mock(),
             )
@@ -620,7 +632,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method._flashinfer_autotuned)
         sync_tactics.assert_called_once_with(tuner)
         flashinfer_module.autotune.assert_not_called()
-        self.assertEqual(engine.forward.call_count, 2)
+        self.assertEqual(engine.forward.call_count, 1)
 
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
         with (

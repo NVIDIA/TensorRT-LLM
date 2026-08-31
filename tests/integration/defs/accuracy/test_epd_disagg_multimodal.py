@@ -108,11 +108,17 @@ def launch_multimodal_encoder_pd_llm(
     """Launch separate encoder and combined prefill/decode llmapi instances."""
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}))
+        # Teardown order matters (nvbugs/6327718): enter LLMs first and the
+        # pool last so unwinding drains the pool before either proxy shuts
+        # down. Otherwise proxy.shutdown() closes ZMQ sockets while pool
+        # threads are still in socket.send() on them, which aborts in libzmq
+        # and surfaces as "Test terminated unexpectedly". Each object is
+        # entered as soon as it exists so a later constructor raising cannot
+        # leak an earlier one.
+        encoder = stack.enter_context(MultimodalEncoder(model=model_name, **encoder_llm_config))
+        pd_llm = stack.enter_context(LLM(model=model_name, **pd_llm_config))
         thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
-        encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
-        pd_llm = LLM(model=model_name, **pd_llm_config)
-        with encoder, pd_llm:
-            yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
+        yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
 
 
 @dataclass(frozen=True)
@@ -225,6 +231,10 @@ class EPDVariant:
             ),
             max_batch_size=128,
             expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+            # Mirrors the cap nano_omni_fp8 already carries (nvbugs/6327718):
+            # bounding concurrency keeps fewer requests in flight when
+            # teardown begins.
+            max_workers=16,
         )
 
 

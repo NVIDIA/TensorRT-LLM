@@ -164,6 +164,20 @@ def _synthetic_state_dict(cfg: SimpleNamespace) -> dict:
         "time_embedder.linear_2.weight": torch.randn(h, h),
         "time_embedder.linear_2.bias": torch.randn(h),
     }
+    if getattr(cfg, "action_gen", False):
+        # DomainAwareLinear stores per-domain weights as nn.Embedding rows of
+        # flattened [out * in] matrices; the modality embed is a root parameter.
+        n_dom = cfg.num_embodiment_domains
+        a = cfg.action_dim
+        sd.update(
+            {
+                "action_modality_embed": torch.randn(h),
+                "action_proj_in.fc.weight": torch.randn(n_dom, h * a),
+                "action_proj_in.bias.weight": torch.randn(n_dom, h),
+                "action_proj_out.fc.weight": torch.randn(n_dom, a * h),
+                "action_proj_out.bias.weight": torch.randn(n_dom, a),
+            }
+        )
     if getattr(cfg, "sound_gen", False):
         sd.update(
             {
@@ -611,6 +625,8 @@ class TestStrictLoading:
         "missing_key",
         [
             "layers.0.self_attn.k_norm_und_for_gen.weight",
+            "action_proj_in.fc.weight",
+            "action_modality_embed",
             "layers.0.mlp.up_proj.weight",
             "layers.1.mlp_moe_gen.down_proj.weight",
             "layers.0.input_layernorm_moe_gen.weight",
@@ -638,15 +654,6 @@ class TestStrictLoading:
         monkeypatch.setattr(tf_module.logger, "info", infos.append)
         cfg = _reduced_edge_config()
         sd = _edge_state_dict(cfg)
-        sd.update(
-            {
-                "action_modality_embed": torch.randn(cfg.hidden_size),
-                "action_proj_in.fc.weight": torch.randn(4, 8),
-                "action_proj_in.bias.weight": torch.randn(4, 8),
-                "action_proj_out.fc.weight": torch.randn(4, 8),
-                "action_proj_out.bias.weight": torch.randn(4, 8),
-            }
-        )
         model = self._model()
         model.load_weights(sd)
 
@@ -659,9 +666,6 @@ class TestStrictLoading:
         # text also mentions lm_head/norm, so assert the parsed set exactly.
         skipped_families = {name.strip() for name in skip_logs[0].rsplit(": ", 1)[1].split(",")}
         assert skipped_families == {
-            "action_modality_embed",
-            "action_proj_in",
-            "action_proj_out",
             "lm_head",
             "norm",
         }
@@ -679,14 +683,13 @@ class TestStrictLoading:
         cfg = _reduced_edge_config()
         sd = _edge_state_dict(cfg)
         sd["model.lm_head.weight"] = torch.randn(cfg.vocab_size, cfg.hidden_size)
-        sd["model.action_modality_embed"] = torch.randn(cfg.hidden_size)
         self._model().load_weights(sd)
 
         assert not any("unknown checkpoint key" in m for m in warnings)
         skip_logs = [m for m in infos if "intentionally unused" in m]
         assert len(skip_logs) == 1
         skipped_families = {name.strip() for name in skip_logs[0].rsplit(": ", 1)[1].split(",")}
-        assert {"lm_head", "action_modality_embed"} <= skipped_families
+        assert "lm_head" in skipped_families
 
     def test_unconsumed_mapped_tensor_warns(self, monkeypatch):
         """A checkpoint tensor that remaps to a module the recipe didn't
@@ -747,6 +750,8 @@ class TestStrictLoading:
 
 def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+    # __new__ skips BasePipeline.__init__, which is where ``_device`` is set.
+    pipeline._device = torch.device("cpu")
     pipeline.family = family
     pipeline.sampling = Cosmos3SamplingPolicy()
     pipeline.audio_gen = False
@@ -956,6 +961,7 @@ class TestSchedulerCacheBounds:
         self, family: str = "nemotron_dense", checkpoint_shift: float = 3.0
     ) -> "pipeline_module.Cosmos3OmniMoTPipeline":
         pipeline = object.__new__(pipeline_module.Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.family = family
         pipeline.sampling = SimpleNamespace(
             checkpoint_flow_shift=checkpoint_shift,

@@ -945,15 +945,6 @@ def llm_lora_model_root(request):
         elif item == "luotuo-lora-7b-0.1":
             model_root_list.append(
                 os.path.join(models_root, "llama-models", "luotuo-lora-7b-0.1"))
-        elif item == "Ko-QWEN-7B-Chat-LoRA":
-            model_root_list.append(
-                os.path.join(models_root, "Ko-QWEN-7B-Chat-LoRA"))
-        elif item == "Qwen1.5-7B-Chat-750Mb-lora":
-            model_root_list.append(
-                os.path.join(models_root, "Qwen1.5-7B-Chat-750Mb-lora"))
-        elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
-            model_root_list.append(
-                os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
@@ -1111,86 +1102,6 @@ def llm_internlm_20b_model_root(llm_venv):
     )
 
     return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("Qwen-7B-Chat", True)
-def llm_qwen_7b_model_root(llm_venv):
-    "prepare qwen-7b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "Qwen-7B-Chat")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_qwen_model_root(request, llm_venv):
-    "prepare qwen model & return model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat")
-
-    if hasattr(request, "param"):
-        if request.param == "qwen_7b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat")
-        elif request.param == "qwen_14b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-14B-Chat")
-        elif request.param == "qwen_72b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-72B-Chat")
-        elif request.param == "qwen_7b_chat_int4":
-            qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat-Int4")
-        elif request.param == "qwen-vl-chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-VL-Chat")
-        elif request.param == "qwen1.5_7b_chat_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-7B-Chat-AWQ")
-        elif request.param == "qwen1.5_0.5b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-0.5B-Chat")
-        elif request.param == "qwen1.5_7b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-7B-Chat")
-        elif request.param == "qwen1.5_14b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-14B-Chat")
-        elif request.param == "qwen1.5_moe_a2.7b_chat":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-MoE-A2.7B-Chat")
-        elif request.param == "qwen1.5_72b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-72B-Chat")
-        elif request.param == "qwen1.5_moe_a2.7b_chat":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-MoE-A2.7B-Chat")
-        elif request.param == "qwen1.5_14b_chat_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-14B-Chat-GPTQ-Int4")
-        elif request.param == "qwen2_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-0.5B-Instruct")
-        elif request.param == "qwen2_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct")
-        elif request.param == "qwen2_7b_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct-AWQ")
-        elif request.param == "qwen2_57b_a14b":
-            qwen_model_root = os.path.join(models_root, "Qwen2-57B-A14B")
-        elif request.param == "qwen2_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-72B-Instruct")
-        elif request.param == "qwen2_vl_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-VL-7B-Instruct")
-        elif request.param == "qwen2_audio_7b_instruct":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2-Audio-7B-Instruct")
-        elif request.param == "qwen2.5_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-0.5B-Instruct")
-        elif request.param == "qwen2.5_1.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-1.5B-Instruct")
-        elif request.param == "qwen2.5_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-7B-Instruct")
-        elif request.param == "qwen2.5_14b_instruct_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2.5-14B-Instruct-GPTQ-Int4")
-        elif request.param == "qwen2.5_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-72B-Instruct")
-
-    assert exists(qwen_model_root), f"{qwen_model_root} does not exist!"
-
-    return qwen_model_root
 
 
 @pytest.fixture(scope="function")
@@ -1550,6 +1461,11 @@ skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
     reason="This test is not supported on ARM architecture",
+)
+
+skip_x86 = pytest.mark.skipif(
+    "x86_64" in platform.machine(),
+    reason="This test is not supported on x86 architecture",
 )
 
 

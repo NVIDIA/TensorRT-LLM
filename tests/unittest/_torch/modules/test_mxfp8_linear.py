@@ -412,7 +412,11 @@ def test_mxfp8_linear_reference_matches_dequant():
 
     qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     lin = Linear(
-        in_features=in_f, out_features=out_f, bias=False, dtype=torch.bfloat16, quant_config=qc
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=qc,
     ).cuda()
     # Mirror the checkpoint key naming (`weight_scale_inv`).
     lin.load_weights([{"weight": w_e4m3, "weight_scale_inv": scale}])
@@ -434,7 +438,8 @@ def _mxfp8_cutlass_op_available():
 
 
 @pytest.mark.skipif(
-    not _mxfp8_cutlass_op_available(), reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100"
+    not _mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
 )
 def test_mxfp8_linear_cutlass_matches_reference():
     """End-to-end CUTLASS path: must agree with the dequant reference."""
@@ -446,7 +451,11 @@ def test_mxfp8_linear_cutlass_matches_reference():
 
     qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     lin = Linear(
-        in_features=in_f, out_features=out_f, bias=False, dtype=torch.bfloat16, quant_config=qc
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=qc,
     ).cuda()
     lin.load_weights([{"weight": w_e4m3, "weight_scale_inv": scale}])
 
@@ -458,7 +467,8 @@ def test_mxfp8_linear_cutlass_matches_reference():
 
 
 @pytest.mark.skipif(
-    not _mxfp8_cutlass_op_available(), reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100"
+    not _mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
 )
 @pytest.mark.parametrize("batch_size", (1, 8, 16, 32))
 def test_mxfp8_flashinfer_decode_graph_matches_native(monkeypatch, batch_size):
