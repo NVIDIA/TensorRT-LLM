@@ -18,19 +18,6 @@ import cutlass as ctm
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import torch
-from ctm.Operations import ptx
-from ctm.Operations.ptx import (
-    AtomicOpKind,
-    CvtaSpace,
-    MBarrierArriveScope,
-    MBarrierArriveSem,
-    MBarrierSpace,
-    MemScopeKind,
-    SharedSpace,
-    cvta_to,
-    mbarrier_arrive,
-)
-from ctm.Operations.ptx import cp_async as _cp_async
 from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
@@ -38,9 +25,9 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
-nvvm_add_packed_f32x2 = partial(ptx.add_packed_f32x2, rnd="rn")
-nvvm_mul_packed_f32x2 = partial(ptx.mul_packed_f32x2, rnd="rn")
-nvvm_fma_packed_f32x2 = partial(ptx.fma_packed_f32x2, rnd="rn")
+nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
+nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
+nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 CUDA_GRID_Z_MAX = 65535
 _CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
@@ -59,7 +46,7 @@ def _as_shared_cta(address, *, loc=None, ip=None):
     address_ir = address.ir_value() if hasattr(address, "ir_value") else address
     address_space = llvm.PointerType(address_ir.type).address_space
     if address_space == ctm.AddressSpace.dsmem:
-        return cvta_to(address, CvtaSpace.SHARED, loc=loc, ip=ip)
+        return prims.cvta_to(address, prims.CvtaSpace.SHARED, loc=loc, ip=ip)
     return address
 
 
@@ -70,12 +57,10 @@ def _mapa_shared_cluster(address, rank, *, loc=None, ip=None):
 
 @ctm.dsl_user_op
 def _mbarrier_arrive_release_cta_shared_cluster(mbar, count=1, *, loc=None, ip=None) -> None:
-    mbarrier_arrive(
+    prims.mbarrier_arrive(
         mbar,
-        count,
-        sem=MBarrierArriveSem.RELEASE,
-        scope=MBarrierArriveScope.CTA,
-        space=MBarrierSpace.SHARED_CLUSTER,
+        count=count,
+        scope=prims.MemScope.CTA,
         loc=loc,
         ip=ip,
     )
@@ -1511,7 +1496,7 @@ def _tma_gather4_cluster(
     leader_barrier = _as_shared_cta(_mapa_shared_cluster(barrier, ctm.Int32(0)))
     barrier_ptr = leader_barrier.data_ptr()
     multicast_mask_u16 = ctm.Uint16(multicast_mask)
-    _cp_async._predicated_inline_ptx(
+    cute_inline_ptx(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
         ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
         " [{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], "
@@ -2294,7 +2279,11 @@ def _softmax_exp2_pair_packed_f16x2(
         (score0, score1), (softmax_scale_log2, softmax_scale_log2), (p_bias, p_bias)
     )
     shifted_h2 = _pack_f32_pair_to_f16x2(shifted[0], shifted[1])
-    return ptx.ex2_f16x2(shifted_h2)
+    return cute_inline_ptx(
+        "ex2.approx.f16x2 {$w0}, {$r0};",
+        write_only_types=[ctm.Int32],
+        read_only_args=[shifted_h2],
+    )
 
 
 @cute.jit
@@ -3591,28 +3580,41 @@ def _smem_p4_p4_materialize_group_col(
 
 @cute.jit
 def _float_to_ordered_u32_for_atomic_max(value: ctm.Float32) -> ctm.Uint32:
-    bits = ptx.mov_b32(value, target_type=ctm.Int32)
+    bits = prims.mov_b32(value, target_type=ctm.Int32)
     sign_mask = bits >> ctm.Int32(31) | ctm.Int32(2147483648)
     encoded = bits ^ sign_mask
-    return ptx.mov_b32(encoded, target_type=ctm.Uint32)
+    return prims.mov_b32(encoded, target_type=ctm.Uint32)
 
 
 @cute.jit
 def _ordered_u32_to_float_after_atomic_max(value: ctm.Uint32) -> ctm.Float32:
-    encoded = ptx.mov_b32(value, target_type=ctm.Int32)
+    encoded = prims.mov_b32(value, target_type=ctm.Int32)
     sign_mask = ~(encoded >> ctm.Int32(31)) | ctm.Int32(2147483648)
     bits = encoded ^ sign_mask
-    return ptx.mov_b32(bits, target_type=ctm.Float32)
+    return prims.mov_b32(bits, target_type=ctm.Float32)
 
 
 @cute.jit
 def _smem_atomic_max_ordered_u32(pointer, value: ctm.Uint32) -> None:
-    ptx.atom(
-        AtomicOpKind.MAX,
+    prims.atomicrmw(
+        prims.AtomicOp.MAX,
         pointer,
         value,
-        syncscope=MemScopeKind.CTA,
-        space=SharedSpace.shared_cta,
+        syncscope=prims.MemScope.CTA,
+        space=prims.SharedSpace.shared_cta,
+    )
+
+
+@cute.jit
+def _tcgen05_ld_red_32x32b_x16_max_f32(tmem) -> tuple:
+    tmem_addr = tmem.toint(ctm.Int32)
+    return cute_inline_ptx(
+        "tcgen05.ld.red.sync.aligned.32x32b.x16.max.f32 "
+        "{{$w0}, {$w1}, {$w2}, {$w3}, {$w4}, {$w5}, {$w6}, {$w7}, "
+        "{$w8}, {$w9}, {$w10}, {$w11}, {$w12}, {$w13}, {$w14}, {$w15}}, "
+        "{$w16}, [{$r0}];",
+        write_only_types=[ctm.Int32] * 17,
+        read_only_args=[tmem_addr],
     )
 
 
@@ -3698,13 +3700,7 @@ def _load_p4_n256_score_half_from_tmem(
             pending_score_groups.append(group_scores)
             pending_group_stats.append(None)
         else:
-            regs = ptx.tcgen05_ld_red(
-                ptx.Tcgen05LdStShape.SHAPE_32X32B,
-                tmem,
-                num=SF_VEC_SIZE,
-                red_op="max",
-                type_="f32",
-            )
+            regs = _tcgen05_ld_red_32x32b_x16_max_f32(tmem)
             pending_score_groups.append(regs)
             pending_group_stats.append(regs[SF_VEC_SIZE])
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
@@ -5432,14 +5428,13 @@ def _runtime_t336_producer_tile(
         )
     if has_previous_tile:
         common_source_ready_pred = prims.elect_sync() & ~warp_rebase
-        mbarrier_arrive(
-            leader_pair_p_source_ready_dsmem_mbar,
-            1,
-            sem=MBarrierArriveSem.RELAXED,
-            scope=MBarrierArriveScope.CLUSTER,
-            space=MBarrierSpace.SHARED_CLUSTER,
-            pred=common_source_ready_pred,
-        )
+        if common_source_ready_pred:
+            prims.mbarrier_arrive(
+                leader_pair_p_source_ready_dsmem_mbar,
+                count=1,
+                scope=prims.MemScope.CLUSTER,
+                relaxed=True,
+            )
         if warp_rebase:
             pv_done_li_idx = stream_li_idx - ctm.Int32(1)
             pv_done_slot = pv_done_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
@@ -5691,14 +5686,13 @@ def _runtime_t336_producer_tile_v23(
     warp_rebase = cute.arch.vote_any_sync(lane_rebase)
     if has_previous_tile:
         common_source_ready_pred = prims.elect_sync() & ~warp_rebase
-        mbarrier_arrive(
-            leader_pair_p_source_ready_dsmem_mbar,
-            1,
-            sem=MBarrierArriveSem.RELAXED,
-            scope=MBarrierArriveScope.CLUSTER,
-            space=MBarrierSpace.SHARED_CLUSTER,
-            pred=common_source_ready_pred,
-        )
+        if common_source_ready_pred:
+            prims.mbarrier_arrive(
+                leader_pair_p_source_ready_dsmem_mbar,
+                count=1,
+                scope=prims.MemScope.CLUSTER,
+                relaxed=True,
+            )
         if warp_rebase:
             pv_done_li_idx = stream_li_idx - ctm.Int32(1)
             pv_done_slot = pv_done_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
