@@ -364,12 +364,12 @@ class TestIngressPointReporter:
 class TestArchitecturePrivacy:
     """Verify the initial wire payload never contains an unknown raw name."""
 
-    def test_background_reporter_hashes_unknown_architecture(self, reporter_session):
+    def test_background_reporter_hashes_unknown_architecture(self, reporter_session: None) -> None:
         private_architecture = "InternalCustomerModelForCausalLM"
         pretrained_config = SimpleNamespace(architectures=[private_architecture])
         captured = {}
 
-        def fake_send(payload):
+        def fake_send(payload: dict[str, object]) -> None:
             captured.update(payload)
 
         stop_event = threading.Event()

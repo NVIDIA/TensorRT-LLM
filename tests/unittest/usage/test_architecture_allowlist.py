@@ -20,18 +20,14 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm.usage.architecture_allowlist import (
-    ARCHITECTURE_ALLOWLIST_CONTENT_SHA256,
-    ARCHITECTURE_ALLOWLIST_FORMAT_VERSION,
-    PUBLIC_HF_ARCHITECTURES,
-)
+from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
 
 pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_allowlist_is_synchronized_with_public_model_catalogs():
+def test_allowlist_is_synchronized_with_public_model_catalogs() -> None:
     """The checked-in allowlist must be regenerated when public catalogs change."""
     result = subprocess.run(
         [
@@ -48,9 +44,10 @@ def test_allowlist_is_synchronized_with_public_model_catalogs():
     assert result.returncode == 0, result.stderr
 
 
-def test_allowlist_metadata_and_entries_are_well_formed():
-    """Runtime data is versioned, content-addressed, and exact-match safe."""
-    assert ARCHITECTURE_ALLOWLIST_FORMAT_VERSION == 1
-    assert len(ARCHITECTURE_ALLOWLIST_CONTENT_SHA256) == 64
+def test_allowlist_entries_are_well_formed() -> None:
+    """Runtime entries are valid schema-bounded identifiers."""
     assert PUBLIC_HF_ARCHITECTURES
-    assert all(name.isidentifier() and name.strip() == name for name in PUBLIC_HF_ARCHITECTURES)
+    assert all(
+        name.isidentifier() and name.strip() == name and len(name) <= 256
+        for name in PUBLIC_HF_ARCHITECTURES
+    )

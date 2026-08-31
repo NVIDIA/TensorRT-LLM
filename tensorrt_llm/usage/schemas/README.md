@@ -103,11 +103,11 @@ fails earlier can send a terminal report without an initial report.
 
 `architectureClassName` and `architectureClassHash` are mutually exclusive.
 Telemetry reports an architecture in plaintext only when it exactly matches a
-name in `tensorrt_llm/usage/architecture_allowlist.py`. Unknown names are not
-logged or added to the payload; the hash field contains
-`"sha256:" + SHA-256("trtllm-architecture-class-v1\\0" + UTF-8(name))` so
-recurring unknown architectures can be grouped without transmitting their
-free-form names.
+name in `tensorrt_llm/usage/architecture_allowlist.py`. The raw unknown name is
+neither logged nor added to the payload; the hash field contains `"sha256:"`
+followed by SHA-256 over `"trtllm-architecture-class-v1"`, one NUL byte, and the
+UTF-8 architecture name. This allows recurring unknown architectures to be
+grouped without transmitting their free-form names.
 
 The plural Hugging Face `architectures` field uses its first item, matching the
 model loader's selection semantics; later items are ignored. Legacy singular
@@ -124,9 +124,9 @@ python3 scripts/update_telemetry_architecture_allowlist.py
 python3 scripts/update_telemetry_architecture_allowlist.py --check
 ```
 
-The generated module records a format version and content digest. Custom or
-externally registered architecture names are deliberately absent until they
-are reviewed and represented in a public source.
+The synchronization test compares the complete generated module with those
+sources. Custom or externally registered architecture names are deliberately
+absent until they are reviewed and represented in a public source.
 
 #### Aggregate LLM lifecycle counters
 
