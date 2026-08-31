@@ -1083,12 +1083,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 )
 
     def prepare_for_spec_decode(self, kv_lens: torch.Tensor):
-        # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits, vendored at
-        # DeepGEMM@8b1392b) runs a native next_n >= 1 on sm100+: the scheduler
-        # decomposes next_n into atoms of <= 2, so no per-draft-token Q flatten /
-        # kv_lens / block_table expansion is needed on Blackwell for any MTP
-        # depth. sm90 still lacks native MTP support (seq_len 1/2 only) and must
-        # expand for max_draft_tokens > 1.
+        # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits) runs a native
+        # next_n >= 1 on sm100+: its scheduler tiles the query tokens into
+        # BLOCK_Q-sized blocks (num_q_blocks = ceil_div(num_q_tokens, BLOCK_Q)),
+        # so any MTP depth is handled without a per-draft-token Q flatten /
+        # kv_lens / block_table expansion on Blackwell. sm90 still lacks native
+        # MTP support (seq_len 1/2 only) and must expand for max_draft_tokens > 1.
         # TODO:
         # - Drop this sm90 branch (and the expanded buffers) once
         #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
