@@ -102,6 +102,9 @@ class _LayerCache:
         self.intermediate_ssm = torch.zeros(
             slots, t_max, h, v, k, dtype=torch.float32, device=device
         )
+        # This double drives the sequential-verify path, not the KDA
+        # fused-replay path, so it has no kda_* replay caches.
+        self.has_kda_replay_caches = False
 
 
 def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -> SimpleNamespace:
@@ -143,7 +146,7 @@ def _prefill_metadata(
 
 
 @torch.no_grad()
-def test_kda_fused_prefill_matches_separate_projections():
+def test_kda_prefill_matches_reference():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
@@ -165,23 +168,26 @@ def test_kda_fused_prefill_matches_separate_projections():
 
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
+    reference._build_mtp_conv_weights()
     runtime.finalize_decode_weights()
-    assert runtime._qkvg_proj_weight is not None
-    assert runtime._bfa_proj_weight is not None
 
     slots = 4
     slot_indices = torch.tensor([2, 0], device=device, dtype=torch.long)
     cu_seqlens = torch.tensor([0, 3, 5], device=device, dtype=torch.long)
     hidden_states = torch.randn(5, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
 
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     expected = reference(hidden_states, _prefill_metadata(expected_cache, slot_indices, cu_seqlens))
 
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    actual_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     actual = runtime(hidden_states, _prefill_metadata(actual_cache, slot_indices, cu_seqlens))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
@@ -220,15 +226,19 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
     slots = batch + 2
     slot_indices = torch.tensor([2, 0, 4], device=device, dtype=torch.long)
     hidden_states = torch.randn(batch, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
 
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     expected = reference(hidden_states, _decode_metadata(expected_cache, slot_indices))
 
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    actual_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     with with_multi_stream(True):
         actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
 
@@ -256,7 +266,7 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
     torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     slots = batch + 2  # non-trivial slot mapping
-    cache = _LayerCache(slots, 3 * dim, w, h, lin["head_dim"], lin["head_dim"], t_steps, device)
+    cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
 
     # Random-but-fixed starting state and inputs.

@@ -146,7 +146,13 @@ class DFlashSpecMetadata(SpecMetadata):
     def maybe_capture_hidden_states(
         self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
     ) -> None:
-        """Capture hidden states from a target model layer into the buffer."""
+        """Capture hidden states from a target model layer into the buffer.
+
+        The ``residual`` convention is model-specific: Qwen3/Llama-style callers
+        pass the pre-add pair and this folds them, while K3 hands in an
+        already-mixed aggregated stream value and passes ``residual=None``
+        (see the DSpark tap in ``modeling_kimi_linear.py``).
+        """
         if self.captured_hidden_states is None:
             return
         i = self._layer_to_idx.get(layer_id)
@@ -239,8 +245,12 @@ class DFlashWorker(SpecWorkerBase):
                 f"DFlash: acceptance-statistics recording enabled -> {self._accept_stats.path}"
             )
 
+        # type(self), not a literal: DSparkWorker does not override
+        # __init__, so a hardcoded name reports the base class and the log
+        # cannot evidence which worker a run actually used.
         logger.info(
-            f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
+            f"{type(self).__name__} initialized with "
+            f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
 
     @property
@@ -314,11 +324,12 @@ class DFlashWorker(SpecWorkerBase):
             self.max_draft_len + 1
         )
         # what the draft forward actually computes
-        self._compute_block_size = self.max_draft_len + 1
-        if self.max_draft_len + 1 > self._resolved_block_size:
+        self._compute_block_size = self._draft_block_width(draft_model)
+        if self._compute_block_size > self._resolved_block_size:
+            slack = self._compute_block_size - self.max_draft_len
             raise ValueError(
                 f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
-                f"Lower max_draft_len to at most {self._resolved_block_size - 1}."
+                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
                 f"Current max_draft_len={self.max_draft_len}."
             )
 
@@ -698,13 +709,13 @@ class DFlashWorker(SpecWorkerBase):
 
                 # Gather K logits per gen request from the block outputs.
                 # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
-                # Plain DFlash reads mask slots 1..K; dspark shift_label reads
-                # slots 0..K-1 (see dflash_draft_slot_ids).
+                # Which block slots carry them is a drafter-family convention,
+                # resolved through _draft_slot_ids.
                 block_size = self._compute_block_size
-                shift_label = getattr(draft_model, "_dspark_shift_label", False)
-                gen_gather_ids = dflash_draft_slot_ids(
-                    num_gens, block_size, K, shift_label, device="cuda"
-                )
+                gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
+                # Shields only the last request: at block_size == K with
+                # shift_label off, slots run 1..K, so every request reads the
+                # next one's slot 0 and the last overruns. Degrades, never raises.
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
                 gen_logits = draft_model.logits_processor(
@@ -714,12 +725,9 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                # DSpark Markov head: add the greedy-chained intra-block
-                # logit bias before sampling (no-op for plain DFlash).
-                if getattr(draft_model, "has_markov_head", False):
-                    gen_logits = self._apply_dspark_markov_bias(
-                        draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
-                    )
+                gen_logits = self._refine_block_logits(
+                    draft_model, gen_logits, inputs, spec_metadata
+                )
 
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
@@ -791,60 +799,43 @@ class DFlashWorker(SpecWorkerBase):
             "next_new_tokens": next_new_tokens,
         }
 
-    def _apply_dspark_markov_bias(
+    def _draft_block_width(self, draft_model) -> int:
+        """Block slots the draft forward must compute for K draft tokens.
+
+        Plain DFlash reads slots 1..K, so slot 0 is pure overhead and the
+        forward needs K+1. Families whose slot convention differs override
+        this alongside :meth:`_draft_slot_ids` — the two must agree, since
+        the width bounds the slots the gather is allowed to name.
+        """
+        return self.max_draft_len + 1
+
+    def _draft_slot_ids(
+        self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
+    ) -> torch.Tensor:
+        """Block-output slots whose hidden states produce the K draft logits.
+
+        Plain DFlash uses the K2.7 convention: mask slots 1..K. Drafter
+        families with another convention override this — see
+        :meth:`DSparkWorker._draft_slot_ids` for the shift_label
+        variant, which reads slots 0..K-1 instead.
+        """
+        return dflash_draft_slot_ids(num_gens, block_size, num_draft_tokens, False, device="cuda")
+
+    def _refine_block_logits(
         self,
         draft_model,
         gen_logits: torch.Tensor,
-        first_prev_tokens: torch.Tensor,
+        inputs: dict,
         spec_metadata,
     ) -> torch.Tensor:
-        """Apply the dspark vanilla-Markov intra-block bias to block logits.
+        """Refine the block logits between the draft forward and sampling.
 
-        Reference (DeepSpec VanillaMarkov.sample_block_tokens, temperature 0):
-        step i adds bias = markov_w2 @ markov_w1[prev_i] to the shared-lm_head
-        logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
-        is the greedy token from step i-1's biased logits. Greedy per-position
-        argmax of the returned logits therefore reproduces the reference
-        sampled chain; the rejection-sampling path samples from the same
-        biased distributions (proposal conditioned on the greedy chain).
-
-        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
-        to this rank's contiguous shard and chaining through the TP-aware
-        global argmax.
+        Plain DFlash proposes the backbone's logits unchanged. Drafter
+        families carrying extra heads override this — see
+        :meth:`DSparkWorker._refine_block_logits` for the Markov
+        intra-block bias.
         """
-        if self._d2t is not None:
-            raise NotImplementedError(
-                "DSpark Markov head requires a shared draft/target vocab "
-                "(d2t vocab mapping is not supported)."
-            )
-        full_vocab = draft_model.markov_w2.shape[0]
-        shard = gen_logits.shape[-1]
-        vocab_slice = None
-        if shard != full_vocab:
-            mapping = self.mapping
-            if (
-                mapping is None
-                or getattr(mapping, "enable_attention_dp", False)
-                or shard * mapping.tp_size != full_vocab
-            ):
-                raise NotImplementedError(
-                    f"DSpark Markov head: draft logits width {shard} does not "
-                    f"match the drafter vocab {full_vocab} and is not a plain "
-                    "TP column shard of it."
-                )
-            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
-
-        def argmax_fn(step_logits):
-            # Full-vocab token ids (TP-aware when sharded); tokens stay in
-            # draft-vocab space, which is what markov_w1 indexes.
-            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
-
-        return draft_model.apply_markov_chain_logits(
-            gen_logits,
-            first_prev_tokens,
-            argmax_fn=argmax_fn,
-            vocab_slice=vocab_slice,
-        )
+        return gen_logits
 
     def prepare_1st_drafter_inputs(
         self,
