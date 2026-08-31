@@ -38,6 +38,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
     TorchCompileConfig)
 # isort: on
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -505,6 +506,74 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "TestLlama3_1_8BInstruct::test_eagle3",
                 acceptance_length,
             )
+
+    @skip_pre_hopper
+    def test_eagle3_one_model_min_p_is_greedy_at_one(self):
+        """A2: min_p == 1.0 keeps only the argmax, so it must reproduce greedy exactly.
+
+        0 < min_p < 1 implies sampling, which leaves no deterministic output to diff --
+        so this is the only exact end-to-end assertion the feature admits, and it covers
+        the whole path: admission, the buffer fill, the expanded layout and the kernel.
+        """
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol for gold is",
+            "The largest planet in the solar system is",
+        ]
+        with LLM(model=self.MODEL_PATH,
+                 max_batch_size=len(prompts),
+                 max_seq_len=1024,
+                 disable_overlap_scheduler=True,
+                 cuda_graph_config=None,
+                 kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                               dtype="auto"),
+                 speculative_config=Eagle3DecodingConfig(
+                     max_draft_len=4,
+                     speculative_model=eagle_model_dir,
+                     eagle3_one_model=True,
+                     use_rejection_sampling=True,
+                     advanced_sampling_mode=AdvancedSamplingMode.UNIVERSAL,
+                 )) as llm:
+            min_p_one = [
+                out.outputs[0].token_ids for out in llm.generate(
+                    prompts,
+                    SamplingParams(
+                        temperature=1.0, min_p=1.0, seed=7, max_tokens=32))
+            ]
+            greedy = [
+                out.outputs[0].token_ids for out in llm.generate(
+                    prompts, SamplingParams(temperature=0.0, max_tokens=32))
+            ]
+        assert min_p_one == greedy
+
+    @skip_pre_hopper
+    def test_eagle3_one_model_min_p_requires_universal_mode(self):
+        """The admission guard this ticket narrows rather than removes.
+
+        Every mode other than UNIVERSAL leaves the min_p buffers at their neutral
+        sentinel, so accepting the request would drop the filter silently. Rejecting is
+        the only honest answer, and the message has to name the fix.
+        """
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        with LLM(model=self.MODEL_PATH,
+                 max_batch_size=1,
+                 max_seq_len=1024,
+                 disable_overlap_scheduler=True,
+                 cuda_graph_config=None,
+                 kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                               dtype="auto"),
+                 speculative_config=Eagle3DecodingConfig(
+                     max_draft_len=4,
+                     speculative_model=eagle_model_dir,
+                     eagle3_one_model=True,
+                     use_rejection_sampling=True,
+                 )) as llm:
+            with pytest.raises(Exception, match="min_p requires"):
+                llm.generate(["The capital of France is"],
+                             SamplingParams(temperature=0.8,
+                                            min_p=0.05,
+                                            max_tokens=8))
 
     @skip_pre_hopper
     def test_eagle3_sa(self):
