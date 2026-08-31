@@ -52,6 +52,7 @@ import cutlass.torch as cutlass_torch
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+# TODO: runnable once the quantized-dense PR in this series adds the imported kernel.
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.rubin import dense_gemm_persistent as kernel_module
 except (ModuleNotFoundError, ImportError):

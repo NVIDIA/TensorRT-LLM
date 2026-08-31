@@ -80,9 +80,10 @@ def test_expected_arch_is_known_to_the_tmem_allocator(arch):
     get_max = getattr(tmem, "get_max_tmem_alloc_cols", None)
     if get_max is None:
         pytest.skip("cutlass build predates get_max_tmem_alloc_cols")
+    # TODO: remove this guard once the CI image ships a Rubin-capable CuTe DSL.
     try:
         import cutlass.utils.rubin_helpers  # noqa: F401
     except ImportError:
-        pytest.skip("installed cutlass-dsl predates Rubin support (needs 4.8+)")
+        pytest.skip("installed cutlass-dsl predates Rubin support")
 
     assert get_max(arch) > 0
