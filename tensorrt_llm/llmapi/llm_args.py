@@ -5233,7 +5233,7 @@ class TorchCompileConfig(StrictBaseModel):
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
-    compile_only_context_and_mixed_graphs: bool = Field(
+    compile_only_piecewise_graphs: bool = Field(
         default=False,
         description="Compile only context and mixed-batch execution graphs. "
         "When enabled, generation-only and auxiliary kernel warmup forwards "

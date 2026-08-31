@@ -745,10 +745,10 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_enabled = bool(self.torch_compile_config is not None)
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
-        compile_only_context_and_mixed_graphs = (
-            self.torch_compile_config.compile_only_context_and_mixed_graphs
+        compile_only_piecewise_graphs = (
+            self.torch_compile_config.compile_only_piecewise_graphs
             if self.torch_compile_config is not None else TorchCompileConfig.
-            model_fields['compile_only_context_and_mixed_graphs'].default)
+            model_fields['compile_only_piecewise_graphs'].default)
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
         torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
@@ -759,8 +759,7 @@ class PyTorchModelEngine(ModelEngine):
             'max_num_streams'].default
 
         self._torch_compile_enabled = torch_compile_enabled
-        self._compile_only_context_and_mixed_graphs = (
-            compile_only_context_and_mixed_graphs)
+        self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
         torch_compile_bypass_state = {"active": False}
         self._torch_compile_bypass_state = torch_compile_bypass_state
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
@@ -815,7 +814,7 @@ class PyTorchModelEngine(ModelEngine):
                         self.model.model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
-                    if compile_only_context_and_mixed_graphs:
+                    if compile_only_piecewise_graphs:
                         compiled_decoder = self.model.model
                         compiled_forward = compiled_decoder.forward
                         logger.info(
@@ -839,10 +838,10 @@ class PyTorchModelEngine(ModelEngine):
 
                         compiled_decoder.forward = phase_selective_forward
                 elif callable(apply_llm_torch_compile):
-                    if compile_only_context_and_mixed_graphs:
+                    if compile_only_piecewise_graphs:
                         raise ValueError(
                             "TorchCompileConfig."
-                            "compile_only_context_and_mixed_graphs=True is "
+                            "compile_only_piecewise_graphs=True is "
                             "only supported for DecoderModelForCausalLM models."
                         )
                     # TODO: Move this contract to MultimodalModelMixin once
@@ -851,10 +850,10 @@ class PyTorchModelEngine(ModelEngine):
                     apply_llm_torch_compile(backend=self._torch_compile_backend,
                                             fullgraph=torch_compile_fullgraph)
                 else:
-                    if compile_only_context_and_mixed_graphs:
+                    if compile_only_piecewise_graphs:
                         raise ValueError(
                             "TorchCompileConfig."
-                            "compile_only_context_and_mixed_graphs=True is "
+                            "compile_only_piecewise_graphs=True is "
                             "only supported for DecoderModelForCausalLM models."
                         )
                     self.model = torch.compile(
@@ -1348,7 +1347,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextmanager
     def _without_torch_compile(self):
-        if not self._compile_only_context_and_mixed_graphs:
+        if not self._compile_only_piecewise_graphs:
             yield
             return
         state = self._torch_compile_bypass_state
