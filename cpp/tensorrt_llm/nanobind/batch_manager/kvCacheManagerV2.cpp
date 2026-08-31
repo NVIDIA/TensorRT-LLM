@@ -2288,6 +2288,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_and_reset_ssm_snapshot_iteration_stats",
             [](kv::KvCacheManager& self)
             { return castSsmSnapshotIterationStatsByLifeCycle(self.getAndResetSsmSnapshotIterationStats()); })
+        .def("record_request_suspended", &kv::KvCacheManager::recordRequestSuspended)
+        .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed)
+        .def(
+            "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
         .def(
             "get_and_reset_iteration_peak_block_stats",
             [](kv::KvCacheManager& self, int cacheLevel)
