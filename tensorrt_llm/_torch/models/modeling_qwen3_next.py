@@ -23,7 +23,7 @@
 import copy
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 import torch
 
@@ -36,8 +36,6 @@ from transformers import Qwen3NextConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.moe.fused_shared_expert import \
-    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
@@ -52,9 +50,11 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.low_m_gemm import apply_direct_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_shared_expert import PendingSharedExpertGate, fused_sigmoid_gate_mul_add
 from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                              RenormalizeMoeRoutingMethod,
                              RenormalizeNaiveMoeRoutingMethod,
@@ -169,6 +169,17 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # At decode this is a one-row GEMM against a [num_experts, hidden]
+        # weight, the regime where cuBLAS splits K to manufacture parallelism
+        # and pairs the GEMM with a separate reduce kernel. Take the low-m
+        # direct kernel on the shapes it is measured to win on; it is the same
+        # BF16-in / FP32-accumulate / BF16-out contract, so the routing decision
+        # is unchanged. Only when out_dtype matches the input, since that kernel
+        # emits the input dtype and cannot honour an out_dtype cast.
+        if self.out_dtype == hidden_states.dtype:
+            logits = apply_direct_low_m_gemm(hidden_states, self.weight, None)
+            if logits is not None:
+                return logits
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
@@ -307,7 +318,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
-    ) -> torch.Tensor:
+        defer_shared_expert_gate: bool = False,
+    ) -> Union[torch.Tensor, PendingSharedExpertGate]:
+        """Route the token through the experts and the shared expert.
+
+        With `defer_shared_expert_gate` the caller takes the shared-expert
+        combine unevaluated whenever no collective needs the gated sum first,
+        so that a consumer can fold it into its own kernel; see
+        `PendingSharedExpertGate`.
+        """
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -371,6 +390,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             final_hidden_states = self.allreduce(
                 final_hidden_states, all_reduce_params=all_reduce_params)
+        elif defer_shared_expert_gate:
+            # Nothing here consumes the gated sum, so hand the operands over
+            # and let the caller's next kernel apply the gate.
+            return PendingSharedExpertGate(
+                final_hidden_states.view(orig_shape),
+                shared_expert_gate_logits,
+                shared_expert_output.view(orig_shape),
+            )
         else:
             final_hidden_states = fused_sigmoid_gate_mul_add(
                 final_hidden_states, shared_expert_gate_logits,
@@ -401,7 +428,10 @@ class _DenseMlpAdapter(nn.Module):
         all_reduce_params=None,
         do_finalize=True,
         lora_params=None,
+        defer_shared_expert_gate=False,
     ):
+        # A dense MLP has no shared expert, so there is never a gate to defer.
+        del defer_shared_expert_gate
         all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
                                if attn_metadata is not None else None)
         return self.mlp(

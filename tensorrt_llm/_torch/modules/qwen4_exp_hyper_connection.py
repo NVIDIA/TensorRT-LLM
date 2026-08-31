@@ -23,9 +23,12 @@ This is a TRT-LLM reimplementation of the sglang reference
 TRT-LLM's existing Mamba Triton kernel with FP32 ``1 + delta_weight``
 semantics. CUDA execution additionally fuses the gate/stream reduction,
 residual injection, and the layer-internal combine-to-next-norm boundary while
-preserving the reference BF16 materialization point. The checkpoint stores the
-Qwen4-Exp variant with ``hc_per_branch_norm=True`` (a per-element ``[10240]``
-grouped-RMSNorm weight, grouped by ``hidden_size``).
+preserving the reference BF16 materialization point. At decode row counts the
+mix-up projection is folded into the gate/stream reduction as well; that fusion
+is the one place the materialization point moves, since the gate sigmoid is
+then taken on the FP32 accumulator rather than on a BF16 projection output.
+The checkpoint stores the Qwen4-Exp variant with ``hc_per_branch_norm=True``
+(a per-element ``[10240]`` grouped-RMSNorm weight, grouped by ``hidden_size``).
 
 The checkpoint keeps ``input_mix_weight_down`` and ``block_inject_weight``
 separate. At load time they are packed into one 16-row-aligned replicated
@@ -37,7 +40,7 @@ all-reduce happens between ``mix`` and ``combine`` on the block output).
 """
 
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -46,11 +49,12 @@ from torch import nn
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
+from .fused_shared_expert import PendingSharedExpertGate
 from .linear import Linear
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
 from .qwen4_exp_hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu
 
-__all__ = ["GroupedRMSNorm", "Qwen4ExpHyperConnection"]
+__all__ = ["GroupedRMSNorm", "HCBlockOutput", "HCResidual", "Qwen4ExpHyperConnection"]
 
 _HC_DIRECT_SKINNY_GEMM_ENV = "TRTLLM_QWEN4_EXP_HC_DIRECT_SKINNY_GEMM"
 _HC_FUSED_MIX_ENV = "TRTLLM_QWEN4_EXP_HC_FUSED_MIX"
@@ -150,6 +154,20 @@ class GroupedRMSNorm(TritonRMSNorm):
 # not retained across the wrapped block; the optional middle slot preserves the
 # tuple contract used by existing callers while allowing its storage to die.
 HCResidual = Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+
+# What a wrapped block hands back to ``combine``. A MoE block may hand back its
+# shared-expert gate unevaluated so the combine kernel applies it while it is
+# already streaming the routed output.
+HCBlockOutput = Union[torch.Tensor, PendingSharedExpertGate]
+
+
+def _block_output_operands(
+    block_output: HCBlockOutput,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Split a block output into ``(injected, shared_expert, gate_logits)``."""
+    if isinstance(block_output, PendingSharedExpertGate):
+        return block_output.routed, block_output.shared, block_output.gate_logits
+    return block_output, None, None
 
 
 class Qwen4ExpHyperConnection(nn.Module):
@@ -292,12 +310,15 @@ class Qwen4ExpHyperConnection(nn.Module):
             -2
         )
 
-    def _packed_down_and_injection(self, normed: torch.Tensor) -> torch.Tensor:
+    def _packed_down_and_injection(self, normed: torch.Tensor) -> Tuple[torch.Tensor, bool]:
         """Run the packed HC down/injection projection.
 
         The direct kernel is an opt-in decode optimization for CUDA-graph
         deployments. Its Python launch path is slower than cuBLAS, while graph
-        replay is about twice as fast for the production ``M=1`` shape.
+        replay is about twice as fast for the production ``M=1`` shape. It also
+        folds the mix gate's ``silu(x / hc_count)`` into its epilogue, so the
+        second element of the returned pair reports whether the low-rank prefix
+        is already activated and the caller must skip its activation kernel.
         """
         projection = self.input_mix_weight_down_block_inject
         rows = normed.numel() // normed.shape[-1]
@@ -318,10 +339,13 @@ class Qwen4ExpHyperConnection(nn.Module):
         )
         if not direct_eligible:
             if runtime_weight.shape == weight.shape or rows < _HC_FUSED_LAYOUT_SLICE_MIN_ROWS:
-                return projection(normed)
-            return F.linear(normed, runtime_weight)
+                return projection(normed), False
+            return F.linear(normed, runtime_weight), False
 
-        from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import DirectTactic, run_direct_dense
+        from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+            DirectTactic,
+            run_direct_dense_silu_prefix,
+        )
         from ..flashinfer_utils import get_env_enable_pdl
 
         input_2d = normed.view(1, normed.shape[-1])
@@ -330,23 +354,38 @@ class Qwen4ExpHyperConnection(nn.Module):
             dtype=torch.bfloat16,
             device=normed.device,
         )
-        run_direct_dense(
+        run_direct_dense_silu_prefix(
             input_2d,
             runtime_weight.t(),
             output,
             get_env_enable_pdl(),
             DirectTactic(block_size=128, outputs_per_block=2, rows_per_block=1),
+            1.0 / self.hc_count,
+            self.hc_lowrank,
         )
-        return output.view(*normed.shape[:-1], runtime_weight.shape[0])
+        return output.view(*normed.shape[:-1], runtime_weight.shape[0]), True
 
     @staticmethod
-    def _fused_cuda_eligible(*tensors: torch.Tensor) -> bool:
+    def _fused_cuda_eligible(*tensors: Optional[torch.Tensor]) -> bool:
+        """Whether the fused CUDA kernels can take these operands.
+
+        ``None`` stands for an optional operand the caller does not have, which
+        constrains nothing.
+        """
         return all(
             tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and tensor.stride(-1) == 1
             for tensor in tensors
+            if tensor is not None
         )
+
+    @staticmethod
+    def _evaluated_block_output(block_output: HCBlockOutput) -> torch.Tensor:
+        """Materialize a deferred shared-expert gate for the unfused paths."""
+        if isinstance(block_output, PendingSharedExpertGate):
+            return block_output.evaluate()
+        return block_output
 
     def _mix_normed(
         self,
@@ -360,7 +399,7 @@ class Qwen4ExpHyperConnection(nn.Module):
             mixed, injection_logits = fused
             return mixed.to(self.params_dtype), (hyper_input, None, injection_logits)
         if self.use_combine:
-            packed = self._packed_down_and_injection(normed)
+            packed, gate_fused = self._packed_down_and_injection(normed)
             down = packed[..., : self.hc_lowrank]
             injection_logits = packed[
                 ...,
@@ -369,18 +408,109 @@ class Qwen4ExpHyperConnection(nn.Module):
         else:
             down = self.input_mix_weight_down(normed)
             injection_logits = None
-        if self._fused_cuda_eligible(down):
+            gate_fused = False
+        if gate_fused:
+            gate = down
+        elif self._fused_cuda_eligible(down):
             gate = hc_silu(down, hc)
         else:
             gate = F.silu(down / hc)
-        gate = self.input_mix_weight_up(gate)
-        if self._fused_cuda_eligible(normed, gate):
-            mixed = hc_gate_mix(normed, gate, hc)
-        else:
-            gate = torch.sigmoid(gate).unflatten(-1, (hc, hs))
-            mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
+        mixed = self._gated_stream_mix(normed, gate)
+        if mixed is None:
+            gate = self.input_mix_weight_up(gate)
+            if self._fused_cuda_eligible(normed, gate):
+                mixed = hc_gate_mix(normed, gate, hc)
+            else:
+                gate = torch.sigmoid(gate).unflatten(-1, (hc, hs))
+                mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
 
         return mixed.to(self.params_dtype), (hyper_input, None, injection_logits)
+
+    def _permuted_up_weight(self) -> Optional[torch.Tensor]:
+        """The mix-up weight in the stream-interleaved layout the gate kernel reads.
+
+        Materialized once on first use and cached. Returns ``None`` while a CUDA
+        graph is capturing, where the reorder (and its allocation) cannot run;
+        callers fall back to the unfused sequence for that call.
+        """
+        permuted = self._input_mix_weight_up_permuted_padded
+        if permuted is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            permuted = _permute_pad_up_weight(
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+                self.hc_lowrank + self.input_mix_lowrank_padding,
+            )
+            self._input_mix_weight_up_permuted_padded = permuted
+        return permuted
+
+    def _gated_stream_mix(
+        self,
+        normed: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Fuse the mix-up projection with the sigmoid-gated stream average.
+
+        The up projection is a decode-shaped ``[1, hc_lowrank] @ [hc_lowrank,
+        hc_count*hidden_size]`` GEMM whose ``hc_dim`` result is consumed only as
+        a sigmoid gate over the normalized streams. Running it through the
+        split-K kernel's gate epilogue sigmoids the FP32 accumulator in shared
+        memory and reduces over the streams there, so neither the ``hc_dim``
+        gate tensor nor a second kernel launch is materialized.
+
+        Returns ``None`` outside the fused kernel's decode band, leaving the
+        caller's unfused projection + gate/mix sequence to run instead.
+        """
+        hc_dim = self.hc_count * self.hidden_size
+        if not (
+            not torch.is_grad_enabled()
+            and gate.ndim == 2
+            and gate.shape[0] == 1
+            and normed.ndim == 2
+            and gate.dtype == torch.bfloat16
+            and normed.dtype == torch.bfloat16
+            and gate.is_cuda
+            and normed.is_cuda
+            and gate.stride(-1) == 1
+            and normed.is_contiguous()
+            # The epilogue reduces mma_m gate rows over hc_count streams per CTA.
+            and self.hc_count == 4
+            and hc_dim % 128 == 0
+            # TMA loads gate rows; their byte stride must be 16-byte aligned.
+            and gate.stride(0) % 8 == 0
+            and is_sm_100f()
+        ):
+            return None
+        permuted_up = self._permuted_up_weight()
+        # The padded fused-mix layout widens the low-rank block; only a gate of
+        # the permuted weight's own width is the same GEMM.
+        if permuted_up is None or permuted_up.shape[1] != gate.shape[-1]:
+            return None
+
+        from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+            default_tactic,
+            run_splitk_dense_gate,
+        )
+        from ..flashinfer_utils import get_env_enable_pdl
+
+        mixed = torch.empty(
+            (gate.shape[0], self.hidden_size),
+            dtype=normed.dtype,
+            device=normed.device,
+        )
+        run_splitk_dense_gate(
+            gate,
+            permuted_up.t(),
+            normed,
+            mixed,
+            get_env_enable_pdl(),
+            default_tactic(gate.shape[0], hc_dim, gate.shape[-1]),
+            1.0 / self.hc_count,
+            self.hc_count,
+        )
+        return mixed
 
     def _fused_mix_normed(
         self,
@@ -414,17 +544,9 @@ class Qwen4ExpHyperConnection(nn.Module):
         ):
             return None
 
-        permuted_up = self._input_mix_weight_up_permuted_padded
+        permuted_up = self._permuted_up_weight()
         if permuted_up is None:
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            permuted_up = _permute_pad_up_weight(
-                up_weight,
-                self.hc_count,
-                self.hidden_size,
-                padded_lowrank,
-            )
-            self._input_mix_weight_up_permuted_padded = permuted_up
+            return None
 
         from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
             SplitKTactic,
@@ -504,29 +626,38 @@ class Qwen4ExpHyperConnection(nn.Module):
         normed = self._normed_bundle(hyper_input)
         return self._mix_normed(hyper_input, normed)
 
-    def combine(self, block_output: torch.Tensor, residual: HCResidual) -> torch.Tensor:
+    def combine(self, block_output: HCBlockOutput, residual: HCResidual) -> torch.Tensor:
         """2560 -> 10240. Injects ``block_output`` into the 4 residual streams
         with a learned per-stream sigmoid gate."""
         assert self.use_combine, "combine() on a mix-only Hyper-Connection"
         hc, hs = self.hc_count, self.hidden_size
         hyper_input, _, injection_logits = residual
+        injected, shared_expert, shared_expert_gate = _block_output_operands(block_output)
         assert hyper_input.shape[-1] == hc * hs
-        assert block_output.shape[-1] == hs
+        assert injected.shape[-1] == hs
         # Empty batch: pass the (untouched) bundle through, matching the reference.
-        if block_output.shape[0] == 0:
+        if injected.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
         assert injection_logits is not None
-        if self._fused_cuda_eligible(hyper_input, block_output, injection_logits):
-            return hc_combine(hyper_input, block_output, injection_logits, hc)
+        if self._fused_cuda_eligible(hyper_input, injected, injection_logits, shared_expert):
+            return hc_combine(
+                hyper_input,
+                injected,
+                injection_logits,
+                hc,
+                shared_expert,
+                shared_expert_gate,
+            )
+        block = self._evaluated_block_output(block_output)
         streams = hyper_input.unflatten(-1, (hc, hs))
         inject_gate = 2.0 * torch.sigmoid(injection_logits / hc)
-        injection = block_output.unsqueeze(-2) * inject_gate.unsqueeze(-1)
+        injection = block.unsqueeze(-2) * inject_gate.unsqueeze(-1)
         return (streams + injection).flatten(-2).to(self.params_dtype)
 
     def combine_and_mix(
         self,
-        block_output: torch.Tensor,
+        block_output: HCBlockOutput,
         previous_residual: HCResidual,
     ) -> Tuple[torch.Tensor, torch.Tensor, HCResidual]:
         """Combine a preceding block and prepare this HC block's input.
@@ -536,30 +667,35 @@ class Qwen4ExpHyperConnection(nn.Module):
         where no PLE update or collective intervenes.
         """
         hyper_input, _, injection_logits = previous_residual
+        injected, shared_expert, shared_expert_gate = _block_output_operands(block_output)
         assert injection_logits is not None
-        if block_output.shape[0] == 0:
+        if injected.shape[0] == 0:
             mixed, residual = self.mix(hyper_input)
             return hyper_input, mixed, residual
         if self._fused_cuda_eligible(
             hyper_input,
-            block_output,
+            injected,
             injection_logits,
             self.hc_norm.weight,
+            shared_expert,
         ):
             hidden_states, normed = hc_combine_norm(
                 hyper_input,
-                block_output,
+                injected,
                 injection_logits,
                 self.hc_norm.weight,
                 self.hc_norm.variance_epsilon,
                 self.hc_count,
+                shared_expert,
+                shared_expert_gate,
             )
         else:
+            block = self._evaluated_block_output(block_output)
             hc, hs = self.hc_count, self.hidden_size
             streams = hyper_input.unflatten(-1, (hc, hs))
             inject_gate = 2.0 * torch.sigmoid(injection_logits / hc)
             hidden_states = (
-                (streams + block_output.unsqueeze(-2) * inject_gate.unsqueeze(-1))
+                (streams + block.unsqueeze(-2) * inject_gate.unsqueeze(-1))
                 .flatten(-2)
                 .to(self.params_dtype)
             )

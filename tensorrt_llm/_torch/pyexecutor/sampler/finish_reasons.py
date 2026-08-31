@@ -30,6 +30,7 @@ from tensorrt_llm.bindings.executor import FinishReason
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest
+from .finish_reasons_kernels import MAX_FUSED_ELEMENTS_PER_REQUEST, fused_write_finish_reasons
 from .sampler_common import int_tensor
 
 __all__ = ["FinishReasonsHandler"]
@@ -645,6 +646,32 @@ class FinishReasonsHandler:
             )
         return num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only
 
+    def _can_fuse_finish_reasons(
+        self,
+        *,
+        seq_slots: torch.Tensor,
+        new_tokens: torch.Tensor,
+        stop_word_indices: torch.Tensor | None,
+        first_finish_reasons: torch.Tensor | None,
+    ) -> bool:
+        """Check whether the step's reasons reduce to the fused end-id/max-length pair.
+
+        Stop words need the past-token window and beam search needs the
+        first-reason latch, so both keep the tensor-op path.
+        """
+        if stop_word_indices is not None or first_finish_reasons is not None:
+            return False
+        if seq_slots.numel() == 0 or not seq_slots.is_cuda:
+            return False
+        if self._max_tokens * self._max_beam_width > MAX_FUSED_ELEMENTS_PER_REQUEST:
+            return False
+        # The tensor-op path broadcasts the per-slot values across the store's
+        # own (max_tokens, beam_width); the kernel indexes new_tokens with them
+        # directly, so the layouts have to agree.
+        return new_tokens.shape[0] == self._max_tokens and (
+            new_tokens.shape[2] == self._max_beam_width
+        )
+
     @nvtx_range("_write_finish_reasons")
     def _write_finish_reasons(
         self,
@@ -685,9 +712,31 @@ class FinishReasonsHandler:
         # Seq Slots should be on the same device as new_tokens
         assert seq_slots.device == new_tokens.device
         assert seq_lens.device == new_tokens.device
-        tokens = new_tokens[:, seq_slots]
 
         store = self.store
+        if self._can_fuse_finish_reasons(
+            seq_slots=seq_slots,
+            new_tokens=new_tokens,
+            stop_word_indices=stop_word_indices,
+            first_finish_reasons=first_finish_reasons,
+        ):
+            fused_write_finish_reasons(
+                finish_reasons=store.finish_reasons_cuda,
+                new_tokens=new_tokens,
+                seq_slots=seq_slots,
+                seq_lens=seq_lens,
+                max_lengths=store.max_lengths_cuda,
+                end_ids=store.end_ids_cuda,
+                max_tokens=self._max_tokens,
+                beam_width=self._max_beam_width,
+                not_finished_value=FinishReason.NOT_FINISHED.value,
+                length_value=FinishReason.LENGTH.value,
+                end_id_value=FinishReason.END_ID.value,
+            )
+            return
+
+        tokens = new_tokens[:, seq_slots]
+
         finish_reasons = store.finish_reasons_cuda
 
         # we need to fill with NOT_FINISHED so we can differentiate between

@@ -15,6 +15,11 @@ Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
 to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
 ``A[M, K] @ B[K, N]`` problem is swapped internally, so tile dimensions below
 use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
+
+A split needs whole CTA K tiles per rank, so it requires ``K`` to be a multiple
+of ``_CTA_K``. Unsplit (``split_k=1``), ``K`` is unconstrained: the TMA load
+zero-fills the residual tile, which then contributes nothing to the FP32
+accumulation.
 """
 
 from __future__ import annotations
@@ -165,7 +170,11 @@ def validate_tactic(
         raise ValueError(f"this low-M policy requires 1 <= M <= {MAX_M}, got {m}")
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
-    if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
+    if k <= 0:
+        raise ValueError(f"K must be positive, got {k}")
+    # A K tail is only representable unsplit: every cluster rank of a split must
+    # own the same number of whole CTA K tiles.
+    if tactic.split_k > 1 and (k % _CTA_K or (k // _CTA_K) % tactic.split_k):
         raise ValueError(
             f"K={k} with CTA_K={_CTA_K} does not divide evenly across split_k={tactic.split_k}"
         )
@@ -230,7 +239,7 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
             mma_m = 128 if k <= 1024 and m <= 24 else 64
             requested_split = 1
 
-    if k <= 4 * _CTA_K:
+    if k <= 4 * _CTA_K or k % _CTA_K:
         requested_split = 1
     split_k = next(
         split_k
@@ -579,8 +588,12 @@ class SplitKDenseGemmKernel:
         else:
             cute.arch.barrier()
 
-        # Host validation guarantees an equal, tail-free K partition.
-        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        if cutlass.const_expr(self.split_k == 1):
+            # The last tile may run past K; the TMA load zero-fills it.
+            k_tile_count = cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k)
+        else:
+            # Host validation guarantees an equal, tail-free K partition.
+            k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
         k_tile_start = split_rank * k_tile_count
 
         if cutlass.const_expr(self.split_k > 1):

@@ -26,6 +26,8 @@ all three into one pass, writing into an optional output buffer or updating
 `final_hidden_states` in-place.
 """
 
+from typing import NamedTuple
+
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
@@ -154,3 +156,26 @@ def fused_sigmoid_gate_mul_add(
         num_stages=3,
     )
     return output
+
+
+class PendingSharedExpertGate(NamedTuple):
+    """A shared-expert combine that has been handed to its consumer unevaluated.
+
+    Carrying the three operands instead of their sum lets a consumer that reads
+    the routed output anyway apply the gate in its own prologue, which keeps
+    `_sigmoid_gate_mul_add_kernel` — a single-CTA pointwise pass over one row —
+    off the critical path entirely. A consumer that cannot absorb it calls
+    `evaluate()` and gets exactly what the MoE block would have returned.
+    """
+
+    routed: torch.Tensor
+    gate_logits: torch.Tensor
+    shared: torch.Tensor
+
+    def evaluate(self) -> torch.Tensor:
+        """Apply the gate with the standalone kernel.
+
+        Updates `routed` in place, which is what the MoE block does when it
+        evaluates the gate itself, so this is single-use.
+        """
+        return fused_sigmoid_gate_mul_add(self.routed, self.gate_logits, self.shared)

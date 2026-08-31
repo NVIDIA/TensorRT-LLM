@@ -12,12 +12,19 @@ select the best cuBLAS or low-M CuTe DSL implementation for each token count.
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
+
+#: Widest element block ``hc_combine_norm`` will ask for in one tile. 4096
+#: lanes is what the previous fixed 512-wide tiling already held in registers
+#: for a 2560-wide hidden size; wider rows fall back to tiling rather than
+#: growing per-thread state.
+_COMBINE_NORM_MAX_BLOCK = 4096
 
 
 def _pdl_enabled(rows: int) -> bool:
@@ -26,6 +33,67 @@ def _pdl_enabled(rows: int) -> bool:
     # parallelism on its own. Keep the shape-aware boundary used by the HC
     # low-latency path rather than regressing prefill or large IFB batches.
     return rows <= 16 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
+
+
+@triton.jit
+def _load_block_output(
+    block_ptr,
+    shared_expert_ptr,
+    shared_expert_gate_ptr,
+    row,
+    stride_block,
+    stride_shared_expert,
+    offsets_inner,
+    mask,
+    gate_shared_expert: tl.constexpr,
+):
+    """Load the block output a combine injects into the residual streams.
+
+    With ``gate_shared_expert`` the block pointer holds only the routed experts'
+    output and this adds the MoE block's shared-expert branch,
+    ``sigmoid(gate) * shared`` with one gate scalar per row. A combine reads
+    the routed output anyway, so folding the branch in costs one extra vector
+    load and removes the pointwise launch that would otherwise produce the sum.
+    """
+    block = tl.load(
+        block_ptr + row * stride_block + offsets_inner,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    if gate_shared_expert:
+        shared_expert = tl.load(
+            shared_expert_ptr + row * stride_shared_expert + offsets_inner,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.sigmoid(tl.load(shared_expert_gate_ptr + row).to(tl.float32))
+        # Round back to the routed tensor's dtype: that is where the separate
+        # shared-expert kernel materializes the sum before a combine reads it,
+        # so both paths inject exactly the same values.
+        block = (block + gate * shared_expert).to(block_ptr.dtype.element_ty).to(tl.float32)
+    return block
+
+
+def _check_shared_expert_branch(
+    block_output: torch.Tensor,
+    shared_expert_output: Optional[torch.Tensor],
+    shared_expert_gate_logits: Optional[torch.Tensor],
+) -> bool:
+    """Validate an optional shared-expert branch and report whether it is set."""
+    if shared_expert_output is None:
+        assert shared_expert_gate_logits is None, (
+            "shared_expert_gate_logits needs shared_expert_output"
+        )
+        return False
+    assert shared_expert_gate_logits is not None, (
+        "shared_expert_output needs shared_expert_gate_logits"
+    )
+    assert shared_expert_output.shape == block_output.shape
+    assert shared_expert_output.dtype == block_output.dtype
+    assert shared_expert_output.stride(1) == 1
+    assert shared_expert_gate_logits.numel() == block_output.shape[0]
+    assert shared_expert_gate_logits.is_contiguous()
+    return True
 
 
 @triton.jit
@@ -177,13 +245,17 @@ def _hc_combine_kernel(
     block_ptr,
     injection_ptr,
     output_ptr,
+    shared_expert_ptr,
+    shared_expert_gate_ptr,
     stride_residual,
     stride_block,
     stride_injection,
     stride_output,
+    stride_shared_expert,
     hidden_size: tl.constexpr,
     hc_count: tl.constexpr,
     block_size: tl.constexpr,
+    gate_shared_expert: tl.constexpr,
     launch_with_pdl: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
@@ -193,11 +265,17 @@ def _hc_combine_kernel(
 
     if launch_with_pdl:
         tl.extra.cuda.gdc_wait()
-    block = tl.load(
-        block_ptr + row * stride_block + offsets_inner,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
+    block = _load_block_output(
+        block_ptr,
+        shared_expert_ptr,
+        shared_expert_gate_ptr,
+        row,
+        stride_block,
+        stride_shared_expert,
+        offsets_inner,
+        mask,
+        gate_shared_expert,
+    )
     for stream in tl.static_range(hc_count):
         offset = stream * hidden_size + offsets_inner
         residual = tl.load(
@@ -222,8 +300,15 @@ def hc_combine(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     hc_count: int,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    shared_expert_gate_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fuse injection sigmoid, broadcast multiply, and residual addition."""
+    """Fuse injection sigmoid, broadcast multiply, and residual addition.
+
+    Passing the shared-expert pair means ``block_output`` carries only the
+    routed experts' output and the kernel completes the MoE block's
+    ``+ sigmoid(gate) * shared`` itself, one launch fewer.
+    """
     rows, hyper_hidden_size = residual.shape
     assert hyper_hidden_size % hc_count == 0
     hidden_size = hyper_hidden_size // hc_count
@@ -231,6 +316,9 @@ def hc_combine(
     assert injection_logits.shape == (rows, hc_count)
     assert residual.is_cuda
     assert residual.stride(1) == block_output.stride(1) == injection_logits.stride(1) == 1
+    gate_shared_expert = _check_shared_expert_branch(
+        block_output, shared_expert_output, shared_expert_gate_logits
+    )
     output = torch.empty_like(residual)
     block_size = 512
     grid = (rows, triton.cdiv(hidden_size, block_size))
@@ -241,13 +329,17 @@ def hc_combine(
             block_output,
             injection_logits,
             output,
+            shared_expert_output,
+            shared_expert_gate_logits,
             residual.stride(0),
             block_output.stride(0),
             injection_logits.stride(0),
             output.stride(0),
+            shared_expert_output.stride(0) if gate_shared_expert else 0,
             hidden_size=hidden_size,
             hc_count=hc_count,
             block_size=block_size,
+            gate_shared_expert=gate_shared_expert,
             launch_with_pdl=launch_with_pdl,
             launch_pdl=launch_with_pdl,
         )
@@ -260,8 +352,11 @@ def _(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     hc_count: int,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    shared_expert_gate_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     del block_output, injection_logits, hc_count
+    del shared_expert_output, shared_expert_gate_logits
     return torch.empty_like(residual)
 
 
@@ -273,17 +368,21 @@ def _hc_combine_norm_kernel(
     weight_ptr,
     output_ptr,
     normed_ptr,
+    shared_expert_ptr,
+    shared_expert_gate_ptr,
     stride_residual,
     stride_block,
     stride_injection,
     stride_output,
     stride_normed,
+    stride_shared_expert,
     hidden_size: tl.constexpr,
     hc_count: tl.constexpr,
     shared_weight: tl.constexpr,
     eps: tl.constexpr,
     block_size: tl.constexpr,
     padded_tiles: tl.constexpr,
+    gate_shared_expert: tl.constexpr,
     launch_with_pdl: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
@@ -301,11 +400,22 @@ def _hc_combine_norm_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    block = tl.load(
-        block_ptr + row * stride_block + offsets_inner,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
+    block = _load_block_output(
+        block_ptr,
+        shared_expert_ptr,
+        shared_expert_gate_ptr,
+        row,
+        stride_block,
+        stride_shared_expert,
+        offsets_inner,
+        mask,
+        gate_shared_expert,
+    )
+    # Issue the norm weight with the input loads even though it is only needed
+    # after the reduction below: that reduction is block-wide, and its barriers
+    # keep the compiler from hoisting the load, which would otherwise serialize
+    # a whole memory round-trip behind it.
+    weight = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0).to(tl.float32)
     injection = tl.load(injection_ptr + row * stride_injection + stream).to(tl.float32)
     injection = 2.0 * tl.sigmoid(injection / hc_count)
 
@@ -316,7 +426,6 @@ def _hc_combine_norm_kernel(
     output_fp32 = output.to(tl.float32)
     sum_squares = tl.sum(tl.sum(output_fp32 * output_fp32, axis=1), axis=0)
     reciprocal_rms = tl.rsqrt(sum_squares / hidden_size + eps)
-    weight = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0).to(tl.float32)
     normed = output_fp32 * reciprocal_rms
     normed += normed * weight
     if launch_with_pdl:
@@ -332,8 +441,15 @@ def hc_combine_norm(
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    shared_expert_gate_logits: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse combine with the next grouped Gemma RMSNorm."""
+    """Fuse combine with the next grouped Gemma RMSNorm.
+
+    Passing the shared-expert pair means ``block_output`` carries only the
+    routed experts' output and the kernel completes the MoE block's
+    ``+ sigmoid(gate) * shared`` itself, one launch fewer.
+    """
     rows, hyper_hidden_size = residual.shape
     assert hyper_hidden_size % hc_count == 0
     hidden_size = hyper_hidden_size // hc_count
@@ -343,9 +459,19 @@ def hc_combine_norm(
     assert residual.is_cuda
     assert residual.stride(1) == block_output.stride(1) == injection_logits.stride(1) == 1
     assert norm_weight.is_contiguous()
+    gate_shared_expert = _check_shared_expert_branch(
+        block_output, shared_expert_output, shared_expert_gate_logits
+    )
     output = torch.empty_like(residual)
     normed = torch.empty_like(residual)
-    block_size = 512
+    # One tile per row wherever it fits. The grid is (rows, hc_count), so at
+    # decode sizes only hc_count CTAs cover the whole GPU and the kernel is
+    # bound by the load-reduce-store chain inside each of them: a single
+    # contiguous [1, next_pow2(hidden)] block reads that chain's inputs in
+    # wider vectors than the equivalent [hidden/512, 512] tiling and needs one
+    # less level of reduction, for the same number of lanes. The cap keeps
+    # per-thread work bounded for rows too wide to hold in registers at once.
+    block_size = min(triton.next_power_of_2(hidden_size), _COMBINE_NORM_MAX_BLOCK)
     padded_tiles = triton.next_power_of_2(triton.cdiv(hidden_size, block_size))
     launch_with_pdl = _pdl_enabled(rows)
     with torch.cuda.device(residual.device.index):
@@ -356,17 +482,21 @@ def hc_combine_norm(
             norm_weight,
             output,
             normed,
+            shared_expert_output,
+            shared_expert_gate_logits,
             residual.stride(0),
             block_output.stride(0),
             injection_logits.stride(0),
             output.stride(0),
             normed.stride(0),
+            shared_expert_output.stride(0) if gate_shared_expert else 0,
             hidden_size=hidden_size,
             hc_count=hc_count,
             shared_weight=norm_weight.numel() == hidden_size,
             eps=eps,
             block_size=block_size,
             padded_tiles=padded_tiles,
+            gate_shared_expert=gate_shared_expert,
             launch_with_pdl=launch_with_pdl,
             # Four warps avoid oversubscribing the fixed-width HC reduction.
             num_warps=4,
@@ -383,8 +513,11 @@ def _(
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    shared_expert_gate_logits: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del block_output, injection_logits, norm_weight, eps, hc_count
+    del shared_expert_output, shared_expert_gate_logits
     return torch.empty_like(residual), torch.empty_like(residual)
 
 

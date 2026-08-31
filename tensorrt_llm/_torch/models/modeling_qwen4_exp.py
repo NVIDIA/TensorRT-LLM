@@ -15,7 +15,7 @@
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import torch
 from torch import nn
@@ -40,7 +40,7 @@ from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.qwen4_exp_hyper_connection import Qwen4ExpHyperConnection
+from ..modules.qwen4_exp_hyper_connection import HCBlockOutput, HCResidual, Qwen4ExpHyperConnection
 from ..modules.qwen4_exp_ple import PLEMetadata, Qwen4ExpPLE
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types, get_qwen4_exp_ple_layer_mask
@@ -186,32 +186,51 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
     def forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         mamba_metadata: Optional[Mamba2Metadata] = None,
         ple_state: Optional[tuple] = None,
         spec_metadata=None,
         lora_params: Optional[dict] = None,
+        pending_combine: Optional[Tuple[HCBlockOutput, HCResidual]] = None,
+        defer_combine: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
-        # Expand the 2560-wide embedding into the 4-stream residual bundle at the
-        # first layer; later layers already receive the 10240-wide bundle.
-        if hidden_states.shape[-1] != self.hc_dim:
-            assert hidden_states.shape[-1] == self.hidden_size, (
-                f"Qwen4-Exp layer {self.layer_idx} expected a {self.hidden_size} "
-                f"embedding or {self.hc_dim} bundle, got {hidden_states.shape[-1]}"
-            )
-            hidden_states = torch.cat([hidden_states] * self.hc_count, dim=-1)
+    ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[HCBlockOutput, HCResidual]]]:
+        """Run one decoder layer, returning ``(bundle, pending_combine)``.
 
-        # PLE n-gram short-conv side path, injected into the bundle before mix.
-        if self.ple is not None and ple_state is not None:
-            ple_meta, conv_state, ngram_context = ple_state
-            hidden_states = hidden_states + self.ple(
-                hidden_states, ple_meta, conv_state, ngram_context
+        ``pending_combine`` carries a preceding layer's MoE output and residual
+        state whose Hyper-Connection combine has been deferred so it can be
+        fused with this layer's grouped norm; exactly one of the two returned
+        values is ``None``. A layer that defers does not materialize the
+        residual bundle, so its caller must feed the pending state to the next
+        layer rather than reading ``hidden_states``.
+        """
+        if pending_combine is not None:
+            # The preceding layer's MoE combine and this layer's grouped norm
+            # form one exact fusion boundary, the same one combine_and_mix
+            # already exploits between attention and MLP.
+            hidden_states, mixed, residual = self.attn_hyper_connection.combine_and_mix(
+                *pending_combine
             )
+        else:
+            # Expand the 2560-wide embedding into the 4-stream residual bundle at
+            # the first layer; later layers already receive the 10240-wide bundle.
+            if hidden_states.shape[-1] != self.hc_dim:
+                assert hidden_states.shape[-1] == self.hidden_size, (
+                    f"Qwen4-Exp layer {self.layer_idx} expected a {self.hidden_size} "
+                    f"embedding or {self.hc_dim} bundle, got {hidden_states.shape[-1]}"
+                )
+                hidden_states = torch.cat([hidden_states] * self.hc_count, dim=-1)
 
-        # Attention block: mix -> mixer -> attn_tp_all_reduce -> combine.
-        mixed, residual = self.attn_hyper_connection.mix(hidden_states)
+            # PLE n-gram short-conv side path, injected into the bundle before mix.
+            if self.ple is not None and ple_state is not None:
+                ple_meta, conv_state, ngram_context = ple_state
+                hidden_states = hidden_states + self.ple(
+                    hidden_states, ple_meta, conv_state, ngram_context
+                )
+
+            # Attention block: mix -> mixer -> attn_tp_all_reduce -> combine.
+            mixed, residual = self.attn_hyper_connection.mix(hidden_states)
         no_reduce = AllReduceParams(enable_allreduce=False)
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(
@@ -238,15 +257,30 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         )
 
         # MoE block: MoE(routed 512 + shared) -> combine. The MoE owns its own
-        # tensor-parallel reduction of the combined routed+shared output.
+        # tensor-parallel reduction of the combined routed+shared output. Where
+        # no reduction stands between the two, the shared-expert gate rides into
+        # the combine kernel instead of costing a launch of its own.
         moe_out = self.mlp(
             mixed,
             attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=self.enable_tp_output_reduction),
             lora_params=lora_params,
+            defer_shared_expert_gate=True,
         )
-        hidden_states = self.mlp_hyper_connection.combine(moe_out, residual)
-        return hidden_states
+        if defer_combine:
+            return None, (moe_out, residual)
+        return self.mlp_hyper_connection.combine(moe_out, residual), None
+
+    def skip_forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        pending_combine: Optional[Tuple[HCBlockOutput, HCResidual]] = None,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[HCBlockOutput, HCResidual]]]:
+        """Pipeline-parallel no-op, in this layer's two-value return contract."""
+        return hidden_states, pending_combine
 
 
 class Qwen4ExpModel(DecoderModel):
@@ -313,6 +347,19 @@ class Qwen4ExpModel(DecoderModel):
         self.hc_dim = config.hc_count * config.hidden_size
         self.ple_layer_mask = ple_layer_mask
         self.has_ple = any(ple_layer_mask)
+        # A layer defers its MoE Hyper-Connection combine to the next layer's
+        # grouped norm, which fuses the two into one kernel. The last layer must
+        # materialize the bundle for the caller, and a PLE layer injects its side
+        # path into the bundle before norming, so neither can consume a deferral.
+        # Under pipeline parallelism the layers between stage boundaries are
+        # replaced by no-ops, which leaves no successor to consume a deferral.
+        can_defer = not model_config.mapping.has_pp()
+        self.defer_combine_mask = [
+            can_defer
+            and layer_idx + 1 < self.num_hidden_layers
+            and not ple_layer_mask[layer_idx + 1]
+            for layer_idx in range(self.num_hidden_layers)
+        ]
         self.eos_token_id = int(getattr(config, "eos_token_id", 0) or 0)
 
         # Fallback per-slot PLE recurrent state (short-conv state + n-gram
@@ -637,8 +684,9 @@ class Qwen4ExpModel(DecoderModel):
             ple_meta, _, ngram_context = ple_state
             self.layers[ple_layer_idx].ple.start_prefetch(ple_meta, ngram_context)
 
+        pending_combine = None
         for layer_idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
-            hidden_states = decoder_layer(
+            hidden_states, pending_combine = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
@@ -646,7 +694,10 @@ class Qwen4ExpModel(DecoderModel):
                 ple_state=ple_state if self.ple_layer_mask[layer_idx] else None,
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
+                pending_combine=pending_combine,
+                defer_combine=self.defer_combine_mask[layer_idx],
             )
+        assert pending_combine is None, "the last decoder layer must materialize the bundle"
 
         # Preserve the widened bundle for both the next PP stage and the
         # optional recurrent MTP layer. Qwen4ExpLogitsProcessor owns the final
@@ -881,7 +932,8 @@ class Qwen4ExpMTP(Qwen4ExpDecoderLayer):
         if all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
         try:
-            return super().forward(
+            # A replayed MTP layer has no successor to defer its combine to.
+            hidden_states, _ = super().forward(
                 position_ids=position_ids,
                 hidden_states=hidden_states.flatten(start_dim=-2),
                 attn_metadata=attn_metadata,
@@ -889,6 +941,7 @@ class Qwen4ExpMTP(Qwen4ExpDecoderLayer):
                 spec_metadata=spec_metadata,
                 **kwargs,
             )
+            return hidden_states
         finally:
             attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 

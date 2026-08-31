@@ -16,6 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -125,13 +128,47 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
-# Rows per program of the multi-row gated-RMSNorm kernel. At the GDN decode
-# shape (thousands of 128-element rows) one row per CTA leaves the kernel
-# launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
-# reduction order (bitwise-identical output) at ~2x the throughput.
-_MULTIROW_ROWS = 4
-_MULTIROW_NUM_WARPS = 4
+# Rows per program of the multi-row gated-RMSNorm kernel, with one warp per
+# row so that a whole row is reduced inside a single warp: that is what makes
+# the grouped kernel reproduce the single-row kernel's reduction order
+# (bitwise-identical output). Grouping rows amortizes the launch when there are
+# thousands of them, but a decode step contributes one row per value head - a
+# few dozen - and grouping those leaves most of the device idle, so a grouping
+# is only taken while the grid it implies still covers every SM.
+# ``tl.arange`` needs a power of two, hence the choices.
+_MULTIROW_ROW_CHOICES = (4, 2, 1)
 _MULTIROW_MAX_N = 256
+
+
+@functools.lru_cache(maxsize=None)
+def _multi_processor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _multirow_launch(M: int, device_index: int) -> tuple[int, int]:
+    """Rows per program and the grid it implies for ``M`` rows.
+
+    Picks the widest grouping whose grid still covers every SM, and one row per
+    program when none does.
+    """
+    sm_count = _multi_processor_count(device_index)
+    rows = next(
+        (rows for rows in _MULTIROW_ROW_CHOICES if M >= rows * sm_count),
+        _MULTIROW_ROW_CHOICES[-1],
+    )
+    return rows, triton.cdiv(M, rows)
+
+
+def _multirow_pdl(grid: int, device_index: int) -> bool:
+    """Whether to launch the multi-row kernel with PDL.
+
+    PDL hides the serial launch dependency on the kernel that produced ``x``,
+    but its synchronization is only worth paying while the grid is too small to
+    supply that overlap by itself.
+    """
+    return (grid < _multi_processor_count(device_index)
+            and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+            and get_sm_version() >= 90)
 
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
@@ -156,6 +193,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     OUTPUT_FP8: tl.constexpr,
     GATE_IS_SIGMOID: tl.constexpr,
     WEIGHT_IS_DELTA: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -170,6 +208,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
     x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
@@ -195,6 +235,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    if LAUNCH_WITH_PDL:
+        # Released only after the store, so a dependent grid that waits on it
+        # observes the whole output.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
@@ -256,9 +300,10 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+    rows_per_program, grid_x = _multirow_launch(M, x.device.index)
+    launch_with_pdl = _multirow_pdl(grid_x, x.device.index)
     with torch.cuda.device(x.device.index):
-        _rms_norm_gated_fwd_multirow_kernel[grid](
+        _rms_norm_gated_fwd_multirow_kernel[(grid_x, )](
             x,
             out,
             weight,
@@ -271,11 +316,13 @@ def rms_norm_gated_token_major(
             M,
             eps,
             N=N,
-            ROWS=_MULTIROW_ROWS,
+            ROWS=rows_per_program,
             HEADS_PER_TOK=heads,
             GATE_IS_SIGMOID=resolved_gate_is_sigmoid,
             WEIGHT_IS_DELTA=False,
-            num_warps=_MULTIROW_NUM_WARPS,
+            LAUNCH_WITH_PDL=launch_with_pdl,
+            num_warps=rows_per_program,
+            launch_pdl=launch_with_pdl,
         )
     return out
 
@@ -345,9 +392,10 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+        rows_per_program, grid_x = _multirow_launch(M, x.device.index)
+        launch_with_pdl = _multirow_pdl(grid_x, x.device.index)
         with torch.cuda.device(x.device.index):
-            _rms_norm_gated_fwd_multirow_kernel[grid](
+            _rms_norm_gated_fwd_multirow_kernel[(grid_x, )](
                 x,
                 out,
                 weight,
@@ -360,11 +408,13 @@ def _layer_norm_fwd(
                 M,
                 eps,
                 N=group_size,
-                ROWS=_MULTIROW_ROWS,
+                ROWS=rows_per_program,
                 HEADS_PER_TOK=1,
                 GATE_IS_SIGMOID=resolved_gate_is_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
-                num_warps=_MULTIROW_NUM_WARPS,
+                LAUNCH_WITH_PDL=launch_with_pdl,
+                num_warps=rows_per_program,
+                launch_pdl=launch_with_pdl,
             )
         return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel

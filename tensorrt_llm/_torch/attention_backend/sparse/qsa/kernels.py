@@ -826,10 +826,11 @@ def _expand_qsa_block_indices_kernel(
     COMPRESS_RATIO: tl.constexpr,
     TOKEN_TOPK: tl.constexpr,
     FINAL_TOPK: tl.constexpr,
-    OUTPUT_BLOCK_SIZE: tl.constexpr,
+    COLUMN_TILE: tl.constexpr,
+    COUNT_BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    columns = tl.arange(0, OUTPUT_BLOCK_SIZE)
+    columns = tl.program_id(1) * COLUMN_TILE + tl.arange(0, COLUMN_TILE)
     sequence_length = tl.load(sequence_lengths + row)
 
     source_columns = columns // COMPRESS_RATIO
@@ -842,13 +843,17 @@ def _expand_qsa_block_indices_kernel(
     expanded = blocks * COMPRESS_RATIO + offsets
     expanded_valid = (columns < TOKEN_TOPK) & (blocks >= 0) & (expanded < sequence_length)
 
+    # The tail's placement depends on the whole row's valid block count, so a
+    # column tile narrower than the row re-derives it over its own range rather
+    # than reusing the output columns.
+    count_columns = tl.arange(0, COUNT_BLOCK)
     valid_blocks = tl.load(
-        block_indices + row * block_stride + columns,
-        mask=columns < BLOCK_TOPK,
+        block_indices + row * block_stride + count_columns,
+        mask=count_columns < BLOCK_TOPK,
         other=-1,
     )
     valid_token_count = tl.minimum(
-        tl.sum(((columns < BLOCK_TOPK) & (valid_blocks >= 0)).to(tl.int32), axis=0)
+        tl.sum(((count_columns < BLOCK_TOPK) & (valid_blocks >= 0)).to(tl.int32), axis=0)
         * COMPRESS_RATIO,
         TOKEN_TOPK,
     )
@@ -878,6 +883,23 @@ def _expand_qsa_block_indices_kernel(
     )
 
 
+# One program per row leaves a single CTA on the device at decode row counts,
+# where the expansion is grid-limited rather than internally bound. Splitting a
+# row's output columns across programs costs one extra read of that row's block
+# indices per program, so it only pays while the row count alone cannot fill the
+# device.
+_EXPAND_COLUMN_TILE = 256
+_EXPAND_ROWS_FILLING_DEVICE = 128
+
+
+def _expand_launch(rows: int, final_topk: int) -> tuple[int, int]:
+    """Output columns handled by one expansion program, and its warp count."""
+    whole_row = triton.next_power_of_2(final_topk)
+    if rows >= _EXPAND_ROWS_FILLING_DEVICE:
+        return whole_row, 8
+    return min(_EXPAND_COLUMN_TILE, whole_row), 4
+
+
 def triton_expand_qsa_block_indices(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
@@ -896,7 +918,8 @@ def triton_expand_qsa_block_indices(
     )
     if rows == 0:
         return output
-    _expand_qsa_block_indices_kernel[(rows,)](
+    column_tile, num_warps = _expand_launch(rows, final_topk)
+    _expand_qsa_block_indices_kernel[(rows, triton.cdiv(final_topk, column_tile))](
         block_indices,
         query_positions,
         sequence_lengths,
@@ -907,8 +930,9 @@ def triton_expand_qsa_block_indices(
         COMPRESS_RATIO=compress_ratio,
         TOKEN_TOPK=token_topk,
         FINAL_TOPK=final_topk,
-        OUTPUT_BLOCK_SIZE=triton.next_power_of_2(final_topk),
-        num_warps=8,
+        COLUMN_TILE=column_tile,
+        COUNT_BLOCK=triton.next_power_of_2(block_topk),
+        num_warps=num_warps,
     )
     return output
 
@@ -1201,8 +1225,15 @@ def triton_qsa_paged_index_scores(
     # GB300 tuning uses fine-grained parallelism for decode-sized batches and
     # reuses each query across multiple score tiles for prefill-sized batches.
     # The 256-row boundary also covers the largest decode CUDA graph.
+    #
+    # A decode row scores its whole causal prefix through one program per score
+    # tile, so the tile width sets both the grid and the length of the block
+    # table -> compressed key gather each program waits on. At 32 columns the
+    # grid covers half the device and the kernel is grid-limited; narrower tiles
+    # are monotonically faster down to 8 and then flatten, so 8 takes almost all
+    # of the win at a quarter of the programs a 4-column tile would launch.
     is_prefill_sized = rows > 256
-    block_n = 64 if is_prefill_sized else 32
+    block_n = 64 if is_prefill_sized else 8
     tiles_per_program = 8 if is_prefill_sized else 1
     query_tile = 1
     if (

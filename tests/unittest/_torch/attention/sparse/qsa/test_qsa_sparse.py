@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     select_qsa_tokens,
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
+    _expand_launch,
     _qsa_index_scores_query_tile,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
@@ -98,6 +99,64 @@ def test_expand_qsa_blocks_appends_incomplete_tail() -> None:
         [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1],
         [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1],
     ]
+
+
+@pytest.mark.parametrize(
+    "rows, final_topk, expected",
+    [(1, 2051, (256, 4)), (127, 2051, (256, 4)), (128, 2051, (4096, 8)), (1, 11, (16, 4))],
+)
+def test_expand_launch_splits_columns_only_for_narrow_batches(
+    rows: int, final_topk: int, expected: tuple[int, int]
+) -> None:
+    assert _expand_launch(rows, final_topk) == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_expand_qsa_blocks_column_split_matches_whole_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(42)
+    compress_ratio = 4
+    token_topk = 2048
+    block_topk = token_topk // compress_ratio
+    # Full width with no tail, full width with a tail, and a row whose visible
+    # prefix is too short to fill the selection.
+    query_positions = torch.tensor([9215, 8190, 1234], dtype=torch.int32)
+    block_indices = torch.full((3, block_topk), -1, dtype=torch.int32)
+    for row, position in enumerate(query_positions.tolist()):
+        visible_blocks = (position + 1) // compress_ratio
+        width = min(block_topk, visible_blocks)
+        block_indices[row, :width] = torch.randperm(visible_blocks, dtype=torch.int32)[:width]
+    sequence_lengths = query_positions + 1
+
+    arguments = dict(compress_ratio=compress_ratio, token_topk=token_topk)
+    split = expand_qsa_block_indices(
+        block_indices.cuda(),
+        query_positions.cuda(),
+        sequence_lengths.cuda(),
+        **arguments,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention_backend.sparse.qsa.kernels._EXPAND_ROWS_FILLING_DEVICE",
+        0,
+    )
+    whole_row = expand_qsa_block_indices(
+        block_indices.cuda(),
+        query_positions.cuda(),
+        sequence_lengths.cuda(),
+        **arguments,
+    )
+    reference = expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        **arguments,
+    )
+
+    # Selected tokens must be bit-identical, not merely close: they index the
+    # KV cache.
+    assert torch.equal(split, whole_row)
+    assert torch.equal(split.cpu(), reference)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -542,6 +542,44 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
 }
 
 template <int kNThreads, int kWidth, typename input_t, typename weight_t>
+void causal_conv1d_update_sl1_launch(ConvParamsBase& params, cudaStream_t stream)
+{
+    using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
+    dim3 const grid(params.batch, (params.dim + kNThreads - 1) / kNThreads);
+    BOOL_SWITCH(params.conv_state_indices_ptr != nullptr, kHasCSI,
+        [&]
+        {
+            auto kernel = &causal_conv1d_update_kernel_sl1<Ktraits, kHasCSI>;
+            kernel<<<grid, kNThreads, 0, stream>>>(params);
+        });
+}
+
+// The seqlen-1 kernel gives each thread one channel and the threads never
+// cooperate, so its block width only decides how the fixed channel work is
+// spread over the SMs. Take the widest block whose grid still covers the
+// device: at generation batch sizes the 128-wide default leaves most SMs with
+// nothing to run, while wider blocks keep the block count - and its scheduling
+// cost - down once there are enough channels to fill the device anyway.
+template <int kWidth, typename input_t, typename weight_t>
+void causal_conv1d_update_sl1_dispatch(ConvParamsBase& params, cudaStream_t stream)
+{
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    auto const blocks = [&](int nThreads) { return params.batch * ((params.dim + nThreads - 1) / nThreads); };
+    if (blocks(128) >= smCount)
+    {
+        causal_conv1d_update_sl1_launch<128, kWidth, input_t, weight_t>(params, stream);
+    }
+    else if (blocks(64) >= smCount)
+    {
+        causal_conv1d_update_sl1_launch<64, kWidth, input_t, weight_t>(params, stream);
+    }
+    else
+    {
+        causal_conv1d_update_sl1_launch<32, kWidth, input_t, weight_t>(params, stream);
+    }
+}
+
+template <int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_update_launch(ConvParamsBase& params, cudaStream_t stream)
 {
     using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
@@ -553,12 +591,7 @@ void causal_conv1d_update_launch(ConvParamsBase& params, cudaStream_t stream)
     // conv_state holds exactly width-1 elements (no extra trailing padding to shift).
     if (params.seqlen == 1 && !isCircularBuffer && params.silu_activation && params.conv_state_len == params.width - 1)
     {
-        BOOL_SWITCH(hasConvStateIndices, kHasCSI,
-            [&]
-            {
-                auto kernel = &causal_conv1d_update_kernel_sl1<Ktraits, kHasCSI>;
-                kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
-            });
+        causal_conv1d_update_sl1_dispatch<kWidth, input_t, weight_t>(params, stream);
     }
     else
     {

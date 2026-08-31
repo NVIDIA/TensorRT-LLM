@@ -50,6 +50,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..llm_request import LlmRequest
+from .greedy_sample_kernels import greedy_argmax_scatter, supports_greedy_argmax_scatter
 from .sampler_common import DEFAULT_BEAM_IDX
 
 if sys.version_info[:2] >= (3, 12):
@@ -442,6 +443,13 @@ def fast_greedy_sample_kernel(
     Performs argmax, applies d2t translation if present, and scatters
     tokens into the output buffer. All operations are in-place.
     """
+    # The d2t translation reads the sampled tokens back, so it needs them as a
+    # separate tensor and keeps the unfused sequence.
+    if d2t is None and supports_greedy_argmax_scatter(logits_cuda, new_tokens_cuda):
+        return greedy_argmax_scatter(
+            logits_cuda, new_tokens_cuda, batch_dest_indices, max_beam_width
+        )
+
     # Simple argmax for greedy sampling
     next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
 
