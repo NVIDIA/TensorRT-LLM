@@ -329,7 +329,6 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6661856)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-b200_deepseek-r1-fp4_8k1k_con1536_ctx1_dep4_gen1_dep8_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6644487)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6661856)
-test_doc.py::test_url_validity SKIP (https://nvbugs/6633929)
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4] SKIP (https://nvbugs/6624972)
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8] SKIP (https://nvbugs/5836830)
 test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (https://nvbugs/6605819)
