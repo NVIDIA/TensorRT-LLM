@@ -49,7 +49,8 @@ from ..attention.backends.utils import get_attention_backend
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.piecewise_optimizer import PiecewiseRunner
-from ..compilation.utils import capture_piecewise_cuda_graph
+from ..compilation.utils import (_PhaseSelectiveForward,
+                                 capture_piecewise_cuda_graph)
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
@@ -653,8 +654,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
-        torch_compile_bypass_state = {"active": False}
-        self._torch_compile_bypass_state = torch_compile_bypass_state
+        self._phase_selective_forward: Optional[_PhaseSelectiveForward] = None
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
         self._torch_compile_prefill_only = False
 
@@ -1300,16 +1300,11 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextmanager
     def _without_torch_compile(self):
-        if not self._compile_only_piecewise_graphs:
+        if self._phase_selective_forward is None:
             yield
             return
-        state = self._torch_compile_bypass_state
-        previous = state["active"]
-        state["active"] = True
-        try:
+        with self._phase_selective_forward.bypass():
             yield
-        finally:
-            state["active"] = previous
 
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
