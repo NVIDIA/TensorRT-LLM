@@ -137,21 +137,11 @@ def _is_visual_gen_instance(obj) -> bool:
 
 # yapf: enable
 
-# msgspec msgpack is the transport for the disagg orchestrator->worker request
-# body: the large agentic chat body otherwise blocks the serving event loop on
-# stdlib json.loads. The worker decodes bodies flagged with the X-TRTLLM-Msgpack
-# header via msgspec and falls back to stdlib json for everything else, so
-# external OpenAI-API clients keep the byte-for-byte unchanged JSON path.
 _msgpack_decoder = msgspec.msgpack.Decoder()
 
 
 class _MsgspecRequest(Request):
-    """Request that decodes msgpack bodies (X-TRTLLM-Msgpack: 1) with msgspec.
-
-    The orchestrator sends Content-Type application/json (so FastAPI still
-    routes the body through Request.json()) with the X-TRTLLM-Msgpack header
-    flagging a msgspec-msgpack payload; everything else is stdlib json.
-    """
+    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
 
     async def json(self):
         if not hasattr(self, "_json_body"):
@@ -159,7 +149,10 @@ class _MsgspecRequest(Request):
             if not body:
                 self._json_body = {}
             elif self.headers.get("x-trtllm-msgpack") == "1":
-                self._json_body = _msgpack_decoder.decode(body)
+                try:
+                    self._json_body = _msgpack_decoder.decode(body)
+                except msgspec.DecodeError as e:
+                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
             else:
                 self._json_body = json.loads(body)
         return self._json_body

@@ -52,10 +52,8 @@ from tensorrt_llm.serve.router import Router
 
 # yapf: enable
 
-# msgspec msgpack is the transport for the orchestrator->worker request body:
-# the orchestrator encodes the forwarded body as msgpack and flags it with the
-# X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
-# routes it through Request.json()).
+# The forwarded orchestrator->worker request body is encoded as msgspec
+# msgpack and flagged with the X-TRTLLM-Msgpack header.
 _msgpack_encoder = msgspec.msgpack.Encoder()
 
 
@@ -232,11 +230,8 @@ class OpenAIHttpClient(OpenAIClient):
                     if hooks:
                         hooks.on_disagg_request_id(dp.disagg_request_id)
             # Serialize once on the orchestrator's single event-loop thread.
-            # msgspec msgpack: encode the request dict to msgpack bytes. Keep
-            # Content-Type application/json so FastAPI still routes the body
-            # through Request.json() (it only does that for json/+json content
-            # subtypes); the X-TRTLLM-Msgpack header tells the worker's
-            # Request.json() to decode with msgspec instead of stdlib json.
+            # Content-Type stays application/json so FastAPI still routes the
+            # body through Request.json(); the header picks the decoder.
             body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
             headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
             if self._request_perf_metrics:

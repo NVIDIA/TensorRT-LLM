@@ -137,10 +137,6 @@ def _mock_worker_app(role: str) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw: Request):
-        # The orchestrator sends the body as msgspec-msgpack under
-        # Content-Type application/json, flagged with X-TRTLLM-Msgpack; mirror
-        # the real worker's _MsgspecRequest.json() decode instead of assuming
-        # stdlib JSON (a bare Request.json() would choke on the msgpack bytes).
         raw_body = await raw.body()
         if not raw_body:
             body = {}
