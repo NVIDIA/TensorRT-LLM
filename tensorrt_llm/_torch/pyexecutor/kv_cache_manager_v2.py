@@ -2384,8 +2384,9 @@ class KVCacheManagerV2(BaseResourceManager):
         from ``py_decoding_iter``: the sampler advances that counter after
         scheduling under the overlap loop, so a schedule-time read is one
         step behind and would repeat the first decode position, overwriting
-        the first generated token's KV. Assumes one new token per step
-        (draft-token modes are rejected under helix).
+        the first generated token's KV. Multi-token verify groups advance
+        py_helix_decode_group_index per committed group, so this formula
+        stays exact under DSpark speculation.
         """
         step = req.py_helix_decode_group_index + 1
         pos = req.total_input_len_cp + step - 1

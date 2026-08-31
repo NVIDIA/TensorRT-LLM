@@ -184,6 +184,20 @@ def get_kv_cache_manager_cls(
         # the shared hybrid transceiver validation below: the Python NIXL
         # transceiver selects the Mixed manager, whose KDA recurrent/conv
         # states transfer through the bounce buffer.
+        # Helix x speculation bookkeeping (per-token verify groups on the
+        # superblock ledger, py_helix_decode_group_index advancement) exists
+        # only in KVCacheManagerV2. The V1-family hybrid managers account
+        # helix decode one token per iteration and have no helix-x-spec
+        # path, so a default (V1) resolution would run silently wrong.
+        if (model_config.mapping is not None
+                and model_config.mapping.has_cp_helix()
+                and model_config.spec_config is not None and not use_v2):
+            raise ValueError(
+                "Kimi K3 helix with speculative decoding requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True; the V1-family "
+                "hybrid managers do not implement per-token verify-group "
+                "bookkeeping.")
+
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(

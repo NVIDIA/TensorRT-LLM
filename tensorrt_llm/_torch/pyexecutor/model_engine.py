@@ -5962,10 +5962,12 @@ class PyTorchModelEngine(ModelEngine):
                         # once (L, L, L+1, ...) and the new token's K is roped
                         # at the wrong position before being written to the KV
                         # cache, corrupting every later step.
-                        # TODO: revisit for helix x speculative decoding -
-                        # the base formula and this +1 both assume exactly
-                        # one new token per step (draft-token modes are
-                        # currently rejected under helix).
+                        # The base formula and this +1 assume exactly one
+                        # new token per step. Helix x DSpark never reaches
+                        # this plain-generation branch: the K3 allowlist
+                        # rejects the acceptance-rate gate, which is the only
+                        # dynamic path that could strip speculation from an
+                        # in-flight helix request.
                         position_id += 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
