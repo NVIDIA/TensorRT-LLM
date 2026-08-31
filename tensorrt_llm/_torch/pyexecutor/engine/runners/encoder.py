@@ -537,8 +537,8 @@ class EncoderMixin:
         with MoeLoadBalancerIterContext(moe_load_balancer):
             return runner.replay(key, prepared.kwargs)
 
-    def cleanup(self) -> None:
-        self._encoder_cuda_graph_runner.clear()
+    def cleanup(self, *, release_nccl_window_owners: bool = True) -> None:
+        self._encoder_cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
 
 
 class EncoderRunner(EncoderMixin):
