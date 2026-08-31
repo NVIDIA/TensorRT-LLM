@@ -102,13 +102,15 @@ def test_benchmark_mode_is_not_a_match_key() -> None:
     assert benchmark_data_matches(history, new, get_test_case_match_keys())
 
 
-def test_pre_merge_branch_substitution_finds_baseline() -> None:
+def test_a_pre_merge_branch_does_not_match_post_merge_history() -> None:
+    """Branch is identity, so a PR run cannot match main's history unaided.
+
+    This is the precondition that makes the baseline-branch substitution in
+    process_and_upload_test_results necessary; the substitution itself is tested
+    against that function in
+    tests/unittest/others/test_perf_regression_branch.py.
+    """
     history = _benchmark_data(s_branch="main")
     pre_merge_data = _benchmark_data(s_branch="github-pr-12345")
-    match_keys = get_test_case_match_keys()
 
-    assert not benchmark_data_matches(history, pre_merge_data, match_keys)
-
-    lookup_data = {**pre_merge_data, "s_branch": "main"}
-    assert benchmark_data_matches(history, lookup_data, match_keys)
-    assert pre_merge_data["s_branch"] == "github-pr-12345"
+    assert not benchmark_data_matches(history, pre_merge_data, get_test_case_match_keys())
