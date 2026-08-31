@@ -18,7 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h"
 
-#include "tensorrt_llm/common/assert.h"
+#include "kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
@@ -131,6 +131,27 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             throw std::invalid_argument("A provider layer is absent from all GPU descriptors");
         }
 
+        // Fail closed until KVCM replaces the batched cuMemcpyBatchAsync copies with kernels: on host
+        // kernels that need chunked pinned-memory registration (Linux 6.11-6.13), the embedded lossless
+        // codec cannot split its copies at registration boundaries when wrapped by this codec.
+        bool hasFallbackLifecycle = false;
+        for (auto const& [lifeCycleId, state] : pendingGroups)
+        {
+            static_cast<void>(lifeCycleId);
+            if (!state.lifecycleIndex)
+            {
+                hasFallbackLifecycle = true;
+                break;
+            }
+        }
+        if (hasFallbackLifecycle && kv::HostMem::shouldUseChunkedRegistration())
+        {
+            throw std::invalid_argument(
+                "Cold-page compression is not supported for models with lossless-fallback lifecycles (SSM/GDN) on "
+                "this host kernel: chunked pinned-memory registration (Linux 6.11-6.13) breaks the fallback codec's "
+                "batched copies. Disable KV cache compression for this model or use a different host kernel.");
+        }
+
         auto const properties = configureProvider(providerLifecycles);
         if (properties.size() != providerLifecycles.size())
         {
@@ -186,17 +207,6 @@ kv::PageIndexLocation NativeColdPageCodec::queryPageIndexLocation(kv::LayerGroup
 {
     auto const* state = findLayerGroup(layerGroupId);
     return state == nullptr ? kv::PageIndexLocation::kBadLocation : state->pageIndexLocation;
-}
-
-bool NativeColdPageCodec::needsHostMemRegistration() const noexcept
-{
-    return mLosslessCodec != nullptr && mLosslessCodec->needsHostMemRegistration();
-}
-
-void NativeColdPageCodec::registerHostMem(kv::HostMem const* memory)
-{
-    TLLM_CHECK(mLosslessCodec != nullptr);
-    mLosslessCodec->registerHostMem(memory);
 }
 
 bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,

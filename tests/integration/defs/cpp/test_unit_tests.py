@@ -44,23 +44,14 @@ def test_kv_cache_compression_unit_tests(build_kv_cache_compression_tests,
 
     xml_name = "results-unit-tests-kv_cache_compression.xml"
 
-    ctest_command = [
-        "ctest",
-        "--output-on-failure",
-        "--test-dir",
-        f"{build_dir}/tests/unit_tests/kv_cache_compression",
-        "--output-junit",
-        f"{build_dir}/{xml_name}",
-    ]
-
-    parallel = _cpp.default_test_parallel
-    if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):
-        parallel = int(parallel_override)
-
-    cpp_env = {**_os.environ}
-
-    _cpp.parallel_run_ctest(ctest_command,
-                            cwd=build_dir,
-                            env=cpp_env,
-                            timeout=2700,
-                            parallel=parallel)
+    # Run the binary directly: the lightweight fixture builds only this gtest,
+    # so a ctest directory scan would trip over unbuilt neighbors.
+    _cpp.run_command(
+        [
+            f"{build_dir}/tests/unit_tests/kernels/nvfp4ColdPageKernelsTest",
+            f"--gtest_output=xml:{build_dir}/{xml_name}",
+        ],
+        cwd=build_dir,
+        env={**_os.environ},
+        timeout=2700,
+    )

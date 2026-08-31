@@ -175,9 +175,9 @@ def build_google_tests(request, build_type):
 
 @pytest.fixture(scope="session")
 def build_kv_cache_compression_tests(request, build_type):
-    """Build only the standalone KV-cache compression gtests.
+    """Build only the standalone NVFP4 cold-page kernel gtest.
 
-    Both binaries use NO_TLLM_LINKAGE, so this skips the full-library
+    The binary uses NO_TLLM_LINKAGE, so this skips the full-library
     build that build_google_tests pays for.
     """
     cuda_arch = f"{request.param}-real"
@@ -206,7 +206,6 @@ def build_kv_cache_compression_tests(request, build_type):
             "--parallel",
             "12",
             "--target",
-            "coldPageCodecTest",
             "nvfp4ColdPageKernelsTest",
         ],
         cwd=build_dir,

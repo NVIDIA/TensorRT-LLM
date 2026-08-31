@@ -71,12 +71,6 @@ public:
 
     [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept final;
 
-    //! Both forward to the embedded lossless codec so fallback lifecycles keep the batched-copy
-    //! registration-boundary workaround.
-    [[nodiscard]] bool needsHostMemRegistration() const noexcept final;
-
-    void registerHostMem(kv::HostMem const* memory) final;
-
     bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
         std::size_t numBasePages, cudaStream_t stream) noexcept final;
 
