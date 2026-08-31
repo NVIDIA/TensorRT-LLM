@@ -2389,6 +2389,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
+    m.def("set_nccl_window_graph_owner(int owner) -> ()");
+    m.def("release_nccl_window_graph_owner(int owner) -> ()");
     m.def(
         "minimax_allreduce_rms("
         "Tensor input,"
@@ -2430,6 +2432,23 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("validate_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::validateAllReduceTuningBuckets);
     m.impl("clear_allreduce_tactic_cache", &tensorrt_llm::torch_ext::clearAllReduceTacticCache);
+}
+
+// Graph-owner bookkeeping has no Tensor argument, so it cannot select CPU or
+// CUDA dispatch. CatchAll is required for these host-side operations.
+TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
+{
+#if ENABLE_MULTI_DEVICE
+    m.impl("set_nccl_window_graph_owner",
+        [](int64_t owner)
+        { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().setGraphPoolOwner(owner); });
+    m.impl("release_nccl_window_graph_owner",
+        [](int64_t owner)
+        { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseGraphPoolOwner(owner); });
+#else
+    m.impl("set_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("release_nccl_window_graph_owner", [](int64_t) {});
+#endif
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

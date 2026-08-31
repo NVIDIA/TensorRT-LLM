@@ -9,8 +9,58 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+import tensorrt_llm._torch.visual_gen.pipeline as pipeline_module
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import CompilationConfig, VisualGenArgs
+
+
+def test_cleanup_releases_distinct_nccl_window_graph_owners_after_graph_reset(monkeypatch):
+    class FakeCUDAGraph:
+        def __init__(self):
+            self.was_reset = False
+
+        def reset(self):
+            self.was_reset = True
+
+    first_pool = (1, 2)
+    second_pool = (3, 4)
+    graphs = [FakeCUDAGraph(), FakeCUDAGraph(), FakeCUDAGraph()]
+    runners = {}
+    for name, graph, pool in (
+        ("first", graphs[0], first_pool),
+        ("second", graphs[1], first_pool),
+        ("third", graphs[2], second_pool),
+    ):
+        runner = CUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True, cuda_graph_mem_pool=pool)
+        )
+        runner.graphs = {"decode": graph}
+        runners[name] = runner
+
+    pipeline = object.__new__(BasePipeline)
+    pipeline._profiler = MagicMock()
+    pipeline.offloader = MagicMock()
+    pipeline._cuda_graph_runners = runners
+    released_pools = []
+
+    def release_graph_pool(graph_pool):
+        assert all(graph.was_reset for graph in graphs)
+        assert all(not runner.graphs for runner in runners.values())
+        released_pools.append(graph_pool)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "release_nccl_window_graph_owner",
+        release_graph_pool,
+    )
+
+    pipeline.cleanup()
+
+    pipeline._profiler.close_window.assert_called_once_with()
+    assert set(released_pools) == {first_pool, second_pool}
+    assert len(released_pools) == 2
+    assert all(runner.memory_pool is None for runner in runners.values())
 
 
 class TestCompilationConfig:
