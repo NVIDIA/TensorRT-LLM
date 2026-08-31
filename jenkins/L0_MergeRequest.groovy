@@ -2308,6 +2308,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            // Canonical images carry BOLT profiles: the raw build is
+                            // published as <tag>-noprofiles and <tag> is produced by the
+                            // overlay. Both unconditional -- the contract is a property of
+                            // the image, not of what triggered the build, so a bundle that
+                            // cannot be pulled is an error rather than a silent plain
+                            // retag. Left unset, boltProfileBranch resolves LLM_BRANCH ->
+                            // main, so a ref with no promoted bundle still gets profiles.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2377,7 +2386,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'buildInternalRelease': false,
                             'buildCiImage': false,
                             'artifactPath': ARTIFACT_PATH,
-                            'uploadPath': UPLOAD_PATH
+                            'uploadPath': UPLOAD_PATH,
+                            // Must match Build-Docker-Images above: this path pushes the
+                            // same tags, so the scanned+registered image has to be the
+                            // BOLTed canonical one rather than a plain build.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
