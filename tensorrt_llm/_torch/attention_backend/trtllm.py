@@ -18,8 +18,9 @@ import math
 import os
 import weakref
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
@@ -37,6 +38,7 @@ from tensorrt_llm._torch.attention_backend.fmha.interface import (
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -55,7 +57,8 @@ from .sparse.skip_softmax import SkipSoftmaxParams
 # Exact scheduler-shape keys are unbounded over a process lifetime. A miss can
 # safely rerun selection, so retain only the most recently used shapes.
 _FMHA_SELECTION_CACHE_CAPACITY = 256
-_FMHA_SELECTION_CACHE_DEBUG_ENV = "TLLM_FMHA_SELECTION_CACHE_DEBUG"
+_FMHA_SELECTION_CACHE_SANITY_CHECK_ENV = (
+    "TRTLLM_FMHA_SELECTION_CACHE_SANITY_CHECK")
 
 
 class _FmhaSelectionCacheKey(NamedTuple):
@@ -70,6 +73,9 @@ class _FmhaSelectionCacheKey(NamedTuple):
     output_sf_dtype: Optional[torch.dtype]
 
 
+_FmhaSelectionInputSnapshot = Dict[str, str]
+
+
 def _is_fmha_selection_cache_enabled() -> bool:
     # Selection policy may differ while tuning (currently for CuTe DSL MLA).
     # Keep all temporary selections out of the serving cache so future FMHAs
@@ -80,8 +86,128 @@ def _is_fmha_selection_cache_enabled() -> bool:
     return autotuner is None or not autotuner.is_tuning_mode
 
 
-def _is_fmha_selection_cache_debug_enabled() -> bool:
-    return os.environ.get(_FMHA_SELECTION_CACHE_DEBUG_ENV, "0") == "1"
+def _is_fmha_selection_cache_sanity_check_enabled() -> bool:
+    return os.environ.get(_FMHA_SELECTION_CACHE_SANITY_CHECK_ENV, "0") == "1"
+
+
+def _snapshot_fmha_selection_value(
+    snapshot: _FmhaSelectionInputSnapshot,
+    path: str,
+    value: object,
+    seen: Set[int],
+) -> None:
+    """Record tensor shapes and primitive values without retaining inputs."""
+    if isinstance(value, torch.Tensor):
+        snapshot[path] = f"shape={tuple(value.shape)}"
+    elif isinstance(value, Enum):
+        snapshot[path] = f"{type(value).__name__}.{value.name}"
+    elif isinstance(value, (torch.dtype, torch.device)):
+        snapshot[path] = str(value)
+    elif value is None or isinstance(value, (bool, int, float, str)):
+        snapshot[path] = repr(value)
+    elif is_dataclass(value):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for value_field in fields(value):
+            if not value_field.name.startswith("_"):
+                _snapshot_fmha_selection_value(
+                    snapshot,
+                    f"{path}.{value_field.name}",
+                    getattr(value, value_field.name),
+                    seen,
+                )
+    elif isinstance(value, (list, tuple)):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for index, item in enumerate(value):
+            _snapshot_fmha_selection_value(snapshot, f"{path}[{index}]", item,
+                                           seen)
+    elif isinstance(value, dict):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for key in sorted(value, key=repr):
+            _snapshot_fmha_selection_value(snapshot, f"{path}[{key!r}]",
+                                           value[key], seen)
+
+
+def _snapshot_fmha_selection_fields(
+    snapshot: _FmhaSelectionInputSnapshot,
+    path: str,
+    value: object,
+    seen: Set[int],
+) -> None:
+    seen.add(id(value))
+    if is_dataclass(value):
+        value_fields = ((value_field.name, getattr(value, value_field.name))
+                        for value_field in fields(value)
+                        if not value_field.name.startswith("_"))
+    else:
+        value_fields = ((name, field_value)
+                        for name, field_value in vars(value).items()
+                        if not name.startswith("_"))
+    for name, field_value in value_fields:
+        _snapshot_fmha_selection_value(snapshot, f"{path}.{name}", field_value,
+                                       seen)
+
+
+def _snapshot_fmha_selection_inputs(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata: "TrtllmAttentionMetadata",
+    forward_args: AttentionForwardArgs,
+) -> _FmhaSelectionInputSnapshot:
+    snapshot: _FmhaSelectionInputSnapshot = {}
+    seen: Set[int] = set()
+    _snapshot_fmha_selection_value(snapshot, "q", q, seen)
+    _snapshot_fmha_selection_value(snapshot, "k", k, seen)
+    _snapshot_fmha_selection_value(snapshot, "v", v, seen)
+    _snapshot_fmha_selection_fields(snapshot, "metadata", metadata, seen)
+    _snapshot_fmha_selection_fields(snapshot, "forward_args", forward_args,
+                                    seen)
+
+    # These values are properties derived from tensor contents or runtime
+    # objects, so the direct field walk above cannot expose them.
+    for name in ("num_generations", "num_ctx_tokens", "num_tokens", "is_cross",
+                 "tokens_per_block"):
+        value = getattr(metadata, name, None)
+        _snapshot_fmha_selection_value(snapshot, f"metadata.{name}", value,
+                                       seen)
+    kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+    snapshot["metadata.has_kv_cache_manager"] = repr(
+        kv_cache_manager is not None)
+    if kv_cache_manager is not None:
+        for name in ("dtype", "tokens_per_block"):
+            value = getattr(kv_cache_manager, name, None)
+            _snapshot_fmha_selection_value(snapshot,
+                                           f"metadata.kv_cache_manager.{name}",
+                                           value, seen)
+    return snapshot
+
+
+def _format_fmha_selection_input_diff(
+    cached: Optional[_FmhaSelectionInputSnapshot],
+    uncached: _FmhaSelectionInputSnapshot,
+) -> str:
+    if cached is None:
+        return ("  cached input snapshot unavailable; enable "
+                f"{_FMHA_SELECTION_CACHE_SANITY_CHECK_ENV} before the cache "
+                "entry is created")
+
+    missing = "<missing>"
+    differences = []
+    for path in sorted(cached.keys() | uncached.keys()):
+        cached_value = cached.get(path, missing)
+        uncached_value = uncached.get(path, missing)
+        if cached_value != uncached_value:
+            differences.append(
+                f"  {path}: cached={cached_value}, uncached={uncached_value}")
+    if not differences:
+        return "  (no captured input differences)"
+    return "\n".join(differences)
 
 
 def _fmha_selections_match(cached: Optional[Fmha],
@@ -1548,6 +1674,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.non_phased_fmha_libs: List[Fmha] = []
         self._fmha_selection_cache: OrderedDict[_FmhaSelectionCacheKey,
                                                 Fmha] = OrderedDict()
+        self._fmha_selection_cache_sanity_inputs: Dict[
+            _FmhaSelectionCacheKey, _FmhaSelectionInputSnapshot] = {}
+        # Environment configuration is fixed for an attention instance so
+        # normal forwarding never pays for an environment lookup.
+        self._fmha_selection_cache_sanity_check_enabled = (
+            _is_fmha_selection_cache_sanity_check_enabled())
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1804,6 +1936,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def create_fmha_libs(self) -> None:
         self._fmha_selection_cache = OrderedDict()
+        self._fmha_selection_cache_sanity_inputs = {}
+        self._fmha_selection_cache_sanity_check_enabled = (
+            _is_fmha_selection_cache_sanity_check_enabled())
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
                 and get_sm_version() in (120, 121)
@@ -1893,15 +2028,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                         forward_args)
         fmha = self._fmha_selection_cache.get(cache_key)
         if fmha is not None:
-            if _is_fmha_selection_cache_debug_enabled():
+            if self._fmha_selection_cache_sanity_check_enabled:
                 uncached_fmha = self._select_fmha_uncached(
                     q, k, v, metadata, forward_args)
                 if not _fmha_selections_match(fmha, uncached_fmha):
-                    raise RuntimeError(
-                        "FMHA selection cache mismatch for "
-                        f"key={cache_key}: "
-                        f"cached={_describe_fmha_selection(fmha)}, "
-                        f"uncached={_describe_fmha_selection(uncached_fmha)}.")
+                    uncached_inputs = _snapshot_fmha_selection_inputs(
+                        q, k, v, metadata, forward_args)
+                    input_diff = _format_fmha_selection_input_diff(
+                        self._fmha_selection_cache_sanity_inputs.get(cache_key),
+                        uncached_inputs)
+                    message = ("FMHA selection cache sanity check failed for "
+                               f"key={cache_key}: "
+                               f"cached={_describe_fmha_selection(fmha)}, "
+                               "uncached="
+                               f"{_describe_fmha_selection(uncached_fmha)}.\n"
+                               f"Forward input differences:\n{input_diff}")
+                    logger.error(message)
+                    raise RuntimeError(message)
+                if cache_key not in self._fmha_selection_cache_sanity_inputs:
+                    self._fmha_selection_cache_sanity_inputs[
+                        cache_key] = _snapshot_fmha_selection_inputs(
+                            q, k, v, metadata, forward_args)
             self._fmha_selection_cache.move_to_end(cache_key)
             return fmha
 
@@ -1909,8 +2056,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             return None
         self._fmha_selection_cache[cache_key] = fmha
+        if self._fmha_selection_cache_sanity_check_enabled:
+            self._fmha_selection_cache_sanity_inputs[
+                cache_key] = _snapshot_fmha_selection_inputs(
+                    q, k, v, metadata, forward_args)
         if len(self._fmha_selection_cache) > _FMHA_SELECTION_CACHE_CAPACITY:
-            self._fmha_selection_cache.popitem(last=False)
+            evicted_key, _ = self._fmha_selection_cache.popitem(last=False)
+            self._fmha_selection_cache_sanity_inputs.pop(evicted_key, None)
         return fmha
 
     def _select_fmha_uncached(

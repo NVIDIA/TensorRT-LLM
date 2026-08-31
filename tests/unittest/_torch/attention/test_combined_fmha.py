@@ -401,7 +401,7 @@ def test_flashinfer_context_fallback_scope(
     assert generation_reason == ""
 
 
-def _make_selection_backend() -> TrtllmAttention:
+def _make_selection_backend(*, sanity_check_enabled: bool = False) -> TrtllmAttention:
     backend = object.__new__(TrtllmAttention)
     backend.is_mla_enable = False
     backend.kv_lora_rank = None
@@ -411,6 +411,8 @@ def _make_selection_backend() -> TrtllmAttention:
     backend.phased_fmha_libs = []
     backend.non_phased_fmha_libs = []
     backend._fmha_selection_cache = OrderedDict()
+    backend._fmha_selection_cache_sanity_inputs = {}
+    backend._fmha_selection_cache_sanity_check_enabled = sanity_check_enabled
     return backend
 
 
@@ -429,9 +431,18 @@ def _make_selection_metadata(
     )
 
 
+def test_fmha_selection_cache_sanity_check_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRTLLM_FMHA_SELECTION_CACHE_SANITY_CHECK", raising=False)
+    assert not trtllm_backend._is_fmha_selection_cache_sanity_check_enabled()
+
+    monkeypatch.setenv("TRTLLM_FMHA_SELECTION_CACHE_SANITY_CHECK", "1")
+    assert trtllm_backend._is_fmha_selection_cache_sanity_check_enabled()
+
+
 @pytest.mark.parametrize("request_order", [(3, 4), (4, 3)])
 def test_fmha_selection_cache_uses_exact_generation_q_length(
-    monkeypatch: pytest.MonkeyPatch,
     request_order: tuple[int, int],
 ) -> None:
     events: list[tuple] = []
@@ -446,7 +457,6 @@ def test_fmha_selection_cache_uses_exact_generation_q_length(
     backend.fmha_libs = [four_token_fmha, fallback]
     metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    monkeypatch.delenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", raising=False)
 
     with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
         selected_by_q_length = {
@@ -469,7 +479,6 @@ def test_fmha_selection_cache_uses_exact_generation_q_length(
 
 @pytest.mark.parametrize("request_order", [(63, 64), (64, 63)])
 def test_fmha_selection_cache_uses_exact_generation_batch_size(
-    monkeypatch: pytest.MonkeyPatch,
     request_order: tuple[int, int],
 ) -> None:
     events: list[tuple] = []
@@ -483,7 +492,6 @@ def test_fmha_selection_cache_uses_exact_generation_batch_size(
     fallback = _TestFmha(backend, "fallback", events)
     backend.fmha_libs = [batch_64_fmha, fallback]
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    monkeypatch.delenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", raising=False)
 
     with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
         selected_by_batch_size = {
@@ -535,7 +543,6 @@ def test_fmha_selection_cache_evicts_lru_entry_at_capacity(
     metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     monkeypatch.setattr(trtllm_backend, "_FMHA_SELECTION_CACHE_CAPACITY", 2)
-    monkeypatch.delenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", raising=False)
 
     with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
         assert (
@@ -566,17 +573,35 @@ def test_fmha_selection_cache_evicts_lru_entry_at_capacity(
 
     assert len(backend._fmha_selection_cache) == 2
     assert events.count(("support", "two-token", None)) == two_token_support_count + 1
+    assert backend._fmha_selection_cache_sanity_inputs == {}
 
 
-def test_context_fmha_selection_cache_uses_exact_batch_only(
+def test_fmha_selection_cache_evicts_sanity_snapshot_with_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    backend = _make_selection_backend(sanity_check_enabled=True)
+    fmha = _TestFmha(backend, "fmha", [])
+    backend.fmha_libs = [fmha]
+    metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    monkeypatch.setattr(trtllm_backend, "_FMHA_SELECTION_CACHE_CAPACITY", 1)
+
+    with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
+        backend._select_fmha(torch.empty((1, 4)), None, None, metadata, forward_args)
+        backend._select_fmha(torch.empty((2, 4)), None, None, metadata, forward_args)
+
+    assert backend._fmha_selection_cache_sanity_inputs.keys() == (
+        backend._fmha_selection_cache.keys()
+    )
+    assert next(iter(backend._fmha_selection_cache)).generation_num_tokens == 2
+
+
+def test_context_fmha_selection_cache_uses_exact_batch_only() -> None:
     events: list[tuple] = []
     backend = _make_selection_backend()
     fmha = _TestFmha(backend, "fmha", events)
     backend.fmha_libs = [fmha]
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
-    monkeypatch.delenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", raising=False)
 
     with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
         first = backend._select_fmha(
@@ -833,17 +858,14 @@ def test_fmha_selection_cache_tracks_lora_output_representation() -> None:
         assert len(backend._fmha_selection_cache) == 2
 
 
-def test_fmha_selection_cache_debug_accepts_matching_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_fmha_selection_cache_sanity_check_accepts_matching_selection() -> None:
     events: list[tuple] = []
-    backend = _make_selection_backend()
+    backend = _make_selection_backend(sanity_check_enabled=True)
     fmha = _TestFmha(backend, "fmha", events)
     backend.fmha_libs = [fmha]
     metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))
-    monkeypatch.setenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", "1")
 
     with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
         first = backend._select_fmha(q, None, None, metadata, forward_args)
@@ -852,39 +874,69 @@ def test_fmha_selection_cache_debug_accepts_matching_selection(
     assert first is fmha
     assert second is fmha
     assert events == [("support", "fmha", None), ("support", "fmha", None)]
+    assert len(backend._fmha_selection_cache_sanity_inputs) == 1
 
 
-def test_fmha_selection_cache_debug_rejects_mismatched_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_fmha_selection_cache_sanity_check_logs_mismatched_inputs() -> None:
     events: list[tuple] = []
-    backend = _make_selection_backend()
-    preferred_is_supported = True
+    backend = _make_selection_backend(sanity_check_enabled=True)
     preferred = _TestFmha(
         backend,
         "preferred",
         events,
-        request_support_predicate=lambda q, metadata: preferred_is_supported,
+        request_support_predicate=lambda q, metadata: q.shape[1] == 4,
     )
     fallback = _TestFmha(backend, "fallback", events)
     backend.fmha_libs = [preferred, fallback]
-    metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    q = torch.empty((1, 4))
-    monkeypatch.setenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", "1")
+    cached_metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
+    cached_metadata.beam_width = 1
+    uncached_metadata = _make_selection_metadata(num_contexts=0, num_generations=1)
+    uncached_metadata.beam_width = 2
+    cached_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        relative_attention_max_distance=0,
+    )
+    uncached_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        relative_attention_max_distance=7,
+    )
 
-    with patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True):
-        assert backend._select_fmha(q, None, None, metadata, forward_args) is preferred
-        preferred_is_supported = False
-        with pytest.raises(RuntimeError, match="FMHA selection cache mismatch"):
-            backend._select_fmha(q, None, None, metadata, forward_args)
+    with (
+        patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True),
+        patch.object(trtllm_backend.logger, "error") as log_error,
+    ):
+        assert (
+            backend._select_fmha(
+                torch.empty((1, 4)),
+                torch.empty((1, 2)),
+                None,
+                cached_metadata,
+                cached_args,
+            )
+            is preferred
+        )
+        with pytest.raises(RuntimeError, match="FMHA selection cache sanity check failed"):
+            backend._select_fmha(
+                torch.empty((1, 8)),
+                torch.empty((1, 3)),
+                torch.empty((1, 3)),
+                uncached_metadata,
+                uncached_args,
+            )
+
+    log_error.assert_called_once()
+    message = log_error.call_args.args[0]
+    assert "cached=_TestFmha, uncached=_TestFmha" in message
+    assert "q: cached=shape=(1, 4), uncached=shape=(1, 8)" in message
+    assert "k: cached=shape=(1, 2), uncached=shape=(1, 3)" in message
+    assert "v: cached=None, uncached=shape=(1, 3)" in message
+    assert "metadata.beam_width: cached=1, uncached=2" in message
+    assert "forward_args.relative_attention_max_distance: cached=0, uncached=7" in message
 
 
-def test_fmha_selection_cache_debug_accepts_equivalent_combined_fmha(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_fmha_selection_cache_sanity_check_accepts_equivalent_combined_fmha() -> None:
     events: list[tuple] = []
-    backend = _make_selection_backend()
+    backend = _make_selection_backend(sanity_check_enabled=True)
     context_fmha = _TestPhasedFmha(backend, {FmhaPhase.CONTEXT}, "context", events)
     generation_fmha = _TestPhasedFmha(backend, {FmhaPhase.GENERATION}, "generation", events)
     cached_combined = CombinedFmha(backend)
@@ -894,7 +946,6 @@ def test_fmha_selection_cache_debug_accepts_equivalent_combined_fmha(
     metadata = _make_selection_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
     q = torch.empty((2, 4))
-    monkeypatch.setenv("TLLM_FMHA_SELECTION_CACHE_DEBUG", "1")
 
     with (
         patch.object(trtllm_backend, "_is_fmha_selection_cache_enabled", return_value=True),
