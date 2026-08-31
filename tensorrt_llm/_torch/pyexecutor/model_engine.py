@@ -51,7 +51,8 @@ from ..attention.backends.utils import get_attention_backend
 from ..attention.backends.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
-from ..compilation.utils import capture_piecewise_cuda_graph
+from ..compilation.utils import (_PhaseSelectiveForward,
+                                 capture_piecewise_cuda_graph)
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
@@ -749,8 +750,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
-        torch_compile_bypass_state = {"active": False}
-        self._torch_compile_bypass_state = torch_compile_bypass_state
+        self._phase_selective_forward: Optional[_PhaseSelectiveForward] = None
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
@@ -813,27 +813,9 @@ class PyTorchModelEngine(ModelEngine):
                         fullgraph=torch_compile_fullgraph)
                     if compile_only_piecewise_graphs:
                         compiled_decoder = self.model.model
-                        compiled_forward = compiled_decoder.forward
-
-                        # The wrapper below will enforce the eager forward function if:
-                        # 1) The torch compile bypass is active (e.g., for auto-tuning)
-                        # 2) The batch is generation-only (rely on ordinary CUDA graphs)
-                        def phase_selective_forward(*args, **kwargs):
-                            attrs = get_model_extra_attrs()
-                            attn_metadata_ref = attrs.get(
-                                "attention_metadata") if attrs else None
-                            attn_metadata = (attn_metadata_ref()
-                                             if attn_metadata_ref is not None
-                                             else None)
-                            # This is the finalized batch classification after
-                            # any context-to-generation promotion.
-                            if (torch_compile_bypass_state["active"]
-                                    or (attn_metadata is not None
-                                        and attn_metadata.num_contexts == 0)):
-                                return eager_decoder(*args, **kwargs)
-                            return compiled_forward(*args, **kwargs)
-
-                        compiled_decoder.forward = phase_selective_forward
+                        self._phase_selective_forward = _PhaseSelectiveForward(
+                            eager_decoder, compiled_decoder.forward)
+                        compiled_decoder.forward = self._phase_selective_forward
                 elif callable(apply_llm_torch_compile):
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
@@ -1408,16 +1390,11 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextmanager
     def _without_torch_compile(self):
-        if not self._compile_only_piecewise_graphs:
+        if self._phase_selective_forward is None:
             yield
             return
-        state = self._torch_compile_bypass_state
-        previous = state["active"]
-        state["active"] = True
-        try:
+        with self._phase_selective_forward.bypass():
             yield
-        finally:
-            state["active"] = previous
 
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
