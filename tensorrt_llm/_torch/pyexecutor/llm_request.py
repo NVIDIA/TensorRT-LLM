@@ -1655,3 +1655,22 @@ def get_draft_token_length(request: LlmRequest) -> int:
     if request.py_draft_tokens is not None:
         return len(request.py_draft_tokens)
     return 0
+
+
+def get_request_tokens_per_gen_step(request: LlmRequest,
+                                    runtime_tokens_per_gen_step: int) -> int:
+    """How many tokens this request contributes to one generation step.
+
+    Uniform speculation gives every request the batch-wide
+    ``runtime_tokens_per_gen_step`` (1 accepted token + ``runtime_draft_len``
+    draft positions). Ragged verification -- where a scheduler hands each
+    request its own verify window -- records the per-request draft length in
+    ``py_verify_len``.
+
+    ``py_verify_len`` is set only by the ragged path, so every other
+    speculation mode gets the batch-wide value back unchanged.
+    """
+    verify_len = getattr(request, "py_verify_len", None)
+    if verify_len is None:
+        return runtime_tokens_per_gen_step
+    return 1 + int(verify_len)
