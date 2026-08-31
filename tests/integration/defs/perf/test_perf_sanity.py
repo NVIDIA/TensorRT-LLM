@@ -31,7 +31,7 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
-from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
+from test_common.perf_sanity_matching import get_test_case_match_keys
 
 from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info
@@ -841,9 +841,6 @@ class ServerConfig:
     def to_env(self) -> Dict[str, str]:
         return to_env_dict(self.env_vars)
 
-    def to_match_keys(self) -> List[str]:
-        return get_server_match_keys(self.match_mode)
-
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
         db_data = {
@@ -1219,9 +1216,6 @@ class ClientConfig:
 
     def to_env(self) -> Dict[str, str]:
         return to_env_dict(self.env_vars)
-
-    def to_match_keys(self) -> List[str]:
-        return get_client_match_keys()
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
@@ -2608,13 +2602,10 @@ class PerfSanityTestConfig:
             rest = key[2:]
             return f"{type_prefix}{prefix_name}_{rest}"
 
-        def add_list_prefix(config_list: List, prefix_name: str) -> List:
-            return [add_prefix(key, prefix_name) for key in config_list]
-
         def add_dict_prefix(config_dict: dict, prefix_name: str) -> dict:
             return {add_prefix(key, prefix_name): value for key, value in config_dict.items()}
 
-        match_keys = []
+        match_keys = get_test_case_match_keys()
 
         if self.runtime == "aggr_server":
             new_data_dict = {}
@@ -2658,11 +2649,6 @@ class PerfSanityTestConfig:
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
-
-                    if not match_keys:
-                        match_keys.extend(["s_gpu_type", "s_runtime"])
-                        match_keys.extend(server_config.to_match_keys())
-                        match_keys.extend(client_config.to_match_keys())
 
         elif self.runtime == "multi_node_disagg_server":
             # Only BENCHMARK node uploads
@@ -2725,28 +2711,6 @@ class PerfSanityTestConfig:
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
-                    if not match_keys:
-                        match_keys.extend(
-                            [
-                                "s_gpu_type",
-                                "s_runtime",
-                                "s_benchmark_mode",
-                                "l_num_ctx_servers",
-                                "l_num_gen_servers",
-                            ]
-                        )
-                        if num_ctx_servers > 0:
-                            match_keys.extend(add_list_prefix(ctx_config.to_match_keys(), "ctx"))
-                        if num_gen_servers > 0:
-                            gen_match_keys = add_list_prefix(gen_config.to_match_keys(), "gen")
-                            if disagg_config.benchmark_mode == "gen_only":
-                                gen_match_keys = [
-                                    k
-                                    for k in gen_match_keys
-                                    if k != "gen_s_cache_transceiver_backend"
-                                ]
-                            match_keys.extend(gen_match_keys)
-                        match_keys.extend(client_config.to_match_keys())
         else:
             return
 
