@@ -1591,6 +1591,56 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
 #endif
 }
 
+#if ENABLE_MULTI_DEVICE
+namespace
+{
+using TensorScopeInputs = std::pair<std::vector<c10::StorageImpl const*>, int>;
+
+TensorScopeInputs getTensorScopeInputs(torch::List<torch::Tensor> const& tensors)
+{
+    std::vector<c10::StorageImpl const*> storages;
+    storages.reserve(tensors.size());
+    std::optional<int> device;
+    for (torch::Tensor const& tensor : tensors)
+    {
+        if (tensor.is_cuda())
+        {
+            storages.push_back(tensor.storage().unsafeGetStorageImpl());
+            if (!device.has_value())
+            {
+                device = tensor.get_device();
+            }
+        }
+    }
+    TLLM_CHECK_WITH_INFO(device.has_value(), "NCCL window tensor scope requires at least one CUDA tensor");
+    return {std::move(storages), *device};
+}
+} // namespace
+#endif // ENABLE_MULTI_DEVICE
+
+void beginNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+{
+#if ENABLE_MULTI_DEVICE
+    auto [storages, device] = getTensorScopeInputs(inputs);
+    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().beginTensorLeaseScope(
+        storages, device, at::cuda::getCurrentCUDAStream(device));
+#else
+    (void) inputs;
+#endif
+}
+
+void endNCCLWindowTensorScope(torch::List<torch::Tensor> const& outputs, bool failed)
+{
+#if ENABLE_MULTI_DEVICE
+    auto [storages, device] = getTensorScopeInputs(outputs);
+    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().endTensorLeaseScope(
+        storages, device, at::cuda::getCurrentCUDAStream(device), failed);
+#else
+    (void) outputs;
+    (void) failed;
+#endif
+}
+
 namespace
 {
 
@@ -2389,8 +2439,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
+    // Scope boundaries change allocator ownership associated with tensor storage. Mutable aliases
+    // make that side effect visible to the dispatcher.
+    m.def("begin_nccl_window_tensor_scope(Tensor(a!)[] inputs) -> ()");
+    m.def("end_nccl_window_tensor_scope(Tensor(a!)[] outputs, bool failed) -> ()");
     m.def("set_nccl_window_graph_owner(int owner) -> ()");
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
+    m.def("synchronize_nccl_window_buffer_releases() -> ()");
     m.def(
         "minimax_allreduce_rms("
         "Tensor input,"
@@ -2423,6 +2478,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("begin_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::beginNCCLWindowTensorScope);
+    m.impl("end_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::endNCCLWindowTensorScope);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
@@ -2434,8 +2491,8 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
     m.impl("clear_allreduce_tactic_cache", &tensorrt_llm::torch_ext::clearAllReduceTacticCache);
 }
 
-// Graph-owner bookkeeping has no Tensor argument, so it cannot select CPU or
-// CUDA dispatch. CatchAll is required for these host-side operations.
+// Graph-owner and synchronization bookkeeping has no Tensor argument, so it cannot select CPU
+// or CUDA dispatch. CatchAll is required for these host-side operations.
 TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
 {
 #if ENABLE_MULTI_DEVICE
@@ -2445,9 +2502,12 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
     m.impl("release_nccl_window_graph_owner",
         [](int64_t owner)
         { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseGraphPoolOwner(owner); });
+    m.impl("synchronize_nccl_window_buffer_releases",
+        []() { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().synchronizeBufferReleases(); });
 #else
     m.impl("set_nccl_window_graph_owner", [](int64_t) {});
     m.impl("release_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("synchronize_nccl_window_buffer_releases", []() {});
 #endif
 }
 
@@ -2462,4 +2522,6 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
         });
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
     m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
+    m.impl("begin_nccl_window_tensor_scope", [](torch::List<torch::Tensor> const&) { return; });
+    m.impl("end_nccl_window_tensor_scope", [](torch::List<torch::Tensor> const&, bool) { return; });
 }
