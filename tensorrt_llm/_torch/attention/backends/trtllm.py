@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 if TYPE_CHECKING:
+    from .fmha.interface import FmhaParams
     from tensorrt_llm.mapping import Mapping
 
     from ...model_config import ModelConfig
@@ -30,10 +31,12 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention.backends.fmha.interface import (
-    MlaBackendPolicy, _CuteDslMlaStagingKey)
+    MlaBackendPolicy, _CuteDslMlaStagingKey, ensure_fmha_scheduler_counter,
+    fmha_scheduler_counter_elements)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1500,8 +1503,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
-        self.position_embedding_type = int(
-            pos_embd_params.type) if pos_embd_params is not None else 0
+        self.position_embedding_type = (pos_embd_params.type
+                                        if pos_embd_params is not None else
+                                        PositionEmbeddingType.learned_absolute)
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
@@ -1525,12 +1529,51 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: FmhaManager
+        self._fmha_scheduler_counter: Optional[torch.Tensor] = None
+        # Owns this layer's native attention op. Built on first use rather than here:
+        # `__init__` can run under a meta device or before CUDA is ready, while
+        # initializing the op creates a cuBLAS handle and the FMHA kernel runners.
+        self._attention_op: Optional[thop.AttentionOp] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
+    def attention_op(self, params: "FmhaParams") -> "thop.AttentionOp":
+        """This layer's native attention op, built on first use.
+
+        The op derives its head counts, parallel layout and MLA flags from the shape
+        below, which is fixed for a layer, so one op serves all of its calls;
+        `update_quant_config` and `release` cover the two moments that stops being
+        true. The shape is read off the first call's parameters rather than off this
+        object because the KV cache manager, not the layer, owns `tokens_per_block`.
+        """
+        if self._attention_op is None:
+            config = thop.StaticAttentionConfig()
+            config.num_heads = params.num_heads
+            config.num_kv_heads = params.num_kv_heads
+            config.head_size = params.head_size
+            config.tokens_per_block = params.tokens_per_block
+            config.is_mla_enable = params.is_mla_enable
+            config.kv_lora_rank = params.kv_lora_rank
+            config.qk_rope_head_dim = params.qk_rope_head_dim
+            config.quant_mode = params.quant_mode
+            config.skip_correction_threshold = self.skip_correction_threshold
+            self._attention_op = thop.AttentionOp(config)
+        return self._attention_op
+
+    def release(self) -> None:
+        """Drop the native op and the CUDA resources it owns.
+
+        Worth calling from an owner's teardown: the op holds a cuBLAS handle, the
+        kernel runners, and (for context parallelism) an NCCL communicator, none of
+        which should be destroyed at interpreter exit, after CUDA has gone away.
+        """
+        self._attention_op = None
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
-        self.quant_mode = int(self.quant_config.layer_quant_mode)
+        self.quant_mode = self.quant_config.layer_quant_mode
+        # The op's kernel selection is derived from the quantization mode.
+        self.release()
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
@@ -1735,6 +1778,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_mla_enable,
         )
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        """Per-head width of the attention output for this phase.
+
+        Single source of truth for the output buffer `create_output` allocates and
+        the view a phased FMHA library takes over it; the two must not drift. MLA
+        generation writes the latent (plus the rope part when it is not appended in
+        place), while MLA context writes the already-projected V head.
+        """
+        if not self.is_mla_enable:
+            return self.head_dim
+        if not is_gen_only:
+            return self.v_head_dim
+        return (self.kv_lora_rank if self.rope_append else self.kv_lora_rank +
+                self.qk_rope_head_dim)
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
@@ -1748,13 +1806,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_tokens = q.size(0)
         if out_dtype is None:
             out_dtype = q.dtype
-        v_head_size = self.head_dim
-        if self.is_mla_enable:
-            if is_gen_only:
-                v_head_size = self.kv_lora_rank if self.rope_append else (
-                    self.kv_lora_rank + self.qk_rope_head_dim)
-            else:
-                v_head_size = self.v_head_dim
+        v_head_size = self.out_head_size(is_gen_only)
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
@@ -1781,8 +1833,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.theta
 
     @property
-    def rope_scale_type(self) -> int:
-        return int(self.rope_params.scale_type)
+    def rope_scale_type(self) -> RotaryScalingType:
+        return self.rope_params.scale_type
 
     @property
     def rope_scale(self) -> float:
@@ -1803,6 +1855,56 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @property
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
+
+    def _ensure_fmha_scheduler_counter(
+        self,
+        q: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        needs_generation_counter = (forward_args.attention_input_type
+                                    != AttentionInputType.context_only
+                                    and metadata.num_generations > 0)
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        sparse_attn_indices = sparse_runtime_params.sparse_attn_indices
+        sparse_kv_indices = sparse_runtime_params.sparse_kv_indices
+        # The context kernels take the multi-CTA-KV counter on any trtllm-gen sparse
+        # path. That is the non-paged sparse-attention case (indices without offsets)
+        # and, for MLA, the sparse-KV case -- mirroring useTllmGenSparseAttention() in
+        # cpp/tensorrt_llm/thop/attentionOp.h.
+        has_unpaged_sparse_attn = (sparse_attn_indices is not None
+                                   and sparse_attn_indices.numel() > 0
+                                   and sparse_runtime_params.sparse_attn_offsets
+                                   is None)
+        has_sparse_mla = (self.is_mla_enable and sparse_kv_indices is not None
+                          and sparse_kv_indices.numel() > 0)
+        needs_sparse_context_counter = ((has_unpaged_sparse_attn
+                                         or has_sparse_mla)
+                                        and forward_args.attention_input_type
+                                        != AttentionInputType.generation_only
+                                        and metadata.num_contexts > 0)
+        if not needs_generation_counter and not needs_sparse_context_counter:
+            return
+
+        max_num_sequences = (metadata.max_num_sequences
+                             or metadata.max_num_requests)
+        required_elements = fmha_scheduler_counter_elements(
+            q.device, self.num_heads, max_num_sequences)
+
+        # Prefer a caller-supplied buffer that already satisfies the contract, so the
+        # sparse backends keep writing into the tensor they also read back.
+        counter = forward_args.fmha_scheduler_counter
+        if (counter is not None and counter.device == q.device
+                and counter.dtype == torch.int32
+                and counter.numel() >= required_elements):
+            counter.zero_()
+            return
+
+        cached = ensure_fmha_scheduler_counter(self._fmha_scheduler_counter,
+                                               q.device, self.num_heads,
+                                               max_num_sequences)
+        self._fmha_scheduler_counter = cached
+        forward_args.fmha_scheduler_counter = cached
 
     def forward(
         self,
@@ -1885,7 +1987,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
         # new latent to the paged cache, and fills the trtllm-gen scheduler
-        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
+        # sequence buffers (cumulative q/kv seqlens). When the
         # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
         # so we skip only the RoPE and do the append + scheduler init here: the
         # generation FMHA only reads the cache, and the fallback path needs the
@@ -1909,11 +2011,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
             forward_args.cu_q_seqlens = cu_q
             forward_args.cu_kv_seqlens = cu_kv
-            if forward_args.fmha_scheduler_counter is None:
-                forward_args.fmha_scheduler_counter = torch.zeros(
-                    1, dtype=torch.uint32, device=q.device)
-            else:
-                forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
             from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 
@@ -1963,6 +2060,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
             self, q, k, metadata, forward_args)
+
+        self._ensure_fmha_scheduler_counter(q, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata

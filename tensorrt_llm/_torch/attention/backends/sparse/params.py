@@ -19,6 +19,8 @@ from typing import Optional
 
 import torch
 
+from ..cpp_schema import cpp_metadata
+
 
 class SparseParams:
     """Base parameters for a sparse attention backend."""
@@ -35,7 +37,7 @@ class SparseBackendForwardArgs:
     """Sparse inputs passed from an attention module to its backend."""
 
     # Shared by algorithms that accept precomputed top-k indices.
-    topk_indices: Optional[torch.Tensor] = None
+    topk_indices: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -43,17 +45,17 @@ class SparseRuntimeParams:
     """Flat optional sparse inputs passed from a backend to ``AttentionOp``."""
 
     # Sparse index inputs shared by multiple algorithms.
-    sparse_kv_indices: Optional[torch.Tensor] = None
-    sparse_kv_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_kv_indices: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    sparse_kv_offsets: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    sparse_attn_indices: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
     # Per-query offsets, or backend-specific secondary sparse indices
     # (DeepSeek-V4 fp8_ds_mla compressed-pool indices).
-    sparse_attn_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices_block_size: int = 0
-    sparse_attn_kv_lens: Optional[torch.Tensor] = None
-    aux_kv_cache_pool_ptr: Optional[int] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    sparse_attn_indices_block_size: int = cpp_metadata(default=0)
+    sparse_attn_kv_lens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    aux_kv_cache_pool_ptr: Optional[int] = cpp_metadata(default=None)
 
     # SkipSoftmax prefill threshold; kernels divide it by context length.
-    threshold_scale_factor_prefill: float = 0.0
+    threshold_scale_factor_prefill: float = cpp_metadata(default=0.0)
     # SkipSoftmax decode threshold; diffusion models leave it at zero.
-    threshold_scale_factor_decode: float = 0.0
+    threshold_scale_factor_decode: float = cpp_metadata(default=0.0)

@@ -33,6 +33,8 @@
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
@@ -61,6 +63,7 @@ namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
 namespace tpb = tensorrt_llm::nanobind::batch_manager;
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 namespace tr = tensorrt_llm::runtime;
 namespace tle = tensorrt_llm::executor;
 using SizeType32 = tr::SizeType32;
@@ -179,6 +182,58 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("NVFP4", tensorrt_llm::DataType::kFP4)
         .export_values();
 
+    // Attention kernel enums and parameter structs. Bound here rather than in the thop
+    // submodule so every binding in the module presents them the same way; nanobind's
+    // enum caster still accepts a plain int for a valid enumerator, so Python callers may
+    // pass either these or the matching tensorrt_llm.functional IntEnum.
+    nb::enum_<tk::AttentionMaskType>(m, "AttentionMaskType", nb::is_arithmetic())
+        .value("PADDING", tk::AttentionMaskType::PADDING)
+        .value("CAUSAL", tk::AttentionMaskType::CAUSAL)
+        .value("SLIDING_WINDOW_CAUSAL", tk::AttentionMaskType::SLIDING_WINDOW_CAUSAL)
+        .value("BIDIRECTIONAL", tk::AttentionMaskType::BIDIRECTIONAL)
+        .value("BIDIRECTIONALGLM", tk::AttentionMaskType::BIDIRECTIONALGLM)
+        .value("BLOCKSPARSE", tk::AttentionMaskType::BLOCKSPARSE)
+        .value("CUSTOM_MASK", tk::AttentionMaskType::CUSTOM_MASK);
+
+    nb::enum_<tk::PositionEmbeddingType>(m, "PositionEmbeddingType", nb::is_arithmetic())
+        .value("LEARNED_ABSOLUTE", tk::PositionEmbeddingType::kLEARNED_ABSOLUTE)
+        .value("ROPE_GPTJ", tk::PositionEmbeddingType::kROPE_GPTJ)
+        .value("ROPE_GPT_NEOX", tk::PositionEmbeddingType::kROPE_GPT_NEOX)
+        .value("LONG_ROPE", tk::PositionEmbeddingType::kLONG_ROPE)
+        .value("ALIBI", tk::PositionEmbeddingType::kALIBI)
+        .value("ALIBI_WITH_SCALE", tk::PositionEmbeddingType::kALIBI_WITH_SCALE)
+        .value("RELATIVE", tk::PositionEmbeddingType::kRELATIVE)
+        .value("CHATGLM", tk::PositionEmbeddingType::kCHATGLM)
+        .value("YARN", tk::PositionEmbeddingType::kYARN)
+        .value("ROPE_M", tk::PositionEmbeddingType::kROPE_M);
+
+    nb::enum_<tk::RotaryScalingType>(m, "RotaryScalingType", nb::is_arithmetic())
+        .value("NONE", tk::RotaryScalingType::kNONE)
+        .value("LINEAR", tk::RotaryScalingType::kLINEAR)
+        .value("DYNAMIC", tk::RotaryScalingType::kDYNAMIC)
+        .value("LONG", tk::RotaryScalingType::kLONG)
+        .value("LLAMA3", tk::RotaryScalingType::kLLAMA3)
+        .value("YARN", tk::RotaryScalingType::kYARN)
+        .value("MROPE", tk::RotaryScalingType::kMROPE);
+
+    nb::class_<tk::BlockSparseParams>(m, "BlockSparseParams")
+        .def(nb::init<>())
+        .def_rw("block_size", &tk::BlockSparseParams::block_size)
+        .def_rw("homo_head_pattern", &tk::BlockSparseParams::homo_head_pattern)
+        .def_rw("num_local_blocks", &tk::BlockSparseParams::num_local_blocks)
+        .def_rw("vertical_stride", &tk::BlockSparseParams::vertical_stride);
+
+    nb::class_<tk::MlaMetaParams>(m, "MlaMetaParams")
+        .def(nb::init<>())
+        .def_rw("q_lora_rank", &tk::MlaMetaParams::q_lora_rank)
+        .def_rw("kv_lora_rank", &tk::MlaMetaParams::kv_lora_rank)
+        .def_rw("qk_nope_head_dim", &tk::MlaMetaParams::qk_nope_head_dim)
+        .def_rw("qk_rope_head_dim", &tk::MlaMetaParams::qk_rope_head_dim)
+        .def_rw("v_head_dim", &tk::MlaMetaParams::v_head_dim)
+        .def_rw("predicted_tokens_per_seq", &tk::MlaMetaParams::predicted_tokens_per_seq)
+        .def_rw("num_layers", &tk::MlaMetaParams::num_layers)
+        .def_rw("rope_append", &tk::MlaMetaParams::rope_append);
+
     nb::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
         .value("GPT", tr::ModelConfig::ModelVariant::kGpt)
         .value("GLM", tr::ModelConfig::ModelVariant::kGlm)
@@ -243,6 +298,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             nb::arg("mamba_in_proj_size") = 0, nb::arg("mamba_inner_size") = 0, nb::arg("moe_latent_size") = 0);
 
     nb::class_<tc::QuantMode>(m, "QuantMode")
+        .def(nb::init<tc::QuantMode::BaseType>(), nb::arg("value"))
         .def_static("none", &tc::QuantMode::none)
         .def_static("int4_weights", &tc::QuantMode::int4Weights)
         .def_static("int8_weights", &tc::QuantMode::int8Weights)
@@ -291,6 +347,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def(nb::self -= nb::self)
         .def(nb::self == nb::self)
         .def(nb::self != nb::self);
+
+    // Python's QuantMode is an IntFlag, so let its value cross as one.
+    nb::implicitly_convertible<tc::QuantMode::BaseType, tc::QuantMode>();
 
     nb::class_<tr::ModelConfig>(m, "ModelConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, tensorrt_llm::DataType>(),

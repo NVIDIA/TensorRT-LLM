@@ -894,3 +894,25 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     assert isinstance(attn._fmha_manager.fmha_libs[0], _NewFmha)
     assert quant_states_during_construction == [True]
     assert events == [("support", "old", None)]
+
+
+def test_a_new_manager_does_not_reuse_a_previous_selection() -> None:
+    """The selection cache belongs to the manager that owns the libs.
+
+    Rebuilding the libs means building a new manager, so a stale entry cannot survive
+    into a different lib set. A shared or module-level cache would break that.
+    """
+    events: list[tuple] = []
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    q = torch.empty((1, 4))
+    metadata = _make_metadata(num_contexts=0, num_generations=1)
+
+    selected = []
+    for name in ("old", "new"):
+        attn, manager = _make_manager()
+        manager.fmha_libs = [FakeFmha(attn, name, events)]
+        with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+            selected.append(manager.select(attn, q, None, None, metadata, forward_args))
+
+    assert [fmha._name for fmha in selected] == ["old", "new"]
+    assert events == [("support", "old", None), ("support", "new", None)]
