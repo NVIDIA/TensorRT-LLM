@@ -3,7 +3,6 @@
 """Tests for the reusable sparse index-selection Top-K module."""
 
 import sys
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -129,8 +128,6 @@ def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
         output,
         2,
         2,
-        pre_idx=None,
-        heuristic_scratch=None,
         compress_ratio=4,
         radix_aux_indices=radix_indices,
         radix_aux_logits=radix_values,
@@ -280,8 +277,6 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
         output,
         1,
         2,
-        pre_idx=None,
-        heuristic_scratch=None,
         compress_ratio=4,
         radix_aux_indices=None,
         radix_aux_logits=None,
@@ -349,7 +344,6 @@ def test_gvr_v2_does_not_update_prior_from_prefill() -> None:
 
 
 def test_needs_gvr_prior_follows_two_level_dispatch() -> None:
-    assert TopK(2, decode_implementation=TopKImplementation.CUDA_GVR).needs_gvr_prior
     assert not TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR).needs_gvr_prior
     assert TopK(
         2,
@@ -390,74 +384,10 @@ def test_cuda_radix_defaults_dispatch_to_cpp(monkeypatch) -> None:
         output,
         1,
         1,
-        pre_idx=None,
-        heuristic_scratch=None,
         compress_ratio=1,
         radix_aux_indices=radix_indices,
         radix_aux_logits=radix_values,
     )
-
-
-def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
-    decode = Mock(side_effect=lambda *args, **kwargs: args[2].copy_(torch.tensor([[3, 1]])))
-    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
-    device_context = Mock(side_effect=lambda _: nullcontext())
-    monkeypatch.setattr(torch.cuda, "device", device_context)
-
-    top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
-    scores = Mock(
-        shape=(1, 8),
-        dtype=torch.float32,
-        is_cuda=True,
-        device=torch.device("cuda", 3),
-    )
-    lengths = torch.tensor([8], dtype=torch.int32)
-    output = torch.empty(1, 2, dtype=torch.int32)
-    radix_indices = torch.empty(1, 10, 2, dtype=torch.int32)
-    radix_values = torch.empty(1, 10, 2)
-    workspace = torch.empty(1, 2)
-    prior_indices = torch.zeros(1, 2, dtype=torch.int32)
-    buffers = Mock()
-    buffers.get_buffer.side_effect = [workspace, radix_indices, radix_values]
-    monkeypatch.setattr(TopK, "_memory_buffers", buffers)
-
-    top_k(
-        scores,
-        output,
-        is_prefill=False,
-        sequence_lengths=lengths,
-        scan_lengths=lengths,
-        gvr_ext_kwargs={"gvr_prior_indices": prior_indices},
-    )
-
-    assert buffers.get_buffer.call_args_list == [
-        call(
-            (scores.shape[0], 2),
-            dtype=scores.dtype,
-            buffer_name="top_k_cuda_gvr_workspace_cuda:3",
-            reserve_buffer=True,
-        ),
-        call(
-            (scores.shape[0], 10, 2),
-            dtype=torch.int32,
-            buffer_name="top_k_radix_indices_workspace_cuda:3",
-            reserve_buffer=True,
-        ),
-        call(
-            (scores.shape[0], 10, 2),
-            dtype=torch.float32,
-            buffer_name="top_k_radix_values_workspace_cuda:3",
-            reserve_buffer=True,
-        ),
-    ]
-    assert device_context.call_args_list == [call(scores.device)] * 3
-    runtime_call = decode.call_args_list[-1]
-    assert runtime_call.kwargs["pre_idx"] is prior_indices
-    assert runtime_call.kwargs["heuristic_scratch"].data_ptr() == workspace.data_ptr()
-    assert runtime_call.kwargs["radix_aux_indices"] is radix_indices
-    assert runtime_call.kwargs["radix_aux_logits"] is radix_values
-    assert prior_indices.tolist() == [[0, 0]]
 
 
 def test_unsupported_prefill_implementation_raises() -> None:
