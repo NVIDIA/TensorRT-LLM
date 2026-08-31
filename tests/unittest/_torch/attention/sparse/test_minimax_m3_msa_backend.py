@@ -60,32 +60,15 @@ def test_msa_import_preserves_cute_compile_option_selection() -> None:
         pytest.skip("fmha_sm100 (MSA) not importable")
 
     import cutlass.cute as cute
+
+    original_compile = cute.compile
     from fmha_sm100.cute import interface as sparse_interface
 
     del sparse_interface
+    assert cute.compile is original_compile
     assert callable(cute.compile)
     selected_compile = cute.compile[cute.FrontendNext]
     assert callable(selected_compile)
-    assert callable(selected_compile._minimax_compile_callable)
-    assert selected_compile._minimax_compile_callable is not cute.compile._minimax_compile_callable
-
-    selected_options = []
-    selected_calls = []
-
-    class FakeCompile:
-        def __call__(self, *args, **kwargs):
-            selected_calls.append((args, kwargs))
-            return "compiled"
-
-        def __getitem__(self, options):
-            selected_options.append(options)
-            return self
-
-    option = object()
-    profiled_compile = type(cute.compile)(FakeCompile())[option]
-    assert profiled_compile("kernel", flag=True) == "compiled"
-    assert selected_options == [option]
-    assert selected_calls == [(("kernel",), {"flag": True})]
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
