@@ -186,12 +186,6 @@ def test_nvfp4_linear_marlin_opt_in_switches_to_weight_only_method(
 
     with (
         patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=sm_version),
-        # is_nvfp4_marlin_supported_sm reads its own get_sm_version binding in
-        # utils.py, so it has to be patched alongside linear's.
-        patch(
-            "tensorrt_llm._torch.modules.linear.is_nvfp4_marlin_supported_sm",
-            return_value=89 <= sm_version < 100,
-        ),
         patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
         patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
     ):
@@ -287,7 +281,7 @@ def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize(
 
     with (
         patch(
-            "tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4.dequant_nvfp4_2d_triton",
+            "tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4.dequant_nvfp4_2d_triton",
             side_effect=fake_dequant,
         ),
         patch("torch.ops.trtllm.fp4_quantize", side_effect=fail_fp4_quantize, create=True),

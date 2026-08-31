@@ -355,7 +355,12 @@ class Compressor(nn.Module):
 
         rope_dim = self.rope_head_dim
         half = rope_dim // 2
-        cos_sin = self.rotary_emb.rotary_cos_sin.view(-1, rope_dim)[position_ids.to(torch.long)]
+        # Reserved padding slots may carry uninitialized position IDs and are
+        # discarded by compressed_mask during scatter.
+        safe_position_ids = torch.where(compressed_mask, position_ids, 0)
+        cos_sin = self.rotary_emb.rotary_cos_sin.view(-1, rope_dim)[
+            safe_position_ids.to(torch.long)
+        ]
         cos, sin = cos_sin[:, :half], cos_sin[:, half:]
         rope = x[:, self.nope_head_dim :]
         even, odd = rope[:, 0::2], rope[:, 1::2]

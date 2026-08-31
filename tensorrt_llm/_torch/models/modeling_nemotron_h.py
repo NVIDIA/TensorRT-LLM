@@ -41,16 +41,16 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
-from ..modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from ..modules.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
-                                              W4A16NVFP4CutlassFusedMoEMethod)
 from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
                               W4A16NVFP4LinearMethod)
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MoEWeightLoadingMode, create_moe
+from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
+                                          W4A16NVFP4CutlassFusedMoEMethod)
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor

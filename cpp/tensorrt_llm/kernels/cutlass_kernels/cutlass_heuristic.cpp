@@ -382,10 +382,19 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     std::vector<CutlassGemmConfig> candidate_configs;
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
     {
+        // FP4 block-scaled types only support the TMA epilogue schedule on SM107.
+        // SM107 uses the shared tile set below; the SM100-only tiles are not enabled for it.
+        if (sm == 107 && schedule != EpilogueScheduleType::TMA)
+        {
+            return {};
+        }
+
         if (sm == 100)
         {
+            // FP4 block-scaled types only support TMA epilogue schedule
             if (schedule != EpilogueScheduleType::TMA)
                 return {};
+
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x64x128B,
                 MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape, sm});
             if (supports_2sm)
@@ -499,6 +508,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(
             ClusterShape::Undefined, sm},
     };
 #else
+    if (tensorrt_llm::common::isSM100Family(sm) && sm != 103 && sm != 107)
+    {
+        TLLM_LOG_INFO("Reassigned sm version to 100 for unknown sm version belonging to SM100 family");
+        sm = 100;
+    }
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         std::vector<CutlassGemmConfig> candidate_configs;
