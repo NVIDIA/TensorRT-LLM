@@ -1195,6 +1195,31 @@ def ltx2_two_stage_assets_exist():
     return True
 
 
+class TestLTX2CudaGraphSetup:
+    def test_uses_pipeline_shared_pool(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        class TinyTransformer:
+            def register_cuda_graph_extra_key_fns(self, runner):
+                pass
+
+            def forward(self, *args, **kwargs):
+                return args, kwargs
+
+        pipeline = object.__new__(LTX2Pipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+
+        pipeline._setup_cuda_graphs()
+
+        runner = pipeline._cuda_graph_runners["transformer"]
+        assert runner._shared_pool is pipeline._cuda_graph_shared_pool
+
+
 class TestLTX2TwoStageLoRAHelpers:
     """Test LTX-2 two-stage distilled LoRA helpers without model loading."""
 
@@ -1361,6 +1386,7 @@ class TestLTX2TwoStageLoRAHelpers:
 
         runner = pipeline._cuda_graph_runners["transformer"]
         assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
+        assert runner._shared_pool is pipeline._cuda_graph_shared_pool
         assert runner._lora_state_getter() == "original"
         assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
 

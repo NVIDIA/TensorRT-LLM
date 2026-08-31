@@ -367,6 +367,51 @@ def test_encoder_graph_tensor_spec_materialize(token_dim, expected_shape):
     assert tuple(t.shape) == expected_shape
 
 
+def test_clear_resets_graphs_before_releasing_pool_owner():
+    runner = MultimodalEncoderGraphRunner.__new__(MultimodalEncoderGraphRunner)
+    events = []
+    first_graph = mock.Mock()
+    second_graph = mock.Mock()
+    first_graph.reset.side_effect = lambda: events.append("reset-first")
+    second_graph.reset.side_effect = lambda: events.append("reset-second")
+    runner._captured = {
+        EncoderGraphKey(total_tokens=8, num_contexts=1): mock.Mock(graph=first_graph),
+        EncoderGraphKey(total_tokens=16, num_contexts=1): mock.Mock(graph=second_graph),
+    }
+    runner._memory_pool = (12345, 67890)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.multimodal_encoder_graph.release_nccl_window_graph_owner",
+        side_effect=lambda pool: events.append(("release", pool)),
+    ):
+        runner.clear()
+        runner.clear()
+
+    assert events == [
+        "reset-first",
+        "reset-second",
+        ("release", (12345, 67890)),
+    ]
+    assert runner._captured == {}
+    assert runner._memory_pool is None
+
+
+def test_uncoordinated_clear_does_not_release_pool_owner():
+    runner = MultimodalEncoderGraphRunner.__new__(MultimodalEncoderGraphRunner)
+    graph = mock.Mock()
+    runner._captured = {EncoderGraphKey(total_tokens=8, num_contexts=1): mock.Mock(graph=graph)}
+    runner._memory_pool = (12345, 67890)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.multimodal_encoder_graph.release_nccl_window_graph_owner"
+    ) as release_owner:
+        runner.clear(release_nccl_window_owners=False)
+
+    graph.reset.assert_called_once_with()
+    release_owner.assert_not_called()
+    assert runner._memory_pool is None
+
+
 pytestmark_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="MultimodalEncoderGraphRunner requires CUDA",
