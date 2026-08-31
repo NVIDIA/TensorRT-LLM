@@ -6557,6 +6557,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
+    // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
+    // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
+    // wall-clock duration instead of a fixed prompt count, so they are pinned to
+    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
+    // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
+        1,
+        24,
+        6
+    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
