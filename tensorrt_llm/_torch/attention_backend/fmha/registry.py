@@ -38,10 +38,10 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
     return {
         "triton_custom_mask": TritonCustomMaskFmha,
-        "prims_ts": PrimsTSFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
         "msa_sparse_gqa": MsaSparseGqaFmha,
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
+        "prims_ts": PrimsTSFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }
