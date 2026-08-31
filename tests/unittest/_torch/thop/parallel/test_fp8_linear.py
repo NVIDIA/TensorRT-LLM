@@ -31,11 +31,7 @@ def test_fp8_linear(dtype, bias):
                 dtype=dtype,
                 quant_config=qc)
     assert l0.weight.dtype == torch.float8_e4m3fn
-    weights = {
-        'weight': w_fp8,
-        'weight_scale': w_scale,
-        'input_scale': x_scale
-    }
+    weights = {'weight': w_fp8, 'weight_scale': w_scale, 'input_scale': x_scale}
     if bias:
         weights['bias'] = torch.randn(HIDDEN_SIZE, dtype=dtype).cuda()
     l0.load_weights([weights])
