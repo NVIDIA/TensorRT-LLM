@@ -30,6 +30,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..nccl_window_graph import release_nccl_window_graph_owner
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
@@ -121,8 +122,11 @@ class Backend:
 
     def clear_piecewise_cuda_graphs(self) -> None:
         runners = list(self._piecewise_runners)
+        old_pools = {runner.graph_pool_handle for runner in runners}
         for runner in runners:
             runner.clear_cuda_graphs()
+        for graph_pool in old_pools:
+            release_nccl_window_graph_owner(graph_pool)
 
         # CUDACachingAllocator does not allow a private pool handle to be
         # reused after its last graph is reset. Preserve the sharing between

@@ -25,6 +25,7 @@ import torch.nn as nn
 from pydantic import Field
 
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.nccl_window_graph import release_nccl_window_graph_owner
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.media_io import MediaModality
@@ -126,6 +127,7 @@ class BasePipeline(nn.Module):
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._device = torch.device(getattr(pipeline_config, "device", "cuda"))
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._cuda_graph_shared_pool: Optional[SharedGraphPool] = None
         self.offloader = PipelineOffloader(self)
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
@@ -175,6 +177,14 @@ class BasePipeline(nn.Module):
             return enumerate(timesteps)
         return self._profiler.steps(timesteps)
 
+    def _get_or_create_cuda_graph_shared_pool(self) -> SharedGraphPool:
+        """Return the pipeline-owned pool shared by non-concurrent graph runners."""
+        shared_pool = getattr(self, "_cuda_graph_shared_pool", None)
+        if shared_pool is None:
+            shared_pool = SharedGraphPool()
+            self._cuda_graph_shared_pool = shared_pool
+        return shared_pool
+
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
 
@@ -199,7 +209,7 @@ class BasePipeline(nn.Module):
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
             )
-            shared_pool = SharedGraphPool()
+            shared_pool = self._get_or_create_cuda_graph_shared_pool()
         else:
             shared_pool = None
 
@@ -1456,6 +1466,13 @@ class BasePipeline(nn.Module):
         self._profiler.close_window()
 
         self.offloader.cleanup()
+        graph_pools = {
+            runner._get_pool()
+            for runner in self._cuda_graph_runners.values()
+            if runner._get_pool() is not None
+        }
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
+        for graph_pool in graph_pools:
+            release_nccl_window_graph_owner(graph_pool)

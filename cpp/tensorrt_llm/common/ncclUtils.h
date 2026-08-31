@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -220,10 +221,18 @@ public:
     static NCCLWindowAllocator& getInstance();
 
     // Request a buffer for the given communicator and size.
-    // If an unused buffer of at least the requested size exists for this communicator, it will be reused.
-    // Uses best-fit strategy: selects the smallest available buffer that meets the size requirement.
-    // Otherwise, a new buffer is allocated and registered.
+    // Eager requests only reuse unowned buffers. A request made during CUDA graph capture first
+    // reuses buffers owned by that PyTorch graph memory pool, then may claim an unowned buffer for it.
+    // Uses best-fit strategy: selects the smallest eligible buffer that meets the size requirement.
+    // New allocation/registration is prohibited during capture.
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size);
+
+    // Select the allocation domain on this host thread. owner == -1 explicitly selects eager;
+    // owner >= 0 selects a stable PyTorch graph-memory-pool owner. Other values are invalid.
+    void setGraphPoolOwner(int64_t owner);
+    // Return this owner's idle buffers to eager use. Buffers still in use are
+    // returned when releaseBuffer is called.
+    void releaseGraphPoolOwner(int64_t owner);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
@@ -271,6 +280,11 @@ private:
 
     using CudaGetLastErrorFunc = cudaError_t (*)();
 
+    // Drain the sticky CUDA error when capture state cannot be queried because another
+    // thread owns a global capture. Returns true when the caller must use an unregistered buffer.
+    static bool clearCudaErrorIfCaptureStateUnknown(
+        cudaError_t captureError, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
+
     // Drain the sticky CUDA error left by a failed symmetric allocation.
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
         int localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
@@ -288,6 +302,10 @@ private:
     {
         NCCLWindowBuffer buffer;
         bool inUse;
+        // Empty for eager/ungraphed buffers. A value reserves the buffer for captures sharing
+        // that exact PyTorch graph memory pool.
+        std::optional<uint64_t> graphPoolOwner;
+        bool releaseOwnerWhenUnused{false};
     };
 
     mutable std::mutex mMutex;
@@ -382,15 +400,10 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
-    try
-    {
-        buffer = allocator.requestBuffer(*comm, buffer_size);
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
-        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
-    }
+    // Expected resource failures, unknown capture state, and captures without a graph-pool owner
+    // return an invalid buffer so callers can use their existing unregistered fallback. Other
+    // programming errors must propagate instead of silently changing the collective implementation.
+    buffer = allocator.requestBuffer(*comm, buffer_size);
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())

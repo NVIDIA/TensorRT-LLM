@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ast
 import contextlib
 import copy
@@ -19,6 +22,8 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -1461,6 +1466,20 @@ class AutoTuner:
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
             graph = torch.cuda.CUDAGraph()
 
+            @contextlib.contextmanager
+            def graph_pool_lifetime():
+                if not use_cuda_graph:
+                    yield None
+                    return
+                graph_pool = torch.cuda.graph_pool_handle()
+                try:
+                    yield graph_pool
+                finally:
+                    # The owner can return its windows to the eager pool only
+                    # after the profiling graph is no longer replayable.
+                    graph.reset()
+                    release_nccl_window_graph_owner(graph_pool)
+
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
                 end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
@@ -1488,9 +1507,9 @@ class AutoTuner:
                 def elapsed_time():
                     return start_evt.elapsed_time(end_evt)
 
-            with torch.cuda.stream(stream):
+            with graph_pool_lifetime() as graph_pool, torch.cuda.stream(stream):
                 if use_cuda_graph:
-                    with torch.cuda.graph(graph):
+                    with nccl_window_graph_capture(graph, graph_pool):
                         for r in range(repeat):
                             runner(
                                 input_tensor_batches[r %

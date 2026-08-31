@@ -52,6 +52,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_nccl_window_graph.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
@@ -73,6 +74,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
   - unittest/_torch/visual_gen/test_wan_timestep_routing.py
   - unittest/_torch/weight_sharing
+  - unittest/auto_deploy/singlegpu/shim/test_engine.py::test_ad_engine_releases_nccl_window_graph_owners
   - unittest/api_stability
   - unittest/bindings
   - unittest/disaggregated

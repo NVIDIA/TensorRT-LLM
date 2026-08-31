@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterator, Optional
 import torch
 from torch import nn
 
+from ..nccl_window_graph import abandon_nccl_window_graph_owner, release_nccl_window_graph_owner
 from ..utils import make_weak_ref
 from .breakable_cuda_graph import (
     BreakableCUDAGraph,
@@ -107,6 +108,8 @@ class BreakableCUDAGraphRunner:
             if graph is not None:
                 graph.reset()
             if created_memory_pool and not self._graphs:
+                # Capture failure can be rank-local; do not return this pool to reuse.
+                abandon_nccl_window_graph_owner(self._memory_pool)
                 self._memory_pool = None
                 self._shared_output = None
             raise
@@ -202,11 +205,13 @@ class BreakableCUDAGraphRunner:
             self.layer_model.forward = original_forward
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
-    def clear(self) -> None:
+    def clear(self, *, release_nccl_window_owners: bool = True) -> None:
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot clear BCG while runner is {self._state.value}")
         for graph in self._graphs.values():
             graph.reset()
+        if release_nccl_window_owners and self._memory_pool is not None:
+            release_nccl_window_graph_owner(self._memory_pool)
         self._graphs.clear()
         self._outputs.clear()
         self._shared_output = None
