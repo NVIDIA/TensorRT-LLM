@@ -3869,6 +3869,118 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
+// [TEMP] DLFW 26.08 bring-up diagnostic -- REVERT BEFORE MERGE.
+//
+// Under the 26.08 base image (Open MPI 5 replaces Open MPI 4) every
+// MPIPoolSession worker spawn in the K8s test pods hangs: the identity
+// barrier times out at 300s with 0/N workers and the worker side prints
+// nothing at all. The minimal repro is
+// unittest/llmapi/test_mpi_session.py::test_mpi_session_basic, which hangs on
+// a CPU-only pod, so it is neither GPU- nor model-related.
+//
+// docker/common/switch_to_ompi5.sh only strips ompi4 from ld.so.conf.d; it
+// does not touch PATH or LD_LIBRARY_PATH, and LD_LIBRARY_PATH takes
+// precedence over the ldconfig cache. The build pods never exercised this
+// because the NGC entrypoint (/opt/nvidia/entrypoint.d/*.sh) that assembles
+// LD_LIBRARY_PATH only runs when the container starts under docker.
+//
+// This dumps the resolved MPI stack and runs a bounded spawn probe with the
+// PRRTE/PMIx launch plumbing made verbose. Never fails the stage.
+def mpiStackDiagnostics(pipeline, stageName)
+{
+    pipeline.sh """
+        set +e
+        echo "===== [TEMP][mpi-diag] BEGIN (${stageName}) ====="
+
+        echo "--- search paths ---"
+        echo "PATH=\$PATH"
+        echo "LD_LIBRARY_PATH=\$LD_LIBRARY_PATH"
+
+        echo "--- hpcx layout ---"
+        ls -l /opt/hpcx 2>&1
+        readlink -f /opt/hpcx/ompi /usr/local/mpi 2>&1
+
+        echo "--- ld.so.conf.d entries mentioning hpcx ---"
+        grep -rn hpcx /etc/ld.so.conf.d/ 2>&1
+
+        echo "--- ldconfig cache for the colliding sonames ---"
+        ldconfig -p | grep -E 'libmpi\\.|libpmix|libopen-pal|libprrte' 2>&1
+
+        echo "--- launcher binaries ---"
+        which mpirun prte prted orted ompi_info 2>&1
+        mpirun --version 2>&1 | head -2
+        prte --version 2>&1 | head -2
+
+        echo "--- mpi4py linkage ---"
+        python3 -c "import mpi4py, mpi4py.MPI as M; print(mpi4py.__version__); print(M.__file__); print(M.Get_library_version().strip())" 2>&1
+        ldd \$(python3 -c "import mpi4py.MPI as M; print(M.__file__)" 2>/dev/null) 2>&1 | grep -E 'mpi|pmix|open-pal|prrte'
+
+        echo "--- tensorrt_llm bindings linkage ---"
+        ldd \$(python3 -c "import tensorrt_llm.bindings as b; print(b.__file__)" 2>/dev/null) 2>&1 | grep -E 'mpi|pmix|open-pal|prrte'
+
+        echo "--- /dev/shm ---"
+        df -h /dev/shm 2>&1
+
+        echo "--- bounded spawn probe (verbose PRRTE/PMIx) ---"
+        cat > /tmp/mpi_spawn_probe.py <<'PROBE_EOF'
+import sys
+import time
+
+from mpi4py import MPI
+
+print("[probe] library: " + MPI.Get_library_version().strip().splitlines()[0], flush=True)
+
+for name, make in (
+        ("COMM_WORLD.Dup", lambda: MPI.COMM_WORLD.Dup()),
+        ("COMM_WORLD.Split_type(SHARED)",
+         lambda: MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED, 0, MPI.INFO_NULL)),
+):
+    try:
+        comm = make()
+        print(f"[probe] {name} OK size={comm.Get_size()}", flush=True)
+        comm.Free()
+    except Exception as e:
+        print(f"[probe] {name} FAILED: {e!r}", flush=True)
+
+# Raw MPI_Comm_spawn, no mpi4py.futures: separates the MPI runtime from the
+# executor's manager thread, which is where the CI hang swallows the error.
+t0 = time.time()
+try:
+    child = MPI.COMM_SELF.Spawn(
+        sys.executable,
+        args=["-c", "from mpi4py import MPI; MPI.Comm.Get_parent().Disconnect()"],
+        maxprocs=1)
+    print(f"[probe] raw Comm_spawn OK in {time.time() - t0:.1f}s", flush=True)
+    child.Disconnect()
+except Exception as e:
+    print(f"[probe] raw Comm_spawn FAILED after {time.time() - t0:.1f}s: {e!r}", flush=True)
+
+# The exact CI path: constructor submits _worker_identity_barrier to the pool.
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+t0 = time.time()
+try:
+    session = MpiPoolSession(n_workers=1, wait_shutdown=True)
+    print(f"[probe] MpiPoolSession OK in {time.time() - t0:.1f}s "
+          f"identities={session._worker_identities}", flush=True)
+    session.shutdown()
+except Exception as e:
+    print(f"[probe] MpiPoolSession FAILED after {time.time() - t0:.1f}s: {e!r}", flush=True)
+PROBE_EOF
+        TRTLLM_MPI_IDENTITY_TIMEOUT=120 \
+        PRTE_MCA_plm_base_verbose=100 \
+        PRTE_MCA_state_base_verbose=10 \
+        OMPI_MCA_dpm_base_verbose=100 \
+        PMIX_MCA_pmix_client_verbose=100 \
+        PMIX_MCA_ptl_base_verbose=100 \
+            timeout -k 10 300 python3 -u /tmp/mpi_spawn_probe.py 2>&1
+        echo "[TEMP][mpi-diag] probe exit status: \$?"
+
+        echo "===== [TEMP][mpi-diag] END (${stageName}) ====="
+        exit 0
+    """
+}
+
 def runLLMDocBuild(pipeline, config)
 {
     // Step 1: cloning source code
@@ -5017,6 +5129,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
+
+        // [TEMP] DLFW 26.08 bring-up diagnostic -- REVERT BEFORE MERGE.
+        mpiStackDiagnostics(pipeline, stageName)
     }
 
     if (testFilter[(DEBUG_MODE)]) {
