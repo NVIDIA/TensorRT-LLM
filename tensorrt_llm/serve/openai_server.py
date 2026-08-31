@@ -3056,6 +3056,7 @@ class OpenAIServer(_VideoRoutesMixin):
         with ``request.format`` extended to accept tensor payloads
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
+        request_received = time.perf_counter()
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3168,8 +3169,9 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} generated and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
+            total = time.perf_counter() - request_received
             headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics))
+                build_visual_gen_server_timings(metrics, total=total))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
@@ -3318,6 +3320,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_image_edit(self, raw_request: Request) -> Response:
         """OpenAI-compatible image editing endpoint."""
+        request_received = time.perf_counter()
         if not self._supports_image_edit():
             return self._create_not_supported_error(
                 "Image editing is not supported by the loaded visual generation model."
@@ -3404,8 +3407,9 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} edited and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
+            total = time.perf_counter() - request_received
             headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics))
+                build_visual_gen_server_timings(metrics, total=total))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 

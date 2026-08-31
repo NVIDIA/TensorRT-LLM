@@ -628,6 +628,18 @@ class TestImageGeneration:
         assert len(decoded) > 0
         assert img_obj["revised_prompt"] == "A cat sitting on a mat"
 
+    def test_image_generation_server_timing_has_total(self, image_client):
+        """The Server-Timing header carries generation, denoise, and ``total``
+        (full server time; real wall-clock, so only checked > 0)."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={"prompt": "timing", "response_format": "b64_json", "size": "64x64"},
+        )
+        assert resp.status_code == 200
+        assert _server_timing_ms(resp.headers, "generation") == 1250.0
+        assert _server_timing_ms(resp.headers, "denoise") == 750.0
+        assert _server_timing_ms(resp.headers, "total") > 0
+
     def test_image_generation_with_optional_params(self, image_client):
         resp = image_client.post(
             "/v1/images/generations",
@@ -1059,6 +1071,24 @@ class TestImageEdit:
         assert content.status_code == 200
         assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
         assert content.headers["content-type"] == "image/png"
+
+    def test_image_edit_server_timing_has_total(self, tmp_path, monkeypatch):
+        """The edit route reports ``total`` too (real wall-clock, so > 0)."""
+        client, _ = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "timing",
+                "image": _b64_white_png_1x1(),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert _server_timing_ms(resp.headers, "generation") == 1250.0
+        assert _server_timing_ms(resp.headers, "denoise") == 750.0
+        assert _server_timing_ms(resp.headers, "total") > 0
 
     def test_image_edit_response_format_path_returns_on_disk_path(self, tmp_path, monkeypatch):
         """``response_format='path'`` returns the server-side output path
