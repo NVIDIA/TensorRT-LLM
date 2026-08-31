@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 
 def _qsa_pdl_enabled(rows: int) -> bool:
@@ -1010,6 +1011,164 @@ def _qsa_paged_index_scores_kernel(
             )
 
 
+@triton.jit
+def _qsa_paged_index_scores_qtile_kernel(
+    q,
+    index_cache,
+    block_table,
+    query_positions,
+    request_indices,
+    output,
+    score_scale,
+    num_rows,
+    q_stride_row: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    cache_stride_page: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    block_table_stride_request: tl.constexpr,
+    block_table_stride_page: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    output_stride_block: tl.constexpr,
+    NUM_INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    MAX_COMPRESSED_BLOCKS: tl.constexpr,
+    QUERY_TILE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    TILES_PER_PROGRAM: tl.constexpr,
+    ONLY_VISIBLE_BLOCKS: tl.constexpr,
+):
+    row_base = tl.program_id(0) * QUERY_TILE
+    first_tile = tl.program_id(1) * TILES_PER_PROGRAM
+
+    # One dot column per (query row, index head) pair, so the tile carries
+    # QUERY_TILE whole rows instead of one row and NUM_INDEX_HEADS of padding.
+    dot_columns = tl.arange(0, BLOCK_H)
+    column_row = dot_columns // NUM_INDEX_HEADS
+    column_head = dot_columns % NUM_INDEX_HEADS
+    rows = row_base + column_row
+    present = rows < num_rows
+
+    requests = tl.load(request_indices + rows, mask=present, other=-1).to(tl.int64)
+    positions = tl.load(query_positions + rows, mask=present, other=0)
+    visible_blocks = tl.where(present, (positions + 1) // COMPRESS_RATIO, 0)
+    if ONLY_VISIBLE_BLOCKS and first_tile * BLOCK_N >= tl.max(visible_blocks):
+        return
+
+    dim_offsets = tl.arange(0, INDEX_HEAD_DIM)
+    query_values = tl.load(
+        q
+        + rows[None, :] * q_stride_row
+        + dim_offsets[:, None] * q_stride_dim
+        + column_head[None, :] * q_stride_head,
+        mask=present[None, :],
+        other=0.0,
+    )
+    column_offsets = tl.arange(0, BLOCK_N)
+
+    # A gather is only shareable across rows that page through the same block
+    # table, so score one request at a time. Context rows arrive packed per
+    # request, which leaves a single group for all but the boundary tiles.
+    previous_requests = tl.load(
+        request_indices + rows - 1,
+        mask=present & (rows > 0),
+        other=-1,
+    ).to(tl.int64)
+    group_leaders = (
+        present & (column_head == 0) & ((column_row == 0) | (requests != previous_requests))
+    )
+    pending = present
+    for _ in tl.range(0, tl.sum(group_leaders.to(tl.int32))):
+        leader = tl.min(tl.where(pending, dot_columns, BLOCK_H))
+        request = tl.max(tl.where(dot_columns == leader, requests, 0))
+        group = pending & (requests == request)
+        pending = pending & (requests != request)
+        group_visible = tl.max(tl.where(group, visible_blocks, 0))
+        last_tile = tl.minimum(
+            first_tile + TILES_PER_PROGRAM,
+            tl.cdiv(
+                group_visible if ONLY_VISIBLE_BLOCKS else MAX_COMPRESSED_BLOCKS,
+                BLOCK_N,
+            ),
+        )
+        for tile in tl.range(first_tile, last_tile, num_stages=2):
+            block_columns = tile * BLOCK_N + column_offsets
+            valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < group_visible)
+            anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
+            logical_pages = anchor_positions // TOKENS_PER_BLOCK
+            token_in_page = anchor_positions % TOKENS_PER_BLOCK
+            physical_pages = tl.load(
+                block_table
+                + request * block_table_stride_request
+                + logical_pages * block_table_stride_page,
+                mask=valid_blocks,
+                other=0,
+            ).to(tl.int64)
+            keys = tl.load(
+                index_cache
+                + physical_pages[:, None] * cache_stride_page
+                + token_in_page[:, None] * cache_stride_token
+                + dim_offsets[None, :] * cache_stride_dim,
+                mask=valid_blocks[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            )
+            positive_scores = tl.maximum(
+                tl.dot(keys, query_values, out_dtype=tl.float32),
+                0.0,
+            )
+            for lane in tl.static_range(QUERY_TILE):
+                row_columns = group & (column_row == lane)
+                scored = tl.max(row_columns.to(tl.int32)) > 0
+                row_visible = tl.max(tl.where(row_columns, visible_blocks, 0))
+                scores = tl.sum(
+                    tl.where(row_columns[None, :], positive_scores, 0.0),
+                    axis=1,
+                )
+                output_ptrs = (
+                    output
+                    + (row_base + lane) * output_stride_row
+                    + block_columns * output_stride_block
+                )
+                row_valid = block_columns < row_visible
+                if ONLY_VISIBLE_BLOCKS:
+                    tl.store(
+                        output_ptrs,
+                        scores * score_scale,
+                        mask=scored & row_valid,
+                    )
+                else:
+                    tl.store(
+                        output_ptrs,
+                        tl.where(row_valid, scores * score_scale, -float("inf")),
+                        mask=scored & (block_columns < MAX_COMPRESSED_BLOCKS),
+                    )
+
+
+# ``tl.dot`` needs at least 16 columns on SM90+, so a narrower model dimension
+# leaves the rest of every tensor-core tile computed and discarded.
+_INDEX_SCORE_TILE_WIDTH = 16
+
+
+def _qsa_index_scores_query_tile(num_index_heads: int) -> int:
+    """Query rows packed into the columns of one paged index-scoring dot.
+
+    Neighbouring context rows of a request read overlapping causal prefixes of
+    the same compressed keys, so filling the columns ``num_index_heads`` leaves
+    idle with whole query rows both fills the tensor-core tile and lets one
+    gather serve every packed row. Only head counts that divide the tile width
+    keep a column index separable into ``(row, head)``.
+    """
+    if num_index_heads <= 0 or _INDEX_SCORE_TILE_WIDTH % num_index_heads != 0:
+        return 1
+    return _INDEX_SCORE_TILE_WIDTH // num_index_heads
+
+
 def triton_qsa_paged_index_scores(
     *,
     q: torch.Tensor,
@@ -1020,12 +1179,17 @@ def triton_qsa_paged_index_scores(
     tokens_per_block: int,
     compress_ratio: int,
     only_visible_blocks: bool = False,
+    context_rows: bool = False,
 ) -> torch.Tensor:
     """Score compressed keys directly in the paged side cache.
 
     ``only_visible_blocks`` leaves columns at and beyond each row's causal
     boundary unspecified. Callers may enable it only when their consumer uses
     the same per-row boundary and cannot inspect those columns.
+
+    ``context_rows`` declares that consecutive rows mostly share a request, so
+    one gather of compressed keys can serve a tile of query rows. Generation
+    batches hold one row per request and would only lose parallelism.
     """
     rows, num_index_heads, index_head_dim = q.shape
     max_compressed_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
@@ -1040,6 +1204,60 @@ def triton_qsa_paged_index_scores(
     is_prefill_sized = rows > 256
     block_n = 64 if is_prefill_sized else 32
     tiles_per_program = 8 if is_prefill_sized else 1
+    query_tile = 1
+    if (
+        context_rows
+        and is_prefill_sized
+        and os.environ.get("TRTLLM_QSA_INDEX_SCORE_QUERY_TILE", "1") != "0"
+    ):
+        query_tile = _qsa_index_scores_query_tile(num_index_heads)
+    if query_tile > 1:
+        # Packing rows leaves QUERY_TILE times fewer programs, so each one
+        # walks a deeper column range and takes more warps to keep the GPU
+        # filled. GB300 is flat from 24 to 96 tiles per program at four warps
+        # and falls off a cliff at eight.
+        tiles_per_program = 32
+        grid = (
+            triton.cdiv(rows, query_tile),
+            triton.cdiv(max_compressed_blocks, block_n * tiles_per_program),
+        )
+        logger.info_once(
+            f"QSA paged index scoring packs {query_tile} context rows per dot tile",
+            key="qsa_paged_index_scores_query_tile_active",
+        )
+        _qsa_paged_index_scores_qtile_kernel[grid](
+            q,
+            index_cache,
+            block_table,
+            query_positions,
+            request_indices,
+            output,
+            index_head_dim**-0.5,
+            rows,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            index_cache.stride(0),
+            index_cache.stride(1),
+            index_cache.stride(2),
+            index_cache.stride(3),
+            block_table.stride(0),
+            block_table.stride(1),
+            output.stride(0),
+            output.stride(1),
+            NUM_INDEX_HEADS=num_index_heads,
+            INDEX_HEAD_DIM=index_head_dim,
+            TOKENS_PER_BLOCK=tokens_per_block,
+            COMPRESS_RATIO=compress_ratio,
+            MAX_COMPRESSED_BLOCKS=max_compressed_blocks,
+            QUERY_TILE=query_tile,
+            BLOCK_H=query_tile * num_index_heads,
+            BLOCK_N=block_n,
+            TILES_PER_PROGRAM=tiles_per_program,
+            ONLY_VISIBLE_BLOCKS=only_visible_blocks,
+            num_warps=4,
+        )
+        return output
     grid = (
         rows,
         triton.cdiv(max_compressed_blocks, block_n * tiles_per_program),

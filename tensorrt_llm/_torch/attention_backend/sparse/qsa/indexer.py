@@ -776,8 +776,14 @@ def select_qsa_paged_tokens(
     top_k_output: torch.Tensor | None = None,
     top_k_row_starts: torch.Tensor | None = None,
     visible_blocks: torch.Tensor | None = None,
+    context_rows: bool = False,
 ) -> torch.Tensor:
-    """Select tokens with packed, fixed-width paged scoring."""
+    """Select tokens with packed, fixed-width paged scoring.
+
+    ``context_rows`` marks the caller that packs many consecutive query rows
+    per request; scoring can then share one gather of compressed keys across a
+    tile of rows.
+    """
     from .kernels import triton_qsa_paged_index_scores
 
     logits = triton_qsa_paged_index_scores(
@@ -792,6 +798,7 @@ def select_qsa_paged_tokens(
         # outside the causal boundary need not be materialized. Preserve fully
         # initialized logits for the Torch fallback below.
         only_visible_blocks=top_k is not None and q.is_cuda,
+        context_rows=context_rows,
     )
     if top_k is not None and logits.is_cuda:
         if top_k_output is None or top_k_row_starts is None:

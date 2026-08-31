@@ -339,6 +339,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k_output=attn_metadata.qsa_topk_indices[packed_slice],
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts[packed_slice],
                 visible_blocks=attn_metadata.qsa_visible_blocks[packed_slice],
+                context_rows=True,
             )
             output[packed_slice] = qsa_sparse_gqa(
                 q=q[packed_slice],

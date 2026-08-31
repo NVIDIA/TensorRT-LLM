@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     select_qsa_tokens,
 )
 from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
+    _qsa_index_scores_query_tile,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
     triton_qsa_paged_index_scores,
@@ -399,6 +400,121 @@ def test_qsa_paged_index_scores_match_reference(rows: int) -> None:
 
     assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
     torch.testing.assert_close(actual[visible], expected[visible], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "num_index_heads, expected",
+    [(1, 16), (2, 8), (4, 4), (8, 2), (16, 1), (3, 1), (12, 1), (24, 1), (0, 1)],
+)
+def test_qsa_index_scores_query_tile_divides_the_dot_width(
+    num_index_heads: int, expected: int
+) -> None:
+    query_tile = _qsa_index_scores_query_tile(num_index_heads)
+    assert query_tile == expected
+    if query_tile > 1:
+        assert query_tile * num_index_heads == 16
+
+
+def _paged_index_scores_reference(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_compressed_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
+    block_indices = torch.arange(max_compressed_blocks, device=q.device)
+    anchor_positions = block_indices * compress_ratio + compress_ratio - 1
+    physical_pages = block_table[request_indices.long()][
+        :, anchor_positions // tokens_per_block
+    ].long()
+    keys = index_cache[physical_pages, anchor_positions % tokens_per_block, 0]
+    scores = torch.einsum("rhd,rbd->rhb", q.float(), keys.float())
+    scores = scores.clamp_min(0).sum(dim=1) * q.shape[-1] ** -0.5
+    visible = block_indices.unsqueeze(0) < ((query_positions + 1) // compress_ratio).unsqueeze(1)
+    return scores, visible
+
+
+@pytest.mark.parametrize("only_visible_blocks", [False, True])
+@pytest.mark.parametrize("rows_per_request", ["many", "one"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_paged_index_scores_query_tile_matches_row_wise(
+    only_visible_blocks: bool, rows_per_request: str
+) -> None:
+    torch.manual_seed(7)
+    tokens_per_block = 8
+    compress_ratio = 4
+    pages_per_request = 40
+    num_heads = 4
+    head_dim = 16
+    # The query tile only replaces the row-wise kernel above the prefill row
+    # boundary, so keep the launch there or the comparison is vacuous.
+    assert _qsa_index_scores_query_tile(num_heads) == 4
+    if rows_per_request == "many":
+        # Request boundaries deliberately land inside a query tile.
+        lengths = [101, 157, 42]
+        cached = [0, 100, 60]
+    else:
+        # A tile whose rows all belong to different requests cannot share a
+        # gather; every row must still be scored against its own block table.
+        lengths = [1] * 300
+        cached = [(17 * row) % 200 for row in range(300)]
+    rows = sum(lengths)
+    assert rows > 256
+
+    request_indices = torch.tensor(
+        [request for request, length in enumerate(lengths) for _ in range(length)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    query_positions = torch.tensor(
+        [start + offset for length, start in zip(lengths, cached) for offset in range(length)],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    pages = len(lengths) * pages_per_request
+    block_table = torch.arange(pages, dtype=torch.int32, device="cuda").reshape(
+        len(lengths), pages_per_request
+    )
+    index_cache = torch.randn(
+        pages,
+        tokens_per_block,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q = torch.randn(rows, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+
+    arguments = {
+        "q": q,
+        "index_cache": index_cache,
+        "block_table": block_table,
+        "query_positions": query_positions,
+        "request_indices": request_indices,
+        "tokens_per_block": tokens_per_block,
+        "compress_ratio": compress_ratio,
+        "only_visible_blocks": only_visible_blocks,
+    }
+    row_wise = triton_qsa_paged_index_scores(**arguments, context_rows=False)
+    tiled = triton_qsa_paged_index_scores(**arguments, context_rows=True)
+
+    expected, visible = _paged_index_scores_reference(
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        tokens_per_block,
+        compress_ratio,
+    )
+    torch.testing.assert_close(tiled[visible], expected[visible], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(tiled[visible], row_wise[visible], rtol=1e-6, atol=1e-6)
+    if not only_visible_blocks:
+        assert torch.equal(torch.isfinite(tiled), visible)
+        assert torch.equal(torch.isfinite(row_wise), visible)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
