@@ -579,12 +579,19 @@ def launchReleaseCheck(pipeline, globalVars)
             // Use GitLab/GitHub API to get the exact list of changed files in this MR.
             // This avoids git history depth issues with shallow clones.
             def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-            if (changedFileList && !changedFileList.isEmpty()) {
+            echo "Changed file count from API: ${changedFileList ? changedFileList.size() : 0}"
+            // GitHub's PR Files API caps out at 3000 entries even with pagination, so a huge
+            // PR (e.g. large cubin/LFS updates) can silently truncate the list and hide real
+            // source changes from the check (see PR #18183 main break). Fail closed by
+            // falling back to a full scan instead of trusting a possibly-truncated list.
+            if (changedFileList && !changedFileList.isEmpty() && changedFileList.size() < 3000) {
                 def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
                 writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
                 // Script runs after "cd ${LLM_ROOT}", so use relative path
                 precommitArgs = "--files-from changed_files.txt"
                 echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
+            } else if (changedFileList && changedFileList.size() >= 3000) {
+                echo "Changed file list hit the 3000-file API cap, falling back to all files"
             } else {
                 echo "Could not determine changed files, falling back to all files"
             }
