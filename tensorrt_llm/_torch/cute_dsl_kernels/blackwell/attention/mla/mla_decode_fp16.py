@@ -329,6 +329,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             workspace,
             split_kv,
             cache_seqs,
+            kv_bounds,
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -349,6 +350,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -366,6 +368,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             workspace,
             split_kv,
             cache_seqs,
+            kv_bounds,
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -386,6 +389,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -1549,8 +1553,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     # per-token: a straddling group leaves this rank zero
                     # entries for its leading tokens while later ones have some.
                     if cutlass.const_expr(kv_bounds is not None):
+                        # blk_coord runs over the folded reduction grid
+                        # (H*F, S_q/F, B) while kv_bounds is indexed by the
+                        # true token. A folded chunk packs its rows as
+                        # tok_in_chunk * H + head, so the true token is
+                        # chunk * F + row // H (self.num_heads and
+                        # self.seq_len_q stay pre-fold).
+                        if cutlass.const_expr(self.fold_sq):
+                            q_tok = (blk_coord[1] * self.fold_sq_ratio +
+                                     blk_coord[0] // self.num_heads)
+                        else:
+                            q_tok = blk_coord[1]
                         has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q +
-                                                 blk_coord[1]] > 0
+                                                 q_tok] > 0
                     else:
                         has_local_kv = cache_seqs[blk_coord[2]] > 0
                     if has_local_kv:
