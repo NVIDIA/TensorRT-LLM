@@ -20,7 +20,7 @@ addresses, and replay() is responsible for copying every live input into
 those buffers before each graph.replay() call. A missed copy_ silently
 leaves stale (or poisoned) data in the region the graph reads.
 
-Four invariants, four tests:
+Five invariants, six tests:
   - Poison-fill completeness: replay() must overwrite every sentinel-poisoned
     static tensor. Catches a key whose copy_ was dropped entirely.
   - input_ids extent agreement: replay() must reject an input_ids whose
@@ -29,6 +29,11 @@ Four invariants, four tests:
   - mrope_delta_read_seq_slots extent agreement: same invariant, but for
     mrope_delta_read_seq_slots, whose copy extent comes from the caller's
     tensor shape rather than from input_ids' seqlen.
+  - mrope_delta_read_seq_slots omission fill: a replay that omits
+    mrope_delta_read_seq_slots entirely must still fill the static buffer
+    with the dummy seq slot's permanently-zero delta, both right after
+    capture (uninitialized buffer) and after a prior replay left real slot
+    values in the buffer (two tests, same invariant, two starting states).
   - Staleness detection: two replays with different inputs must produce
     different outputs. A dropped copy_ makes them identical.
 """
@@ -82,6 +87,9 @@ class TestCaptureReplayStaticTensors:
 
     @pytest.mark.parametrize("use_mrope", [False, True])
     def test_replay_overwrites_poisoned_static_tensors(self, use_mrope):
+        """replay() must overwrite every shared static tensor's captured
+        region; none may be left holding the sentinel poison value.
+        """
         batch_size = 1
         runner = create_mock_cuda_graph_runner(batch_size, use_mrope=use_mrope)
         key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
@@ -285,4 +293,4 @@ class TestCaptureReplayStaticTensors:
         # run 2 eagerly
         logits_eager = forward_fn(self._make_inputs(attn_metadata, num_tokens, batch_size, value=2))
 
-        assert torch.allclose(logits_cuda_graph, logits_eager)
+        torch.testing.assert_close(logits_cuda_graph, logits_eager)
