@@ -705,7 +705,7 @@ class CUDAGraphRunner:
                     raise ValueError(
                         f"replay() got {mrope_delta_read_seq_slots.shape[0]} "
                         f"mrope_delta_read_seq_slots for key {key}, but the graph "
-                        f"was captured for {key.batch_size * self.max_beam_width} "
+                        f"was captured for {num_slots} "
                         "mrope_delta_read_seq_slots.")
                 static_tensors[
                     'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
