@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -155,13 +156,22 @@ def test_correctness_across_batch_sizes(
     llm_with_schedule.shutdown()
 
     if drafter_type == "model_drafter":
+        for batch_size, runtime_draft_len in runtime_schedule:
+            expected_draft_len = get_draft_len_for_batch_size(schedule, batch_size, max_draft_len)
+            assert runtime_draft_len == expected_draft_len, (
+                f"DraftTarget resolved batch size {batch_size} to draft length "
+                f"{runtime_draft_len}, expected {expected_draft_len} from {schedule}"
+            )
+
         runtime_transitions = [
             observation
             for index, observation in enumerate(runtime_schedule)
             if index == 0 or observation != runtime_schedule[index - 1]
         ]
-        assert runtime_transitions == [(8, 1), (4, 2), (1, 3)], (
-            f"DraftTarget runtime schedule did not follow {schedule}: got {runtime_transitions}"
+        expected_key_transitions = {(8, 1), (4, 2), (1, 3)}
+        assert expected_key_transitions.issubset(runtime_transitions), (
+            f"DraftTarget runtime schedule did not exercise {expected_key_transitions}: "
+            f"got {runtime_transitions}"
         )
         return
 
