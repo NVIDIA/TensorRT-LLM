@@ -61,6 +61,12 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_8k1k_c
 # GB300 Kimi-K3
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL]
 
+# GB300 MiniMax-M3
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep16_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep8_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ctx1_tep2_gen2_tp4_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ctx1_tp4_gen2_tp4_eplb0_eagle3_ccb-NIXL]
+
 # GB300 Qwen3-235B
 
 # wideep multi-node

@@ -31,7 +31,6 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
 from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
@@ -2121,7 +2120,7 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
+        from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),
@@ -3555,10 +3554,10 @@ class Linear(nn.Module):
         elif method_type is NVFP4LinearMethod:
             # The Marlin kernel is W4A16, so an explicit opt-in on a W4A4
             # checkpoint runs the weight-only method, which pads N/K to the
-            # tile sizes the kernel requires.
-            if ("marlin" in self.nvfp4_allowed_backends
-                    and is_nvfp4_marlin_supported_sm()
-                    and MarlinNVFP4LinearMethod.is_supported(self)):
+            # tile sizes the kernel requires. Reuse the same predicate the
+            # ``uses_marlin_nvfp4`` property reads, so the method chosen here
+            # and that property can never disagree on the SM.
+            if _uses_marlin_nvfp4_backend(self):
                 return MarlinNVFP4LinearMethod()
         return quant_method
 

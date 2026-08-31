@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import Field
@@ -121,6 +122,18 @@ _GENERATION_CONFIG_FIELDS: tuple = (
 )
 
 
+def _literal_choices(type_expr: str) -> tuple[Any, ...] | None:
+    if not type_expr.startswith("Literal[") or not type_expr.endswith("]"):
+        return None
+
+    literal_body = type_expr[len("Literal[") : -1]
+    try:
+        choices = ast.literal_eval(f"({literal_body},)")
+    except (SyntaxError, ValueError):
+        return None
+    return choices if isinstance(choices, tuple) else (choices,)
+
+
 def validate_visual_gen_params(
     params: VisualGenParams,
     *,
@@ -174,6 +187,18 @@ def validate_visual_gen_params(
             spec = specs[key]
             # Skip None values (param left at its None default)
             if value is None:
+                continue
+            literal_choices = _literal_choices(spec.type)
+            if literal_choices is not None:
+                if value not in literal_choices:
+                    messages.append(
+                        f"extra_params['{key}'] expected one of {list(literal_choices)}, "
+                        f"got {value!r}"
+                    )
+                # Terminal on purpose: membership in the literal set already
+                # decides the value, so the type, validator and range checks
+                # below cannot add anything. A literal spec that also declares
+                # one of those has a redundant declaration, not a skipped check.
                 continue
             # Type check
             expected_types = _TYPE_MAP.get(spec.type)

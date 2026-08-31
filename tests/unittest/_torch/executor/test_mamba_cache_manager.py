@@ -213,7 +213,7 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     params = extract_mamba_kv_cache_params(config)
 
     assert params.state_size == 8
-    assert params.conv_kernel == 5
+    assert params.conv_kernel == 4
     assert params.num_heads == 4
     assert params.n_groups == 4
     assert params.head_dim == 8
@@ -301,7 +301,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert isinstance(kwargs, dict)
     assert args[:9] == (
         8,
-        5,
+        4,
         4,
         4,
         8,

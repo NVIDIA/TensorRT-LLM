@@ -192,6 +192,15 @@ Qwen3/Qwen3-8B:
     accuracy: 87.1114
   - spec_dec_algo: DFlash
     accuracy: 87.1114
+  # accuracy 0 means "run the task, do not gate on it" -- the same value
+  # TRTLLM_ACCURACY_NO_REFERENCE and INTEGRATION_TEST use, and the threshold
+  # (ref + z_alpha*scale) is then always cleared. test_dspark gates on
+  # acceptance length instead. Accuracy is not meaningful in its 0-shot chat
+  # regime: the model stops emitting "#### N", so strict-match is 0 and the
+  # reported score is the mean of that and flexible-extract (28.92 measured).
+  - spec_dec_algo: DSpark
+    extra_acc_spec: zero_shot_al_only
+    accuracy: 0
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 87.1114

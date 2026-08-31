@@ -217,7 +217,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `request_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `return_perf_metrics` | `<class 'bool'>` | `value` |  |  |
 | `sampler_force_async_worker` | `<class 'bool'>` | `value` |  |  |
-| `sampler_type` | `Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]` | `categorical` | allowlist | `TRTLLMSampler`, `TorchSampler`, `auto` |
 | `scheduler_config.capacity_scheduler_policy` | `<enum 'CapacitySchedulerPolicy'>` | `categorical` |  | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]` | `categorical` |  | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
