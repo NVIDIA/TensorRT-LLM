@@ -44,6 +44,16 @@ def _cpp_introspection_module() -> Any | None:
     return getattr(package, "_cpp_introspection", None)
 
 
+def create_test_padding_cold_page_codec(
+    cold_page_bytes_by_layer: dict[int, int],
+) -> Any:
+    """Create the private native padding codec used by cold-tier end-to-end tests."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the test padding cold-page codec requires the C++ backend")
+    return cpp_introspection.create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
+
+
 def make_test_block(
     manager: Any,
     tokens: Any,
@@ -427,12 +437,28 @@ def reuse_match_planned_drop_counts(
     return match.num_tokens, counts
 
 
-def pool_group_index(manager: Any, lc_id: int) -> int:
-    """Return the storage pool-group index for lifecycle ``lc_id``."""
+def pool_group_index(manager: Any, lc_id: int, cache_level: int = 0) -> int:
+    """Return a lifecycle storage pool-group index at ``cache_level``."""
     cpp_introspection = _cpp_introspection_module()
     if cpp_introspection is not None:
-        return cpp_introspection.pool_group_index(manager, lc_id)
+        return cpp_introspection.pool_group_index(manager, lc_id, cache_level)
+    # The Python backend currently uses the hot lifecycle grouping at every level.
     return manager._storage.get_pool_group_index(lc_id)
+
+
+def life_cycle_pool_group_indices(manager: Any, cache_level: int = 0) -> list[int]:
+    """Return the pool-group index of every lifecycle at ``cache_level``, indexed by lifecycle ID.
+
+    Cold levels group lifecycles by encoded cold-page size, so their pool-group indices and counts are
+    unrelated to the hot ones. Callers that aggregate level-specific data must translate through this
+    mapping rather than reusing hot pool-group indices.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(cpp_introspection.life_cycle_pool_group_indices(manager, cache_level))
+    # The Python backend currently uses the hot lifecycle grouping at every level.
+    storage = manager._storage
+    return [storage.get_pool_group_index(lc_id) for lc_id in range(storage.num_life_cycles)]
 
 
 def compute_slots_for_batch(
@@ -450,5 +476,7 @@ def compute_slots_for_batch(
             )
         )
     return list(
-        manager._storage._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+        manager._storage._compute_pool_group_slots_for_batch(
+            batch, tokens_per_block, swa_scratch_reuse
+        )
     )

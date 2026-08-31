@@ -108,8 +108,7 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FLASHINFER",
-        "FLASHINFER_STAR_ATTENTION"
+        "FLASHINFER"
       ],
       "annotation": "<class 'str'>",
       "converter": "allowlist",
@@ -213,23 +212,8 @@
       "path": "context_parallel_size"
     },
     {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "cp_config.block_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "cp_config.cp_anchor_size"
-    },
-    {
       "allowed_values": [
         "ULYSSES",
-        "STAR",
         "RING",
         "HELIX"
       ],
@@ -737,6 +721,7 @@
         "bfloat16",
         "float32",
         "fp8",
+        "fp8_ds_mla",
         "nvfp4"
       ],
       "annotation": "<class 'str'>",
@@ -966,6 +951,13 @@
       "path": "load_format"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.cuda_graph_specialize_lora"
+    },
+    {
       "allowed_values": [
         "hf",
         "nemo"
@@ -995,6 +987,13 @@
       "converter": "",
       "kind": "value",
       "path": "lora_config.max_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.overlap_lora_and_base"
     },
     {
       "allowed_values": [],
@@ -1064,7 +1063,6 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
-        "WIDEEP",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1074,7 +1072,7 @@
         "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1458,17 +1456,6 @@
     },
     {
       "allowed_values": [
-        "TRTLLMSampler",
-        "TorchSampler",
-        "auto"
-      ],
-      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]",
-      "converter": "allowlist",
-      "kind": "categorical",
-      "path": "sampler_type"
-    },
-    {
-      "allowed_values": [
         "MAX_UTILIZATION",
         "GUARANTEED_NO_EVICT",
         "STATIC_BATCH"
@@ -1615,6 +1602,16 @@
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.indexer_k_dtype"
+    },
+    {
+      "allowed_values": [
+        "bf16",
+        "fp8"
+      ],
+      "annotation": "Literal['bf16', 'fp8']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_kv_dtype"
     },
     {
       "allowed_values": [],
@@ -1912,6 +1909,13 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.enable_penalty"
     },
     {
       "allowed_values": [],

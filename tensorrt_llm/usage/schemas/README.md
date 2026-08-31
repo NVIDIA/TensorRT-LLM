@@ -191,7 +191,6 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `speculative_config.decoding_type` | Speculative decoding mode discriminator (e.g. `User_Provided`); other arms expose their own numeric/boolean knobs under `speculative_config.*`. |
 | `sparse_attention_config.algorithm` | Sparse attention algorithm discriminator; arm-specific knobs appear under `sparse_attention_config.*`. |
 | `reasoning_parser` | Reasoning parser selection, captured through an allowlist mirroring the `ReasoningParserFactory` registry. |
-| `sampler_type` | Sampler selection, captured through an allowlist mirroring the `SamplerType` enum. |
 
 `llmApiConfigMetaJson` describes the capture process itself. It includes
 contract/version fields, schema and manifest digests, source args class, field

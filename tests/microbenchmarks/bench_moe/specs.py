@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from tensorrt_llm._torch.modules.fused_moe.routing import (
+from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -35,6 +35,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
 )
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, MoeModelConfig
@@ -47,6 +48,11 @@ _ROUTING_METHODS: Dict[str, type] = {
     "DEEPSEEK_V3": DeepSeekV3MoeRoutingMethod,
     "MINIMAX_M2": MiniMaxM2MoeRoutingMethod,
     "SIGMOID_RENORM": SigmoidRenormMoeRoutingMethod,
+}
+
+_ACTIVATIONS: Dict[str, ActivationType] = {
+    "SWIGLU": ActivationType.Swiglu,
+    "RELU2": ActivationType.Relu2,
 }
 
 _ROUTING_NAME_BY_CLS: Dict[type, str] = {cls: name for name, cls in _ROUTING_METHODS.items()}
@@ -117,6 +123,12 @@ class ModelSpec:
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
+    activation_type: str = "SWIGLU"
+    # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
+    # SiTU is gated, so ``activation_type`` stays SWIGLU and only the epilogue
+    # changes; backends take it through their own parameters (see build.py).
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.n_shared_experts < 0:
@@ -125,10 +137,23 @@ class ModelSpec:
             raise ValueError(
                 f"shared_expert_mode must be 'fused' or 'unfused', got {self.shared_expert_mode!r}."
             )
+        if (self.situ_beta is None) != (self.situ_linear_beta is None):
+            raise ValueError("situ_beta and situ_linear_beta must be set together.")
+        if self.situ_beta is not None:
+            if self.situ_beta <= 0 or self.situ_linear_beta <= 0:
+                raise ValueError("SiTU betas must be positive.")
+            if self.activation_type != "SWIGLU":
+                raise ValueError("SiTU requires the SwiGLU fc1 geometry (activation_type=SWIGLU).")
+            if self.swiglu_limit != float("inf"):
+                raise ValueError("SiTU is mutually exclusive with a gate/up clamp.")
 
     @property
     def routing_method_cls(self) -> type:
         return _ROUTING_METHODS[self.routing_method]
+
+    @property
+    def activation_type_enum(self) -> ActivationType:
+        return _ACTIVATIONS[self.activation_type]
 
     @property
     def quant_algo_enum(self) -> Optional[QuantAlgo]:
@@ -264,6 +289,9 @@ class RunResult:
     actual_backend: Optional[str] = None
     actual_comm_method: Optional[str] = None
     actual_comm_fallback_reason: Optional[str] = None
+    # Epilogue the built module ran ("swiglu" / "situ"), read back rather
+    # than echoed from the spec.
+    actual_epilogue_activation: Optional[str] = None
     scheduler_kind: Optional[str] = None
     moe_ep_size: Optional[int] = None
     moe_tp_size: Optional[int] = None
@@ -285,15 +313,6 @@ class RunResult:
 # publicly known MoE checkpoint.
 
 BUILT_IN_MODELS: Dict[str, ModelSpec] = {
-    "qwen1.5_moe": ModelSpec(
-        name="qwen1.5_moe",
-        num_experts=60,
-        top_k=4,
-        hidden_size=2048,
-        intermediate_size=1408,
-        quant_algo="FP8",
-        routing_method="RENORMALIZE",
-    ),
     "deepseek_v2_lite": ModelSpec(
         name="deepseek_v2_lite",
         num_experts=64,
@@ -374,15 +393,6 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo=None,
         routing_method="RENORMALIZE",
     ),
-    "mixtral_8x7b": ModelSpec(
-        name="mixtral_8x7b",
-        num_experts=8,
-        top_k=2,
-        hidden_size=4096,
-        intermediate_size=14336,
-        quant_algo="FP8",
-        routing_method="RENORMALIZE",
-    ),
     "gpt_oss_120b": ModelSpec(
         name="gpt_oss_120b",
         num_experts=128,
@@ -394,5 +404,33 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         swiglu_alpha=1.702,
         swiglu_beta=1.0,
         swiglu_limit=7.0,
+    ),
+    # Qwen3.8, 2.4T total / A95B activated
+    "qwen3_8": ModelSpec(
+        name="qwen3_8",
+        num_experts=512,
+        top_k=10,
+        hidden_size=8192,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="RENORMALIZE",
+    ),
+    # Kimi-K3. SiTU is gated, so ``activation_type`` stays SWIGLU (same fc1
+    # geometry). ``build._situ_kwargs`` switches the epilogue for the backends
+    # that implement it (TRTLLM / MEGAMOE_DEEPGEMM on W4A8_MXFP4_MXFP8,
+    # MEGAMOE_CUTEDSL / CUTLASS on NVFP4); other combinations keep the SwiGLU
+    # proxy.
+    "kimi_k3": ModelSpec(
+        name="kimi_k3",
+        num_experts=896,
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        situ_beta=4.0,  # text_config.activation_situ_beta
+        situ_linear_beta=25.0,  # text_config.activation_situ_linear_beta
     ),
 }

@@ -5,13 +5,23 @@ run, based on what the PR changed. New rules are added in Python only.
 
 ---
 
+## Selection tiers
+
+| Tier | Where | Basis |
+|---|---|---|
+| **1. Rules** | `rules/` | Path patterns and diffs. Each rule claims the files it understands and narrows to the blocks they affect. |
+| **2. Coverage** | `coverage_selection/`, `coverage_tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is core Python present in the touch DB. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `coverage_selection/SELECTION.md`. |
+
+The touch DB is produced by the post-merge collection under `coverage_utils/`;
+see `coverage_utils/COLLECTION.md` for what it does and does not record.
+
 ## Consumption layers
 
 CBTS narrows test cases only; Build always runs.
 
 | Layer | Where | Action |
 |---|---|---|
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages run only when present in `affected_stages` (not force-kept). Empty affectedSet + nothing force-kept → no-op. |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Intersect the baseline-eligible stage set with affected stages, then add PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages run only when present in `affected_stages` (not force-kept). Empty affectedSet + nothing force-kept → no-op. |
 | **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
@@ -75,8 +85,18 @@ jenkins/scripts/cbts/
 │   ├── visual_gen_rule.py
 │   ├── spec_dec_rule.py
 │   └── out_of_scope_rule.py
+├── coverage_tier.py       Tier 2 entry: applies the selector to the test-db YAMLs, classifies every candidate entry
+├── coverage_selection/
+│   ├── SELECTION.md       how a decision is made: qualname concepts, decline gates, narrowing
+│   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
+│   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
+│   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
+│   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
+├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 └── tools/
     ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
+    ├── coverage_audit.py  report a touch DB's format, scale, untrusted rate and HEAD coverage gap
+    ├── coverage_explain.py  explain one commit's decision case by case (delegates to CoverageSelector)
     └── report_cbts_decision.py  post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 ```
 
@@ -294,6 +314,14 @@ CBTS defers to the existing filter chain when:
   but cannot decide; e.g. testdef blast-radius cap, testlist structural
   YAML edit)
 - Combined scope is `None` (incompatible mix)
+- Tier 2 declines: a residual file is not core Python, is absent from the
+  touch DB, has an import-executed change (module / class body, signature or
+  decorator line), has no usable patch, has unparsable source, or has a closure
+  change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
+- No touch DB artifact could be resolved — Tier 2 never runs
+- The resolved DB sits more than `--coverage-max-drift` commits from the PR's
+  base commit, on either side, or an unmeasurable distance from it — Tier 2
+  declines (`coverage_freshness` = `stale` / `unknown`)
 - Layer 3 narrowing would empty a block — block keeps original tests
 - `cbts_test_db` tarball upload or download/extraction fails — renderTestDB falls back to source
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -27,33 +28,17 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
-// ---------------------------------------------------------------------------
-// PoolDesc / PoolGroupDesc — describe GPU memory pool layout.
-// ---------------------------------------------------------------------------
-struct PoolDesc
-{
-    PoolIndex poolIndex{0};
-    MemAddress baseAddress = 0;
-    size_t slotBytes = 0;
-};
-
-struct PoolGroupDesc
-{
-    PoolGroupIndex poolGroupIndex{0};
-    SlotCount numSlots = 0;
-    SlotDesc slotDesc;
-    TypedVec<PoolIndex, PoolDesc> pools;
-};
 
 // ---------------------------------------------------------------------------
 // ExpandedBuffer / AggregatedPageDesc — returned by getAggregatedPages().
@@ -117,7 +102,10 @@ struct PageIndexConverter
 class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
-    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr);
+    // coldPageCodec is consumed when construction is invoked, including when construction throws; nullptr selects
+    // the default lossless codec.
+    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr,
+        std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec = nullptr);
     ~KvCacheManager();
 
     KvCacheManager(KvCacheManager const&) = delete;
@@ -141,11 +129,14 @@ public:
     //                       Stats-only: no effect on allocation, reuse, or correctness.
     // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
     //                       nullopt inherits the manager config default.
+    // enableRequestStats:   collect request-local allocation and reuse statistics even when
+    //                       manager-level statistics are disabled.
     // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
     // duration of the call (matching reads it but never stores it).
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
-        std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt);
+        std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
+        bool enableRequestStats = false);
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     // Defaults false (safe: the scanning path is taken).
@@ -242,6 +233,19 @@ public:
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
 
+    // Count one ACTIVE->SUSPENDED transition for the current iteration window.
+    void recordRequestSuspended();
+    // Count one preemption recovery for the current iteration window. Only a
+    // previously-ACTIVE cache that was suspended and then successfully resumed
+    // counts; a freshly-created cache is activated by its first resume(), but
+    // that is an admission, not a recovery, and is not counted.
+    void recordRequestResumed();
+    // Return {suspended, resumed} counts since the last drain and reset them.
+    // Both counters track the same population, so the running
+    // (suspended - resumed) total is the number of requests still parked in
+    // the SUSPENDED state.
+    std::pair<int64_t, int64_t> getAndResetIterationSuspendResumeStats();
+
     void markStatsDirty(std::optional<RequestIdType> kvCacheId);
     void clearStatsDirty(std::optional<RequestIdType> kvCacheId);
     std::unordered_set<RequestIdType> getDirtyStatsKvCacheIds() const;
@@ -321,15 +325,15 @@ private:
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherPersistentPages() const;
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
     void _updateIterationPeakNumBlocks();
 
-    // Current per-pool-group GPU utilization ratios.
-    TypedVec<PoolGroupIndex, float> _currentGpuRatio() const;
-    TypedVec<PoolGroupIndex, float> _currentOtherRatios() const;
+    // Current per-pool-group utilization ratios for the hot and cold representations.
+    TypedVec<PoolGroupIndex, float> _currentHotRatio() const;
+    TypedVec<PoolGroupIndex, float> _currentColdRatios() const;
 
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
@@ -345,8 +349,8 @@ private:
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
 
-    TypedVec<PoolGroupIndex, float> mTargetRatioListGpu;
-    TypedVec<PoolGroupIndex, float> mTargetRatioListOther;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};
@@ -359,6 +363,8 @@ private:
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
+    int64_t mIterSuspendedRequests{0};
+    int64_t mIterResumedRequests{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

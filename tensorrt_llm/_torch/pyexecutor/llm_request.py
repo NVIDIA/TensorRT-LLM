@@ -969,31 +969,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
-        self.py_prompt_len = self.prompt_len
-        self.py_orig_prompt_len = self.orig_prompt_len
-        self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
-        # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
-        self.seqlen_this_rank_cp = self.prompt_len
-        self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
-        self.py_batch_idx = None
-        self.py_draft_pages_allocated = 0
-        self.py_rewind_len = 0
-        # Tokens physically evicted by KV-cache compression; deducted in the engine.
-        self.py_num_compressed_tokens = 0
-        self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
-        self.py_last_context_chunk = (None, None)
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_draft_logits = None
         self.py_target_probs = None
-        self.py_last_draft_tokens = None
-        self.py_num_accepted_draft_tokens = 0
-        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
-        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
-        self.py_needs_onehot_draft_probs = False
-        self.py_num_accepted_draft_tokens_indices = []
-        self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
@@ -1005,22 +987,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
-        # Denominator paired with py_num_accepted_draft_tokens: the number of
-        # genuinely proposed draft tokens the sampler verified in the step it
-        # wrote that numerator for (CUDA-graph padding excluded). Written by
-        # the samplers' update_requests, consumed (and reset to 0) by
-        # PyExecutor._accumulate_spec_dec_stats so each verified step is
-        # counted exactly once. py_draft_tokens itself cannot serve as the
-        # denominator: it is padded for CUDA graphs and, in the one-model
-        # flow, already holds the NEXT step's drafts by response time.
-        self.py_num_draft_tokens_verified = 0
-        # Number of real draft tokens installed for the upcoming step,
-        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
-        # py_draft_tokens to the static max. None when no drafter recorded a
-        # count (e.g. one-model flow, which tracks lengths in its sample
-        # state instead).
-        self.py_draft_tokens_effective_len = None
-        self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
@@ -1057,25 +1023,22 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
         self.py_is_draft = is_draft
-        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
-        self.py_seq_slot = seq_slot
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
-        self._cached_tokens = 0
-        self._cached_tokens_set = False
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
         self.d2t = None
-        self.py_draft_use_greedy_sampling = False
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
         self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
-        # TODO: remove this when use DynamicDecodeOp in pytorch flow.
-        # currently, keep py_stop_words_list as python list, rather than tensor.
+        self._initialize_execution_state(seq_slot=seq_slot,
+                                         orig_prompt_len=self.orig_prompt_len)
+
+        # Keep py_stop_words_list as a python list, rather than a tensor.
         self.py_stop_words_list = stop_words_list
 
         self.py_logprobs_mode = LogprobMode(
@@ -1153,6 +1116,66 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if not self._cached_tokens_set:
             self._cached_tokens = value
             self._cached_tokens_set = True
+
+    def _initialize_execution_state(self,
+                                    *,
+                                    seq_slot: Optional[int],
+                                    orig_prompt_len: int,
+                                    clear_draft_tokens: bool = False) -> None:
+        self.py_prompt_len = self.prompt_len
+        self.py_orig_prompt_len = orig_prompt_len
+        self.py_max_new_tokens = self.max_new_tokens
+        # CP sequence lengths are relevant to helix parallelism.
+        self.seqlen_this_rank_cp = self.prompt_len
+        self.total_input_len_cp = self.prompt_len
+        self.py_batch_idx = None
+        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
+        self.py_seq_slot = seq_slot
+        self.py_draft_pages_allocated = 0
+        self.py_rewind_len = 0
+        # Tokens physically evicted by KV-cache compression; deducted in the engine.
+        self.py_num_compressed_tokens = 0
+        if clear_draft_tokens:
+            self.draft_tokens = []
+            self.py_draft_tokens = []
+        else:
+            self.py_draft_tokens = ([] if self.draft_tokens is None else
+                                    self.draft_tokens)
+        # Number of real draft tokens installed for the upcoming step,
+        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
+        # py_draft_tokens to the static max. None when no drafter recorded a
+        # count (e.g. one-model flow, which tracks lengths in its sample
+        # state instead).
+        self.py_draft_tokens_effective_len = None
+        self.py_last_context_chunk = (None, None)
+        self.py_last_draft_tokens = None
+        self.py_num_accepted_draft_tokens = 0
+        # Denominator paired with py_num_accepted_draft_tokens: the number of
+        # genuinely proposed draft tokens the sampler verified in the step it
+        # wrote that numerator for (CUDA-graph padding excluded). Written by
+        # the samplers' update_requests, consumed (and reset to 0) by
+        # PyExecutor._accumulate_spec_dec_stats so each verified step is
+        # counted exactly once. py_draft_tokens itself cannot serve as the
+        # denominator: it is padded for CUDA graphs and, in the one-model
+        # flow, already holds the NEXT step's drafts by response time.
+        self.py_num_draft_tokens_verified = 0
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
+        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        self.py_needs_onehot_draft_probs = False
+        self.py_num_accepted_draft_tokens_indices = []
+        self.py_rewind_draft_token_separate_adjustment = 0
+        self.py_decoding_iter = 0
+        self.py_ctx_pre_resize_cap = None
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
+
+    def reset_for_recompute(self, max_input_len: int) -> None:
+        """Reset Python-side execution state so the request can replay prefill."""
+        self.pause(max_input_len)
+        self._initialize_execution_state(seq_slot=None,
+                                         orig_prompt_len=self.prompt_len,
+                                         clear_draft_tokens=True)
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY

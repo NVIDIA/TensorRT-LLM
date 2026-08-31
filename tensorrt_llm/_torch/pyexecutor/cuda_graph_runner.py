@@ -15,9 +15,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
-from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
+from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -49,6 +49,7 @@ class KeyType(NamedTuple):
     context_query_len: int = 0
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
+    use_lora_graph: bool = False
 
 
 def _save_spec_decode_capture_state(
@@ -132,7 +133,7 @@ class CUDAGraphRunner:
 
     This unified class handles high-level orchestration (padding, eligibility)
     and low-level execution (capturing, resource management, replaying) for
-    multiple graphs, keyed by (batch size, draft_len, is_first_draft).
+    multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
 
@@ -316,6 +317,7 @@ class CUDAGraphRunner:
         spec_metadata: Optional[SpecMetadata] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
+        use_lora_graph: bool = False,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -342,7 +344,8 @@ class CUDAGraphRunner:
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
                           is_all_greedy_sample=is_all_greedy_sample,
-                          peft_cache_data_type=peft_cache_data_type)
+                          peft_cache_data_type=peft_cache_data_type,
+                          use_lora_graph=use_lora_graph)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -372,7 +375,8 @@ class CUDAGraphRunner:
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
                           num_encoder_tokens=num_encoder_tokens,
-                          peft_cache_data_type=peft_cache_data_type)
+                          peft_cache_data_type=peft_cache_data_type,
+                          use_lora_graph=use_lora_graph)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -434,6 +438,7 @@ class CUDAGraphRunner:
         spec_resource_manager: Optional[BaseResourceManager] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
+        use_lora_graph: bool = False,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
@@ -480,7 +485,7 @@ class CUDAGraphRunner:
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
                                  promoted_context_request_ids,
-                                 peft_cache_data_type)
+                                 peft_cache_data_type, use_lora_graph)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
@@ -522,37 +527,6 @@ class CUDAGraphRunner:
         else:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
-
-    def clear_capture_only_spec_state(self) -> int:
-        """Clear capture-scoped state from every cached graph SpecMetadata.
-
-        ``create_cuda_graph_metadata`` shallow-copies the live SpecMetadata, so a
-        copy made while ``_run_capture_pass(force_non_greedy=True)`` is active
-        inherits ``_force_non_greedy_for_capture=True``. That copy is cached here
-        and reseated as the live spec_metadata on every later replay of its graph,
-        while the capture pass clears the flag on the base object only. Without
-        this cleanup the copies keep the flag forever and
-        ``_scan_one_model_sampling`` rewrites EVERY serving request's sampling
-        params to the synthetic capture values (temperature 0.7 / top_k 50 /
-        top_p 0.9), silently ignoring what the client asked for.
-
-        The flag must NOT be cleared at copy time instead: it is load-bearing
-        *during* capture. It is what makes the pass-2 populate scan non-greedy on
-        parameter-less warmup requests, so that the advanced-sampling branch (not
-        the argmax fast path, and with the top-k/top-p kernels present) is the one
-        recorded into the graph. Clearing it here -- after the pass has captured
-        every graph -- keeps capture correct and serving clean.
-
-        Returns the number of cached metadata objects cleared.
-        """
-        cleared = 0
-        for stored in self.graph_metadata.values():
-            spec_metadata = stored.get("spec_metadata")
-            if spec_metadata is not None and getattr(
-                    spec_metadata, "_force_non_greedy_for_capture", False):
-                spec_metadata._force_non_greedy_for_capture = False
-                cleared += 1
-        return cleared
 
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs
@@ -681,6 +655,9 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -1821,6 +1798,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph,
                                   pool=self.memory_pool,
                                   capture_error_mode="thread_local"):

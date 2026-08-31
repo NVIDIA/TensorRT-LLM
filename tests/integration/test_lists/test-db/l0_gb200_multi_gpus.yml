@@ -49,12 +49,12 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] TIMEOUT (90)
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
-  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
-  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
-  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_cuda_graph_replay_uses_updated_routing
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
+  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform]
+  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_b_overlap]
+  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt]
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_cuda_graph_replay_uses_updated_routing
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce[TinyLlama-1.1B-Chat-v1.0]
 
@@ -78,8 +78,6 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[ADP2_PP2]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tep4]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[dep4]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[dep4-cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[dep4-trtllm]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_2gpu_mtp_ar
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=True]
@@ -122,4 +120,4 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
   # ---- moved to post-merge (MoE CI optimization) ----
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary

@@ -32,7 +32,6 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -207,19 +206,6 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
     return mapping
 
 
-def update_sampler_max_seq_len(max_seq_len, sampler):
-    # Originally, TRTLLMSampler is constructed with executor_config, but
-    # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
-    # Because TRTLLMSampler.sample_async still needs the updated limit and executor_config is
-    # deprecated inside TRTLLMSampler, keep TRTLLMSampler.max_seq_len updated with
-    # with executor_config.max_seq_len.
-    from .sampler import TRTLLMSampler
-
-    if isinstance(sampler, TRTLLMSampler):
-        assert hasattr(sampler, "max_seq_len")
-        sampler.max_seq_len = max_seq_len
-
-
 def _extend_full_attention_windows_for_spec_decode(
     kv_cache_config: KvCacheConfig,
     spec_config: Optional[SpeculativeConfig],
@@ -383,8 +369,6 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
 
-    decoding_config = llm_args.decoding_config
-
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
     # failures with trust_remote_code models.  Reload it from the checkpoint
     # when guided decoding needs it.
@@ -437,19 +421,6 @@ def create_py_executor(
     if is_minimax_m3(m3_sparse_config):
         tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
-
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION":
-        # Star attention still derives its page table from every allocated block,
-        # which is incompatible with blocks allocated ahead for reuse.
-        if kv_cache_config.enable_block_reuse:
-            logger.warning(
-                f"Disabling block reuse for {llm_args.attn_backend} backend")
-            kv_cache_config.enable_block_reuse = False
-
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
-        logger.warning(
-            f"Disabling chunked context for {llm_args.attn_backend} backend")
-        enable_chunked_context = False
 
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
@@ -536,10 +507,34 @@ def create_py_executor(
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
-    # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    # Initialize DWDP Manager.
+    #
+    # DWDP needs every global MPI rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # only meaningful under that bijection. Disaggregated context workers satisfy
+    # this with TP=1, aggregated serving with full attention DP; everything that
+    # shards a replica across ranks is rejected. Pipeline and context parallelism
+    # are rejected even under attention DP, since pairing ranks that hold
+    # different layers as DWDP peers gives wrong expert weights rather than an
+    # error. The TP check tests `dp_size == tp_size` rather than
+    # `enable_attention_dp` so a future partial attention DP cannot slip through.
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
-        assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
+        if llm_args.dwdp_config.dwdp_size <= 1:
+            raise ValueError(
+                f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
+            )
+        if mapping.pp_size > 1 or mapping.cp_size > 1:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica, so "
+                "pipeline and context parallelism are not supported, but got "
+                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
+        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica: use "
+                "tp_size=1 (disaggregated context worker) or "
+                "enable_attention_dp=True (aggregated serving), but got "
+                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
@@ -580,7 +575,7 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
-    validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+    validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
@@ -594,38 +589,6 @@ def create_py_executor(
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-
-            use_chain_drafter = (
-                guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
-                and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
-                and draft_spec_config.draft_len_schedule is None)
-
-            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
-
-                def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper,
-                        StaticTreeDraftingLoopWrapper)
-                    from tensorrt_llm.llmapi import EagleDecodingConfig
-
-                    static_tree_drafter = isinstance(
-                        draft_spec_config, EagleDecodingConfig
-                    ) and draft_spec_config.eagle_choices is not None
-
-                    if static_tree_drafter:
-                        return StaticTreeDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, max_batch_size,
-                            model)
-                    else:
-                        return LinearDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, model)
-            else:
-                drafting_loop_wrapper = None
 
             draft_llm_args = copy.copy(llm_args)
             if spec_config.load_format == "dummy":
@@ -646,7 +609,6 @@ def create_py_executor(
                 dist=dist,
                 spec_config=draft_spec_config,
                 is_draft_model=True,
-                drafting_loop_wrapper=drafting_loop_wrapper,
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
@@ -658,13 +620,10 @@ def create_py_executor(
     else:
         draft_model_engine = None
 
-    # TODO: Overlap scheduler is not supported for below cases:
-    # 1. non-CDL is used
-    # 2. non-TrtllmAttention attention backend is used
-    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
-            draft_model_engine.attn_backend, TrtllmAttention)):
+    # TODO: Overlap scheduler is not supported for two-model speculative decoding.
+    if has_draft_model_engine:
         logger.warning(
-            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
+            "Overlap scheduler is not supported for two-model speculative decoding."
         )
         llm_args.disable_overlap_scheduler = True
 
@@ -826,11 +785,8 @@ def create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            max_seq_len=max_seq_len,
             mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
-            decoding_config=decoding_config,
-            kv_cache_config=kv_cache_config,
             max_num_sequences=max_num_seq_slots,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
@@ -959,10 +915,6 @@ def create_py_executor(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point).
@@ -1058,10 +1010,6 @@ def create_py_executor(
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 

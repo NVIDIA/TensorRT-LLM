@@ -171,10 +171,6 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
-      sampler_type:
-        annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
-        default: auto
-        status: deprecated
       sampler_force_async_worker:
         annotation: bool
         default: False
@@ -478,5 +474,8 @@ properties:
     annotation: str
     default: inspect._empty
   disaggregated_params:
+    annotation: dict
+    default: None
+  startup_metrics:
     annotation: dict
     default: None

@@ -24,12 +24,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
+    canonical_activation,
     canonical_quant,
 )
-from tensorrt_llm._torch.modules.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -45,7 +47,7 @@ def _is_deepep_feasible(num_ranks: int) -> bool:
 
     Intranode: num_ranks in {2, 4, 8} and num_ranks == local_mpi_size().
     Internode: exactly 8 ranks per node, with 2/4/8/16 RDMA nodes.
-    Mirrors the feasibility check in fused_moe_wide_ep.py::select_alltoall_method_type.
+    Mirrors the feasibility check in communication/deep_ep.py::DeepEP._is_deepep_feasible.
     """
     _INTRANODE_RANKS = {2, 4, 8}
     _REQUIRED_LOCAL_SIZE = 8
@@ -63,6 +65,7 @@ def _check_backend_can_implement(
     quant_algo: Optional[QuantAlgo],
     dtype_activation: torch.dtype,
     swiglu_gptoss_style: bool,
+    activation_type: ActivationType,
 ) -> Tuple[bool, Optional[str]]:
     """Resolve backend_str to its MoE class and ask whether it can serve this.
 
@@ -78,6 +81,9 @@ def _check_backend_can_implement(
         quant=canonical_quant(quant_algo),
         dtype_act=dtype_activation,
         swiglu_gptoss_style=swiglu_gptoss_style,
+        # Defaults to SwiGLU when unset, which would make every upstream
+        # activation gate evaluate the wrong activation.
+        activation=canonical_activation(activation_type),
     )
     deployment = MoEDeployment(
         ep_size=1,
@@ -175,7 +181,11 @@ def is_candidate_valid(
     """Return ``(ok, reason)`` based on backend / mapping / comm gates."""
     # Backend can_implement gate.
     ok, reason = _check_backend_can_implement(
-        config.backend, model.quant_algo_enum, act_dtype, model.swiglu_gptoss_style
+        config.backend,
+        model.quant_algo_enum,
+        act_dtype,
+        model.swiglu_gptoss_style,
+        model.activation_type_enum,
     )
     if not ok:
         return False, reason

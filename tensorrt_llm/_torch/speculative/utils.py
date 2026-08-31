@@ -21,7 +21,7 @@ from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .dspark import DSparkSpecMetadata, DSparkWorker
+from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
                      Eagle3ResourceManager, Eagle3SpecMetadata, MTPEagleWorker)
@@ -333,6 +333,29 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
+    metadata = _build_spec_metadata(spec_config,
+                                    model_config,
+                                    max_num_requests,
+                                    max_num_tokens,
+                                    spec_resource_manager=spec_resource_manager,
+                                    is_draft_model=is_draft_model,
+                                    max_seq_len=max_seq_len,
+                                    num_seq_slots=num_seq_slots)
+    # Set here rather than in each branch below: every one-model mode needs it and
+    # the per-mode constructors are easy to miss one of.
+    if metadata is not None:
+        metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+    return metadata
+
+
+def _build_spec_metadata(spec_config,
+                         model_config,
+                         max_num_requests,
+                         max_num_tokens,
+                         spec_resource_manager=None,
+                         is_draft_model=False,
+                         max_seq_len=262144,
+                         num_seq_slots=None):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
@@ -442,7 +465,13 @@ def get_spec_metadata(spec_config,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
-    if spec_config.spec_dec_mode.is_dflash():
+    # A standalone DSpark drafter is drafted by DFlashWorker, so it needs the
+    # DFlash metadata (paged draft KV, DFlash capture buffer). Only the
+    # embedded DeepSeek-V4-Pro draft uses DSparkSpecMetadata and its rolling
+    # window. See DSparkDecodingConfig.draft_is_embedded_in_target.
+    if spec_config.spec_dec_mode.is_dflash() or (
+            spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
         return DFlashSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -659,7 +688,17 @@ def get_spec_decoder(
         accepted_path_len = None
         if getattr(spec_config, "eagle_choices", None):
             accepted_path_len = sampler_args.max_total_draft_tokens + 1
-        return SpecSampler(sampler_args, accepted_path_len=accepted_path_len)
+        # Occurrence penalties assume the linear row layout: one logits row per
+        # speculative position, so a position's prefix is the positions before it.
+        # A tree's rows are nodes whose prefix is their root path instead, and
+        # sibling branches must not penalize each other -- so tree modes are not
+        # supported yet and are rejected at admission rather than mispenalized.
+        penalty_supported = not (getattr(spec_config, "eagle_choices", None)
+                                 or _is_effective_dynamic_tree(spec_config))
+        return SpecSampler(sampler_args,
+                           accepted_path_len=accepted_path_len,
+                           enable_penalty=spec_config.enable_penalty,
+                           penalty_supported=penalty_supported)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -757,7 +796,16 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    # DSpark splits by deployment form, mirroring the draft-model side. The
+    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
+    # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
+    # forward_batched). A standalone drafter is DFlash lineage and is served by
+    # DSparkWorker, which adds only the Markov bias and the shift_label
+    # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
+        if spec_config.draft_is_embedded_in_target:
+            return DSv4DSparkWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)

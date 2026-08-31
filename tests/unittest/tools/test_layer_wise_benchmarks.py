@@ -15,8 +15,6 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell
 
-_LAYER_WISE_BENCHMARKS_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337228")
-
 
 @pytest.fixture(scope="module", autouse=True)
 def require_nsys_cuda_tracing():
@@ -133,15 +131,11 @@ def require_nsys_cuda_tracing():
         )
 
 
-# The pinned DeepSeek FP4 checkpoint requires SM100+.
+# The pinned DeepSeek FP4 checkpoint requires SM100+, so this is guarded with
+# skip_pre_blackwell like its siblings below. https://nvbugs/6337228 was exactly
+# this test aborting (rc 134/1) on the A10 pre-merge stage.
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
-        4,
-    ],
-)
+@pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_r1_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -170,13 +164,7 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
 
 # The pinned DeepSeek FP4 checkpoint requires SM100+.
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
-        4,
-    ],
-)
+@pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_r1_ctx_tep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -207,13 +195,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
 
 # The pinned config (DeepSeek-V3.2 with the DEEPGEMM MoE backend) targets SM100+.
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(1, marks=_LAYER_WISE_BENCHMARKS_NVBUG),
-        4,
-    ],
-)
+@pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_v32_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
@@ -244,9 +226,10 @@ def test_deepseek_v32_ctx_dep(llm_root, world_size):
 
 # The pinned DeepSeek FP4 checkpoint requires SM100+.
 @pytest.mark.skip(
-    reason="--scaled-from rewrites WideEPMoE.select_alltoall_method_type, which is "
-    "the only alltoall-selection hook it patches. The WIDEEP backend is deprecated, "
-    "so weak scaling has no equivalent backend until the hook is generalized."
+    reason="--scaled-from makes the CTX prefill pack come out all-NaN, independently of "
+    "the MoE backend: on 4x B200 every combination of gen backend (CUTEDSL, CUTLASS) and "
+    "prefill backend (CUTLASS, DEEPGEMM) fails the NaN check, while the same command "
+    "without --scaled-from passes. Re-enable once weak scaling yields finite activations."
 )
 @skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [4])
@@ -264,7 +247,7 @@ def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, world_size):
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
             "--layer-indices=5,6",
             "--scaled-from=16",
-            "--moe-backend=WIDEEP",
+            "--moe-backend=CUTEDSL",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
@@ -325,6 +308,54 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
             "--no-enable-attention-dp",
             "--mamba-ssm-cache-dtype=float16",
             "--moe-backend=TRTLLM",
+        ],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+        env={
+            **os.environ,
+            "NP": f"{world_size:d}",
+            "PROFILE_DIR": profile_dir,
+        },
+    )
+    check_call(
+        ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+    )
+
+
+# Kimi K3's MXFP4 routed experts and KDA kernels require SM100+.
+@skip_pre_blackwell
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_kimi_k3_gen_dep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
+    model_root = llm_models_root(check=True)
+    profile_dir = f"profiles/test_kimi_k3_gen_dep_{world_size}"
+    if world_size == 1:
+        # EP1 puts all 896 experts on one GPU, and GEN builds a second (prefill)
+        # model, so halve the slice: layer 6 is KDA and 7 is MLA, still covering
+        # both attention paths. Balanced routing needs the top-k computed outside
+        # the MoE kernel, which only happens once there is expert parallelism.
+        layer_args = ["--layer-indices=6,7", "--balance-method=NotModified"]
+    else:
+        # 0-based: three KDA layers then one full-attention (MLA) layer.
+        layer_args = ["--layer-indices=4,5,6,7"]
+    check_call(
+        [
+            "./mpi_launch.sh",
+            "./run.sh",
+            "config_gen.yaml",
+            "--model",
+            model_root / "Kimi-K3",
+            *layer_args,
+            "--tokens-per-block=64",
+            # SiTU routed experts support no other backend, and GEN also builds
+            # a prefill runner.
+            "--moe-backend=TRTLLM",
+            "--moe-backend-for-prefill=TRTLLM",
+            # 1 golden + 3 draft tokens per generation step.
+            "--batch-size=32",
+            "--seq-len-q=4",
+            "--spec-max-draft-len=3",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
