@@ -424,7 +424,11 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
         if (suppressTestReporting || xmlCount > 0) {
             def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+            // debug_env.txt is written via `env | sort`, which captures credentials
+            // from the pipeline's environment (e.g. OPEN_SEARCH_DB_CREDENTIALS) in
+            // plaintext. Jenkins only masks credentials in console log output, not
+            // in files, so it must be excluded from the uploaded archive.
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz --exclude='${stageName}/debug_env.txt' ${transformOpt} ${stageName}/"
             trtllm_utils.uploadArtifacts(
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
@@ -3446,7 +3450,11 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // results.xml, or the superseded-file rename above can all leave the
             // last uploaded snapshot stale.
             def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+            // debug_env.txt is written via `env | sort`, which captures credentials
+            // from the pipeline's environment (e.g. OPEN_SEARCH_DB_CREDENTIALS) in
+            // plaintext. Jenkins only masks credentials in console log output, not
+            // in files, so it must be excluded from the uploaded archive.
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz --exclude='${stageName}/debug_env.txt' ${transformOpt} ${stageName}/"
             trtllm_utils.uploadArtifacts(
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
