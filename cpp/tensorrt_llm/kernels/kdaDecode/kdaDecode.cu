@@ -1428,7 +1428,6 @@ struct KdaDecodeLaunchParams
     bool update_conv_cache;
     bool use_lower_bound;
     bool apply_beta_sigmoid;
-    bool enable_pdl;
     float lower_bound;
     float scale;
     float onorm_eps;
@@ -1444,7 +1443,7 @@ void launch_kda_decode_compact_heads_raw(KdaDecodeLaunchParams const& p)
     auto const kernel = kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads,
         kHeads, false, false, false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>;
     TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStageDynamicSmemBytes));
-    common::launchWithPdl("kdaDecodeCompactHeads", p.enable_pdl, kernel, dim3(p.B * p.HV), dim3(kThreads),
+    common::launchWithPdlWhenEnabled("kdaDecodeCompactHeads", kernel, dim3(p.B * p.HV), dim3(kThreads),
         kStageDynamicSmemBytes, p.stream, reinterpret_cast<__nv_bfloat16 const*>(p.x_q),
         reinterpret_cast<__nv_bfloat16 const*>(p.x_k), reinterpret_cast<__nv_bfloat16 const*>(p.x_v),
         reinterpret_cast<__nv_bfloat16 const*>(p.w_q_t), reinterpret_cast<__nv_bfloat16 const*>(p.w_k_t),
@@ -1466,7 +1465,7 @@ void launch_kda_decode_many_heads_raw(KdaDecodeLaunchParams const& p)
     auto const kernel
         = kda_decode_fusion_many_heads_kernel<kApplyOnorm, kUseStaticDecodeLayout, kHeads, kHeads, kUseHeadGrid, false,
             false, false, false, false, true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>;
-    common::launchWithPdl("kdaDecodeManyHeads", p.enable_pdl, kernel, grid, dim3(kThreads), 0, p.stream,
+    common::launchWithPdlWhenEnabled("kdaDecodeManyHeads", kernel, grid, dim3(kThreads), 0, p.stream,
         reinterpret_cast<__nv_bfloat16 const*>(p.x_q), reinterpret_cast<__nv_bfloat16 const*>(p.x_k),
         reinterpret_cast<__nv_bfloat16 const*>(p.x_v), reinterpret_cast<__nv_bfloat16 const*>(p.w_q_t),
         reinterpret_cast<__nv_bfloat16 const*>(p.w_k_t), reinterpret_cast<__nv_bfloat16 const*>(p.w_v_t),
@@ -1605,8 +1604,8 @@ void invokeKdaDecode(KdaDecodeParams const& params, cudaStream_t stream)
         params.gate, params.dtBias, params.beta, params.outputNormGate, params.outputNormWeight, params.ssmStateIndices,
         params.cuSeqlens, params.state, params.stateSlotStride, params.convStateSlotStride, params.output,
         params.batchSize, params.numHeads, params.numValueHeads, params.applyOutputNorm, params.updateConvCache,
-        params.useLowerBound, params.applyBetaSigmoid, params.enablePdl, params.lowerBound, params.scale,
-        params.outputNormEps, params.layout, stream};
+        params.useLowerBound, params.applyBetaSigmoid, params.lowerBound, params.scale, params.outputNormEps,
+        params.layout, stream};
     if (useCompactHeads)
     {
         dispatch_kda_decode_heads<true>(launchParams);

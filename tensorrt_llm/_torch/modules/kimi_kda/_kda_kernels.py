@@ -30,7 +30,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ...flashinfer_utils import get_env_enable_pdl
 from ..fla.index import prepare_chunk_indices
 from . import _kda_decode
 
@@ -379,9 +378,7 @@ class KDAKernelDispatch:
         use_optimized_prefill: bool = True,
         use_optimized_decode: bool = True,
         use_optimized_verify: bool = True,
-        enable_pdl: Optional[bool] = None,
     ) -> None:
-        self._enable_pdl = get_env_enable_pdl() if enable_pdl is None else enable_pdl
         optimized_supported = is_kda_optimized_supported()
         self.prefill_kernel_path = "fla"
         if use_optimized_prefill and optimized_supported and is_intree_prefill_available():
@@ -629,4 +626,4 @@ class KDAKernelDispatch:
                 "decode_kda called on non-optimized path; use FLA path via "
                 "the module's fallback handling instead."
             )
-        return _kda_decode.run_kda_decode_fusion_cuda(enable_pdl=self._enable_pdl, **kwargs)
+        return _kda_decode.run_kda_decode_fusion_cuda(**kwargs)

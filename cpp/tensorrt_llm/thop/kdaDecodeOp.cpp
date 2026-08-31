@@ -190,7 +190,7 @@ void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::
     at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta, at::Tensor onorm_g,
     at::Tensor onorm_weight, std::optional<at::Tensor> const& ssm_state_indices, at::Tensor cu_seqlens,
     at::Tensor state, at::Tensor out, bool apply_onorm, bool update_conv_cache, bool use_lower_bound,
-    bool apply_beta_sigmoid, double lower_bound, double scale, double onorm_eps, bool enable_pdl)
+    bool apply_beta_sigmoid, double lower_bound, double scale, double onorm_eps)
 {
     int const B = static_cast<int>(x_q.size(1));
     int const H = static_cast<int>(x_q.size(2));
@@ -205,7 +205,7 @@ void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::
         dt_bias.data_ptr<float>(), beta.data_ptr(), onorm_g.data_ptr(), onorm_weight.data_ptr<float>(),
         ssm_state_indices.has_value() ? ssm_state_indices->data_ptr<int>() : nullptr, cu_seqlens.data_ptr<int>(),
         state.data_ptr<float>(), state.stride(0), cs_q.stride(0), out.data_ptr(), B, H, HV, apply_onorm,
-        update_conv_cache, use_lower_bound, apply_beta_sigmoid, enable_pdl, static_cast<float>(lower_bound),
+        update_conv_cache, use_lower_bound, apply_beta_sigmoid, static_cast<float>(lower_bound),
         static_cast<float>(scale), static_cast<float>(onorm_eps), layout};
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -218,7 +218,7 @@ at::Tensor kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor 
     at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta, at::Tensor onorm_g,
     at::Tensor onorm_weight, std::optional<at::Tensor> ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state,
     bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid, double lower_bound,
-    double scale, double onorm_eps, bool enable_pdl, std::optional<at::Tensor> output)
+    double scale, double onorm_eps, std::optional<at::Tensor> output)
 {
     validate_kda_decode_fusion_inputs(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
         a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, apply_onorm,
@@ -235,7 +235,7 @@ at::Tensor kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor 
     }
     launch_selected_kernel(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
         dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm, update_conv_cache,
-        use_lower_bound, apply_beta_sigmoid, lower_bound, scale, onorm_eps, enable_pdl);
+        use_lower_bound, apply_beta_sigmoid, lower_bound, scale, onorm_eps);
     return out;
 }
 
@@ -256,7 +256,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? ssm_state_indices, Tensor cu_seqlens, Tensor(d!) state, "
         "bool apply_onorm, bool update_conv_cache, bool use_lower_bound, "
         "bool apply_beta_sigmoid, float lower_bound, float scale, "
-        "float onorm_eps, bool enable_pdl=True, Tensor(e!)? output=None) -> Tensor(e!)");
+        "float onorm_eps, Tensor(e!)? output=None) -> Tensor(e!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

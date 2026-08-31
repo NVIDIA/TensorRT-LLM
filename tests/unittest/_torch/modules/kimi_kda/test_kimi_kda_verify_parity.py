@@ -195,8 +195,7 @@ def test_kda_prefill_matches_reference():
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl_off", "pdl_on"])
-def test_kda_decode_matches_reference(enable_pdl):
+def test_kda_decode_matches_reference():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
@@ -209,14 +208,14 @@ def test_kda_decode_matches_reference(enable_pdl):
     d = h * head_dim
     w = lin["short_conv_kernel_size"]
 
-    runtime = KimiKDALinearAttention(cfg, layer_idx=0, enable_pdl=enable_pdl).to(device)
+    runtime = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     if get_production_decode_kernel_path(runtime) != "optimized":
         pytest.skip("needs an SM100/SM103 GPU")
     for param in runtime.parameters():
         if param.is_floating_point():
             torch.nn.init.normal_(param, std=0.02)
 
-    reference = KimiKDALinearAttention(cfg, layer_idx=0, enable_pdl=enable_pdl).to(device)
+    reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
     runtime.finalize_decode_weights()
 

@@ -92,7 +92,6 @@ def run_kda_decode_fusion_cuda(
     use_beta_sigmoid_in_kernel: bool = True,
     verbose: bool = False,
     update_conv_cache: bool = False,
-    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Run CUDA KDA decode fusion for the tuned decode shapes.
 
@@ -226,6 +225,5 @@ def run_kda_decode_fusion_cuda(
         lower_bound_value,
         float(scale),
         float(onorm_eps),
-        enable_pdl,
     )
     return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
