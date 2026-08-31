@@ -197,12 +197,14 @@ public:
                 // Make sure the hashIds are not duplicated.
                 // Except for the case where we have both family version and specific version of the same config.
                 auto const hash = hashID(kernelMeta);
-                auto it = mFunctions.find(hash);
-                if (it != mFunctions.end())
+                auto& functions = getFunctions(kernelMeta.mFusesDsv4InvRopeFp8Quant, kernelMeta.mUsesDsv4Ue8m0ScaleO);
+                auto it = functions.find(hash);
+                if (it != functions.end())
                 {
                     auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
                     TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
-                        "The kernel's hashId has conflicts with others.");
+                        "The kernel's hashId conflicts with another kernel in the same variant: existing=%s, new=%s.",
+                        existingKernelMeta.mFuncName, kernelMeta.mFuncName);
                     // Prefer specific SM version over family version
                     if (existingKernelMeta.mSM == kSM_100f)
                     {
@@ -211,7 +213,7 @@ public:
                 }
                 else
                 {
-                    mFunctions[hash] = funcInfo;
+                    functions[hash] = funcInfo;
                 }
             }
         }
@@ -281,7 +283,8 @@ public:
         algoFilterForCubinPath(options);
         auto [hashId, info] = hashFromFmhaOptions(options);
 
-        if (mFunctions.find(hashId) == mFunctions.end())
+        auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
+        if (functions.find(hashId) == functions.end())
         {
             TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
             return std::make_pair(false, info);
@@ -322,8 +325,8 @@ private:
         10752, 11264, 11776, 12288, 13312, 14336, 16384, 20480, 24576, 32768, 40960, 49152, 65536, 98304, 131072};
     // Selection of seqLenQ: typically our prefill kernels would not use JIT and seqLenQ is fixed during decode.
     // However seqLenQ can change when we use generation kernel to do prefill. SeqLenQ is sensitive in the range 1-16.
-    // But for prefill we typically face much longer sequence. So we only use a very single datapoint.
-    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {128};
+    // Below sequence are chosen to cover most sparse attention cases.
+    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {1, 2, 4, 8, 32, 64, 128};
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
@@ -543,18 +546,21 @@ public:
             auto [hashId, info] = hashFromFmhaOptions(options);
 
             // load from cubin
-            auto const findIter = mFunctions.find(hashId);
+            auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
+            auto const findIter = functions.find(hashId);
             // Add debug info when kernels are not found.
-            TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "Trtllm-gen kernels not found: " + info);
+            TLLM_CHECK_WITH_INFO(findIter != functions.end(), "Trtllm-gen kernels not found: " + info);
 
             auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
             const CUfunction func = findIter->second.mDeviceFunction;
 
-            // mGroupsHeadsQ and mGroupsTokensHeadsQ are not part of the hashID, so they don't
-            // affect kernel lookup. Use cubin-side values from kernelMeta instead of AutoTuner
-            // output, since cubins are exported with enableAutotuner=false.
+            // mGroupsHeadsQ, mGroupsTokensHeadsQ, and mNumInsts{Q,Kv} are part of the hashID, so the
+            // matched cubin already agrees with the AutoTuner decision. Re-assign from kernelMeta
+            // anyway to keep options authoritative w.r.t. the actual cubin used for setKernelParams.
             options.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
             options.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
+            options.mNumInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
+            options.mNumInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
 
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
@@ -562,7 +568,7 @@ public:
                 fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
                 fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr, fmhaData.mMetaData.kvPageIdxD,
                 fmhaData.mScales.outputScaleD, fmhaData.mInputBuffers.dsv4InvRopeCosSinCacheD,
-                fmhaData.mScales.dsv4OScaleFp32D, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
+                fmhaData.mScales.dsv4OScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
                 fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
                 fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
                 fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mScales.sageAttnSfsQPtrD,
@@ -571,7 +577,8 @@ public:
                 fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
                 fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
                 fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
-                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax,
+                fmhaData.mMetaData.skipCorrThreshold, fmhaData.mScales.kvSfScale,
                 fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
                 options.mUsesSharedPagedKvIdx);
 
@@ -584,8 +591,8 @@ public:
 private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax,
-        bool fusesDsv4InvRopeFp8Quant) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool groupsHeadsQ,
+        bool groupsTokensHeadsQ, int numInstsQ, int numInstsKv) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -599,6 +606,10 @@ private:
         TLLM_CHECK_WITH_INFO((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
             "The tileSizeQ and tileSizeKv must be power of 2.");
         TLLM_CHECK_WITH_INFO(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
+        // Only (1,1), (2,1), and (1,2) are supported by FmhaOptions.
+        TLLM_CHECK_WITH_INFO(
+            (numInstsQ == 1 || numInstsQ == 2) && (numInstsKv == 1 || numInstsKv == 2) && (numInstsQ * numInstsKv <= 2),
+            "Expect numInstsQ/Kv in {(1,1),(2,1),(1,2)}, got numInstsQ=%d, numInstsKv=%d", numInstsQ, numInstsKv);
         // Format of the hash key:
         // Bit 0  - 3 : qkvLayout.
         // Bit 4  - 7 : maskType.
@@ -615,7 +626,10 @@ private:
         // Bit 54 - 54: uses2CtaMma.
         // Bit 55 - 56: sparseAttention.
         // Bit 57 - 57: skipsSoftmax.
-        // Bit 58 - 58: fusesDsv4InvRopeFp8Quant.
+        // Bit 58 - 58: groupsHeadsQ.
+        // Bit 59 - 59: groupsTokensHeadsQ.
+        // Bit 60 - 60: (numInstsQ == 2). Distinguishes Q128Kv256 vs Q256Kv128 cubins that share tile sizes.
+        // Bit 61 - 61: (numInstsKv == 2).
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -624,16 +638,24 @@ private:
             | (static_cast<uint64_t>(numTokensPerPage > 0 ? static_cast<int>(log2(numTokensPerPage)) : 0) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 58);
+            | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(groupsHeadsQ) << 58)
+            | (static_cast<uint64_t>(groupsTokensHeadsQ) << 59) | (static_cast<uint64_t>(numInstsQ == 2) << 60)
+            | (static_cast<uint64_t>(numInstsKv == 2) << 61);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
     {
+        TLLM_CHECK_WITH_INFO(kernelMeta.mTileSizeQ > 0 && kernelMeta.mTileSizeKv > 0
+                && kernelMeta.mStepQ % kernelMeta.mTileSizeQ == 0 && kernelMeta.mStepKv % kernelMeta.mTileSizeKv == 0,
+            "Invalid step/tile sizes in FMHA kernel meta: stepQ=%d tileSizeQ=%d stepKv=%d tileSizeKv=%d",
+            kernelMeta.mStepQ, kernelMeta.mTileSizeQ, kernelMeta.mStepKv, kernelMeta.mTileSizeKv);
+        int const numInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
+        int const numInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
             kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
-            kernelMeta.mFusesDsv4InvRopeFp8Quant);
+            kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -662,7 +684,11 @@ private:
             + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
             + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible)
-            + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(options.mFusesDsv4InvRopeFp8Quant);
+            + ", groupsHeadsQ=" + std::to_string(options.mGroupsHeadsQ)
+            + ", groupsTokensHeadsQ=" + std::to_string(options.mGroupsTokensHeadsQ) + ", numInstsQ="
+            + std::to_string(options.mNumInstsQ) + ", numInstsKv=" + std::to_string(options.mNumInstsKv) + ", variant="
+            + (options.mFusesDsv4InvRopeFp8Quant ? (options.mUsesDsv4Ue8m0ScaleO ? "dsv4-ue8m0" : "dsv4-fp32")
+                                                 : "plain");
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
         return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
@@ -672,7 +698,8 @@ private:
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
                                   static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible,
-                                  options.mFusesDsv4InvRopeFp8Quant),
+                                  options.mGroupsHeadsQ, options.mGroupsTokensHeadsQ, options.mNumInstsQ,
+                                  options.mNumInstsKv),
             info);
     }
 
@@ -858,6 +885,7 @@ private:
         fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
+        fmhaData.mMetaData.skipCorrThreshold = 0.0F; // 0 disables threshold-based skip correction
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
 
         // Fill Scales
@@ -870,7 +898,7 @@ private:
         if (params.mDsv4EpilogueFusion.enabled)
         {
             fmhaData.mInputBuffers.dsv4InvRopeCosSinCacheD = params.mDsv4EpilogueFusion.cosSinCache;
-            fmhaData.mScales.dsv4OScaleFp32D = static_cast<float*>(params.oSfPtr);
+            fmhaData.mScales.dsv4OScaleD = static_cast<float*>(params.oSfPtr);
         }
         // Sage Attention scaling factors
         fmhaData.mScales.sageAttnSfsQPtrD = params.sageAttnSfsQPtr;
@@ -1127,10 +1155,6 @@ private:
         {
             sstream << "\"skipsFirstProdAcquiresLastConsReleases\": false,\n";
         }
-        // Reduce the number of anti-dependencies in the generated code.
-        // See https://nvbugs/4940327
-        // WARNING: Increase this might lead to more register usage and even spills. Please finetune it carefully.
-        sstream << "\"antiDepWeight\": 25,\n";
 
         sstream << "\"usesNvRtc\": "
                 << "true"
@@ -1223,10 +1247,12 @@ private:
             + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
             + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible)
+            + ", numInstsQ=1, numInstsKv=1"
             + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mDsv4EpilogueFusion.enabled);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
+        // Legacy path: SelectKernelParams has no groupsHeadsQ/numInsts fields; default them.
         return std::make_pair(
             hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(selectKernelParams.mMaskType),
                 static_cast<int>(selectKernelParams.mKernelType), static_cast<int>(selectKernelParams.mTileScheduler),
@@ -1234,7 +1260,8 @@ private:
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
-                selectKernelParams.mSkipsSoftmaxWhenPossible, params.mDsv4EpilogueFusion.enabled),
+                selectKernelParams.mSkipsSoftmaxWhenPossible, /* groupsHeadsQ */ false,
+                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1),
             info);
     }
 
@@ -1288,7 +1315,36 @@ private:
         CUfunction mDeviceFunction;
     };
 
-    std::unordered_map<uint64_t, KernelInfo> mFunctions;
+    using KernelMap = std::unordered_map<uint64_t, KernelInfo>;
+
+    // Route each kernel to the map matching its DSv4 fused inverse-RoPE FP8 epilogue variant.
+    // Non-fused kernels, DSv4-fused (FP32 output scale), and DSv4-fused (UE8M0 output scale) live in
+    // separate maps so that variants sharing an identical hashID do not collide during registration.
+    KernelMap& getFunctions(bool fusesDsv4InvRopeFp8Quant, bool usesDsv4Ue8m0ScaleO)
+    {
+        TLLM_CHECK_WITH_INFO(!usesDsv4Ue8m0ScaleO || fusesDsv4InvRopeFp8Quant,
+            "The DSv4 UE8M0 output-scale variant requires the fused inverse-RoPE FP8 epilogue.");
+        if (!fusesDsv4InvRopeFp8Quant)
+        {
+            return mFunctions;
+        }
+        return usesDsv4Ue8m0ScaleO ? mDsv4FusedUe8m0Functions : mDsv4FusedFunctions;
+    }
+
+    KernelMap const& getFunctions(bool fusesDsv4InvRopeFp8Quant, bool usesDsv4Ue8m0ScaleO) const
+    {
+        TLLM_CHECK_WITH_INFO(!usesDsv4Ue8m0ScaleO || fusesDsv4InvRopeFp8Quant,
+            "The DSv4 UE8M0 output-scale variant requires the fused inverse-RoPE FP8 epilogue.");
+        if (!fusesDsv4InvRopeFp8Quant)
+        {
+            return mFunctions;
+        }
+        return usesDsv4Ue8m0ScaleO ? mDsv4FusedUe8m0Functions : mDsv4FusedFunctions;
+    }
+
+    KernelMap mFunctions;
+    KernelMap mDsv4FusedFunctions;
+    KernelMap mDsv4FusedUe8m0Functions;
 
     FmhaInterface mFmhaInterface{false, 1};
 };

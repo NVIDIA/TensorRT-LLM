@@ -16,7 +16,7 @@
 
 Covers the framework-side logic that does NOT need the full draft model:
 ``DSparkSpecMetadata`` hidden-state capture (incl. the mHC hc-mean reduction)
-and ``DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
+and ``DSv4DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
 draft and acceptance path is covered by the DSpark test in
 ``integration/defs/accuracy/test_llm_api_pytorch.py``.
 """
@@ -26,7 +26,11 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSparkWorker
+from tensorrt_llm._torch.speculative.dspark import (
+    DSparkSpecMetadata,
+    DSparkWorker,
+    DSv4DSparkWorker,
+)
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 pytestmark = pytest.mark.skipif(
@@ -101,7 +105,7 @@ def _make_worker():
     )
     from tensorrt_llm.mapping import Mapping
 
-    return DSparkWorker(cfg, Mapping())
+    return DSv4DSparkWorker(cfg, Mapping())
 
 
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
@@ -753,3 +757,70 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
     gen_draft = nd[num_contexts:]
     expected_gen = torch.stack([s[num_contexts:] for s in sampled_per_step], dim=1)
     assert torch.equal(gen_draft, expected_gen)
+
+
+# ---------------------------------------------------------------------------
+# Routing: decoding_type DSpark serves two deployment forms, and the worker,
+# the spec metadata and the draft-KV decision must all follow the same flag.
+# Mis-routing is not hypothetical: handing a standalone drafter to
+# DSv4DSparkWorker raises AttributeError on num_stages at lazy init.
+# ---------------------------------------------------------------------------
+
+
+def _routing_config(embedded):
+    return types.SimpleNamespace(
+        max_draft_len=5,
+        max_total_draft_tokens=5,
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        draft_is_embedded_in_target=embedded,
+        attention_backend="TRTLLM",
+        confidence_threshold=0.5,
+        _use_shared_kv_cache=False,
+        _allow_separate_draft_kv_cache=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "embedded,worker_cls,uses_separate_draft_kv",
+    [(True, DSv4DSparkWorker, False), (False, DSparkWorker, True)],
+    ids=["embedded", "standalone"],
+)
+def test_worker_and_draft_kv_follow_the_draft_form(embedded, worker_cls, uses_separate_draft_kv):
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm._torch.speculative.utils import get_spec_worker
+    from tensorrt_llm.mapping import Mapping
+
+    spec_config = _routing_config(embedded)
+
+    worker = get_spec_worker(spec_config, None, Mapping())
+    assert type(worker) is worker_cls
+
+    # The embedded draft owns a rolling window and never reads the paged draft
+    # KV cache; the standalone one is DFlash lineage and does.
+    assert should_use_separate_draft_kv_cache(spec_config) is uses_separate_draft_kv
+
+
+def test_dspark_worker_policies_come_from_the_drafter():
+    """The two DSpark overrides must read the checkpoint, not hardcode dspark.
+
+    A DSpark drafter trained with the legacy DFlash slot layout, or shipped
+    without a Markov head, has to get the base-class behaviour. Hardcoding the
+    dspark answer here would pass every routing test while silently mis-slotting
+    such a drafter -- and mis-slotting costs acceptance without ever failing.
+    """
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm.mapping import Mapping
+
+    worker = DSparkWorker(_routing_config(False), Mapping())
+    legacy = types.SimpleNamespace(_dspark_shift_label=False, has_markov_head=False)
+
+    # shift_label off -> the base class' slots 1..K, not the dspark 0..K-1.
+    ids = worker._draft_slot_ids(legacy, num_gens=2, block_size=5, num_draft_tokens=3)
+    base_ids = DFlashWorker._draft_slot_ids(
+        worker, legacy, num_gens=2, block_size=5, num_draft_tokens=3
+    )
+    assert ids.tolist() == base_ids.tolist()
+
+    # No Markov head -> the backbone logits pass through untouched.
+    logits = torch.randn(2, 3, 8, device="cuda")
+    assert worker._refine_block_logits(legacy, logits, {}, None) is logits

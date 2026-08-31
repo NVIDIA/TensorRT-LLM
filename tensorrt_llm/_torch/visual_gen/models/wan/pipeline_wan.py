@@ -587,19 +587,21 @@ class WanPipeline(BasePipeline):
             else:
                 current_model = self.transformer
 
-            # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
+            # Build the Wan 2.2 TI2V-5B timestep: per-patch 2D for I2V, per-batch 1D for T2V
             if self.is_wan22_5b:
                 _, ph, pw = self.transformer.config.patch_size
-                nf = latents.shape[2]
-                nh = latents.shape[3] // ph
-                nw = latents.shape[4] // pw
                 if is_i2v:
                     # I2V: timestep 0 for reference image, current_t for noisy frames
                     patch_ts = i2v_first_frame_mask[0, 0, :, ::ph, ::pw] * current_t
                     timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
                 else:
-                    # T2V: current_t for all frames
-                    timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+                    # T2V: current_t is uniform across all patches, so keep the
+                    # timestep 1-D per batch. The transformer broadcasts one
+                    # modulation row per batch element instead of embedding
+                    # batch*seq_len identical rows, and a 1-D timestep keeps
+                    # TeaCache's timestep-embedding hook working (diffusers'
+                    # get_timestep_embedding requires a 1-D input).
+                    timestep = current_t.reshape(1).expand(latents.shape[0])
 
             if _vsa_active and _vsa_builder is not None:
                 # latents: [B, C, T_latent, H_latent, W_latent]
@@ -625,11 +627,14 @@ class WanPipeline(BasePipeline):
                 encoder_hidden_states=encoder_hidden_states,
             )
 
-        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
-        def _pin_i2v_first_frame(x):
-            return ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
+        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only).
+        # post_step_fn also carries the denoise loop's side-stream latents (Cosmos3
+        # denoises action/audio alongside video); Wan has none, so they pass through.
+        def _pin_i2v_first_frame(x, extra_stream_latents):
+            pinned = ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
                 self.dtype
             )
+            return pinned, extra_stream_latents
 
         post_step_fn = _pin_i2v_first_frame if (self.is_wan22_5b and is_i2v) else None
 

@@ -7,7 +7,7 @@ The op runs the tcgen05 MMA kernel
 (:class:`DSparkAttention`) on the supported DSV4 DSpark
 geometry: 128 heads, head_dim 512, draft block 5 or 6, and a 128-row rolling
 window. Other shapes fall back to the pure-PyTorch reference path in
-``models/dspark/attention.py``.
+``models/modeling_dspark.py``.
 """
 
 from collections.abc import Callable
