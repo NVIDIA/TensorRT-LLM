@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
+from importlib import import_module, util
+from importlib.machinery import ModuleSpec
 from typing import Optional, Tuple
 
 import torch
@@ -42,23 +43,42 @@ def _install_msa_cutlass_compatibility() -> None:
 
 @functools.lru_cache(maxsize=1)
 def msa_package_available() -> bool:
-    """Prepare and report whether the packaged fmha_sm100 module can be imported.
+    """Prepare and report whether the packaged fmha_sm100 interface can be imported.
 
-    Cached: each call scans sys.path until fmha_sm100 is first imported, and
-    FmhaManager construction checks once per attention layer. Whether the
-    package is installed cannot change within a process.
+    The packaged MSA sources historically replaced the process-wide
+    ``cutlass.cute.compile`` dispatcher during import. Import the sparse interface
+    here and restore that dispatcher before any other CuTe DSL backend is selected.
+    The module remains cached, so later kernel use does not repeat the side effect.
     """
-    if importlib.util.find_spec("fmha_sm100") is None:
+    package_spec = util.find_spec("fmha_sm100")
+    if package_spec is None:
         return False
     _install_msa_cutlass_compatibility()
+    # Unit tests replace find_spec with a minimal sentinel while validating only
+    # the CUTLASS compatibility aliases.
+    if not isinstance(package_spec, ModuleSpec):
+        return True
+
+    try:
+        import cutlass.cute as cute
+    except ImportError:
+        return False
+
+    compile_dispatcher = cute.compile
+    try:
+        import_module("fmha_sm100.cute.interface")
+    except ImportError:
+        return False
+    finally:
+        cute.compile = compile_dispatcher
     return True
 
 
 def require_msa_module() -> types.ModuleType:
     """Import the packaged fmha_sm100 module or raise a clear error.
 
-    The import is deferred to first kernel use so the MSA backend can be
-    advertised in the config schema on systems where the kernels cannot load.
+    The package root is imported on first kernel use. The sparse interface was
+    already validated by ``msa_package_available`` during backend selection.
     A missing package is a hard error, never a silent fallback to another backend.
     """
     _install_msa_cutlass_compatibility()

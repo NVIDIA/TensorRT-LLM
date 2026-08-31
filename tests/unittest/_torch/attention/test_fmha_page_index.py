@@ -113,6 +113,14 @@ def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor() -> None:
     )
 
 
+@pytest.mark.parametrize("value, expected", [(None, 0), (0, 0), (8192, 8192)])
+def test_attention_chunk_size_uses_zero_for_native_disabled_value(
+    value: int | None,
+    expected: int,
+) -> None:
+    assert FlashInferTrtllmGenFmha._get_attention_chunk_size(value) == expected
+
+
 def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -149,12 +157,12 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     with pytest.raises(RuntimeError, match="counter size arguments observed"):
         FlashInferTrtllmGenFmha.prepare_workspace(
             fmha,
-            q=SimpleNamespace(),
-            k=None,
-            v=None,
+            params=SimpleNamespace(
+                qkv_or_q=SimpleNamespace(),
+                fwd=SimpleNamespace(),
+                workspace=SimpleNamespace(),
+            ),
             metadata=metadata,
-            forward_args=SimpleNamespace(),
-            workspace=SimpleNamespace(),
         )
 
 
@@ -230,27 +238,34 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=torch.empty((batch_size, 2, 4)),
-        context_buf=output,
-        sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
+        output=output,
+        qkv_or_q=torch.empty((batch_size, 2, 4)),
+        sequence_length=torch.ones(batch_size, dtype=torch.int32),
         input_seq_length=1,
         num_tokens=batch_size,
         seq_offset=2,
+        num_heads=attn.num_heads,
+        num_kv_heads=attn.num_kv_heads,
+        head_size=attn.head_dim,
+        q_scaling=attn.q_scaling,
+        quant_mode=attn.quant_mode,
+        predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
+        attention_chunk_size=attn.attention_chunk_size,
+        position_embedding_type=attn.position_embedding_type,
+        rope_params=attn.rope_params,
         tokens_per_block=32,
         kv_factor=2,
         total_num_blocks=8,
-        batch_size=batch_size,
+        num_seqs=batch_size,
         num_requests=1,
+        beam_width=metadata.beam_width,
         is_cross=True,
     )
-    fmha = SimpleNamespace(
-        _layout="HND",
-        _enable_pdl=False,
-        USE_SHARED_PAGED_KV_IDX=False,
-        _multi_processor_count=1,
-        _use_fp8_context_fmha=lambda _output, _input_type: False,
-        _get_multi_ctas_kv_counter_buffer=lambda: None,
-    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._layout = "HND"
+    fmha._enable_pdl = False
+    fmha._multi_processor_count = 1
+    fmha._multi_ctas_kv_counter_buffer = torch.empty(0, dtype=torch.int32)
 
     FlashInferTrtllmGenFmha.run_generation(fmha, params)
 
