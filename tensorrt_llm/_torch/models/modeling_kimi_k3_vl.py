@@ -443,6 +443,9 @@ class KimiK3InputProcessor(KimiK25InputProcessor):
             "image": "<|kimi_image_placeholder|>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        # K3's reference renderer concatenates content parts with no
+        # separator; the default "\n" join skews prompt-token parity.
+        placeholders_separator="",
     ),
 )
 class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):

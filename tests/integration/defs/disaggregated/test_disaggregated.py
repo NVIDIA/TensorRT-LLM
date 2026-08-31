@@ -80,22 +80,7 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
-    if sm == 90:
-        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
-        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
-        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
-        return "^gdr_copy"
     return "^ib,gdr_copy"
-
-
-# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 def cleanup_output_files():
@@ -1687,8 +1672,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
-    # This test validates the C++ transceiver's timing-metric semantics. Force
-    # DEFAULT to UCX so Llama's Python preference falls back to C++.
+    # This test validates the C++ transceiver's timing-metric semantics: the
+    # config pins transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env = llm_venv._new_env | {
         "TRTLLM_USE_NIXL_KVCACHE": "0",
         "TRTLLM_USE_UCX_KVCACHE": "1",
@@ -1731,8 +1716,8 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
     env = llm_venv._new_env.copy()
-    # This test validates the C++ transceiver's CSV format. Selecting UCX for
-    # the DEFAULT backend also resolves the automatic runtime to C++.
+    # This test validates the C++ transceiver's CSV format: the config pins
+    # transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
