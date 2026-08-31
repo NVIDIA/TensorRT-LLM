@@ -226,7 +226,8 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
     assert generation_layout_records
     compact_preprocess_bytes = int(generation_layout_records[0][2]["total_size"])
     assert all(
-        kwargs["skip_workspace"] is True for _args, kwargs, _layout in generation_layout_records
+        kwargs["skip_fmha_workspace"] is True
+        for _args, kwargs, _layout in generation_layout_records
     )
     assert all(
         int(layout["trtllm_gen_workspace_size"]) == 0
