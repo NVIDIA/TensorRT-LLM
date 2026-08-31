@@ -101,7 +101,9 @@ checked-in public TensorRT-LLM model catalogs. Do not edit by hand.
 """
 
 ARCHITECTURE_ALLOWLIST_FORMAT_VERSION = 1
-ARCHITECTURE_ALLOWLIST_CONTENT_SHA256 = "{content_sha256}"
+ARCHITECTURE_ALLOWLIST_CONTENT_SHA256 = (
+    "{content_sha256}"
+)
 
 PUBLIC_HF_ARCHITECTURES = frozenset(
     {{
