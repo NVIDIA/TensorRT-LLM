@@ -579,12 +579,17 @@ def launchReleaseCheck(pipeline, globalVars)
             // Use GitLab/GitHub API to get the exact list of changed files in this MR.
             // This avoids git history depth issues with shallow clones.
             def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-            if (changedFileList && !changedFileList.isEmpty()) {
+            echo "Changed file count from API: ${changedFileList ? changedFileList.size() : 0}"
+            // GitHub's PR Files API caps out at 3000 entries, silently truncating the
+            // list for huge PRs. Fail closed with a 2500 margin below that cap.
+            if (changedFileList && !changedFileList.isEmpty() && changedFileList.size() < 2500) {
                 def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
                 writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
                 // Script runs after "cd ${LLM_ROOT}", so use relative path
                 precommitArgs = "--files-from changed_files.txt"
                 echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
+            } else if (changedFileList && changedFileList.size() >= 2500) {
+                echo "Changed file list hit the 2500-file safety margin, falling back to all files"
             } else {
                 echo "Could not determine changed files, falling back to all files"
             }
@@ -1275,6 +1280,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
+        "requirements.txt",
+        "security_scanning/pyproject.toml",
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
@@ -1283,7 +1290,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/distributed/",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
-        "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
@@ -1345,6 +1352,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
@@ -1354,6 +1363,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/_torch/multi_gpu/",
+        "tests/unittest/_torch/moe/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
@@ -2305,6 +2315,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            // Canonical images carry BOLT profiles: the raw build is
+                            // published as <tag>-noprofiles and <tag> is produced by the
+                            // overlay. Both unconditional -- the contract is a property of
+                            // the image, not of what triggered the build, so a bundle that
+                            // cannot be pulled is an error rather than a silent plain
+                            // retag. Left unset, boltProfileBranch resolves LLM_BRANCH ->
+                            // main, so a ref with no promoted bundle still gets profiles.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2374,7 +2393,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'buildInternalRelease': false,
                             'buildCiImage': false,
                             'artifactPath': ARTIFACT_PATH,
-                            'uploadPath': UPLOAD_PATH
+                            'uploadPath': UPLOAD_PATH,
+                            // Must match Build-Docker-Images above: this path pushes the
+                            // same tags, so the scanned+registered image has to be the
+                            // BOLTed canonical one rather than a plain build.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [

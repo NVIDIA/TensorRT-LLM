@@ -32,6 +32,8 @@ The following is a table of supported models for the PyTorch backend:
 | `HunYuanMoEForCausalLM` [^5]         | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
 | `InternLM3ForCausalLM` [^5]          | InternLM3                          | `internlm/internlm3-8b-instruct`             |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
+| `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
+| `KimiLinearForCausalLM` [^15]        | Kimi-K3 (text decoder)             | `moonshotai/Kimi-K3`                         |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
@@ -99,6 +101,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
+[^15]: Kimi K3 is only supported on NVIDIA Blackwell GPUs (`SM100` family); see the [Kimi K3 deployment guide](../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.md). Which recipes fit is set by the attention layout rather than by the GPU count: DEP16 (`enable_attention_dp: true`) replicates the BF16 non-expert weights on every rank (114 GB) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB), needing 210 GB per rank, so it requires GB300-class per-GPU memory. TEP16 (`enable_attention_dp: false`) shards those non-expert weights instead and needs 115 GB per rank; it is validated end-to-end on GB200 (`SM100`) at 16 GPUs. On B200 (`SM100`), kernel and module support is functional and covered by CI. Note that the FP8 weight-read path (TRTLLM-14765) does not relax the DEP16 requirement: the conversion runs after the weights are already resident in BF16, so it lowers the steady-state footprint but not the load-time peak.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 

@@ -57,11 +57,11 @@ from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
 from ..disaggregation.executor.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..expert_statistic import ExpertStatistic
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
@@ -96,7 +96,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
-                      SampleStateTensors, TRTLLMSampler)
+                      SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -726,15 +726,6 @@ class PyExecutor:
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
-        if (self.dist.pp_size > 1 and self.pp_multi_stream_sample
-                and isinstance(self.sampler, TRTLLMSampler)):
-            # TRTLLM sampler uses default stream for store and algorithms.
-            # To enable multi-stream sampling, we need to re-initialize
-            # the sampler store and algorithms on the sample stream.
-            with torch.cuda.stream(self.sample_stream):
-                self.sampler._initialize_store()
-                self.sampler._instantiate_algorithms()
-
         # Set of request IDs that are currently in flight across all micro batches
         # or waiting for synchronized PP resource teardown. The scheduler avoids
         # these requests until their prior execution state is safe to reuse.
@@ -6110,19 +6101,38 @@ class PyExecutor:
 
         encoder_max_batch_size = self.llm_args.encoder_max_batch_size
         encoder_cuda_graph_config = self.llm_args.encoder_cuda_graph_config
+        # A fixed-shape feature encoder has no token/seq-len buckets to gate on.
+        runner = getattr(self.model_engine, 'encoder_cuda_graph_runner', None)
+        is_feature_encoder = bool(getattr(runner, 'feature_mode', False))
         if (encoder_max_batch_size is not None
                 and encoder_cuda_graph_config is not None
-                and bool(encoder_cuda_graph_config.num_tokens)
-                and bool(encoder_cuda_graph_config.seq_lens)):
+                and (is_feature_encoder or
+                     (bool(encoder_cuda_graph_config.num_tokens)
+                      and bool(encoder_cuda_graph_config.seq_lens)))):
             encoder_batch_size_limit = min(encoder_max_batch_size,
                                            self.max_batch_size)
-            configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
-                                      or [])
+            if is_feature_encoder:
+                # Feature batch sizes may have been derived rather than
+                # configured, so take the ones the runner actually resolved.
+                # They stay populated even when capture was declined, so
+                # waiting on them would delay a batch that can only run eager.
+                configured_batch_sizes = (list(runner.supported_batch_sizes)
+                                          if runner.enabled else [])
+            else:
+                configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
+                                          or [])
             supported_batch_sizes = [
                 batch_size for batch_size in configured_batch_sizes
                 if batch_size <= encoder_batch_size_limit
             ]
-            if (encoder_cuda_graph_config.enable_padding
+            # Targeting a size the runner never captured only pays off on the
+            # token path, where the pads are single tokens and the batch still
+            # rounds up into a captured bucket. A feature pad slot is a whole
+            # fixed_seq_len request, so `pad_batch` refuses any gap wider than
+            # 12.5% and such a batch would run eager; target the largest
+            # captured size within the limit instead.
+            if (not is_feature_encoder
+                    and encoder_cuda_graph_config.enable_padding
                     and any(batch_size > encoder_batch_size_limit
                             for batch_size in configured_batch_sizes) and
                 (not supported_batch_sizes
@@ -7592,10 +7602,11 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
-        finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
+        ctx_status = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
-        completed_req_ids = set(finished_requests + error_requests)
+        completed_req_ids = set(ctx_status.completed_request_ids) | set(
+            ctx_status.error_request_ids)
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -7643,11 +7654,11 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
-        result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
-        if isinstance(result, tuple):
-            _, _, cancelled_reqs = result
+        gen_status = self.kv_cache_transceiver.check_gen_transfer_status(
+            atLeastNum)
+        if gen_status.cancelled_requests:
             user_canceled_set = set(self.canceled_req_ids)
-            for req in cancelled_reqs:
+            for req in gen_status.cancelled_requests:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
