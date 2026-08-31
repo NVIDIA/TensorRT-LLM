@@ -35,7 +35,21 @@ namespace kernels
 namespace
 {
 
-constexpr int kBlockSize = 512;
+//! One block owns one row, so the grid is only as wide as the batch, and the best block
+//! size depends on which of the two regimes that puts us in:
+//!
+//! * **Few rows.** At 64 rows on an H200's 132 SMs every block already has an SM to
+//!   itself; what goes unused is the warp slots inside it. A wide block shortens the row's
+//!   critical path. Measured: neutral probs 1.32x -> 0.86x, top_p probs 1.35x -> 0.96x.
+//! * **Many rows.** Blocks now queue for SMs, and a wide block just makes each one longer
+//!   while fitting fewer per SM. Measured going the other way: top_k_top_p tokens
+//!   1.37x -> 1.82x at 256 rows.
+//!
+//! So it is chosen per launch rather than fixed. The crossover is between 64 and 256 rows
+//! in the sweep; 128 is the midpoint and neither regime is sharp there.
+constexpr int kNarrowBlock = 512;
+constexpr int kWideBlock = 1024;
+constexpr int kWideBlockMaxRows = 128;
 //! Digits per radix pass of the threshold search. 8 bits -> 256 buckets, 4 passes to pin
 //! a float exactly.
 constexpr int kRadixBits = 8;
@@ -83,7 +97,7 @@ __device__ inline void forEachLogit(T const* row, int vocabSize, Fn fn)
     constexpr int kWidth = kVecBytes / sizeof(T);
     if ((reinterpret_cast<uintptr_t>(row) % kVecBytes) != 0)
     {
-        for (int i = threadIdx.x; i < vocabSize; i += kBlockSize)
+        for (int i = threadIdx.x; i < vocabSize; i += blockDim.x)
         {
             fn(i, toFloat(row[i]));
         }
@@ -91,7 +105,7 @@ __device__ inline void forEachLogit(T const* row, int vocabSize, Fn fn)
     }
 
     int const vecCount = vocabSize / kWidth;
-    for (int v = threadIdx.x; v < vecCount; v += kBlockSize)
+    for (int v = threadIdx.x; v < vecCount; v += blockDim.x)
     {
         int4 const packed = reinterpret_cast<int4 const*>(row)[v];
         T const* elems = reinterpret_cast<T const*>(&packed);
@@ -101,7 +115,7 @@ __device__ inline void forEachLogit(T const* row, int vocabSize, Fn fn)
             fn(v * kWidth + j, toFloat(elems[j]));
         }
     }
-    for (int i = vecCount * kWidth + threadIdx.x; i < vocabSize; i += kBlockSize)
+    for (int i = vecCount * kWidth + threadIdx.x; i < vocabSize; i += blockDim.x)
     {
         fn(i, toFloat(row[i]));
     }
@@ -225,7 +239,7 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             *sFired = false;
         }
 
-        for (int b = tid; b < kRadixBuckets * kHistCopies; b += kBlockSize)
+        for (int b = tid; b < kRadixBuckets * kHistCopies; b += blockDim.x)
         {
             sCount[b] = 0;
             sMass[b] = 0.0f;
@@ -264,7 +278,7 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
 
         // Fold the private copies into copy 0, one bucket per thread. 256 buckets against
         // a vocabSize-long histogram pass -- not what this costs.
-        for (int b = tid; b < kRadixBuckets; b += kBlockSize)
+        for (int b = tid; b < kRadixBuckets; b += blockDim.x)
         {
             int totalCount = sCount[b];
             float totalMass = sMass[b];
@@ -326,7 +340,7 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
 }
 
 //! \brief Fused temperature + min-p + top-k + top-p + (probs | sampling), one block per row.
-template <typename T, bool NEED_TOKENS, bool NEED_PROBS>
+template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS>
 __global__ void universalSamplingKernel(UniversalSamplingParams params)
 {
     int const row = blockIdx.x;
@@ -337,9 +351,9 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
 
     RowParams const rp = loadRowParams(params, row);
 
-    using BlockReduceF = cub::BlockReduce<float, kBlockSize>;
-    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, kBlockSize>;
-    using BlockScanF = cub::BlockScan<float, kBlockSize>;
+    using BlockReduceF = cub::BlockReduce<float, BLOCK>;
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, BLOCK>;
+    using BlockScanF = cub::BlockScan<float, BLOCK>;
 
     __shared__ union
     {
@@ -506,7 +520,7 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
         bool const probsAligned = (reinterpret_cast<uintptr_t>(rowProbs) % kVecBytes) == 0;
         if (probsAligned)
         {
-            for (int v = tid; v < probVecCount; v += kBlockSize)
+            for (int v = tid; v < probVecCount; v += blockDim.x)
             {
                 float4 out;
                 float* outElems = reinterpret_cast<float*>(&out);
@@ -518,7 +532,7 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
                 }
                 reinterpret_cast<float4*>(rowProbs)[v] = out;
             }
-            for (int i = probVecCount * 4 + tid; i < vocabSize; i += kBlockSize)
+            for (int i = probVecCount * 4 + tid; i < vocabSize; i += blockDim.x)
             {
                 float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
                 rowProbs[i] = w >= threshold ? w * scale : 0.0f;
@@ -526,7 +540,7 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
         }
         else
         {
-            for (int i = tid; i < vocabSize; i += kBlockSize)
+            for (int i = tid; i < vocabSize; i += blockDim.x)
             {
                 float const w = weightOf(rowLogits, i, rp.tempInv, maxScaled);
                 rowProbs[i] = w >= threshold ? w * scale : 0.0f;
@@ -613,25 +627,42 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
 
 } // namespace
 
-template <typename T>
-void invokeUniversalSampling(UniversalSamplingParams const& params, cudaStream_t stream)
+//! Launch one (block size, output shape) specialization. Both are compile-time so the
+//! kernel is emitted without the half it does not need and with cub sized correctly.
+template <typename T, int BLOCK>
+void launchUniversalSampling(UniversalSamplingParams const& params, cudaStream_t stream)
 {
     dim3 const grid(params.numRows);
-    dim3 const block(kBlockSize);
+    dim3 const block(BLOCK);
     bool const needTokens = params.outputTokens != nullptr;
     bool const needProbs = params.outputProbs != nullptr;
 
     if (needTokens && needProbs)
     {
-        universalSamplingKernel<T, true, true><<<grid, block, 0, stream>>>(params);
+        universalSamplingKernel<T, BLOCK, true, true><<<grid, block, 0, stream>>>(params);
     }
     else if (needTokens)
     {
-        universalSamplingKernel<T, true, false><<<grid, block, 0, stream>>>(params);
+        universalSamplingKernel<T, BLOCK, true, false><<<grid, block, 0, stream>>>(params);
     }
     else if (needProbs)
     {
-        universalSamplingKernel<T, false, true><<<grid, block, 0, stream>>>(params);
+        universalSamplingKernel<T, BLOCK, false, true><<<grid, block, 0, stream>>>(params);
+    }
+}
+
+template <typename T>
+void invokeUniversalSampling(UniversalSamplingParams const& params, cudaStream_t stream)
+{
+    // See kNarrowBlock / kWideBlock: a small batch wants a wide block to shorten each
+    // row's critical path, a large one wants narrow blocks so more fit per SM.
+    if (params.numRows <= kWideBlockMaxRows)
+    {
+        launchUniversalSampling<T, kWideBlock>(params, stream);
+    }
+    else
+    {
+        launchUniversalSampling<T, kNarrowBlock>(params, stream);
     }
 }
 
