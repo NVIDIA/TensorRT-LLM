@@ -47,8 +47,7 @@ def _make_creator(
 
     ``*_intercept`` model the affine fixed cost (e.g. mamba SSM state) that a
     manager pays per batch regardless of token count. The draft cost is derived
-    as ``total - target`` for both slope and intercept (see
-    ``_get_target_and_draft_cache_costs``).
+    as ``total - target`` for both slope and intercept.
     """
     c = object.__new__(KvCacheCreator)
 
@@ -71,8 +70,12 @@ def _make_creator(
     )
 
     c._get_kv_size_per_token = Mock(
-        return_value=CacheCost(slope=total_kv_per_token, intercept=total_kv_intercept)
+        return_value=CacheCost(
+            slope=total_kv_per_token,
+            intercept=total_kv_intercept,
+        )
     )
+    c._should_create_separate_draft_kv_cache = Mock(return_value=True)
 
     return c
 
@@ -123,6 +126,7 @@ class TestSplitGpuBudgetForDraft:
         creator._tokens_per_block = 64
         creator._max_seq_len = 16384
         creator._max_batch_size = 1
+        creator._max_num_tokens = 128
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
@@ -144,7 +148,8 @@ class TestSplitGpuBudgetForDraft:
 
         # The draft layer stores 64 bytes/token in a fixed 512-token window.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
-        assert creator._get_kv_size_per_token() == CacheCost(slope=10, intercept=512 * 64)
+        cost = creator._get_kv_size_per_token()
+        assert cost == CacheCost(slope=10, intercept=512 * 64)
         assert len(draft_kv_configs) == 1
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
@@ -256,6 +261,71 @@ class TestSplitGpuBudgetForDraft:
 
         assert target_config is c._kv_cache_config
         assert draft_config is None
+
+    def test_fixed_only_draft_uses_manager_estimated_quota(self):
+        total_gpu = 10 * GB
+        slot_bytes = 327_680
+        configured_slots = 2_561
+        configured_bytes = configured_slots * slot_bytes
+        c = _make_creator(
+            max_gpu_total_bytes=total_gpu,
+            total_kv_per_token=80,
+            target_kv_per_token=80,
+            total_kv_intercept=configured_bytes,
+            target_kv_intercept=0,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config is not None
+        assert draft_config.max_gpu_total_bytes == configured_bytes
+        assert target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes == total_gpu
+
+    @pytest.mark.parametrize(
+        ("total_gpu", "expected_target", "expected_draft"),
+        [(500, 300, 200), (1_000, 800, 200)],
+        ids=["exact_fixed_cost", "spare_budget"],
+    )
+    def test_both_managers_can_be_fixed_only(self, total_gpu, expected_target, expected_draft):
+        c = _make_creator(
+            max_gpu_total_bytes=total_gpu,
+            total_kv_per_token=0,
+            target_kv_per_token=0,
+            total_kv_intercept=500,
+            target_kv_intercept=300,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config is not None
+        assert target_config.max_gpu_total_bytes == expected_target
+        assert draft_config.max_gpu_total_bytes == expected_draft
+
+    def test_target_can_be_fixed_only(self):
+        c = _make_creator(
+            max_gpu_total_bytes=1_000,
+            total_kv_per_token=20,
+            target_kv_per_token=0,
+            total_kv_intercept=300,
+            target_kv_intercept=300,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config is not None
+        assert target_config.max_gpu_total_bytes == 300
+        assert draft_config.max_gpu_total_bytes == 700
+
+    def test_exact_fixed_budget_rejects_a_linear_manager(self):
+        c = _make_creator(
+            max_gpu_total_bytes=200,
+            total_kv_per_token=80,
+            target_kv_per_token=80,
+            total_kv_intercept=200,
+        )
+
+        with pytest.raises(ValueError, match="GPU budget"):
+            c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
 
 class TestSplitHostCacheBudgetForDraft:
