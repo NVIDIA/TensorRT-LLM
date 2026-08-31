@@ -3,9 +3,9 @@
 """FlashInfer attention backend for visual generation models."""
 
 import math
-from collections.abc import Callable
 from typing import Any, Literal
 
+import flashinfer
 import torch
 
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -49,8 +49,8 @@ class FlashInferAttention(AttentionBackend):
             attention_metadata_state if attention_metadata_state is not None else {}
         )
 
-        self._single_prefill = self._load_flashinfer_api("single_prefill_with_kv_cache")
-        self._batch_prefill_cls = self._load_flashinfer_api("BatchPrefillWithRaggedKVCacheWrapper")
+        self._single_prefill = flashinfer.single_prefill_with_kv_cache
+        self._batch_prefill_cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
         if quant_attention_config is not None and quant_attention_config.qk_dtype not in (
             "mxfp8",
             "nvfp4",
@@ -59,19 +59,6 @@ class FlashInferAttention(AttentionBackend):
                 "FlashInfer quantized attention supports qk_dtype='mxfp8' or 'nvfp4', "
                 f"got {quant_attention_config.qk_dtype!r}."
             )
-
-    @staticmethod
-    def _load_flashinfer_api(name: str) -> Callable[..., Any]:
-        try:
-            import flashinfer
-        except (ImportError, OSError) as exc:
-            raise ImportError(
-                "VisualGen FLASHINFER attention requires a compatible FlashInfer installation."
-            ) from exc
-        api = getattr(flashinfer, name, None)
-        if api is None:
-            raise ImportError(f"VisualGen FLASHINFER attention requires flashinfer.{name}.")
-        return api
 
     def _validate_inputs(
         self,
@@ -328,13 +315,16 @@ class FlashInferAttention(AttentionBackend):
                 "FlashInfer SM120/SM121 NVFP4 attention requires sequence length "
                 f"to be a multiple of 128, got {sequence_length}."
             )
-        nvfp4_quantize = self._load_flashinfer_api("nvfp4_attention_sm120_quantize_qkv")
-        nvfp4_forward = self._load_flashinfer_api("nvfp4_attention_sm120_fwd")
         query = q.transpose(1, 2).contiguous()
         key = k.transpose(1, 2).contiguous()
         value = v.transpose(1, 2).contiguous()
-        quantized_qkv = nvfp4_quantize(query, key, value, per_block_mean=False)
-        output, lse = nvfp4_forward(
+        quantized_qkv = flashinfer.nvfp4_attention_sm120_quantize_qkv(
+            query,
+            key,
+            value,
+            per_block_mean=False,
+        )
+        output, lse = flashinfer.nvfp4_attention_sm120_fwd(
             *quantized_qkv,
             sm_scale=self.scale,
             causal=is_causal,
