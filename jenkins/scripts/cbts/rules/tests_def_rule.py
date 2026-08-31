@@ -37,6 +37,7 @@ from typing import Optional
 from blocks import Stage, YAMLIndex
 
 from ._helpers import (
+    is_perf_stem,
     iter_diff_post_line_numbers,
     lookup_paths_into_block_filters,
     resolve_affected_stages,
@@ -96,10 +97,6 @@ def _map_lines_to_pytest_scopes(content: str, line_numbers: set[int]) -> Optiona
             return None
         scopes.add(scope)
     return scopes if scopes else None
-
-
-def _is_perf_stem(stem: str) -> bool:
-    return stem == "l0_perf" or "perf_sanity" in stem
 
 
 def _diff_has_deletions(diff: str) -> bool:
@@ -321,7 +318,7 @@ class TestsDefRule(Rule):
             block_filters, self.yaml_index, self._stages_by_yaml
         )
         sanity_relevant = any(stem == "l0_sanity_check" for stem, _ in block_filters)
-        perfsanity_relevant = any(_is_perf_stem(stem) for stem, _ in block_filters)
+        perfsanity_relevant = any(is_perf_stem(stem) for stem, _ in block_filters)
 
         nonarrow_note = ""
         if no_match:

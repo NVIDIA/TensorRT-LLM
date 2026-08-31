@@ -35,6 +35,10 @@ namespace fmha {
 //   FP32 scale: [numHeadsQ / headsPerGroup,
 //               headsPerGroup * headDimV / quantGroupSize,
 //               scaleBufM]
+//   UE8M0 scale (mUsesDsv4Ue8m0ScaleO): INT32 words aliasing the FP32 scale buffer,
+//               [numHeadsQ / headsPerGroup, headsPerGroup, scaleBufM]. Each word packs the head's
+//               4 block exponent bytes, block 0 in the LSB; the byte is the FP32 exponent of
+//               exp2(ceil(log2(max(amax, 1e-10) / 448))). The padded region is left unwritten.
 //
 // Inverse-RoPE inputs:
 //   positionIds:   [sumOfSeqLensQ]
@@ -62,8 +66,18 @@ inline constexpr int32_t kDsv4RopeHalf = 32;
 inline constexpr int32_t kDsv4RopeOffsetInBlock = kDsv4RopeStart % kDsv4QuantGroupSize;
 inline constexpr int32_t kDsv4CosSinStride = kDsv4RopeHalf * 2;
 
+// UE8M0 packed-scale layout: 4 per-head 1x128-block exponent bytes per INT32 word, so the byte
+// address of block b for (group g, headInGroup h, token t) is
+//   ((g * headsPerGroup + h) * scaleBufM + t) * kDsv4Ue8m0BytesPerWord + b.
+inline constexpr int32_t kDsv4Ue8m0BytesPerWord = 4;
+// The amax clamp used by the UE8M0 scale mode; must match vLLM fused_inv_rope_fp8_quant (1e-10,
+// not the 1e-12 used by the FP32-scale mode).
+inline constexpr float kDsv4Ue8m0AmaxEps = 1.0e-10f;
+
 static_assert(kDsv4HeadDimV % kDsv4QuantGroupSize == 0);
 static_assert((kDsv4QuantGroupSize & (kDsv4QuantGroupSize - 1)) == 0);
 static_assert(kDsv4RopeOffsetInBlock + kDsv4RopeHalf * 2 == kDsv4QuantGroupSize);
+// UE8M0 packs one exponent byte per 1x128 block, so a head's blocks must fill exactly one word.
+static_assert(kDsv4HeadDimV / kDsv4QuantGroupSize == kDsv4Ue8m0BytesPerWord);
 
 } // namespace fmha

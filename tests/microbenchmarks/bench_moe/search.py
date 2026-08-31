@@ -24,13 +24,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
     canonical_activation,
     canonical_quant,
 )
-from tensorrt_llm._torch.modules.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo

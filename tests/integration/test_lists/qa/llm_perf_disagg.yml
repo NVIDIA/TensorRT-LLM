@@ -53,6 +53,9 @@ llm_perf_disagg:
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con1229_ctx7_dep4_gen1_dep8_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx8_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con2_ctx1_dep4_gen5_tep4_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
+  # GB300 DeepSeek-V4-Pro-DSpark (AgentX agentic trace replay)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL] TIMEOUT (210)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (240)
   # GB300 Kimi-K2.5-Thinking
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)

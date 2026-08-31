@@ -740,6 +740,7 @@ accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embe
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill]
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget]
 accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_fp8_prequantized
+accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (120)
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm]
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralSmall24B::test_auto_dtype[forced_chunked_prefill]
@@ -754,7 +755,6 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_27B_VL::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_fp8_prequantized
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
-unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
 disaggregated/test_aiperf_gate.py::test_all_cancelled_fails
 disaggregated/test_aiperf_gate.py::test_corrupt_export_fails
 disaggregated/test_aiperf_gate.py::test_empty_export_fails
@@ -887,4 +887,3 @@ test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[Qwen3/Qwen3-0.6B-Qwen3/Qwe
 test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
 test_e2e.py::test_trtllm_multimodal_benchmark_serving
-unittest/llmapi/apps/_test_openai_embeddings.py

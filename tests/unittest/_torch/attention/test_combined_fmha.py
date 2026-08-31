@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
@@ -303,3 +304,78 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
     assert fmha._use_fp8_context_fmha(output, AttentionInputType.context_only)
     assert fmha._use_fp8_context_fmha(output, AttentionInputType.mixed)
     assert not fmha._use_fp8_context_fmha(output, AttentionInputType.generation_only)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sm_version", [100, 103])
+@pytest.mark.parametrize("tokens_per_block", [32, 64])
+@pytest.mark.parametrize("num_contexts", [1, 4, 5])
+def test_flashinfer_context_fallback_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    sm_version: int,
+    tokens_per_block: int,
+    num_contexts: int,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        lambda: sm_version,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.kv_factor = 2
+    q = torch.empty((num_contexts, 64), dtype=dtype)
+    attn = SimpleNamespace(
+        is_mla_enable=False,
+        sparse_params=None,
+        position_embedding_type=0,
+        head_dim=64,
+        num_heads=1,
+        num_kv_heads=1,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=None,
+        is_cross=False,
+        is_spec_decoding_enabled=False,
+        tokens_per_block=tokens_per_block,
+        beam_width=1,
+    )
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.mixed,
+    )
+
+    supported, reason = fmha._is_supported_with_reason(
+        q,
+        None,
+        None,
+        attn,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.CONTEXT,
+    )
+
+    expected_fallback = (dtype == torch.bfloat16 and num_contexts <= 4) or sm_version == 103
+    if expected_fallback:
+        assert not supported
+        assert "fallback FMHA" in reason
+    else:
+        assert supported, reason
+        assert reason == ""
+
+    generation_supported, generation_reason = fmha._is_supported_with_reason(
+        q,
+        None,
+        None,
+        attn,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.GENERATION,
+    )
+    assert generation_supported, generation_reason
+    assert generation_reason == ""

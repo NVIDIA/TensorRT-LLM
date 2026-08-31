@@ -2125,7 +2125,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip(
         reason="CuteDslFusedMoE declines FP8 block scales: it has no FP8 "
         "block-scale kernel, only a torch.einsum reference. See the ‡ footnote "
-        "in tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md. "
+        "in tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md. "
         "Re-enable against DEEPGEMM / TRTLLM once this checkpoint has an "
         "owner backend on SM100.")
     @skip_pre_blackwell
@@ -5061,6 +5061,73 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "attention_backend",
+        ["VANILLA", pytest.param("TRTLLM", marks=skip_pre_blackwell)])
+    def test_dspark(self, attention_backend):
+        """Standalone DSpark drafter on Qwen3-8B, 0-shot chat.
+
+        Acceptance length is the gate here. DSpark drafters are distilled on
+        the target's own chat-mode generations, so the harness default (5-shot
+        completion) is out of distribution for the drafter and understates
+        acceptance: 4.42 there against 6.26 here, on the same checkpoints.
+        GSM8K accuracy is not meaningful in this regime and is not gated --
+        see the extra_acc_spec entry in references/gsm8k.yaml.
+
+        Both block-decode backends run: TRTLLM is what deployments use, and
+        it is the one the acceptance number above was measured on, but it
+        needs SM100/SM103 so H100 only covers VANILLA. The two differ
+        numerically (GSM8K 28.9 vs 28.1) while landing the same acceptance
+        length, so they share one reference.
+        """
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+
+        # DeepSeek's official DSpark head for this target (block_size 7,
+        # markov_rank 256, confidence head). Head tensors are named after the
+        # submodules that own them (markov_head.*, confidence_head.proj.*),
+        # which is the spelling the drafter loader has to resolve.
+        dspark_model_dir = (
+            f"{llm_models_root()}/dspark/dspark_qwen3_8b_block7")
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+
+        spec_config = DSparkDecodingConfig(max_draft_len=7,
+                                           speculative_model=dspark_model_dir,
+                                           attention_backend=attention_backend)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            # 0-shot chat, not the harness default 5-shot completion: a DSpark
+            # drafter is distilled on the target's chat-mode output, so the
+            # default prompt is out of distribution for it and understates
+            # acceptance (4.42 vs 6.26 on these same checkpoints). Only the AL
+            # is gated -- extra_acc_spec selects a gsm8k.yaml entry whose
+            # reference accuracy is 0, i.e. run the task, do not gate on it.
+            task.evaluate(llm,
+                          extra_acc_spec="zero_shot_al_only",
+                          extra_evaluator_kwargs=dict(
+                              num_fewshot=0,
+                              apply_chat_template=True,
+                              chat_template_kwargs={"enable_thinking": False},
+                          ))
+            acceptance_length = _compute_acceptance_length(llm)
+            print(f"[AL] test_dspark[{attention_backend}] acceptance_length "
+                  f"= {acceptance_length:.3f}")
+            assert_acceptance_length("TestQwen3_8B::test_dspark",
+                                     acceptance_length)
+
     @skip_pre_blackwell
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp",
                              [(1, 1, 1, False)],
@@ -5687,6 +5754,229 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K("GPT-OSS/20B-MXFP4")
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    def test_w4_1gpu_suspend_resume(self) -> None:
+        # Suspend / resume correctness for an ACTIVE request -- the
+        # V2-only preemption round-trip, distinct from idle committed-block reuse.
+        # Under capacity pressure the scheduler preempts an in-flight request:
+        # live pages go ACTIVE -> SUSPENDED (LOCKED->HELD), are lazily offloaded
+        # to host when a competing request needs the slots, and on resume are
+        # onboarded with their host page-index buffers RECONNECTED
+        kv_cache_config = KvCacheConfig(
+            # Sized so the four concurrent requests contend: each alone fits, but
+            # the pool cannot hold all four at their decode peak, so the scheduler
+            # must preempt (ACTIVE->SUSPENDED, pages LOCKED->HELD) and resume.
+            #
+            # NOTE: max_tokens is NOT the resulting pool size. The V2 manager
+            # converts it to a byte quota and then inflates it by
+            # 1 / max_util_for_resume -- see the _get_quota_from_max_tokens call
+            # in tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and the
+            # note in _util.py::_configure_helix_kv_cache_capacity. With 0.7
+            # below, the pool is sized for roughly 512/0.7 tokens. GPT-OSS is
+            # also a SWA model, so the token->byte rate is not uniform across
+            # layers. Whether any given pair of requests can co-reside is
+            # therefore NOT derivable from this knob -- read `pool_tokens` in the
+            # [I-10 sizing] diagnostic below instead.
+            max_tokens=512,
+            free_gpu_memory_fraction=0.5,
+            # Refuse resume() once the hot tier is above this utilization, so a
+            # suspended request genuinely defers before being recalled (V2-only).
+            # Also doubles as the pool-inflation factor described above.
+            max_util_for_resume=0.7,
+            enable_block_reuse=False,
+            host_cache_size=4 * (1 << 30),
+            use_kv_cache_manager_v2=True)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  max_seq_len=1024,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # Several distinct long prompts. Each alone fits the pool; together they
+        # cannot all stay resident at their decode peak, which is what forces
+        # suspend/resume. The contention comes from context + 128 decode across
+        # four requests plus the max_util_for_resume gate -- not from two bare
+        # contexts failing to co-reside (see the sizing note above).
+        base = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ")
+        # One distinct needle per prompt, planted at the very start of the
+        # context -- i.e. in the first KV pages, exactly the ones that go
+        # LOCKED->HELD on suspend and are reconnected on resume. Recalling it
+        # after a round trip is the KV-integrity signal (assertion (3) below).
+        # The needles also keep the four prompts genuinely distinct: a bare
+        # "Alpha:"/"Beta:" prefix is ignored by the model, which made two
+        # contended completions come back byte-identical.
+        needles = ("BANANA", "TRUMPET", "GLACIER", "VIOLIN")
+        prompts = [
+            f"Remember this code word: {n}. {base * 8}"
+            f"Question: what was the code word? Answer in one word."
+            for n in needles
+        ]
+        # Long generation so each suspend/resume round trip spans many decode
+        # steps and the suspended requests are held across a long active run of
+        # the request that owns the pool
+        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+
+        def _drain_stats() -> tuple[int, int, int, int, int]:
+            # Single drain: llm.get_stats() consumes the per-iteration records,
+            # so suspend/resume counts AND offload/onboard bytes must be summed
+            # in one pass. iterSuspendedRequests/iterResumedRequests are manager-
+            # level (top-level of each record); offload/onboard are per pool
+            # group. Both are V2-only.
+            suspended = resumed = offload = onboard = pool_tokens = 0
+            for s in llm.get_stats(timeout=10):
+                suspended += s.get("iterSuspendedRequests", 0)
+                resumed += s.get("iterResumedRequests", 0)
+                # Measured pool size, for the [I-10 sizing] diagnostic. This is
+                # the allocated GPU pool the manager actually built; do NOT
+                # re-derive it from max_tokens (see the sizing note on
+                # kv_cache_config above). kvCacheStats is emitted for every
+                # backend, so this needs no V2-only key.
+                kvs = s.get("kvCacheStats") or {}
+                pool_tokens = max(
+                    pool_tokens,
+                    kvs.get("maxNumBlocks", 0) * kvs.get("tokensPerBlock", 0))
+                pgs = s.get("kvCacheIterationStatsByPoolGroup")
+                if not pgs:
+                    continue
+                for pg in pgs.values():
+                    offload += pg.get("iterOffloadBytes", 0)
+                    onboard += pg.get("iterOnboardBytes", 0)
+            return suspended, resumed, offload, onboard, pool_tokens
+
+        def _common_prefix_len(a: list[int], b: list[int]) -> int:
+            # Diagnostic only -- do NOT turn this into an assertion. Contended
+            # and uncontended runs use different batch compositions, which is
+            # enough to change MoE routing and GEMM tiling, so greedy decoding
+            # may legitimately diverge at any index including 0. See (3) below.
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        with llm:
+            # Uncontended references: each prompt alone fits the tight pool, so
+            # no suspend occurs (the deterministic single-request path).
+            ref_ids = []
+            ref_txt = []
+            for p in prompts:
+                r = llm.generate([p], sampling)
+                ref_ids.append(list(r[0].outputs[0].token_ids))
+                ref_txt.append(r[0].outputs[0].text)
+            _, _, _, _, pool_tokens = _drain_stats()  # discard ref-run stats
+            # Sizing ground truth, printed before the contended phase so it is
+            # visible even if that phase fails. `pool_tokens` is measured, not
+            # derived from max_tokens -- see the sizing note on kv_cache_config.
+            ctx_lens = [len(llm.tokenizer.encode(p)) for p in prompts]
+            peak_per_request = min(ctx_lens) + sampling.max_tokens
+            concurrent_peak = len(prompts) * peak_per_request
+            print(f"[I-10 sizing] pool_tokens={pool_tokens} "
+                  f"ctx_lens={ctx_lens} decode={sampling.max_tokens} "
+                  f"peak_per_request={peak_per_request} "
+                  f"concurrent_peak={concurrent_peak}")
+            # Workload precondition: the pool cannot hold all four requests at
+            # their decode peak, which is what forces the scheduler to preempt.
+            # Checked against the *measured* pool, never against max_tokens --
+            # the manager inflates that knob by 1 / max_util_for_resume, so a
+            # config-derived bound is wrong by ~1.43x (see the sizing note on
+            # kv_cache_config). Observed on B200/H100 at 1588 vs 736, a ~2.2x
+            # margin; the deliberately weaker two-request form (794 vs 736) is
+            # only ~8% and too tight to gate CI on. Failing here means the
+            # workload stopped being contended, NOT that the KV path broke.
+            assert concurrent_peak > pool_tokens, (
+                f"workload precondition failed: the pool ({pool_tokens} tokens) "
+                f"can hold all {len(prompts)} requests at their decode peak "
+                f"({concurrent_peak} tokens), so nothing forces preemption -- "
+                f"retune max_tokens / prompt length; this is not a KV-path "
+                f"failure")
+            # Contended: all prompts in flight against a ~1-request pool, so the
+            # scheduler must suspend/resume (and may offload/onboard) to serve them.
+            # Bounded wait: a V2 scheduler deadlock (all requests suspended, none
+            # resumable) would otherwise hang the test until the CI stage timeout,
+            # with no diagnostics. TimeoutError here IS the deadlock signal.
+            futures = [llm.generate_async(p, sampling) for p in prompts]
+            contended = [f.result(timeout=600) for f in futures]
+            suspended, resumed, offload, onboard, _ = _drain_stats()
+
+        con_ids = [list(r.outputs[0].token_ids) for r in contended]
+        con_txt = [r.outputs[0].text for r in contended]
+        prefixes = [
+            _common_prefix_len(ref_ids[i], con_ids[i])
+            for i in range(len(prompts))
+        ]
+        # Diagnostics FIRST, so the round-trip evidence and the ref/contended
+        # comparison are always visible even when an assertion fails.
+        print(f"[I-10 suspend/resume] suspended={suspended} resumed={resumed} "
+              f"offload_bytes={offload} onboard_bytes={onboard} "
+              f"common_prefix_tokens={prefixes}")
+        for i in range(len(prompts)):
+            print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_recall={needles[i] in ref_txt[i].upper()} "
+                  f"con_recall={needles[i] in con_txt[i].upper()} "
+                  f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
+
+        # (1) No crash / no deadlock: every request completed within the bounded
+        # wait above and produced a non-empty completion (a KV-corrupting bad
+        # page-index reconnect would instead illegal-memory-access crash here).
+        assert len(contended) == len(prompts)
+        assert all(len(ids) > 0 for ids in con_ids), (
+            "a request produced no tokens under suspend/resume contention "
+            "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
+        # queuing): an in-flight request was suspended under pressure and later
+        # recovered. These per-iteration manager counters are the direct signal;
+        # offload/onboard bytes may legitimately be 0 (suspend keeps HELD pages
+        # on GPU and offloads only lazily), so they are not gated -- only printed
+        # above. iterResumedRequests counts preemption recovery only: a request's
+        # initial admission also drives a SUSPENDED->ACTIVE transition internally
+        # but is excluded, so a non-zero value here cannot come from mere arrivals.
+        assert suspended > 0 and resumed > 0, (
+            "expected an active-request suspend->resume round trip "
+            "(iterSuspendedRequests>0 and iterResumedRequests>0); "
+            f"suspended={suspended} resumed={resumed} -- if 0, the pool was not "
+            "tight enough to force preemption of an in-flight request; "
+            "retune max_tokens")
+        # Not asserted: `resumed <= suspended` holds globally but not necessarily
+        # within one drain window -- a request suspended just before a drain and
+        # recovered just after straddles the boundary. The deterministic guard
+        # against the counter regressing to admission-counting is the model-free
+        # unit test test_admission_is_not_counted_as_a_resume; the ratio is only
+        # printed above.
+        # (3) KV integrity: the needle planted in each prompt's first KV pages
+        # survives the suspend/resume round trip. A bad page-index reconnect
+        # loses the prompt content and the recall fails; benign numerical drift
+        # does not touch it.
+        #
+        # Token-level equality against the uncontended reference is deliberately
+        # NOT asserted: batch composition changes MoE routing and GEMM tiling,
+        # so greedy decoding is not required to match a batch-of-1 reference at
+        # any index -- not even index 0. `prefixes` is a diagnostic only.
+        #
+        # The contended check is gated on the reference recalling the needle
+        # first, so a model-capability miss fails loudly as a workload
+        # precondition instead of masquerading as KV corruption.
+        missing_ref = [
+            n for n, t in zip(needles, ref_txt) if n not in t.upper()
+        ]
+        assert not missing_ref, (
+            "workload precondition failed: the uncontended reference run did "
+            f"not recall {missing_ref} -- retune the prompt; this is not a "
+            "KV-path failure")
+        missing_con = [
+            n for n, t in zip(needles, con_txt) if n not in t.upper()
+        ]
+        assert not missing_con, (
+            "a preempted request lost prompt content that it recalls "
+            f"uncontended: {missing_con} -- possible KV corruption across "
+            f"suspend/resume; common_prefix_tokens={prefixes}")
 
     def test_dummy_load_format(self):
         llm = LLM(
@@ -7224,7 +7514,7 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                    moe_backend, max_draft_len, mocker):
         model_path = f"{llm_models_root()}/Inferact-Qwen3.8-2.4T-A95B-NVFP4"
         if not os.path.exists(model_path):
-            pytest.skip(f"Model directory {model_path} does not exist")
+            pytest.fail(f"Model directory {model_path} does not exist")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False,
