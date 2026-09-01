@@ -1406,6 +1406,14 @@ class MLA(nn.Module):
         if self.use_cute_dsl_bf16_bmm and is_sm_100f():
             torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(a, b_no_transpose, output)
         else:
+            if get_sm_version() in (120, 121):
+                # `a` is a head-major transpose of a [tokens, heads, dim] buffer, so its
+                # batch stride is the token count rather than the tile extent. cuBLAS picks
+                # a TMA-based nvjet kernel for that layout on SM120/121, and
+                # cuTensorMapEncodeTiled cannot describe it -- the kernel then faults with
+                # an MMU page fault (surfaced as CUBLAS_STATUS_INTERNAL_ERROR or a later
+                # illegal memory access). Densify so a non-TMA kernel is selected.
+                a = a.contiguous()
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
     def forward_absorption_generation(
