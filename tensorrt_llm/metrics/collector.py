@@ -16,9 +16,13 @@
 
 import math
 import time
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Mapping, Optional, TypeAlias, Union
 
 from .enums import MetricNames
+
+RequestMetricValue: TypeAlias = Union[
+    int, float, str, list[int], list[float], dict[str, int], dict[str, float]
+]
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
@@ -45,6 +49,7 @@ class MetricsCollector:
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
             trtllm_prompt_cached_tokens_total
+            trtllm_prompt_cache_tier_tokens_total
             trtllm_prompt_cached_tokens_per_request
             trtllm_spec_decode_drafted_tokens_total
             trtllm_spec_decode_accepted_tokens_total
@@ -412,18 +417,22 @@ class MetricsCollector:
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
 
-        # Prompt cache hit tracking by storage tier
+        # Prompt cache hit tracking (aggregate counter + tier breakdown)
+        self.counter_tokens_cached_prompt = Counter(
+            name=self.metric_prefix + "prompt_cached_tokens_total",
+            documentation="Total prompt tokens served from KV cache.",
+            labelnames=self.labels.keys())
         self.labelname_cache_tier = "cache_tier"
         self.labels_with_cache_tier = {
             **self.labels, self.labelname_cache_tier: ""
         }
-        self.counter_tokens_cached_prompt = Counter(
-            name=self.metric_prefix + "prompt_cached_tokens_total",
+        self.counter_tokens_cached_prompt_by_tier = Counter(
+            name=self.metric_prefix + "prompt_cache_tier_tokens_total",
             documentation=
             "Total prompt tokens served from KV cache by storage tier.",
             labelnames=self.labels_with_cache_tier.keys())
         for tier in ("gpu", "host", "disk", "remote"):
-            self.counter_tokens_cached_prompt.labels(
+            self.counter_tokens_cached_prompt_by_tier.labels(
                 **{**self.labels, self.labelname_cache_tier: tier}
             )
         self.histogram_tokens_cached_prompt = Histogram(
@@ -548,7 +557,10 @@ class MetricsCollector:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def log_request_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
+    def log_request_metrics_dict(
+            self,
+            metrics_dict: Mapping[Union[str, MetricNames], RequestMetricValue]
+    ) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -639,25 +651,28 @@ class MetricsCollector:
                 else:
                     cached_tokens = int(raw_cached or 0)
 
-                if cached_tokens_by_tier:
-                    accounted_tokens = 0
+                if cached_tokens > 0:
+                    self._log_counter(self.counter_tokens_cached_prompt, {},
+                                      cached_tokens)
+
+                accounted_tokens = 0
+                if cached_tokens_by_tier and isinstance(cached_tokens_by_tier,
+                                                        dict):
                     for tier, count in cached_tokens_by_tier.items():
-                        if count > 0:
+                        if count > 0 and accounted_tokens < cached_tokens:
                             tier_str = tier.value if hasattr(
                                 tier, "value") else str(tier).lower()
+                            alloc = min(count, cached_tokens - accounted_tokens)
                             self._log_counter(
-                                self.counter_tokens_cached_prompt,
-                                {self.labelname_cache_tier: tier_str}, count)
-                            accounted_tokens += count
-                    if cached_tokens > accounted_tokens:
-                        self._log_counter(
-                            self.counter_tokens_cached_prompt,
-                            {self.labelname_cache_tier: "gpu"},
-                            cached_tokens - accounted_tokens)
-                elif cached_tokens > 0:
+                                self.counter_tokens_cached_prompt_by_tier,
+                                {self.labelname_cache_tier: tier_str}, alloc)
+                            accounted_tokens += alloc
+                if cached_tokens > accounted_tokens:
                     self._log_counter(
-                        self.counter_tokens_cached_prompt,
-                        {self.labelname_cache_tier: "gpu"}, cached_tokens)
+                        self.counter_tokens_cached_prompt_by_tier,
+                        {self.labelname_cache_tier: "gpu"},
+                        cached_tokens - accounted_tokens)
+
                 self._log_histogram(self.histogram_tokens_cached_prompt,
                                     cached_tokens)
 

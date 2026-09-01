@@ -47,18 +47,16 @@ def collector():
     return MetricsCollector(labels)
 
 
-def _get_gauge_value(collector, metric_name: str):
+def _get_gauge_value(collector: MetricsCollector, metric_name: str) -> float:
     """Get the current value of a Prometheus gauge."""
     metric = getattr(collector, metric_name)
     return metric.labels(**collector.labels)._value.get()
 
 
-def _get_counter_value(collector, metric_name: str, **extra_labels):
+def _get_counter_value(collector: MetricsCollector, metric_name: str, **extra_labels: str) -> float:
     """Get the current value of a Prometheus counter."""
     metric = getattr(collector, metric_name)
     labels = {**collector.labels, **extra_labels}
-    if hasattr(collector, "labelname_cache_tier") and collector.labelname_cache_tier in metric._labelnames and collector.labelname_cache_tier not in labels:
-        labels[collector.labelname_cache_tier] = "gpu"
     return metric.labels(**labels)._value.get()
 
 
@@ -1036,15 +1034,18 @@ def _counter_value_with_labels(metric, labels: Dict[str, str]) -> float:
 class TestPromptCacheMetrics:
     """trtllm_prompt_cached_tokens_total counter + trtllm_prompt_cached_tokens histogram."""
 
-    def test_cached_tokens_counter_incremented(self, collector):
+    def test_cached_tokens_counter_incremented(self, collector: MetricsCollector) -> None:
+        """Verify aggregate and default gpu tier counters increment on cache hit."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256,
         }
         collector.log_request_metrics_dict(metrics)
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 256
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 256
 
-    def test_cached_tokens_histogram_observed(self, collector):
+    def test_cached_tokens_histogram_observed(self, collector: MetricsCollector) -> None:
+        """Verify cached tokens are observed by the per-request histogram."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256,
@@ -1055,7 +1056,7 @@ class TestPromptCacheMetrics:
             256.0
         )
 
-    def test_zero_cached_tokens_histogram_but_not_counter(self, collector):
+    def test_zero_cached_tokens_histogram_but_not_counter(self, collector: MetricsCollector) -> None:
         """Zero cache hits must reach the histogram (cache-miss bucket) without bumping the counter."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
@@ -1063,10 +1064,12 @@ class TestPromptCacheMetrics:
         }
         collector.log_request_metrics_dict(metrics)
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 0
         assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 1
         assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(0.0)
 
-    def test_cached_tokens_accumulate(self, collector):
+    def test_cached_tokens_accumulate(self, collector: MetricsCollector) -> None:
+        """Verify cached token counters accumulate monotonically across requests."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PROMPT_CACHE_CACHED_TOKENS: 128,
@@ -1074,9 +1077,11 @@ class TestPromptCacheMetrics:
         collector.log_request_metrics_dict(metrics)
         collector.log_request_metrics_dict(metrics)
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 256
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 256
         assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 2
 
-    def test_cache_metrics_absent_no_increment(self, collector):
+    def test_cache_metrics_absent_no_increment(self, collector: MetricsCollector) -> None:
+        """Verify counter and histogram remain untouched when cache metrics are absent."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.E2E: 1.0,
@@ -1085,27 +1090,42 @@ class TestPromptCacheMetrics:
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
         assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 0
 
-    def test_no_observation_without_finish_reason(self, collector):
+    def test_no_observation_without_finish_reason(self, collector: MetricsCollector) -> None:
         """Per-request metrics must only fire on finish_reason."""
         metrics = {MetricNames.PROMPT_CACHE_CACHED_TOKENS: 64}
         collector.log_request_metrics_dict(metrics)
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
         assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 0
 
-    def test_cached_tokens_by_tier_individual(self, collector):
-        """Test explicit attribution to individual storage tiers (host, disk, remote)."""
+    def test_cached_tokens_by_tier_individual(self, collector: MetricsCollector) -> None:
+        """Test explicit attribution to individual host storage tier."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PROMPT_CACHE_CACHED_TOKENS: 100,
             MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"host": 100},
         }
         collector.log_request_metrics_dict(metrics)
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="host") == 100
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="gpu") == 0
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="disk") == 0
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="remote") == 0
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 100
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 100
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 0
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="disk") == 0
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="remote") == 0
 
-    def test_cached_tokens_by_tier_multi_tier(self, collector):
+    def test_cached_tokens_by_tier_disk(self, collector: MetricsCollector) -> None:
+        """Test positive hit attribution to the disk storage tier."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 80,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"disk": 80},
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 80
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="disk") == 80
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 0
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 0
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="remote") == 0
+
+    def test_cached_tokens_by_tier_multi_tier(self, collector: MetricsCollector) -> None:
         """Test multi-tier hit attribution where tier totals sum to aggregate value."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
@@ -1116,30 +1136,32 @@ class TestPromptCacheMetrics:
             },
         }
         collector.log_request_metrics_dict(metrics)
-        gpu_val = _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="gpu")
-        host_val = _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="host")
-        disk_val = _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="disk")
-        remote_val = _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="remote")
+        gpu_val = _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu")
+        host_val = _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host")
+        disk_val = _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="disk")
+        remote_val = _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="remote")
 
         assert gpu_val == 150
         assert host_val == 106
         assert disk_val == 0
         assert remote_val == 0
         assert (gpu_val + host_val + disk_val + remote_val) == 256
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 256
         assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(256.0)
 
-    def test_cached_tokens_dict_input(self, collector):
+    def test_cached_tokens_dict_input(self, collector: MetricsCollector) -> None:
         """Test passing a tier mapping directly via PROMPT_CACHE_CACHED_TOKENS."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PROMPT_CACHE_CACHED_TOKENS: {"gpu": 128, "remote": 64},
         }
         collector.log_request_metrics_dict(metrics)
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="gpu") == 128
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="remote") == 64
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 192
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 128
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="remote") == 64
         assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(192.0)
 
-    def test_cached_tokens_unattributed_remainder_attributed_to_gpu(self, collector):
+    def test_cached_tokens_unattributed_remainder_attributed_to_gpu(self, collector: MetricsCollector) -> None:
         """Any cached tokens not explicitly partitioned into tiers must default to GPU."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
@@ -1147,13 +1169,53 @@ class TestPromptCacheMetrics:
             MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"host": 50},
         }
         collector.log_request_metrics_dict(metrics)
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="host") == 50
-        assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier="gpu") == 150
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 200
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 50
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 150
 
-    def test_counter_tier_preinitialization(self, collector):
+    def test_cached_tokens_tier_clamped_to_aggregate(self, collector: MetricsCollector) -> None:
+        """Tier counts exceeding aggregate total must be bounded to aggregate total."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 100,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"host": 105},
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 100
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 100
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 0
+
+    def test_counter_tier_preinitialization(self, collector: MetricsCollector) -> None:
         """All standard storage tiers must be pre-initialized to 0.0 upon startup."""
         for tier in ("gpu", "host", "disk", "remote"):
-            assert _get_counter_value(collector, "counter_tokens_cached_prompt", cache_tier=tier) == 0.0
+            assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier=tier) == 0.0
+
+    def test_cached_tokens_disaggregated_remote_fallback(self, collector: MetricsCollector) -> None:
+        """Test disaggregated serving fallback where cached tokens are attributed to remote tier."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 128,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {"remote": 128},
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 128
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="remote") == 128
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 0
+
+    def test_cached_tokens_ctx_usage_tier_recovery(self, collector: MetricsCollector) -> None:
+        """Test tier recovery from ctx_usage prompt_tokens_details payload."""
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS: 200,
+            MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER: {
+                "gpu": 120,
+                "host": 80,
+            },
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 200
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="gpu") == 120
+        assert _get_counter_value(collector, "counter_tokens_cached_prompt_by_tier", cache_tier="host") == 80
 
 
 class TestPerPositionSpecDecodeMetrics:

@@ -78,7 +78,8 @@ def parse_and_display_metrics(metrics_data: str) -> None:
         f"{METRIC_PREFIX}kv_cache_reused_blocks_total": "KV cache reused blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_missed_blocks_total": "KV cache missed blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_utilization": "KV cache utilization",
-        f"{METRIC_PREFIX}prompt_cached_tokens_total": "Total prompt tokens served from KV cache by storage tier",
+        f"{METRIC_PREFIX}prompt_cached_tokens_total": "Total prompt tokens served from KV cache",
+        f"{METRIC_PREFIX}prompt_cache_tier_tokens_total": "Total prompt tokens served from KV cache by storage tier",
     }
 
     found_metrics = []

@@ -1119,10 +1119,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def cached_tokens_by_tier(self) -> dict[str, int]:
+        """Return the count of cached prompt tokens partitioned by storage tier."""
         return getattr(self, "_cached_tokens_by_tier", {})
 
     @cached_tokens_by_tier.setter
-    def cached_tokens_by_tier(self, value: dict[str, int]):
+    def cached_tokens_by_tier(self, value: dict[str, int]) -> None:
+        """Set the cached prompt token breakdown by storage tier."""
         self._cached_tokens_by_tier = value
 
     def _initialize_execution_state(self,

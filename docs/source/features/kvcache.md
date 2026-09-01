@@ -221,3 +221,20 @@ Property ```use_uvm``` has been deprecated and will be removed in a future relea
 Property ```sink_token_length``` is deprecated and silently ignored on the PyTorch backend.
 The PyTorch attention kernels do not support StreamingLLM, so any non-``None`` value is
 dropped before reaching the executor.
+
+## KV Cache Hit Metrics by Storage Tier
+
+TensorRT-LLM exports Prometheus metrics tracking reused prompt tokens across storage tiers:
+
+- `trtllm_prompt_cached_tokens_total`: Legacy aggregate counter of all prompt tokens served from KV cache across all requests.
+- `trtllm_prompt_cache_tier_tokens_total{cache_tier="..."}`: Monotonic counter partitioned by storage tier via the `cache_tier` label:
+  - `gpu`: Reused tokens resident in GPU VRAM (`CacheTier::GPU_MEM`).
+  - `host`: Reused tokens offloaded to pinned CPU host memory (`CacheTier::HOST_MEM`).
+  - `disk`: Reused tokens stored in local persistent disk cache (`CacheTier::DISK`).
+  - `remote`: Transferred context tokens received from context workers in disaggregated serving.
+
+### Counter and Reset Semantics
+- **Monotonicity**: Counters are monotonically non-decreasing totals accumulated over the process lifetime.
+- **Reset**: Counters reset to `0.0` only upon server process restart.
+- **Pre-initialization**: Series for all standard tiers (`gpu`, `host`, `disk`, `remote`) are pre-initialized to `0.0` upon server initialization.
+- **Invariant**: Every cache hit is attributed to exactly one tier. The sum across all tiers matches `trtllm_prompt_cached_tokens_total`. Unpartitioned cache hits default to `gpu`.

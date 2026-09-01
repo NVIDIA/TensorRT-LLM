@@ -252,6 +252,7 @@ class _KVCache:
         "_scratch_slots",
         "_enable_request_stats",
         "_pending_stats",
+        "_reused_tokens_by_tier",
         "__rawref__",
     )
 
@@ -270,6 +271,7 @@ class _KVCache:
     _capacity: int
     _history_length: int
     _commit_state: _CommitState
+    _reused_tokens_by_tier: dict[str, int]
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _base_page_indices to accelerate the get_base_page_indices() API. In principle it can
@@ -1119,6 +1121,7 @@ class _KVCache:
 
     @property
     def reused_tokens_by_tier(self) -> dict[str, int]:
+        """Return the count of reused tokens partitioned by storage tier (gpu, host, disk, remote)."""
         return getattr(
             self,
             "_reused_tokens_by_tier",
