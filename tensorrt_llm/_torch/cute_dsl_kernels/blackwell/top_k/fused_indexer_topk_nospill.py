@@ -552,6 +552,11 @@ def _dsv4_kernel(
             if (crk + i * CS) * TOK + lane < L:
                 cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
 
+    # Each warp signals cluster arrival as soon as its own scan work is done;
+    # the matching wait sits after the CTA barrier, so a CTA only pays the
+    # cross-CTA skew instead of a full barrier round trip.
+    if cutlass.const_expr(CS > 1):
+        cute.arch.cluster_arrive()
     cute.arch.barrier()
     if warp_idx == 0:
         cute.arch.dealloc_tmem(tmem_ptr, 512)
@@ -562,7 +567,6 @@ def _dsv4_kernel(
     # counters live in cluster-rank-0's SMEM; every CTA of the row claims there
     cnt = sCtl.iterator + 8
     if cutlass.const_expr(CS > 1):
-        cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         cnt = cute.arch.map_dsmem_ptr(sCtl.iterator + 8, 0)
         # broadcast-reduce the CS per-CTA histograms through DSMEM: every CTA
@@ -640,9 +644,9 @@ def _dsv4_kernel(
             cute.arch.atomic_add(sFine.iterator + (I32(kv1) & (NFINE - 1)), I32(1), scope="cta")
     cute.arch.barrier()
 
+    # No rendezvous before the fine push: peer sFTot buffers were zeroed before
+    # the scan-end arrive and nobody reads them until the wait below.
     if cutlass.const_expr(CS > 1):
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
         ptf = [cute.arch.map_dsmem_ptr(sFTot.iterator, c) for c in range(CS)]
         if tidx < NFINE:
             v = sFine[tidx]
