@@ -23,6 +23,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.evaluate import JsonModeEval as JsonModeEvaluator
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
+    DeepSeekSparseAttentionConfig,
     KvCacheConfig,
     MoeConfig,
     MTPDecodingConfig,
@@ -212,17 +213,37 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             rank_stats = [
                 entry
                 for entry in stats_entries
-                if entry.get("rank", entry.get("attentionDpRank")) == rank
+                if entry.get("attentionDpRank", entry.get("rank")) == rank
             ]
             assert rank_stats, f"No iteration statistics reported for ADP rank {rank}"
-            assert any(
-                entry.get("inflightBatchingStats", {}).get("numContextRequests", 0) > 0
-                for entry in rank_stats
-            ), f"No real context request executed on ADP rank {rank}"
-            assert any(
-                entry.get("inflightBatchingStats", {}).get("numGenRequests", 0) > 0
-                for entry in rank_stats
-            ), f"No real generation request executed on ADP rank {rank}"
+            inflight_batching_stats = [
+                entry.get("inflightBatchingStats", {}) for entry in rank_stats
+            ]
+            num_context_requests = sum(
+                stats.get("numContextRequests", 0) for stats in inflight_batching_stats
+            )
+            assert num_context_requests == 1, (
+                f"Expected exactly one real context request on ADP rank {rank}, "
+                f"got {num_context_requests}"
+            )
+            num_context_tokens = sum(
+                stats.get("numCtxTokens", 0) for stats in inflight_batching_stats
+            )
+            assert num_context_tokens == len(prompts[rank]), (
+                f"Expected {len(prompts[rank])} real context tokens on ADP rank "
+                f"{rank}, got {num_context_tokens}"
+            )
+            max_generation_requests = max(
+                (stats.get("numGenRequests", 0) for stats in inflight_batching_stats),
+                default=0,
+            )
+            assert max_generation_requests == 1, (
+                f"Expected exactly one real generation request per iteration on ADP "
+                f"rank {rank}, got {max_generation_requests}"
+            )
+            assert any(stats.get("numGenKvTokens", 0) > 0 for stats in inflight_batching_stats), (
+                f"No real generation KV-cache work executed on ADP rank {rank}"
+            )
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -413,9 +434,13 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 free_gpu_memory_fraction=0.6,
                 dtype="fp8",
             ),
+            sparse_attention_config=DeepSeekSparseAttentionConfig(
+                skip_indexer_for_short_seqs=False,
+            ),
             moe_config=MoeConfig(backend="CUTEDSL"),
         ) as llm:
             assert llm.args.kv_cache_config.enable_block_reuse is True
+            assert llm.args.sparse_attention_config.skip_indexer_for_short_seqs is False
             cold_output = llm.generate(
                 [prompt_token_ids],
                 sampling_params=sampling_params,
