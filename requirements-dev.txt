@@ -7,6 +7,18 @@ diffusers==0.39.0
 # transitively via openai, and openai 3.3.1 dropped it, which silently emptied
 # every sysinfo-rendered CI test list (linux_distribution_name became 'na').
 distro==1.9.0
+# Imported directly by CI/infra Python but otherwise only present transitively
+# (requests via datasets/tiktoken; pyyaml via pydantic-settings[yaml]). Declared
+# explicitly so infra never depends on a third-party's transitive dep set --
+# the distro failure mode above. Ranges, NOT == (unlike distro, which is pip-
+# only): the CI base image ships these as Debian packages (python3-yaml,
+# python3-requests) with no pip RECORD, so an exact pin forces an uninstall pip
+# cannot perform (uninstall-no-record-file). Floors are the real requirement
+# (requests>=2.32.4 also clears CVE-2024-47081); ceilings block unvetted
+# releases -- pyyaml<6.0.3 excludes 6.0.3, which fails to import on Python 3.12
+# (pyyaml issue #891).
+pyyaml>=6.0.1,<6.0.3
+requests>=2.32.4,<3
 boto3
 einops
 # Reference implementation for KDA kernel parity tests.
@@ -50,10 +62,10 @@ opentelemetry-sdk>=1.26.0
 opentelemetry-api>=1.26.0
 opentelemetry-exporter-otlp>=1.26.0
 opentelemetry-semantic-conventions-ai>=0.4.1
-fuzzywuzzy==0.18.0
+rapidfuzz==3.14.5
 aiperf==0.8.0
 nanobind>=2.9.0
-nixl-cu13==1.3.1
+nixl-cu13==1.4.0
 cupti-python>=13.0,<13.2
 nvidia-cuda-cupti>=13.0,<13.2
 cxxfilt

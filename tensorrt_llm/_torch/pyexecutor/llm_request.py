@@ -971,6 +971,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_end_id = self.end_id
         self.py_min_length = self.sampling_config.min_length
         self.py_helix_is_inactive_rank = False
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_draft_logits = None
         self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
@@ -1026,7 +1029,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
         self.d2t = None
-        self.py_draft_use_greedy_sampling = False
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
@@ -1036,8 +1038,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self._initialize_execution_state(seq_slot=seq_slot,
                                          orig_prompt_len=self.orig_prompt_len)
 
-        # TODO: remove this when use DynamicDecodeOp in pytorch flow.
-        # currently, keep py_stop_words_list as python list, rather than tensor.
+        # Keep py_stop_words_list as a python list, rather than a tensor.
         self.py_stop_words_list = stop_words_list
 
         self.py_logprobs_mode = LogprobMode(
@@ -1670,7 +1671,7 @@ def executor_request_to_llm_request(
     # No-repeat-ngram size for the TorchSampler path, normalized once here so
     # the per-step sampler gate is a plain attribute read. The C++
     # SamplingConfig rejects negative values up front and 0 means disabled
-    # (same convention as the C++ banRepeatNgram kernel), so falsy == off.
+    # (same convention as the former C++ ban-repeat-ngram kernel), so falsy == off.
     ngram_size = executor_request.sampling_config.no_repeat_ngram_size
     llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 

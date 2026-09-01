@@ -27,6 +27,7 @@ Override checkpoint:
 import gc
 import json
 import os
+from collections.abc import Generator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +39,7 @@ import torch
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_EXTRA_SPECS,
@@ -56,6 +58,9 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
+from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
+from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -144,6 +149,7 @@ def _run_forward(
     height=HEIGHT,
     width=WIDTH,
     guidance_scale=GUIDANCE_SCALE,
+    frame_rate=FRAME_RATE,
     **extra,
 ):
     return pipeline.forward(
@@ -155,7 +161,7 @@ def _run_forward(
         num_inference_steps=NUM_STEPS,
         guidance_scale=guidance_scale,
         seed=SEED,
-        frame_rate=FRAME_RATE,
+        frame_rate=frame_rate,
         use_guardrails=False,
         **extra,
     )
@@ -228,6 +234,24 @@ def _require_audio_pipeline(pipeline) -> None:
         pytest.skip("Audio tokenizer was not loaded for this pipeline")
 
 
+def _require_action_pipeline(pipeline) -> None:
+    if not getattr(pipeline, "action_gen", False):
+        pytest.skip("Checkpoint does not enable action generation")
+
+
+def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_size: int):
+    assert action is not None
+    assert action.dtype == torch.float32
+    assert action.dim() == 3, f"Expected (B,T,D), got {action.shape}"
+    batch, t, d = action.shape
+    assert batch == 1
+    assert t == chunk_size
+    assert d == raw_action_dim
+    af = action.float()
+    assert not torch.isnan(af).any()
+    assert not torch.isinf(af).any()
+
+
 def _scheduler_use_karras_sigmas(scheduler) -> bool | None:
     value = getattr(scheduler.config, "use_karras_sigmas", None)
     return None if value is None else bool(value)
@@ -268,7 +292,9 @@ def _make_test_image() -> PIL.Image.Image:
 @pytest.fixture
 def cosmos3_format_pipeline():
     """Minimal pipeline for prompt formatting helpers (no checkpoint)."""
-    return Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+    pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+    pipeline._device = torch.device("cpu")
+    return pipeline
 
 
 def _format_prompt_with_metadata(
@@ -655,19 +681,30 @@ class TestDefaultNegativePrompt:
 
 
 @pytest.fixture(scope="class")
-def cosmos3_pipeline():
-    checkpoint = _require_checkpoint()
-    pipeline = _load_pipeline(checkpoint)
-    yield pipeline
-    del pipeline
-    gc.collect()
-    torch.cuda.empty_cache()
+def cosmos3_pipeline() -> Generator[Cosmos3OmniMoTPipeline, None, None]:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
+        checkpoint = _require_checkpoint()
+        pipeline = _load_pipeline(checkpoint)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2v
 @pytest.mark.high_cuda_memory
 class TestCosmos3T2V:
+    def test_native_wan_vae_is_default(self, cosmos3_pipeline: Cosmos3OmniMoTPipeline) -> None:
+        assert isinstance(cosmos3_pipeline.vae, WanVAE)
+
+        config = cosmos3_pipeline.vae.config
+        assert len(config.latents_mean) == config.z_dim
+        assert len(config.latents_std) == config.z_dim
+        assert config.scale_factor_spatial == cosmos3_pipeline.vae_scale_factor_spatial
+        assert config.scale_factor_temporal == cosmos3_pipeline.vae_scale_factor_temporal
+
     def test_t2v_smoke(self, cosmos3_pipeline):
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
@@ -843,6 +880,7 @@ class TestCosmos3V2V:
 
     def test_v2v_flow_shift_override_request_path(self):
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         # Bypassing __init__ means the generation-default family has to be set
@@ -912,6 +950,7 @@ class TestCosmos3V2V:
         the checkpoint's flow shift / Karras sigmas and the streams step on
         different schedules."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = True
         # Bypassing __init__ means the generation-default family has to be set
@@ -967,6 +1006,155 @@ class TestCosmos3V2V:
 
         assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
 
+    def test_action_video_is_not_classified_as_v2v(self):
+        """An action reference arrives as the same `video` bytes V2V uses, but
+        it is an observation, not a clip to continue. Treating it as V2V forces
+        the system prompt, so the same frame would tokenize differently
+        depending on whether it was passed as an image or a one-frame clip."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
+        pipeline.transformer = SimpleNamespace(
+            device=torch.device("cpu"), num_embodiment_domains=32
+        )
+        pipeline.audio_gen = False
+        pipeline.action_gen = True
+        pipeline.default_use_system_prompt = False
+        pipeline.family = QWEN3_RECIPE.name
+        token_calls = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                return scheduler
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            token_calls.append(use_system_prompt)
+            raise StopAfterTokenize
+
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+        pipeline.sampling = FakeSampling()
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="pick up the block",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                num_frames=NUM_FRAMES,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                use_system_prompt=None,
+                use_guardrails=False,
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=10,
+                action_chunk_size=NUM_FRAMES - 1,
+            )
+
+        assert token_calls[0] is False
+
+    def test_action_restores_the_checkpoint_flow_shift(self):
+        """set_flow_shift is a no-op when both knobs are None, and the pipeline
+        instance outlives the request. An action request that followed a V2V one
+        would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
+        pipeline.transformer = SimpleNamespace(
+            device=torch.device("cpu"), num_embodiment_domains=32
+        )
+        pipeline.audio_gen = False
+        pipeline.action_gen = True
+        pipeline.default_use_system_prompt = False
+        pipeline.family = QWEN3_RECIPE.name
+        calls = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 7.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                calls.append((scheduler.name, target, use_karras_sigmas))
+                return scheduler
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            raise StopAfterTokenize
+
+        pipeline.scheduler = SimpleNamespace(name="video", config=SimpleNamespace(flow_shift=1.0))
+        pipeline.action_scheduler = SimpleNamespace(
+            name="action", config=SimpleNamespace(flow_shift=1.0)
+        )
+        pipeline.sampling = FakeSampling()
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="pick up the block",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                num_frames=NUM_FRAMES,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                use_guardrails=False,
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=10,
+                action_chunk_size=NUM_FRAMES - 1,
+            )
+
+        assert calls == [("video", 7.0, None), ("action", 7.0, None)]
+
+    def test_scheduler_for_serves_every_stream(self):
+        """Video, audio and action denoise in lockstep, so one resolved
+        (shift, karras) configuration must yield a scheduler per stream --
+        separate instances (schedulers mutate state on every .step()) built
+        from that stream's own base."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.family = QWEN3_RECIPE.name
+        rebuilt = []
+
+        class FakeSampling:
+            checkpoint_flow_shift = 1.0
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                rebuilt.append((scheduler.name, target, use_karras_sigmas))
+                return scheduler
+
+        pipeline.sampling = FakeSampling()
+        pipeline.scheduler = SimpleNamespace(name="video")
+        pipeline.audio_scheduler = SimpleNamespace(name="audio")
+        pipeline.action_scheduler = SimpleNamespace(name="action")
+
+        for stream in ("video", "audio", "action"):
+            pipeline._scheduler_for(10.0, False, stream=stream)
+
+        assert rebuilt == [
+            ("video", 10.0, False),
+            ("audio", 10.0, False),
+            ("action", 10.0, False),
+        ]
+
     def test_image_and_video_rejected(self, cosmos3_pipeline):
         with pytest.raises(ValueError, match="not both image and video"):
             _run_forward(
@@ -985,6 +1173,120 @@ class TestCosmos3V2V:
                 height=T2I_HEIGHT,
                 width=T2I_WIDTH,
             )
+
+
+class TestCosmos3TransferRouting:
+    def test_transfer_rejects_an_image_reference(self):
+        """`_forward_transfer` takes no image, so a request carrying both used
+        to have its image silently dropped. The sibling guards already reject
+        transfer with image output and with audio; this one completes them."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        # __new__ skips __init__, where the real pipeline resolves this.
+        pipeline.family = QWEN3_RECIPE.name
+        pipeline.audio_gen = False
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        pipeline._forward_transfer = lambda **kwargs: None
+        # A precomputed control and no video: an existing guard already rejects
+        # image+video, so this is the shape where the image used to reach
+        # `_forward_transfer` and be discarded.
+        cfg = resolve_transfer_config(
+            {"edge": _V2V_FIXTURE_MP4.read_bytes()},
+            SimpleNamespace(num_frames=93, guidance_scale=None),
+            None,
+        )
+
+        with pytest.raises(ValueError, match="cannot be combined with an image reference"):
+            pipeline.forward(
+                prompt="bounce",
+                image="frame.png",
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+            )
+
+    def test_transfer_use_system_prompt_defaults_off(self):
+        """Reference parity: transfer defaults ``use_system_prompt=False`` even
+        when a video input is present — V2V's default-True rule must not leak
+        into the transfer branch (vllm-omni ``_forward_transfer`` defaults False).
+        An explicit request value is still honored."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        # __new__ skips __init__, where the real pipeline resolves this.
+        pipeline.family = QWEN3_RECIPE.name
+        pipeline.audio_gen = False
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        captured = {}
+
+        def fake_forward_transfer(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        pipeline._forward_transfer = fake_forward_transfer
+        cfg = resolve_transfer_config(
+            {"edge": True}, SimpleNamespace(num_frames=93, guidance_scale=None), None
+        )
+
+        for explicit, expected in ((None, False), (True, True)):
+            captured.clear()
+            pipeline.forward(
+                prompt="bounce",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=explicit,
+                use_guardrails=False,
+            )
+            assert captured["use_system_prompt"] is expected
 
 
 @pytest.mark.integration
@@ -1037,6 +1339,208 @@ class TestCosmos3Audio:
             flow_shift=10.0,
             use_karras_sigmas=False,
         )
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_action
+@pytest.mark.high_cuda_memory
+class TestCosmos3Action:
+    ACTION_HEIGHT = 480
+    ACTION_WIDTH = 832
+    ACTION_CHUNK = COSMOS3_ACTION_PARAMS["action_chunk_size"]
+    # Derived, not configured: both references fix the clip at chunk + 1.
+    ACTION_FRAMES = ACTION_CHUNK + 1
+    RAW_ACTION_DIM = 10
+
+    def test_policy_smoke(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=image,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+            num_frames=self.ACTION_FRAMES,
+            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            action_mode="policy",
+            domain_name="bridge_orig_lerobot",
+            raw_action_dim=self.RAW_ACTION_DIM,
+            action_chunk_size=self.ACTION_CHUNK,
+        )
+        _assert_valid_video(
+            result.video,
+            num_frames=self.ACTION_FRAMES,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+        )
+        _assert_valid_action(
+            result.action,
+            raw_action_dim=self.RAW_ACTION_DIM,
+            chunk_size=self.ACTION_CHUNK,
+        )
+
+    def test_forward_dynamics_smoke(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
+        action_traj = [[0.1] * self.RAW_ACTION_DIM for _ in range(self.ACTION_CHUNK)]
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=image,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+            num_frames=self.ACTION_FRAMES,
+            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            action_mode="forward_dynamics",
+            domain_name="bridge_orig_lerobot",
+            action=action_traj,
+            action_chunk_size=self.ACTION_CHUNK,
+        )
+        _assert_valid_video(
+            result.video,
+            num_frames=self.ACTION_FRAMES,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+        )
+        _assert_valid_action(
+            result.action,
+            raw_action_dim=self.RAW_ACTION_DIM,
+            chunk_size=self.ACTION_CHUNK,
+        )
+
+    def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+            num_frames=NUM_FRAMES,
+            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            action_mode="inverse_dynamics",
+            domain_name="bridge_orig_lerobot",
+            raw_action_dim=self.RAW_ACTION_DIM,
+            # The clip is chunk + 1 frames, and the fixture holds NUM_FRAMES.
+            action_chunk_size=NUM_FRAMES - 1,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
+        )
+        _assert_valid_video(
+            result.video,
+            num_frames=NUM_FRAMES,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+        )
+        _assert_valid_action(
+            result.action,
+            raw_action_dim=self.RAW_ACTION_DIM,
+            chunk_size=NUM_FRAMES - 1,
+        )
+
+    def test_inverse_dynamics_rejects_short_video(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match=r"requires \d+ frames at"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=None,
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=NUM_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=NUM_FRAMES,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+            )
+
+    def test_inverse_dynamics_thins_to_the_requested_rate(self, cosmos3_pipeline):
+        """A 24 fps reference asked for at 5 fps keeps every 5th frame, so the
+        window widens accordingly and the 9-frame fixture comes up short."""
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match=r"thinned by 5 \(41 source frames needed\)"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=None,
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=NUM_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                frame_rate=5.0,
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=NUM_FRAMES - 1,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+            )
+
+    def test_out_of_range_domain_id_rejected_before_decode(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match=r"domain_id must be in \[0, \d+\)"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=_make_test_image(),
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=self.ACTION_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                action_mode="policy",
+                domain_id=10_000,
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=self.ACTION_CHUNK,
+            )
+
+    def test_first_frame_failure_is_synchronized(self, cosmos3_pipeline, monkeypatch):
+        """Every rank decodes its own reference. A failure on one rank has to
+        reach the others before the transformer's collectives, or the job hangs."""
+        _require_action_pipeline(cosmos3_pipeline)
+        from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3
+
+        seen = []
+        real = pipeline_cosmos3.synchronize_media_prepare_status
+
+        def spy(error):
+            seen.append(error)
+            return real(error)
+
+        monkeypatch.setattr(pipeline_cosmos3, "synchronize_media_prepare_status", spy)
+
+        with pytest.raises(Exception):
+            _run_forward(
+                cosmos3_pipeline,
+                image="/nonexistent/action_reference_frame.png",
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=self.ACTION_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                action_mode="policy",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=self.ACTION_CHUNK,
+            )
+
+        assert seen and isinstance(seen[0], Exception)
+
+    def test_action_and_audio_rejected(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match="joint action and audio"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=_make_test_image(),
+                action_mode="policy",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                enable_audio=True,
+            )
+
+    def test_action_and_t2i_rejected(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match="output_type='image'"):
+            _run_forward(
+                cosmos3_pipeline,
+                output_type="image",
+                action_mode="policy",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+            )
 
 
 @pytest.mark.integration
@@ -1107,6 +1611,10 @@ class TestCosmos3TextGuardrailBlocked:
     @staticmethod
     def _blocked_pipeline():
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        # __new__ skips BasePipeline.__init__, which sets the device and offloader.
+        pipeline._device = torch.device("cpu")
+        pipeline.pipeline_config = SimpleNamespace(cpu_offload_config=None)
+        pipeline.offloader = PipelineOffloader(pipeline)
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
@@ -1114,10 +1622,10 @@ class TestCosmos3TextGuardrailBlocked:
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
         pipeline.default_use_system_prompt = False
-        # ``rank`` and ``device`` are read-only properties: rank resolves to 0
-        # with no distributed init, device comes off the transformer stub.
-        # The guardrail model is not under test, so a checker that reports
-        # "unsafe" for any input drives the path without an unsafe prompt.
+        # ``rank`` is a read-only property that resolves to 0 with no
+        # distributed init. The guardrail model is not under test, so a
+        # checker that reports "unsafe" for any input drives the path
+        # without an unsafe prompt.
         pipeline.safety_checker = SimpleNamespace(check_text_safety=lambda _prompt: False)
         pipeline._scheduler_for = lambda *args, **kwargs: None
         return pipeline
@@ -1146,7 +1654,7 @@ class TestCosmos3FP8Load:
         checkpoint = _require_checkpoint()
         pipeline = _load_pipeline(checkpoint, quant_config=COSMOS3_FP8_QUANT_CONFIG)
         try:
-            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
             result = _run_forward(pipeline, image=None, num_frames=NUM_FRAMES)
             _assert_valid_video(result.video, num_frames=NUM_FRAMES)
             assert result.frame_rate == FRAME_RATE

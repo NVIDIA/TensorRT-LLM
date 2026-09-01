@@ -17,6 +17,7 @@ import atexit
 import json
 import os
 import socket
+import threading
 import time
 import weakref
 from collections.abc import Mapping
@@ -56,7 +57,8 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
+from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs,
+                       validate_token_encoder_bucket_config)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -342,7 +344,6 @@ class PreprocessedInputs:
     """
 
     prompt_token_ids: List[int]
-    query_token_ids: Optional[List[int]] = None
     multimodal_params: Optional[MultimodalParams] = None
     encoder_input_token_ids: Optional[List[int]] = None
 
@@ -494,25 +495,6 @@ class BaseLLM:
                 self.mpi_session.shutdown()
             raise
 
-        # --- Usage telemetry (fail-silent) ---
-        try:
-            import tensorrt_llm.usage as _usage
-            telemetry_config = getattr(self.args, 'telemetry_config', None)
-            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
-            # CLI commands set their specific context before LLM construction,
-            # so this only fires for users calling LLM() directly.
-            if telemetry_config is not None:
-                if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
-                    telemetry_config = telemetry_config.model_copy(
-                        update={"usage_context": _usage.UsageContext.LLM_CLASS})
-            _usage.report_usage(
-                llm_args=self.args,
-                pretrained_config=self._hf_model_config,
-                telemetry_config=telemetry_config,
-            )
-        except Exception as exc:
-            logger.debug("Usage telemetry setup failed: %s", exc)
-
         try:
             if self.args.otlp_traces_endpoint:
                 tracing.init_tracer("trt.llm", self.args.otlp_traces_endpoint)
@@ -524,6 +506,27 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _start_usage_reporting(self) -> None:
+        """Start the success-only initial report and heartbeat stream."""
+        try:
+            import tensorrt_llm.usage as _usage
+
+            telemetry_config = getattr(self.args, 'telemetry_config', None)
+            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
+            # CLI commands set their specific context before LLM construction,
+            # so this only fires for users calling LLM() directly.
+            if (telemetry_config is not None and telemetry_config.usage_context
+                    == _usage.UsageContext.UNKNOWN):
+                telemetry_config = telemetry_config.model_copy(
+                    update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            _usage.report_usage(
+                llm_args=self.args,
+                pretrained_config=self._hf_model_config,
+                telemetry_config=telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug("Usage telemetry setup failed: %s", exc)
 
     @property
     @set_api_status("beta")
@@ -806,7 +809,6 @@ class BaseLLM:
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
-            query_token_ids = inputs.query_token_ids
             multimodal_params = inputs.multimodal_params
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
@@ -819,7 +821,7 @@ class BaseLLM:
                 prompt_token_ids = self._get_decoder_prompt_token_ids(
                     sampling_params)
         else:
-            (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+            (prompt_token_ids, prompt, multimodal_params,
              encoder_input_token_ids) = self._preprocess(
                  inputs,
                  sampling_params,
@@ -829,17 +831,14 @@ class BaseLLM:
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
-        self._check_arguments(
-            len(prompt_token_ids),
-            len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params,
-            is_gen_only=is_gen_only)
+        self._check_arguments(len(prompt_token_ids),
+                              sampling_params,
+                              is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
         result = self._executor.generate_async(
             prompt_token_ids,
-            query_token_ids=query_token_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
@@ -872,15 +871,15 @@ class BaseLLM:
         inputs: Optional[PromptInputs],
         sampling_params: SamplingParams,
         disaggregated_params: Optional[DisaggregatedParams] = None,
-    ) -> Tuple[List[int], Optional[str], Optional[List[int]],
-               Optional[MultimodalParams], Optional[List[int]]]:
+    ) -> Tuple[List[int], Optional[str], Optional[MultimodalParams],
+               Optional[List[int]]]:
         """Preprocess raw prompts into token IDs and multimodal params.
 
         This is the CPU-heavy portion of generate_async (tokenization,
         multimodal processing, hash computation).
 
         Returns:
-            `(prompt_token_ids, prompt, query_token_ids, multimodal_params, encoder_input_token_ids)`
+            `(prompt_token_ids, prompt, multimodal_params, encoder_input_token_ids)`
         """
         if isinstance(inputs, dict):
             inputs = self._copy_prompt_inputs(inputs)
@@ -921,7 +920,6 @@ class BaseLLM:
         is_gen_only = (disaggregated_params is not None and
                        disaggregated_params.request_type == "generation_only")
 
-        query_token_ids = None
         multimodal_params = None
         prompt = None
 
@@ -952,7 +950,6 @@ class BaseLLM:
                     "DisaggPrefillMultimodalInputs")
             prompt_token_ids = disagg_mm_inputs.prompt_token_ids
             prompt = inputs.get("prompt", None)
-            query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
                 raise ValueError(
                     "Generation-only mode should not need multimodal parameters"
@@ -1002,7 +999,6 @@ class BaseLLM:
               and inputs.get("multi_modal_data") is None
               and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
-            query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
@@ -1057,7 +1053,6 @@ class BaseLLM:
             prompt = inputs.get(
                 "prompt")  # This is the text prompt, if present.
             if extra_processed_inputs is not None:
-                query_token_ids = extra_processed_inputs.get('query_token_ids')
                 # Create unified MultimodalParams.
                 multimodal_params = MultimodalParams(
                     multimodal_input=extra_processed_inputs.get(
@@ -1117,7 +1112,7 @@ class BaseLLM:
                 prompt_token_ids = self._get_decoder_prompt_token_ids(
                     sampling_params)
 
-        return (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+        return (prompt_token_ids, prompt, multimodal_params,
                 normalized_encoder_input_token_ids)
 
     @set_api_status("prototype")
@@ -1140,7 +1135,7 @@ class BaseLLM:
                 passed directly to :meth:`generate_async` as `inputs`.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
-        (prompt_token_ids, _prompt, query_token_ids, multimodal_params,
+        (prompt_token_ids, _prompt, multimodal_params,
          encoder_input_token_ids) = self._preprocess(
              inputs,
              sampling_params,
@@ -1149,7 +1144,6 @@ class BaseLLM:
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,
-            query_token_ids=query_token_ids,
             multimodal_params=multimodal_params,
             encoder_input_token_ids=encoder_input_token_ids,
         )
@@ -1568,18 +1562,17 @@ class BaseLLM:
         )
         _append_logits_processor(sampling_params, processor)
 
-    def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams,
+    def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            # Check prompt length and query length against max_num_tokens to filter illegal requests.
+            # Check prompt length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
                 max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
                     raise RequestError(
-                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                        f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
             return
 
@@ -1593,10 +1586,10 @@ class BaseLLM:
         # TODO: Remove this check and left the request verification to cpp runtime
 
         if (not self.args.enable_chunked_prefill) and (
-                prompt_len / self.args.parallel_config.cp_size + query_len +
+                prompt_len / self.args.parallel_config.cp_size +
             (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
+                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({max_seq_len})")
 
         if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
@@ -1706,6 +1699,13 @@ class BaseLLM:
 
     @set_api_status("beta")
     def shutdown(self) -> None:
+        try:
+            self._shutdown_resources()
+        finally:
+            self._record_usage_shutdown()
+
+    def _shutdown_resources(self) -> None:
+        """Release executors and any LLM-owned MPI session."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
@@ -1719,6 +1719,23 @@ class BaseLLM:
                 and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+    def _record_usage_shutdown(self) -> None:
+        """Update the process counter at most once for this LLM object."""
+        lifecycle_lock = getattr(self, "_usage_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            return
+        with lifecycle_lock:
+            if not getattr(self, "_usage_lifecycle_active", False):
+                return
+            self._usage_lifecycle_active = False
+
+        try:
+            import tensorrt_llm.usage as _usage
+
+            _usage.record_llm_shutdown()
+        except Exception as exc:
+            logger.debug(f"Usage telemetry shutdown tracking failed: {exc}")
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
@@ -1779,22 +1796,58 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        self._usage_lifecycle_active = False
+        self._usage_lifecycle_lock = threading.Lock()
+        telemetry_config = kwargs.get("telemetry_config")
+        usage_attempt_tracked = False
+        _usage = None
+        # Telemetry: Track before construction so initialization failures are visible.
+        try:
+            import tensorrt_llm.usage as _usage
+
+            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                telemetry_config,
+                default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Usage telemetry initialization tracking failed: {exc}")
+
         backend = kwargs.pop("backend", "pytorch")
 
-        # Validate that only arguments supported by the PyTorch backend are passed.
-        self._validate_args_for_torch_backend(kwargs)
+        try:
+            # Validate that only arguments supported by the PyTorch backend are passed.
+            self._validate_args_for_torch_backend(kwargs)
 
-        super().__init__(model,
-                         tokenizer,
-                         tokenizer_mode,
-                         skip_tokenizer_init,
-                         trust_remote_code,
-                         tensor_parallel_size,
-                         dtype,
-                         revision,
-                         tokenizer_revision,
-                         backend=backend,
-                         **kwargs)
+            super().__init__(model,
+                             tokenizer,
+                             tokenizer_mode,
+                             skip_tokenizer_init,
+                             trust_remote_code,
+                             tensor_parallel_size,
+                             dtype,
+                             revision,
+                             tokenizer_revision,
+                             backend=backend,
+                             **kwargs)
+        except Exception:
+            if usage_attempt_tracked:
+                _usage.record_llm_initialization_failure()
+            raise
+
+        try:
+            if not usage_attempt_tracked and _usage is not None:
+                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                    getattr(self.args, 'telemetry_config', None),
+                    default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+                )
+
+            if usage_attempt_tracked:
+                self._usage_lifecycle_active = _usage.record_llm_initialized()
+        except Exception as exc:
+            logger.debug(f"Usage telemetry completion tracking failed: {exc}")
+
+        self._start_usage_reporting()
 
     @set_api_status("prototype")
     def _collective_rpc(
@@ -1832,6 +1885,45 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    def _reject_token_encoder_config_without_buckets(self) -> None:
+        """Reject a bucket-less token-encoder config before weights load.
+
+        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the
+        last word; this asks the class its architecture resolves to. It defers
+        wherever that class might not be the one the engine builds, so it can
+        only reject earlier, never differently. A model that installs
+        `encoder_graph_spec` at construction instead of declaring it on the
+        class would be misjudged here; no in-tree model does.
+        """
+        config = self.args.encoder_cuda_graph_config
+        # `checkpoint_loader`, a non-HF `checkpoint_format` and `model_kwargs`
+        # all feed `checkpoint_loader.load_config()`, which is where the engine
+        # gets its class from, so the on-disk architecture may not be the one
+        # it builds. Decoder-only models are left to the engine too: its
+        # "consumes packed tokens" wording would only confuse there.
+        if (config is None or not self._is_encoder_decoder_model()
+                or self.args.model_kwargs is not None
+                or self.args.checkpoint_loader is not None
+                or self.args.checkpoint_format not in (None, "HF")):
+            return
+        bucket_config_error = validate_token_encoder_bucket_config(
+            config.num_tokens, config.seq_lens)
+        if bucket_config_error is None:
+            return
+        architectures = getattr(self._hf_model_config, "architectures",
+                                None) if self._hf_model_config else None
+        if not architectures:
+            return
+        # Local: resolving an architecture imports its model module, which the
+        # client process otherwise never loads.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+        model_cls = get_registered_model_class(architectures[0])
+        # Unresolved, or a feature encoder that derives both dimensions itself.
+        if model_cls is None or hasattr(model_cls, "encoder_graph_spec"):
+            return
+        raise ValueError(bucket_config_error)
+
     def _build_model(self):
         super()._build_model()
         assert self._engine_dir is None
@@ -1840,6 +1932,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
         )

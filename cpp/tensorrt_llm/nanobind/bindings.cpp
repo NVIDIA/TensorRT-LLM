@@ -35,7 +35,6 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
-#include "tensorrt_llm/nanobind/batch_manager/buffers.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
@@ -73,14 +72,6 @@ using OptVec = std::optional<std::vector<T>>;
 #if not defined(TRTLLM_NB_MODULE)
 #error "TRTLLM_NB_MODULE must be defined"
 #endif
-
-namespace
-{
-tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
-{
-    return tr::SamplingConfig(configs);
-}
-} // namespace
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
@@ -466,10 +457,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("__setstate__", SamplingConfigSetState)
         .def("__eq__", &tr::SamplingConfig::operator==);
 
-    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "SamplingConfigVector");
-
-    m.def("make_sampling_config", &makeSamplingConfig, nb::arg("configs"));
-
     nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
                  tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
@@ -522,7 +509,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
     tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
-    tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

@@ -21,7 +21,10 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import BindKvCacheTransceiver
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    BindKvCacheTransceiver,
+    CtxTransferStatus,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -112,14 +115,14 @@ def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
 
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     assert executor.active_requests == []
-    executor.dist.tp_allgather.assert_called_once_with(True)
+    executor.dist.tp_allgather.assert_called_once_with(True, small_payload=True)
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[request],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(True),
+        call.vote(True, small_payload=True),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[request],
@@ -135,14 +138,14 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
     PyExecutor._handle_kv_transfer_timeouts_synced(executor)
 
     executor.kv_cache_transceiver.cancel_request.assert_not_called()
-    executor.dist.tp_allgather.assert_called_once_with(False)
+    executor.dist.tp_allgather.assert_called_once_with(False, small_payload=True)
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(False),
+        call.vote(False, small_payload=True),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[],
@@ -195,7 +198,9 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = CtxTransferStatus(
+        [], []
+    )
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
@@ -222,7 +227,9 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = CtxTransferStatus(
+        [], []
+    )
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor.async_transfer_manager = Mock()

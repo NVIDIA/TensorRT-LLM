@@ -74,6 +74,11 @@ def stages_by_yaml_stem(stages: dict[str, Stage]) -> dict[str, list[tuple[str, S
     return out
 
 
+def is_perf_stem(stem: str) -> bool:
+    """Return whether a test-db stem belongs to perf or perf-sanity."""
+    return stem == "l0_perf" or "perf_sanity" in stem
+
+
 def iter_diff_changes(diff: str) -> Iterator[tuple[str, str]]:
     """Yield (sign, body) for every `+`/`-` line; skip headers and context."""
     for line in diff.splitlines():

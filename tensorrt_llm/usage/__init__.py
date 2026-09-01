@@ -32,13 +32,37 @@ from tensorrt_llm.usage import usage_lib as _usage_lib
 TelemetryConfig = _config.TelemetryConfig
 TelemetryField = _config.TelemetryField
 UsageContext = _config.UsageContext
+TerminalOutcome = _usage_lib.TerminalOutcome
 report_usage = _usage_lib.report_usage
+report_exit = _usage_lib.report_exit
+apply_usage_session_config = _usage_lib.apply_usage_session_config
+record_llm_initialization_attempt = _usage_lib.record_llm_initialization_attempt
+record_llm_initialization_failure = _usage_lib.record_llm_initialization_failure
+record_llm_initialized = _usage_lib.record_llm_initialized
+record_llm_shutdown = _usage_lib.record_llm_shutdown
+record_observed_signal = _usage_lib.record_observed_signal
+record_termination_observation = _usage_lib.record_termination_observation
+set_lifecycle_phase = _usage_lib.set_lifecycle_phase
+set_usage_context = _usage_lib.set_usage_context
+get_observed_signal = _usage_lib.get_observed_signal
 is_usage_stats_enabled = _usage_lib.is_usage_stats_enabled
 
 __all__ = [
     "TelemetryConfig",
     "TelemetryField",
+    "TerminalOutcome",
     "UsageContext",
+    "get_observed_signal",
+    "record_llm_initialization_attempt",
+    "record_llm_initialization_failure",
+    "record_llm_initialized",
+    "record_llm_shutdown",
+    "record_observed_signal",
+    "record_termination_observation",
+    "report_exit",
     "report_usage",
+    "set_lifecycle_phase",
+    "set_usage_context",
+    "apply_usage_session_config",
     "is_usage_stats_enabled",
 ]
