@@ -715,28 +715,29 @@ class PrimsTSFmha(PhasedFmha):
         )
 
         wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
-        wrapper.plan_live(
-            q,
-            k_cache,
-            v_cache,
+        wrapper.plan(
+            device=q.device,
             batch_size=batch_size,
             max_seq_len_q=max_seq_len_q,
             max_seq_len_k=max_seq_len_k,
             max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+            num_qo_heads=int(q.shape[-2]),
+            num_kv_heads=int(k_cache.shape[1]),
+            head_dim=int(q.shape[-1]),
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            out_dtype=output_dtype,
             page_size=page_size,
             mask_type=mask_type,
             window_left=window_left,
             sm_scale=sm_scale,
             output_scale=1.0,
-            out_dtype=output_dtype,
         )
         self._context_wrappers[batch_size] = wrapper
         return wrapper
 
     def _get_or_plan_decode_wrapper(
         self,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
         workspace_buffer: torch.Tensor,
         *,
         batch_size: int,
@@ -754,8 +755,6 @@ class PrimsTSFmha(PhasedFmha):
     ) -> "BatchDecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS decode requires a positive batch size.")
-        if paged_kv_indptr.numel() != batch_size + 1:
-            raise RuntimeError("PrimTS decode indptr extent does not match the phase batch size.")
         wrapper = self._decode_wrappers.get(batch_size)
         if wrapper is not None:
             return wrapper
@@ -765,21 +764,20 @@ class PrimsTSFmha(PhasedFmha):
 
         wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
         wrapper.plan(
-            paged_kv_indptr,
-            paged_kv_indices,
-            None,
+            workspace_buffer.device,
+            batch_size,
             num_qo_heads,
             num_kv_heads,
             head_dim,
             page_size,
-            seq_len_q=seq_len_q,
+            max_kv_len,
+            max_seq_len_q=seq_len_q,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=output_dtype,
             mask_type=mask_type,
             window_left=window_left,
-            max_kv_len=max_kv_len,
-            live_metadata=True,
             workspace_buffer=workspace_buffer,
         )
         self._decode_wrappers[batch_size] = wrapper
@@ -787,8 +785,6 @@ class PrimsTSFmha(PhasedFmha):
 
     def _get_or_plan_mla_decode_wrapper(
         self,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
         workspace_buffer: torch.Tensor,
         *,
         batch_size: int,
@@ -805,8 +801,6 @@ class PrimsTSFmha(PhasedFmha):
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
-        if block_tables.shape[0] != batch_size or seq_lens.numel() != batch_size:
-            raise RuntimeError("PrimTS MLA metadata extents do not match the phase batch size.")
         wrapper = self._mla_decode_wrappers.get(batch_size)
         if wrapper is not None:
             return wrapper
@@ -818,19 +812,19 @@ class PrimsTSFmha(PhasedFmha):
 
         wrapper = BatchMLADecodePagedTSWrapper()
         wrapper.plan(
-            block_tables,
-            seq_lens,
+            workspace_buffer.device,
+            batch_size,
             num_heads,
             kv_lora_rank,
             qk_rope_head_dim,
             page_size,
+            max_kv_len,
             max_seq_len_q=max_seq_len_q,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=output_dtype,
             mask_type=mask_type,
-            max_kv_len=max_kv_len,
-            live_metadata=True,
             workspace_buffer=workspace_buffer,
         )
         self._mla_decode_wrappers[batch_size] = wrapper
@@ -1149,11 +1143,12 @@ class PrimsTSFmha(PhasedFmha):
             q_processed,
             k_cache,
             v_cache,
+            cu_q_seqlens,
+            logical_kv_indptr,
+            dense_page_idx_kv,
+            seq_lens_kv,
             out=params.context_buf,
-            qo_indptr=cu_q_seqlens,
-            logical_kv_indptr=logical_kv_indptr,
-            dense_page_idx_kv=dense_page_idx_kv,
-            seq_lens_kv=seq_lens_kv,
+            validate=False,
         )
 
         thop.trtllm_gen_context_postprocess(
@@ -1306,8 +1301,6 @@ class PrimsTSFmha(PhasedFmha):
         mask_type = self._get_prims_mask_type(fwd)
         decode_workspace = self._get_decode_workspace(params.workspace)
         wrapper = self._get_or_plan_decode_wrapper(
-            paged_kv_indptr,
-            paged_kv_indices,
             decode_workspace,
             batch_size=batch_size,
             num_qo_heads=attn.num_heads,
@@ -1322,8 +1315,12 @@ class PrimsTSFmha(PhasedFmha):
             mask_type=mask_type,
             window_left=window_left,
         )
-        control_offset = wrapper._workspace_layout.split_kv_counter.byte_offset
-        decode_workspace[control_offset : wrapper._workspace_layout.total_bytes].zero_()
+        plan_state = wrapper._plan_state
+        if plan_state is None:
+            raise RuntimeError("PrimTS decode wrapper has no compiled plan.")
+        workspace_layout = plan_state.workspace_layout
+        control_offset = workspace_layout.split_kv_counter.byte_offset
+        decode_workspace[control_offset : workspace_layout.total_bytes].zero_()
         wrapper.run(
             query,
             (k_cache, v_cache),
@@ -1333,6 +1330,7 @@ class PrimsTSFmha(PhasedFmha):
             bmm1_scale=self._get_bmm1_scale(attn),
             bmm2_scale=1.0,
             out=output,
+            validate=False,
         )
 
     def _get_decode_workspace(
@@ -1407,8 +1405,6 @@ class PrimsTSFmha(PhasedFmha):
         )
         caller_workspace = params.workspace.reshape(-1).view(torch.uint8)
         wrapper = self._get_or_plan_mla_decode_wrapper(
-            dense_block_tables,
-            seq_lens,
             caller_workspace,
             batch_size=batch_size,
             num_heads=attn.num_heads,
@@ -1430,6 +1426,7 @@ class PrimsTSFmha(PhasedFmha):
             out=output,
             bmm1_scale=bmm1_scale,
             bmm2_scale=1.0,
+            validate=False,
         )
 
 

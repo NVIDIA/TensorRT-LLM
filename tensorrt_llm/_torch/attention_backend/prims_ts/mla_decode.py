@@ -23,7 +23,6 @@ from typing import Any, Literal, Optional, cast
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-
 from ._tensor_aliasing import (
     _validate_out_does_not_overlap_inputs,
     _validate_tensor_does_not_overlap_inputs,
@@ -87,10 +86,37 @@ class _MLAWorkspaceViews:
 
 
 @dataclass(frozen=True)
+class _MLADecodePlanState:
+    """Immutable compile and workspace state for one reusable MLA plan."""
+
+    device: torch.device
+    batch_size: int
+    num_heads: int
+    max_seq_len_q: int
+    packed_query: bool
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    page_size: int
+    q_dtype: torch.dtype
+    kv_dtype: torch.dtype
+    output_dtype: torch.dtype
+    mask_type: Literal["dense", "causal"]
+    max_kv_len: int
+    required_page_columns: int
+    workspace_buffer: torch.Tensor
+    workspace_layout: _MLAWorkspaceLayout
+    workspace_views: _MLAWorkspaceViews
+    compiled: Callable[..., object]
+    policy: tuple[tuple[str, object], ...]
+    split_kv: int
+
+
+@dataclass(frozen=True)
 class _MLARuntime:
     query: torch.Tensor
     normalized_cache: torch.Tensor
     out: torch.Tensor
+    num_physical_pages: int
     bmm1_scale: float
     bmm2_scale: float
 
@@ -296,8 +322,8 @@ def _derive_max_seq_len_q(
 ) -> tuple[int, int, tuple[int, ...]]:
     """Validate cumulative offsets and derive their maximum positive delta.
 
-    This helper intentionally synchronizes and is therefore used only by the
-    wrapper planning path when the caller omits an explicit static bound.
+    This helper intentionally synchronizes and is therefore used only by
+    explicit runtime validation and the one-shot convenience path.
     """
 
     offsets = [int(value) for value in qo_indptr.tolist()]
@@ -311,6 +337,98 @@ def _derive_max_seq_len_q(
     if any(length <= 0 for length in q_lengths):
         raise ValueError("qo_indptr must be strictly increasing")
     return max(q_lengths), offsets[-1], q_lengths
+
+
+def _validate_mla_run_metadata(
+    state: _MLADecodePlanState,
+    runtime: _MLARuntime,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    qo_indptr: Optional[torch.Tensor],
+) -> None:
+    """Validate live request metadata against one static MLA plan.
+
+    Value checks synchronize CUDA metadata with the host. ``run(validate=False)``
+    is the synchronization-free path for compilation and graph capture.
+    """
+
+    device, batch_size, max_num_pages = _validate_mla_metadata(block_tables, seq_lens)
+    if device != state.device:
+        raise ValueError(
+            f"MLA metadata must be on the planned device {state.device}, got {device}"
+        )
+    if batch_size != state.batch_size:
+        raise ValueError(
+            "MLA metadata batch size must match the plan "
+            f"({state.batch_size}), got {batch_size}"
+        )
+    if max_num_pages < state.required_page_columns:
+        raise ValueError(
+            "block_tables must have at least ceil(max_kv_len / page_size) "
+            f"columns ({state.required_page_columns}), got {max_num_pages}"
+        )
+
+    if state.packed_query:
+        if qo_indptr is None:
+            raise ValueError("packed-query MLA run requires qo_indptr")
+        _validate_qo_indptr(
+            qo_indptr,
+            device=state.device,
+            batch_size=state.batch_size,
+        )
+        runtime_max_seq_len_q, total_q, q_lengths = _derive_max_seq_len_q(
+            qo_indptr,
+            batch_size=state.batch_size,
+        )
+        if total_q != int(runtime.query.shape[0]):
+            raise ValueError(
+                "qo_indptr must end at the packed query row count "
+                f"({runtime.query.shape[0]}), got {total_q}"
+            )
+        if runtime_max_seq_len_q > state.max_seq_len_q:
+            raise ValueError(
+                "qo_indptr contains a per-request Q length larger than "
+                f"max_seq_len_q ({state.max_seq_len_q}): got "
+                f"{runtime_max_seq_len_q}"
+            )
+    else:
+        if qo_indptr is not None:
+            raise ValueError("fixed-query MLA plan does not accept qo_indptr")
+        q_lengths = (state.max_seq_len_q,) * state.batch_size
+
+    seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
+    if any(seq_len <= 0 for seq_len in seq_lens_host):
+        raise ValueError("every runtime request must contain at least one KV token")
+    runtime_max_kv_len = max(seq_lens_host)
+    if runtime_max_kv_len > state.max_kv_len:
+        raise ValueError(
+            "runtime KV metadata contains a request longer than "
+            f"max_kv_len ({state.max_kv_len}): got {runtime_max_kv_len}"
+        )
+    block_table_rows = block_tables.tolist()
+    for request_idx, (row, seq_len) in enumerate(
+        zip(block_table_rows, seq_lens_host, strict=True)
+    ):
+        required_pages = _ceil_div(seq_len, state.page_size)
+        if any(
+            int(page_id) < 0 or int(page_id) >= runtime.num_physical_pages
+            for page_id in row[:required_pages]
+        ):
+            raise ValueError(
+                "block_tables values for live pages must index the physical "
+                f"K/V cache in [0, {runtime.num_physical_pages}); request "
+                f"{request_idx} contains an invalid page ID"
+            )
+    if state.mask_type == "causal":
+        for request_idx, (q_len, kv_len) in enumerate(
+            zip(q_lengths, seq_lens_host, strict=True)
+        ):
+            if q_len > kv_len:
+                raise ValueError(
+                    "causal MLA decode requires every per-request Q length "
+                    "to be no greater than its K/V length; request "
+                    f"{request_idx} has Q={q_len} and K/V={kv_len}"
+                )
 
 
 def _resolve_max_seq_len_q_alias(
@@ -1247,6 +1365,7 @@ def _prepare_mla_runtime(
     batch_size: int,
     num_heads: int,
     max_seq_len_q: int,
+    packed_query: bool,
     qo_indptr: Optional[torch.Tensor],
     page_size: int,
     q_dtype: torch.dtype,
@@ -1255,40 +1374,52 @@ def _prepare_mla_runtime(
     bmm1_scale: float,
     bmm2_scale: float,
     out: Optional[torch.Tensor],
+    validate: bool,
 ) -> _MLARuntime:
-    """Validate public MLA tensors and normalize the cache without copies."""
+    """Normalize one launch, optionally validating its public arguments."""
 
-    packed_query = qo_indptr is not None
-    if packed_query:
-        _validate_qo_indptr(
-            qo_indptr,
+    if validate:
+        if packed_query:
+            if qo_indptr is None:
+                raise ValueError("packed-query MLA run requires qo_indptr")
+            _validate_qo_indptr(
+                qo_indptr,
+                device=device,
+                batch_size=batch_size,
+            )
+        elif qo_indptr is not None:
+            raise ValueError("fixed-query MLA plan does not accept qo_indptr")
+        _validate_query(
+            query,
+            packed_query=packed_query,
             device=device,
             batch_size=batch_size,
+            num_heads=num_heads,
+            max_seq_len_q=max_seq_len_q,
+            q_dtype=q_dtype,
         )
-    _validate_query(
-        query,
-        packed_query=packed_query,
-        device=device,
-        batch_size=batch_size,
-        num_heads=num_heads,
-        max_seq_len_q=max_seq_len_q,
-        q_dtype=q_dtype,
-    )
-    normalized_cache, _, runtime_page_size = _normalize_mla_kv_cache(
-        kv_cache, expected_device=device
-    )
-    if runtime_page_size != page_size:
-        raise ValueError(
-            "kv_cache page size does not match the launch: expected "
-            f"{page_size}, got {runtime_page_size}"
-        )
-    if normalized_cache.dtype != kv_dtype:
-        raise ValueError(
-            f"kv_cache dtype must match the launch ({kv_dtype}), "
-            f"got {normalized_cache.dtype}"
-        )
-    effective_bmm1_scale = _validate_scale(bmm1_scale, "bmm1_scale")
-    effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+        (
+            normalized_cache,
+            num_physical_pages,
+            runtime_page_size,
+        ) = _normalize_mla_kv_cache(kv_cache, expected_device=device)
+        if runtime_page_size != page_size:
+            raise ValueError(
+                "kv_cache page size does not match the launch: expected "
+                f"{page_size}, got {runtime_page_size}"
+            )
+        if normalized_cache.dtype != kv_dtype:
+            raise ValueError(
+                f"kv_cache dtype must match the launch ({kv_dtype}), "
+                f"got {normalized_cache.dtype}"
+            )
+        effective_bmm1_scale = _validate_scale(bmm1_scale, "bmm1_scale")
+        effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+    else:
+        normalized_cache = kv_cache[:, 0] if kv_cache.ndim == 4 else kv_cache
+        num_physical_pages = int(normalized_cache.shape[0])
+        effective_bmm1_scale = bmm1_scale
+        effective_bmm2_scale = bmm2_scale
     total_q = int(query.shape[0]) if packed_query else None
     if out is None:
         out_shape = (
@@ -1297,7 +1428,7 @@ def _prepare_mla_runtime(
             else (batch_size, max_seq_len_q, num_heads, _MLA_LATENT_DIM)
         )
         out = torch.empty(out_shape, device=device, dtype=output_dtype)
-    else:
+    elif validate:
         _validate_out(
             out,
             device=device,
@@ -1312,6 +1443,7 @@ def _prepare_mla_runtime(
         query=query,
         normalized_cache=normalized_cache,
         out=out,
+        num_physical_pages=num_physical_pages,
         bmm1_scale=effective_bmm1_scale,
         bmm2_scale=effective_bmm2_scale,
     )
@@ -1344,6 +1476,7 @@ def _launch_mla_decode(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
+    packed_query: bool,
     kv_lora_rank: int,
     split_kv: int,
     workspace: _MLAWorkspaceViews,
@@ -1351,7 +1484,6 @@ def _launch_mla_decode(
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
-    packed_query = qo_indptr is not None
     if packed_query:
         q_latent = runtime.query[..., :kv_lora_rank].permute(1, 2, 0)
         q_rope = runtime.query[..., kv_lora_rank:].permute(1, 2, 0)
@@ -1544,6 +1676,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         batch_size=batch_size,
         num_heads=num_heads,
         max_seq_len_q=max_seq_len_q,
+        packed_query=packed_query,
         qo_indptr=qo_indptr,
         page_size=page_size,
         q_dtype=query.dtype,
@@ -1552,6 +1685,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         out=out,
+        validate=True,
     )
     _validate_tensor_does_not_overlap_inputs(
         workspace_buffer,
@@ -1582,6 +1716,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         block_tables=block_tables,
         seq_lens=seq_lens,
         qo_indptr=qo_indptr,
+        packed_query=packed_query,
         kv_lora_rank=kv_lora_rank,
         split_kv=spec.split_kv,
         workspace=workspace,
@@ -1590,281 +1725,112 @@ def prims_ts_batch_decode_with_kv_cache_mla(
 
 
 class BatchMLADecodePagedTSWrapper:
-    """Plan and reuse task-scheduled paged MLA decode launches.
+    """Compile and reuse task-scheduled paged MLA decode launches.
 
-    Args:
-        workspace_buffer: Optional caller-owned contiguous ``torch.int8`` or
-            ``torch.uint8`` CUDA workspace. The buffer is validated and bound
-            once by :meth:`plan`; its contents need not be initialized. It must
-            remain alive, at the same address and size, and exclusive to one
-            in-flight execution lane or captured-graph replay, and must not
-            overlap query, K/V cache, metadata, or output storage. If omitted,
-            each successful plan allocates private workspace with the same
-            exclusivity requirement.
+    .. warning::
+        This wrapper is experimental. Its plan/run contract may change without
+        a compatibility shim.
     """
 
     @flashinfer_api
-    def __init__(self, workspace_buffer: Optional[torch.Tensor] = None) -> None:
+    def __init__(self) -> None:
         """Initialize an unplanned task-scheduled paged-MLA wrapper."""
-        self._caller_workspace_buffer = workspace_buffer
-        self._planned = False
-
-    def _resolve_run_metadata(
-        self,
-        block_tables: Optional[torch.Tensor],
-        seq_lens: Optional[torch.Tensor],
-        qo_indptr: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Resolve retained or live metadata and validate its static contract."""
-
-        if not self._live_metadata:
-            if (
-                block_tables is not None
-                or seq_lens is not None
-                or qo_indptr is not None
-            ):
-                raise ValueError(
-                    "run-time MLA metadata requires plan(live_metadata=True)"
-                )
-            return self._block_tables, self._seq_lens, self._qo_indptr
-
-        resolved_block_tables = (
-            self._block_tables if block_tables is None else block_tables
-        )
-        resolved_seq_lens = self._seq_lens if seq_lens is None else seq_lens
-        resolved_qo_indptr = self._qo_indptr if qo_indptr is None else qo_indptr
-        device, batch_size, max_num_pages = _validate_mla_metadata(
-            resolved_block_tables, resolved_seq_lens
-        )
-        if device != self._device:
-            raise ValueError(
-                f"MLA metadata must be on the planned device {self._device}, got {device}"
-            )
-        if batch_size != self._batch_size:
-            raise ValueError(
-                "MLA metadata batch size must match the plan "
-                f"({self._batch_size}), got {batch_size}"
-            )
-        if max_num_pages < self._required_page_columns:
-            raise ValueError(
-                "block_tables must have at least ceil(max_kv_len / page_size) "
-                f"columns ({self._required_page_columns}), got {max_num_pages}"
-            )
-        if self._packed_query:
-            if resolved_qo_indptr is None:
-                raise ValueError("packed-query MLA run requires qo_indptr")
-        elif resolved_qo_indptr is not None:
-            raise ValueError("fixed-query MLA plan does not accept qo_indptr")
-        return resolved_block_tables, resolved_seq_lens, resolved_qo_indptr
+        self._plan_state: Optional[_MLADecodePlanState] = None
 
     @flashinfer_api
     def plan(
         self,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
+        device: int | str | torch.device,
+        batch_size: int,
         num_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         page_size: int,
+        max_kv_len: int,
         *,
-        seq_len_q: Optional[int] = None,
-        qo_indptr: Optional[torch.Tensor] = None,
-        max_seq_len_q: Optional[int] = None,
-        q_data_type: torch.dtype = torch.bfloat16,
-        kv_data_type: Optional[torch.dtype] = None,
-        o_data_type: torch.dtype = torch.bfloat16,
+        max_seq_len_q: int,
+        packed_query: bool,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
-        max_kv_len: Optional[int] = None,
-        live_metadata: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
-        """Prepare metadata, automatic policy, compiled callable, and scratch.
+        """Compile one static MLA shape and bind its reusable workspace.
 
-        With ``live_metadata=False``, planning preserves the legacy lifecycle:
-        it reads and validates every K/V length, retains ``block_tables`` and
-        ``seq_lens``, and, for packed query, reads cumulative ``qo_indptr``
-        offsets to validate their deltas and fixed final total. If a Q or K/V
-        bound is omitted, the corresponding metadata maximum becomes the exact
-        static plan bound. An explicit bound may be larger but is still checked
-        against every planned row.
+        Planning consumes only compile-time geometry, capacity, dtype, and
+        storage-mode inputs. Request metadata belongs exclusively to
+        :meth:`run` and is never retained by the wrapper. A successful re-plan
+        atomically replaces the previous immutable state; a failed re-plan
+        leaves that state usable.
 
-        ``live_metadata=True`` makes the three metadata tensors runtime bindings.
-        The plan-time tensors establish device, batch, page-table capacity, and
-        fixed-versus-packed query mode, and remain defaults when a run omits an
-        override. This mode requires an explicit ``max_kv_len`` and packed-query
-        plans additionally require ``max_seq_len_q``. Planning therefore
-        performs no device-to-host metadata read. Runtime metadata values are
-        otherwise trusted. The planned batch size is exact: every run has ``B``
-        sequence lengths, ``B`` block-table rows, and ``B + 1`` packed offsets.
-        Lengths must remain positive and within their static bounds; packed
-        offsets must start at zero, increase strictly, end at the runtime
-        query/output extent, and have every delta within ``max_seq_len_q``.
-        Every causal run must also preserve ``q_len[b] <= seq_lens[b]``.
+        ``packed_query=False`` selects fixed ``[B, SQ, H, 576]`` query storage,
+        where ``SQ`` is exactly ``max_seq_len_q``. ``packed_query=True`` selects
+        ``[total_q, H, 576]`` storage with live cumulative offsets supplied to
+        every run. ``max_seq_len_q`` is then the per-request capacity.
 
-        ``qo_indptr=None`` selects fixed query storage and the Q bound defaults
-        to one. ``seq_len_q`` remains a backward-compatible alias for the same
-        static bound. ``workspace_buffer`` overrides the constructor workspace
-        for this successful plan; when both are omitted, the plan allocates
-        private workspace. A wrapper workspace is mutable scratch and supports
-        only one in-flight execution lane or captured-graph replay. Separate
-        workspaces are required for concurrent streams or graph replays, even
-        when they use separate wrapper instances. Warm the plan and retain stable
-        workspace and metadata addresses before graph capture.
+        If ``workspace_buffer`` is omitted, the plan allocates private scratch.
+        A workspace is mutable and exclusive to one in-flight launch or graph
+        replay. Warm the plan before graph capture, and call ``run`` with
+        ``validate=False`` inside compiled or captured regions.
 
         Parameters
         ----------
-        block_tables : torch.Tensor
-            Dense physical-page table for each request.
-        seq_lens : torch.Tensor
-            Live K/V sequence lengths.
+        device : device-like
+            CUDA device on which the plan will execute.
+        batch_size : int
+            Exact runtime request count.
         num_heads, kv_lora_rank, qk_rope_head_dim, page_size : int
-            MLA head geometry and K/V page size.
-        seq_len_q : int, optional
-            Backward-compatible fixed-query length alias.
-        qo_indptr : torch.Tensor, optional
-            Cumulative query offsets selecting packed-query mode.
-        max_seq_len_q : int, optional
-            Static packed-query length bound.
+            Static MLA head geometry and K/V page size.
+        max_kv_len, max_seq_len_q : int
+            Static per-request K/V and Q capacities.
+        packed_query : bool
+            Select packed rather than fixed query storage.
         q_data_type, kv_data_type, o_data_type : torch.dtype
             Query, K/V, and output dtypes used to compile the plan.
         mask_type : {"dense", "causal"}
             Attention mask mode.
-        max_kv_len : int, optional
-            Static K/V length bound; defaults to the metadata maximum.
-        live_metadata : bool
-            Select synchronization-free live-metadata planning.
         workspace_buffer : torch.Tensor, optional
             Caller-owned scratch for this plan.
         """
 
-        if not isinstance(live_metadata, bool):
-            raise TypeError("live_metadata must be a bool")
+        if not isinstance(packed_query, bool):
+            raise TypeError("packed_query must be a bool")
         _validate_mask(mask_type)
+        batch_size = _validate_positive_int(batch_size, "batch_size")
+        _validate_mla_int32_extent(batch_size, "batch_size")
         num_heads = _validate_positive_int(num_heads, "num_heads")
         _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
         page_size = _validate_page_size(page_size)
-        device, batch_size, max_num_pages = _validate_mla_metadata(
-            block_tables, seq_lens
-        )
-        device_index = _validate_runtime_device(device)
-        packed_query = qo_indptr is not None
-        planned_total_q = None
-        resolved_q_bound = _resolve_max_seq_len_q_alias(
-            seq_len_q=seq_len_q,
-            max_seq_len_q=max_seq_len_q,
-            default=None,
-        )
-        if live_metadata and max_kv_len is None:
-            raise ValueError("max_kv_len is required when live_metadata=True")
-        if live_metadata and packed_query and resolved_q_bound is None:
-            raise ValueError(
-                "max_seq_len_q is required with qo_indptr when live_metadata=True"
-            )
-        if packed_query:
-            _validate_qo_indptr(
-                qo_indptr,
-                device=device,
-                batch_size=batch_size,
-            )
-            if live_metadata and resolved_q_bound is not None:
-                max_seq_len_q = resolved_q_bound
-                planned_q_lengths = None
-            else:
-                (
-                    derived_q_bound,
-                    derived_total_q,
-                    planned_q_lengths,
-                ) = _derive_max_seq_len_q(qo_indptr, batch_size=batch_size)
-                if not live_metadata:
-                    planned_total_q = derived_total_q
-                if resolved_q_bound is None:
-                    max_seq_len_q = derived_q_bound
-                else:
-                    max_seq_len_q = resolved_q_bound
-                    if derived_q_bound > max_seq_len_q:
-                        raise ValueError(
-                            "qo_indptr contains a per-request Q length larger than "
-                            f"max_seq_len_q ({max_seq_len_q}): got {derived_q_bound}"
-                        )
-        elif resolved_q_bound is None:
-            max_seq_len_q = 1
-            planned_q_lengths = (max_seq_len_q,) * batch_size
-        else:
-            max_seq_len_q = resolved_q_bound
-            planned_q_lengths = (max_seq_len_q,) * batch_size
-
+        max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
+        max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")
         _validate_mla_query_head_extent(
             batch_size=batch_size,
             num_heads=num_heads,
             max_seq_len_q=max_seq_len_q,
-            total_q=planned_total_q,
         )
-
-        if kv_data_type is None:
-            kv_data_type = q_data_type
         _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
+        device, device_index = _resolve_cuda_device(device)
+        required_page_columns = _ceil_div(max_kv_len, page_size)
 
-        seq_lens_host = None
-        if not live_metadata:
-            seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
-            if any(seq_len <= 0 for seq_len in seq_lens_host):
-                raise ValueError(
-                    "every planned request must contain at least one KV token"
-                )
-        if (
-            mask_type == "causal"
-            and planned_q_lengths is not None
-            and seq_lens_host is not None
-        ):
-            for request_idx, (q_len, kv_len) in enumerate(
-                zip(planned_q_lengths, seq_lens_host, strict=True)
-            ):
-                if q_len > kv_len:
-                    raise ValueError(
-                        "causal MLA decode requires every per-request Q length "
-                        "to be no greater than its K/V length; request "
-                        f"{request_idx} has Q={q_len} and K/V={kv_len}"
-                    )
-        if max_kv_len is None:
-            assert seq_lens_host is not None
-            exact_max_kv_len = max(seq_lens_host)
-        else:
-            exact_max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
-            if seq_lens_host is not None:
-                metadata_max_kv_len = max(seq_lens_host)
-                if metadata_max_kv_len > exact_max_kv_len:
-                    raise ValueError(
-                        "planned KV metadata contains a request longer than "
-                        f"max_kv_len ({exact_max_kv_len}): got {metadata_max_kv_len}"
-                    )
-        exact_max_kv_len = _validate_mla_max_kv_len(exact_max_kv_len, "max_kv_len")
-        required_page_columns = _ceil_div(exact_max_kv_len, page_size)
-        if max_num_pages < required_page_columns:
-            raise ValueError(
-                "block_tables must have at least ceil(max_kv_len / page_size) "
-                f"columns ({required_page_columns}), got {max_num_pages}"
-            )
-
-        compiled, policy, workspace_size = _get_compiled_mla_decode(
+        spec_key = (
             device_index,
             batch_size,
             num_heads,
             kv_lora_rank,
             qk_rope_head_dim,
             page_size,
-            exact_max_kv_len,
+            max_kv_len,
             _dtype_key(q_data_type),
             _dtype_key(kv_data_type),
             _dtype_key(o_data_type),
             mask_type,
             max_seq_len_q,
-            packed_query,
         )
+        spec = _resolve_mla_decode_launch_spec(*spec_key)
         workspace_layout = _make_mla_workspace_layout(
-            workspace_size, batch_size, num_heads, max_seq_len_q
+            spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
         )
-        if workspace_buffer is None:
-            workspace_buffer = self._caller_workspace_buffer
         if workspace_buffer is None:
             workspace_buffer = torch.empty(
                 workspace_layout.total_bytes, device=device, dtype=torch.int8
@@ -1875,66 +1841,64 @@ class BatchMLADecodePagedTSWrapper:
                 device=device,
                 required_bytes=workspace_layout.total_bytes,
             )
-            _validate_tensor_does_not_overlap_inputs(
-                workspace_buffer,
-                "workspace_buffer",
-                ("block_tables", block_tables),
-                ("seq_lens", seq_lens),
-                ("qo_indptr", qo_indptr),
-            )
         workspace = _bind_mla_workspace(workspace_buffer, workspace_layout)
+        compiled, policy, kernel_workspace_bytes = _get_compiled_mla_decode(
+            *spec_key, packed_query
+        )
+        if (
+            kernel_workspace_bytes != spec.kernel_workspace_bytes
+            or policy != spec.policy
+        ):
+            raise RuntimeError("MLA workspace policy changed during compilation")
 
-        # Publish only after every validation, compilation, and allocation has
-        # succeeded, so a failed re-plan leaves the previous plan usable.
-        self._device = device
-        self._device_index = device_index
-        self._batch_size = batch_size
-        self._num_heads = num_heads
-        self._max_seq_len_q = max_seq_len_q
-        self._qo_indptr = qo_indptr
-        self._packed_query = packed_query
-        self._planned_total_q = planned_total_q
-        self._kv_lora_rank = kv_lora_rank
-        self._qk_rope_head_dim = qk_rope_head_dim
-        self._page_size = page_size
-        self._q_dtype = q_data_type
-        self._kv_dtype = kv_data_type
-        self._output_dtype = o_data_type
-        self._mask_type = mask_type
-        self._max_kv_len = exact_max_kv_len
-        self._required_page_columns = required_page_columns
-        self._block_tables = block_tables
-        self._seq_lens = seq_lens
-        self._live_metadata = live_metadata
-        self._workspace_buffer = workspace_buffer
-        self._workspace_layout = workspace_layout
-        self._workspace_views = workspace
-        self._workspace = workspace.kernel_workspace
-        self._lse = workspace.lse
-        self._compiled = compiled
-        self._policy = policy
-        self._split_kv = int(dict(policy)["split_kv"])
-        self._planned = True
+        # Publish only after validation, compilation, allocation, and binding
+        # succeed, so a failed re-plan leaves the previous plan usable.
+        self._plan_state = _MLADecodePlanState(
+            device=device,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            max_seq_len_q=max_seq_len_q,
+            packed_query=packed_query,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+            q_dtype=q_data_type,
+            kv_dtype=kv_data_type,
+            output_dtype=o_data_type,
+            mask_type=mask_type,
+            max_kv_len=max_kv_len,
+            required_page_columns=required_page_columns,
+            workspace_buffer=workspace_buffer,
+            workspace_layout=workspace_layout,
+            workspace_views=workspace,
+            compiled=compiled,
+            policy=policy,
+            split_kv=int(dict(policy)["split_kv"]),
+        )
 
     @flashinfer_api
     def run(
         self,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
         *,
-        block_tables: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
         qo_indptr: Optional[torch.Tensor] = None,
         bmm1_scale: float = 1.0,
         bmm2_scale: float = 1.0,
         out: Optional[torch.Tensor] = None,
+        validate: bool = True,
     ) -> torch.Tensor:
         """Launch the most recently planned MLA decode on the current stream.
 
-        In retained metadata mode, omit all three metadata arguments. In live
-        mode, each argument optionally replaces its plan-time default for this
-        run without changing the compiled plan. The caller must keep metadata
-        values within the static plan contract documented by :meth:`plan`.
+        ``block_tables`` and ``seq_lens`` are required live bindings.
+        ``qo_indptr`` is required by a packed-query plan and rejected by a
+        fixed-query plan. With validation enabled, tensor structure, metadata
+        values, scales, aliases, and every static capacity are checked before
+        launch. These checks synchronize metadata to the host. Set
+        ``validate=False`` only after validating representative inputs, and use
+        it for ``torch.compile`` or CUDA graph capture.
 
         Parameters
         ----------
@@ -1942,71 +1906,81 @@ class BatchMLADecodePagedTSWrapper:
             Runtime fixed or packed query tensor matching the plan.
         kv_cache : torch.Tensor
             Runtime compact paged latent K/V cache.
+        block_tables : torch.Tensor
+            Runtime physical-page table with one row per request.
+        seq_lens : torch.Tensor
+            Runtime K/V lengths with one element per request.
+        qo_indptr : torch.Tensor, optional
+            Runtime cumulative query offsets for a packed-query plan.
         bmm1_scale, bmm2_scale : float
             QK and value/output scaling factors.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
-        block_tables, seq_lens, qo_indptr : torch.Tensor, optional
-            Live metadata bindings for a live-metadata plan.
+        validate : bool
+            Enable explicit runtime validation. Defaults to ``True``.
         """
 
-        if not self._planned:
+        state = self._plan_state
+        if state is None:
             raise RuntimeError("plan() must be called before run()")
-        block_tables, seq_lens, qo_indptr = self._resolve_run_metadata(
-            block_tables, seq_lens, qo_indptr
-        )
-        if (
-            self._planned_total_q is not None
-            and int(query.shape[0]) != self._planned_total_q
-        ):
-            raise ValueError(
-                "packed query rows must match the final planned qo_indptr "
-                f"offset ({self._planned_total_q}), got {query.shape[0]}"
-            )
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
+        runtime_qo_indptr = qo_indptr if state.packed_query else None
         caller_provided_out = out is not None
         runtime = _prepare_mla_runtime(
             query,
             kv_cache,
-            device=self._device,
-            batch_size=self._batch_size,
-            num_heads=self._num_heads,
-            max_seq_len_q=self._max_seq_len_q,
-            qo_indptr=qo_indptr,
-            page_size=self._page_size,
-            q_dtype=self._q_dtype,
-            kv_dtype=self._kv_dtype,
-            output_dtype=self._output_dtype,
+            device=state.device,
+            batch_size=state.batch_size,
+            num_heads=state.num_heads,
+            max_seq_len_q=state.max_seq_len_q,
+            packed_query=state.packed_query,
+            qo_indptr=runtime_qo_indptr,
+            page_size=state.page_size,
+            q_dtype=state.q_dtype,
+            kv_dtype=state.kv_dtype,
+            output_dtype=state.output_dtype,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             out=out,
+            validate=validate,
         )
-        _validate_tensor_does_not_overlap_inputs(
-            self._workspace_buffer,
-            "workspace_buffer",
-            ("query", runtime.query),
-            ("kv_cache", runtime.normalized_cache),
-            ("block_tables", block_tables),
-            ("seq_lens", seq_lens),
-            ("qo_indptr", qo_indptr),
-            ("out", runtime.out),
-        )
-        if caller_provided_out:
-            _validate_mla_output_aliasing(
+        if validate:
+            _validate_mla_run_metadata(
+                state,
                 runtime,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                qo_indptr=qo_indptr,
-                workspace_buffer=self._workspace_buffer,
+                block_tables,
+                seq_lens,
+                qo_indptr,
             )
+            _validate_tensor_does_not_overlap_inputs(
+                state.workspace_buffer,
+                "workspace_buffer",
+                ("query", runtime.query),
+                ("kv_cache", runtime.normalized_cache),
+                ("block_tables", block_tables),
+                ("seq_lens", seq_lens),
+                ("qo_indptr", runtime_qo_indptr),
+                ("out", runtime.out),
+            )
+            if caller_provided_out:
+                _validate_mla_output_aliasing(
+                    runtime,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    qo_indptr=runtime_qo_indptr,
+                    workspace_buffer=state.workspace_buffer,
+                )
         return _launch_mla_decode(
             runtime,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            qo_indptr=qo_indptr,
-            kv_lora_rank=self._kv_lora_rank,
-            split_kv=self._split_kv,
-            workspace=self._workspace_views,
-            compiled=self._compiled,
+            qo_indptr=runtime_qo_indptr,
+            packed_query=state.packed_query,
+            kv_lora_rank=state.kv_lora_rank,
+            split_kv=state.split_kv,
+            workspace=state.workspace_views,
+            compiled=state.compiled,
         )
 
 
@@ -2078,19 +2052,31 @@ def batch_decode_mla_with_paged_kv_cache(
             batch_size=batch_size,
         )
         num_heads = int(query.shape[1])
-        if max_seq_len_q is None:
-            _validate_mla_int32_extent(
-                int(query.shape[0]) * num_heads,
-                "total_q * num_heads",
+        derived_max_seq_len_q, total_q, runtime_q_lengths = _derive_max_seq_len_q(
+            qo_indptr,
+            batch_size=batch_size,
+        )
+        if total_q != int(query.shape[0]):
+            raise ValueError(
+                "qo_indptr must end at the packed query row count "
+                f"({query.shape[0]}), got {total_q}"
             )
+        if max_seq_len_q is None:
+            max_seq_len_q = derived_max_seq_len_q
         else:
             max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")
-            _validate_mla_query_head_extent(
-                batch_size=batch_size,
-                num_heads=num_heads,
-                max_seq_len_q=max_seq_len_q,
-                total_q=int(query.shape[0]),
-            )
+            if derived_max_seq_len_q > max_seq_len_q:
+                raise ValueError(
+                    "qo_indptr contains a per-request Q length larger than "
+                    f"max_seq_len_q ({max_seq_len_q}): got "
+                    f"{derived_max_seq_len_q}"
+                )
+        _validate_mla_query_head_extent(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            max_seq_len_q=max_seq_len_q,
+            total_q=int(query.shape[0]),
+        )
     else:
         num_heads = int(query.shape[2])
         fixed_seq_len_q = int(query.shape[1])
@@ -2109,17 +2095,39 @@ def batch_decode_mla_with_paged_kv_cache(
             num_heads=num_heads,
             max_seq_len_q=max_seq_len_q,
         )
+        runtime_q_lengths = (max_seq_len_q,) * batch_size
+    seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
+    if any(seq_len <= 0 for seq_len in seq_lens_host):
+        raise ValueError("every runtime request must contain at least one KV token")
+    metadata_max_kv_len = max(seq_lens_host)
+    if max_kv_len is None:
+        max_kv_len = metadata_max_kv_len
+    else:
+        max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
+        if metadata_max_kv_len > max_kv_len:
+            raise ValueError(
+                "runtime KV metadata contains a request longer than "
+                f"max_kv_len ({max_kv_len}): got {metadata_max_kv_len}"
+            )
+    if mask_type == "causal":
+        for request_idx, (q_len, kv_len) in enumerate(
+            zip(runtime_q_lengths, seq_lens_host, strict=True)
+        ):
+            if q_len > kv_len:
+                raise ValueError(
+                    "causal MLA decode requires every per-request Q length "
+                    "to be no greater than its K/V length; request "
+                    f"{request_idx} has Q={q_len} and K/V={kv_len}"
+                )
+    assert max_seq_len_q is not None
+    assert max_kv_len is not None
     if out is not None:
         _validate_out(
             out,
             device=query.device,
             batch_size=batch_size,
             num_heads=num_heads,
-            max_seq_len_q=(
-                _validate_positive_int(max_seq_len_q, "max_seq_len_q")
-                if max_seq_len_q is not None
-                else int(query.shape[0])
-            ),
+            max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
             total_q=int(query.shape[0]) if packed_query else None,
             output_dtype=out_dtype,
@@ -2127,23 +2135,26 @@ def batch_decode_mla_with_paged_kv_cache(
 
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper.plan(
-        block_tables,
-        seq_lens,
+        query.device,
+        batch_size,
         num_heads,
         kv_lora_rank,
         qk_rope_head_dim,
         page_size,
-        qo_indptr=qo_indptr,
+        max_kv_len,
         max_seq_len_q=max_seq_len_q,
+        packed_query=packed_query,
         q_data_type=query.dtype,
         kv_data_type=normalized_cache.dtype,
         o_data_type=out_dtype,
         mask_type=mask_type,
-        max_kv_len=max_kv_len,
     )
     return wrapper.run(
         query,
         normalized_cache,
+        block_tables,
+        seq_lens,
+        qo_indptr=qo_indptr,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         out=out,
