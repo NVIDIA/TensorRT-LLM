@@ -76,12 +76,84 @@ def get_layer_attention_window(
     return sliding_window
 
 
+def _is_per_layer_config_attr(config, name: str) -> bool:
+    """Whether ``name`` may only be read from a per-layer config."""
+    return name in (getattr(config, "per_layer_attributes", None) or ())
+
+
+def read_layer_config_attr(config, layer_idx: int, name: str, default=None):
+    """Read ``name`` for one layer under either config schema.
+
+    transformers>=5.15 expresses layer-varying attributes through
+    ``per_layer_config`` and makes the flat read on the global config raise
+    ``AmbiguousGlobalPerLayerAttributeError``.  That exception derives from
+    ``RuntimeError``, so ``getattr(config, name, default)`` and
+    ``hasattr(config, name)`` propagate it instead of falling back -- the
+    schema must be inspected before reading.  Flat (pre-5.15) configs carry no
+    ``per_layer_config`` and are read directly.
+    """
+    if _is_per_layer_config_attr(config, name):
+        per_layer_config = getattr(config, "per_layer_config", None)
+        if per_layer_config is not None:
+            return getattr(per_layer_config[layer_idx], name, default)
+    return getattr(config, name, default)
+
+
+def get_gemma4_layer_head_dim(config, layer_idx: int) -> Optional[int]:
+    """Gemma4 ``head_dim`` for one layer, or ``None`` if undeterminable.
+
+    Gemma4 gives full-attention layers a wider head than sliding layers. The
+    flat schema spells the full-attention value ``global_head_dim``; the
+    per-layer schema folds it into ``per_layer_config[i].head_dim`` and drops
+    ``global_head_dim`` entirely, so both shapes must be handled.
+    """
+    head_dim = read_layer_config_attr(config, layer_idx, "head_dim")
+    if _is_per_layer_config_attr(config, "head_dim"):
+        return head_dim
+    layer_types = getattr(config, "layer_types", None)
+    if not layer_types or _is_sliding_attention_layer(layer_types[layer_idx]):
+        return head_dim
+    # Without a distinct full-attention head width the config is uniform.
+    global_head_dim = getattr(config, "global_head_dim", None)
+    return global_head_dim if isinstance(global_head_dim, int) else head_dim
+
+
+def get_gemma4_layer_head_dims(config) -> Optional[List[int]]:
+    """Per-layer Gemma4 ``head_dim`` values, or ``None`` if undeterminable."""
+    layer_types = getattr(config, "layer_types", None)
+    if not layer_types:
+        return None
+    head_dims = [
+        get_gemma4_layer_head_dim(config, layer_idx)
+        for layer_idx in range(len(layer_types))
+    ]
+    return head_dims if all(
+        isinstance(head_dim, int) for head_dim in head_dims) else None
+
+
+def get_gemma4_layer_num_kv_heads(config, layer_idx: int) -> Optional[int]:
+    """Gemma4 KV-head count for one layer, or ``None`` if undeterminable.
+
+    ``num_global_key_value_heads`` only applies to K=V (alternative attention)
+    full layers; every other layer keeps ``num_key_value_heads``. Under the
+    per-layer schema transformers has already folded that choice into
+    ``per_layer_config``, so the layer read is already the answer.
+    """
+    num_kv_heads = read_layer_config_attr(config, layer_idx,
+                                          "num_key_value_heads")
+    if _is_per_layer_config_attr(config, "num_key_value_heads"):
+        return num_kv_heads
+    layer_types = getattr(config, "layer_types", None)
+    if (not layer_types or _is_sliding_attention_layer(layer_types[layer_idx])
+            or not getattr(config, "attention_k_eq_v", False)):
+        return num_kv_heads
+    return getattr(config, "num_global_key_value_heads", None) or num_kv_heads
+
+
 def is_gemma4_hybrid(config):
     """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
-    global_head_dim = getattr(config, 'global_head_dim', None)
-    head_dim = getattr(config, 'head_dim', None)
-    return (global_head_dim is not None and isinstance(head_dim, int)
-            and global_head_dim != head_dim)
+    head_dims = get_gemma4_layer_head_dims(config)
+    return head_dims is not None and len(set(head_dims)) > 1
 
 
 def is_hybrid_linear(config):

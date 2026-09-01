@@ -45,6 +45,11 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_gemma4_layer_head_dims,
+    get_gemma4_layer_num_kv_heads,
+    is_gemma4_hybrid,
+)
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -201,6 +206,168 @@ class TestGemma4Config(unittest.TestCase):
         explicit = ["full_attention"] * 4
         cfg = Gemma4TextConfig(num_hidden_layers=4, layer_types=explicit)
         self.assertEqual(cfg.layer_types, explicit)
+
+
+class AmbiguousGlobalPerLayerAttributeError(RuntimeError):
+    """Local stand-in for the transformers>=5.15 exception (also a RuntimeError)."""
+
+
+class PerLayerSchemaConfig:
+    """A Gemma4 text config shaped like transformers>=5.15 emits it.
+
+    transformers>=5.15 pops ``global_head_dim``/``num_global_key_value_heads``
+    and re-expresses the full-attention layers through ``per_layer_config``.
+    After that, reading ``head_dim`` or ``num_key_value_heads`` off the global
+    config raises ``AmbiguousGlobalPerLayerAttributeError`` -- which subclasses
+    ``RuntimeError``, so ``getattr(cfg, name, default)`` and ``hasattr`` raise
+    too instead of falling back.
+
+    Reproduced locally rather than by installing a newer transformers so this
+    regression stays covered under the repo's own pin (requirements.txt).
+    """
+
+    _PER_LAYER_ATTRS = frozenset({"head_dim", "num_key_value_heads"})
+
+    def __init__(self, config_dict):
+        d = deepcopy(config_dict)
+        sliding_head_dim = d.pop("head_dim")
+        full_head_dim = d.pop("global_head_dim")
+        sliding_kv_heads = d.pop("num_key_value_heads")
+        num_global_kv_heads = d.pop("num_global_key_value_heads", None)
+        full_kv_heads = (
+            num_global_kv_heads
+            if (num_global_kv_heads and d.get("attention_k_eq_v", False))
+            else sliding_kv_heads
+        )
+        self._sliding_layer = SimpleNamespace(
+            head_dim=sliding_head_dim, num_key_value_heads=sliding_kv_heads
+        )
+        self._full_layer = SimpleNamespace(
+            head_dim=full_head_dim, num_key_value_heads=full_kv_heads
+        )
+        # Mirror a real config's *normalized* values (e.g. torch_dtype resolved
+        # from the "bfloat16" string), keeping only the per-layer attributes out.
+        reference = Gemma4TextConfig(**deepcopy(config_dict))
+        self.layer_types = list(reference.layer_types)
+        for key, value in d.items():
+            setattr(self, key, getattr(reference, key, value))
+
+    @property
+    def per_layer_attributes(self):
+        return self._PER_LAYER_ATTRS
+
+    @property
+    def per_layer_config(self):
+        return [
+            self._full_layer if layer_type == "full_attention" else self._sliding_layer
+            for layer_type in self.layer_types
+        ]
+
+    def __getattr__(self, key):
+        if key in PerLayerSchemaConfig._PER_LAYER_ATTRS:
+            raise AmbiguousGlobalPerLayerAttributeError(
+                f"'{key}' is a per-layer attribute and may vary across layers."
+            )
+        raise AttributeError(key)
+
+
+class TestGemma4PerLayerConfigSchema(unittest.TestCase):
+    """Gemma4 must read per-layer geometry under both config schemas.
+
+    transformers>=5.15 turns ``head_dim``/``num_key_value_heads`` into per-layer
+    attributes that raise when read flat off the global config. Every Gemma4
+    consumer has to go through the layer-aware accessors, and must derive the
+    same geometry it derives on the flat pre-5.15 schema.
+    """
+
+    def _flat_config(self, config_dict=GEMMA4_SMALL_CONFIG):
+        return Gemma4TextConfig(**deepcopy(config_dict))
+
+    def test_per_layer_schema_really_raises_on_flat_read(self):
+        """Guard the fixture: a flat read must raise, and defaults must not help."""
+        cfg = PerLayerSchemaConfig(GEMMA4_SMALL_CONFIG)
+        for name in ("head_dim", "num_key_value_heads"):
+            with self.assertRaises(AmbiguousGlobalPerLayerAttributeError):
+                getattr(cfg, name)
+            # RuntimeError, not AttributeError -> the default is never reached.
+            with self.assertRaises(AmbiguousGlobalPerLayerAttributeError):
+                getattr(cfg, name, 999)
+        # Non-per-layer attributes stay readable.
+        self.assertEqual(cfg.hidden_size, GEMMA4_SMALL_CONFIG["hidden_size"])
+
+    def test_head_dims_match_across_schemas(self):
+        flat_head_dims = get_gemma4_layer_head_dims(self._flat_config())
+        per_layer_head_dims = get_gemma4_layer_head_dims(PerLayerSchemaConfig(GEMMA4_SMALL_CONFIG))
+        expected = [
+            GEMMA4_SMALL_CONFIG["global_head_dim"]
+            if layer_type == "full_attention"
+            else GEMMA4_SMALL_CONFIG["head_dim"]
+            for layer_type in self._flat_config().layer_types
+        ]
+        self.assertEqual(flat_head_dims, expected)
+        self.assertEqual(per_layer_head_dims, expected)
+
+    def test_num_kv_heads_match_across_schemas(self):
+        flat = self._flat_config()
+        per_layer = PerLayerSchemaConfig(GEMMA4_SMALL_CONFIG)
+        expected = [
+            GEMMA4_SMALL_CONFIG["num_global_key_value_heads"]
+            if layer_type == "full_attention"
+            else GEMMA4_SMALL_CONFIG["num_key_value_heads"]
+            for layer_type in flat.layer_types
+        ]
+        for layer_idx, want in enumerate(expected):
+            self.assertEqual(get_gemma4_layer_num_kv_heads(flat, layer_idx), want)
+            self.assertEqual(get_gemma4_layer_num_kv_heads(per_layer, layer_idx), want)
+
+    def test_is_gemma4_hybrid_true_on_both_schemas(self):
+        """A False here would silently drop VSWA per-layer KV pool grouping."""
+        self.assertTrue(is_gemma4_hybrid(self._flat_config()))
+        self.assertTrue(is_gemma4_hybrid(PerLayerSchemaConfig(GEMMA4_SMALL_CONFIG)))
+
+    def test_uniform_head_dim_is_not_hybrid_on_both_schemas(self):
+        uniform = deepcopy(GEMMA4_SMALL_CONFIG)
+        uniform["global_head_dim"] = uniform["head_dim"]
+        uniform["num_global_key_value_heads"] = uniform["num_key_value_heads"]
+        self.assertFalse(is_gemma4_hybrid(self._flat_config(uniform)))
+        self.assertFalse(is_gemma4_hybrid(PerLayerSchemaConfig(uniform)))
+
+    def test_attention_builds_on_per_layer_schema(self):
+        """Gemma4Attention must construct and pick up the per-layer head_dim."""
+        per_layer = PerLayerSchemaConfig(GEMMA4_SMALL_CONFIG)
+        model_config = ModelConfig(
+            pretrained_config=per_layer,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        )
+        for layer_idx, layer_type in enumerate(per_layer.layer_types):
+            is_sliding = layer_type == "sliding_attention"
+            with self.subTest(layer_idx=layer_idx, layer_type=layer_type):
+                attn = Gemma4Attention(model_config, layer_idx=layer_idx, is_sliding=is_sliding)
+                if is_sliding:
+                    self.assertEqual(attn.head_dim, GEMMA4_SMALL_CONFIG["head_dim"])
+                    self.assertEqual(
+                        attn.num_key_value_heads,
+                        GEMMA4_SMALL_CONFIG["num_key_value_heads"],
+                    )
+                else:
+                    self.assertEqual(attn.head_dim, GEMMA4_SMALL_CONFIG["global_head_dim"])
+                    self.assertEqual(
+                        attn.num_key_value_heads,
+                        GEMMA4_SMALL_CONFIG["num_global_key_value_heads"],
+                    )
+                # q/k/v norms are sized off the resolved per-layer head_dim.
+                self.assertEqual(attn.q_norm.weight.shape[0], attn.head_dim)
+                self.assertEqual(attn.k_norm.weight.shape[0], attn.head_dim)
+
+    def test_attention_does_not_mutate_the_config(self):
+        """The old fix overrode config.head_dim in place; nothing may do that now."""
+        flat = self._flat_config()
+        model_config = ModelConfig(
+            pretrained_config=flat, mapping=Mapping(world_size=1, tp_size=1, rank=0)
+        )
+        Gemma4Attention(model_config, layer_idx=5, is_sliding=False)
+        self.assertEqual(flat.head_dim, GEMMA4_SMALL_CONFIG["head_dim"])
+        self.assertEqual(flat.global_head_dim, GEMMA4_SMALL_CONFIG["global_head_dim"])
 
 
 class TestGemma4ModelInstantiation(unittest.TestCase):

@@ -30,6 +30,10 @@ from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_gemma4_layer_head_dim,
+    get_gemma4_layer_num_kv_heads,
+)
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
@@ -238,22 +242,13 @@ class Gemma4Attention(QKNormRoPEAttention):
             and is_sm_100f()
         )
 
-        # Per-layer head_dim and kv heads
-        # Note: num_global_key_value_heads is only used when K=V (alternative
-        # attention). For non-K=V full layers, use regular num_key_value_heads.
+        # Per-layer head_dim and kv heads.  Both are per-layer attributes that
+        # transformers>=5.15 only exposes through ``per_layer_config``, so they
+        # must be read via the schema-agnostic helpers rather than flat off the
+        # global config.
         use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
-        if is_sliding:
-            layer_head_dim = config.head_dim
-            layer_num_kv_heads = config.num_key_value_heads
-        else:
-            layer_head_dim = getattr(config, "global_head_dim", config.head_dim)
-            if use_k_eq_v:
-                layer_num_kv_heads = (
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
-                )
-            else:
-                layer_num_kv_heads = config.num_key_value_heads
+        layer_head_dim = get_gemma4_layer_head_dim(config, layer_idx)
+        layer_num_kv_heads = get_gemma4_layer_num_kv_heads(config, layer_idx)
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
@@ -296,15 +291,11 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         self.use_k_eq_v = use_k_eq_v
 
-        # Temporarily override config.head_dim so the Attention base class
-        # picks up the correct per-layer head_dim.
-        original_head_dim = config.head_dim
-        config.head_dim = layer_head_dim
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=layer_num_kv_heads,
+            head_dim=layer_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
@@ -320,9 +311,6 @@ class Gemma4Attention(QKNormRoPEAttention):
             # pairing with only the logical rotary dimension.
             rope_fusion=is_sliding and not self._use_trtllm_fused_qkv_prep,
         )
-
-        # Restore original config head_dim
-        config.head_dim = original_head_dim
 
         # Fix proportional RoPE for full-attention layers.
         #
