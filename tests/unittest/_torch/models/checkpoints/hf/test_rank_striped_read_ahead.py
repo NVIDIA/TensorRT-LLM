@@ -224,7 +224,7 @@ def test_mpi_disabled_distributed_fallback_preserves_native_prefetch(
     monkeypatch.setattr(loader, "_load_weights_native", native_load)
     monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
 
-    with loader.open_weight_session("/unused", mapping=Mapping(world_size=2)) as weights:
+    with loader.open_weight_session("/unused", mapping=Mapping(world_size=2, tp_size=2)) as weights:
         assert weights is native_weights
 
     native_load.assert_called_once()
@@ -256,7 +256,7 @@ def test_collective_native_fallback_failure_escapes_without_cleanup(
     with pytest.raises(OSError, match="rank-local prefetch failure"):
         loader._fallback_to_native(
             "/unused",
-            Mapping(world_size=2),
+            Mapping(world_size=2, tp_size=2),
             False,
             "runtime fallback",
             active_communicator,
