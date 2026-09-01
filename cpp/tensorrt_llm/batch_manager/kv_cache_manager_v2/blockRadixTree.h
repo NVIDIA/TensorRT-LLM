@@ -409,7 +409,7 @@ public:
     }
 
     // Propose removal of an empty root block. Deferred to avoid destroying
-    // objects during destructor chains. Drained at safe points (addOrGetExisting, match).
+    // objects during destructor chains. Drained by addOrGetExisting() and clear() only.
     void proposeToEraseEmptyRoot(BlockKey const& key)
     {
         mPendingRootErases.push_back(key);
