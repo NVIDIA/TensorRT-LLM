@@ -419,3 +419,31 @@ def test_kv_splits_rejects_unsupported_value():
     with pytest.raises(ValueError):
         SolAttnAttentionConfig(tau=2.0, kv_splits="4")
     assert SolAttnAttentionConfig(tau=2.0).kv_splits == "auto"
+
+
+def _is_dynamo_disabled(fn) -> bool:
+    """True if `fn` is wrapped by torch.compiler.disable / torch._dynamo.disable."""
+    target = getattr(fn, "__func__", fn)
+    return bool(getattr(target, "_torchdynamo_disable", False))
+
+
+def test_kernel_launch_is_opaque_to_dynamo():
+    """The CuTe DSL launch boundary must be @torch.compiler.disable'd.
+
+    Without it Dynamo traces into the CuTe DSL JIT builder and retraces on every
+    call: 69x slower on B200 (denoise 2496.9 s vs 36.2 s), and silent -- it looks
+    like torch.compile simply not paying off.
+    """
+    assert _is_dynamo_disabled(_backend_mod()._run_sol_attn_bthd), (
+        "_run_sol_attn_bthd must be decorated with @torch.compiler.disable"
+    )
+
+
+def test_timestep_scalar_read_is_opaque_to_dynamo():
+    """The dense-prefix `.item()` must stay in eager.
+
+    Otherwise it graph-breaks the enclosing block once per attention layer.
+    """
+    assert _is_dynamo_disabled(SolAttnAttention._dense_by_step), (
+        "SolAttnAttention._dense_by_step must be decorated with @torch.compiler.disable"
+    )

@@ -149,6 +149,32 @@ class SolAttnAttention(AttentionBackend):
         self.disabled_until_timestep = getattr(cfg, "disabled_until_timestep", None)
         self.dense_layers = _parse_dense_layers(getattr(cfg, "dense_layers", None))
 
+    # The `.item()` in here would graph-break the enclosing block once per
+    # attention layer, so keep it in eager (as cute_dsl/fmha.py and VSA's
+    # `_get_vsa_inputs` do). Returns a host-side bool, so the dense and sparse
+    # phases still compile as separate graphs -- they run different kernels.
+    @torch.compiler.disable
+    def _dense_by_step(self, timestep) -> bool:
+        phase = sol_attn_graph_phase(
+            timestep,
+            disabled_until_timestep=self.disabled_until_timestep,
+        )
+        if phase is None:
+            # Fail open, matching the CuTeDSL skip-softmax path: without a
+            # timestep we cannot tell which phase we are in, so run the
+            # sparse kernel rather than silently forcing dense forever.
+            # This degrades quality rather than raising, so say so once.
+            logger.warning_once(
+                "SolAttnAttentionConfig.disabled_until_timestep="
+                f"{self.disabled_until_timestep} is set, but no `timestep` reached "
+                "the Sol-Attn forward call. The dense prefix it requests will not "
+                "be applied. Ensure the pipeline passes a normalized timestep, or "
+                "unset disabled_until_timestep.",
+                key="sol_attn_missing_timestep",
+            )
+            return False
+        return phase == 0
+
     def forward(
         self,
         q: torch.Tensor,
@@ -160,25 +186,7 @@ class SolAttnAttention(AttentionBackend):
         dense_by_layer = self.layer_idx in self.dense_layers
         dense_by_step = False
         if self.disabled_until_timestep is not None:
-            phase = sol_attn_graph_phase(
-                kwargs.get("timestep"),
-                disabled_until_timestep=self.disabled_until_timestep,
-            )
-            if phase is None:
-                # Fail open, matching the CuTeDSL skip-softmax path: without a
-                # timestep we cannot tell which phase we are in, so run the
-                # sparse kernel rather than silently forcing dense forever.
-                # This degrades quality rather than raising, so say so once.
-                logger.warning_once(
-                    "SolAttnAttentionConfig.disabled_until_timestep="
-                    f"{self.disabled_until_timestep} is set, but no `timestep` reached "
-                    "the Sol-Attn forward call. The dense prefix it requests will not "
-                    "be applied. Ensure the pipeline passes a normalized timestep, or "
-                    "unset disabled_until_timestep.",
-                    key="sol_attn_missing_timestep",
-                )
-            else:
-                dense_by_step = phase == 0
+            dense_by_step = self._dense_by_step(kwargs.get("timestep"))
         if dense_by_layer or dense_by_step:
             return torch.nn.functional.scaled_dot_product_attention(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
