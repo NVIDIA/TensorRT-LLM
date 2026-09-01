@@ -36,13 +36,13 @@ import sys
 from open_search_db import OpenSearchDB
 
 
-def queryJobEvents(commitID="", onlySuccess=True, stageNamePattern=""):
+def queryJobEvents(commitID="", stageNamePattern="", onlySuccess=True):
     """Query OpenSearch database for job events with pagination.
 
     Args:
         commitID: Git commit SHA to filter by (optional)
-        onlySuccess: If True, only return PASSED tests (default: True)
         stageNamePattern: Non-empty regular-expression stage-name pattern to filter by
+        onlySuccess: If True, only return PASSED tests (default: True)
 
     Returns:
         List of all matching test result records

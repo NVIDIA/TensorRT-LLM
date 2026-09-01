@@ -2835,10 +2835,6 @@ String getTestReuseStagePattern(String stageName) {
     return "${stageNamePrefix}-[0-9]+(-cbts)?"
 }
 
-boolean shouldReuseStage(String stageName, List reuseStageList) {
-    return stageName in reuseStageList
-}
-
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -2887,10 +2883,10 @@ def CBTS_RESULT = "cbts_result"
 // Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
 @Field
 def CBTS_COVERAGE = "cbts_coverage"
-// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
-// Their individual passed testcases may still be reused through an OpenSearch query.
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
@@ -6800,7 +6796,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         stageInfraScope[key] = stageOpts.slurmDispatcher ? InfraFailure.SLURM : InfraFailure.K8S
         [key, {
         stage(key) {
-            if (shouldReuseStage(key, testFilter[REUSE_STAGE_LIST])) {
+            if (key in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
                 }
