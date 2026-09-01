@@ -66,8 +66,12 @@ def _make_minimal_nano_model_config():
 
 @pytest.mark.cpu_only
 def test_nemotron_nano_registers_native_multimodal_epd_components():
-    """Native Nano VL/Omni classes advertise MM EPD support."""
-    for arch in ("NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"):
+    """Every arch served by the native Nano VL class advertises MM EPD support."""
+    for arch in (
+        "NemotronH_Nano_VL_V2",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
+    ):
         vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
         assert vision_encoder_cls is NanoV2VLMultimodalEncoder
         assert vlm_base_model is None

@@ -1352,6 +1352,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
