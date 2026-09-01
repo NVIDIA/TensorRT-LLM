@@ -141,6 +141,8 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             max_seq_len=8192,
             **pytorch_config,
         ) as llm:
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
+            assert llm.args.kv_cache_config.enable_block_reuse is True
             assert llm.args.disable_overlap_scheduler is False
             assert llm.args.cuda_graph_config is not None
             assert llm.args.cuda_graph_config.enable_padding is True
@@ -148,7 +150,40 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.timeout(7200)
+    @skip_pre_blackwell
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_dep(self, tp_size, ep_size):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=1),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=True,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
+        ) as llm:
+            assert llm.args.enable_attention_dp is True
+            assert llm.args.kv_cache_config.enable_block_reuse is True
+            assert llm.args.disable_overlap_scheduler is False
+            assert llm.args.cuda_graph_config is not None
+            assert llm.args.cuda_graph_config.enable_padding is True
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @skip_ray
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -198,8 +233,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 use_tqdm=False,
             )
             stats_entries = llm.get_stats(timeout=10)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
         assert isinstance(outputs, list)
         assert len(outputs) == num_ranks
@@ -276,86 +309,65 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            self._assert_mtp_acceptance_rate(llm)
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    def test_mtp_index_share_mtp_ar(self, tp_size, ep_size):
-        # Acceptance-rate guard for max_draft_len=3 + index-share.
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
-            speculative_config=MTPDecodingConfig(max_draft_len=3),
-            enable_chunked_prefill=True,
+    @staticmethod
+    def _assert_mtp_acceptance_rate(llm: LLM) -> None:
+        raw_prompts = [
+            "The capital of France is",
+            "The president of the United States is",
+            "The future of AI is",
+        ]
+        prompts = [
+            llm.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for prompt in raw_prompts
+        ]
+        token_ids = [llm.tokenizer.encode(prompt) for prompt in prompts]
+        sampling_params = SamplingParams(
+            max_tokens=128,
+            temperature=0,
+            end_id=-1,
+            return_perf_metrics=True,
+        )
+        outputs = llm.generate(
+            token_ids,
+            sampling_params=sampling_params,
+            use_tqdm=False,
         )
 
-        with LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=ep_size,
-            kv_cache_config=kv_cache_config,
-            max_seq_len=8192,
-            **pytorch_config,
-        ) as llm:
-            raw_prompts = [
-                "The capital of France is",
-                "The president of the United States is",
-                "The future of AI is",
-            ]
-            prompts = [
-                llm.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                for p in raw_prompts
-            ]
-            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
-            sampling_params = SamplingParams(
-                max_tokens=128,
-                temperature=0,
-                end_id=-1,
-                return_perf_metrics=True,
-            )
-            outputs = llm.generate(
-                tok_ids,
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
-
-            total_drafted = 0
-            total_accepted = 0
-            assert isinstance(outputs, list)
-            assert len(outputs) == len(tok_ids)
-            for i, output in enumerate(outputs):
-                request_perf_metrics = output.outputs[0].request_perf_metrics
-                assert request_perf_metrics is not None
-                speculative_metrics = request_perf_metrics.speculative_decoding
-                assert speculative_metrics is not None
-                num_drafted = int(speculative_metrics.total_draft_tokens)
-                num_accepted = int(speculative_metrics.total_accepted_draft_tokens)
-                assert num_drafted > 0
-                accept_rate = num_accepted / num_drafted
-                total_drafted += num_drafted
-                total_accepted += num_accepted
-                print(
-                    f"GLM-5.2 MTP index-share prompt {i} acceptance rate: "
-                    f"{accept_rate:.2%} ({num_accepted}/{num_drafted} tokens)"
-                )
-
-            aggregate_accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+        total_drafted = 0
+        total_accepted = 0
+        assert isinstance(outputs, list)
+        assert len(outputs) == len(token_ids)
+        for i, output in enumerate(outputs):
+            request_perf_metrics = output.outputs[0].request_perf_metrics
+            assert request_perf_metrics is not None
+            speculative_metrics = request_perf_metrics.speculative_decoding
+            assert speculative_metrics is not None
+            num_drafted = int(speculative_metrics.total_draft_tokens)
+            num_accepted = int(speculative_metrics.total_accepted_draft_tokens)
+            assert num_drafted > 0
+            accept_rate = num_accepted / num_drafted
+            total_drafted += num_drafted
+            total_accepted += num_accepted
             print(
-                "GLM-5.2 MTP index-share aggregate acceptance rate: "
-                f"{aggregate_accept_rate:.2%} ({total_accepted}/"
-                f"{total_drafted} tokens across {len(tok_ids)} prompts)"
+                f"GLM-5.2 MTP index-share prompt {i} acceptance rate: "
+                f"{accept_rate:.2%} ({num_accepted}/{num_drafted} tokens)"
             )
-            assert aggregate_accept_rate > 0.2, (
-                f"Aggregate acceptance rate {aggregate_accept_rate:.2%} below threshold 20%"
-            )
+
+        aggregate_accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+        print(
+            "GLM-5.2 MTP index-share aggregate acceptance rate: "
+            f"{aggregate_accept_rate:.2%} ({total_accepted}/"
+            f"{total_drafted} tokens across {len(token_ids)} prompts)"
+        )
+        assert aggregate_accept_rate > 0.2, (
+            f"Aggregate acceptance rate {aggregate_accept_rate:.2%} below threshold 20%"
+        )
 
     @skip_pre_blackwell
     @skip_ray
