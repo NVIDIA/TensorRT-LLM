@@ -80,6 +80,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         # which would charge the pick against KV-cache-aware load accounting.
         self._count_tokens_rr_counter = 0
         self._warm_ctx_enabled = config.warm_ctx_from_gen
+        self._warm_tasks: set = set()
 
         match self._config.schedule_style:
             case "generation_first":
@@ -211,6 +212,11 @@ class OpenAIDisaggregatedService(OpenAIService):
             return list(prompt)
         return []
 
+    def _spawn_warm_task(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._warm_tasks.add(task)
+        task.add_done_callback(self._warm_tasks.discard)
+
     async def _warm_ctx(
         self,
         ctx_server: Optional[str],
@@ -283,7 +289,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             body = b"".join(c for c in seen if isinstance(c, bytes)).decode(
                 "utf-8", errors="ignore"
             )
-            asyncio.create_task(
+            self._spawn_warm_task(
                 self._warm_ctx(
                     ctx_server,
                     gen_server,
@@ -367,7 +373,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 return self._warming_stream(
                     gen_response, ctx_server, gen_server, gen_req, disagg_request_id
                 )
-            asyncio.create_task(
+            self._spawn_warm_task(
                 self._warm_ctx(
                     ctx_server,
                     gen_server,
