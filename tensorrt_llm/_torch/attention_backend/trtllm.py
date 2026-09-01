@@ -986,7 +986,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._invalidate_mla_scheduler_buffers()
         if getattr(self, '_fp4_mla_device_page_table', False):
             self._fp4_mla_device_page_table_valid = False
-        self._update_fp4_mla_append_metadata()
+        if getattr(self, 'high_precision_kv_pool', None) is not None:
+            self._update_fp4_mla_append_metadata()
 
     def _update_fp4_mla_append_metadata(self) -> None:
         if self.high_precision_kv_pool is not None and self.num_tokens > 0:
@@ -1001,7 +1002,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
-        if self.high_precision_kv_pool is None:
+        if getattr(self, 'high_precision_kv_pool', None) is None:
             return
 
         num_seqs = self.num_seqs
@@ -1028,7 +1029,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # positions/kv lens -> corrupted KV writes and illegal memory access
         # in the RoPE table lookup).
         super().restore_from_spec_dec()
-        if self.high_precision_kv_pool is None:
+        if getattr(self, 'high_precision_kv_pool', None) is None:
             return
         num_seqs = self.num_seqs
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:num_seqs]
