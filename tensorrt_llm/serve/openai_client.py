@@ -505,7 +505,8 @@ class OpenAIHttpClient(OpenAIClient):
         except Exception as e:
             logger.warning(f"Cannot read data_transceiver_state from {server}: {e}")
 
-        self._data_transceiver_states[server] = state
+        if state is not None:
+            self._data_transceiver_states[server] = state
         return state
 
     def forget_data_transceiver_state(self, server: str) -> None:

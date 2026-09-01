@@ -1159,7 +1159,8 @@ def test_warm_ctx_from_gen(model, generation_overlap):
         for _ in range(2)
     ]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
+        for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -1224,14 +1225,17 @@ def test_warm_ctx_from_gen(model, generation_overlap):
                 opaque_state=state,
                 first_gen_tokens=[0],
                 disagg_request_id=4242,
+                transfer_only=True,
             )
             requests = [(full_ids, SamplingParams(max_tokens=1,
                                                   ignore_eos=True), warm_params)
                         ]
             responses = send_requests_to_worker(requests, 1, intercomm)
             assert len(responses) == 1
-            assert len(responses[0][0].token_ids) > 0, (
-                f"Warming request failed instead of pulling KV: {responses[0]}")
+            warm_tokens = responses[0][0].token_ids or []
+            assert len(warm_tokens) == 0, (
+                f"transfer_only request decoded {len(warm_tokens)} tokens. Should have decoded 0 tokens."
+            )
 
             # 4. Next turn on worker 1: turn 1 plus a new user message, as token ids so the
             #    prefix stays byte-identical to what worker 0 served.

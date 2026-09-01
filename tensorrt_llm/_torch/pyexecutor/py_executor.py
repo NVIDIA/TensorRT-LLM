@@ -7472,6 +7472,11 @@ class PyExecutor:
 
         if len(transfer_only_requests) > 0:
             self._finish_transfer_only_requests(transfer_only_requests)
+            done = {id(req) for req in transfer_only_requests}
+            scheduled_batch.generation_requests = [
+                req for req in scheduled_batch.generation_requests
+                if id(req) not in done
+            ]
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
