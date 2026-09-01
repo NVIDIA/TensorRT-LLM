@@ -32,6 +32,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 
@@ -436,6 +437,7 @@ def test_flashinfer_context_fallback_scope(
     if is_fused_qkv:
         input_hidden_size += 2 * attn.num_kv_heads * attn.head_dim
     q = torch.empty((num_contexts, input_hidden_size), dtype=dtype)
+    kv_cache_dtype = DataType.BF16 if dtype == torch.bfloat16 else DataType.HALF
     metadata = SimpleNamespace(
         num_contexts=num_contexts,
         helix_position_offsets=None,
@@ -443,7 +445,7 @@ def test_flashinfer_context_fallback_scope(
         use_spec_decoding=False,
         is_spec_dec_tree=False,
         kv_cache_block_offsets=object(),
-        kv_cache_manager=None,
+        kv_cache_manager=SimpleNamespace(dtype=kv_cache_dtype),
         is_cross=False,
         is_spec_decoding_enabled=False,
         tokens_per_block=tokens_per_block,
@@ -1155,3 +1157,66 @@ def test_create_fmha_libs_invalidates_fmha_cache() -> None:
         ("support", "old", None),
         ("support", "new", None),
     ]
+
+
+@pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize(
+    "dtype,sm_version",
+    [(torch.bfloat16, 100), (torch.float16, 103)],
+    ids=["small_bf16_batch", "sm103_fp16"],
+)
+def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: DataType,
+    dtype: torch.dtype,
+    sm_version: int,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        lambda: sm_version,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.kv_factor = 2
+    attn = SimpleNamespace(
+        is_mla_enable=False,
+        sparse_params=None,
+        position_embedding_type=0,
+        head_dim=256,
+        num_heads=32,
+        num_kv_heads=2,
+    )
+    q_hidden_size = attn.num_heads * attn.head_dim
+    qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
+    q = torch.empty((1, qkv_hidden_size), dtype=dtype)
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=SimpleNamespace(dtype=kv_cache_dtype),
+        is_cross=False,
+        is_spec_decoding_enabled=False,
+        tokens_per_block=64,
+        beam_width=1,
+    )
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((1, q_hidden_size), dtype=dtype),
+        attention_input_type=AttentionInputType.context_only,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+    )
+
+    supported, reason = fmha._is_supported_with_reason(
+        q,
+        None,
+        None,
+        attn,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.CONTEXT,
+    )
+
+    assert supported, reason
+    assert reason == ""
