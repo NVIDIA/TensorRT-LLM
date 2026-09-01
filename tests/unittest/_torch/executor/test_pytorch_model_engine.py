@@ -21,6 +21,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, EncoderCUDAGraphRunner, KeyType,
     _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
+    setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -1511,18 +1513,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         for max_tokens_per_item, expected_max_seq_len in cases:
             with self.subTest(max_tokens_per_item=max_tokens_per_item):
                 encoder = CapturingEncoder()
-                model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-                model_engine.model = torch.nn.Sequential(encoder)
-                model_engine.encoder_max_num_tokens = encoder_max_num_tokens
-                model_engine.mm_encoder_attention_metadata_capacity = None
                 if max_tokens_per_item is None:
-                    model_engine.input_processor = Mock()
+                    input_processor = Mock()
                 else:
-                    model_engine.input_processor = Mock(
+                    input_processor = Mock(
                         spec=BaseMultimodalDummyInputsBuilder)
-                    model_engine.input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+                    input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
 
-                model_engine._set_up_multimodal_encoder_attn_metadata()
+                setup_mm_encoder_attn_metadata(torch.nn.Sequential(encoder),
+                                               input_processor,
+                                               encoder_max_num_tokens, None)
 
                 self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
