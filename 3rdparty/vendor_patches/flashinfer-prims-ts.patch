@@ -1,5 +1,5 @@
 diff --git a/block_sparse.py b/block_sparse.py
-index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8f21e7e0e 100644
+index 77a9fc4542ab5fb82aa0df6f7c73e56b7d5fbe89..b415eee42a4487f4be165863f83edddde7c9355f 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -7,19 +7,31 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -32,10 +33,6 @@ from typing import Literal
+@@ -35,13 +36,6 @@ from typing import Literal
  import torch
  
  from flashinfer.api_logging import flashinfer_api
 -from flashinfer.trace.templates.attention import (
 -    prims_ts_block_sparse_trace,
+-    prims_ts_block_sparse_wrapper_trace_dispatch,
 -    prims_ts_paged_block_sparse_trace_dispatch,
+-    prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 -)
+-
+ from ._block_sparse.config import _validate_block_sparse_static_profile
+ from ._block_sparse.inspection import (
+     _inspect_block_sparse_bsr,
+@@ -220,7 +214,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+         # previously published revision intact and runnable.
+         self._plan_state = candidate
  
- from ._block_sparse.config import (
-     _BlockSparseStaticProfile,
-@@ -335,7 +332,7 @@ def _inspect_one_shot_block_sparse_routes(
-     )
+-    @flashinfer_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         q: torch.Tensor,
+@@ -302,7 +296,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+         return self._launch_validated_run(state, run_args, run_stream)
  
  
 -@flashinfer_api(trace=prims_ts_block_sparse_trace)
@@ -27,7 +39,16 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8
  def block_sparse_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -668,7 +665,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -512,7 +506,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+             )
+         self._plan_state = candidate
+ 
+-    @flashinfer_api(trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         q: torch.Tensor,
+@@ -618,7 +612,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
