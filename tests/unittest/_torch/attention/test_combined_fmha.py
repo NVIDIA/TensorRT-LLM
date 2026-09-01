@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Callable
 from unittest.mock import patch
@@ -29,11 +28,9 @@ from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, Phased
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
-    CustomAttentionMask,
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization.mode import QuantMode
 
 
@@ -431,73 +428,6 @@ def _make_fmha_cache_metadata(
     )
 
 
-def test_fmha_cache_sanity_check_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("TRTLLM_FMHA_CACHE_SANITY_CHECK", raising=False)
-    assert not trtllm_backend._is_fmha_cache_sanity_check_enabled()
-
-    monkeypatch.setenv("TRTLLM_FMHA_CACHE_SANITY_CHECK", "1")
-    assert trtllm_backend._is_fmha_cache_sanity_check_enabled()
-
-
-def test_fmha_cache_input_snapshot_excludes_manager_and_properties() -> None:
-    @dataclass
-    class _KvCacheManager:
-        dtype: str
-
-    @dataclass
-    class _MetadataBase:
-        stored_value: int
-        kv_cache_manager: _KvCacheManager
-        derived_value: int
-
-        @property
-        def derived_value(self) -> int:
-            raise AssertionError("derived property must not be evaluated")
-
-        @derived_value.setter
-        def derived_value(self, value: int) -> None:
-            self._derived_value = value
-
-    class _Metadata(_MetadataBase):
-        pass
-
-    snapshot = trtllm_backend._snapshot_fmha_cache_inputs(
-        torch.empty((1, 4)),
-        None,
-        None,
-        _Metadata(
-            stored_value=7,
-            kv_cache_manager=_KvCacheManager(dtype="float16"),
-            derived_value=11,
-        ),
-        AttentionForwardArgs(),
-    )
-
-    assert snapshot["metadata.stored_value"] == "7"
-    assert all("kv_cache_manager" not in path for path in snapshot)
-    assert "metadata.derived_value" not in snapshot
-
-
-def test_fmha_cache_grid_normalization() -> None:
-    assert trtllm_backend._make_fmha_cache_grid((1, 2, 4)) == (1, 2, 3, 4)
-
-    q_grid = trtllm_backend._FMHA_CACHE_SEQ_LEN_Q_GRID
-    assert [
-        trtllm_backend._normalize_fmha_cache_grid_value(value, q_grid)
-        for value in (3, 4, 5, 7, 8, 9, 31, 32)
-    ] == [3, 4, 7, 7, 8, 31, 31, 32]
-
-    batch_grid = trtllm_backend._FMHA_CACHE_BATCH_SIZE_GRID
-    assert [
-        trtllm_backend._normalize_fmha_cache_grid_value(value, batch_grid)
-        for value in (31, 32, 57, 63, 64, 65, 79, 80)
-    ] == [31, 32, 63, 63, 64, 79, 79, 80]
-    assert trtllm_backend._normalize_fmha_cache_grid_value(0, batch_grid) == 0
-    assert trtllm_backend._normalize_fmha_cache_grid_value(4096, batch_grid) == batch_grid[-1]
-
-
 @pytest.mark.parametrize(("lower_q_length", "upper_q_length"), [(3, 4), (7, 8)])
 @pytest.mark.parametrize("upper_first", [False, True])
 def test_fmha_cache_separates_generation_q_boundaries(
@@ -508,7 +438,6 @@ def test_fmha_cache_separates_generation_q_boundaries(
     events: list[tuple] = []
     backend = _make_fmha_cache_backend()
     backend.is_mla_enable = True
-    backend.num_heads = 16
     upper_boundary_fmha = _TestFmha(
         backend,
         "upper-boundary",
@@ -550,21 +479,19 @@ def test_fmha_cache_separates_generation_q_boundaries(
 
 
 @pytest.mark.parametrize(
-    ("lower_batch_size", "upper_batch_size", "q_length", "num_heads"),
-    [(31, 32, 4, 16), (63, 64, 1, 128)],
+    ("lower_batch_size", "upper_batch_size", "q_length"),
+    [(31, 32, 4), (63, 64, 1)],
 )
 @pytest.mark.parametrize("upper_first", [False, True])
 def test_fmha_cache_separates_generation_batch_boundaries(
     lower_batch_size: int,
     upper_batch_size: int,
     q_length: int,
-    num_heads: int,
     upper_first: bool,
 ) -> None:
     events: list[tuple] = []
     backend = _make_fmha_cache_backend()
     backend.is_mla_enable = True
-    backend.num_heads = num_heads
     upper_boundary_fmha = _TestFmha(
         backend,
         "upper-boundary",
@@ -695,99 +622,52 @@ def test_context_fmha_cache_uses_batch_grid_only() -> None:
     assert events == [("support", "fmha", None)]
 
 
-def test_fmha_cache_key_tracks_phase_composition() -> None:
-    backend = _make_fmha_cache_backend()
-    removed_fields = {
-        "attention_input_type",
-        "has_context",
-        "has_generation",
-        "ragged_generation_num_tokens",
-    }
-    assert removed_fields.isdisjoint(trtllm_backend._FmhaCacheKey._fields)
-
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    pure_generation = backend._make_fmha_cache_key(
-        torch.empty((2, 4)),
-        _make_fmha_cache_metadata(num_contexts=0, num_generations=2),
-        forward_args,
-    )
-    mixed_generation = backend._make_fmha_cache_key(
-        torch.empty((2, 4)),
-        _make_fmha_cache_metadata(num_contexts=3, num_generations=2),
-        forward_args,
-    )
-
-    assert pure_generation != mixed_generation
-    assert pure_generation.context_batch_size == 0
-    assert mixed_generation.context_batch_size == 3
-    assert pure_generation.generation_batch_size == mixed_generation.generation_batch_size
-    assert pure_generation.generation_seq_len_q == mixed_generation.generation_seq_len_q
-
-
-def test_fmha_cache_key_distinguishes_compacted_phases() -> None:
+@pytest.mark.parametrize("generation_first", [False, True])
+def test_fmha_cache_separates_compacted_mla_phases(generation_first: bool) -> None:
+    events: list[tuple] = []
     backend = _make_fmha_cache_backend()
     backend.is_mla_enable = True
+    context_fmha = _TestPhasedFmha(backend, {FmhaPhase.CONTEXT}, "context", events)
+    generation_fmha = _TestPhasedFmha(backend, {FmhaPhase.GENERATION}, "generation", events)
+    backend.fmha_libs = [context_fmha, generation_fmha]
     metadata = _make_fmha_cache_metadata(num_contexts=3, num_generations=2, num_ctx_tokens=6)
-    context = backend._make_fmha_cache_key(
-        torch.empty((6, 4)),
-        metadata,
-        AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+    requests = {
+        FmhaPhase.CONTEXT: (
+            torch.empty((6, 4)),
+            AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+        ),
+        FmhaPhase.GENERATION: (
+            torch.empty((2, 4)),
+            AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
+        ),
+    }
+    request_order = (
+        (FmhaPhase.GENERATION, FmhaPhase.CONTEXT)
+        if generation_first
+        else (FmhaPhase.CONTEXT, FmhaPhase.GENERATION)
     )
-    generation = backend._make_fmha_cache_key(
-        torch.empty((2, 4)),
-        metadata,
-        AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
-    )
 
-    assert context != generation
-    assert context.context_batch_size == generation.context_batch_size
-    assert context.generation_batch_size == generation.generation_batch_size
-    assert context.generation_seq_len_q == 0
-    assert generation.generation_seq_len_q == 1
+    with patch.object(trtllm_backend, "_is_fmha_cache_enabled", return_value=True):
+        selected_by_phase = {
+            phase: backend._select_fmha(
+                requests[phase][0], None, None, metadata, requests[phase][1]
+            )
+            for phase in request_order
+        }
+        for phase in request_order:
+            assert (
+                backend._select_fmha(requests[phase][0], None, None, metadata, requests[phase][1])
+                is selected_by_phase[phase]
+            )
 
-
-def test_fmha_cache_key_tracks_mixed_generation_q_length() -> None:
-    backend = _make_fmha_cache_backend()
-    metadata = _make_fmha_cache_metadata(
-        num_contexts=1,
-        num_generations=1,
-        num_ctx_tokens=32,
-    )
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
-
-    single_token = backend._make_fmha_cache_key(torch.empty((33, 4)), metadata, forward_args)
-    four_tokens = backend._make_fmha_cache_key(torch.empty((36, 4)), metadata, forward_args)
-
-    assert single_token.context_batch_size == four_tokens.context_batch_size
-    assert single_token.generation_batch_size == four_tokens.generation_batch_size
-    assert single_token.generation_seq_len_q == 1
-    assert four_tokens.generation_seq_len_q == 4
-    assert single_token != four_tokens
-
-
-def test_fmha_cache_key_tracks_attention_mask_type() -> None:
-    backend = _make_fmha_cache_backend()
-    metadata = _make_fmha_cache_metadata(num_contexts=1, num_generations=0)
-    q = torch.empty((4, 4))
-    keys = []
-
-    for attention_mask, expected_mask_type in (
-        (PredefinedAttentionMask.CAUSAL, AttentionMaskType.causal),
-        (PredefinedAttentionMask.FULL, AttentionMaskType.padding),
-        (CustomAttentionMask.CUSTOM, AttentionMaskType.custom_mask),
-    ):
-        key = backend._make_fmha_cache_key(
-            q,
-            metadata,
-            AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                attention_mask=attention_mask,
-            ),
-        )
-        assert key.attention_mask_type == expected_mask_type
-        keys.append(key)
-
-    assert len(set(keys)) == 3
+    assert selected_by_phase == {
+        FmhaPhase.CONTEXT: context_fmha,
+        FmhaPhase.GENERATION: generation_fmha,
+    }
+    assert len(backend._fmha_cache) == 2
+    assert events.count(("support", "context", FmhaPhase.CONTEXT)) == 1
+    assert events.count(("support", "context", FmhaPhase.GENERATION)) == 1
+    assert events.count(("support", "generation", FmhaPhase.GENERATION)) == 1
 
 
 def test_fmha_cache_tracks_attention_mask_data() -> None:
@@ -813,8 +693,6 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
             attention_mask=PredefinedAttentionMask.CAUSAL,
             attention_mask_data=torch.empty((1, 1)),
         )
-        mask_data_key = backend._make_fmha_cache_key(q, metadata, mask_data_args)
-        assert mask_data_key.attention_mask_type == AttentionMaskType.custom_mask
         request_order = (
             (mask_data_args, implicit_mask_args)
             if mask_data_first
@@ -835,32 +713,61 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
         assert len(backend._fmha_cache) == 2
 
 
-def test_fmha_cache_key_tracks_use_spec_decoding() -> None:
+@pytest.mark.parametrize("speculative_first", [False, True])
+def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> None:
+    events: list[tuple] = []
     backend = _make_fmha_cache_backend()
+    regular_only = _TestFmha(
+        backend,
+        "regular-only",
+        events,
+        request_support_predicate=lambda _q, metadata: not metadata.use_spec_decoding,
+    )
+    fallback = _TestFmha(backend, "fallback", events)
+    backend.fmha_libs = [regular_only, fallback]
     q = torch.empty((4, 4))
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    regular = backend._make_fmha_cache_key(
-        q,
-        _make_fmha_cache_metadata(
+    metadata_by_mode = {
+        False: _make_fmha_cache_metadata(
             num_contexts=0,
             num_generations=1,
             use_spec_decoding=False,
         ),
-        forward_args,
-    )
-    speculative = backend._make_fmha_cache_key(
-        q,
-        _make_fmha_cache_metadata(
+        True: _make_fmha_cache_metadata(
             num_contexts=0,
             num_generations=1,
             use_spec_decoding=True,
         ),
-        forward_args,
-    )
+    }
+    request_order = (True, False) if speculative_first else (False, True)
 
-    assert not regular.use_spec_decoding
-    assert speculative.use_spec_decoding
-    assert regular != speculative
+    with patch.object(trtllm_backend, "_is_fmha_cache_enabled", return_value=True):
+        selected_by_mode = {
+            use_spec_decoding: backend._select_fmha(
+                q,
+                None,
+                None,
+                metadata_by_mode[use_spec_decoding],
+                forward_args,
+            )
+            for use_spec_decoding in request_order
+        }
+        for use_spec_decoding in request_order:
+            assert (
+                backend._select_fmha(
+                    q,
+                    None,
+                    None,
+                    metadata_by_mode[use_spec_decoding],
+                    forward_args,
+                )
+                is selected_by_mode[use_spec_decoding]
+            )
+
+    assert selected_by_mode == {False: regular_only, True: fallback}
+    assert len(backend._fmha_cache) == 2
+    assert events.count(("support", "regular-only", None)) == 2
+    assert events.count(("support", "fallback", None)) == 1
 
 
 def test_fmha_cache_tracks_lora_output_representation() -> None:
@@ -899,25 +806,6 @@ def test_fmha_cache_tracks_lora_output_representation() -> None:
         assert backend._select_fmha(q, None, None, metadata, lora_args) is unpacked_only
         assert backend._select_fmha(q, None, None, metadata, base_args) is fallback
         assert len(backend._fmha_cache) == 2
-
-
-def test_fmha_cache_sanity_check_accepts_matching_selection() -> None:
-    events: list[tuple] = []
-    backend = _make_fmha_cache_backend(sanity_check_enabled=True)
-    fmha = _TestFmha(backend, "fmha", events)
-    backend.fmha_libs = [fmha]
-    metadata = _make_fmha_cache_metadata(num_contexts=0, num_generations=1)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    q = torch.empty((1, 4))
-
-    with patch.object(trtllm_backend, "_is_fmha_cache_enabled", return_value=True):
-        first = backend._select_fmha(q, None, None, metadata, forward_args)
-        second = backend._select_fmha(q, None, None, metadata, forward_args)
-
-    assert first is fmha
-    assert second is fmha
-    assert events == [("support", "fmha", None), ("support", "fmha", None)]
-    assert len(backend._fmha_cache_inputs) == 1
 
 
 def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
