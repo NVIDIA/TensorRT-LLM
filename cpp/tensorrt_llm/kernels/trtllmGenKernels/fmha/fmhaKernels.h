@@ -321,6 +321,23 @@ public:
     {
     }
 
+    ~TllmGenFmhaKernel()
+    {
+        // A queued background warmup task captures `this`. Scheduled sweeps drain
+        // before CUDA-graph capture in normal operation, but nothing forces that
+        // before this object is destroyed (e.g. static teardown of the owning
+        // factory while startup is still in flight). The worker singleton is
+        // intentionally leaked, so draining here is safe even during static
+        // destruction.
+        if (asyncJITWarmupEnabled())
+        {
+            getAsyncJITWarmupWorker().drain();
+        }
+    }
+
+    TllmGenFmhaKernel(TllmGenFmhaKernel const&) = delete;
+    TllmGenFmhaKernel& operator=(TllmGenFmhaKernel const&) = delete;
+
     void loadKernels()
     {
         // Build a lookup map for all kernels.
@@ -573,8 +590,9 @@ private:
     }
 
     // The set of kernels a warmup sweep compiles only depends on this kernel
-    // instance (dtypes/SM/sage) and the scalar runner params hashed below, not
-    // on the calling layer. Every attention layer with the same configuration
+    // instance (dtypes/SM/sage), the current device (modules load into the
+    // calling device's CUDA context), and the scalar runner params hashed
+    // below, not on the calling layer. Every attention layer with the same configuration
     // requests an identical sweep during the warmup forward, and (with eagle3
     // one-model speculative decoding) the target layers and the draft layers
     // request sweeps that differ only in the spec-decoding fields.
@@ -589,7 +607,12 @@ private:
         uint32_t scaleQBits = 0;
         std::memcpy(&scaleQBits, &params.mScaleQ, sizeof(scaleQBits));
         uint64_t fingerprint = 0;
-        for (uint64_t value : std::initializer_list<uint64_t>{static_cast<uint64_t>(mSM),
+        // Include the current device: compiled modules are loaded into the calling
+        // device's CUDA context, so an identical configuration on another device
+        // still needs its own sweep. Warmup requests always run with the target
+        // device current.
+        for (uint64_t value : std::initializer_list<uint64_t>{
+                 static_cast<uint64_t>(tensorrt_llm::common::getDevice()), static_cast<uint64_t>(mSM),
                  static_cast<uint64_t>(mDtypeQ), static_cast<uint64_t>(mDtypeK), static_cast<uint64_t>(mDtypeV),
                  static_cast<uint64_t>(mDtypeOut), static_cast<uint64_t>(mNumEltsPerSageAttnBlkQ),
                  static_cast<uint64_t>(mNumEltsPerSageAttnBlkK), static_cast<uint64_t>(mNumEltsPerSageAttnBlkP),
@@ -629,6 +652,9 @@ private:
     {
         RunnerParams mParams;
         JITWarmupState mState;
+        // Device the sweep was registered for. The fingerprint already includes it;
+        // kept here so the verify pass only picks up sweeps for the current device.
+        int mDeviceId;
     };
 
     static std::mutex& getJITWarmupRegistryMutex()
@@ -664,6 +690,7 @@ private:
         JITWarmupConfig config;
         config.mParams = params;
         config.mState = initialState;
+        config.mDeviceId = tensorrt_llm::common::getDevice();
         registry.emplace(fingerprint, std::move(config));
         return false;
     }
@@ -699,6 +726,9 @@ private:
         {
             return;
         }
+        // Only verify sweeps registered for the current device: the sweep re-runs on
+        // this thread, and compiled modules load into the current device's context.
+        int const currentDevice = tensorrt_llm::common::getDevice();
         while (true)
         {
             uint64_t fingerprint = 0;
@@ -706,8 +736,10 @@ private:
             {
                 std::lock_guard<std::mutex> lock(getJITWarmupRegistryMutex());
                 auto& registry = getJITWarmupRegistry();
-                auto it = std::find_if(registry.begin(), registry.end(), [](auto const& entry)
-                    { return entry.second.mState == JITWarmupState::kBackgroundDone; });
+                auto it = std::find_if(registry.begin(), registry.end(), [currentDevice](auto const& entry) {
+                    return entry.second.mState == JITWarmupState::kBackgroundDone
+                        && entry.second.mDeviceId == currentDevice;
+                });
                 if (it == registry.end())
                 {
                     return;
