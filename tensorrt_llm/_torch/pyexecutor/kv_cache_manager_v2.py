@@ -1968,13 +1968,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 # cache pools.
                 generation_request_capacity = self._get_generation_request_capacity()
                 context_capacity = (
-                    self.max_num_tokens
-                    if self.max_num_tokens is not None
-                    else typical_seq_len
+                    self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
                 ) + self.num_extra_kv_tokens
-                generation_history_length = max(
-                    0, typical_seq_len - self.max_draft_len - 1
-                )
+                generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
                 typical_step = BatchDesc(
                     [KVCacheDesc(capacity=context_capacity, history_length=0)]
                     + [
@@ -2009,8 +2005,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         BatchDesc(
                             [
                                 KVCacheDesc(
-                                    capacity=self.max_num_tokens
-                                    + self.num_extra_kv_tokens,
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
                                     history_length=0,
                                 )
                             ]

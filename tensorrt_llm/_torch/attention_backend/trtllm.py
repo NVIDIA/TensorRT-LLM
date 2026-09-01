@@ -1340,7 +1340,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
-
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
         extra_attrs = get_model_extra_attrs()
