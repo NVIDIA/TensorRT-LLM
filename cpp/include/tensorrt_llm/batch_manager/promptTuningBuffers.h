@@ -24,6 +24,9 @@
 #include "tensorrt_llm/runtime/promptTuningParams.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <list>
+#include <memory>
+
 namespace tensorrt_llm::batch_manager
 {
 
@@ -43,6 +46,8 @@ public:
 
     PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, bool promptTableOffloading);
+
+    ~PromptTuningBuffers();
 
     void validate(std::optional<TensorPtr> const& optReqPromptEmbeddingTable,
         std::optional<SizeType32> const& optReqPromptVocabSize);
@@ -101,6 +106,14 @@ public:
     void updateBufferStartPosition(size_t index, SizeType32 numRows);
 
     void clearBufferStartPositions(size_t index);
+
+private:
+    class PendingPromptEmbeddingTableH2DCopy;
+
+    void releasePromptEmbeddingTableHostBuffersIfReady();
+    PendingPromptEmbeddingTableH2DCopy& retainPromptEmbeddingTableHostBufferBeforeCopy(TensorPtr source);
+
+    std::list<std::unique_ptr<PendingPromptEmbeddingTableH2DCopy>> mPendingPromptEmbeddingTableH2DCopies;
 };
 
 } // namespace tensorrt_llm::batch_manager
