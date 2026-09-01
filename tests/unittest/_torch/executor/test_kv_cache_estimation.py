@@ -21,8 +21,11 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window, is_gemma4_hybrid
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _get_static_cache_size_layer_components,
+)
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
@@ -730,6 +733,98 @@ def test_v2_static_cache_size_preserves_window_pattern_phase_across_pp() -> None
     # Global layer 3 selects the full-attention entry, so its 64-byte layer
     # cost is entirely per-token with no fixed SWA allocation.
     assert cache_cost == CacheCost(slope=64, intercept=0)
+
+
+def test_gemma4_12b_v2_static_sizing_uses_per_layer_geometry() -> None:
+    gemma_layer_types = [
+        "sliding_attention" if (layer_idx + 1) % 6 else "full_attention" for layer_idx in range(12)
+    ]
+
+    class StrictGemma4TextConfig:
+        model_type = "gemma4_text"
+        num_hidden_layers = 12
+        num_attention_heads = 16
+        hidden_size = 3840
+        vocab_size = 262_144
+        layer_types = gemma_layer_types
+        per_layer_attributes = {"head_dim", "num_key_value_heads"}
+        per_layer_config = [
+            SimpleNamespace(
+                head_dim=256 if layer_type == "sliding_attention" else 512,
+                num_key_value_heads=8 if layer_type == "sliding_attention" else 1,
+            )
+            for layer_type in gemma_layer_types
+        ]
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {
+                "global_head_dim",
+                "head_dim",
+                "num_global_key_value_heads",
+                "num_key_value_heads",
+            }:
+                raise RuntimeError(f"ambiguous global per-layer attribute: {name}")
+            return super().__getattribute__(name)
+
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = StrictGemma4TextConfig()
+
+        def get_num_attention_layers(self) -> int:
+            return self.pretrained_config.num_hidden_layers
+
+    model_config = FakeModelConfig()
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    max_seq_len = 8192
+    kv_cache_config = KvCacheConfig(
+        max_attention_window=[
+            128 if layer_type == "sliding_attention" else max_seq_len
+            for layer_type in model_config.pretrained_config.layer_types
+        ]
+    )
+
+    layer_sizes, attention_windows = _get_static_cache_size_layer_components(
+        model_config,
+        mapping,
+        max_seq_len=max_seq_len,
+        kv_cache_config=kv_cache_config,
+    )
+    expected_layer_sizes = [
+        8192 if layer_type == "sliding_attention" else 2048
+        for layer_type in model_config.pretrained_config.layer_types
+    ]
+    expected_windows = [
+        128 if layer_type == "sliding_attention" else None
+        for layer_type in model_config.pretrained_config.layer_types
+    ]
+    assert layer_sizes == expected_layer_sizes
+    assert attention_windows == expected_windows
+    assert CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            model_config,
+            mapping,
+            tokens_per_block=32,
+            max_seq_len=max_seq_len,
+            max_batch_size=1,
+            kv_cache_config=kv_cache_config,
+        )
+    ) == CacheCost(
+        slope=2 * 2048,
+        intercept=10 * 128 * 8192,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["gemma4_unified", "gemma4_unified_audio", "qwen3_text"],
+)
+def test_is_gemma4_hybrid_rejects_non_text_configs(model_type: str) -> None:
+    config = SimpleNamespace(
+        model_type=model_type,
+        per_layer_attributes={"head_dim"},
+        per_layer_config=[SimpleNamespace(head_dim=256), SimpleNamespace(head_dim=512)],
+    )
+    assert not is_gemma4_hybrid(config)
 
 
 def test_creator_uses_v2_affine_cache_cost():

@@ -83,7 +83,12 @@ from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to
 from ...logger import logger
 from ...mapping import Mapping
 from ..utils import maybe_compile
-from .config_utils import uses_vswa_kv_cache_layout
+from .config_utils import (
+    get_gemma4_layer_head_dim,
+    get_gemma4_layer_num_kv_heads,
+    is_gemma4_hybrid,
+    uses_vswa_kv_cache_layout,
+)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -408,33 +413,53 @@ def _get_static_cache_size_layer_components(
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
 
-    num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-    if isinstance(num_key_value_heads, Iterable):
-        num_key_value_heads = sum(num_key_value_heads) / len(num_key_value_heads)
-
     mla = hasattr(config, "kv_lora_rank") and config.kv_lora_rank is not None
     if mla:
-        head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-        kv_factor = 1
+        cache_sizes_per_token = [config.kv_lora_rank + config.qk_rope_head_dim]
+        layer_indices = None
+    elif is_gemma4_hybrid(config):
+        # Static sizing runs before a manager exists. Gemma4 exposes its
+        # variable head and KV-head geometry only through per-layer configs,
+        # so mirror the constructor inputs here instead of reading ambiguous
+        # global attributes.
+        if num_layers is None:
+            layer_indices = mapping.pp_layers(model_config.get_num_attention_layers())
+        else:
+            layer_indices = list(range(max(num_layers, 1)))
+        if not layer_indices:
+            layer_indices = [0]
+
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        cache_sizes_per_token = []
+        for layer_idx in layer_indices:
+            config_layer_idx = layer_idx % config.num_hidden_layers
+            num_kv_heads = get_gemma4_layer_num_kv_heads(config, config_layer_idx)
+            num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+            head_dim = get_gemma4_layer_head_dim(config, config_layer_idx)
+            cache_sizes_per_token.append(2 * head_dim * num_kv_heads)
     else:
+        num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        if isinstance(num_key_value_heads, Iterable):
+            num_key_value_heads = sum(num_key_value_heads) / len(num_key_value_heads)
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
         head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
         head_dim = head_dim * num_key_value_heads // tp_size
-        kv_factor = 2
+        cache_sizes_per_token = [2 * head_dim]
+        layer_indices = None
 
-    cache_size_per_token = kv_factor * head_dim
     quant_config = model_config.quant_config
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
-        layer_size = cache_size_per_token
-    elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
-        layer_size = math.ceil(cache_size_per_token / 2) + math.ceil(cache_size_per_token / 16)
-    else:
+
+    def get_layer_size(cache_size_per_token: int) -> int:
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+            return cache_size_per_token
+        if quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
+            return math.ceil(cache_size_per_token / 2) + math.ceil(cache_size_per_token / 16)
         assert quant_config is None or (not quant_config.quant_mode.has_kv_cache_quant()), (
             "Quantized kv cache is not expected"
         )
-        layer_size = cache_size_per_token * 2
+        return cache_size_per_token * 2
 
     if num_layers is None:
         total_attention_layers = model_config.get_num_attention_layers()
@@ -442,7 +467,11 @@ def _get_static_cache_size_layer_components(
     else:
         local_layer_ids = list(range(max(num_layers, 1)))
     num_attention_layers = len(local_layer_ids)
-    layer_sizes = [layer_size] * num_attention_layers
+    if len(cache_sizes_per_token) == 1:
+        layer_sizes = [get_layer_size(cache_sizes_per_token[0])] * num_attention_layers
+    else:
+        layer_sizes = [get_layer_size(size) for size in cache_sizes_per_token]
+        assert len(layer_sizes) == num_attention_layers
     window_pattern = kv_cache_config.max_attention_window if kv_cache_config is not None else None
 
     # Static estimation accepts an unknown max_seq_len and treats recurrent-state

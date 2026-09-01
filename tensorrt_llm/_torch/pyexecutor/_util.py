@@ -50,10 +50,14 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+                           get_layer_attention_window, is_hybrid_linear,
+                           is_kimi_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
+
+# isort: split
+from .config_utils import (get_gemma4_layer_head_dim,
+                           get_gemma4_layer_num_kv_heads, is_gemma4_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -2381,12 +2385,6 @@ def _create_kv_cache_manager(
 
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
-    num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
-        config, 'num_key_value_heads', num_attention_heads)
-    if not isinstance(head_dim, int):
-        head_dim = getattr(config, "head_dim", None)
-    if not isinstance(head_dim, int):
-        head_dim = hidden_size // num_attention_heads
 
     # Gemma4: build per-layer head_dim, num_kv_heads, and sliding window
     # for hybrid attention. Different layer types need different KV cache
@@ -2394,25 +2392,15 @@ def _create_kv_cache_manager(
     # are consistent within each group.
     if is_gemma4_hybrid(config):
         layer_types = config.layer_types
-        global_head_dim = config.global_head_dim
-        attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
-        num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
-                                       None) or num_key_value_heads)
         sliding_window = getattr(config, 'sliding_window', None)
-        head_dim_list = []
-        kv_heads_list = []
-        for lt in layer_types:
-            is_sliding = (lt == "sliding_attention")
-            if is_sliding:
-                head_dim_list.append(head_dim)
-                kv_heads_list.append(num_key_value_heads)
-            else:
-                head_dim_list.append(global_head_dim)
-                use_k_eq_v = attention_k_eq_v and not is_sliding
-                kv_heads_list.append(
-                    num_global_kv_heads if use_k_eq_v else num_key_value_heads)
-        head_dim = head_dim_list
-        num_key_value_heads = kv_heads_list
+        head_dim = [
+            get_gemma4_layer_head_dim(config, layer_idx)
+            for layer_idx in range(len(layer_types))
+        ]
+        num_key_value_heads = [
+            get_gemma4_layer_num_kv_heads(config, layer_idx)
+            for layer_idx in range(len(layer_types))
+        ]
 
         # Set per-layer max_attention_window so V2 creates separate pool
         # groups for sliding vs full attention layers (different page sizes).
@@ -2432,6 +2420,13 @@ def _create_kv_cache_manager(
                 if lt == "sliding_attention" else int(max_seq_len)
                 for lt in layer_types
             ]
+    else:
+        num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
+            config, 'num_key_value_heads', num_attention_heads)
+        if not isinstance(head_dim, int):
+            head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
     # Note: Gemma4 KV sharing is handled at the model level — shared layers
     # use cache_layer_idx to read from the target layer's cache slot via

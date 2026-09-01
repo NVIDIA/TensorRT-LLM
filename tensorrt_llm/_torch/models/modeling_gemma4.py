@@ -63,6 +63,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.config_utils import get_gemma4_layer_head_dim, get_gemma4_layer_num_kv_heads
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
 from .modeling_speculative import (
@@ -227,6 +228,17 @@ class Gemma4Attention(QKNormRoPEAttention):
         self.is_sliding = is_sliding
         self.is_kv_shared = is_kv_shared
         config = model_config.pretrained_config
+        geometry_layer_idx = layer_idx
+        if geometry_layer_idx is None:
+            if getattr(config, "per_layer_config", None) is not None:
+                raise ValueError(
+                    "Gemma4Attention requires layer_idx with a heterogeneous Transformers config."
+                )
+            geometry_layer_idx = next(
+                idx
+                for idx, layer_type in enumerate(config.layer_types)
+                if (layer_type == "sliding_attention") == is_sliding
+            )
 
         # Native TRTLLM's SM100 FP8-KV path consumes BF16 Q/K/V and quantizes
         # while appending to the cache. Keep RoPE at the model layer so the
@@ -239,22 +251,12 @@ class Gemma4Attention(QKNormRoPEAttention):
             and is_sm_100f()
         )
 
-        # Per-layer head_dim and kv heads
-        # Note: num_global_key_value_heads is only used when K=V (alternative
-        # attention). For non-K=V full layers, use regular num_key_value_heads.
+        # Transformers 5.14+ exposes heterogeneous geometry only through
+        # per_layer_config, while older versions keep flat global fields.
+        # Resolve both schemas without enabling ambiguous global access.
         use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
-        if is_sliding:
-            layer_head_dim = config.head_dim
-            layer_num_kv_heads = config.num_key_value_heads
-        else:
-            layer_head_dim = getattr(config, "global_head_dim", config.head_dim)
-            if use_k_eq_v:
-                layer_num_kv_heads = (
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
-                )
-            else:
-                layer_num_kv_heads = config.num_key_value_heads
+        layer_head_dim = get_gemma4_layer_head_dim(config, geometry_layer_idx)
+        layer_num_kv_heads = get_gemma4_layer_num_kv_heads(config, geometry_layer_idx)
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
@@ -297,11 +299,6 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         self.use_k_eq_v = use_k_eq_v
 
-        # Temporarily override config.head_dim so the Attention base class
-        # picks up the correct per-layer head_dim.
-        original_head_dim = config.head_dim
-        config.head_dim = layer_head_dim
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -315,15 +312,13 @@ class Gemma4Attention(QKNormRoPEAttention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
+            head_dim=layer_head_dim,
             # Full-attention layers use proportional RoPE whose active
             # frequencies are paired across the full head. Apply it at the
             # module layer because fused preprocessing cannot represent that
             # pairing with only the logical rotary dimension.
             rope_fusion=is_sliding and not self._use_trtllm_fused_qkv_prep,
         )
-
-        # Restore original config head_dim
-        config.head_dim = original_head_dim
 
         # Fix proportional RoPE for full-attention layers.
         #
@@ -1300,9 +1295,10 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        The TRTLLM attention backend uses trtllm-gen for the regular attention
-        phases and a Triton context phase for bidirectional multimodal masks.
-        External shared-KV MTP still requires FlashInfer attention metadata.
+        Preserve the existing TRTLLM default on datacenter Blackwell. Other
+        architectures use FlashInfer FA2 because the native MMHA backend does
+        not support Gemma4's 512-wide heads. External shared-KV MTP also
+        requires FlashInfer attention metadata.
         """
         speculative_config = getattr(llm_args, "speculative_config", None)
         spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)
@@ -1310,7 +1306,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             spec_dec_mode is not None and spec_dec_mode.is_mtp_eagle_one_model()
         )
         return {
-            "attn_backend": "FLASHINFER" if uses_external_shared_kv else "TRTLLM",
+            "attn_backend": (
+                "FLASHINFER" if uses_external_shared_kv or not is_sm_100f() else "TRTLLM"
+            ),
         }
 
     @classmethod

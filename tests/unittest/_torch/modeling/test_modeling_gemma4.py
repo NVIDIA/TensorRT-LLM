@@ -45,6 +45,11 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_gemma4_layer_head_dim,
+    get_gemma4_layer_num_kv_heads,
+    is_gemma4_hybrid,
+)
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -143,6 +148,59 @@ def _make_model_config(config_dict):
     return ModelConfig(pretrained_config=cfg, mapping=mapping)
 
 
+class _HeterogeneousGemma4TextConfig(Gemma4TextConfig):
+    """Simulate Transformers 5.14+ rejecting ambiguous global geometry."""
+
+    _AMBIGUOUS_GLOBAL_ATTRS = {
+        "global_head_dim",
+        "head_dim",
+        "num_global_key_value_heads",
+        "num_key_value_heads",
+    }
+
+    def __getattribute__(self, name: str) -> object:
+        config_dict = object.__getattribute__(self, "__dict__")
+        is_global_config = "_heterogeneity_spec" in config_dict or isinstance(
+            config_dict.get("per_layer_config"), list
+        )
+        if (
+            name in object.__getattribute__(self, "_AMBIGUOUS_GLOBAL_ATTRS")
+            and config_dict.get("_reject_global_geometry", False)
+            and is_global_config
+        ):
+            raise RuntimeError(f"ambiguous global per-layer attribute: {name}")
+        return super().__getattribute__(name)
+
+
+def _make_heterogeneous_model_config(
+    config_dict: dict[str, object] = GEMMA4_SMALL_CONFIG,
+) -> ModelConfig:
+    """Build a Gemma4 config with only concrete per-layer geometry readable."""
+    cfg = _HeterogeneousGemma4TextConfig(**deepcopy(config_dict))
+    if getattr(cfg, "per_layer_attributes", None) is None:
+        cfg.per_layer_config = [
+            SimpleNamespace(
+                head_dim=(
+                    config_dict["head_dim"]
+                    if layer_type == "sliding_attention"
+                    else config_dict["global_head_dim"]
+                ),
+                num_key_value_heads=(
+                    config_dict["num_key_value_heads"]
+                    if layer_type == "sliding_attention"
+                    else config_dict.get("num_global_key_value_heads")
+                    or config_dict["num_key_value_heads"]
+                ),
+            )
+            for layer_type in cfg.layer_types
+        ]
+        cfg.per_layer_attributes = {"head_dim", "num_key_value_heads"}
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    model_config = ModelConfig(pretrained_config=cfg, mapping=mapping)
+    cfg._reject_global_geometry = True
+    return model_config
+
+
 def _make_assistant_model_config(config_dict=GEMMA4_ASSISTANT_CONFIG):
     """Build a ModelConfig for a standalone Gemma4 assistant."""
     cfg = Gemma4AssistantConfig(**deepcopy(config_dict))
@@ -221,6 +279,27 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         for layer in model.model.layers:
             self.assertIsInstance(layer, Gemma4DecoderLayer)
             self.assertIsInstance(layer.self_attn, Gemma4Attention)
+
+    def test_model_instantiation_with_heterogeneous_transformers_config(self):
+        """Model construction must use concrete per-layer attention geometry."""
+        model_config = _make_heterogeneous_model_config()
+
+        self.assertTrue(is_gemma4_hybrid(model_config.pretrained_config))
+        model = Gemma4ForCausalLM(model_config)
+
+        for layer_idx, layer in enumerate(model.model.layers):
+            expected_head_dim = 64 if layer.is_sliding else 128
+            expected_num_kv_heads = 2 if layer.is_sliding else 1
+            self.assertEqual(layer.self_attn.head_dim, expected_head_dim)
+            self.assertEqual(layer.self_attn.num_key_value_heads, expected_num_kv_heads)
+            self.assertEqual(
+                get_gemma4_layer_head_dim(model_config.pretrained_config, layer_idx),
+                expected_head_dim,
+            )
+            self.assertEqual(
+                get_gemma4_layer_num_kv_heads(model_config.pretrained_config, layer_idx),
+                expected_num_kv_heads,
+            )
 
     def test_model_instantiation_moe(self):
         """Create with MoE enabled and verify MoE layers exist."""
@@ -919,6 +998,58 @@ GEMMA4_26B_REAL_DIMS_CONFIG = {
     "num_global_key_value_heads": 8,
     "attention_k_eq_v": True,
 }
+
+
+class TestGemma4HeterogeneousKVCacheLayout(unittest.TestCase):
+    """Regression tests for Transformers per-layer config KV geometry."""
+
+    def test_12b_kv_cache_manager_uses_per_layer_geometry(self):
+        from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+        class CapturingKVCacheManagerV2(KVCacheManagerV2):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.args = args
+                self.kwargs = kwargs
+
+        model_config = _make_heterogeneous_model_config(GEMMA4_12B_REAL_DIMS_CONFIG)
+        max_seq_len = 8192
+        manager = _create_kv_cache_manager(
+            model_engine=None,
+            kv_cache_manager_cls=CapturingKVCacheManagerV2,
+            mapping=model_config.mapping,
+            kv_cache_config=KvCacheConfig(max_tokens=max_seq_len),
+            tokens_per_block=32,
+            max_seq_len=max_seq_len,
+            max_batch_size=1,
+            spec_config=None,
+            sparse_attention_config=None,
+            max_num_tokens=max_seq_len,
+            max_beam_width=1,
+            kv_connector_manager=None,
+            model_config=model_config,
+            dtype=torch.bfloat16,
+            is_draft=False,
+            kv_cache_type=object(),
+        )
+
+        layer_types = model_config.pretrained_config.layer_types
+        self.assertEqual(
+            manager.kwargs["head_dim"],
+            [256 if layer_type == "sliding_attention" else 512 for layer_type in layer_types],
+        )
+        self.assertEqual(
+            manager.kwargs["num_kv_heads"],
+            [8 if layer_type == "sliding_attention" else 1 for layer_type in layer_types],
+        )
+        self.assertEqual(
+            manager.args[0].max_attention_window,
+            [
+                128 if layer_type == "sliding_attention" else max_seq_len
+                for layer_type in layer_types
+            ],
+        )
 
 
 def _build_gemma4_kv_cache_manager(
@@ -2588,26 +2719,30 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                     self.assertIsNotNone(attn.rotary_emb)
                     self.assertEqual(attn.attn.flashinfer_backend, "trtllm-gen")
 
-    def test_causal_lm_requires_trtllm_backend(self):
-        """Gemma4ForCausalLM must default to the TRTLLM attention backend."""
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
-        self.assertIn("attn_backend", defaults, "get_model_defaults must set attn_backend")
-        self.assertEqual(
-            defaults["attn_backend"], "TRTLLM", "Gemma4 requires TRTLLM (exact uppercase)"
-        )
+    def test_model_defaults_follow_architecture(self):
+        """Preserve TRTLLM on SM100f and FlashInfer FA2 elsewhere."""
+        from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+        for is_sm100f, expected in ((True, "TRTLLM"), (False, "FLASHINFER")):
+            with (
+                self.subTest(is_sm100f=is_sm100f),
+                unittest.mock.patch(
+                    "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                    return_value=is_sm100f,
+                ),
+            ):
+                self.assertEqual(
+                    Gemma4ForCausalLM.get_model_defaults(None)["attn_backend"], expected
+                )
+                self.assertEqual(
+                    Gemma4ForConditionalGeneration.get_model_defaults(None)["attn_backend"],
+                    expected,
+                )
 
     def test_causal_lm_does_not_disable_cuda_graphs(self):
         """Gemma4ForCausalLM must not disable CUDA graphs."""
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         self.assertNotIn("cuda_graph_config", defaults)
-
-    def test_conditional_gen_requires_trtllm_backend(self):
-        """Gemma4ForConditionalGeneration must also default to TRTLLM."""
-        from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
-
-        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
-        self.assertIn("attn_backend", defaults)
-        self.assertEqual(defaults["attn_backend"], "TRTLLM")
 
     def test_conditional_gen_does_not_disable_cuda_graphs(self):
         """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
@@ -2623,26 +2758,39 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
         llm_args = SimpleNamespace(speculative_config=SimpleNamespace(spec_dec_mode=spec_dec_mode))
 
-        self.assertEqual(
-            Gemma4ForCausalLM.get_model_defaults(llm_args)["attn_backend"], "FLASHINFER"
-        )
-        self.assertEqual(
-            Gemma4ForConditionalGeneration.get_model_defaults(llm_args)["attn_backend"],
-            "FLASHINFER",
-        )
+        for is_sm100f in (True, False):
+            with (
+                self.subTest(is_sm100f=is_sm100f),
+                unittest.mock.patch(
+                    "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                    return_value=is_sm100f,
+                ),
+            ):
+                self.assertEqual(
+                    Gemma4ForCausalLM.get_model_defaults(llm_args)["attn_backend"],
+                    "FLASHINFER",
+                )
+                self.assertEqual(
+                    Gemma4ForConditionalGeneration.get_model_defaults(llm_args)["attn_backend"],
+                    "FLASHINFER",
+                )
 
-    def test_attn_backend_dispatches_to_trtllm(self):
-        """Verify the Gemma4 default dispatches to TrtllmAttention."""
+    def test_attn_backend_dispatches_by_architecture(self):
+        """Verify architecture defaults dispatch to their intended classes."""
         from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
-        backend_cls = get_attention_backend(defaults["attn_backend"])
-
-        self.assertEqual(
-            backend_cls.__name__,
-            "TrtllmAttention",
-            "TRTLLM must dispatch to TrtllmAttention",
-        )
+        expected_classes = ((True, "TrtllmAttention"), (False, "FlashInferAttention"))
+        for is_sm100f, expected_class in expected_classes:
+            with (
+                self.subTest(is_sm100f=is_sm100f),
+                unittest.mock.patch(
+                    "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                    return_value=is_sm100f,
+                ),
+            ):
+                defaults = Gemma4ForCausalLM.get_model_defaults(None)
+                backend_cls = get_attention_backend(defaults["attn_backend"])
+                self.assertEqual(backend_cls.__name__, expected_class)
 
     def test_all_layers_use_trtllm_backend(self):
         """All Gemma4 layers use the default TRTLLM attention backend."""
