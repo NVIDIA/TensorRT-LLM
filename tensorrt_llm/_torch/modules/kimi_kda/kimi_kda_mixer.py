@@ -884,7 +884,7 @@ class KimiKDALinearAttention(nn.Module):
             forget_gate = self.f_b_proj(self.f_a_proj(x))
 
         d = self.proj_size
-        q_proj, k_proj, v_proj = (part.contiguous() for part in qkvg[..., : 3 * d].split(d, dim=-1))
+        q_proj, k_proj, v_proj = qkvg[..., : 3 * d].split(d, dim=-1)
         qkvg_split_sizes = self.qkvg_split_sizes
         has_onorm_gate = qkvg_weight is not None or (
             self.use_full_rank_gate and qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4
@@ -928,7 +928,7 @@ class KimiKDALinearAttention(nn.Module):
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
         g = forget_gate.view(1, T_total, H, K)
-        beta = beta_proj.contiguous().view(1, T_total, H)
+        beta = beta_proj.view(1, T_total, H)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
