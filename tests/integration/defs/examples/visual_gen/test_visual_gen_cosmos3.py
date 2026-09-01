@@ -802,8 +802,7 @@ def test_cosmos3_edge_policy_droid_example(_visual_gen_deps, llm_root, llm_venv)
     )
 
     payload = load_file(output_path)
-    assert payload["video"].shape[0] == 33
-    assert payload["video"].shape[-1] == 3
+    assert payload["video"].shape == (33, 544, 736, 3)
     assert payload["action"].shape == (32, 8)
     assert payload["frame_rate"].item() == pytest.approx(15.0)
     with open(action_output_path, encoding="utf-8") as action_file:
