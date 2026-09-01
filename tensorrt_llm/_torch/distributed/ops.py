@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 import os
 import platform
@@ -13,7 +28,7 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
-from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -40,6 +55,17 @@ _ALLREDUCE_AUTOTUNER_TUNING_MODE = False
 
 # Disabled only after the Python/C++ native-tactic contract cannot be honored.
 _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
+
+
+def _nccl_symmetric_auto_tactic_supported() -> bool:
+    """Return whether AUTO may benchmark the NCCL symmetric tactic."""
+    try:
+        # NCCL symmetric can produce non-deterministic output or stall on
+        # SM103. Explicit strategy selection remains available for diagnostics.
+        return get_sm_version() != 103
+    except (AssertionError, RuntimeError):
+        # Preserve the existing policy when device discovery is unavailable.
+        return True
 
 
 def disable_native_allreduce_autotuner(reason: str) -> None:
@@ -815,10 +841,13 @@ class AllReduce(nn.Module):
         Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
         strategy AND tp_size > 1 AND MPI not disabled.
         """
-        return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
-                in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
-                    AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
-                and not self._disable_mpi)
+        strategy_supports_window = self.strategy in (
+            AllReduceStrategy.NCCL_SYMMETRIC,
+            AllReduceStrategy.NCCL,
+        ) or (self.strategy == AllReduceStrategy.AUTO
+              and _nccl_symmetric_auto_tactic_supported())
+        return (_NCCL_SYMMETRIC_ZERO_COPY and strategy_supports_window
+                and self.mapping.tp_size > 1 and not self._disable_mpi)
 
     @property
     def output_buffer_kind(self) -> int:
