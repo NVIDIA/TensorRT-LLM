@@ -305,15 +305,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         super().__init__(pipeline_config)
 
-    def _mode_params(self, mode: str, *, action_mode: Optional[str] = None) -> dict:
-        """Generation default table for this checkpoint family and request mode."""
-        params = COSMOS3_GENERATION_DEFAULTS[(self.family, mode)]
+    def _mode_params(self, output_type: str, *, action_mode: Optional[str] = None) -> dict:
+        """Generation defaults selected from the request's output and action mode."""
+        normalized_action_mode = normalize_action_mode(action_mode)
+        request_mode = "action" if normalized_action_mode is not None else output_type
+        params = COSMOS3_GENERATION_DEFAULTS[(self.family, request_mode)]
         checkpoint_policy_defaults = getattr(self, "checkpoint_policy_defaults", {})
-        if (
-            mode == "action"
-            and normalize_action_mode(action_mode) == ACTION_MODE_POLICY
-            and checkpoint_policy_defaults
-        ):
+        if normalized_action_mode == ACTION_MODE_POLICY and checkpoint_policy_defaults:
             sampling_keys = {"num_inference_steps", "guidance_scale", "guidance_interval"}
             return {
                 **params,
@@ -326,11 +324,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return params
 
     def _resolve_generation_params(
-        self, mode: str, *, action_mode: Optional[str] = None, **values
+        self, output_type: str, *, action_mode: Optional[str] = None, **values
     ) -> dict:
         """Fill None values: sampling-policy overrides win, then the mode
         table, then the video table (for fields the image table omits)."""
-        mode_params = self._mode_params(mode, action_mode=action_mode)
+        mode_params = self._mode_params(output_type, action_mode=action_mode)
         video_params = self._mode_params("video")
         sampling_overrides = self.sampling.generation_default_overrides()
         resolved = {}
@@ -1547,44 +1545,37 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             raise ValueError(f"output_type must be 'video' or 'image', got {output_type!r}.")
         is_t2i = output_type == "image"
 
-        mode_params = self._mode_params(output_type)
-        if do_action:
-            mode_params = self._mode_params("action", action_mode=normalized_action_mode)
-            # The embodiment resolves the canvas, clip length and frame rate
-            # below; only the sampling recipe and the text budget come from
-            # tables (distilled overrides still win inside the resolver).
-            resolved = self._resolve_generation_params(
-                "action",
-                action_mode=normalized_action_mode,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                guidance_interval=None,
-                max_sequence_length=max_sequence_length,
-            )
-            num_inference_steps = resolved["num_inference_steps"]
-            guidance_scale = resolved["guidance_scale"]
-            max_sequence_length = resolved["max_sequence_length"]
-        else:
-            resolved = self._resolve_generation_params(
-                output_type,
+        mode_params = self._mode_params(output_type, action_mode=normalized_action_mode)
+        values_to_resolve = {
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "guidance_interval": None,
+            "max_sequence_length": max_sequence_length,
+        }
+        if not do_action:
+            # Action geometry belongs to the embodiment and reference resolvers
+            # below, not the regular image/video default tables.
+            values_to_resolve.update(
                 height=height,
                 width=width,
                 num_frames=num_frames,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                guidance_interval=None,
-                max_sequence_length=max_sequence_length,
                 frame_rate=frame_rate,
             )
+        resolved = self._resolve_generation_params(
+            output_type,
+            action_mode=normalized_action_mode,
+            **values_to_resolve,
+        )
+        num_inference_steps = resolved["num_inference_steps"]
+        guidance_scale = resolved["guidance_scale"]
+        guidance_interval = resolved["guidance_interval"]
+        max_sequence_length = resolved["max_sequence_length"]
+        if not do_action:
             height = resolved["height"]
             width = resolved["width"]
             num_frames = resolved["num_frames"]
-            num_inference_steps = resolved["num_inference_steps"]
-            guidance_scale = resolved["guidance_scale"]
-            max_sequence_length = resolved["max_sequence_length"]
             frame_rate = resolved["frame_rate"]
 
-        guidance_interval = resolved["guidance_interval"]
         self.sampling.validate_request(num_inference_steps, guidance_scale)
 
         # Skipped for action: its dims resolve from the embodiment below, and

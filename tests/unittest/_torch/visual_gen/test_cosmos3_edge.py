@@ -829,13 +829,13 @@ class TestEdgeDefaults:
             }
         )
 
-        policy = pipeline._mode_params("action", action_mode=ACTION_MODE_POLICY)
+        policy = pipeline._mode_params("video", action_mode=ACTION_MODE_POLICY)
 
         assert policy["num_inference_steps"] == 4
         assert policy["guidance_scale"] == 3.0
         assert policy["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
         resolved_policy = pipeline._resolve_generation_params(
-            "action",
+            "video",
             action_mode=ACTION_MODE_POLICY,
             num_inference_steps=None,
             guidance_scale=None,
@@ -847,16 +847,16 @@ class TestEdgeDefaults:
             "guidance_interval": COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"],
         }
         assert (
-            pipeline._mode_params("action", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
+            pipeline._mode_params("video", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
             is COSMOS3_ACTION_PARAMS
         )
         assert (
-            pipeline._mode_params("action", action_mode=ACTION_MODE_INVERSE_DYNAMICS)
+            pipeline._mode_params("video", action_mode=ACTION_MODE_INVERSE_DYNAMICS)
             is COSMOS3_ACTION_PARAMS
         )
         for action_mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS):
             resolved = pipeline._resolve_generation_params(
-                "action",
+                "video",
                 action_mode=action_mode,
                 num_inference_steps=None,
                 guidance_scale=None,
