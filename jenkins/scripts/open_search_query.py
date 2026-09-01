@@ -104,11 +104,11 @@ def writeTestListToFile(testList, fileName):
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, outputFile, stageNamePattern=""):
+def getPassedTestList(commitID, stageNamePattern, outputFile):
     hits = queryJobEvents(
         commitID=commitID,
-        onlySuccess=True,
         stageNamePattern=stageNamePattern,
+        onlySuccess=True,
     )
     # Use set to automatically remove duplicates
     testSet = set()
@@ -132,6 +132,6 @@ if __name__ == "__main__":
         parser.error("--stage-name-pattern cannot be empty")
     getPassedTestList(
         commitID=args.commit_id,
-        outputFile=args.output_file,
         stageNamePattern=args.stage_name_pattern,
+        outputFile=args.output_file,
     )
