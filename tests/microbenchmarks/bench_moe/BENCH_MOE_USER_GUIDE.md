@@ -53,7 +53,7 @@ For single-rank sanity checks:
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model mixtral_8x7b \
+  --model deepseek_v4_flash \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -87,7 +87,7 @@ every MPI rank to execute the benchmark worker.
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model mixtral_8x7b \
+  --model deepseek_v4_flash \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -368,7 +368,7 @@ parallel mapping checks, and forced-communication validity checks.
 | `backend` | Backends. If `--backend` is omitted, all backends are searched. | Find the fastest backend. |
 | `comm` | Forced communication methods: `NVLINK_ONE_SIDED`, `NVLINK_TWO_SIDED`, `DEEPEP`, `DEEPEPLOWLATENCY`, and `ALLGATHER`. `AUTO` is filtered out. | Compare concrete communication strategies. |
 | `backend comm` | Backend x forced-communication product; other axes use the base config. | Most common combined search. |
-| `parallel` | Parallel layouts: `DEP`, `TEP`, `DTP`, `TTP`, or a subset. | Compare EP/TP layout effects. |
+| `parallel` | Parallel layouts: `DEP`, `TEP`, `DTP`, `TTP` plus the even-split hybrids for the current `world_size`, or a subset. Other `(D\|T)TP<k>EP<m>` grids must be listed explicitly on `--parallel_mode`. | Compare EP/TP layout effects. |
 | `full` | Backend, parallel layout, communication, and CUDA Graph on/off. | Full runtime sweep; can be large. |
 
 Passing more than one value to `--backend`, `--comm_method`, or
@@ -658,16 +658,22 @@ includes full requested and observed dispatch/expert matrices.
 
 | Model | Experts | `top_k` | Hidden | Intermediate | Default quant | Default routing |
 |---|---:|---:|---:|---:|---|---|
-| `qwen1.5_moe` | 60 | 4 | 2048 | 1408 | `FP8` | `RENORMALIZE` |
 | `deepseek_v2_lite` | 64 | 6 | 2048 | 1408 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_v3` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
+| `kimi_k3` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
-| `mixtral_8x7b` | 8 | 2 | 4096 | 14336 | `FP8` | `RENORMALIZE` |
+| `qwen3_8` | 512 | 10 | 8192 | 2048 | pass `--quant` | `RENORMALIZE` |
 | `gpt_oss_120b` | 128 | 4 | 2880 | 2880 | `W4A8_MXFP4_MXFP8` | `RENORMALIZE` |
+
+† **Latent MoE.** Some models project tokens down to a smaller latent dimension
+before dispatch and back up after combine, so the routed experts never see the
+model's `hidden_size`. For those, `Hidden` is the latent dimension — that is what
+both the expert GEMMs and the all-to-all payload actually run at. The outer
+down/up projections sit outside the MoE layer and are not benchmarked.
 
 Custom shapes can be used instead of `--model`:
 
@@ -703,11 +709,75 @@ Parallel modes:
 | `TEP` | `world_size` | 1 | false | Tensor-parallel attention with expert-parallel MoE. |
 | `DTP` | 1 | `world_size` | true | Data-parallel attention with MoE tensor parallelism. |
 | `TTP` | 1 | `world_size` | false | Tensor-parallel attention with MoE tensor parallelism. |
+| `DTP<k>EP<m>` | `m` | `k` | true | Hybrid MoE TP x EP with data-parallel attention, e.g. `DTP2EP2`. |
+| `TTP<k>EP<m>` | `m` | `k` | false | Hybrid MoE TP x EP with tensor-parallel attention, e.g. `TTP2EP4`. |
 | `CUSTOM` | user-specified | user-specified | user-specified | Advanced layout through explicit mapping flags. |
 
-`CUSTOM` is not part of the default `--search parallel` expansion. A bare
-`--search parallel` expands only `DEP`, `TEP`, `DTP`, and `TTP`. Use `CUSTOM`
-when you need an EP/TP split that is not covered by the four presets.
+### Hybrid `(D|T)TP<k>EP<m>` modes
+
+The hybrid names spell the MoE grid out in the mode itself: `k` is `moe_tp_size`,
+`m` is `moe_ep_size`, and the leading letter keeps the meaning it has in the four
+presets (`D` = attention DP, `T` = attention TP). `DTP2EP2` therefore means
+"attention DP, MoE TP=2, MoE EP=2" and is valid at `world_size=4`.
+
+Unlike `CUSTOM`, a hybrid name carries its whole layout, so it can take part in a
+multi-value `--parallel_mode` sweep and gets its own group in the report rankings:
+
+```bash
+PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} \
+mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 4 \
+  python3 -m bench_moe \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP TEP DTP2EP2 TTP2EP2 \
+  --backend TRTLLM \
+  --balanced_total_num_tokens 256
+```
+
+Notes:
+
+- The usual invariant applies: `k * m` must equal `world_size`. `DTP2EP2` on 8
+  ranks is rejected with an explicit error.
+- Do not pass `--moe_ep_size` / `--moe_tp_size` alongside a hybrid mode; the two
+  would describe the layout twice. Use `CUSTOM` if you want the flag form.
+- The even-split hybrids **are** part of the default `--search parallel`
+  expansion (see below). Any *other* grid must be listed explicitly on
+  `--parallel_mode` or in the JSON `search.parallel_mode`.
+- Any layout with `moe_tp_size != 1` cannot use alltoall communication;
+  TensorRT-LLM routes it through `AllGatherReduceScatter`. Consequently the only
+  legal *forced* `--comm_method` for a hybrid mode is `ALLGATHER`, and only with
+  attention DP (i.e. the `DTP<k>EP<m>` flavor). `TTP<k>EP<m>` collapses the comm
+  axis to `AUTO`.
+- `DENSEGEMM` (no EP) and `MEGAMOE_DEEPGEMM` (no MoE TP) cannot run hybrid
+  layouts; sweeps record them as `skipped` rows with the reason.
+- Quantization caps `k`: `intermediate_size / k` must be a multiple of 128 for
+  both `FP8_BLOCK_SCALES` (all backends) and `NVFP4` (CUTEDSL / TRTLLM). So
+  `intermediate_size=2048` allows `k <= 16` and `3072` allows `k <= 24`;
+  larger `k` is pruned as `skipped`.
+
+### Default `--search parallel` expansion
+
+A bare `--search parallel` expands to the four presets plus the hybrid grids
+that split the world as evenly as possible, so a sweep compares pure EP, pure
+MoE-TP and the balanced middle instead of only the extremes. When `world_size`
+is a perfect square the even split is unique; otherwise both neighbouring grids
+are offered (rounded down and rounded up on the MoE-TP axis). Both attention
+flavours are emitted for every grid, keeping the axis symmetric.
+
+| `world_size` | Added to the four presets | Total |
+|---|---|---|
+| 1, 2 | *(none — every split degenerates to a preset)* | 4 |
+| 4 | `DTP2EP2`, `TTP2EP2` | 6 |
+| 8 | `DTP2EP4`, `TTP2EP4`, `DTP4EP2`, `TTP4EP2` | 8 |
+| 16 | `DTP4EP4`, `TTP4EP4` | 6 |
+| 32 | `DTP4EP8`, `TTP4EP8`, `DTP8EP4`, `TTP8EP4` | 8 |
+| 64 | `DTP8EP8`, `TTP8EP8` | 6 |
+
+Passing `--parallel_mode` explicitly (or `search.parallel_mode` in the JSON
+config) replaces this set entirely.
+
+`CUSTOM` is never part of the default expansion. Use a hybrid name — or
+`CUSTOM` — when you need an EP/TP split outside the defaults.
 
 Users provide a custom layout through these flags:
 
@@ -768,6 +838,9 @@ mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 4 \
   --backend TRTLLM \
   --balanced_total_num_tokens 256
 ```
+
+This particular layout also has a named equivalent — `--parallel_mode DTP2EP2`
+with no size flags — which is preferable when you want it in a sweep.
 
 Communication methods are `AUTO`, `NVLINK_ONE_SIDED`, `NVLINK_TWO_SIDED`,
 `DEEPEP`, `DEEPEPLOWLATENCY`, and `ALLGATHER`. For a single candidate, `AUTO`

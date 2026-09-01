@@ -1057,7 +1057,70 @@ class HarmonyAdapter:
                 # The last message is complete, we're done
                 break
 
+        # clean_tokens is always a prefix of tokens, so the discarded span is
+        # the remaining suffix.
+        if len(clean_tokens) < len(tokens):
+            self._log_discarded_tokens(tokens[len(clean_tokens):])
+
         return clean_tokens
+
+    def _log_discarded_tokens(self, discarded: list[int]) -> None:
+        """Report tokens dropped by :meth:`_strip_incomplete_messages`.
+
+        A trailing message with no ``<|message|>`` token is usually a
+        generation that was cut short (e.g. ``max_tokens`` was hit), and
+        discarding it is correct and unremarkable.
+
+        It is *not* benign when the discarded span carries a stop token or a
+        tool recipient: that message was complete, merely malformed. With a
+        recipient, dropping it turns a tool call into an empty ``tool_calls``
+        list with ``finish_reason="stop"`` — indistinguishable from the model
+        choosing not to call a tool. Without one, a final or analysis message
+        was lost instead; that is still worth a warning, but the two are
+        reported separately so the log never points at a tool call that never
+        existed.
+
+        The decoded text is only inspected, never logged: it holds the tool
+        call's arguments, which routinely carry user data and occasionally
+        secrets, and this path can fire at warning level in production.
+        """
+        try:
+            text = self._safe_decode_utf8(discarded, "DISCARDED_TOKENS: ")
+        except Exception:  # noqa: BLE001
+            # Diagnostics must never change the response. This helper runs
+            # inside harmony_output_to_openai's outer try, so letting a decode
+            # error escape would downgrade the whole response to the raw-text
+            # fallback -- precisely on the corrupted-token input this code
+            # exists to report. Fall back to a token-count-only warning.
+            text = ""
+
+        stop_tokens = set(self.get_stop_tokens())
+        # Any recipient other than "assistant" denotes a tool call: mirror the
+        # streaming path's `current_recipient != "assistant"` test rather than
+        # matching only "functions.*", so browser/python recipients are named
+        # too instead of falling through to the no-recipient branch.
+        match = re.search(r"to=([\w.-]+)", text)
+        recipient = match.group(1) if match else None
+        if recipient == "assistant":
+            recipient = None
+
+        if recipient:
+            logger.warning(
+                f"Discarded {len(discarded)} token(s) forming a complete but "
+                f"malformed harmony message; a tool call for "
+                f"{recipient} has been dropped from the response.")
+        elif any(token in stop_tokens for token in discarded):
+            # Complete but malformed, with no recipient to name: a final or
+            # analysis message carrying a stop token. Report the loss without
+            # claiming a tool call was involved.
+            logger.warning(
+                f"Discarded {len(discarded)} token(s) forming a complete but "
+                f"malformed harmony message; its content has been dropped "
+                f"from the response.")
+        else:
+            logger.debug(
+                f"Stripped {len(discarded)} token(s) of an incomplete trailing "
+                f"harmony message.")
 
     def harmony_output_to_openai(
             self,
@@ -1914,12 +1977,17 @@ def _create_usage_info(num_prompt_tokens,
 
 
 def maybe_transform_reasoning_effort(
-    reasoning_effort: ReasoningEffort | Literal["low", "medium", "high"] | None
+    reasoning_effort: ReasoningEffort
+    | Literal["low", "medium", "high", "max", "none"] | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
-        "high": ReasoningEffort.HIGH
+        "high": ReasoningEffort.HIGH,
+        # Kimi-style efforts accepted by the shared request schema; map to
+        # the nearest harmony level ("none" means no explicit effort).
+        "max": ReasoningEffort.HIGH,
+        "none": None,
     }
     if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
         return str_to_effort[reasoning_effort]

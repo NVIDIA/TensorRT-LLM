@@ -56,6 +56,9 @@ public:
     // Unregister from CUDA and unmap. Safe to call multiple times.
     void destroy();
 
+    // Detect whether host registration must be chunked on this kernel. Cached after the first query.
+    static bool shouldUseChunkedRegistration();
+
     MemAddress address() const noexcept
     {
         return mAddr;
@@ -76,9 +79,6 @@ private:
     size_t mSize = 0;
     int mNumRegisteredChunks = 0;
     bool mUseThp = true;
-
-    // Detect kernel version once at startup.
-    static bool shouldUseChunkedRegistration();
 };
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -19,11 +20,25 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .indexer import Indexer, transform_local_topk_and_prepare_pool_view
+from .indexer import (
+    Indexer,
+    transform_local_topk_and_prepare_pool_view,
+    transform_local_topk_and_prepare_pool_view_grouped,
+)
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
+
+# Cross-layer fan-out of the DSA index remap (convert_req_index_to_global). Each
+# full+shared indexer group's per-layer remap launches collapse into a single
+# grouped launch per group (grid.z = group_size), with shared layers consuming a
+# precomputed slice; grouped output is bit-identical to the per-layer path.
+# Enabled by default; set TRTLLM_DISABLE_DSA_GROUP_REMAP=1 to force the per-layer
+# path. Applies only to the generation forward (MLA path); context and MTP draft
+# passes keep the per-layer path. Auto-inert on models without shared indexer
+# layers (every group is a singleton -> per-layer fallback).
+_GROUP_REMAP = os.environ.get("TRTLLM_DISABLE_DSA_GROUP_REMAP", "0") != "1"
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -59,6 +74,8 @@ class DSATrtllmAttention(TrtllmAttention):
             sparse_params = sparse_attention_config.to_sparse_params(layer_idx=layer_idx)
         if sparse_params is None:
             raise ValueError("sparse_params is required for DSATrtllmAttention and cannot be None")
+        kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         TrtllmAttention.__init__(
             self,
             layer_idx,
@@ -125,11 +142,93 @@ class DSATrtllmAttention(TrtllmAttention):
                     : topk_indices.shape[1],
                 ].copy_(topk_indices)
 
-        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation
-        )
+        topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
         return topk_indices_global, None
+
+    def _remap_topk_to_global(
+        self,
+        topk_indices: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        is_generation: bool,
+    ) -> torch.Tensor:
+        """Convert this layer's local top-k to global pool indices.
+
+        Uses the cross-layer fan-out (grouped) remap when enabled and applicable;
+        otherwise the per-layer single-op path (unchanged).
+        """
+        local_layer_idx = self.get_local_layer_idx(metadata)
+
+        # Grouping applies only to the MLA target-verify generation forward.
+        # Context and MTP draft passes keep the per-layer path (draft passes may
+        # reuse a frozen top-k for shared layers that differs from the leader's,
+        # so fan-out is unsafe there; context is excluded to avoid a group-sized
+        # allocation over many tokens).
+        if _GROUP_REMAP and is_generation and not metadata.in_mtp_draft_loop:
+            grouped = self._grouped_remap_topk_to_global(
+                topk_indices, metadata, local_layer_idx, is_generation
+            )
+            if grouped is not None:
+                return grouped
+
+        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
+            topk_indices, metadata, local_layer_idx, is_generation
+        )
+        return topk_indices_global
+
+    def _grouped_remap_topk_to_global(
+        self,
+        topk_indices: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        local_layer_idx: int,
+        is_generation: bool,
+    ) -> Optional[torch.Tensor]:
+        """Grouped fan-out remap for one full+shared indexer group.
+
+        The full (leader) layer computes the batched remap for the whole group in
+        one launch and caches it; each shared layer consumes its precomputed
+        slice. Returns None to signal a fall back to the per-layer path (inactive
+        group, or leader output not yet available).
+
+        Grouped output is bit-identical to the per-layer path by construction;
+        that equivalence is covered by unit tests (see
+        ``tests/unittest/_torch/attention/sparse/test_cpp_custom_ops.py``).
+        """
+        struct = metadata._ensure_group_remap_struct()
+        leader_of = struct.get("leader_of")
+        if leader_of is None or local_layer_idx >= len(leader_of):
+            return None
+        leader = leader_of[local_layer_idx]
+        if leader < 0 or not struct["group_active"].get(leader, False):
+            return None
+        slot = struct["slot_of"][local_layer_idx]
+
+        if self.indexer is not None:
+            # Leader (full-indexer layer): compute the whole group in one launch.
+            batched = transform_local_topk_and_prepare_pool_view_grouped(
+                topk_indices,
+                metadata,
+                struct["group_layer_ids"][leader],
+                struct["group_scale"][leader],
+                is_generation,
+            )
+            metadata._group_remap_batched[leader] = batched
+        else:
+            # Shared layer: read the leader's precomputed batch. The batch is
+            # cleared at every step boundary, so a present entry is from this
+            # forward; still require it to match this layer's group slot and
+            # top-k shape, and otherwise fall back to the per-layer path. This
+            # makes any leader/follower ordering or shape mismatch a safe
+            # per-layer fallback rather than a stale/out-of-bounds read.
+            batched = metadata._group_remap_batched.get(leader, None)
+            if (
+                batched is None
+                or slot >= batched.shape[0]
+                or batched.shape[1:] != topk_indices.shape
+            ):
+                return None
+
+        return batched[slot]
 
     def sparse_kv_predict(
         self,
