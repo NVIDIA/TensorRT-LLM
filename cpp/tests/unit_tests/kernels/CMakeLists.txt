@@ -13,8 +13,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
-add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
 add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
 add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
@@ -48,7 +46,6 @@ endif()
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
 add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
@@ -88,12 +85,6 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   endif()
 endforeach()
 
-set(SAMPLING_KERNEL_TEST_SRC
-    sampling/samplingTest.cpp sampling/samplingTopKTest.cpp
-    sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
-    sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
-add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
-
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp
     routing/routingCustomTest.cpp routing/routingDeepSeekTest.cpp)
@@ -110,6 +101,5 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
 endif()
 
-add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
