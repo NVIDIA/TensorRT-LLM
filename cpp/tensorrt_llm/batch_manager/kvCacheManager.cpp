@@ -498,59 +498,6 @@ bool KVCacheBlock::isDetached() const
     return mLookupNode == nullptr;
 }
 
-// This function calculates the number of block a layer should have, given
-// the total free memory and the window size of each layer.
-// For example, if we have 1 layer of window size 1024, and 2 layer of window
-// size 2048, and 3 layers of 4096.
-// Each layer of window size 1024 should have
-//     1024 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
-// Each layer of window size 2048 should have
-//     2048 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
-// Each layer of window size 4096 should have
-//     4096 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
-// NOTE: Currently the use of this function is not used for
-// BaseKVCacheManager::calculateMaxNumBlocks because the we want to first
-// achieve identical performance as assuming all layers as full attention.
-std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
-    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
-    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
-{
-    if (windowSizeToLayers.size() == 1)
-    {
-        return {{windowSizeToLayers.begin()->first, 1.0f}};
-    }
-
-    std::map<SizeType32, float> windowSizeToContribution;
-
-    SizeType32 cacheSizePerTokenTotal
-        = std::accumulate(windowSizeToCacheSizePerToken.begin(), windowSizeToCacheSizePerToken.end(), SizeType32{0},
-            [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    for (auto const& [windowSize, cacheSizePerToken] : windowSizeToCacheSizePerToken)
-    {
-        auto const cacheSizeWeight = static_cast<float>(cacheSizePerToken) / cacheSizePerTokenTotal;
-        windowSizeToContribution[windowSize] = cacheSizeWeight;
-    }
-
-    for (auto const& [windowSize, _] : windowSizeToLayers)
-    {
-        windowSizeToContribution.at(windowSize) *= windowSize;
-    }
-    auto const windowSizesTotalSum = std::accumulate(windowSizeToContribution.begin(), windowSizeToContribution.end(),
-        0.0, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-
-    std::map<SizeType32, float> windowSizeToShare;
-    for (auto const& [windowSize, windowSizeSum] : windowSizeToContribution)
-    {
-        float const fraction = windowSizeSum / windowSizesTotalSum;
-        TLLM_CHECK(0.0f < fraction && fraction <= 1.0f);
-        windowSizeToShare[windowSize] = fraction;
-    }
-    auto total = std::accumulate(windowSizeToShare.begin(), windowSizeToShare.end(), 0.0f,
-        [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    TLLM_CHECK(total == 1.0f);
-    return windowSizeToShare;
-}
-
 BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, CudaStreamPtr stream,
     SizeType32 maxSequenceLength, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
