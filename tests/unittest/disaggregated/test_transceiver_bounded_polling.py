@@ -41,6 +41,7 @@ from tensorrt_llm.bindings import LlmRequestState
 @dataclass
 class _FakeRequest:
     state: Optional[LlmRequestState] = None
+    py_kv_send_session_retired: bool = False
 
 
 class _FakeTransferWorker:
@@ -310,7 +311,8 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert failed == [13]
     assert session.blocking_calls == [False]
     assert session.closed
-    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert req.state is None
+    assert req.py_kv_send_session_retired
     assert 13 not in transceiver._send_sessions
     assert 13 not in transceiver._send_reqs
 
