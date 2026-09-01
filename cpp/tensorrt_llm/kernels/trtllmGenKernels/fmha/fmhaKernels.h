@@ -200,7 +200,15 @@ public:
                 KernelInfo funcInfo;
                 funcInfo.mMetaInfoIndex = i;
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-                if (kernelMeta.mSharedMemBytes >= 48 * 1024)
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+                if (kernelMeta.mSharedMemBytes + 1024 > 228 * 1024)
+                {
+                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                        CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+                }
+                else
+#endif
+                    if (kernelMeta.mSharedMemBytes >= 48 * 1024)
                 {
                     auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
                         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
@@ -244,6 +252,13 @@ public:
 
     static bool shouldUseNvrtc(FmhaOptions const& options)
     {
+#ifdef TLLM_RUBIN_FEATURES
+        // Spcompress kernels must use precompiled cubins.
+        if (options.mUsesSpcompress)
+        {
+            return false;
+        }
+#endif // TLLM_RUBIN_FEATURES
         // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
@@ -268,6 +283,15 @@ public:
             return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
         }
 
+        // Keep this in sync with the BMM2-N constraints in MmaTraits. Reject unsupported dimensions before
+        // constructing KernelTraits so callers can fall back to another attention backend instead of aborting.
+        bool const isHeadDimVSupported = params.mHeadDimV == 32 || params.mHeadDimV == 64 || params.mHeadDimV == 80
+            || params.mHeadDimV == 128 || (params.mHeadDimV > 0 && params.mHeadDimV % 128 == 0);
+        if (!isHeadDimVSupported)
+        {
+            return std::make_pair(false, "HeadDimV must be 32, 64, 80, 128, or a multiple of 128");
+        }
+
         if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
             || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
         {
@@ -283,8 +307,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -349,8 +373,8 @@ private:
         10752, 11264, 11776, 12288, 13312, 14336, 16384, 20480, 24576, 32768, 40960, 49152, 65536, 98304, 131072};
     // Selection of seqLenQ: typically our prefill kernels would not use JIT and seqLenQ is fixed during decode.
     // However seqLenQ can change when we use generation kernel to do prefill. SeqLenQ is sensitive in the range 1-16.
-    // Below sequence are chosen to cover most sparse attention cases.
-    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {1, 2, 4, 8, 32, 64, 128};
+    // But for prefill we typically face much longer sequence. So we only use a very single datapoint.
+    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {128};
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
@@ -381,8 +405,8 @@ private:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
@@ -482,6 +506,15 @@ public:
         {
             return;
         }
+
+        // Keep the additional fail-fast validation Rubin-only so other architectures retain their existing behavior.
+        // The output and scale-buffer shape are already validated by the Python caller; the inverse-RoPE cache has no
+        // equivalent guard before reaching this ABI boundary.
+        if (mSM == kSM_107 && params.mDsv4EpilogueFusion.enabled)
+        {
+            TLLM_CHECK_WITH_INFO(params.mDsv4EpilogueFusion.cosSinCache != nullptr,
+                "SM107 DSV4 FMHA epilogue fusion requires a non-null inverse-RoPE cos/sin cache.");
+        }
         runJITWarmupGridIfRequested(params);
 
         int32_t ctaDim = 512;
@@ -490,8 +523,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
         // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
@@ -539,14 +572,24 @@ public:
 
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
+        fmha::checkSkipCorrThreshold(options, fmhaData.mMetaData.skipCorrThreshold);
 
         if (shouldUseNvrtc(options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
+            FmhaOptions nvrtcOptions = options;
+#ifdef TLLM_RUBIN_FEATURES
+            // On Rubin, compile non-spcompress NVRTC kernels with Sm100f target for compatibility.
+            if (tg::isArchRubin(options.mCudaArch) && !options.mUsesSpcompress)
+            {
+                nvrtcOptions.mCudaArch = tg::CudaArch::Sm100f;
+            }
+#endif // TLLM_RUBIN_FEATURES
+
             FmhaConfig fmhaConfig;
-            fmhaConfig.mOptions = options;
+            fmhaConfig.mOptions = nvrtcOptions;
             std::ostringstream sstream;
-            populateJsonConfig(options, sstream);
+            populateJsonConfig(nvrtcOptions, sstream);
             fmhaConfig.mGenCfgJsonStr = sstream.str();
 
             fmhaConfig.mExecPath = getExecPath().c_str();
@@ -616,6 +659,43 @@ public:
     }
 
 private:
+    std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelWithCgaSmemReductionLimit(
+        FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
+    {
+        if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
+        {
+            constexpr int kMaxCgaClusterDimX = 16;
+            constexpr int kMinPreSelectCgaClusterDimX = 2;
+            // selectKernel may promote this candidate to CgaSmemReduction and call computeNumCtas
+            // before returning the selected options. Keep the candidate legal for both 1-CTA and
+            // 2-CTA FMHA kernels; the exact selected clusterDimX is applied below.
+            options.mMaxNumCtasPerSeqKv = std::min(options.mMaxNumCtasPerSeqKv,
+                kMaxCgaClusterDimX / std::max(options.mClusterDimX, kMinPreSelectCgaClusterDimX));
+        }
+
+        int32_t ctaDim = 512;
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        limitCgaSmemReductionCtasKv(options);
+        return {options, optionsFromArgs, ctaDim};
+    }
+
+    void limitCgaSmemReductionCtasKv(FmhaOptions& options) const
+    {
+        if (!isCgaSmemReduction(options.mMultiCtasKvMode))
+        {
+            return;
+        }
+        constexpr int kMaxCgaClusterDimX = 16;
+        if (options.mClusterDimX * options.mMaxNumCtasPerSeqKv > kMaxCgaClusterDimX)
+        {
+            TLLM_LOG_WARNING(
+                "CGA reduction is not supported when numCtasPerSeqKv * clusterDimX > 16. Set mMaxNumCtasPerSeqKv to "
+                "16 / clusterDimX");
+            options.mMaxNumCtasPerSeqKv = kMaxCgaClusterDimX / options.mClusterDimX;
+        }
+    }
+
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool groupsHeadsQ,
