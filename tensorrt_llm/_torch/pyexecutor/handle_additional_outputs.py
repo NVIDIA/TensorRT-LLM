@@ -54,7 +54,7 @@ class HandleAdditionalOutputs:
         output_index_with_context = 0
         output_index_without_context = 0
 
-        # Copy additional outputs into decoderBuffers.additional_outputs
+        # Copy additional outputs into the per-request output buffers
         for llm_req in context_requests:
             context_output_length = llm_req.context_chunk_size
 

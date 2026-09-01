@@ -25,7 +25,7 @@
 
 namespace tensorrt_llm
 {
-namespace layers
+namespace runtime
 {
 
 class DefaultDecodingParams
@@ -139,5 +139,5 @@ public:
         return std::vector<runtime::SizeType32>{1};
     }
 };
-} // namespace layers
+} // namespace runtime
 } // namespace tensorrt_llm
