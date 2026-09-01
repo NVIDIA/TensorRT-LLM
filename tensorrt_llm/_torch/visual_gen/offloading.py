@@ -304,9 +304,7 @@ class ModuleOffloadManager:
             try:
                 tensor = getattr(spec.owner, spec.name).detach()
                 # Copy physical storage order so rebinding with the original stride is lossless.
-                tensor_bytes = (
-                    tensor.as_strided((tensor.numel(),), (1,)).view(torch.uint8).cpu()
-                )
+                tensor_bytes = tensor.as_strided((tensor.numel(),), (1,)).view(torch.uint8).cpu()
                 layout.cpu_storage.narrow(0, spec.offset, spec.nbytes).copy_(tensor_bytes)
             except RuntimeError as e:
                 raise RuntimeError(
