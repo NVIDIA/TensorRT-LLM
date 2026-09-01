@@ -29,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
@@ -53,13 +54,12 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   and registered with addPeer() before the first sendTo().
 //
 // Threading
-//   The ROUTER is touched only by the reactor thread (recv). Every DEALER is created,
-//   used and destroyed by ONE dedicated outbound thread. Public addPeer/removePeer
-//   calls enqueue synchronous commands; sendTo is fire-and-forget and only enqueues
-//   the blob. This is stricter than merely serializing calls with a mutex: DEALER is
-//   not a thread-safe zmq socket type, so using one from several application threads
-//   is undefined even when the calls do not overlap. recv() polls the ROUTER with a
-//   timeout so the reactor can interleave getXferStatus polling.
+//   Every ROUTER and DEALER is created, used and destroyed by ONE dedicated control
+//   thread. Public addPeer/removePeer calls enqueue synchronous commands; sendTo is
+//   fire-and-forget and only enqueues the blob. The control thread places received
+//   messages on an application queue for recv(). This is stricter than serializing
+//   calls with a mutex: zmq sockets are not thread-safe, so creating a socket on the
+//   transfer-agent thread and later using it on the reactor thread is also invalid.
 // ============================================================================
 class ZmqControlChannel : public ControlChannel
 {
@@ -94,23 +94,26 @@ private:
         std::shared_ptr<std::promise<void>> removeDone;
     };
 
-    void outboundLoop();
+    void controlLoop(std::string bindAddr, std::promise<std::string> ready);
 
     std::string mSelfName;
     zmq::context_t mCtx;
-    zmq::socket_t mRouter; // receive-only (reactor thread)
-    std::string mEndpoint; // resolved bound endpoint
+    std::string mEndpoint;
 
     std::mutex mQueueMu;
-    std::condition_variable mQueueCv;
     std::deque<OutboundCommand> mOutbound;
     bool mStopping{false};
     std::atomic<bool> mQueueFullWarned{false};
 
-    // Outbound-thread-only. The thread clears this map before it exits so every DEALER is also
-    // destroyed by its sole owning thread.
+    std::mutex mInboundMu;
+    std::condition_variable mInboundCv;
+    std::deque<std::pair<std::string, std::string>> mInbound;
+    std::atomic<bool> mControlStopped{false};
+
+    // Control-thread-only. The thread clears this map before it exits so every DEALER is destroyed
+    // by its sole owning thread. The ROUTER is a local in controlLoop for the same reason.
     std::unordered_map<std::string, zmq::socket_t> mDealers;
-    std::thread mOutboundThread;
+    std::thread mControlThread;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

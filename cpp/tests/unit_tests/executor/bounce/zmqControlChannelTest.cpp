@@ -24,6 +24,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -162,6 +163,40 @@ TEST(ZmqControlChannel, ConcurrentSendersUseOneSocketOwner)
         seen[h.requestId] = true;
     }
     EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) { return value; }));
+}
+
+TEST(ZmqControlChannel, RecvMayRunOutsideConstructionThread)
+{
+    b::ZmqControlChannel sender("crossThreadSender");
+    b::ZmqControlChannel receiver("crossThreadReceiver");
+    sender.addPeer("crossThreadReceiver", receiver.localEndpoint());
+
+    std::promise<std::pair<std::string, std::string>> received;
+    auto result = received.get_future();
+    std::thread reactor(
+        [&receiver, &received]
+        {
+            std::string peer;
+            std::string blob;
+            if (recvRetry(receiver, peer, blob, 4000))
+            {
+                received.set_value({std::move(peer), std::move(blob)});
+            }
+            else
+            {
+                received.set_exception(std::make_exception_ptr(std::runtime_error("message not received")));
+            }
+        });
+
+    sender.sendTo("crossThreadReceiver", b::encodeAck(/*rid=*/9, /*chunk=*/3, /*regionHandle=*/7));
+    auto const status = result.wait_for(std::chrono::seconds(5));
+    reactor.join();
+    ASSERT_EQ(status, std::future_status::ready);
+    auto const [peer, blob] = result.get();
+    EXPECT_EQ(peer, "crossThreadSender");
+    b::BounceMsgHeader header{};
+    ASSERT_TRUE(b::decodeHeader(blob, header));
+    EXPECT_EQ(header.requestId, 9U);
 }
 
 TEST(ZmqControlChannel, SendToDoesNotBlockWhenPeerQueueFull)
