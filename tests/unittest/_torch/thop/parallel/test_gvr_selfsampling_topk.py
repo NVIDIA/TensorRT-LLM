@@ -228,26 +228,16 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
-def _run_varlen_case(
-    kv, next_n, cr, top_k, seed, with_values=False, engine="auto", hint_free=False
-):
+def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
-    batch, rows = len(kv), len(kv) * next_n
+    rows = len(kv) * next_n
     n_r = [(kv[r // next_n] - next_n + (r % next_n) + 1) // cr for r in range(rows)]
     npad = (max(n_r) + 63) // 64 * 64
     gen = torch.Generator(device=_DEV).manual_seed(seed)
     logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
     for r in range(rows):
         logits[r, n_r[r] :] = 3e38  # poison beyond each row's OWN n_r
-    pre_idx = None
-    if not hint_free:
-        pre_idx = torch.empty((batch, top_k), dtype=torch.int32, device=_DEV)
-        for q in range(batch):
-            nmin = max(min(n_r[q * next_n : (q + 1) * next_n]), 1)
-            pre_idx[q] = torch.randint(
-                0, nmin, (top_k,), generator=gen, dtype=torch.int32, device=_DEV
-            )
     indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     values = (
         torch.full((rows, top_k), 7.0, dtype=torch.float32, device=_DEV) if with_values else None
@@ -255,13 +245,11 @@ def _run_varlen_case(
     kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(
         logits,
-        pre_idx,
         kv_lens,
         indices,
         next_n=next_n,
         compress_ratio=cr,
         values=values,
-        engine=engine,
     )
     torch.cuda.synchronize()
     fmin = torch.finfo(torch.float32).min
@@ -287,7 +275,28 @@ def _run_varlen_case(
                 assert torch.equal(values[r], torch.gather(logits[r], 0, idx))
 
 
-@pytest.mark.parametrize("engine", ["auto", "reference"])
+def _reference_varlen_indices(logits, kv_lens, next_n, compress_ratio, top_k):
+    """Build a simple torch reference for the hint-free varlen contract."""
+    reference = torch.full((logits.shape[0], top_k), -1, dtype=torch.int32, device=logits.device)
+    lengths = kv_lens.tolist()
+    for row in range(logits.shape[0]):
+        valid = (
+            max(
+                lengths[row // next_n] - next_n + row % next_n + 1,
+                0,
+            )
+            // compress_ratio
+        )
+        valid = min(valid, logits.shape[1])
+        if valid <= 0:
+            continue
+        if valid <= top_k:
+            reference[row, :valid] = torch.arange(valid, dtype=torch.int32, device=logits.device)
+        else:
+            reference[row] = torch.topk(logits[row, :valid], top_k).indices.to(torch.int32)
+    return reference
+
+
 @pytest.mark.parametrize(
     "kv,next_n,cr,top_k",
     [
@@ -300,76 +309,9 @@ def _run_varlen_case(
     ],
     ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4", "cr4_mtp3"],
 )
-def test_selfsampling_topk_varlen(kv, next_n, cr, top_k, engine):
-    """run_varlen production contract: per-row n from device kv_lens with the
-    MTP window formula, request-level hints, per-row short path — on BOTH the
-    per-row in-kernel engine ("auto") and the b=1 reference loop."""
-    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr, engine=engine)
-
-
-@pytest.mark.parametrize(
-    "kv,next_n,cr,top_k",
-    [
-        ([33000, 8200, 300], 1, 1, 512),
-        ([131075, 32800, 2000], 1, 4, 512),
-        ([9000, 5001], 2, 1, 512),
-        ([65540], 4, 4, 1024),
-        ([40000, 7003], 3, 4, 512),
-    ],
-    ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4", "cr4_mtp3"],
-)
-def test_selfsampling_topk_varlen_hint_free(kv, next_n, cr, top_k):
-    """pre_idx=None (hint-free): the bracket comes from the current row
-    itself; exactness must be identical to the hinted contract."""
-    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr, hint_free=True)
-
-
-def test_selfsampling_topk_varlen_hint_free_reference_rejected():
-    """The b=1 reference loop needs a hint tensor; pre_idx=None must raise."""
-    kv_lens = torch.tensor([9000], dtype=torch.int32, device=_DEV)
-    logits = torch.randn((1, 9024), dtype=torch.float32, device=_DEV)
-    indices = torch.full((1, 512), -7, dtype=torch.int32, device=_DEV)
-    with pytest.raises(RuntimeError, match="auto-engine only"):
-        ss_host.run_varlen(logits, None, kv_lens, indices, engine="reference")
-
-
-def test_selfsampling_topk_varlen_engine_matches_reference():
-    """Differential: the in-kernel engine's per-row value multisets must
-    equal the reference loop's on a mixed batch (deep SPLIT rows, tsh band,
-    short rows, compressed space)."""
-    kv = [524288, 131075, 32800, 2000, 65540, 8192, 262144, 900]
-    top_k, cr = 1024, 4
-    rows = len(kv)
-    n_r = [(v - 1 + 1) // cr for v in kv]
-    npad = (max(n_r) + 63) // 64 * 64
-    gen = torch.Generator(device=_DEV).manual_seed(77)
-    logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
-    for r in range(rows):
-        logits[r, n_r[r] :] = 3e38
-    pre_idx = torch.empty((rows, top_k), dtype=torch.int32, device=_DEV)
-    for q in range(rows):
-        pre_idx[q] = torch.randint(
-            0, max(n_r[q], 1), (top_k,), generator=gen, dtype=torch.int32, device=_DEV
-        )
-    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
-    out_a = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    out_r = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, out_a, compress_ratio=cr)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, out_r, compress_ratio=cr, engine="reference")
-    torch.cuda.synchronize()
-    for r in range(rows):
-        if n_r[r] <= top_k:
-            assert torch.equal(out_a[r], out_r[r]) or torch.equal(
-                torch.sort(out_a[r]).values, torch.sort(out_r[r]).values
-            )
-        else:
-            ga = torch.sort(
-                torch.gather(logits[r], 0, out_a[r].to(torch.int64)) + 0.0, descending=True
-            ).values
-            gr = torch.sort(
-                torch.gather(logits[r], 0, out_r[r].to(torch.int64)) + 0.0, descending=True
-            ).values
-            assert torch.equal(ga, gr), f"row {r}: engine != reference"
+def test_selfsampling_topk_varlen(kv, next_n, cr, top_k):
+    """Validate the hint-free per-row KV-length and MTP window contract."""
+    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr)
 
 
 def test_selfsampling_topk_varlen_values():
@@ -393,90 +335,46 @@ def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
 
 def test_selfsampling_topk_varlen_zero_kv_slot():
     """Padded / evicted CUDA-graph request slots can carry kv_len < next_n
-    (even 0): both engines must emit the empty short row (all -1), not raise —
+    (even 0): the engine must emit the empty short row (all -1), not raise —
     mixed with live MTP rows of another request in the same launch."""
-    for engine in ("auto", "reference"):
-        gen = torch.Generator(device=_DEV).manual_seed(9)
-        logits = torch.randn((8, 8192), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
-        pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
-        kv_lens = torch.tensor([0, 8192], dtype=torch.int32, device=_DEV)
-        indices = torch.full((8, 512), -7, dtype=torch.int32, device=_DEV)
-        for r in range(4, 8):
-            n = 8192 - 4 + (r - 4) + 1
-            logits[r, n:] = 3e38
-        ss_host.run_varlen(
-            logits, pre_idx, kv_lens, indices, next_n=4, compress_ratio=1, engine=engine
-        )
-        torch.cuda.synchronize()
-        assert bool((indices[:4] == -1).all()), f"{engine}: kv=0 rows must be all -1"
-        for r in range(4, 8):
-            n = 8192 - 4 + (r - 4) + 1
-            idx = indices[r].to(torch.int64)
-            assert int(idx.min()) >= 0 and int(idx.max()) < n
-            ref = torch.topk(logits[r, :n], 512).values
-            got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
-            assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values)
-
-
-def test_selfsampling_topk_varlen_wide_buffers_flat_packed():
-    """indices wider than k follow the CUDA flat-packed contract (rows at
-    stride k from the tensor base) IDENTICALLY on both engines."""
-    kv = [9000, 300]
-    top_k, width = 512, 512 + 64
-    gen = torch.Generator(device=_DEV).manual_seed(21)
-    logits = torch.randn((2, 9024), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
-    logits[0, 9000:] = 3e38
-    logits[1, 300:] = 3e38
-    pre_idx = torch.randint(0, 300, (2, top_k), generator=gen, dtype=torch.int32, device=_DEV)
-    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
-    outs = {}
-    for engine in ("auto", "reference"):
-        wide = torch.full((2, width), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(logits, pre_idx, kv_lens, wide, compress_ratio=1, engine=engine)
-        torch.cuda.synchronize()
-        outs[engine] = wide.reshape(-1)[: 2 * top_k].view(2, top_k).clone()
-    packed_a, packed_r = outs["auto"], outs["reference"]
-    # row 0 (kernel row): same value multiset via the SAME packed convention
-    ga = torch.sort(
-        torch.gather(logits[0], 0, packed_a[0].to(torch.int64)) + 0.0, descending=True
-    ).values
-    gr = torch.sort(
-        torch.gather(logits[0], 0, packed_r[0].to(torch.int64)) + 0.0, descending=True
-    ).values
-    assert torch.equal(ga, gr), "wide-buffer packing convention diverged between engines"
-    # row 1 (short row): identity + -1 tail at the packed location, bit-equal
-    expect = torch.cat(
-        [
-            torch.arange(300, dtype=torch.int32, device=_DEV),
-            torch.full((top_k - 300,), -1, dtype=torch.int32, device=_DEV),
-        ]
-    )
-    assert torch.equal(torch.sort(packed_a[1, :300]).values, expect[:300])
-    assert bool((packed_a[1, 300:] == -1).all())
-    assert torch.equal(torch.sort(packed_r[1, :300]).values, expect[:300])
-    assert bool((packed_r[1, 300:] == -1).all())
+    gen = torch.Generator(device=_DEV).manual_seed(9)
+    logits = torch.randn((8, 8192), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    kv_lens = torch.tensor([0, 8192], dtype=torch.int32, device=_DEV)
+    indices = torch.full((8, 512), -7, dtype=torch.int32, device=_DEV)
+    for r in range(4, 8):
+        n = 8192 - 4 + (r - 4) + 1
+        logits[r, n:] = 3e38
+    ss_host.run_varlen(logits, kv_lens, indices, next_n=4, compress_ratio=1)
+    torch.cuda.synchronize()
+    assert bool((indices[:4] == -1).all()), "kv=0 rows must be all -1"
+    for r in range(4, 8):
+        n = 8192 - 4 + (r - 4) + 1
+        idx = indices[r].to(torch.int64)
+        assert int(idx.min()) >= 0 and int(idx.max()) < n
+        ref = torch.topk(logits[r, :n], 512).values
+        got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
+        assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values)
 
 
 def test_selfsampling_topk_varlen_guards():
     logits = torch.randn((2, 8192), dtype=torch.float32, device=_DEV)
-    pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
     indices = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
     kv = torch.tensor([8192, 8192], dtype=torch.int32, device=_DEV)
     with pytest.raises(RuntimeError, match="kv_lens length"):
-        ss_host.run_varlen(logits, pre_idx, kv[:1], indices)
+        ss_host.run_varlen(logits, kv[:1], indices)
     with pytest.raises(RuntimeError, match="not divisible"):
-        ss_host.run_varlen(logits, pre_idx, kv, indices, next_n=3)
+        ss_host.run_varlen(logits, kv, indices, next_n=3)
     with pytest.raises(RuntimeError, match="compress_ratio"):
-        ss_host.run_varlen(logits, pre_idx, kv, indices, compress_ratio=2)
+        ss_host.run_varlen(logits, kv, indices, compress_ratio=2)
     with pytest.raises(RuntimeError, match="CUDA tensor"):
-        ss_host.run_varlen(logits, pre_idx, kv.cpu(), indices)
+        ss_host.run_varlen(logits, kv.cpu(), indices)
     with pytest.raises(RuntimeError, match="num_rows"):
         # request-level-shaped indices under MTP: MUST be rejected (the
         # kernel grid comes from logits rows — silent OOB writes otherwise)
-        ss_host.run_varlen(logits, pre_idx[:1], kv[:1], indices[:1], next_n=2)
+        ss_host.run_varlen(logits, kv[:1], indices[:1], next_n=2)
     with pytest.raises(RuntimeError, match="contiguous"):
         strided = torch.zeros((2, 2), dtype=torch.int32, device=_DEV)[:, 0]
-        ss_host.run_varlen(logits, pre_idx, strided, indices)
+        ss_host.run_varlen(logits, strided, indices)
 
 
 def test_selfsampling_topk_varlen_cuda_graph():
@@ -488,7 +386,6 @@ def test_selfsampling_topk_varlen_cuda_graph():
     rows, top_k, msl = 4, 512, 262144
     npad = msl
     logits = torch.randn((rows, npad), dtype=torch.float32, device=_DEV) - 2.0
-    pre_idx = torch.zeros((rows, top_k), dtype=torch.int32, device=_DEV)
     kv_lens = torch.tensor([100, 4099, 131070, 200000], dtype=torch.int32, device=_DEV)
     indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
 
@@ -502,17 +399,14 @@ def test_selfsampling_topk_varlen_cuda_graph():
         for r in range(rows):
             n = min(kv[r], npad)
             logits[r, n:] = 3e38
-            pre_idx[r] = torch.randint(
-                0, max(n, 1), (top_k,), generator=gen, dtype=torch.int32, device=_DEV
-            )
         return kv
 
     refresh(0)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
+    ss_host.run_varlen(logits, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ss_host.run_varlen(logits, pre_idx, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
+        ss_host.run_varlen(logits, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
     for step in range(1, 6):
         kv = refresh(step)
         indices.fill_(-7)
@@ -635,10 +529,9 @@ def test_selfsampling_topk_varlen_rejects_non_fp32():
     the loud contract message instead of a CuTe typing failure)."""
     logits = torch.randn(1, 8192, device=_DEV, dtype=torch.bfloat16)
     kv = torch.tensor([8000], dtype=torch.int32, device=_DEV)
-    pre = torch.zeros(1, 512, dtype=torch.int32, device=_DEV)
     out = torch.empty(1, 512, dtype=torch.int32, device=_DEV)
     with pytest.raises(RuntimeError, match="float32"):
-        ss_host.run_varlen(logits, pre, kv, out, next_n=1, compress_ratio=4, max_seq_len=32768)
+        ss_host.run_varlen(logits, kv, out, next_n=1, compress_ratio=4, max_seq_len=32768)
 
 
 def test_selfsampling_topk_varlen_zero_window_rows():
@@ -652,9 +545,8 @@ def test_selfsampling_topk_varlen_zero_window_rows():
     rows = kv.numel() * nn
     npad = (msl // cr + 63) // 64 * 64
     logits = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-    pre = torch.zeros(kv.numel(), k, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(logits, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
+    ss_host.run_varlen(logits, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
     torch.cuda.synchronize()
     assert (out[nn:] == -1).all().item(), "n<=0 rows must be fully -1-padded"
     for r in range(nn):
@@ -679,41 +571,10 @@ def test_selfsampling_warmup_row_stride_matches_arena():
     arena = torch.randn(rows, stride, dtype=torch.float32, device=_DEV)
     logits = arena[:, :msl]  # non-contiguous column slice, like serving
     kv = torch.full((rows,), msl, dtype=torch.int32, device=_DEV)
-    pre = torch.zeros(rows, k, dtype=torch.int32, device=_DEV)
     out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        ss_host.run_varlen(logits, pre, kv, out, max_seq_len=msl)
-    g.replay()
-    torch.cuda.synchronize()
-    ref = torch.topk(arena[:, :msl], k, dim=1).values.sort(dim=1).values
-    got = arena.gather(1, out.long().clamp_min(0)).sort(dim=1).values
-    assert torch.equal(ref, got)
-
-
-def test_selfsampling_warmup_hint_free_matches_dispatch():
-    """warmup_varlen(hint_free=True) must compile the launcher key the
-    hint-free dispatch (pre_idx=None) looks up: the key includes the
-    hint-free bit, so a hinted warmup would leave capture uncompiled."""
-    k, msl = 512, 8300
-    stride = (msl + 255) // 256 * 256
-    rows = 2
-    ss_host.warmup_varlen(
-        k,
-        msl,
-        compress_ratio=1,
-        next_n=1,
-        num_rows_list=(rows,),
-        row_stride=stride,
-        hint_free=True,
-    )
-    arena = torch.randn(rows, stride, dtype=torch.float32, device=_DEV)
-    logits = arena[:, :msl]
-    kv = torch.full((rows,), msl, dtype=torch.int32, device=_DEV)
-    out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        ss_host.run_varlen(logits, None, kv, out, max_seq_len=msl)
+        ss_host.run_varlen(logits, kv, out, max_seq_len=msl)
     g.replay()
     torch.cuda.synchronize()
     ref = torch.topk(arena[:, :msl], k, dim=1).values.sort(dim=1).values
@@ -734,24 +595,13 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     rows = batch * nn
     torch.manual_seed(7)
     lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
     kv = torch.tensor([msl_c * cr, 900, nn - 1], dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-    key = (rows, npad, k, msl_c, nn, cr, False)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    key = (rows, npad, k, msl_c, nn, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
-    ss_host.run_varlen(
-        lg,
-        pre,
-        kv,
-        ref,
-        next_n=nn,
-        compress_ratio=cr,
-        max_seq_len=msl_c * cr,
-        engine="reference",
-    )
     torch.cuda.synchronize()
+    ref = _reference_varlen_indices(lg, kv, nn, cr, k)
     for r in range(rows):
         if (ref[r] >= 0).any():
             row = lg[r].float()
@@ -770,15 +620,14 @@ def test_selfsampling_varlen_regclus_cuda_graph():
     rows = 8
     torch.manual_seed(11)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
     kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
     with torch.cuda.graph(g):
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -811,24 +660,13 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
         assert fam == want, (fam, want, k, msl_c)
         msl = msl_c * cr
         lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-        pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
         kv = torch.tensor([msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
-        key = (rows, npad, k, msl_c, nn, cr, False)
+        ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
+        key = (rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
-        ss_host.run_varlen(
-            lg,
-            pre,
-            kv,
-            ref,
-            next_n=nn,
-            compress_ratio=cr,
-            max_seq_len=msl,
-            engine="reference",
-        )
         torch.cuda.synchronize()
+        ref = _reference_varlen_indices(lg, kv, nn, cr, k)
         for r in range(rows):
             if (ref[r] >= 0).any():
                 row = lg[r].float()
@@ -859,27 +697,16 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         assert plan["kernel"] == "clus" and plan["cluster"] == want_cs, plan
         batch = rows // nn
         lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-        pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
         lens = [msl_c * cr, 900, nn - 1, 20000, 40000, 300000, msl_c * cr // 2, 5000]
         kv = torch.tensor(
             [lens[i % len(lens)] for i in range(batch)], dtype=torch.int32, device=_DEV
         )
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-        key = (rows, npad, k, msl_c, nn, cr, False)
+        ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+        key = (rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
-        ss_host.run_varlen(
-            lg,
-            pre,
-            kv,
-            ref,
-            next_n=nn,
-            compress_ratio=cr,
-            max_seq_len=msl_c * cr,
-            engine="reference",
-        )
         torch.cuda.synchronize()
+        ref = _reference_varlen_indices(lg, kv, nn, cr, k)
         for r in range(rows):
             if (ref[r] >= 0).any():
                 row = lg[r].float()
@@ -899,17 +726,16 @@ def test_selfsampling_varlen_clus_cuda_graph():
     rows = 32
     torch.manual_seed(29)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
     kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr, False)
+    key = (rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
     with torch.cuda.graph(g):
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -926,17 +752,16 @@ def test_selfsampling_varlen_reg_cuda_graph():
     rows = 16
     torch.manual_seed(17)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
     kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr, False)
+    key = (rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
     with torch.cuda.graph(g):
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -955,12 +780,11 @@ def test_selfsampling_varlen_full_row_range():
     torch.manual_seed(3)
     for rows in (304, 1024):
         lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-        pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
         kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
         torch.cuda.synchronize()
-        key = (rows, msl_c, k, msl_c, 1, cr, False)
+        key = (rows, msl_c, k, msl_c, 1, cr)
         assert key in ss_host._VARLEN_CACHE, "row count must dispatch in-engine"
         ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
         got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
@@ -997,14 +821,13 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
     rows = batch * nn  # 304 -> route_streaming main family
     torch.manual_seed(5)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
     kv = torch.randint(1, msl_c * cr, (batch,), dtype=torch.int32, device=_DEV)
     kv[0] = msl_c * cr  # full length
     kv[1] = 900  # short (n <= k)
     kv[2] = nn - 1  # zero-window (every row of the request empty)
     kv[3] = k * cr + nn  # just above the short path
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
     kl = kv.tolist()
     for r in range(rows):
