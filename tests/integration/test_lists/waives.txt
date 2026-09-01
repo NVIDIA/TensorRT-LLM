@@ -378,8 +378,6 @@ unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py::TestRingAttention::
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py::test_capture_smoke SKIP (https://nvbugs/6385134)
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_attention.py SKIP (https://nvbugs/6311866)
 unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py::TestWanPipelineParallel::test_cfg2_attn2d2x1_ulysses2_pvae8 SKIP (https://nvbugs/6644465)
-unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BCombinedOptimizations::test_fp8_cache_dit_trtllm SKIP (https://nvbugs/6661914)
-unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_T2V_PipelineCorrectness::test_cosine_similarity SKIP (https://nvbugs/6661914)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_gpu_tensor SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_multiple_chunks SKIP (https://nvbugs/6517836)
