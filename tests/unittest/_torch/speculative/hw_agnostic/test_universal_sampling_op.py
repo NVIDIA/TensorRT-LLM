@@ -19,9 +19,8 @@ the order ``sampler_strategy._compute_probs`` uses and ``docs/source/features/sa
 documents -- not a reimplementation, so a semantic drift in either shows up here.
 
 What is deliberately NOT asserted: equality of sampled token *ids* against the flashinfer
-path. The two consume their RNG differently, so identical ids were never expected and a
-test demanding them would be wrong. Token behavior is checked by support, determinism and
-distribution instead.
+path. The two consume their RNG differently, so identical ids are not expected; token
+behavior is checked by support, determinism and distribution instead.
 """
 
 import pytest
@@ -37,7 +36,7 @@ DISABLE_MINP = 0.0
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not uni.is_available(),
-    reason="requires CUDA and the universal sampling op (set TLLM_UNIVERSAL_SAMPLING_JIT=1 in a checkout)",
+    reason="requires CUDA and a build carrying the universal sampling op",
 )
 
 

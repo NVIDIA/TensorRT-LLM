@@ -345,14 +345,13 @@ def get_spec_metadata(spec_config,
     # the per-mode constructors are easy to miss one of.
     if metadata is not None:
         metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
-        # advanced_sampling_mode has exactly that property, and the warning above was
-        # already earned once: it was threaded through two of the per-mode constructors
-        # and missed by the rest, including eagle3_one_model. The metadata then kept its
-        # FULL default while SpecSampler.validate_request read the real mode off the
-        # config -- so a min_p request was admitted, its buffers were never filled
-        # (fill_min_p reads this field), and the dispatcher routed to the flashinfer
-        # chain, which has no min_p argument at all. min_p was silently ignored end to
-        # end while every unit test passed. Set it in one place so no mode can miss it.
+        # advanced_sampling_mode has exactly that property, and getting it wrong fails
+        # silently rather than loudly: SpecSampler.validate_request reads the mode off the
+        # *config* to decide whether a min_p request is admitted, while the buffer fill
+        # (fill_min_p) and the sampling dispatcher read it off the *metadata*. If the two
+        # disagree the request is accepted, its buffers are never filled, and the
+        # dispatcher routes to a backend that takes no min_p argument -- so the filter is
+        # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
     return metadata
 

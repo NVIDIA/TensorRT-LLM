@@ -509,11 +509,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_eagle3_one_model_min_p_is_greedy_at_one(self):
-        """A2: min_p == 1.0 keeps only the argmax, so it must reproduce greedy exactly.
+        """min_p == 1.0 keeps only the argmax, so it must reproduce greedy exactly.
 
-        0 < min_p < 1 implies sampling, which leaves no deterministic output to diff --
-        so this is the only exact end-to-end assertion the feature admits, and it covers
-        the whole path: admission, the buffer fill, the expanded layout and the kernel.
+        Scope, because it is narrower than it looks: min_p == 1.0 is classified as
+        explicit greedy, so the request normalizes to the disable sentinel and takes the
+        argmax fast path. This asserts the greedy classification end to end; it does NOT
+        exercise the min_p buffers or the fused kernel, and it passes whether or not the
+        filter itself works. The tests that cover the filter are the op-level ones and the
+        min_p ladder in the task's e2e harness.
         """
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
         prompts = [

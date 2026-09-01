@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``get_spec_metadata`` must carry advanced_sampling_mode onto the metadata.
 
-This is the gap that let min_p be silently ignored end to end. The mode has two readers
-that must agree:
+The mode has two readers that must agree:
 
 * ``SpecSampler.validate_request`` reads it off the **config**, and decides whether a
   min_p request is admitted at all;
@@ -11,12 +10,11 @@ that must agree:
   dispatcher read it off the **metadata**, and decide whether the buffers are filled and
   which backend runs.
 
-When the per-mode constructors were threaded by hand, two of them got the field and the
-rest kept the ``FULL`` default -- including eagle3_one_model. The request was admitted,
-its min_p buffers were never filled, and the dispatcher routed to the flashinfer chain,
-which has no min_p argument. Nothing raised, and every op-level and buffer-level unit
-test still passed, because each of them constructs the metadata itself and so asserts on
-a mode the factory never actually produced.
+A disagreement is silent: the request is admitted, its min_p buffers stay at the neutral
+sentinel, and the dispatcher routes to a backend that takes no min_p argument, so the
+filter is dropped without an error. Neither the op-level nor the buffer-level tests can
+see it, because each constructs its own metadata and therefore asserts on a mode the
+factory may never produce.
 
 These tests exercise the factory, which is the only place that disagreement can appear.
 """
@@ -66,10 +64,11 @@ def test_metadata_carries_the_configured_sampling_mode(make_config, mode):
 
 
 def test_universal_is_not_silently_downgraded():
-    """The specific direction that loses min_p, stated on its own.
+    """The one direction that loses min_p, stated on its own.
 
-    Called out separately from the parametrized sweep because this is the failure that
-    actually shipped: UNIVERSAL on the config, FULL on the metadata.
+    UNIVERSAL on the config and FULL on the metadata is the combination that admits a
+    min_p request and then drops the filter, so it is asserted separately from the
+    parametrized sweep rather than left to be inferred from it.
     """
     metadata = get_spec_metadata(
         _eagle3_one_model(AdvancedSamplingMode.UNIVERSAL),

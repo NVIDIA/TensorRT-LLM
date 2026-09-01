@@ -15,10 +15,6 @@
  * limitations under the License.
  */
 
-// This file is compiled two ways and must stay identical under both: by CMake as part of
-// the wheel, and by torch.utils.cpp_extension during development. So it depends only on
-// CUDA, CUB and curand -- no TensorRT-LLM headers beyond its own.
-
 #include "universalSamplingKernels.h"
 
 #include <cfloat>
@@ -38,15 +34,13 @@ namespace
 //! One block owns one row, so the grid is only as wide as the batch, and the best block
 //! size depends on which of the two regimes that puts us in:
 //!
-//! * **Few rows.** At 64 rows on an H200's 132 SMs every block already has an SM to
-//!   itself; what goes unused is the warp slots inside it. A wide block shortens the row's
-//!   critical path. Measured: neutral probs 1.32x -> 0.86x, top_p probs 1.35x -> 0.96x.
-//! * **Many rows.** Blocks now queue for SMs, and a wide block just makes each one longer
-//!   while fitting fewer per SM. Measured going the other way: top_k_top_p tokens
-//!   1.37x -> 1.82x at 256 rows.
+//! * **Few rows.** Every block already has an SM to itself; what goes unused is the warp
+//!   slots inside it, so a wide block shortens the row's critical path.
+//! * **Many rows.** Blocks queue for SMs, and a wide block just makes each one longer while
+//!   fitting fewer per SM.
 //!
-//! So it is chosen per launch rather than fixed. The crossover is between 64 and 256 rows
-//! in the sweep; 128 is the midpoint and neither regime is sharp there.
+//! So it is chosen per launch rather than fixed. The crossover sits between 64 and 256
+//! rows; 128 is the midpoint and neither regime is sharp there.
 constexpr int kNarrowBlock = 512;
 constexpr int kWideBlock = 1024;
 constexpr int kWideBlockMaxRows = 128;
@@ -58,16 +52,13 @@ constexpr int kMaxThreadsPerSm = 2048;
 constexpr int kRadixBits = 8;
 constexpr int kRadixBuckets = 1 << kRadixBits;
 constexpr int kRadixPasses = 32 / kRadixBits;
-//! Private histogram copies, one per group of warps, to cut shared-atomic contention.
-//! 8 copies is 16 KB of shared memory -- affordable, and enough to spread the few buckets
-//! a softmax actually lands in across separate addresses.
+//! Private histogram copies, one per group of warps, spreading the few buckets a softmax
+//! actually lands in across separate addresses.
 //!
-//! 16 rather than 8, paid for out of the gather buffer below. Round 7 tried 16 with the
-//! 4096-entry buffer and did not fit (`ptxas error: uses too much shared data`, 0xc8d0 of
-//! 0xc000); halving the buffer frees the 8 KB that made room. Stage timing says this is
-//! where the money is: at 8 rows and 131072 vocab the descent costs ~22x a full sweep of
-//! the row, so each of its four passes runs ~5x slower than simply reading the same data
-//! -- the signature of serialized shared atomics, not of bandwidth.
+//! The descent's histogram scatter is bound by shared-atomic contention rather than by
+//! bandwidth, so this count governs its cost. 16 copies and a 2048-entry gather buffer
+//! together sit just under the 48 KB static shared-memory limit; raising either means
+//! lowering the other.
 constexpr int kHistCopies = 16;
 //! How many survivors the shared gather buffer holds (8 KB). Past this the descent falls
 //! back to re-reading the row, so the cap is a performance knob, never a correctness one.
@@ -97,45 +88,14 @@ __device__ inline float toFloat(__nv_bfloat16 v)
     return __bfloat162float(v);
 }
 
-//! Per-stage clock, compiled out entirely unless TLLM_USAMP_STAGE_TIMING is defined.
-//! Attribution inside one fused kernel is otherwise guesswork: ncu reports a single kernel,
-//! and the stages differ by more than an order of magnitude depending on a row's filters.
-#ifdef TLLM_USAMP_STAGE_TIMING
-#define USAMP_STAGES 16
-__device__ unsigned long long gUsampStageCycles[USAMP_STAGES];
-
-//! Both __syncthreads() calls make this usable ONLY where the whole block arrives: a mark
-//! inside `if (tid == 0)` or inside a per-pass branch of the descent deadlocks the kernel.
-__device__ inline void usampMark(int slot, long long& last)
-{
-    __syncthreads();
-    if (threadIdx.x == 0)
-    {
-        long long const now = clock64();
-        atomicAdd(gUsampStageCycles + slot, static_cast<unsigned long long>(now - last));
-        last = now;
-    }
-    __syncthreads();
-}
-
-#define USAMP_MARK(slot) usampMark(slot, stageLast)
-#else
-#define USAMP_MARK(slot)                                                                                               \
-    do                                                                                                                 \
-    {                                                                                                                  \
-    } while (0)
-#endif
-
 //! Bytes moved by one vector load. 16 is the widest a single instruction issues.
 constexpr int kVecBytes = 16;
 
 //! \brief Sweep one row, 16 bytes per thread per step, calling ``fn(index, logit)``.
 //!
 //! Every stage of this kernel is a full sweep of [vocabSize], so how efficiently one
-//! sweep reads memory multiplies through all of them. Scalar 4-byte loads leave most of
-//! the achievable bandwidth on the table; measurement put a two-pass neutral row at ~1.5x
-//! of flashinfer's two-pass softmax, which is a per-pass efficiency gap, not a pass-count
-//! one.
+//! sweep reads memory multiplies through all of them, and scalar 4-byte loads leave most
+//! of the achievable bandwidth unused.
 //!
 //! Falls back to scalar when the row is not 16-byte aligned or not a whole number of
 //! vectors. Both are properties of the base pointer and vocabSize, so the branch is
@@ -292,9 +252,6 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
     long long targetCount, float targetMass, bool byCount, int* sCount, float* sMass, float* sCand, int* sCandCount,
     int* sBucketCount, int* sChosen, long long* sCountHi, float* sMassHi, bool* sFired)
 {
-#ifdef TLLM_USAMP_STAGE_TIMING
-    long long stageLast = clock64();
-#endif
     uint32_t prefix = 0u;
     uint32_t fixedMask = 0u;
     long long countHi = 0;
@@ -521,8 +478,6 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
             useShared = *sCandCount <= kCandCap;
             __syncthreads();
         }
-        // End of the pass body: block-uniform, which is what the mark requires.
-        USAMP_MARK(8 + pass);
     }
 
     return __uint_as_float(prefix);
@@ -534,10 +489,9 @@ __device__ float findThreshold(T const* rowLogits, int vocabSize, float tempInv,
 //! instantiations wants an occupancy bound, and __launch_bounds__ lives on the entry
 //! point. Writing it as a template-dependent expression on a single __global__ does not
 //! work: naming any bound changes what ptxas does even where the expression is the
-//! architectural default. Measured, at 1024 rows / 131072 vocab, `__launch_bounds__(1024,
-//! 1)` on the probs instantiation -- nominally the no-bound assumption -- cost 1.20-1.29x
-//! against no attribute at all. So the bounded case gets its own entry point and every
-//! other instantiation keeps none.
+//! architectural default: `__launch_bounds__(1024, 1)` on an instantiation that wants no
+//! bound is measurably worse than no attribute at all. So the bounded case gets its own
+//! entry point and every other instantiation keeps none.
 //! \brief Fused temperature + min-p + top-k + top-p + (probs | sampling), one block per row.
 template <typename T, int BLOCK, bool NEED_TOKENS, bool NEED_PROBS>
 __device__ void universalSamplingBody(UniversalSamplingParams const& params)
@@ -549,9 +503,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     float* rowProbs = NEED_PROBS ? params.outputProbs + static_cast<size_t>(row) * vocabSize : nullptr;
 
     RowParams const rp = loadRowParams(params, row);
-#ifdef TLLM_USAMP_STAGE_TIMING
-    long long stageLast = clock64();
-#endif
 
     using BlockReduceF = cub::BlockReduce<float, BLOCK>;
     using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, BLOCK>;
@@ -593,9 +544,8 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
 
     // --- Pass 1: online softmax -- max, total mass and argmax in a SINGLE read of the
     //     row (Milakov & Gimelshein). The naive form needs two, one for the max and one
-    //     for the sum, and measurement showed that second pass is exactly what put a
-    //     neutral `probs` row at ~1.5x of flashinfer's two-pass softmax. The argmax rides
-    //     along for free and is the fallback if the inverse-CDF walk falls off the end.
+    //     for the sum, and that second pass is pure overhead here. The argmax rides along
+    //     for free and is the fallback if the inverse-CDF walk falls off the end.
     OnlineSoftmax local{-FLT_MAX, 0.0f, 0};
     forEachLogit(rowLogits, vocabSize,
         [&](int i, float logit) {
@@ -610,7 +560,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     }
     __syncthreads();
     float const maxScaled = sMaxScaled;
-    USAMP_MARK(0); // pass 1: online softmax
 
     // --- Pass 2: only min-p needs one, and only because its cutoff is relative to the max
     //     -- which pass 1 does not know until it ends, so the filtered mass cannot be
@@ -650,9 +599,8 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     // stays valid across rounds because every support this loop builds still contains the
     // kept set.
     //
-    // This is the stage the measurements pointed at: at 64 rows the descent is 77-83% of a
-    // filtered tokens call, and a descent-free row already runs ~3x faster than
-    // flashinfer's filtered tokens path. Removing it is worth more than tuning it.
+    // The descent dominates a filtered tokens call, so removing it outright is worth more
+    // than tuning it.
     //
     // Two things keep a row out of here, and they are different in kind.
     //
@@ -661,12 +609,12 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     // caller chose and which sits near 0.9 in practice, so the loop ends in about one
     // round. top-k keeps k *entries*, and what mass they carry is a property of the
     // logits: on a flat row, 50 of 131072 hold almost nothing and the support has to be
-    // whittled down instead. Measured at 64 rows: routing top-k through here cost
-    // 188us -> 250us at 131072 vocab, while top-p gained 208us -> 76us. (At 32000 vocab
-    // top-k did gain, 56us -> 36us -- so the real predicate is how peaked the row is,
-    // not which filter is set. Estimating that from pass 1's mass is left alone here;
-    // "no top-k" is the rule that is right for the reason stated rather than by
-    // coincidence of vocabulary size.)
+    // whittled down instead, and rejection then costs more than the descent it replaced.
+    //
+    // The sharper predicate is how peaked the row is rather than which filter is set --
+    // a top-k row over a small vocabulary does gain here. Estimating peakedness from
+    // pass 1's mass is left undone; "no top-k" is the rule that holds for the reason
+    // stated rather than by coincidence of vocabulary size.
     //
     // top-k AND top-p together, because top-p's target is a fraction of the *post-top-k*
     // mass, which nothing knows without solving for the top-k cutoff first. Subsumed by
@@ -829,7 +777,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         }
     }
 
-    USAMP_MARK(1); // pass 2: min-p re-total
     // --- Pass 3: the rank/mass thresholds, skipped wholesale when neither top-k nor
     //     top-p is active. This is the only expensive stage, and the only one a neutral
     //     row -- or a neutral row in a mixed batch -- does not run at all.
@@ -856,8 +803,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         //
         // When neither of those ran the threshold is still 0, nothing has been removed,
         // and that mass is the total pass 1 already produced -- so the sweep is pure
-        // waste. That is exactly the top-p-only row, which measurement left as the worst
-        // remaining case.
+        // waste, which is exactly what a top-p-only row would pay.
         if (threshold > 0.0f)
         {
             float localSurviving = 0.0f;
@@ -888,7 +834,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         threshold = fmaxf(threshold, topPThreshold);
     }
 
-    USAMP_MARK(2); // pass 3: descent
     // --- Pass 4: kept mass. Skipped when no filter can have removed anything, in which
     //     case pass 2's total already is the kept mass.
     //
@@ -931,7 +876,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         haveLocalKept = false;
     }
 
-    USAMP_MARK(3); // pass 4: kept mass
     // --- Pass 5: the renormalized distribution.
     if (NEED_PROBS)
     {
@@ -970,7 +914,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         }
     }
 
-    USAMP_MARK(4); // pass 5: probs write
     // --- Pass 6: inverse-CDF sample over the kept weights.
     if (NEED_TOKENS)
     {
@@ -1046,16 +989,6 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
             params.outputTokens[row] = sToken >= 0 ? sToken : sArgMax;
         }
     }
-#ifdef TLLM_USAMP_STAGE_TIMING
-    USAMP_MARK(5); // pass 6: sampling
-    __syncthreads();
-    if (row == 0 && threadIdx.x == 0)
-    {
-        printf("[USAMP] softmax=%llu descent=%llu probs=%llu | pass0=%llu pass1=%llu pass2=%llu pass3=%llu\n",
-            gUsampStageCycles[0], gUsampStageCycles[2], gUsampStageCycles[4], gUsampStageCycles[8],
-            gUsampStageCycles[9], gUsampStageCycles[10], gUsampStageCycles[11]);
-    }
-#endif
 }
 
 //! The generic entry point: no __launch_bounds__, so ptxas compiles every instantiation
@@ -1070,10 +1003,10 @@ __global__ void universalSamplingKernel(UniversalSamplingParams params)
 //!
 //! The rejection loop costs registers: 47 at BLOCK=512 against 32 for the other output
 //! shapes. 512 threads x 47 registers fits 2 blocks in an SM's 65536 where 32 fits 4, and
-//! that halving showed up as a 1.24-1.34x regression at 1024 rows -- on cases that never
-//! enter the loop at all, since top-k rows take the descent. Naming the target trades a
-//! 4-byte spill for the occupancy, which is the right way round for a kernel reading half a
-//! megabyte per row.
+//! and that halving costs more than the spill avoided -- including on rows that never enter
+//! the loop, since top-k rows take the descent. Naming the target trades a small spill for
+//! the occupancy, which is the right way round for a kernel reading half a megabyte per
+//! row.
 //!
 //! Only the narrow block. The wide block is the few-rows regime, where a block already owns
 //! its SM and capping registers would buy nothing while the spill still cost.

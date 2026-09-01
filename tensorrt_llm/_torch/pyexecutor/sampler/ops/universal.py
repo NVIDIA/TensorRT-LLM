@@ -38,10 +38,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-
-from . import universal_jit
-
 _OP_NAMES = (
     "universal_sample_from_logits",
     "universal_sample_from_logits_with_probs",
@@ -54,25 +50,16 @@ def _ops_registered() -> bool:
 
 
 def is_available() -> bool:
-    """Whether the op can be called, building it via JIT if that was asked for.
-
-    The compiled op wins when the wheel carries it; the JIT path is a development
-    convenience and never overrides a real build.
-    """
-    if _ops_registered():
-        return True
-    if universal_jit.jit_requested():
-        return universal_jit.load() and _ops_registered()
-    return False
+    """Whether the op is present in this build."""
+    return _ops_registered()
 
 
 def ensure_available() -> None:
     if is_available():
         return
     raise RuntimeError(
-        "the universal sampling op is not available in this build. It ships compiled in "
-        f"the wheel; in a development checkout set {universal_jit.ENV_FLAG}=1 to build it "
-        "with ninja instead."
+        "the universal sampling op is not available in this build; it is compiled into "
+        "the C++ extension, so a build that predates it will not have it."
     )
 
 
@@ -149,8 +136,3 @@ def _register_fake_impls() -> None:
 
 if _ops_registered():
     _register_fake_impls()
-elif universal_jit.jit_requested():
-    if universal_jit.load() and _ops_registered():
-        _register_fake_impls()
-    else:
-        logger.warning("universal sampling JIT build did not register the ops")
