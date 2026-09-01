@@ -354,7 +354,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
-    prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
+    # num_prompt_tokens stays None until a prompt length is recorded, and only
+    # the usage branches below consume it, so offset it only once it exists.
+    prompt_tokens = args.num_prompt_tokens
+    if prompt_tokens is not None:
+        prompt_tokens -= args.num_prompt_tokens_offset
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
