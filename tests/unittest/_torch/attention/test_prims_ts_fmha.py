@@ -730,7 +730,7 @@ def test_kv_page_offset_uses_v2_manager_displacement() -> None:
     )
 
     assert (
-        fmha_utils._get_kv_page_offset(
+        fmha_utils.get_kv_page_offset(
             fmha.attn,
             metadata,
             0,
@@ -756,7 +756,7 @@ def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
     )
 
     assert (
-        fmha_utils._get_kv_page_offset(
+        fmha_utils.get_kv_page_offset(
             fmha.attn,
             metadata,
             1,

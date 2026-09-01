@@ -37,7 +37,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .utils import _get_kv_page_offset
+from .utils import get_kv_page_offset
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
@@ -420,7 +420,7 @@ class PrimsTSFmha(PhasedFmha):
 
         if (
             not is_mla
-            and _get_kv_page_offset(
+            and get_kv_page_offset(
                 attn,
                 meta,
                 0,
@@ -1112,7 +1112,7 @@ class PrimsTSFmha(PhasedFmha):
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_pool is None or block_tables is None:
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
-        kv_page_offset = _get_kv_page_offset(
+        kv_page_offset = get_kv_page_offset(
             attn,
             meta,
             params.seq_offset,
@@ -1277,7 +1277,7 @@ class PrimsTSFmha(PhasedFmha):
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_pool is None or block_tables is None:
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
-        kv_page_offset = _get_kv_page_offset(
+        kv_page_offset = get_kv_page_offset(
             attn,
             meta,
             params.seq_offset,
