@@ -350,7 +350,7 @@ class CUDAGraphRunner:
             getattr(spec_metadata, "is_all_greedy_sample", True))
 
         # Sampling tier this graph must contain. Only meaningful when the fast
-        # sampler is enabled; otherwise it stays None so every batch shares one
+        # sampler is enabled; otherwise it stays FULL so every batch shares one
         # graph and sampling runs eagerly after the forward, as before.
         sample_type = self._resolve_sample_type(batch)
 
