@@ -495,7 +495,6 @@ private:
         TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration);
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
-    void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
 
     void _evictOutOfWindowBlocks(int historyLength)
