@@ -1388,7 +1388,7 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
 
 
-@pytest.mark.parametrize("mode", ["e2e", "e2e_time_breakdown", "gen_only"])
+@pytest.mark.parametrize("mode", ["e2e", "gen_only"])
 def test_parse_args_accepts_every_forwarded_benchmark_mode(tmp_path, mode):
     """--benchmark-mode must admit every mode submit.py can forward.
 
@@ -1397,8 +1397,10 @@ def test_parse_args_accepts_every_forwarded_benchmark_mode(tmp_path, mode):
     a mode missing from these choices makes the precheck srun die in argparse --
     before the workload starts, and for a reason that reads as a launch failure
     rather than an unsupported mode. resolve_plan only distinguishes gen_only;
-    the others are accepted precisely because the KV transfer they precheck is
-    the same.
+    e2e is accepted precisely because the KV transfer it prechecks is the same.
+
+    An instrumentation modifier such as `time_breakdown` is a separate test-id
+    segment and is never forwarded here, which is what keeps this list closed.
     """
     args = rp.parse_args(
         [
@@ -1417,11 +1419,14 @@ def test_parse_args_accepts_every_forwarded_benchmark_mode(tmp_path, mode):
     assert args.benchmark_mode == mode
 
 
-def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path):
-    """The widened choices list must stay a gate, not become a free-text field.
+@pytest.mark.parametrize("mode", ["e2e_time_breakdown", "time_breakdown", "ctx_only"])
+def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path, mode):
+    """The choices list must stay a gate, not become a free-text field.
 
     A typo'd mode has to fail here, where the message names the argument, rather
-    than silently resolving to the e2e plan.
+    than silently resolving to the e2e plan. The fused spelling
+    `e2e_time_breakdown` and a bare modifier are rejected for the same reason: a
+    caller passing either is a caller that has not split the axis.
     """
     with pytest.raises(SystemExit):
         rp.parse_args(
@@ -1435,6 +1440,6 @@ def test_parse_args_still_rejects_an_unknown_benchmark_mode(tmp_path):
                 "--work-dir",
                 str(tmp_path),
                 "--benchmark-mode",
-                "e2e_time_breakdwon",
+                mode,
             ]
         )

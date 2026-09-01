@@ -22,15 +22,17 @@ jenkins/scripts/perf/disaggregated/submit.py.
 Three test shapes are supported (all flow through the same parsing logic):
   1. Multi-node aggregated:        aggr[_upload]-{config_base}-{server_name}
         runtime_mode = "aggregated", benchmark_mode = None
-  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only-{config_base}
+  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only[-{modifier}]-{config_base}
         runtime_mode = "aggregated", benchmark_mode = "ctx_only"
         (reads disagg yaml, but launches via the aggregated single-pytest path
          using the ctx worker's parallel sizes)
-  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|e2e_time_breakdown|gen_only}-{config_base}
-        runtime_mode = "disaggregated", benchmark_mode in
-        {"e2e", "e2e_time_breakdown", "gen_only"}
-        (e2e_time_breakdown launches exactly like e2e -- it differs only in what
-         the harness asks the servers and the client to record)
+  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}[-{modifier}]-{config_base}
+        runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+
+The optional {modifier} segment is an instrumentation flag that is orthogonal to
+the benchmark mode; the only one today is "time_breakdown", which launches
+exactly like its bare mode and differs only in what the harness asks the servers
+and the client to record.
 
 Test name → yaml folder mapping mirrors test_perf_sanity.py:parse_test_string.
 """
@@ -64,6 +66,12 @@ def _import_precheck_config(llm_src):
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
+
+# Optional instrumentation segments that may follow the benchmark mode in a test
+# id. Keep in sync with test_perf_sanity.py:TEST_ID_MODIFIERS -- the grammar is
+# only decidable because no config file stem starts with one of these.
+TIME_BREAKDOWN_MODIFIER = "time_breakdown"
+TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 
 
 # --------------------------------------------------------------------------- #
@@ -319,11 +327,25 @@ def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_gr
     return selected[0]
 
 
+def _split_modifiers(rest, bracket_content):
+    """Peel the optional modifier segment off the front of the config stem.
+
+    Mirrors test_perf_sanity.py:parse_test_string.split_modifiers.
+    Returns (time_breakdown, config_base_name).
+    """
+    time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
+    if time_breakdown:
+        rest = rest[1:]
+    if not rest:
+        raise ValueError(f"Test name has a modifier but no config: {bracket_content}")
+    return time_breakdown, "-".join(rest)
+
+
 def parse_test_case_name(llm_src, selected_line):
     """Parse the selected test-list line.
 
-    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode).
-    See the module docstring for the supported test name shapes.
+    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode,
+    time_breakdown). See the module docstring for the supported test name shapes.
     """
     line = selected_line
 
@@ -335,30 +357,31 @@ def parse_test_case_name(llm_src, selected_line):
     if len(parts) < 2:
         raise ValueError(f"Invalid test name (need at least prefix and config): {bracket_content}")
 
+    time_breakdown = False
     prefix = parts[0]
     if "disagg" in prefix:
         if len(parts) < 3:
             raise ValueError(
                 f"Invalid disagg test format. Expected disagg[_upload]-"
-                f"{{e2e|e2e_time_breakdown|gen_only}}-{{config_base}}, got: {bracket_content}"
+                f"{{e2e|gen_only}}[-{{modifier}}]-{{config_base}}, got: {bracket_content}"
             )
         benchmark_mode = parts[1]
-        if benchmark_mode not in ("e2e", "e2e_time_breakdown", "gen_only"):
+        if benchmark_mode not in ("e2e", "gen_only"):
             raise ValueError(
-                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e', "
-                f"'e2e_time_breakdown' or 'gen_only'."
+                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
             )
         runtime_mode = "disaggregated"
         server_name = None
-        config_base_name = "-".join(parts[2:])
+        time_breakdown, config_base_name = _split_modifiers(parts[2:], bracket_content)
         config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
     elif "aggr" in prefix:
         if len(parts) > 2 and parts[1] == "ctx_only":
-            # ctx_only: aggr[_upload]-ctx_only-{config_base}; reads disagg yaml.
+            # ctx_only: aggr[_upload]-ctx_only[-{modifier}]-{config_base};
+            # reads disagg yaml.
             benchmark_mode = "ctx_only"
             runtime_mode = "aggregated"
             server_name = None
-            config_base_name = "-".join(parts[2:])
+            time_breakdown, config_base_name = _split_modifiers(parts[2:], bracket_content)
             config_yaml_path = os.path.join(
                 llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml"
             )
@@ -385,7 +408,7 @@ def parse_test_case_name(llm_src, selected_line):
     if not os.path.exists(config_yaml_path):
         raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
 
-    return config_yaml_path, server_name, benchmark_mode, runtime_mode
+    return config_yaml_path, server_name, benchmark_mode, runtime_mode, time_breakdown
 
 
 # --------------------------------------------------------------------------- #
@@ -812,7 +835,9 @@ def main():
     )
     if selected_test_skipped:
         print("Selected test is SKIP-waived; cache-transceiver precheck will not run")
-    config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
+    # time_breakdown only changes what the harness records, never the launch
+    # topology or the mode token handed to the precheck, so it is unused here.
+    config_yaml, server_name, benchmark_mode, runtime_mode, _time_breakdown = parse_test_case_name(
         args.llm_src,
         selected_test_line,
     )

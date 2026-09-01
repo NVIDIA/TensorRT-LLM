@@ -24,14 +24,14 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 | List | Count | Contents |
 |------|-------|----------|
 | `MAXIMIZE_METRICS` | 8 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) + spec-decoding `d_al` |
-| `MINIMIZE_METRICS` | 14 + 108 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of `e2e_time_breakdown` |
+| `MINIMIZE_METRICS` | 14 + 108 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
 
 **Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 
 A newly added gated metric has no baseline history, and `check_regression` skips any metric whose baseline is absent or non-positive (`continue`), so the median cannot fail a build until enough runs accrue.
 
-#### `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (gen_only, e2e, e2e_time_breakdown)
+#### `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (gen_only, e2e)
 
 Uploaded for every mode in `DEVICE_STEP_TIME_MODES`, but **gated only in `gen_only`** (see the override above). In `e2e` the gen workers do pure decode — the ctx workers do the prefill — so the statistic means the same thing it does in `gen_only`, and it is there to attribute an `e2e` throughput or TTFT regression to the device side rather than to declare one. `ctx_only` is excluded by construction: it runs the *aggregated* runtime from a disagg YAML with no gen worker, so there is no `gen_server_*.log` to read; TTFT is the prefill signal there.
 
@@ -73,7 +73,7 @@ build a baseline. They are the same for every deployment mode
 
 | Key | Why |
 |-----|-----|
-| `s_test_case_name` | `<server_config.name>-<client_config.name>` for aggregated, `<e2e\|ctx_only\|gen_only>-<disagg stem>-<client_config.name>` for disaggregated. Already encodes every fixed parameter of the case: model, parallelism, ISL/OSL, concurrency. |
+| `s_test_case_name` | `<server_config.name>-<client_config.name>` for aggregated, `<e2e\|ctx_only\|gen_only>[-<modifier>]-<disagg stem>-<client_config.name>` for disaggregated. Already encodes every fixed parameter of the case: model, parallelism, ISL/OSL, concurrency. |
 | `s_gpu_type` | The same case name runs on more than one GPU type. |
 | `s_runtime` | The same case name runs on both `aggr_server` and `multi_node_aggr_server`. |
 | `s_branch` | Release branches keep their own baseline rather than blending into `main`'s. |
@@ -107,9 +107,10 @@ a case silently costs it its history and its next pre-merge regression check, so
 `multi_round` should be treated as a workload parameter, not a knob to sweep.
 
 `s_benchmark_mode` is deliberately excluded: it is null on every aggregated record
-and exactly equals the test case name's prefix on every disaggregated one, so it
-adds no information while breaking matching against records written before the
-field existed (`benchmark_data_matches` treats `None` and `"e2e"` as different).
+and exactly equals the test case name's prefix on every disaggregated one
+(modifier segment included), so it adds no information while breaking matching
+against records written before the field existed (`benchmark_data_matches` treats
+`None` and `"e2e"` as different).
 
 `match_mode: scenario` in the server yamls is now inert — not forking a case on a
 config change is the default for every case.
@@ -291,6 +292,45 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{disagg config file base na
 ```
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
 ```
+
+### The optional instrumentation modifier
+
+The three shapes that read a disaggregated config (2, 3 and 4 above) take one
+**optional** extra segment between the benchmark mode and the config stem:
+
+```
+perf/test_perf_sanity.py::test_e2e[<prefix>-<mode>[-<modifier>]-<disagg config file base name>]
+```
+
+`<modifier>` comes from a closed vocabulary (`TEST_ID_MODIFIERS` in
+`test_perf_sanity.py`), and the only member today is `time_breakdown`:
+
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-time_breakdown-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+A modifier is **orthogonal to the mode**. It selects extra instrumentation — for
+`time_breakdown`, `return_perf_metrics` plus `num_postprocess_workers: 0` on the
+workers, `--save-request-time-breakdown` on the client, and the 108 `d_tb_*`
+lifecycle-span fields on the uploaded document — while the mode continues to
+decide *what workload runs*. Shape 1 has no modifier slot: there, the segment
+after the prefix is the config stem itself and the remainder is the server-config
+name. Anything downstream that needs a benchmark mode
+(notably `run_precheck.py --benchmark-mode`) is handed the bare `<mode>`, which is
+why the modifier does not have to be enumerated in those whitelists.
+
+Two consequences worth knowing:
+
+- **The stem is whatever follows the mode and the optional modifier**, not a fixed
+  segment count. Disagg stems routinely contain `-` (`..._ccb-NIXL`), so the
+  grammar is only decidable because no config file stem begins with a modifier
+  name. `get_disagg_test_cases` asserts that at import time, so a future colliding
+  filename fails collection loudly instead of resolving to the wrong YAML.
+- **A modified case is its own baseline series.** The modifier is part of
+  `s_test_case_name`, and for `time_breakdown` that is required rather than
+  incidental: `num_postprocess_workers: 0` measurably changes throughput, so its
+  aggregate numbers are deliberately not comparable to the sibling unmodified
+  case.
 
 ## CI Test Database
 

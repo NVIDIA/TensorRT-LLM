@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the ``e2e_time_breakdown`` perf-sanity mode's metric plumbing.
+"""Tests for the ``time_breakdown`` perf-sanity modifier's metric plumbing.
 
 The mode has a three-hop contract, and each hop fails *silently* if it drifts:
 
@@ -158,12 +158,17 @@ def test_metric_names_cover_every_metric_and_statistic():
         assert name.startswith("tb_")
 
 
-def test_every_case_type_the_harness_maps_is_one_the_parser_supports():
-    """A mode mapped to an unsupported case type would upload 108 zeros."""
+def test_every_benchmark_mode_is_one_the_parser_supports():
+    """The case type IS the benchmark mode now -- no map in between.
+
+    ``_append_time_breakdown_metrics`` feeds ``record["benchmark_mode"]``
+    straight to the parser, so the two vocabularies have to be the same set. A
+    mode the parser did not know would silently skip aggregation instead of
+    uploading, and the run would fail only on the "parsed no lines" check.
+    """
     from defs.perf.time_breakdown_metrics import MODE_GROUPS
 
-    for mode, case_type in _sanity.TIME_BREAKDOWN_CASE_TYPE.items():
-        assert case_type in MODE_GROUPS, f"{mode} -> {case_type}"
+    assert set(MODE_GROUPS) == {"ctx_only", "gen_only", "e2e"}
 
 
 @pytest.mark.parametrize("stat", ["mean", "median", "p75", "p99"])
@@ -265,19 +270,19 @@ def _parsed_metrics(**extra):
     return metrics
 
 
-def test_add_perf_metric_value_uploads_only_in_the_new_mode():
+def test_add_perf_metric_value_uploads_only_with_the_modifier():
     metrics = _parsed_metrics(tb_ctx_queue_median=4.5, tb_gen_kv_transfer_p99=41.25)
 
     new_data = {}
     _sanity.add_perf_metric_value(
-        new_data, metrics, spec_decoding=False, benchmark_mode=_sanity.E2E_TIME_BREAKDOWN_MODE
+        new_data, metrics, spec_decoding=False, benchmark_mode="e2e", time_breakdown=True
     )
     assert new_data["d_tb_ctx_queue_median"] == pytest.approx(4.5)
     assert new_data["d_tb_gen_kv_transfer_p99"] == pytest.approx(41.25)
 
-    # The same parsed dict in e2e mode must not grow any d_tb_* field: the two
-    # modes share every other metric name, and an e2e case that started
-    # uploading breakdown fields would fork its own history series.
+    # The same parsed dict without the modifier must not grow any d_tb_* field:
+    # the two cases share every other metric name, and a plain e2e case that
+    # started uploading breakdown fields would fork its own history series.
     e2e_data = {}
     _sanity.add_perf_metric_value(e2e_data, metrics, spec_decoding=False, benchmark_mode="e2e")
     assert not [key for key in e2e_data if key.startswith("d_tb_")]
@@ -290,6 +295,7 @@ def test_add_perf_metric_value_skips_a_missing_span():
         new_data,
         _parsed_metrics(tb_gen_kv_transfer_median=None),
         spec_decoding=False,
-        benchmark_mode=_sanity.E2E_TIME_BREAKDOWN_MODE,
+        benchmark_mode="e2e",
+        time_breakdown=True,
     )
     assert "d_tb_gen_kv_transfer_median" not in new_data

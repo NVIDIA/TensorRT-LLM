@@ -335,7 +335,7 @@ def test_jsonl_record_still_strips_absent_kv_transfer_timestamps():
 def test_header_derived_record_yields_twelve_non_zero_spans(tmp_path):
     """The acceptance test for the transport: 12/12 spans, each exactly right.
 
-    This is what the ``e2e_time_breakdown`` perf-sanity mode uploads. A span that
+    This is what the ``time_breakdown`` perf-sanity modifier uploads. A span that
     computes to 0 is reported by the tool as "0 ms", not as missing data, so
     without this test a silently collapsed span would land in OpenSearch as a
     real-looking measurement.

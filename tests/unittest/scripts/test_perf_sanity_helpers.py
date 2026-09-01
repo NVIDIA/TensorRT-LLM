@@ -218,7 +218,7 @@ def test_append_time_breakdown_metrics_reads_the_configured_dir(
         {
             "output_index": 0,
             "benchmark_file_path": str(benchmark_log),
-            "benchmark_mode": perf_sanity.E2E_TIME_BREAKDOWN_MODE,
+            "benchmark_mode": "e2e",
         }
     ]
     commands = perf_sanity.DisaggTestCmds(
@@ -286,7 +286,7 @@ def test_append_time_breakdown_metrics_without_any_jsonl_is_not_fatal(tmp_path: 
             {
                 "output_index": 0,
                 "benchmark_file_path": str(benchmark_log),
-                "benchmark_mode": perf_sanity.E2E_TIME_BREAKDOWN_MODE,
+                "benchmark_mode": "e2e",
             }
         ],
         outputs,
@@ -825,7 +825,7 @@ def test_add_perf_metric_value_skips_absent_statistics() -> None:
     assert "d_p99_gen_worker_per_iter_device_step_time" not in new_data
 
 
-@pytest.mark.parametrize("mode", ["gen_only", "e2e", perf_sanity.E2E_TIME_BREAKDOWN_MODE])
+@pytest.mark.parametrize("mode", ["gen_only", "e2e"])
 def test_add_perf_metric_value_uploads_the_family_for_every_gen_worker_mode(
     mode: str,
 ) -> None:
