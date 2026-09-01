@@ -634,7 +634,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # checkpoint's boolean would destroy "unset" before forward() can
         # resolve it by mode. The checkpoint value is exposed separately as
         # ``default_use_system_prompt``.
-        return dict(COSMOS3_EXTRA_SPECS)
+        specs = dict(COSMOS3_EXTRA_SPECS)
+        if getattr(self, "checkpoint_policy_defaults", {}):
+            specs["action_mode"] = specs["action_mode"].model_copy(
+                update={"default": ACTION_MODE_POLICY}
+            )
+        return specs
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;

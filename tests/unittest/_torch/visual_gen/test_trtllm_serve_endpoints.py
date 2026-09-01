@@ -290,7 +290,12 @@ class MockVisualGen:
         seeds request params from this, so it must return a fresh instance."""
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        return VisualGenParams(**self.executor.default_generation_params)
+        kwargs = dict(self.executor.default_generation_params)
+        if self.extra_param_specs:
+            kwargs["extra_params"] = {
+                key: spec.default for key, spec in self.extra_param_specs.items()
+            }
+        return VisualGenParams(**kwargs)
 
     @property
     def extra_param_specs(self):
@@ -519,7 +524,7 @@ def checkpoint_policy_video_client(tmp_path):
 
     specs = {
         "action": ExtraParamSchema(type="list", default=None),
-        "action_mode": ExtraParamSchema(type="str", default=None, requires_tensor_output=True),
+        "action_mode": ExtraParamSchema(type="str", default="policy", requires_tensor_output=True),
     }
     gen = MockVisualGen(
         video_output=_make_dummy_video_tensor(),
@@ -3037,7 +3042,7 @@ class TestTensorOnlyFormatResolution:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("video/")
 
-    def test_checkpoint_policy_uses_existing_tensor_request_contract(
+    def test_checkpoint_policy_default_uses_tensor_request_contract(
         self, checkpoint_policy_video_client
     ):
         prompt = json.dumps(
@@ -3051,11 +3056,11 @@ class TestTensorOnlyFormatResolution:
             checkpoint_policy_video_client,
             prompt=prompt,
             input_reference=_b64_white_png_1x1(),
-            format="safetensors",
             extra_params={"action": state},
         )
 
         assert resp.status_code == 200
+        assert resp.headers["content-disposition"].endswith('.safetensors"')
         from safetensors.torch import load as load_safetensors
 
         tensors = load_safetensors(resp.content)
@@ -3064,7 +3069,10 @@ class TestTensorOnlyFormatResolution:
         assert checkpoint_policy_video_client.mock_gen.last_inputs == prompt
         assert os.path.isfile(checkpoint_policy_video_client.mock_gen.last_params.image)
         assert checkpoint_policy_video_client.mock_gen.last_params.extra_params["action"] == state
-        assert "action_mode" not in checkpoint_policy_video_client.mock_gen.last_params.extra_params
+        assert (
+            checkpoint_policy_video_client.mock_gen.last_params.extra_params["action_mode"]
+            == "policy"
+        )
 
 
 class TestTensorOnlyFormatRule:

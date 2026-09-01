@@ -165,7 +165,7 @@ class _VideoRoutesMixin:
                     media_storage_path=str(self.media_storage_path),
                 )
                 request_format = _resolve_tensor_only_format(
-                    request.format, request.extra_params, self.generator.extra_param_specs
+                    request.format, params.extra_params, self.generator.extra_param_specs
                 )
                 resolved_encoder_fmt = _preflight_encoder_format(request_format)
                 logger.info(
@@ -404,7 +404,7 @@ class _VideoRoutesMixin:
                 extra_param_specs=self.generator.executor.extra_param_specs,
             )
             request_format = _resolve_tensor_only_format(
-                request.format, request.extra_params, self.generator.extra_param_specs
+                request.format, params.extra_params, self.generator.extra_param_specs
             )
             _preflight_encoder_format(request_format)
             logger.info(

@@ -37,6 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ACTION_PARAMS,
     COSMOS3_EDGE_T2I_PARAMS,
     COSMOS3_EDGE_VIDEO_PARAMS,
+    COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
     COSMOS3_POLICY_SAMPLING_PARAMS,
     resolve_checkpoint_policy_defaults,
@@ -849,6 +850,19 @@ class TestEdgeDefaults:
             )
             assert resolved == {"num_inference_steps": 30, "guidance_scale": 1.0}
         assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
+
+    def test_policy_manifest_declares_policy_as_the_action_mode_default(self):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+
+        assert pipeline.extra_param_specs["action_mode"].default == ACTION_MODE_POLICY
+        assert COSMOS3_EXTRA_SPECS["action_mode"].default is None
 
     def test_none_params_resolve_from_edge_tables(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
