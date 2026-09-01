@@ -79,6 +79,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
@@ -107,6 +108,14 @@ from .sampler import SampleStateTensors
 from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+
+
+def _get_context_prompt_lookahead_token(request: LlmRequest,
+                                        chunk_end: int) -> int:
+    """Read the prompt token immediately following a context chunk."""
+    if chunk_end >= request.py_prompt_len:
+        return INVALID_PROMPT_LOOKAHEAD_TOKEN
+    return request.get_token(0, chunk_end)
 
 
 def _make_single_token_context_graph_batch(
@@ -4108,14 +4117,38 @@ class PyTorchModelEngine(ModelEngine):
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-                return list(self.dist.tp_cp_allgather(num_tokens))
-            return list(self.dist.tp_allgather(num_tokens))
+                return list(
+                    self.dist.tp_cp_allgather(num_tokens, small_payload=True))
+            return list(self.dist.tp_allgather(num_tokens, small_payload=True))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(num_ctx_requests))
+            return list(
+                self.dist.tp_allgather(num_ctx_requests, small_payload=True))
         return None
+
+    def _get_all_rank_num_tokens_and_spec_counts(
+        self, attn_metadata: AttentionMetadata, spec_counts: Tuple[int, ...]
+    ) -> Tuple[Optional[List[int]], Optional[List[List[int]]]]:
+        """Exchange the attention and speculative per-rank counts in a single
+        collective instead of one collective each."""
+        if not self.enable_attention_dp:
+            return None, None
+        if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
+            # attn counts span TP only while spec counts span TP*CP; keep the
+            # two exchanges separate.
+            gathered = self.dist.tp_cp_allgather(list(spec_counts),
+                                                 small_payload=True)
+            return (self._get_all_rank_num_tokens(attn_metadata),
+                    [list(col) for col in zip(*gathered)])
+        num_tokens = attn_metadata.num_tokens
+        if self.mapping.has_cp_helix():
+            num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
+        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts],
+                                             small_payload=True)
+        cols = [list(col) for col in zip(*gathered)]
+        return cols[0], cols[1:]
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.
@@ -4137,7 +4170,7 @@ class PyTorchModelEngine(ModelEngine):
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather(local_flag)
+        all_flags = self.dist.tp_allgather(local_flag, small_payload=True)
         spec_metadata.group_all_greedy_sample = all(all_flags)
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
@@ -4183,8 +4216,6 @@ class PyTorchModelEngine(ModelEngine):
             can_run_prefill_cuda_graph: whether a prefill CUDA graph can run
             attn_all_rank_num_tokens: the number of tokens for each rank
         """
-        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
-            num_ctx_requests)
 
         def get_padded_prefill_tokens(tokens: int) -> int:
             return self._prefill_cuda_graph_num_tokens[bisect.bisect_left(
@@ -4192,6 +4223,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if (self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED
                 and self._prefill_cuda_graph_num_tokens):
+            all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+                num_ctx_requests)
             max_captured_num_tokens = self._prefill_cuda_graph_num_tokens[-1]
             if attn_all_rank_num_tokens is not None:
                 has_ctx_requests = num_ctx_requests != 0 or (
@@ -4202,7 +4235,8 @@ class PyTorchModelEngine(ModelEngine):
                                               and max(attn_all_rank_num_tokens)
                                               <= max_captured_num_tokens)
                 all_ranks_can_run_prefill_cuda_graph = list(
-                    self.dist.tp_allgather(can_run_prefill_cuda_graph))
+                    self.dist.tp_allgather(can_run_prefill_cuda_graph,
+                                           small_payload=True))
                 if all(all_ranks_can_run_prefill_cuda_graph):
                     padded_num_tokens = get_padded_prefill_tokens(
                         max(attn_all_rank_num_tokens))
@@ -4877,9 +4911,17 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = None
 
         # Handle attention DP
+        spec_all_rank_counts = None
         if enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
+            if spec_metadata is not None:
+                (attn_metadata.all_rank_num_tokens, spec_all_rank_counts
+                 ) = self._get_all_rank_num_tokens_and_spec_counts(
+                     attn_metadata,
+                     (total_num_tokens, len(spec_metadata.seq_lens),
+                      attn_metadata.num_generations))
+            else:
+                attn_metadata.all_rank_num_tokens = \
+                    self._get_all_rank_num_tokens(attn_metadata)
 
         # Prepare speculative metadata
         if spec_metadata is not None:
@@ -4892,15 +4934,8 @@ class PyTorchModelEngine(ModelEngine):
 
             # Handle distributed spec metadata
             if enable_attention_dp:
-                sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    spec_metadata.num_tokens,
-                    len(sequence_lengths), attn_metadata.num_generations
-                ])
                 self._set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    spec_metadata, *spec_all_rank_counts)
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
@@ -5016,9 +5051,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        if self.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
 
         final_position_ids = self.position_ids_cuda[:
                                                     virtual_num_tokens].unsqueeze(
@@ -5231,9 +5263,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        if self.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
 
         final_position_ids = self.position_ids_cuda[:
                                                     virtual_num_tokens].unsqueeze(
@@ -5526,6 +5555,11 @@ class PyTorchModelEngine(ModelEngine):
         # (start_idx, end_idx, seq_slot) for first_draft requests
         first_draft_input_ids_positions = []
 
+        context_prompt_lookahead = None
+        if (spec_metadata is not None
+                and spec_metadata.context_prompt_lookahead_tokens is not None):
+            context_prompt_lookahead = []
+
         def append_cross_attention_state(request: LlmRequest,
                                          project_encoder_output: bool,
                                          repeat: int = 1) -> None:
@@ -5562,6 +5596,9 @@ class PyTorchModelEngine(ModelEngine):
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
+            if context_prompt_lookahead is not None:
+                context_prompt_lookahead.append(
+                    _get_context_prompt_lookahead_token(request, end_compute))
             # Fetch only the current chunk. get_tokens(0) marshals the whole
             # O(seq_len) VecTokens into a Python list of boxed ints; chunked
             # prefill re-enters this loop for every chunk of the same prompt, so
@@ -6559,7 +6596,15 @@ class PyTorchModelEngine(ModelEngine):
             maybe_graph,
             use_lora_graph=use_lora_graph)
 
-        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
+        spec_all_rank_counts = None
+        if spec_metadata is not None and self.enable_attention_dp:
+            (attn_all_rank_num_tokens, spec_all_rank_counts
+             ) = self._get_all_rank_num_tokens_and_spec_counts(
+                 attn_metadata, (total_num_tokens, len(sequence_lengths),
+                                 len(scheduled_requests.generation_requests)))
+        else:
+            attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
+                attn_metadata)
         (padded_num_tokens, can_run_prefill_cuda_graph,
          attn_all_rank_num_tokens) = self._get_padding_params(
              total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
@@ -6632,6 +6677,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
+            if context_prompt_lookahead is not None:
+                spec_metadata.populate_context_prompt_lookahead(
+                    context_prompt_lookahead)
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
@@ -6646,14 +6694,8 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    spec_metadata.num_tokens,
-                    len(sequence_lengths), spec_metadata.num_generations
-                ])
                 self._set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    spec_metadata, *spec_all_rank_counts)
 
         if mm_token_indices is not None:
             self._ship_multimodal_indices(

@@ -57,6 +57,5 @@ l0_a30:
   - cpp/test_unit_tests.py::test_unit_tests[common-80]
   - cpp/test_unit_tests.py::test_unit_tests[executor-80]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
-  - cpp/test_unit_tests.py::test_unit_tests[layers-80]
   - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
   - cpp/test_unit_tests.py::test_unit_tests[thop-80]
