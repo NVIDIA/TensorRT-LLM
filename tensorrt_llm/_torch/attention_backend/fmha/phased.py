@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    CustomAttentionMask,
+    PredefinedAttentionMask,
+)
 
 from .interface import Fmha
 
@@ -37,6 +42,8 @@ class FmhaParams:
     workspace: torch.Tensor
     attention_input: Optional[torch.Tensor] = None
     qkv_input: Optional[torch.Tensor] = None
+    key_input: Optional[torch.Tensor] = None
+    value_input: Optional[torch.Tensor] = None
     context_buf: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
@@ -47,7 +54,6 @@ class FmhaParams:
     num_tokens: int = 0
     seq_offset: int = 0
     tokens_per_block: int = 64
-    fp8_context_fmha: bool = False
     kv_factor: int = 0
     total_num_blocks: int = 0
     # Context-only fields
@@ -83,6 +89,16 @@ class PhasedFmha(Fmha):
         if kv_cache_manager is None:
             return 0
 
+        get_page_index_upper_bound = getattr(
+            getattr(kv_cache_manager, "impl", None),
+            "get_page_index_upper_bound",
+            None,
+        )
+        if get_page_index_upper_bound is not None:
+            # KVCacheManagerV2 exposes an already-flattened page-index bound,
+            # unlike the legacy logical block count.
+            return int(kv_cache_manager.blocks_in_primary_pool)
+
         blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
         if blocks_in_primary_pool is None:
             blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
@@ -93,16 +109,6 @@ class PhasedFmha(Fmha):
         if blocks_in_primary_pool is None:
             return 0
         return int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * self.kv_factor
-
-    def get_fp8_context_fmha(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
-    ) -> bool:
-        return False
 
     def prepare_workspace(
         self,
@@ -146,7 +152,6 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
-        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
         self.prepare_workspace(
             q,
             k,
@@ -182,7 +187,6 @@ class PhasedFmha(Fmha):
             max_attention_window_size=max_attention_window_size,
             cyclic_attention_window_size=attention_window_size,
             tokens_per_block=tokens_per_block,
-            fp8_context_fmha=fp8_context_fmha,
             kv_factor=self.kv_factor,
             total_num_blocks=self._get_total_num_blocks(metadata),
             is_cross=metadata.is_cross,
@@ -205,6 +209,12 @@ class PhasedFmha(Fmha):
 
             params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
             params.qkv_input = params.attention_input
+            params.key_input = (
+                k[token_offset : token_offset + num_ctx_tokens] if k is not None else None
+            )
+            params.value_input = (
+                v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
+            )
             params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
@@ -242,6 +252,12 @@ class PhasedFmha(Fmha):
 
             params.attention_input = q[token_offset : token_offset + num_gen_tokens]
             params.qkv_input = params.attention_input
+            params.key_input = (
+                k[token_offset : token_offset + num_gen_tokens] if k is not None else None
+            )
+            params.value_input = (
+                v[token_offset : token_offset + num_gen_tokens] if v is not None else None
+            )
             params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
@@ -254,6 +270,13 @@ class PhasedFmha(Fmha):
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:
+                # The custom mask covers only the context portion of a mixed batch.
+                if (
+                    not metadata.is_cross
+                    and params.fwd.attention_mask == CustomAttentionMask.CUSTOM
+                ):
+                    params.fwd.attention_mask = PredefinedAttentionMask.CAUSAL
+                    params.fwd.attention_mask_data = None
                 self.run_generation(params)
 
     def run_context(self, params: FmhaParams) -> None:

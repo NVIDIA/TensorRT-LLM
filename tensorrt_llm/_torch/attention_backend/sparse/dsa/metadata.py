@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -125,6 +127,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        # Cross-layer fan-out of the DSA index remap (TRTLLM_DISABLE_DSA_GROUP_REMAP).
+        # `_group_remap_struct` is the (static) full+shared indexer
+        # group layout; `_group_remap_batched` holds the current forward's
+        # per-group batched remap output (leader writes, shared members read).
+        self._group_remap_struct = None
+        self._group_remap_struct_kv_id = 0
+        self._group_remap_batched = {}
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -339,6 +348,80 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=_INDEXER_LOGITS_DTYPE,
             num_sms=self.num_sms,
         )
+
+    def warmup_selfsampling_topk(
+        self, next_n: int, batch_sizes: Optional[List[int]] = None
+    ) -> None:
+        """Pre-compile the self-sampling GVR varlen engine during warmup.
+
+        Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
+        by the exact row count AND the logits row stride: rows cover the
+        small eager batches plus every configured CUDA-graph batch size, and
+        the stride mirrors what the active paged-MQA producer emits, so the
+        warmed keys are the ones dispatch actually looks up. Batches outside
+        this set still compile lazily on first touch. The helper enumerates
+        one representative row per distinct engine compile key, so large
+        batch lists warm in bounded time and memory. No-op unless the opt-in
+        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        """
+        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
+            return
+        # same hardware gates as the dispatch flag (indexer __init__): never
+        # compile these kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+            return
+        if not self.enable_gvr_topk or self.kv_cache_manager is None:
+            return
+        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not top_k or int(top_k) not in (512, 1024, 2048):
+            return
+        cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
+        if cr not in (1, 4):
+            return
+        try:
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                gvr_topk_decode_self_sampling_host as _ss_host,
+            )
+        except ImportError:
+            return
+        nn = int(next_n)
+        # warm the small row counts eager mixed batches commonly produce;
+        # larger eager row counts lazy-JIT on first touch, and CUDA-graph
+        # geometries are covered through ``batch_sizes`` below
+        eager_warm_rows = 32
+        rows = set(range(nn, eager_warm_rows + 1, nn)) or {nn}
+        for bs in batch_sizes or ():
+            rows.add(int(bs) * nn)
+        msl_c = int(self.get_indexer_max_seq_len())
+        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+            # mirror the DSL paged-MQA arena stride (rows round up to 256
+            # elements). A drift here only degrades warmup to unused keys —
+            # dispatch still lazy-JITs the true key outside capture.
+            row_stride = (msl_c + 255) // 256 * 256
+        else:
+            # DeepGEMM emits exact-width rows; a non-float4 width falls
+            # through at the dispatch format gate, so there is nothing to warm
+            row_stride = msl_c
+            if row_stride % 4:
+                return
+        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
+        # is compressed — same multiply-back as the dispatch seam)
+        try:
+            _ss_host.warmup_varlen(
+                int(top_k),
+                msl_c * cr,
+                compress_ratio=cr,
+                next_n=int(next_n),
+                num_rows_list=tuple(sorted(rows)),
+                row_stride=row_stride,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # warmup is best-effort: the dispatch works without it (engines
+            # JIT lazily outside capture), so do not fail engine init
+            logger.warning(
+                "self-sampling GVR warmup ran out of memory; varlen engines "
+                "will JIT-compile lazily on first touch instead."
+            )
 
     def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
@@ -851,7 +934,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: bool = False,
         spec_metadata: Optional["SpecMetadata"] = None,
         spec_tree_manager: Optional["SpecTreeManager"] = None,
         num_contexts: int = 0,
@@ -864,7 +946,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped,
             spec_metadata,
             spec_tree_manager,
             num_contexts=num_contexts,
@@ -915,6 +996,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         _ensure_pool_view_cached() recomputes them for the new batch.
         """
         self._pool_cache_valid = False
+        # The grouped remap batches (leader-written, follower-read) are only
+        # valid within one forward. Drop them at the step boundary so a follower
+        # can never read a previous step's batch, and so the tensors are not
+        # retained across idle steps. Python-only -> safe under graph replay
+        # (replay does not re-run this).
+        self._group_remap_batched.clear()
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by
@@ -945,6 +1032,94 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self._cached_kv_mgr_id = id(kv_cache_manager)
         self._pool_cache_valid = True
+
+    def _ensure_group_remap_struct(self):
+        """Build (once) the static full+shared indexer group layout used by the
+        cross-layer fan-out remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
+
+        Groups are runs of consecutive local layers starting at a full-indexer
+        layer (``indexer_k_cache_local_layer_mask[L] == True``, i.e.
+        ``is_full_indexer_layer``); the shared layers that follow reuse the
+        leader's top-k. Within a group, the remap output for each member differs
+        from the leader's only by the additive ``layer_offset * tokens_per_block``
+        term, so one launch (grid.z = group_size) covers the whole group.
+
+        A group is marked active only when it has >= 2 members (a genuine
+        fan-out) and a uniform primary-pool page scale (required for a single
+        stride_factor). Singleton / non-uniform groups fall back to the
+        per-layer single-op path (identical to flag-off behavior).
+        """
+        kvm = self.kv_cache_manager
+        if self._group_remap_struct is not None and self._group_remap_struct_kv_id == id(kvm):
+            return self._group_remap_struct
+
+        # Building the small per-group layer-offset device tensors must happen
+        # eagerly (host->device copy), never inside a CUDA-graph capture. TRT-LLM
+        # runs an eager warmup before capture, so return an uncached empty struct
+        # if somehow reached first during capture; it is (re)built on the next
+        # eager step and grouping simply falls back to per-layer until then.
+        if torch.cuda.is_current_stream_capturing():
+            return {}
+
+        mask = getattr(kvm, "indexer_k_cache_local_layer_mask", None)
+        if mask is None:
+            self._group_remap_struct = {}
+            self._group_remap_struct_kv_id = id(kvm)
+            return self._group_remap_struct
+
+        n = len(mask)
+        leader_of = [-1] * n
+        slot_of = [0] * n
+        members = {}  # leader local idx -> [member local idx, ...]
+        cur_leader = None
+        for local_idx in range(n):
+            if mask[local_idx]:
+                cur_leader = local_idx
+                members[cur_leader] = [local_idx]
+            else:
+                if cur_leader is None:
+                    # Shouldn't happen (layer 0 forced full); be safe.
+                    cur_leader = local_idx
+                    members[cur_leader] = [local_idx]
+                else:
+                    members[cur_leader].append(local_idx)
+            leader_of[local_idx] = cur_leader
+            slot_of[local_idx] = len(members[cur_leader]) - 1
+
+        # Device for the small per-group layer-offset tensors.
+        device = None
+        if self.shared_topk_indices is not None:
+            device = self.shared_topk_indices.device
+        elif self.block_table is not None:
+            device = self.block_table.device
+
+        group_active = {}
+        group_scale = {}
+        group_size = {}
+        group_layer_ids = {}
+        for leader, member_list in members.items():
+            group_size[leader] = len(member_list)
+            params = [kvm.get_primary_pool_page_index_params(m) for m in member_list]
+            scale0 = params[0][0]
+            uniform_scale = all(p[0] == scale0 for p in params)
+            offsets = [int(p[1]) for p in params]
+            active = len(member_list) >= 2 and uniform_scale and device is not None
+            group_active[leader] = active
+            group_scale[leader] = int(scale0)
+            if active:
+                group_layer_ids[leader] = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+        struct = {
+            "leader_of": leader_of,
+            "slot_of": slot_of,
+            "group_active": group_active,
+            "group_scale": group_scale,
+            "group_size": group_size,
+            "group_layer_ids": group_layer_ids,
+        }
+        self._group_remap_struct = struct
+        self._group_remap_struct_kv_id = id(kvm)
+        return struct
 
     @maybe_compile(dynamic=True)
     def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens):
@@ -1009,19 +1184,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 )
 
     def prepare_for_spec_decode(self, kv_lens: torch.Tensor):
-        # fp8_paged_mqa_logits supports seq_len 1/2/4 on sm100 and 1/2 on
-        # sm90. Flatten Q and expand kv_lens and block_table for other MTP
-        # configurations.
+        # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits) runs a native
+        # next_n >= 1 on sm100+: its scheduler tiles the query tokens into
+        # BLOCK_Q-sized blocks (num_q_blocks = ceil_div(num_q_tokens, BLOCK_Q)),
+        # so any MTP depth is handled without a per-draft-token Q flatten /
+        # kv_lens / block_table expansion on Blackwell. sm90 still lacks native
+        # MTP support (seq_len 1/2 only) and must expand for max_draft_tokens > 1.
         # TODO:
-        # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
-        # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+        # - Drop this sm90 branch (and the expanded buffers) once
+        #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
-        self.use_expanded_buffers_for_mtp = not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or (
-                (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100
-            )
+        self.use_expanded_buffers_for_mtp = (
+            not use_dsl and self.max_draft_tokens > 1 and get_sm_version() == 90
         )
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)

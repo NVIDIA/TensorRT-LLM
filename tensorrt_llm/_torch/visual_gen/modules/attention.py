@@ -242,10 +242,14 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Resolve sparse attention params for TRTLLM backend
+        # Lower the shared SkipSoftmax user/checkpoint config for each backend
+        # whose kernel consumes SkipSoftmaxParams.
         sparse_params = None
         ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
+        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name in (
+            "TRTLLM",
+            "CUTEDSL",
+        ):
             sparse_params = ss_cfg.to_sparse_params(
                 module_name=self.module_name,
                 pretrained_config=config.pretrained_config,

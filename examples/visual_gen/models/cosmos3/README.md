@@ -8,6 +8,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local MP4/AVI file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); the encoded bytes pass through and each worker decodes just that window on NVDEC (see [Media I/O dependencies](#media-io-dependencies)). Validated for Nano / Super only.
 - **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned sampling preset — guidance scale, control guidance and flow shift — for any of those the request leaves unset; requests with several hints fall back to the generic video defaults. The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
+- **Action** — policy / forward dynamics / inverse dynamics generation (pass `--action_mode`); `inverse_dynamics` reads its observation clip from `--video_path` (MP4/AVI, decoded on worker NVDEC like V2V). Action and audio generation are mutually exclusive. A predicted trajectory has no representation in a video container, so action runs are saved as `safetensors` or `pt`, keeping the rollout and the action tensor in one payload — over `trtllm-serve` the default `format=auto` selects that payload automatically, and an explicit `mp4`/`avi` is rejected.
 
 ## Checkpoints
 
@@ -191,4 +192,36 @@ python cosmos3.py --model nvidia/Cosmos3-Edge \
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A cute puppy playing with a ball in a park" \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# Action — policy (first frame + instruction -> predicted action + rollout video)
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/action_policy.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --action_mode policy \
+    --domain_name bridge_orig_lerobot \
+    --raw_action_dim 10 \
+    --output_path policy_rollout.safetensors \
+    --action_output_path policy_action.json
+
+# Action — forward dynamics (first frame + action trajectory -> rollout video)
+# action_trajectory.json is a [T, D] list of lists; D is the embodiment's action
+# width (9 for av) and a mismatch is rejected.
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/action_forward_dynamics.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --action_mode forward_dynamics \
+    --domain_name av \
+    --action_json action_trajectory.json \
+    --output_path forward_dynamics.safetensors
+
+# Action — inverse dynamics (video -> predicted action)
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/action_inverse_dynamics.json \
+    --video_path /path/to/observation_clip.mp4 \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --action_mode inverse_dynamics \
+    --domain_name bridge_orig_lerobot \
+    --raw_action_dim 10 \
+    --output_path inverse_video.safetensors \
+    --action_output_path inverse_action.json
 ```

@@ -259,6 +259,52 @@ def transform_local_topk_and_prepare_pool_view(
     return global_indices, attn_metadata._cached_pool_view
 
 
+def transform_local_topk_and_prepare_pool_view_grouped(
+    topk_indices: torch.Tensor,
+    attn_metadata: "DSAtrtllmAttentionMetadata",
+    layer_ids: torch.Tensor,
+    page_index_scale: int,
+    is_generation: bool = False,
+) -> torch.Tensor:
+    """Grouped (cross-layer fan-out) variant of the local-topk → global-index
+    remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
+
+    Computes the global-index output for a whole full+shared indexer group in a
+    single launch. All members of a group share the same top-k selection,
+    ``req_idx`` and ``block_table`` (constant across layers within a forward);
+    only the additive ``layer_offset * tokens_per_block`` term differs per
+    member. ``layer_ids`` (int32 CUDA tensor of length ``group_size``) carries
+    each member's layer offset; ``page_index_scale`` is the (uniform) primary-
+    pool page scale for the group.
+
+    Returns a tensor of shape ``[group_size, num_tokens, topk]``; slice ``[z]``
+    is bit-identical to ``transform_local_topk_and_prepare_pool_view`` for the
+    member with offset ``layer_ids[z]``. MLA-only path.
+    """
+    assert topk_indices.dtype == torch.int32
+
+    attn_metadata._ensure_pool_view_cached()
+
+    if is_generation:
+        block_table = attn_metadata._cached_block_table_gen
+        req_idx = attn_metadata._cached_req_idx_gen
+    else:
+        block_table = attn_metadata._cached_block_table_ctx
+        req_idx = attn_metadata._cached_req_idx_ctx
+
+    global_indices = torch.ops.trtllm.convert_req_index_to_global_grouped(
+        req_idx,
+        block_table,
+        topk_indices,
+        attn_metadata._cached_tokens_per_block,
+        topk_indices.shape[1],
+        page_index_scale * attn_metadata._cached_tokens_per_block,
+        layer_ids,
+    )
+
+    return global_indices
+
+
 def split_prefill_chunks(
     seq_lens: torch.Tensor,
     max_chunk_size: int,
@@ -635,6 +681,23 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        # Opt-in self-sampling GVR top-K decode (CuTeDSL, env-gated:
+        # TRTLLM_GVR_SELF_SAMPLING=1). Same operator contract as the tiered
+        # heuristic path (per-request device kv_lens, raw prev-top-K hints,
+        # per-row MTP window, in-kernel n <= topK short path); tuning is
+        # frozen from indexer_max_seq_len at capture time, so the launch is
+        # CUDA-graph-replay safe. The TopK module's hardware-format gate
+        # falls through to the CUDA GVR path with a one-time warning;
+        # contract violations inside the engine raise.
+        self._use_self_sampling_topk = (
+            os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
+            and IS_CUTLASS_DSL_AVAILABLE
+            # datacenter Blackwell only; consumer Blackwell (sm_120/121)
+            # lacks thread-block clusters
+            and get_sm_version() in (100, 103)
+            and sparse_params.index_topk in (512, 1024, 2048)
+            and compress_ratio in (1, 4)
+        )
         self.mtp_index_share = sparse_params.mtp_index_share
 
         if self.use_cute_dsl_topk:
@@ -647,6 +710,10 @@ class Indexer(nn.Module):
             decode_top_k_implementation = TopKImplementation.CUDA_GVR
         else:
             decode_top_k_implementation = TopKImplementation.CUDA_RADIX
+        if self._use_self_sampling_topk and self._enable_heuristic_topk:
+            # env opt-in overrides the decode implementation; the GVR prior
+            # contract is identical
+            decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR_V2
         self.top_k = TopK(
             self.index_topk,
             prefill_implementation=TopKImplementation.CUDA_RADIX,
