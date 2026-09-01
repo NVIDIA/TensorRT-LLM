@@ -120,6 +120,73 @@ def default_negative_prompt(output_type: str) -> str:
     )
 
 
+def _resolve_use_system_prompt(
+    requested: Optional[bool],
+    *,
+    checkpoint_default: bool,
+    is_v2v: bool,
+    is_transfer: bool,
+) -> bool:
+    """Resolve the request override against workflow and checkpoint defaults."""
+    if requested is not None:
+        return bool(requested)
+    # Transfer opts out for reference parity; vllm-omni's transfer path also
+    # defaults use_system_prompt to False.
+    if is_transfer:
+        return False
+    return is_v2v or checkpoint_default
+
+
+def _validate_request_compatibility(
+    *,
+    output_type: str,
+    image: Any,
+    video: Any,
+    action_mode: Optional[str],
+    action_gen: bool,
+    enable_audio: bool,
+    transfer_config: Optional[Cosmos3TransferConfig],
+) -> None:
+    """Reject incompatible Cosmos3 workflows before request preparation."""
+    is_t2i = output_type == "image"
+    has_image = image is not None
+    has_video = video is not None
+    do_action = action_mode is not None
+    do_transfer = transfer_config is not None
+    if do_action and not action_gen:
+        raise ValueError(
+            "Cosmos3 action generation was requested, but this checkpoint "
+            "does not enable action_gen."
+        )
+    if do_action and enable_audio:
+        raise ValueError("Cosmos3 does not support joint action and audio generation.")
+    if has_image and has_video:
+        raise ValueError(
+            "Cosmos3 generation supports text-only, text + image, "
+            "or text + video input, but not both image and video."
+        )
+    if is_t2i and has_video:
+        raise ValueError("Cosmos3 video-to-video generation is supported only for video outputs.")
+    if do_action and do_transfer:
+        raise ValueError("Cosmos3 action generation cannot be combined with transfer inference.")
+    if do_transfer:
+        if is_t2i:
+            raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
+        if enable_audio:
+            raise ValueError("Cosmos3 transfer inference cannot be combined with sound generation.")
+        if has_image:
+            raise ValueError(
+                "Cosmos3 transfer inference cannot be combined with an image reference; "
+                "pass the conditioning clip as the 'video' extra param instead."
+            )
+    if is_t2i and has_image:
+        raise ValueError(
+            "Cosmos3 text-to-image (output_type='image') does not accept an image input."
+        )
+    if is_t2i and do_action:
+        raise ValueError("Cosmos3 action generation does not support output_type='image'.")
+
+
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a give prompt."
@@ -1529,13 +1596,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         normalized_action_mode = normalize_action_mode(action_mode)
         do_action = normalized_action_mode is not None
-        if do_action and not self.action_gen:
-            raise ValueError(
-                "Cosmos3 action generation was requested, but this checkpoint "
-                "does not enable action_gen."
-            )
-        if do_action and enable_audio:
-            raise ValueError("Cosmos3 does not support joint action and audio generation.")
 
         # Text-to-image mode: same checkpoint/forward path as T2V, but a single
         # latent frame, image-flavored prompt templates, flow_shift=3.0, a CFG
@@ -1544,6 +1604,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if output_type not in ("video", "image"):
             raise ValueError(f"output_type must be 'video' or 'image', got {output_type!r}.")
         is_t2i = output_type == "image"
+        _validate_request_compatibility(
+            output_type=output_type,
+            image=image,
+            video=video,
+            action_mode=normalized_action_mode,
+            action_gen=getattr(self, "action_gen", False),
+            enable_audio=enable_audio,
+            transfer_config=transfer_config,
+        )
 
         mode_params = self._mode_params(output_type, action_mode=normalized_action_mode)
         values_to_resolve = {
@@ -1590,54 +1659,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 max_sequence_length=max_sequence_length,
             )
 
-        if image is not None and video is not None:
-            raise ValueError(
-                "Cosmos3 generation supports text-only, text + image, "
-                "or text + video input, but not both image and video."
-            )
-        if is_t2i and video is not None:
-            raise ValueError(
-                "Cosmos3 video-to-video generation is supported only for video outputs."
-            )
         # Action reads its reference through the same `video` bytes, but it is
         # not V2V: the reference is an observation, not a clip to continue. Left
         # in, an action request's prompt would depend on whether the caller
         # passed the same frame as an image or as a one-frame clip.
         is_v2v = video is not None and not is_t2i and not do_action
-        if use_system_prompt is None:
-            # V2V always wants it; otherwise the checkpoint declares the default.
-            # Transfer opts out for reference parity (vllm-omni
-            # `_forward_transfer` defaults it False).
-            if transfer_config is not None:
-                use_system_prompt = False
-            else:
-                use_system_prompt = is_v2v or self.default_use_system_prompt
-        else:
-            use_system_prompt = bool(use_system_prompt)
-        if transfer_config is not None:
-            if is_t2i:
-                raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
-            if enable_audio:
-                raise ValueError(
-                    "Cosmos3 transfer inference cannot be combined with sound generation."
-                )
-            if image is not None:
-                # _forward_transfer takes no image: structure comes from the
-                # control hints and the first chunk conditions on `video`. Say
-                # so rather than dropping the reference silently.
-                raise ValueError(
-                    "Cosmos3 transfer inference cannot be combined with an image reference; "
-                    "pass the conditioning clip as the 'video' extra param instead."
-                )
+        use_system_prompt = _resolve_use_system_prompt(
+            use_system_prompt,
+            checkpoint_default=getattr(self, "default_use_system_prompt", False),
+            is_v2v=is_v2v,
+            is_transfer=transfer_config is not None,
+        )
 
         resolved_action_fps: Optional[float] = None
         if is_t2i:
-            if image is not None:
-                raise ValueError(
-                    "Cosmos3 text-to-image (output_type='image') does not accept an image input."
-                )
-            if do_action:
-                raise ValueError("Cosmos3 action generation does not support output_type='image'.")
             num_frames = 1
             # T2I force-disables audio instead of rejecting it, so an image
             # request never trips the audio-weight presence check below.

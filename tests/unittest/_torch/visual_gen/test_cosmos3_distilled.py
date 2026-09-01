@@ -19,7 +19,11 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_T2I_PARAMS,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
+from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+    Cosmos3OmniMoTPipeline,
+    _resolve_use_system_prompt,
+    _validate_request_compatibility,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
@@ -1114,6 +1118,110 @@ class TestSystemPromptDefault:
         pipeline._run_warmup(height=720, width=1280, num_frames=9, steps=4)
 
         assert captured.get("use_system_prompt") is None
+
+
+class TestSystemPromptResolution:
+    @pytest.mark.parametrize(
+        "requested,checkpoint_default,is_v2v,is_transfer,expected",
+        [
+            (None, False, False, False, False),
+            (None, True, False, False, True),
+            (None, False, True, False, True),
+            (None, True, True, True, False),
+            (True, False, False, True, True),
+            (False, True, True, False, False),
+        ],
+    )
+    def test_resolution_precedence(
+        self, requested, checkpoint_default, is_v2v, is_transfer, expected
+    ):
+        assert (
+            _resolve_use_system_prompt(
+                requested,
+                checkpoint_default=checkpoint_default,
+                is_v2v=is_v2v,
+                is_transfer=is_transfer,
+            )
+            is expected
+        )
+
+
+class TestRequestCompatibility:
+    DEFAULTS = {
+        "output_type": "video",
+        "image": None,
+        "video": None,
+        "action_mode": None,
+        "action_gen": False,
+        "enable_audio": False,
+        "transfer_config": None,
+    }
+
+    @pytest.mark.parametrize(
+        "overrides,error",
+        [
+            ({"action_mode": "policy"}, "does not enable action_gen"),
+            (
+                {"action_mode": "policy", "action_gen": True, "enable_audio": True},
+                "joint action and audio",
+            ),
+            ({"image": object(), "video": b"video"}, "not both image and video"),
+            ({"output_type": "image", "video": b"video"}, "supported only for video outputs"),
+            (
+                {"action_mode": "policy", "action_gen": True, "transfer_config": object()},
+                "cannot be combined with transfer inference",
+            ),
+            (
+                {"output_type": "image", "transfer_config": object()},
+                "supported only for video outputs",
+            ),
+            (
+                {"enable_audio": True, "transfer_config": object()},
+                "cannot be combined with sound generation",
+            ),
+            (
+                {"image": object(), "transfer_config": object()},
+                "cannot be combined with an image reference",
+            ),
+            (
+                {"output_type": "image", "image": object()},
+                "does not accept an image input",
+            ),
+            (
+                {"output_type": "image", "action_mode": "policy", "action_gen": True},
+                "does not support output_type='image'",
+            ),
+        ],
+    )
+    def test_rejects_incompatible_workflows(self, overrides, error):
+        values = {**self.DEFAULTS, **overrides}
+        with pytest.raises(ValueError, match=error):
+            _validate_request_compatibility(**values)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"image": object()},
+            {"video": b"video"},
+            {"output_type": "image", "enable_audio": True},
+            {"image": object(), "action_mode": "policy", "action_gen": True},
+            {"video": b"video", "transfer_config": object()},
+        ],
+    )
+    def test_accepts_supported_workflows(self, overrides):
+        _validate_request_compatibility(**{**self.DEFAULTS, **overrides})
+
+    def test_forward_rejects_action_with_transfer_before_preparation(self):
+        pipeline = _bare_pipeline(action_gen=True)
+
+        with pytest.raises(ValueError, match="cannot be combined with transfer inference"):
+            pipeline.forward(
+                prompt="x",
+                action_mode="policy",
+                transfer_config=object(),
+                use_guardrails=False,
+            )
 
 
 class TestAudioWeightPresenceGuard:
