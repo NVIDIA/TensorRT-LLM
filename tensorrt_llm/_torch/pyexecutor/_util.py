@@ -52,13 +52,18 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
+# yapf: disable
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
+                           get_gemma4_layer_head_dims,
+                           get_gemma4_layer_num_kv_heads,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           resolve_vocab_size, uses_vswa_kv_cache_layout)
+                           read_layer_config_attr, resolve_vocab_size,
+                           uses_vswa_kv_cache_layout)
+# yapf: enable
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -2782,10 +2787,15 @@ def _create_kv_cache_manager(
 
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
-    num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
-        config, 'num_key_value_heads', num_attention_heads)
+    # ``head_dim``/``num_key_value_heads`` can be per-layer attributes that only
+    # a layer config may expose (transformers>=5.15), so route the scalar reads
+    # through the layer-aware accessor; per-layer models overwrite these with
+    # full lists below.
+    num_key_value_heads = num_kv_heads if num_kv_heads is not None else (
+        read_layer_config_attr(config, 0, 'num_key_value_heads',
+                               num_attention_heads))
     if not isinstance(head_dim, int):
-        head_dim = getattr(config, "head_dim", None)
+        head_dim = read_layer_config_attr(config, 0, "head_dim")
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
@@ -2795,24 +2805,11 @@ def _create_kv_cache_manager(
     # are consistent within each group.
     if is_gemma4_hybrid(config):
         layer_types = config.layer_types
-        global_head_dim = config.global_head_dim
-        attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
-        num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
-                                       None) or num_key_value_heads)
-        head_dim_list = []
-        kv_heads_list = []
-        for lt in layer_types:
-            is_sliding = (lt == "sliding_attention")
-            if is_sliding:
-                head_dim_list.append(head_dim)
-                kv_heads_list.append(num_key_value_heads)
-            else:
-                head_dim_list.append(global_head_dim)
-                use_k_eq_v = attention_k_eq_v and not is_sliding
-                kv_heads_list.append(
-                    num_global_kv_heads if use_k_eq_v else num_key_value_heads)
-        head_dim = head_dim_list
-        num_key_value_heads = kv_heads_list
+        head_dim = get_gemma4_layer_head_dims(config)
+        num_key_value_heads = [
+            get_gemma4_layer_num_kv_heads(config, layer_idx)
+            or num_key_value_heads for layer_idx in range(len(layer_types))
+        ]
 
     # Derive per-layer max_attention_window for any model that publishes a
     # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2

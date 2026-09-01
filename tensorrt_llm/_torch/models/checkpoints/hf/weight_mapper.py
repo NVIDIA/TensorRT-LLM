@@ -18,6 +18,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.pyexecutor.config_utils import read_layer_config_attr
 
 from ..base_weight_mapper import BaseWeightMapper
 
@@ -81,9 +82,9 @@ class HfWeightMapper(BaseWeightMapper):
     @property
     def _num_kv_heads(self) -> int:
         config = self.model.config
-        if hasattr(config, 'num_key_value_heads'
-                   ) and config.num_key_value_heads is not None:
-            return config.num_key_value_heads
+        num_kv_heads = read_layer_config_attr(config, 0, 'num_key_value_heads')
+        if num_kv_heads is not None:
+            return num_kv_heads
         return config.num_attention_heads
 
     def _duplicate_kv_weights(
