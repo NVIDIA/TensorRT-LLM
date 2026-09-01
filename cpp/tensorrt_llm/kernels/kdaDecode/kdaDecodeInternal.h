@@ -29,17 +29,17 @@ void launchKdaDecodeLegacyCompactHeads(KdaDecodeParams const& params, cudaStream
 //! Launches the legacy many-heads KDA decode kernel.
 void launchKdaDecodeLegacyManyHeads(KdaDecodeParams const& params, cudaStream_t stream);
 
-//! Launches the Blackwell single-CTA cp.async KDA decode kernel.
-void launchKdaDecodeBlackwellSingleCta(KdaDecodeParams const& params, cudaStream_t stream);
+//! Launches the optimized single-CTA cp.async KDA decode kernel.
+void launchKdaDecodeOptimizedSingleCta(KdaDecodeParams const& params, cudaStream_t stream);
 
-//! Launches the Blackwell single-CTA two-stage cp.async.bulk KDA decode kernel.
-void launchKdaDecodeBlackwellTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream);
+//! Launches the optimized single-CTA two-stage cp.async.bulk KDA decode kernel.
+void launchKdaDecodeOptimizedTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream);
 
-//! Launches the Blackwell single-CTA four-stage cp.async.bulk KDA decode kernel.
-void launchKdaDecodeBlackwellFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream);
+//! Launches the optimized single-CTA four-stage cp.async.bulk KDA decode kernel.
+void launchKdaDecodeOptimizedFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream);
 
-//! Launches the Blackwell four-CTA cluster cp.async KDA decode kernel.
-void launchKdaDecodeBlackwellFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream);
+//! Launches the optimized four-CTA cluster cp.async KDA decode kernel.
+void launchKdaDecodeOptimizedFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream);
 
 } // namespace kernels::kdaDecode
 
