@@ -33,10 +33,10 @@ enum class KdaDecodeKernel
 {
     kLegacyCompactHeads,
     kLegacyManyHeads,
-    kBlackwellSingleCta,
-    kBlackwellTwoStageBulk,
-    kBlackwellFourStageBulk,
-    kBlackwellFourCtaCluster,
+    kOptimizedSingleCta,
+    kOptimizedTwoStageBulk,
+    kOptimizedFourStageBulk,
+    kOptimizedFourCtaCluster,
 };
 
 KdaDecodeKernel selectLegacyKdaDecodeKernel(KdaDecodeParams const& params)
@@ -45,32 +45,32 @@ KdaDecodeKernel selectLegacyKdaDecodeKernel(KdaDecodeParams const& params)
     return useCompactHeads ? KdaDecodeKernel::kLegacyCompactHeads : KdaDecodeKernel::kLegacyManyHeads;
 }
 
-KdaDecodeKernel selectBlackwellKdaDecodeKernel(int smVersion, int64_t workload)
+KdaDecodeKernel selectOptimizedKdaDecodeKernel(int smVersion, int64_t workload)
 {
     if (smVersion == 100)
     {
         if (workload <= 48)
         {
-            return KdaDecodeKernel::kBlackwellFourCtaCluster;
+            return KdaDecodeKernel::kOptimizedFourCtaCluster;
         }
         if ((workload >= 320 && workload <= 864) || (workload >= 960 && workload <= 1152)
             || (workload >= 1440 && workload <= 3072))
         {
-            return KdaDecodeKernel::kBlackwellSingleCta;
+            return KdaDecodeKernel::kOptimizedSingleCta;
         }
-        return KdaDecodeKernel::kBlackwellTwoStageBulk;
+        return KdaDecodeKernel::kOptimizedTwoStageBulk;
     }
     else
     {
         if (workload <= 48)
         {
-            return KdaDecodeKernel::kBlackwellFourCtaCluster;
+            return KdaDecodeKernel::kOptimizedFourCtaCluster;
         }
         if ((workload >= 512 && workload <= 864) || (workload >= 1440 && workload <= 6144))
         {
-            return KdaDecodeKernel::kBlackwellSingleCta;
+            return KdaDecodeKernel::kOptimizedSingleCta;
         }
-        return KdaDecodeKernel::kBlackwellTwoStageBulk;
+        return KdaDecodeKernel::kOptimizedTwoStageBulk;
     }
 }
 
@@ -80,7 +80,7 @@ KdaDecodeKernel selectKdaDecodeKernel(KdaDecodeParams const& params)
     if (smVersion == 100 || smVersion == 103)
     {
         int64_t const workload = static_cast<int64_t>(params.batchSize) * params.numHeads;
-        return selectBlackwellKdaDecodeKernel(smVersion, workload);
+        return selectOptimizedKdaDecodeKernel(smVersion, workload);
     }
     return selectLegacyKdaDecodeKernel(params);
 }
@@ -94,10 +94,10 @@ void invokeKdaDecode(KdaDecodeParams const& params, cudaStream_t stream)
     {
     case KdaDecodeKernel::kLegacyCompactHeads: launchKdaDecodeLegacyCompactHeads(params, stream); break;
     case KdaDecodeKernel::kLegacyManyHeads: launchKdaDecodeLegacyManyHeads(params, stream); break;
-    case KdaDecodeKernel::kBlackwellSingleCta: launchKdaDecodeBlackwellSingleCta(params, stream); break;
-    case KdaDecodeKernel::kBlackwellTwoStageBulk: launchKdaDecodeBlackwellTwoStageBulk(params, stream); break;
-    case KdaDecodeKernel::kBlackwellFourStageBulk: launchKdaDecodeBlackwellFourStageBulk(params, stream); break;
-    case KdaDecodeKernel::kBlackwellFourCtaCluster: launchKdaDecodeBlackwellFourCtaCluster(params, stream); break;
+    case KdaDecodeKernel::kOptimizedSingleCta: launchKdaDecodeOptimizedSingleCta(params, stream); break;
+    case KdaDecodeKernel::kOptimizedTwoStageBulk: launchKdaDecodeOptimizedTwoStageBulk(params, stream); break;
+    case KdaDecodeKernel::kOptimizedFourStageBulk: launchKdaDecodeOptimizedFourStageBulk(params, stream); break;
+    case KdaDecodeKernel::kOptimizedFourCtaCluster: launchKdaDecodeOptimizedFourCtaCluster(params, stream); break;
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
