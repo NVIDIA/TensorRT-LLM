@@ -117,7 +117,11 @@ srun --ntasks=1 --ntasks-per-node=1 --nodes=1 \
         #    No instrument -- the collect jobs already produced the .fdata.
         _extract='"$RUNDIR"'/extract
         mkdir -p "$_extract" && tar xzf /builds/'"$TARBALL_NAME"' -C "$_extract" 2>/dev/null
-        /workspace/bolt/setup_env.sh "$_extract"
+        # Libs-only: the merge only needs the wheel ELFs on disk to convert
+        # .fdata -> .yaml (no runtime import), so skip setup_env.sh runtime
+        # tensorrt gate -- the profiling base image has no importable tensorrt
+        # before install and would otherwise fail here.
+        BOLT_SETUP_LIBS_ONLY=1 /workspace/bolt/setup_env.sh "$_extract"
         source /workspace/bolt/bolt_lib.sh
         bolt_run_stages setup_directories backup_libraries
 

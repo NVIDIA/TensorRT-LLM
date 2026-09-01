@@ -3422,9 +3422,8 @@ class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
 
     Covers strategy routing, the post-sample runtime update (parity with the
-    C++ computeToppDecay recurrence; cases ported from
-    topPSamplingLayerTest.cpp), and per-request rejection of unsupported
-    combinations.
+    recurrence the former C++ computeToppDecay implemented), and per-request
+    rejection of unsupported combinations.
     """
 
     VOCAB_SIZE = 1000

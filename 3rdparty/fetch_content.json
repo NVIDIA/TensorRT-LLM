@@ -45,7 +45,7 @@
     {
       "name": "flashmla",
       "git_repository": "https://github.com/deepseek-ai/FlashMLA.git",
-      "git_tag": "1408756a88e52a25196b759eaf8db89d2b51b5a1",
+      "git_tag": "15f13e5030374295491c5ce31b02d7e63a7772c6",
       "git_submodules_recurse": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
