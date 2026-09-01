@@ -255,7 +255,7 @@ kv_cache_config:
         llm_args_dict = self._yaml_to_dict(yaml_content)
 
         llm_args = TorchLlmArgs(model=llama_model_path, **llm_args_dict)
-        assert llm_args.kv_cache_config.enable_block_reuse == True
+        assert llm_args.kv_cache_config.enable_block_reuse
         assert llm_args.kv_cache_config.max_tokens == 1024
         assert llm_args.kv_cache_config.max_attention_window == [
             1024, 1024, 1024
@@ -864,7 +864,7 @@ def test_KvCacheConfig_declaration():
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
-    assert pybind_config.enable_block_reuse == True
+    assert pybind_config.enable_block_reuse
     assert pybind_config.max_tokens == 1024
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
     assert pybind_config.free_gpu_memory_fraction == 0.5
@@ -900,8 +900,8 @@ def test_KvCacheConfig_declaration():
                          ).kv_cache_event_hash_algo == "v2_sha256"
     assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256_64"
                          ).kv_cache_event_hash_algo == "v2_sha256_64"
-    assert pybind_config.enable_partial_reuse == True
-    assert pybind_config.copy_on_partial_reuse == True
+    assert pybind_config.enable_partial_reuse
+    assert pybind_config.copy_on_partial_reuse
     assert pybind_config.attention_dp_events_gather_period_ms == 10
     assert BlockReuseConfig(
         policy="per_conversation").policy == "per_conversation"
@@ -1439,8 +1439,8 @@ def test_DynamicBatchConfig_declaration():
 
     pybind_config = PybindMirror.maybe_to_pybind(config)
 
-    assert pybind_config.enable_batch_size_tuning == True
-    assert pybind_config.enable_max_num_tokens_tuning == True
+    assert pybind_config.enable_batch_size_tuning
+    assert pybind_config.enable_max_num_tokens_tuning
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
@@ -2722,7 +2722,7 @@ class TestStrictBaseModelArbitraryArgs:
         config = DynamicBatchConfig(enable_batch_size_tuning=True,
                                     enable_max_num_tokens_tuning=True,
                                     dynamic_batch_moving_average_window=8)
-        assert config.enable_batch_size_tuning == True
+        assert config.enable_batch_size_tuning
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -2767,7 +2767,7 @@ class TestStrictBaseModelArbitraryArgs:
         """Test that KvCacheConfig rejects arbitrary arguments."""
         # Valid arguments should work
         config = KvCacheConfig(enable_block_reuse=True, max_tokens=1024)
-        assert config.enable_block_reuse == True
+        assert config.enable_block_reuse
         assert config.max_tokens == 1024
 
         # Arbitrary arguments should be rejected
@@ -2782,8 +2782,8 @@ class TestStrictBaseModelArbitraryArgs:
         # Valid arguments should work
         config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
                                                cuda_graph_mode=False)
-        assert config.multi_block_mode == True
-        assert config.cuda_graph_mode == False
+        assert config.multi_block_mode
+        assert not config.cuda_graph_mode
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -2821,8 +2821,8 @@ class TestStrictBaseModelArbitraryArgs:
         # Valid arguments should work
         config = TorchCompileConfig(enable_fullgraph=True,
                                     enable_inductor=False)
-        assert config.enable_fullgraph == True
-        assert config.enable_inductor == False
+        assert config.enable_fullgraph
+        assert not config.enable_inductor
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -3153,8 +3153,8 @@ class TestPyTorchBackendModelDefaults:
             assert self.get_model_defaults_called
 
             modified_args = llm._executor.engine.model_engine.llm_args
-            assert modified_args.enable_chunked_prefill == True
-            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.enable_chunked_prefill
+            assert not modified_args.kv_cache_config.enable_block_reuse
             assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
 
     @pytest.mark.part0
@@ -3174,10 +3174,10 @@ class TestPyTorchBackendModelDefaults:
             assert self.get_model_defaults_called
 
             modified_args = llm._executor.engine.model_engine.llm_args
-            assert modified_args.enable_chunked_prefill == False
+            assert not modified_args.enable_chunked_prefill
             assert modified_args.max_batch_size == 42
             assert modified_args.max_input_len == 256
-            assert modified_args.kv_cache_config.enable_block_reuse == True
+            assert modified_args.kv_cache_config.enable_block_reuse
 
     @pytest.mark.part0
     def test_partial_user_override(self):
@@ -3194,8 +3194,8 @@ class TestPyTorchBackendModelDefaults:
 
             modified_args = llm._executor.engine.model_engine.llm_args
             assert modified_args.max_batch_size == 42
-            assert modified_args.enable_chunked_prefill == True
-            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.enable_chunked_prefill
+            assert not modified_args.kv_cache_config.enable_block_reuse
 
     @pytest.mark.part0
     def test_empty_nested_config_preserves_defaults(self):
@@ -3221,7 +3221,7 @@ class TestPyTorchBackendModelDefaults:
             # Model defaults set enable_block_reuse=False and
             # free_gpu_memory_fraction=0.75.  An empty KvCacheConfig()
             # should not prevent these from being applied.
-            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert not modified_args.kv_cache_config.enable_block_reuse
             assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
 
 
@@ -3292,8 +3292,7 @@ def _get_qualified_name(cls: type) -> str:
 
 @pytest.mark.cpu_only
 class TestPydanticBestPractices:
-    """Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
-    """
+    """Check user-facing LlmArgs and subfields for Pydantic best practices."""
 
     # Fields exempt from Pydantic compatibility checks due to typing limitations or other edge cases.
     # Avoid adding to this list unless absolutely necessary, especially if a field is user-facing.
@@ -4573,3 +4572,117 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+class TestDSparkConfidenceScheduling:
+    """Config surface for DSpark confidence-scheduled verification."""
+
+    def _cfg(self, **kw):
+        from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+        kw.setdefault("max_draft_len", 5)
+        return DSparkDecodingConfig(**kw)
+
+    def _scheduled(self, **kw):
+        """Scheduling on with the required profiled cost table."""
+        kw["enable_confidence_scheduling"] = True
+        kw.setdefault("confidence_sps_table_path", "/tmp/sps.json")
+        return self._cfg(**kw)
+
+    def test_defaults_are_off(self):
+        c = self._cfg()
+        assert c.enable_confidence_scheduling is False
+        assert c.enable_fused_confidence_scheduler is False
+        assert c.confidence_verify_len_tiers is None
+        # With scheduling off the ladder is just the static length.
+        assert c.verify_len_tiers == [5]
+
+    def test_knobs_require_the_master_switch(self):
+        for kw in ({
+                "confidence_sts_path": "/tmp/sts.json"
+        }, {
+                "confidence_sps_table_path": "/tmp/sps.json"
+        }, {
+                "confidence_sps_live_fingerprint_path": "/tmp/runtime.json"
+        }, {
+                "confidence_verify_len_tiers": [1, 5]
+        }):
+            with pytest.raises(ValueError,
+                               match="enable_confidence_scheduling"):
+                self._cfg(**kw)
+
+    def test_default_ladder_is_derived_and_includes_the_full_block(self):
+        c = self._scheduled()
+        assert c.verify_len_tiers == [1, 3, 5]
+
+    def test_full_block_is_always_reachable(self):
+        """The full block is the fallback when confidence is stale; keep it."""
+        c = self._scheduled(confidence_verify_len_tiers=[1, 2])
+        assert c.verify_len_tiers[-1] == 5
+
+    def test_ladder_cannot_exceed_max_draft_len(self):
+        with pytest.raises(ValueError, match="exceeds max_draft_len"):
+            self._scheduled(confidence_verify_len_tiers=[1, 9])
+
+    def test_ladder_is_deduped_and_sorted(self):
+        c = self._scheduled(confidence_verify_len_tiers=[5, 1, 3, 3])
+        assert c.verify_len_tiers == [1, 3, 5]
+
+    def test_fused_scheduler_is_independently_gated(self):
+        with pytest.raises(ValueError,
+                           match="enable_fused_confidence_scheduler"):
+            self._cfg(enable_fused_confidence_scheduler=True)
+        c = self._scheduled(enable_fused_confidence_scheduler=True)
+        assert c.enable_fused_confidence_scheduler is True
+
+    @staticmethod
+    def _environment(**overrides):
+        values = dict(
+            cuda_graph_config=SimpleNamespace(enable_padding=True),
+            guided_decoding_backend=None,
+            enable_lora=False,
+            lora_config=None,
+            sparse_attention_config=None,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({
+                "cuda_graph_config": None
+            }, "requires cuda_graph_config"),
+            (
+                {
+                    "cuda_graph_config": SimpleNamespace(enable_padding=False)
+                },
+                "enable_padding=True",
+            ),
+            ({
+                "guided_decoding_backend": "xgrammar"
+            }, "guided decoding"),
+            ({
+                "enable_lora": True
+            }, "does not yet support LoRA"),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=True,
+                        use_cute_dsl_topk=False,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "enable_heuristic_topk",
+            ),
+        ],
+    )
+    def test_confidence_environment_rejects_unsupported_runtime_combinations(
+            self, overrides, message):
+        environment = self._environment(**overrides)
+        with pytest.raises(ValueError, match=message):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    def test_confidence_environment_accepts_padded_cuda_graphs(self):
+        TorchLlmArgs._validate_dspark_confidence_environment(
+            self._environment())

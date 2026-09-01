@@ -704,9 +704,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     algorithm: str
 
     def supports_backend(self, backend: str) -> bool:
-        """Override if the sparse attention algorithm does not support
-        a subset of the possible backends.
-        """
+        """Return whether this sparse-attention algorithm supports the backend."""
         return True
 
     def to_sparse_params(self, **kwargs):
@@ -1166,7 +1164,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return backend == "pytorch"
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """Whether to capture separate CUDA graphs for short and long sequences.
+        """Return whether short and long sequences need separate CUDA graphs.
+
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
@@ -1174,10 +1173,10 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
     @staticmethod
     def _is_full_indexer_layer(pretrained_config, layer_idx) -> bool:
-        """Whether a DSA layer runs its own indexer ("full") or reuses the
-        previous full layer's top-k ("shared") -- cross-layer indexer sharing.
+        """Return whether a DSA layer runs its own indexer.
 
-        Resolved from the HF config: index_topk_pattern, else
+        Shared layers reuse the previous full layer's top-k. The setting is
+        resolved from the HF config: index_topk_pattern, else
         index_topk_freq/index_skip_topk_offset. The MTP/nextn layer
         (>= num_hidden_layers) is always full. Defaults to full (a dense
         per-layer indexer, e.g. DeepSeek-V3.2).
@@ -1493,7 +1492,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
     # --- Methods ---
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """Initializes the runtime state of the configuration.
+        """Initialize the runtime state of the configuration.
+
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -2130,9 +2130,7 @@ class DecodingBaseConfig(StrictBaseModel):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        """Override if the speculation algorithm does not support
-        a subset of the possible backends.
-        """
+        """Return whether this speculation algorithm supports the backend."""
         return True
 
     @property
@@ -2455,7 +2453,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
-        """Returns the number of layers to capture of the target model.
+        """Return the number of target-model layers to capture.
+
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -2571,7 +2570,8 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self):
-        """Returns the number of layers to save.
+        """Return the number of layers to save.
+
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -3029,13 +3029,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     layers as cross-attention context and drafts a whole block in a single
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
-    head) and predicts an acceptance-confidence per position to truncate the
-    proposed prefix.
+    head) and predicts a per-position acceptance confidence used to budget how
+    much verification the batch is worth.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
     - Semi-parallel: one block backbone forward + cheap sequential head refine.
-    - Confidence head: truncates the proposed draft length (NOT the accept rule;
+    - Confidence head: sizes the *verification* budget (NOT the accept rule;
       acceptance stays standard target verification, preserving greedy parity).
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
@@ -3072,13 +3072,65 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
+    enable_confidence_scheduling: bool = Field(
+        default=False,
+        description=
+        "Score each drafted position with the draft's confidence head and let "
+        "the verification scheduler size the batch's verify budget from those "
+        "scores. The block is always drafted in full; only the number of tokens "
+        "sent to the target for verification changes, so acceptance (and hence "
+        "output distribution) is unaffected. Requires a checkpoint with trained "
+        "confidence-head weights. Gains only appear at high concurrency -- at "
+        "small batch sizes the step cost is nearly flat in the verified token "
+        "count, so trimming saves nothing and costs acceptance length.",
+        status="prototype")
+
+    confidence_sts_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with per-position sequential-temperature-scaling "
+        "(STS) values used to calibrate the confidence head. The scheduler "
+        "consumes a cumulative product of per-position probabilities, so a "
+        "per-position calibration error compounds geometrically along the "
+        "block. If None, the raw sigmoid is used (identity calibration).",
+        status="prototype")
+
+    confidence_sps_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with the profiled decode step cost as a function of "
+        "the total verified token count. Without it the planner has a flat cost "
+        "model, under which every extra verified token looks free and the budget "
+        "degenerates to verify-all (no scheduling gain).",
+        status="prototype")
+
+    confidence_sps_live_fingerprint_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to an independently generated JSON fingerprint of the active "
+        "runtime. Required by schema-v2 exact T(G,V) cost tables so the table "
+        "cannot authenticate its own model, source, topology, GPU, or CUDA "
+        "graph ladder. Legacy one-dimensional SPS curves do not require it.",
+        status="prototype")
+
+    confidence_verify_len_tiers: Optional[List[PositiveInt]] = Field(
+        default=None,
+        description=
+        "Legacy uniform-scheduling draft lengths. Exact schema-v2 SPS tables "
+        "derive production CUDA-graph verifier budgets directly from their "
+        "measured T(G,V) cells and ignore this ladder. If None, the legacy "
+        "path defaults to [1, ceil(max_draft_len/2), max_draft_len].",
+        status="prototype")
+
+    enable_fused_confidence_scheduler: bool = Field(
+        default=False,
+        description=
+        "Use the optional policy-neutral Triton implementation of confidence "
+        "top-k allocation plus exact CUDA-graph bucket fill. This changes only "
+        "the scheduler launch path: budgets, survival thresholds, selected "
+        "windows, and fallback behavior remain identical. It is independently "
+        "default-off and requires confidence scheduling.",
+        status="prototype")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
@@ -3094,6 +3146,50 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
         "with a private paged context cache; VANILLA uses FlashAttention with "
         "a contiguous cache.")
+
+    @model_validator(mode="after")
+    def validate_confidence_scheduling(self):
+        if not self.enable_confidence_scheduling:
+            if (self.enable_fused_confidence_scheduler
+                    or self.confidence_sts_path
+                    or self.confidence_sps_table_path
+                    or self.confidence_sps_live_fingerprint_path
+                    or self.confidence_verify_len_tiers):
+                raise ValueError(
+                    "enable_fused_confidence_scheduler / confidence_sts_path / "
+                    "confidence_sps_table_path / "
+                    "confidence_sps_live_fingerprint_path / "
+                    "confidence_verify_len_tiers require "
+                    "enable_confidence_scheduling=True")
+            return self
+
+        if not self.confidence_sps_table_path:
+            raise ValueError(
+                "enable_confidence_scheduling=True requires "
+                "confidence_sps_table_path from a matched static-cost sweep")
+        if self.max_draft_len is not None:
+            tiers = self.confidence_verify_len_tiers or [
+                1, max(1, (self.max_draft_len + 1) // 2), self.max_draft_len
+            ]
+            tiers = sorted({int(t) for t in tiers})
+            if tiers[-1] > self.max_draft_len:
+                raise ValueError(
+                    f"confidence_verify_len_tiers {tiers} exceeds max_draft_len "
+                    f"({self.max_draft_len}); a request cannot verify more tokens "
+                    f"than the draft proposes")
+            # The full block must stay reachable: it is the fallback used whenever
+            # the confidence snapshot is stale or the cost model is unprofiled.
+            if tiers[-1] != self.max_draft_len:
+                tiers.append(self.max_draft_len)
+            self.confidence_verify_len_tiers = tiers
+        return self
+
+    @property
+    def verify_len_tiers(self) -> List[int]:
+        """Captured draft-length ladder; ``[max_draft_len]`` when scheduling is off."""
+        if not self.enable_confidence_scheduling:
+            return [self.max_draft_len]
+        return list(self.confidence_verify_len_tiers or [self.max_draft_len])
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -3276,7 +3372,8 @@ class PrometheusMetricsConfig(StrictBaseModel):
 
 
 class RayPlacementConfig(StrictBaseModel):
-    """Configuration for Ray GPU workers placement.
+    """Configure Ray GPU worker placement.
+
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -3463,9 +3560,7 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    """A class containing the utilities for mirroring Python classes to
-    pybind classes.
-    """
+    """Provide utilities for mirroring Python classes to pybind classes."""
 
     @abstractmethod
     def _to_pybind(self):
@@ -3823,8 +3918,10 @@ SparseAttentionConfig: TypeAlias = Annotated[
 
 
 class KvCacheCompressionConfig(StrictBaseModel):
-    """Config for KV-cache compression: a compression manager runs a KV-reduction
-    algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
+    """Configure KV-cache compression.
+
+    A compression manager runs a KV-reduction algorithm (e.g. periodic token
+    eviction) alongside KVCacheManagerV2.
 
     Kept separate from SparseAttentionConfig by design -- compression changes
     which KV is stored, not the attention computation. Iteration-driven methods
@@ -6052,6 +6149,88 @@ class TorchLlmArgs(BaseLlmArgs):
                 "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
+    def _validate_dspark_confidence_environment(self) -> None:
+        """Reject configurations confidence scheduling cannot honour.
+
+        Every check here guards a path that would otherwise degrade *silently*:
+        the run comes up, produces plausible text, and either never takes the
+        ragged path at all or takes it with a kernel that mis-attributes rows.
+        A hard error at construction is the only signal that survives.
+        """
+        cuda_graph_config = self.cuda_graph_config
+        if self.guided_decoding_backend is not None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support guided decoding. Guided-decoder bitmasks are laid "
+                "out with one uniform speculative stride; applying them to "
+                "packed per-request verify windows would shift every request "
+                "after the first short window. Disable guided decoding or "
+                "disable confidence scheduling.")
+        if self.enable_lora or self.lora_config is not None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support LoRA. LoRA metadata expands generation requests "
+                "with one uniform speculative stride, which cannot represent "
+                "packed per-request verify windows. Disable LoRA or disable "
+                "confidence scheduling.")
+        # `fit_ragged_verify_lens` plans against the padded row count and
+        # reserves tokens for the CUDA-graph padding rows, so it presumes those
+        # rows exist. With padding off, `_get_padded_batch` adds none: the batch
+        # then carries a token total that keys into a graph nobody captured and
+        # drops to eager on every ragged step -- which costs far more than the
+        # trimmed tokens save -- while real requests were still shrunk to leave
+        # room for padding that never arrived.
+        if cuda_graph_config is None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True requires "
+                "cuda_graph_config to be set with enable_padding=True. Ragged "
+                "verification fits each step's token total onto a captured "
+                "CUDA-graph bucket; with no graphs there is no bucket to fit "
+                "and every step would silently run eager.")
+        if not cuda_graph_config.enable_padding:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True requires "
+                "cuda_graph_config.enable_padding=True (it defaults to False). "
+                "The ragged token budget is planned against the padded batch "
+                "size and reserves tokens for the padding rows; without padding "
+                "those rows never appear, so the step's token total misses its "
+                "captured bucket and falls out of graph replay.")
+
+        sparse_attention_config = self.sparse_attention_config
+        if sparse_attention_config is not None:
+            # Both recover "which request is this row" from a fixed next_n --
+            # GVR indexes its previous-step top-k hint by request and strides it
+            # by next_n, and the CuTe-DSL kernel takes next_n as a compile-time
+            # constant and JIT cache key. Neither can express per-request
+            # windows. The C++ launcher already refuses the combination
+            # (indexerTopK.cu, "ragged rowKvLens is incompatible with the GVR
+            # preIdx hint"), but that fires deep in a decode step; say so here.
+            incompatible = [
+                name for name in ("enable_heuristic_topk", "use_cute_dsl_topk")
+                if getattr(sparse_attention_config, name, False)
+            ]
+            if incompatible:
+                raise ValueError(
+                    "speculative_config.enable_confidence_scheduling=True is "
+                    "incompatible with sparse_attention_config."
+                    f"{' / '.join(incompatible)}=True: those top-k paths "
+                    "reconstruct each row's request and window position from a "
+                    "single batch-wide next_n, which a ragged batch does not "
+                    "have. Disable them, or disable confidence scheduling.")
+            # Not an error: the DSL paged-MQA-logits path is structurally
+            # uniform too, but the expanded (one row per query token) path it
+            # falls back to is numerically equivalent, and it is the default on
+            # DeepSeek-V4 anyway. Still worth saying out loud, since the knob
+            # will read as honoured otherwise.
+            if getattr(sparse_attention_config, "use_cute_dsl_paged_mqa_logits",
+                       False):
+                logger.warning(
+                    "sparse_attention_config.use_cute_dsl_paged_mqa_logits=True "
+                    "is ignored on ragged-verification steps: the DSL kernel "
+                    "broadcasts one KV length per request across a fixed next_n. "
+                    "Those steps use the expanded DeepGEMM path instead, which "
+                    "is numerically equivalent.")
+
     @model_validator(mode="after")
     def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Normalize legacy piecewise CUDA graph options into prefill fields."""
@@ -6390,6 +6569,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                if spec_cfg.enable_confidence_scheduling:
+                    self._validate_dspark_confidence_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
