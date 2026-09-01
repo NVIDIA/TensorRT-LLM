@@ -429,8 +429,40 @@ def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
     assert prior_indices.tolist() == [[0, 0]]
 
 
-def test_unsupported_prefill_implementation_raises() -> None:
+def test_cute_dsl_prefill_dispatches_to_blackwell_kernel(monkeypatch) -> None:
+    prefill = Mock()
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_indexer_topk_prefill_blackwell",
+        prefill,
+    )
     top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_RADIX)
+    scores = torch.ones(1, 1)
+    output = torch.empty(1, 1, dtype=torch.int32)
+    row_starts = torch.zeros(1, dtype=torch.int32)
+    row_ends = torch.ones(1, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=True,
+        row_starts=row_starts,
+        row_ends=row_ends,
+    )
+
+    assert result is output
+    prefill.assert_called_once_with(
+        scores,
+        row_starts,
+        row_ends,
+        output,
+        1,
+        128,
+    )
+
+
+def test_unsupported_prefill_implementation_raises() -> None:
+    top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
 
     with pytest.raises(NotImplementedError, match="does not support prefill Top-K"):
         top_k(

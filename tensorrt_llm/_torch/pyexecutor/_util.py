@@ -156,8 +156,12 @@ def get_kv_cache_manager_cls(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
+        if sparse_attn_algorithm == "qsa" and not use_v2:
+            raise ValueError(
+                "QSA with hybrid Mamba / linear-attention models requires "
+                "use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None
-                and sparse_attn_algorithm != "skip_softmax"):
+                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -291,8 +295,17 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if sparse_attn_algorithm == "qsa":
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
+        if sparse_attn_algorithm == "qsa":
+            # The QSA manager extends the hybrid manager because it must retain
+            # both paged attention data and recurrent GDN state.
+            raise ValueError(
+                "QSA sparse attention currently requires a hybrid Mamba / "
+                "linear-attention model.")
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
                                                 use_kv_cache_manager_v2=use_v2)
     else:
@@ -2687,6 +2700,13 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
+            # Resolve the side-cache shape from the same checkpoint geometry
+            # used to construct the QSA index projection.
+            mamba_manager_extra_kwargs.update(
+                sparse_attention_config=sparse_attention_config,
+                pretrained_config=config,
+            )
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

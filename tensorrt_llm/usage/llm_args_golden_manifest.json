@@ -1568,6 +1568,7 @@
         "dsa",
         "deepseek_v4",
         "minimax_m3",
+        "qsa",
         "rocket",
         "skip_softmax"
       ],

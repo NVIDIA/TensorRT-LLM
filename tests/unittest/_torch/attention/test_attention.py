@@ -1,6 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable, Optional, Sequence
+from unittest.mock import Mock
 
 import flashinfer
 import pytest
@@ -14,6 +19,7 @@ from tensorrt_llm._torch.attention_backend import (AttentionBackend,
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modules import attention as attention_module
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -130,6 +136,58 @@ paged_backends = {
     VanillaAttention: False,
     FlashInferAttention: True,
 }
+
+
+def test_attention_forward_without_sparse_hooks_prepares_qkv_once(
+        monkeypatch) -> None:
+    hidden_states = torch.randn(2, 4)
+    qkv = torch.randn(2, 12)
+    preprocessed = tuple(torch.randn(2, 4) for _ in range(3))
+    converted = tuple(torch.randn(2, 4) for _ in range(3))
+    attention_output = torch.randn(2, 4)
+    projected_output = torch.randn(2, 4)
+
+    allgather = Mock(return_value=hidden_states)
+    output_projection = Mock(return_value=projected_output)
+    monkeypatch.setattr(attention_module, "_helix_cp_allgather_input",
+                        allgather)
+    monkeypatch.setattr(attention_module, "_helix_cp_output_projection",
+                        output_projection)
+
+    qkv_proj = Mock(return_value=qkv)
+    preprocess_qkv = Mock(return_value=(*preprocessed, None))
+    convert_qkv = Mock(return_value=converted)
+    forward_impl = Mock(return_value=attention_output)
+    attention = SimpleNamespace(
+        mapping=object(),
+        mapping_o=object(),
+        layer_idx=3,
+        rope_fusion=True,
+        qkv_proj=qkv_proj,
+        preprocess_qkv=preprocess_qkv,
+        convert_qkv=convert_qkv,
+        sparse_attn_hooks=None,
+        attn_backend="TRTLLM",
+        forward_impl=forward_impl,
+        attn_output_gate=False,
+        o_proj=object(),
+    )
+
+    result = attention_module.Attention.forward(
+        attention,
+        position_ids=None,
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+    )
+
+    assert result is projected_output
+    qkv_proj.assert_called_once_with(hidden_states)
+    preprocess_qkv.assert_called_once_with(qkv, None)
+    convert_qkv.assert_called_once_with(*preprocessed)
+    assert forward_impl.call_count == 1
+    for actual, expected in zip(forward_impl.call_args.args[:3], converted):
+        assert actual is expected
+    output_projection.assert_called_once()
 
 
 def kv_cache_manager_from(

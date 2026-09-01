@@ -27,6 +27,7 @@ def get_sparse_attn_kv_cache_manager(
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
+    from .qsa import QSAMambaHybridCacheManagerV2
     from .rocket import RocketKVCacheManager
 
     if sparse_attention_config.algorithm == "rocket":
@@ -39,6 +40,10 @@ def get_sparse_attn_kv_cache_manager(
         return KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
         return MiniMaxM3KVCacheManagerV2
+    elif sparse_attention_config.algorithm == "qsa":
+        if not use_kv_cache_manager_v2:
+            raise ValueError("QSA sparse attention requires KV cache manager V2")
+        return QSAMambaHybridCacheManagerV2
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm: {sparse_attention_config.algorithm}"
@@ -85,7 +90,11 @@ def get_trtllm_sparse_attn_attention_backend(
 
     from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
+    from .qsa import QSATrtllmAttention
     from .rocket import RocketTrtllmAttention
+
+    if sparse_params.algorithm == "qsa":
+        return QSATrtllmAttention
 
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention

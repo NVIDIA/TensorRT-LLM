@@ -16,11 +16,13 @@ l0_b300:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/qsa/test_qsa_sparse.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  - unittest/_torch/attention/sparse/qsa/test_qsa_sparse.py TIMEOUT (90)
+  - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -34,6 +36,10 @@ l0_b300:
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/test_low_m_gemm.py
+  - unittest/_torch/modules/test_top_k.py
+  - unittest/_torch/modules/test_qwen4_exp_hyper_connection.py TIMEOUT (90)
+  - unittest/_torch/modules/test_qwen4_exp_ple.py TIMEOUT (90)
+  - unittest/_torch/modules/test_qwen4_exp_ple_kernels.py TIMEOUT (90)
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------

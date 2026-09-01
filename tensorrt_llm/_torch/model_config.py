@@ -310,6 +310,14 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if self.pretrained_config and self.sparse_attention_config:
+            # Sparse geometry can come from the checkpoint. Resolve it once so
+            # cache allocation, CUDA-graph routing, and model layers all read
+            # the same concrete values.
+            self.sparse_attention_config = (
+                self.sparse_attention_config._resolve_checkpoint_defaults(
+                    self.pretrained_config))
+
         if self.pretrained_config:
             self.is_encoder_decoder = self.is_encoder_decoder_model(
                 self.pretrained_config)
