@@ -599,18 +599,6 @@ class GenerationResultBase:
                     self._disaggregated_params or DisaggregatedParams(),
                     ctx_usage=ctx_usage,
                 )
-                if not self.cached_tokens_by_tier:
-                    details = ctx_usage.get("prompt_tokens_details") if isinstance(
-                        ctx_usage, dict) else getattr(ctx_usage, "prompt_tokens_details", None)
-                    tier_breakdown = None
-                    if isinstance(details, dict):
-                        tier_breakdown = details.get("cached_tokens_by_tier")
-                    elif details is not None:
-                        tier_breakdown = getattr(details, "cached_tokens_by_tier", None)
-                    if tier_breakdown:
-                        self.cached_tokens_by_tier = tier_breakdown
-                    elif self.cached_tokens > 0:
-                        self.cached_tokens_by_tier = {"remote": self.cached_tokens}
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and

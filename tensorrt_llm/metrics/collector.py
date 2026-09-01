@@ -431,7 +431,7 @@ class MetricsCollector:
             documentation=
             "Total prompt tokens served from KV cache by storage tier.",
             labelnames=self.labels_with_cache_tier.keys())
-        for tier in ("gpu", "host", "disk", "remote"):
+        for tier in ("gpu", "host", "disk", "remote", "unknown"):
             self.counter_tokens_cached_prompt_by_tier.labels(
                 **{**self.labels, self.labelname_cache_tier: tier}
             )
@@ -631,34 +631,26 @@ class MetricsCollector:
                     MetricNames.GENERATION_TOKENS, 0):
                 self._log_counter(self.counter_generation_tokens, {},
                                   generation_tokens)
-            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict or MetricNames.PROMPT_CACHE_CACHED_TOKENS.value in metrics_dict:
-                raw_cached = metrics_dict.get(
-                    MetricNames.PROMPT_CACHE_CACHED_TOKENS)
-                if raw_cached is None:
-                    raw_cached = metrics_dict.get(
-                        MetricNames.PROMPT_CACHE_CACHED_TOKENS.value)
-
-                cached_tokens_by_tier = metrics_dict.get(
-                    MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER)
-                if cached_tokens_by_tier is None and hasattr(
-                        MetricNames, "PROMPT_CACHE_CACHED_TOKENS_BY_TIER"):
-                    cached_tokens_by_tier = metrics_dict.get(
-                        MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER.value)
-
-                if isinstance(raw_cached, dict):
-                    cached_tokens_by_tier = raw_cached
-                    cached_tokens = sum(cached_tokens_by_tier.values())
-                else:
-                    cached_tokens = int(raw_cached or 0)
-
+            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict:
+                cached_tokens = int(
+                    metrics_dict.get(MetricNames.PROMPT_CACHE_CACHED_TOKENS) or 0
+                )
                 if cached_tokens > 0:
                     self._log_counter(self.counter_tokens_cached_prompt, {},
                                       cached_tokens)
 
-                accounted_tokens = 0
+                cached_tokens_by_tier = metrics_dict.get(
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER
+                )
                 if cached_tokens_by_tier and isinstance(cached_tokens_by_tier,
                                                         dict):
-                    for tier, count in cached_tokens_by_tier.items():
+                    accounted_tokens = 0
+                    ordered_tiers = ("gpu", "host", "disk", "remote", "unknown")
+                    extra_tiers = tuple(
+                        t for t in cached_tokens_by_tier if t not in ordered_tiers
+                    )
+                    for tier in ordered_tiers + extra_tiers:
+                        count = cached_tokens_by_tier.get(tier, 0)
                         if count > 0 and accounted_tokens < cached_tokens:
                             tier_str = tier.value if hasattr(
                                 tier, "value") else str(tier).lower()
@@ -667,11 +659,13 @@ class MetricsCollector:
                                 self.counter_tokens_cached_prompt_by_tier,
                                 {self.labelname_cache_tier: tier_str}, alloc)
                             accounted_tokens += alloc
-                if cached_tokens > accounted_tokens:
-                    self._log_counter(
-                        self.counter_tokens_cached_prompt_by_tier,
-                        {self.labelname_cache_tier: "gpu"},
-                        cached_tokens - accounted_tokens)
+                    if cached_tokens > accounted_tokens:
+                        # If a breakdown was supplied but doesn't sum to the aggregate,
+                        # attribute leftover unaccounted tokens to unknown rather than guessing.
+                        self._log_counter(
+                            self.counter_tokens_cached_prompt_by_tier,
+                            {self.labelname_cache_tier: "unknown"},
+                            cached_tokens - accounted_tokens)
 
                 self._log_histogram(self.histogram_tokens_cached_prompt,
                                     cached_tokens)

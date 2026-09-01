@@ -226,15 +226,18 @@ dropped before reaching the executor.
 
 TensorRT-LLM exports Prometheus metrics tracking reused prompt tokens across storage tiers:
 
-- `trtllm_prompt_cached_tokens_total`: Legacy aggregate counter of all prompt tokens served from KV cache across all requests.
+- `trtllm_prompt_cached_tokens_total`: Aggregate counter of all prompt tokens served from KV cache across all requests.
 - `trtllm_prompt_cache_tier_tokens_total{cache_tier="..."}`: Monotonic counter partitioned by storage tier via the `cache_tier` label:
-  - `gpu`: Reused tokens resident in GPU VRAM (`CacheTier::GPU_MEM`).
-  - `host`: Reused tokens offloaded to pinned CPU host memory (`CacheTier::HOST_MEM`).
-  - `disk`: Reused tokens stored in local persistent disk cache (`CacheTier::DISK`).
-  - `remote`: Transferred context tokens received from context workers in disaggregated serving.
+  - `gpu`: Reused tokens resident in GPU VRAM (`CacheTier.GPU_MEM`).
+  - `host`: Reused tokens offloaded to pinned CPU host memory (`CacheTier.HOST_MEM`).
+  - `disk`: Reused tokens stored in local persistent disk cache (`CacheTier.DISK`).
+  - `remote`: Reused tokens transferred from remote workers in disaggregated serving.
+  - `unknown`: Reused tokens where specific storage tier attribution is unavailable or unaccounted.
 
-### Counter and Reset Semantics
+### Availability and Semantics
+- **Backend Requirement**: The per-tier breakdown is populated when using KVCacheManagerV2 (`--use_kv_cache_manager_v2=True` or models that enable it by default). When running with KVCacheManager v1 or when no breakdown is measured by the backend, tier breakdown series remain at `0.0`, while the aggregate `trtllm_prompt_cached_tokens_total` continues to track all cache hits.
 - **Monotonicity**: Counters are monotonically non-decreasing totals accumulated over the process lifetime.
 - **Reset**: Counters reset to `0.0` only upon server process restart.
-- **Pre-initialization**: Series for all standard tiers (`gpu`, `host`, `disk`, `remote`) are pre-initialized to `0.0` upon server initialization.
-- **Invariant**: Every cache hit is attributed to exactly one tier. The sum across all tiers matches `trtllm_prompt_cached_tokens_total`. Unpartitioned cache hits default to `gpu`.
+- **Pre-initialization**: Series for all standard tiers (`gpu`, `host`, `disk`, `remote`, `unknown`) are pre-initialized to `0.0` upon server initialization.
+- **Invariant**: When a tier breakdown is provided, per-tier allocations are bounded by the aggregate hit count, and any unaccounted residual tokens are recorded under `cache_tier="unknown"`, ensuring the sum across all tiers equals the aggregate cached token count.
+

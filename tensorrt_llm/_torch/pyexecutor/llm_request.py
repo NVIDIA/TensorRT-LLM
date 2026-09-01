@@ -1120,12 +1120,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     @property
     def cached_tokens_by_tier(self) -> dict[str, int]:
         """Return the count of cached prompt tokens partitioned by storage tier."""
-        return getattr(self, "_cached_tokens_by_tier", {})
+        return self._cached_tokens_by_tier
 
     @cached_tokens_by_tier.setter
     def cached_tokens_by_tier(self, value: dict[str, int]) -> None:
         """Set the cached prompt token breakdown by storage tier."""
-        self._cached_tokens_by_tier = value
+        if not self._cached_tokens_by_tier_set:
+            self._cached_tokens_by_tier = value
+            self._cached_tokens_by_tier_set = True
 
     def _initialize_execution_state(self,
                                     *,
@@ -1180,6 +1182,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self._cached_tokens = 0
         self._cached_tokens_by_tier = {}
         self._cached_tokens_set = False
+        self._cached_tokens_by_tier_set = False
 
     def reset_for_recompute(self, max_input_len: int) -> None:
         """Reset Python-side execution state so the request can replay prefill."""

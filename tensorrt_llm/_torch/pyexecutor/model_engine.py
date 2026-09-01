@@ -2581,7 +2581,9 @@ class PyTorchModelEngine(ModelEngine):
                     (request, request.py_encoder_output,
                      request.py_skip_cross_kv_projection, request.state,
                      request.py_batch_idx, request._cached_tokens,
-                     request._cached_tokens_set))
+                     request._cached_tokens_set,
+                     request._cached_tokens_by_tier,
+                     request._cached_tokens_by_tier_set))
                 request.py_encoder_output = torch.ones(
                     (max_encoder_output_len, hidden_size),
                     device="cuda",
@@ -2613,7 +2615,8 @@ class PyTorchModelEngine(ModelEngine):
 
             for (request, encoder_output, skip_cross_kv_projection, state,
                  batch_idx, cached_tokens,
-                 cached_tokens_set) in saved_request_state:
+                 cached_tokens_set, cached_tokens_by_tier,
+                 cached_tokens_by_tier_set) in saved_request_state:
                 request.py_encoder_output = encoder_output
                 request.py_skip_cross_kv_projection = skip_cross_kv_projection
                 request.state = state
@@ -2622,6 +2625,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.py_batch_idx = batch_idx
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
+                request._cached_tokens_by_tier = cached_tokens_by_tier
+                request._cached_tokens_by_tier_set = cached_tokens_by_tier_set
 
         def _run_capture_pass(force_non_greedy: bool, label: str,
                               force_lora_graph: bool) -> None:

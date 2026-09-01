@@ -365,7 +365,6 @@ class _KVCache:
             "gpu": 0,
             "host": 0,
             "disk": 0,
-            "remote": 0,
         }
         self._status = self.Status.SUSPENDED
         if reuse_match is not None:
@@ -1121,12 +1120,8 @@ class _KVCache:
 
     @property
     def reused_tokens_by_tier(self) -> dict[str, int]:
-        """Return the count of reused tokens partitioned by storage tier (gpu, host, disk, remote)."""
-        return getattr(
-            self,
-            "_reused_tokens_by_tier",
-            {"gpu": len(self._committed_tokens), "host": 0, "disk": 0, "remote": 0}
-        )
+        """Return the count of reused tokens partitioned by storage tier (gpu, host, disk)."""
+        return self._reused_tokens_by_tier
 
     def _get_num_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
@@ -2145,46 +2140,12 @@ class _KVCache:
             ],
         )
 
-        self._reused_tokens_by_tier = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
+        self._reused_tokens_by_tier = {"gpu": 0, "host": 0, "disk": 0}
         attn_lc_indices = [
             lc_idx for lc_idx, lc in life_cycles.items()
             if isinstance(lc, AttnLifeCycle)
         ]
-
-        if attn_lc_indices and matched:
-            num_attn_lcs = len(attn_lc_indices)
-            for ordinal in range(len(matched)):
-                tokens_in_block = min(
-                    tokens_per_block,
-                    num_tokens - ordinal * tokens_per_block
-                )
-                if tokens_in_block <= 0:
-                    break
-
-                tier_page_counts = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
-                for lc_idx in attn_lc_indices:
-                    page = matched[ordinal].get_page(lc_idx)
-                    if page is not None and getattr(page, "cache_level", None) is not None:
-                        tier = manager.cache_tier_list[page.cache_level]
-                        if tier == CacheTier.HOST_MEM:
-                            tier_page_counts["host"] += 1
-                        elif tier == CacheTier.DISK:
-                            tier_page_counts["disk"] += 1
-                        else:
-                            tier_page_counts["gpu"] += 1
-                    else:
-                        tier_page_counts["gpu"] += 1
-
-                assigned_tokens = 0
-                for tier_name in ("disk", "host"):
-                    count = tier_page_counts[tier_name]
-                    if count > 0:
-                        allocated = (tokens_in_block * count) // num_attn_lcs
-                        self._reused_tokens_by_tier[tier_name] += allocated
-                        assigned_tokens += allocated
-                self._reused_tokens_by_tier["gpu"] += (tokens_in_block - assigned_tokens)
-        elif num_tokens > 0:
-            self._reused_tokens_by_tier["gpu"] += num_tokens
+        num_attn_lcs = len(attn_lc_indices)
 
         beam_idx = DEFAULT_BEAM_INDEX
 
@@ -2194,6 +2155,31 @@ class _KVCache:
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
+
+            is_attn = isinstance(lc, AttnLifeCycle)
+            if is_attn and num_attn_lcs > 0:
+                # Tally every matched block's tier, including sliding-window stale
+                # (out-of-window) blocks that are matched but not loaded into active blocks.
+                for ordinal in typed_range(BlockOrdinal(len(matched))):
+                    tokens_in_block = min(
+                        tokens_per_block,
+                        num_tokens - ordinal * tokens_per_block
+                    )
+                    if tokens_in_block <= 0:
+                        break
+                    page = matched[ordinal].get_page(lc_idx)
+                    tier = CacheTier.GPU_MEM
+                    if page is not None and getattr(page, "cache_level", None) is not None:
+                        tier = manager.cache_tier_list[page.cache_level]
+                    tier_name = "gpu"
+                    if tier == CacheTier.HOST_MEM:
+                        tier_name = "host"
+                    elif tier == CacheTier.DISK:
+                        tier_name = "disk"
+                    # Integer division floors per attention lifecycle. Residue from
+                    # multiple lifecycles is reconciled into GPU below.
+                    self._reused_tokens_by_tier[tier_name] += (tokens_in_block // num_attn_lcs)
+
             stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
             full_reused_blocks = 0
             partial_reused_blocks = 0
@@ -2201,11 +2187,13 @@ class _KVCache:
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_optional(matched[ordinal].get_page(lc_idx)).hold()
+                page = unwrap_optional(matched[ordinal].get_page(lc_idx))
+                holder = page.hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
-                if record_shared_stats and isinstance(lc, AttnLifeCycle):
+
+                if record_shared_stats and is_attn:
                     if ordinal < full_reused_end:
                         full_reused_blocks += 1
                     elif (
@@ -2214,7 +2202,7 @@ class _KVCache:
                         and self._has_reuse_source(holder)
                     ):
                         partial_reused_blocks = 1
-            if record_shared_stats and isinstance(lc, AttnLifeCycle):
+            if record_shared_stats and is_attn:
                 changed = self._pending_stats.record_reuse(
                     lc_idx,
                     full_reused_blocks=full_reused_blocks,
@@ -2224,6 +2212,14 @@ class _KVCache:
                 )
                 if changed:
                     self.manager.mark_stats_dirty(self.id)
+
+        # Note: If multiple attention lifecycles exist and tokens_in_block does not
+        # divide evenly across lifecycles, integer division floors per lifecycle,
+        # and any residual tokens are assigned to the GPU tier so that
+        # sum(self._reused_tokens_by_tier.values()) == num_tokens.
+        assigned_tokens = sum(self._reused_tokens_by_tier.values())
+        if num_tokens > assigned_tokens:
+            self._reused_tokens_by_tier["gpu"] += (num_tokens - assigned_tokens)
         # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1]

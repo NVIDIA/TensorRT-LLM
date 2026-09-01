@@ -1080,8 +1080,7 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
-                response.result.cached_tokens_by_tier = getattr(
-                    request, 'cached_tokens_by_tier', {})
+                response.result.cached_tokens_by_tier = request.cached_tokens_by_tier
                 self._maybe_attach_ctx_usage(request, response)
                 # Buffer the response instead of enqueueing immediately.
                 # With ADP, _enqueue_responses does a tp_gather collective.
@@ -8326,8 +8325,7 @@ class PyExecutor:
                 response = req.create_response(False, self.dist.rank)
                 if response is not None:
                     response.result.cached_tokens = req.cached_tokens
-                    response.result.cached_tokens_by_tier = getattr(
-                        req, 'cached_tokens_by_tier', {})
+                    response.result.cached_tokens_by_tier = req.cached_tokens_by_tier
                     self._maybe_attach_ctx_usage(req, response)
                     if logits_snapshot is not None:
                         response.result.generation_logits = logits_snapshot
@@ -8374,8 +8372,7 @@ class PyExecutor:
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
-            response.result.cached_tokens_by_tier = getattr(
-                request, 'cached_tokens_by_tier', {})
+            response.result.cached_tokens_by_tier = request.cached_tokens_by_tier
             self._maybe_attach_ctx_usage(request, response)
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot
@@ -8477,8 +8474,7 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
-                    response.result.cached_tokens_by_tier = getattr(
-                        request, 'cached_tokens_by_tier', {})
+                    response.result.cached_tokens_by_tier = request.cached_tokens_by_tier
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
