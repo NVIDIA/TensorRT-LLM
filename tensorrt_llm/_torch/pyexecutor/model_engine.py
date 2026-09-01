@@ -5970,7 +5970,7 @@ class PyTorchModelEngine(ModelEngine):
                                                                 LlmRequest]]):
         assert not self._is_packed_runner, (
             "a packed-batch runner cannot execute scheduled requests")
-        if not self._disable_overlap_scheduler:
+        if not getattr(self, "_disable_overlap_scheduler", True):
             # Do not refill reusable host staging while the previous
             # iteration's asynchronous H2D copies still consume it.  This
             # event precedes the model forward, so its synchronization retains
