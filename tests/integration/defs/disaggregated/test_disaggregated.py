@@ -4141,6 +4141,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,

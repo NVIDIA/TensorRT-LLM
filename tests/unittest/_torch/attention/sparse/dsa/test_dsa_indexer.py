@@ -1498,14 +1498,14 @@ def _create_mock_metadata(
 
             self.runtime_features = RuntimeFeatures()
 
-            # Add expanded buffers for MTP support
-            # DSL kernel supports arbitrary next_n natively, so it never needs expansion.
-            self.use_expanded_buffers_for_mtp = not use_cute_dsl_paged_mqa_logits and (
-                (self.max_draft_tokens > 1 and get_sm_version() == 90)
-                or (
-                    (self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                    and get_sm_version() >= 100
-                )
+            # Add expanded buffers for MTP support. Mirrors the production gate in
+            # DSAtrtllmAttentionMetadata.prepare_for_spec_decode: sm100+ DeepGEMM
+            # runs a native next_n for any MTP depth, so only sm90 expands. The DSL
+            # kernel supports arbitrary next_n natively, so it never needs expansion.
+            self.use_expanded_buffers_for_mtp = (
+                not use_cute_dsl_paged_mqa_logits
+                and self.max_draft_tokens > 1
+                and get_sm_version() == 90
             )
             self.kv_lens_expanded_cuda = torch.zeros(
                 (self.num_seqs * (1 + self.max_draft_tokens),), device="cuda", dtype=torch.int32
@@ -1950,7 +1950,10 @@ def test_fp8_k_cache_roundtrip():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
+# next_n=5 (MTP-4) exercises the native paged-MQA path on sm100+ (no buffer
+# expansion); on sm90 it falls back to the expanded buffers. See
+# DSAtrtllmAttentionMetadata.prepare_for_spec_decode.
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4), (2, 5)])
 @pytest.mark.parametrize(
     "backend",
     [
