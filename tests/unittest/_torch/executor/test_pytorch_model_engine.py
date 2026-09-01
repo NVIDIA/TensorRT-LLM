@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
     _filter_cuda_graph_batch_sizes, _get_context_prompt_lookahead_token,
+    _get_num_heads_per_kv,
     _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
@@ -75,6 +76,29 @@ class DummyKvCacheConnectorWorker(KvCacheConnectorWorker):
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         pass
+
+
+def test_gemma4_metadata_gqa_ratio_uses_per_layer_kv_heads():
+
+    class StrictGemma4TextConfig:
+        model_type = "gemma4_text"
+        num_hidden_layers = 12
+        num_attention_heads = 16
+        per_layer_attributes = {"head_dim", "num_key_value_heads"}
+        per_layer_config = [
+            SimpleNamespace(
+                head_dim=256 if (layer_idx + 1) % 6 else 512,
+                num_key_value_heads=8 if (layer_idx + 1) % 6 else 1,
+            ) for layer_idx in range(12)
+        ]
+
+        def __getattribute__(self, name):
+            if name == "num_key_value_heads":
+                raise RuntimeError(
+                    f"ambiguous global per-layer attribute: {name}")
+            return super().__getattribute__(name)
+
+    assert _get_num_heads_per_kv(StrictGemma4TextConfig()) == 16
 
 
 class DummyModel(torch.nn.Module):
