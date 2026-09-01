@@ -1153,6 +1153,7 @@ class TestRequestCompatibility:
         "video": None,
         "action_mode": None,
         "action_gen": False,
+        "audio_gen": False,
         "enable_audio": False,
         "transfer_config": None,
     }
@@ -1191,6 +1192,21 @@ class TestRequestCompatibility:
                 {"output_type": "image", "action_mode": "policy", "action_gen": True},
                 "does not support output_type='image'",
             ),
+            ({"enable_audio": True}, "no audio tower"),
+            (
+                {"image": torch.zeros(1), "action_mode": "policy", "action_gen": True},
+                "does not support tensor image/video inputs",
+            ),
+            (
+                {"video": torch.zeros(1), "action_mode": "policy", "action_gen": True},
+                "does not support tensor image/video inputs",
+            ),
+            (
+                {"video": "video.mp4", "action_mode": "inverse_dynamics", "action_gen": True},
+                "inverse_dynamics requires encoded MP4/AVI bytes",
+            ),
+            ({"video": "video.mp4"}, "V2V reference must be encoded MP4/AVI bytes"),
+            ({"image": object()}, "image.*must be a PIL.Image"),
         ],
     )
     def test_rejects_incompatible_workflows(self, overrides, error):
@@ -1202,10 +1218,12 @@ class TestRequestCompatibility:
         "overrides",
         [
             {},
-            {"image": object()},
+            {"image": "image.png"},
+            {"image": torch.zeros(1)},
             {"video": b"video"},
             {"output_type": "image", "enable_audio": True},
-            {"image": object(), "action_mode": "policy", "action_gen": True},
+            {"enable_audio": True, "audio_gen": True},
+            {"image": "image.png", "action_mode": "policy", "action_gen": True},
             {"video": b"video", "transfer_config": object()},
         ],
     )

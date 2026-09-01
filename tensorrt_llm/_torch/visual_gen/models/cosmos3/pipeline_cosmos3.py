@@ -144,6 +144,7 @@ def _validate_request_compatibility(
     video: Any,
     action_mode: Optional[str],
     action_gen: bool,
+    audio_gen: bool,
     enable_audio: bool,
     transfer_config: Optional[Cosmos3TransferConfig],
 ) -> None:
@@ -185,6 +186,38 @@ def _validate_request_compatibility(
         )
     if is_t2i and do_action:
         raise ValueError("Cosmos3 action generation does not support output_type='image'.")
+    if enable_audio and not is_t2i and not audio_gen:
+        raise ValueError(
+            "enable_audio=True, but this checkpoint has no audio tower "
+            "(transformer config declares sound_gen=false). Drop enable_audio "
+            "or use an audio-capable Cosmos3 checkpoint."
+        )
+    if do_action and (isinstance(image, torch.Tensor) or isinstance(video, torch.Tensor)):
+        raise ValueError(
+            "Cosmos3 action generation does not support tensor image/video inputs; "
+            "pass a PIL image or image path, or encoded MP4/AVI video bytes."
+        )
+    if (
+        action_mode == ACTION_MODE_INVERSE_DYNAMICS
+        and video is not None
+        and not isinstance(video, bytes)
+    ):
+        raise ValueError(
+            "Cosmos3 inverse_dynamics requires encoded MP4/AVI bytes "
+            f"(the 'video' extra-param contract), got {type(video).__name__}."
+        )
+    is_v2v = has_video and not is_t2i and not do_action and not do_transfer
+    if is_v2v and not isinstance(video, bytes):
+        raise ValueError(
+            "Cosmos3 V2V reference must be encoded MP4/AVI bytes "
+            f"(the 'video' extra-param contract), got {type(video).__name__}."
+        )
+    if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+        raise ValueError(
+            f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+            f"got {type(image)}. Batch of different images is not supported; "
+            f"use a single image with multiple prompts instead."
+        )
 
 
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
@@ -1610,6 +1643,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             video=video,
             action_mode=normalized_action_mode,
             action_gen=getattr(self, "action_gen", False),
+            audio_gen=getattr(self, "audio_gen", False),
             enable_audio=enable_audio,
             transfer_config=transfer_config,
         )
@@ -1758,26 +1792,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 f"frame_rate={frame_rate:.1f}"
             )
 
-        # Weight-presence guard, not workflow policy: the request explicitly
-        # asks for audio, but the checkpoint ships no audio tower. Silently
-        # returning a silent video would hide the capability limit.
-        if enable_audio and not self.audio_gen:
-            raise ValueError(
-                "enable_audio=True, but this checkpoint has no audio tower "
-                "(transformer config declares sound_gen=false). Drop enable_audio "
-                "or use an audio-capable Cosmos3 checkpoint."
-            )
-
         if resolved_action_fps is None:
             resolved_action_fps = frame_rate
 
         action_source_h = action_source_w = None
         if do_action:
-            if isinstance(image, torch.Tensor) or isinstance(video, torch.Tensor):
-                raise ValueError(
-                    "Cosmos3 action generation does not support tensor image/video inputs; "
-                    "pass a PIL image or image path, or encoded MP4/AVI video bytes."
-                )
             # Header probe for video bytes, direct measure for an image: the
             # canvas is the bucket closest to the source's shape, so the size
             # has to be known before anything is decoded at it.
@@ -1828,14 +1847,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if batch_size > 1:
             # TODO: support batch generation
             raise ValueError("Batch generation is not supported for Cosmos3")
-
-        # Validate image input — only single image is supported for batch generation
-        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
-            raise ValueError(
-                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
-                f"got {type(image)}. Batch of different images is not supported; "
-                f"use a single image with multiple prompts instead."
-            )
 
         # Text guardrail — check both positive and user-supplied negative prompts.
         # None negative_prompt means the empty default will be used (safe); skip it.
@@ -1985,11 +1996,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
             if normalized_action_mode == ACTION_MODE_INVERSE_DYNAMICS:
-                if not isinstance(video, bytes):
-                    raise ValueError(
-                        "Cosmos3 inverse_dynamics requires encoded MP4/AVI bytes "
-                        f"(the 'video' extra-param contract), got {type(video).__name__}."
-                    )
                 prepare_error: Optional[Exception] = None
                 try:
                     source_info = video_stream_info(video)
@@ -2127,33 +2133,26 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         f"of range for a {num_frames}-frame output "
                         f"({num_latent_frames} latent frames)."
                     )
-                if isinstance(video, bytes):
-                    window = _condition_pixel_frame_count(
-                        condition_video_latent_indexes, self.vae_scale_factor_temporal
-                    )
-                    # The conditioning window is a Cosmos3 constraint: it is
-                    # derived from indexes into the *output* latent timeline,
-                    # already bound-checked above. The decoder just returns
-                    # the frames asked for. "last" is a negative range, which
-                    # costs a decode to EOS -- the caller's choice to make.
-                    if _normalize_condition_video_keep(condition_video_keep) == "first":
-                        first_frame, last_frame = 0, window - 1
-                    else:
-                        first_frame, last_frame = -window, -1
-                    frames_u8 = decode_video_reference_window(
-                        video,
-                        first_frame=first_frame,
-                        last_frame=last_frame,
-                        target_h=height,
-                        target_w=width,
-                        device=self.device,
-                    )
+                window = _condition_pixel_frame_count(
+                    condition_video_latent_indexes, self.vae_scale_factor_temporal
+                )
+                # The conditioning window is a Cosmos3 constraint: it is
+                # derived from indexes into the *output* latent timeline,
+                # already bound-checked above. The decoder just returns
+                # the frames asked for. "last" is a negative range, which
+                # costs a decode to EOS -- the caller's choice to make.
+                if _normalize_condition_video_keep(condition_video_keep) == "first":
+                    first_frame, last_frame = 0, window - 1
                 else:
-                    raise ValueError(
-                        "Cosmos3 V2V reference must be encoded MP4/AVI bytes "
-                        f"(the 'video' extra-param contract), got "
-                        f"{type(video).__name__}."
-                    )
+                    first_frame, last_frame = -window, -1
+                frames_u8 = decode_video_reference_window(
+                    video,
+                    first_frame=first_frame,
+                    last_frame=last_frame,
+                    target_h=height,
+                    target_w=width,
+                    device=self.device,
+                )
                 condition_pixels = self._condition_frames_to_video_tensor(frames_u8)
                 del frames_u8
 
