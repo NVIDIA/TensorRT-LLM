@@ -44,7 +44,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..conftest import (check_device_contain, get_device_count,
                         get_mpi_world_size, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
-                        skip_no_mxfp4_swizzle, skip_no_sm120,
+                        skip_no_mxfp4_swizzle, skip_no_rubin, skip_no_sm120,
                         skip_post_blackwell, skip_post_hopper, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
