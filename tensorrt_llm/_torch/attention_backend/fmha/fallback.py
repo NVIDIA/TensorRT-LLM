@@ -52,6 +52,14 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
 # literal value.
 _THOP_LITERALS: dict = {}
 
+# ``mmha_supported`` is not exposed to Python, so this is an exact copy of
+# ``MMHA_SUPPORTED_HEAD_SIZES`` in
+# ``cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention.cu``;
+# ``test_attention_op_sync.py`` parses that array to keep the two in step.
+_MMHA_SUPPORTED_HEAD_SIZES: frozenset = frozenset(
+    {32, 48, 64, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256}
+)
+
 
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
@@ -66,6 +74,37 @@ class FallbackFmha(Fmha):
                 return False
         return True
 
+    @classmethod
+    def can_serve(
+        cls,
+        attn: "TrtllmAttention",
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        """Whether this backend can run the request at all.
+
+        Another FMHA library may decline a request expecting this one to pick it
+        up. That handoff is only safe when the native op accepts the request:
+        ``thop.attention`` rejects Q-only cached-KV self attention, and
+        ``AttentionOp::initialize``'s MMHA head-size pre-check kills the process
+        with SIGABRT rather than surfacing a Python error, so an unserviceable
+        handoff takes the caller down instead of falling through to the
+        selector's ``RuntimeError``.
+        """
+        return (
+            cls.is_available(attn)
+            and forward_args.attention_mask != CustomAttentionMask.CUSTOM
+            and (forward_args.update_kv_cache or metadata.is_cross)
+            # ``AttentionOp::initialize``'s head-size pre-check: MLA skips it by
+            # bringing its own kernels, and 72 is exempt because only the FMHA
+            # kernels serve that size.
+            and (
+                attn.is_mla_enable
+                or attn.head_dim == 72
+                or attn.head_dim in _MMHA_SUPPORTED_HEAD_SIZES
+            )
+        )
+
     def is_supported(
         self,
         q: torch.Tensor,
@@ -77,9 +116,7 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del q, k, v, phase
-        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
-            forward_args.update_kv_cache or metadata.is_cross
-        )
+        return self.can_serve(self.attn, metadata, forward_args)
 
     def forward(
         self,

@@ -58,6 +58,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .fallback import FallbackFmha
 from .interface import FmhaPhase, _CuteDslMlaStagingKey
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
@@ -681,7 +682,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         else:
             return False, f"invalid FMHA phase: {phase}."
 
-        if has_context_phase and q.dtype == torch.bfloat16 and 0 < meta.num_contexts <= 4:
+        if (
+            has_context_phase
+            and q.dtype == torch.bfloat16
+            and 0 < meta.num_contexts <= 4
+            # Declining hands the request to the fallback, so give up the
+            # optimization rather than the process when it cannot serve it.
+            and FallbackFmha.can_serve(attn, meta, fwd)
+        ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
             # Let the FMHA selector choose the fallback implementation only

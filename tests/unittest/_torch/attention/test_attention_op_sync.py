@@ -46,11 +46,15 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.attention_backend.fmha.fallback import (
+    _MMHA_SUPPORTED_HEAD_SIZES,
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
     FallbackFmha,
 )
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    CustomAttentionMask,
+)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 pytestmark = pytest.mark.cpu_only
@@ -93,9 +97,14 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "workspace_": ("metadata", ("effective_workspace",)),
 }
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
+
 # The C++ attention() declaration is the single source of truth for kwarg
 # names, ordering, and types.
-_HEADER = pathlib.Path(__file__).resolve().parents[4] / ("cpp/tensorrt_llm/thop/attentionOp.h")
+_HEADER = _REPO_ROOT / "cpp/tensorrt_llm/thop/attentionOp.h"
+
+# The MMHA head-size allowlist that AttentionOp::initialize pre-checks.
+_MMHA_KERNEL_SOURCE = _REPO_ROOT / "cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention.cu"
 
 
 # ---- C++ declaration parser -------------------------------------------------
@@ -661,18 +670,98 @@ def test_no_sequence_kwargs_at_thop_attention_boundary():
     )
 
 
+class _AttnStub(SimpleNamespace):
+    """Stand-in for the ``attn`` fields ``FallbackFmha.can_serve`` reads.
+
+    Subclasses ``SimpleNamespace`` only to become weak-referenceable, which
+    ``Fmha.__init__`` requires; plain ``SimpleNamespace`` is not.
+    """
+
+
+def _fallback_is_supported(
+    *,
+    is_cross: bool = False,
+    head_dim: int = 128,
+    is_mla_enable: bool = False,
+    **forward_kwargs,
+) -> bool:
+    """Ask ``FallbackFmha`` about a request built from stub inputs."""
+    # Bind the stub to a local: ``Fmha`` only holds a weakref to it.
+    attn = _AttnStub(head_dim=head_dim, is_mla_enable=is_mla_enable, sparse_params=None)
+    return FallbackFmha(attn).is_supported(
+        None,
+        None,
+        None,
+        SimpleNamespace(is_cross=is_cross),
+        AttentionForwardArgs(**forward_kwargs),
+    )
+
+
 @pytest.mark.parametrize(
-    ("is_cross", "update_kv_cache", "expected"),
+    ("is_cross", "update_kv_cache", "head_dim", "is_mla_enable", "expected"),
     (
-        (False, False, False),
-        (False, True, True),
-        (True, False, True),
+        # Q-only self attention: thop.attention rejects it.
+        (False, False, 128, False, False),
+        (False, True, 128, False, True),
+        (True, False, 128, False, True),
+        # Head size MMHA has no kernel for: AttentionOp::initialize aborts.
+        (False, True, 512, False, False),
+        # 72 is exempt from the MMHA check (FMHA kernels serve it).
+        (False, True, 72, False, True),
+        # MLA brings its own kernels, so the head-size check does not apply.
+        (False, True, 512, True, True),
     ),
 )
-def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_cache, expected):
-    """Do not dispatch requests that the native attention op rejects."""
-    fmha = object.__new__(FallbackFmha)
-    metadata = SimpleNamespace(is_cross=is_cross)
-    forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
+def test_fallback_support_matches_thop_kv_update_contract(
+    is_cross, update_kv_cache, head_dim, is_mla_enable, expected
+):
+    """Do not dispatch requests that the native attention op rejects.
 
-    assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
+    ``thop.attention`` raises on Q-only cached-KV self attention, and
+    ``AttentionOp::initialize`` aborts the process on an unsupported head size,
+    so the predicate must decline both before dispatch.
+    """
+    assert (
+        _fallback_is_supported(
+            is_cross=is_cross,
+            head_dim=head_dim,
+            is_mla_enable=is_mla_enable,
+            update_kv_cache=update_kv_cache,
+        )
+        is expected
+    )
+
+
+def test_fallback_declines_custom_mask():
+    """The custom-mask code path belongs to the Triton FMHA library."""
+    assert (
+        _fallback_is_supported(
+            update_kv_cache=True,
+            attention_mask=CustomAttentionMask.CUSTOM,
+        )
+        is False
+    )
+
+
+def test_mmha_head_sizes_mirror_the_cpp_array():
+    """``_MMHA_SUPPORTED_HEAD_SIZES`` must track its C++ source of truth.
+
+    ``mmha_supported`` is not exposed to Python, so the head-size list is a
+    hand-copy of ``MMHA_SUPPORTED_HEAD_SIZES``. Parse the C++ array so
+    extending it there without updating the Python mirror fails here.
+    """
+    match = re.search(
+        r"MMHA_SUPPORTED_HEAD_SIZES\s*\{([^}]*)\}",
+        _MMHA_KERNEL_SOURCE.read_text(),
+    )
+    assert match, "Could not find MMHA_SUPPORTED_HEAD_SIZES in the C++ source."
+    cpp_sizes = {int(token) for token in re.findall(r"\d+", match.group(1))}
+
+    # Name the mirror in the message: a C++ author who extends the array has no
+    # reason to look for a Python copy, so the failure has to say where it is.
+    assert _MMHA_SUPPORTED_HEAD_SIZES == cpp_sizes, (
+        f"{_MMHA_KERNEL_SOURCE.name} lists {sorted(cpp_sizes)}, but "
+        f"_MMHA_SUPPORTED_HEAD_SIZES in "
+        f"tensorrt_llm/_torch/attention_backend/fmha/fallback.py lists "
+        f"{sorted(_MMHA_SUPPORTED_HEAD_SIZES)}. Update the Python mirror."
+    )

@@ -371,7 +371,12 @@ def test_flashinfer_context_fallback_scope(
         phase=FmhaPhase.CONTEXT,
     )
 
-    expected_fallback = (dtype == torch.bfloat16 and num_contexts <= 4) or sm_version == 103
+    # The small-batch BF16 decline only fires when the fallback can actually
+    # serve the request. A Q-only input reads an already-populated cache, which
+    # ``thop.attention`` rejects, so trtllm-gen keeps those requests itself.
+    expected_fallback = (
+        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv
+    ) or sm_version == 103
     if expected_fallback:
         assert not supported
         assert "fallback FMHA" in reason
