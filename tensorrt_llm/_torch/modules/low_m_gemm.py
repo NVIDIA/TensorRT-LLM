@@ -61,6 +61,11 @@ def _parse_enabled() -> bool:
     )
 
 
+def _parse_direct_enabled() -> bool:
+    """Enable conservative direct dispatch by default, but honor explicit off."""
+    return _BACKEND_ENV not in os.environ or _parse_enabled()
+
+
 @functools.lru_cache(maxsize=None)
 def _current_sm(device: torch.device) -> int:
     """Return the SM version (e.g. 100 for B200, 103 for GB300) for *device*.
@@ -313,6 +318,7 @@ class _SplitKGemmRunner(TunableRunner):
 # ``LOW_M_GEMM_ACTIVE`` is read at import time from the env var so that
 # ``linear.py`` can gate the hot path with a single bool check.
 LOW_M_GEMM_ACTIVE = _parse_enabled()
+_DIRECT_LOW_M_GEMM_ACTIVE = _parse_direct_enabled()
 
 
 class LowMGemmDispatcher:
@@ -622,6 +628,53 @@ def prepare_low_m_gemm(
     return dispatcher
 
 
+def apply_direct_low_m_gemm(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return a direct BF16 result, or ``None`` to keep the caller's GEMM.
+
+    This path does not require AutoTuner state, so it also serves hand-written
+    projections such as MoE router gates. It accepts only conservative shapes
+    measured to beat the normal GEMM path; all other dtype, device, layout,
+    bias, architecture, and tactic combinations fall through.
+    """
+    if (
+        not _DIRECT_LOW_M_GEMM_ACTIVE
+        or bias is not None
+        or not LowMGemmDispatcher._is_candidate_shape(input_tensor, weight, None)
+    ):
+        return None
+
+    from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import (
+        default_tactic,
+        prefer_direct_bf16_gemm_sm100,
+        run_direct_dense,
+    )
+
+    k = int(input_tensor.shape[-1])
+    m = input_tensor.numel() // k
+    n = int(weight.shape[0])
+    if not prefer_direct_bf16_gemm_sm100(m, n, k):
+        return None
+    try:
+        tactic = default_tactic(m, n, k)
+    except ValueError:
+        return None
+
+    input_2d = input_tensor.view(m, k)
+    output = torch.empty((m, n), dtype=input_2d.dtype, device=input_2d.device)
+    run_direct_dense(
+        input_2d,
+        weight.detach().t(),
+        output,
+        get_env_enable_pdl(),
+        tactic,
+    )
+    return output.view(*input_tensor.shape[:-1], n)
+
+
 def apply_low_m_gemm(
     module: torch.nn.Module,
     input_tensor: torch.Tensor,
@@ -647,6 +700,7 @@ def apply_low_m_gemm(
 __all__ = [
     "LOW_M_GEMM_ACTIVE",
     "_MAX_M",
+    "apply_direct_low_m_gemm",
     "apply_low_m_gemm",
     "prepare_low_m_gemm",
 ]

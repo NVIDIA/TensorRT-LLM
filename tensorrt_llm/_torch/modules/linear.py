@@ -36,13 +36,12 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
-from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+from .low_m_gemm import (LOW_M_GEMM_ACTIVE, apply_direct_low_m_gemm,
+                         apply_low_m_gemm)
 
 
-def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
-    """Fast pre-filter: check the global enable flag and M upper bound only."""
-    if not LOW_M_GEMM_ACTIVE:
-        return False
+def _is_low_m_input(input: torch.Tensor) -> bool:
+    """Cheap M-bound check before either low-M dispatch policy."""
     if input.ndim < 1:
         return False
     k = int(input.shape[-1])
@@ -534,10 +533,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
     ----------------------------------------------------------
-    1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
-       CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
-       Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
-       independently via the env var.
+    1. **low-m GEMM** (M ≤ 32)
+       ``TRTLLM_LOW_M_GEMM_BACKEND=auto`` autotunes cuBLAS and the two CuTe DSL
+       kernels. When the environment variable is unset, a conservative
+       direct-kernel predicate is tried and all other shapes fall through. An
+       explicit ``off`` disables both policies. This is orthogonal to
+       ``use_cute_dsl_bf16_gemm``.
 
     2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
        ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
@@ -576,14 +577,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
-        # kernel and returns None to fall through to the normal GEMM path.
-        # Skip when use_custom_cublas_mm is set: that path may allocate output
-        # in an NCCL symmetric-memory window for TP all-reduce fusion, which
-        # the low-M dispatcher does not support.
-        if _should_apply_low_m_gemm(input) and not getattr(
+        # Custom cuBLAS may allocate an NCCL-window output that neither low-M
+        # path can honor. Both helpers return None for their unsupported cases.
+        if _is_low_m_input(input) and not getattr(
                 module, "use_custom_cublas_mm", False):
-            output = apply_low_m_gemm(module, input, module.weight, bias)
+            output = (apply_low_m_gemm(module, input, module.weight, bias)
+                      if LOW_M_GEMM_ACTIVE else apply_direct_low_m_gemm(
+                          input, module.weight, bias))
             if output is not None:
                 return output
         # CuTe DSL BF16 GEMM path for Blackwell
