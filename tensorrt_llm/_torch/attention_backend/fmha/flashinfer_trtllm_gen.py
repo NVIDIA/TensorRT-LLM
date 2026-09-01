@@ -681,11 +681,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         else:
             return False, f"invalid FMHA phase: {phase}."
 
-        if has_context_phase and q.dtype == torch.bfloat16 and 0 < meta.num_contexts <= 4:
+        if (
+            has_context_phase
+            and q.dtype == torch.bfloat16
+            and 0 < meta.num_contexts <= 4
+            and any(
+                fmha.is_supported(q, k, v, meta, fwd)
+                for fmha in getattr(attn, "non_phased_fmha_libs", ())
+            )
+        ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
-            # Let the FMHA selector choose the fallback implementation only
-            # for that affected regime.
+            # Let the FMHA selector choose a non-phased implementation only
+            # when it supports this exact request. Q-only cached-KV inputs and
+            # head dimensions above MMHA's limit must stay on TRTLLM-Gen.
             return False, (
                 "small-batch BF16 context attention uses the fallback FMHA for "
                 "performance because the FlashInfer TRTLLM-Gen context path "

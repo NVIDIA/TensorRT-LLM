@@ -22,6 +22,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
@@ -328,12 +329,14 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
 @pytest.mark.parametrize("sm_version", [100, 103])
 @pytest.mark.parametrize("tokens_per_block", [32, 64])
 @pytest.mark.parametrize("num_contexts", [1, 4, 5])
+@pytest.mark.parametrize("head_dim", [64, 512])
 def test_flashinfer_context_fallback_scope(
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
     sm_version: int,
     tokens_per_block: int,
     num_contexts: int,
+    head_dim: int,
     is_fused_qkv: bool,
 ) -> None:
     monkeypatch.setattr(
@@ -342,14 +345,11 @@ def test_flashinfer_context_fallback_scope(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
-    attn = SimpleNamespace(
-        is_mla_enable=False,
-        sparse_params=None,
-        position_embedding_type=0,
-        head_dim=64,
-        num_heads=1,
-        num_kv_heads=1,
-    )
+    attn = _TestAttention()
+    attn.sparse_params = None
+    attn.position_embedding_type = 0
+    attn.head_dim = head_dim
+    attn.non_phased_fmha_libs = [FallbackFmha(attn)]
     q_hidden_size = attn.num_heads * attn.head_dim
     # Both layouts the trtllm-gen self-attention path accepts, wired the way
     # TrtllmAttention.forward wires them: fused QKV carries K/V inline and writes
@@ -388,7 +388,10 @@ def test_flashinfer_context_fallback_scope(
         phase=FmhaPhase.CONTEXT,
     )
 
-    expected_fallback = (dtype == torch.bfloat16 and num_contexts <= 4) or sm_version == 103
+    small_bf16_fallback = (
+        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv and head_dim == 64
+    )
+    expected_fallback = small_bf16_fallback or sm_version == 103
     if expected_fallback:
         assert not supported
         assert "fallback FMHA" in reason
