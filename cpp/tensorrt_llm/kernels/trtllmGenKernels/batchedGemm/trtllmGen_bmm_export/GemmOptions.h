@@ -134,20 +134,21 @@ struct GemmOptions
         int fallbackClusterDimY, int fallbackClusterDimZ, FusedBiasShuffleMode fusedBiasShuffleMode,
         bool fuseLoadSfTask, bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
         bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
-        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA, MatrixLayout layoutB, int m,
-        int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n,
-        int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo,
-        int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA,
-        int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile,
-        int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId,
-        bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype, SchedHostTask schedHostTask,
-        int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC, tg::SfLayout sfLayoutA,
-        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor, tg::Sparsity sparsityA, SplitK splitK,
-        int tileK, int tileM, int tileN, TileScheduler tileScheduler, bool transposeMmaOutput,
-        bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useFlexibleClusterDims,
-        bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
-        bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize)
+        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, bool fineGrainedConsumerA,
+        bool fineGrainedConsumerB, bool fineGrainedForceValid, bool fineGrainedProducer, MatrixLayout layoutA,
+        MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK,
+        bool mockAllReduce, int n, int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
+        int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp,
+        int numSlicesForSplitK, int numStagesA, int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile,
+        int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemSfA,
+        int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype,
+        SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC,
+        tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor,
+        tg::Sparsity sparsityA, SplitK splitK, int tileK, int tileM, int tileN, TileScheduler tileScheduler,
+        bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+        bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap,
+        bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasDtype{biasDtype}
         , mBiasType{biasType}
@@ -186,6 +187,10 @@ struct GemmOptions
         , mHoistMmaTaskTryWaits{hoistMmaTaskTryWaits}
         , mK{k}
         , mKernelTraits{kernelTraits}
+        , mFineGrainedConsumerA(fineGrainedConsumerA)
+        , mFineGrainedConsumerB(fineGrainedConsumerB)
+        , mFineGrainedForceValid(fineGrainedForceValid)
+        , mFineGrainedProducer(fineGrainedProducer)
         , mLayoutA{layoutA}
         , mLayoutB{layoutB}
         , mM{m}
