@@ -773,6 +773,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         hidden_states,
         accepted_tokens,
         attn_metadata,
+        spec_metadata,
     ):
         """Repack step-0 drafter inputs to accepted-path layout."""
         num_contexts = attn_metadata.num_contexts
@@ -782,7 +783,12 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Match MTPEagleWorker context input repack.
         input_ids_ctx = self._prepare_context_input_ids(
-            input_ids, num_ctx_tokens, last_tokens_idx, accepted_tokens, num_contexts
+            input_ids,
+            num_ctx_tokens,
+            last_tokens_idx,
+            accepted_tokens,
+            num_contexts,
+            prompt_lookahead_tokens=spec_metadata.context_prompt_lookahead_tokens,
         )
 
         if num_gens > 0:
@@ -887,6 +893,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             hidden_states=hidden_states,
             accepted_tokens=accepted_tokens,
             attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
         )
 
         # Reset verify-time tree metadata to accepted-path width.
