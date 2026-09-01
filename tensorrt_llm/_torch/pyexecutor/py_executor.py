@@ -8297,6 +8297,7 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
+        """Emit first token response snapshots for decoding iteration 1."""
         new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
@@ -8323,8 +8324,12 @@ class PyExecutor:
                 logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
                                    if has_prepended_logits else None)
                 response = req.create_response(False, self.dist.rank)
-                if logits_snapshot is not None and response is not None:
-                    response.result.generation_logits = logits_snapshot
+                if response is not None:
+                    response.result.cached_tokens = req.cached_tokens
+                    response.result.cached_tokens_by_tier = getattr(
+                        req, 'cached_tokens_by_tier', {})
+                    if logits_snapshot is not None:
+                        response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
@@ -8379,6 +8384,7 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
+        """Handle request completion, response creation, and termination."""
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
@@ -8470,6 +8476,8 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
+                    response.result.cached_tokens_by_tier = getattr(
+                        request, 'cached_tokens_by_tier', {})
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
