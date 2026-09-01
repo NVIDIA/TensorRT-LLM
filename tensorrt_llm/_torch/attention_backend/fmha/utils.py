@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     )
 
 
-def _get_kv_page_offset(
+def get_kv_page_offset(
     attn: "TrtllmAttention",
     metadata: "TrtllmAttentionMetadata",
     seq_offset: int,
