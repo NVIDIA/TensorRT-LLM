@@ -510,7 +510,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
         # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, _num_proposed, block_logits = draft_model.forward_batched(
+        _toks, _confidence, block_logits = draft_model.forward_batched(
             main_hidden,
             bonus,
             start_pos,
@@ -518,7 +518,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             slots=slots,
             valid_len=self._valid_len[slots],
             temperature=0.0,
-            confidence_threshold=0.0,
+            return_confidence=False,
             return_logits=True,
             all_rank_num_tokens=all_rank_num_tokens,
         )

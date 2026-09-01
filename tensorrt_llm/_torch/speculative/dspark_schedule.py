@@ -32,6 +32,8 @@ import torch
 
 __all__ = [
     "DSparkScheduleConfig",
+    "HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT",
+    "NATIVE_UNIFORM_VERIFY_OUTPUT",
     "compute_survival",
     "schedule_verify_lens_topk",
 ]
@@ -42,6 +44,12 @@ __all__ = [
 # -- optimistic by design. Lives here because the worker (writes it) and the
 # planner (counts it) cannot import each other.
 NEUTRAL_CONFIDENCE_LOGIT = 30.0
+
+# The DSpark forward publishes one of these markers when it cannot return a
+# batch-aligned verify-length tensor. The sampler uses the marker to preserve
+# the current iteration's policy across overlap with the next iteration.
+HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT = "host_policy_windows_snapshot"
+NATIVE_UNIFORM_VERIFY_OUTPUT = "native_uniform_verify"
 
 
 @dataclass(frozen=True)
