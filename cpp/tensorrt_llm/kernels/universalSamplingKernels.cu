@@ -61,10 +61,17 @@ constexpr int kRadixPasses = 32 / kRadixBits;
 //! Private histogram copies, one per group of warps, to cut shared-atomic contention.
 //! 8 copies is 16 KB of shared memory -- affordable, and enough to spread the few buckets
 //! a softmax actually lands in across separate addresses.
-constexpr int kHistCopies = 8;
-//! How many survivors the shared gather buffer holds (16 KB). Past this the descent falls
+//!
+//! 16 rather than 8, paid for out of the gather buffer below. Round 7 tried 16 with the
+//! 4096-entry buffer and did not fit (`ptxas error: uses too much shared data`, 0xc8d0 of
+//! 0xc000); halving the buffer frees the 8 KB that made room. Stage timing says this is
+//! where the money is: at 8 rows and 131072 vocab the descent costs ~22x a full sweep of
+//! the row, so each of its four passes runs ~5x slower than simply reading the same data
+//! -- the signature of serialized shared atomics, not of bandwidth.
+constexpr int kHistCopies = 16;
+//! How many survivors the shared gather buffer holds (8 KB). Past this the descent falls
 //! back to re-reading the row, so the cap is a performance knob, never a correctness one.
-constexpr int kCandCap = 4096;
+constexpr int kCandCap = 2048;
 //! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
 constexpr float kTempEpsilon = 1e-6f;
 //! Rejection rounds a tokens-only row may spend before it settles for the argmax. Each
@@ -89,6 +96,35 @@ __device__ inline float toFloat(__nv_bfloat16 v)
 {
     return __bfloat162float(v);
 }
+
+//! Per-stage clock, compiled out entirely unless TLLM_USAMP_STAGE_TIMING is defined.
+//! Attribution inside one fused kernel is otherwise guesswork: ncu reports a single kernel,
+//! and the stages differ by more than an order of magnitude depending on a row's filters.
+#ifdef TLLM_USAMP_STAGE_TIMING
+#define USAMP_STAGES 8
+__device__ unsigned long long gUsampStageCycles[USAMP_STAGES];
+
+//! Both __syncthreads() calls make this usable ONLY where the whole block arrives: a mark
+//! inside `if (tid == 0)` or inside a per-pass branch of the descent deadlocks the kernel.
+__device__ inline void usampMark(int slot, long long& last)
+{
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        long long const now = clock64();
+        atomicAdd(gUsampStageCycles + slot, static_cast<unsigned long long>(now - last));
+        last = now;
+    }
+    __syncthreads();
+}
+
+#define USAMP_MARK(slot) usampMark(slot, stageLast)
+#else
+#define USAMP_MARK(slot)                                                                                               \
+    do                                                                                                                 \
+    {                                                                                                                  \
+    } while (0)
+#endif
 
 //! Bytes moved by one vector load. 16 is the widest a single instruction issues.
 constexpr int kVecBytes = 16;
@@ -493,6 +529,9 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     float* rowProbs = NEED_PROBS ? params.outputProbs + static_cast<size_t>(row) * vocabSize : nullptr;
 
     RowParams const rp = loadRowParams(params, row);
+#ifdef TLLM_USAMP_STAGE_TIMING
+    long long stageLast = clock64();
+#endif
 
     using BlockReduceF = cub::BlockReduce<float, BLOCK>;
     using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, BLOCK>;
@@ -551,6 +590,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
     }
     __syncthreads();
     float const maxScaled = sMaxScaled;
+    USAMP_MARK(0); // pass 1: online softmax
 
     // --- Pass 2: only min-p needs one, and only because its cutoff is relative to the max
     //     -- which pass 1 does not know until it ends, so the filtered mass cannot be
@@ -769,6 +809,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         }
     }
 
+    USAMP_MARK(1); // pass 2: min-p re-total
     // --- Pass 3: the rank/mass thresholds, skipped wholesale when neither top-k nor
     //     top-p is active. This is the only expensive stage, and the only one a neutral
     //     row -- or a neutral row in a mixed batch -- does not run at all.
@@ -827,6 +868,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         threshold = fmaxf(threshold, topPThreshold);
     }
 
+    USAMP_MARK(2); // pass 3: descent
     // --- Pass 4: kept mass. Skipped when no filter can have removed anything, in which
     //     case pass 2's total already is the kept mass.
     //
@@ -869,6 +911,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         haveLocalKept = false;
     }
 
+    USAMP_MARK(3); // pass 4: kept mass
     // --- Pass 5: the renormalized distribution.
     if (NEED_PROBS)
     {
@@ -907,6 +950,7 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
         }
     }
 
+    USAMP_MARK(4); // pass 5: probs write
     // --- Pass 6: inverse-CDF sample over the kept weights.
     if (NEED_TOKENS)
     {
@@ -982,6 +1026,16 @@ __device__ void universalSamplingBody(UniversalSamplingParams const& params)
             params.outputTokens[row] = sToken >= 0 ? sToken : sArgMax;
         }
     }
+#ifdef TLLM_USAMP_STAGE_TIMING
+    USAMP_MARK(5); // pass 6: sampling
+    __syncthreads();
+    if (row == 0 && threadIdx.x == 0)
+    {
+        printf("[USAMP] softmax=%llu minp=%llu descent=%llu keptmass=%llu probs=%llu sample=%llu\n",
+            gUsampStageCycles[0], gUsampStageCycles[1], gUsampStageCycles[2], gUsampStageCycles[3],
+            gUsampStageCycles[4], gUsampStageCycles[5]);
+    }
+#endif
 }
 
 //! The generic entry point: no __launch_bounds__, so ptxas compiles every instantiation

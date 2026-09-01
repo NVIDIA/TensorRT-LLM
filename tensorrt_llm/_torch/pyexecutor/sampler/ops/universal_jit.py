@@ -31,7 +31,9 @@ Off unless ``TLLM_UNIVERSAL_SAMPLING_JIT=1``; a release wheel therefore never re
 this module.
 """
 
+import hashlib
 import os
+import shlex
 from functools import lru_cache
 from pathlib import Path
 
@@ -78,12 +80,16 @@ def load() -> bool:
 
     from torch.utils.cpp_extension import load as load_extension
 
-    build_dir = Path(
-        os.environ.get(
-            "TLLM_UNIVERSAL_SAMPLING_JIT_DIR",
-            Path.home() / ".cache" / "tensorrt_llm" / "universal_jit",
-        )
-    )
+    # Extra nvcc flags for development builds -- e.g. -DTLLM_USAMP_STAGE_TIMING, which
+    # turns on the kernel's per-stage clock. Folded into the build directory name because
+    # ninja keys its cache on the directory, not on the flags: reusing the same directory
+    # with different flags silently returns the previously built object.
+    extra_cuda = shlex.split(os.environ.get("TLLM_UNIVERSAL_SAMPLING_JIT_CUDA_FLAGS", ""))
+    default_dir = Path.home() / ".cache" / "tensorrt_llm" / "universal_jit"
+    if extra_cuda:
+        digest = hashlib.sha1(" ".join(extra_cuda).encode()).hexdigest()[:10]
+        default_dir = default_dir.with_name(f"{default_dir.name}_{digest}")
+    build_dir = Path(os.environ.get("TLLM_UNIVERSAL_SAMPLING_JIT_DIR", default_dir))
     build_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
@@ -96,7 +102,7 @@ def load() -> bool:
         # CMake, so cpp/ is the include root in both builds.
         extra_include_paths=[str(root / "cpp")],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--use_fast_math", "--expt-relaxed-constexpr"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "--expt-relaxed-constexpr", *extra_cuda],
         build_directory=str(build_dir),
         is_python_module=False,
         verbose=False,

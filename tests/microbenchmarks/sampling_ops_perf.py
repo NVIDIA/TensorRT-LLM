@@ -557,8 +557,16 @@ def main() -> int:
         "--rows",
         type=int,
         nargs="+",
-        default=[64, 256, 1024],
-        help="logits rows == batch x (draft_len + 1) for the per-token layouts",
+        default=[1, 4, 8, 16, 32, 64],
+        help=(
+            "rows of the logits tensor, i.e. independent distributions per call. This is "
+            "NOT the serving batch size: the draft sampler gets one row per request "
+            "(rows == batch), while the target gets batch x (draft_len + 1). "
+            "The default is the small-batch regime, which is where this kernel is weakest "
+            "-- one block owns one row, so below the SM count the wall time stops falling "
+            "and most of the GPU sits idle. Use --full for the regression sweep that also "
+            "covers the large batches, where the kernel already wins."
+        ),
     )
     parser.add_argument(
         "--full",
@@ -619,7 +627,7 @@ def main() -> int:
     impls = [impls_by_name[n] for n in selected]
 
     vocab_list = [32000, 131072, 152064] if args.full else args.vocab
-    rows_list = [1, 8, 64, 256, 1024, 2048] if args.full else args.rows
+    rows_list = [1, 4, 8, 16, 32, 40, 64, 128, 256, 1024, 2048] if args.full else args.rows
     cases = [c for c in FILTER_CASES if c.name in args.cases]
     dtype = getattr(torch, args.dtype)
 
