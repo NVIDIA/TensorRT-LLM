@@ -56,10 +56,12 @@ from .action import (
     action_reference_size,
     action_start_frame_offset,
     build_vision_condition_mask,
+    crop_action_latent,
     normalize_action_mode,
     pil_to_rgb,
     prepare_action_latents,
     resize_and_pad_action_image,
+    resolve_action_content_size,
     resolve_action_size,
     resolve_domain_id,
 )
@@ -1369,24 +1371,34 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         mode: str,
         num_frames: int,
         generator: torch.Generator,
+        *,
+        content_h: int,
+        content_w: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         C = self.transformer.latent_channel_size
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
         W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
 
+        cond_latent = self._encode_video_tensor(video_tensor)
+        if cond_latent.shape[2:] != (T_lat, H_lat, W_lat):
+            raise ValueError(
+                "Cosmos3 action video latent shape mismatch: "
+                f"encoded={tuple(cond_latent.shape)}, "
+                f"expected spatial-temporal shape={(T_lat, H_lat, W_lat)}."
+            )
+        cond_latent = crop_action_latent(
+            cond_latent,
+            content_h,
+            content_w,
+            self.vae_scale_factor_spatial,
+        )
         noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
+            (1, C, T_lat, cond_latent.shape[-2], cond_latent.shape[-1]),
             generator=generator,
             device=self.device,
             dtype=self.dtype,
         )
-        cond_latent = self._encode_video_tensor(video_tensor)
-        if cond_latent.shape[2:] != noise.shape[2:]:
-            raise ValueError(
-                "Cosmos3 action video latent shape mismatch: "
-                f"encoded={tuple(cond_latent.shape)}, expected={tuple(noise.shape)}."
-            )
         condition_mask = build_vision_condition_mask(
             mode,
             num_frames,
@@ -1759,6 +1771,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             height, width = resolve_action_size(
                 height, width, action_source_h, action_source_w, action_resolution
             )
+            action_content_h, action_content_w = resolve_action_content_size(
+                action_source_h, action_source_w, height, width
+            )
 
         if self.rank == 0:
             logger.info(
@@ -1991,6 +2006,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         normalized_action_mode,
                         num_frames,
                         generator,
+                        content_h=action_content_h,
+                        content_w=action_content_w,
                     )
                     del video_tensor
                 except Exception as exc:
@@ -2015,6 +2032,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         normalized_action_mode,
                         num_frames,
                         generator,
+                        content_h=action_content_h,
+                        content_w=action_content_w,
                     )
                 except Exception as exc:
                     prepare_error = exc

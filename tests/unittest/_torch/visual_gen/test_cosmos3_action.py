@@ -19,10 +19,12 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     VIDEO_RES_SIZE_INFO,
     action_reference_frame_step,
     action_reference_size,
+    crop_action_latent,
     find_closest_target_size,
     normalize_action_resolution,
     prepare_action_latents,
     resize_and_pad_action_image,
+    resolve_action_content_size,
     resolve_action_size,
     resolve_domain_id,
     resolve_raw_action_dim,
@@ -721,6 +723,32 @@ class TestResizeAndPadActionImage:
         # A square source contained in a 16:9 canvas fills the height, so the
         # scaled content is square and the pad lands on the right.
         assert out[:480, :480].any()
+
+
+class TestActionContentLatent:
+    def test_droid_content_keeps_source_size_before_padding(self):
+        assert resolve_action_content_size(540, 640, 544, 736) == (540, 640)
+
+    def test_large_source_is_scaled_to_fit_canvas(self):
+        assert resolve_action_content_size(1080, 1920, 544, 736) == (414, 736)
+
+    def test_droid_padding_is_removed_at_vae_resolution(self):
+        latent = torch.zeros(1, 2, 3, 34, 46)
+        cropped = crop_action_latent(latent, 540, 640, spatial_compression_factor=16)
+
+        assert cropped.shape == (1, 2, 3, 33, 40)
+        assert cropped.data_ptr() == latent.data_ptr()
+
+    def test_bucket_sized_content_is_a_noop(self):
+        latent = torch.zeros(1, 2, 3, 34, 46)
+        cropped = crop_action_latent(latent, 544, 736, spatial_compression_factor=16)
+
+        assert cropped is latent
+
+    def test_content_cannot_exceed_encoded_canvas(self):
+        latent = torch.zeros(1, 2, 3, 34, 46)
+        with pytest.raises(ValueError, match="content exceeds encoded latent size"):
+            crop_action_latent(latent, 560, 752, spatial_compression_factor=16)
 
 
 class TestResolveDomainId:

@@ -428,12 +428,20 @@ def action_reference_frame_step(source_frame_rate: float | None, target_frame_ra
     return max(1, round(source_frame_rate / target_frame_rate))
 
 
+def resolve_action_content_size(
+    source_h: int, source_w: int, target_h: int, target_w: int
+) -> tuple[int, int]:
+    """Return the resized content size before bottom/right canvas padding."""
+    scale = min(target_w / source_w, target_h / source_h, 1.0)
+    content_w = max(1, int(scale * source_w + 0.5))
+    content_h = max(1, int(scale * source_h + 0.5))
+    return content_h, content_w
+
+
 def resize_and_pad_action_image(
     image: PIL.Image.Image, target_h: int, target_w: int
 ) -> PIL.Image.Image:
-    scale = min(target_w / image.width, target_h / image.height, 1.0)
-    resize_w = max(1, int(scale * image.width + 0.5))
-    resize_h = max(1, int(scale * image.height + 0.5))
+    resize_h, resize_w = resolve_action_content_size(image.height, image.width, target_h, target_w)
     if (resize_w, resize_h) != image.size:
         image = image.resize((resize_w, resize_h), PIL.Image.Resampling.BICUBIC)
 
@@ -450,6 +458,26 @@ def resize_and_pad_action_image(
     pad_mode = "reflect" if pad_h < resize_h and pad_w < resize_w else "edge"
     padded = np.pad(array, ((0, pad_h), (0, pad_w), (0, 0)), mode=pad_mode)
     return PIL.Image.fromarray(padded)
+
+
+def crop_action_latent(
+    latent: torch.Tensor,
+    content_h: int,
+    content_w: int,
+    spatial_compression_factor: int,
+) -> torch.Tensor:
+    """Remove action canvas padding from a VAE latent without copying it."""
+    latent_h = max(content_h // spatial_compression_factor, 1)
+    latent_w = max(content_w // spatial_compression_factor, 1)
+    if latent_h > latent.shape[-2] or latent_w > latent.shape[-1]:
+        raise ValueError(
+            "Cosmos3 action content exceeds encoded latent size: "
+            f"content={(content_h, content_w)}, factor={spatial_compression_factor}, "
+            f"latent={tuple(latent.shape)}."
+        )
+    if latent.shape[-2:] == (latent_h, latent_w):
+        return latent
+    return latent[..., :latent_h, :latent_w]
 
 
 def prepare_action_latents(
