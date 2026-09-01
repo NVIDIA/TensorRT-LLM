@@ -748,9 +748,27 @@ class CuTeDSLAttention(AttentionBackend):
         qac = self.quant_attention_config
         smooth_qk = qac is not None and qac.qk_dtype in ("mxfp8", "nvfp4")
 
-        # Published kernel supports float16 and bfloat16 only.
-        origin_dtype = q.dtype
-        if q.dtype not in (torch.float16, torch.bfloat16):
+        # The static E4M3 FLUX path may fuse QK norm, RoPE, and quantization
+        # before entering the backend. Preserve those already-quantized inputs;
+        # dense CUTEDSL FMHA accepts E4M3 Q/K/V directly and returns BF16.
+        prequantized_static_fp8 = q.dtype == torch.float8_e4m3fn
+        if prequantized_static_fp8:
+            if (
+                qac is None
+                or qac.qk_dtype != "fp8"
+                or qac.v_dtype != "fp8"
+                or k.dtype != torch.float8_e4m3fn
+                or v.dtype != torch.float8_e4m3fn
+            ):
+                raise ValueError(
+                    "Prequantized E4M3 Q/K/V require the dense static FP8 attention recipe."
+                )
+            origin_dtype = torch.bfloat16
+        else:
+            origin_dtype = q.dtype
+
+        # Published non-quantized kernel inputs support float16 and bfloat16.
+        if not prequantized_static_fp8 and q.dtype not in (torch.float16, torch.bfloat16):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
@@ -770,12 +788,13 @@ class CuTeDSLAttention(AttentionBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len_q, num_heads, _ = q.shape
         value_head_dim = v.shape[-1]
+        output_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
         out = torch.empty(
             batch_size,
             seq_len_q,
             num_heads,
             value_head_dim,
-            dtype=q.dtype,
+            dtype=output_dtype,
             device=q.device,
         )
         lse = torch.empty(
@@ -796,13 +815,15 @@ class CuTeDSLAttention(AttentionBackend):
         scale_v_channels = None
         if qac is not None:
             if qac.qk_dtype == "fp8":
-                # FLUX splits Q/K/V from one packed projection, so each operand is a strided
-                # view. The static quantization op requires contiguous input. Materialize here
-                # instead of at the common pre-launch point below; its FP8 output is contiguous,
-                # so this does not add another copy.
-                q = _quantize_fp8_static(q.contiguous(), kwargs.get("static_q_scale"), "Q")
-                k = _quantize_fp8_static(k.contiguous(), kwargs.get("static_k_scale"), "K")
-                v = _quantize_fp8_static(v.contiguous(), kwargs.get("static_v_scale"), "V")
+                if q.dtype == torch.float8_e4m3fn:
+                    if k.dtype != q.dtype or v.dtype != q.dtype:
+                        raise ValueError("Static E4M3 Q/K/V must all use torch.float8_e4m3fn.")
+                else:
+                    # Generic callers may still provide strided BF16 Q/K/V. The static
+                    # quantization op requires contiguous inputs and emits dense E4M3 tensors.
+                    q = _quantize_fp8_static(q.contiguous(), kwargs.get("static_q_scale"), "Q")
+                    k = _quantize_fp8_static(k.contiguous(), kwargs.get("static_k_scale"), "K")
+                    v = _quantize_fp8_static(v.contiguous(), kwargs.get("static_v_scale"), "V")
             elif qac.qk_dtype in ("mxfp8", "nvfp4"):
                 qk_sf_vec = 32 if qac.qk_dtype == "mxfp8" else 16
                 q, q_sf, gs_q = _quantize_blockscaled_one(q, qk_sf_vec)

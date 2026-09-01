@@ -513,6 +513,17 @@ def test_cute_dsl_static_fp8_qkv_forward() -> None:
         scale_k=scale_values["k"],
         scale_v=scale_values["v"],
     )
+    out_prequantized = backend(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        attention_mask=PredefinedAttentionMask.FULL,
+        scale_q=scale_values["q"],
+        scale_k=scale_values["k"],
+        scale_v=scale_values["v"],
+    )
 
     assert torch.isfinite(out).all(), "Static FP8 FMHA produced NaN / Inf"
+    assert out_prequantized.dtype == torch.bfloat16
     torch.testing.assert_close(out, out_ref, atol=8e-2, rtol=8e-2)
+    torch.testing.assert_close(out_prequantized, out, atol=0, rtol=0)

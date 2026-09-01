@@ -307,6 +307,41 @@ class FluxJointAttention(Attention):
 
         q_add = self.norm_added_q.weight if hasattr(self, "norm_added_q") else None
         k_add = self.norm_added_k.weight if hasattr(self, "norm_added_k") else None
+
+        if self.requires_static_e4m3_attention:
+            if not self.static_e4m3_attention_scales_loaded:
+                raise RuntimeError(
+                    "Static CUTEDSL FP8 attention scales were not loaded. Quantize the "
+                    "checkpoint with ModelOpt --quantize-mha and preserve the Q/K/V amax tensors."
+                )
+
+            batch_size, seq_len, _ = qkv.shape
+            query, key, value = torch.ops.trtllm.fused_dit_qk_norm_rope_quant_fp8(
+                qkv.view(batch_size * seq_len, -1),
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                q_add,
+                k_add,
+                self._static_q_dequant_scale,
+                self._static_k_dequant_scale,
+                self._static_v_dequant_scale,
+                freqs_cos,
+                freqs_sin,
+                num_txt,
+                self.interleave,
+                seq_len if num_txt > 0 else 0,
+            )
+            return (
+                query.view(batch_size, seq_len, -1),
+                key.view(batch_size, seq_len, -1),
+                value.view(batch_size, seq_len, -1),
+            )
+
         self.apply_packed_qk_norm_rope(
             qkv,
             freqs_cos,
@@ -359,6 +394,7 @@ class FluxJointAttention(Attention):
         projection_hidden_states = (
             qkv_hidden_states if qkv_hidden_states is not None else hidden_states
         )
+        output_dtype = hidden_states.dtype
         query, key, value = self._prepare_qkv(
             projection_hidden_states, encoder_hidden_states, image_rotary_emb
         )
@@ -382,7 +418,7 @@ class FluxJointAttention(Attention):
             )
 
         hidden_states = self._attn_impl(query, key, value, **attention_kwargs)
-        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = hidden_states.to(output_dtype)
 
         if is_dual_stream:
             encoder_hidden_states_out, hidden_states = hidden_states.split(
