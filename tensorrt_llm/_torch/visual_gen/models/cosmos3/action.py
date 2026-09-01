@@ -431,7 +431,18 @@ def action_reference_frame_step(source_frame_rate: float | None, target_frame_ra
 def resolve_action_content_size(
     source_h: int, source_w: int, target_h: int, target_w: int
 ) -> tuple[int, int]:
-    """Return the resized content size before bottom/right canvas padding."""
+    """Resolve the content size before bottom/right canvas padding.
+
+    Args:
+        source_h: Source image height in pixels.
+        source_w: Source image width in pixels.
+        target_h: Target canvas height in pixels.
+        target_w: Target canvas width in pixels.
+
+    Returns:
+        The aspect-preserving, non-upscaled content size as
+        ``(content_h, content_w)``.
+    """
     scale = min(target_w / source_w, target_h / source_h, 1.0)
     content_w = max(1, int(scale * source_w + 0.5))
     content_h = max(1, int(scale * source_h + 0.5))
@@ -441,6 +452,17 @@ def resolve_action_content_size(
 def resize_and_pad_action_image(
     image: PIL.Image.Image, target_h: int, target_w: int
 ) -> PIL.Image.Image:
+    """Resize an RGB action image and pad it to the target canvas.
+
+    Args:
+        image: RGB PIL image to resize and pad.
+        target_h: Target canvas height in pixels.
+        target_w: Target canvas width in pixels.
+
+    Returns:
+        An RGB PIL image with size ``(target_w, target_h)``. The content keeps
+        its aspect ratio and any padding is added on the bottom and right.
+    """
     resize_h, resize_w = resolve_action_content_size(image.height, image.width, target_h, target_w)
     if (resize_w, resize_h) != image.size:
         image = image.resize((resize_w, resize_h), PIL.Image.Resampling.BICUBIC)
@@ -466,7 +488,22 @@ def crop_action_latent(
     content_w: int,
     spatial_compression_factor: int,
 ) -> torch.Tensor:
-    """Remove action canvas padding from a VAE latent without copying it."""
+    """Remove action canvas padding from a VAE latent without copying it.
+
+    Args:
+        latent: VAE latent with shape ``[..., latent_h, latent_w]``. Any
+            PyTorch dtype is accepted and preserved because cropping returns a
+            view.
+        content_h: Unpadded content height in image pixels.
+        content_w: Unpadded content width in image pixels.
+        spatial_compression_factor: Positive VAE spatial compression factor.
+
+    Returns:
+        A view with shape
+        ``[..., max(content_h // spatial_compression_factor, 1),
+        max(content_w // spatial_compression_factor, 1)]`` on the same device
+        and with the same dtype as ``latent``.
+    """
     latent_h = max(content_h // spatial_compression_factor, 1)
     latent_w = max(content_w // spatial_compression_factor, 1)
     if latent_h > latent.shape[-2] or latent_w > latent.shape[-1]:
