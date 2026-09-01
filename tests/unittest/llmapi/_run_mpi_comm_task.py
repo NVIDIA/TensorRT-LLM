@@ -19,6 +19,7 @@ from typing import Literal
 
 import click
 
+from _flashinfer_workspace_probe import get_flashinfer_environment
 from tensorrt_llm.executor.utils import get_spawn_proxy_process_ipc_hmac_key_env
 from tensorrt_llm.llmapi.mpi_session import (MpiPoolSession,
                                              RemoteMpiCommSessionClient)
@@ -67,11 +68,14 @@ def main(
 
             nested_session = MpiPoolSession(n_workers=2)
             try:
-                nested_workspaces = set(
-                    nested_session.submit_sync(os.getenv,
-                                               "FLASHINFER_WORKSPACE_BASE"))
+                nested_worker_envs = nested_session.submit_sync(
+                    get_flashinfer_environment)
             finally:
                 nested_session.shutdown()
+            nested_workspaces = {
+                workspace
+                for workspace, _ in nested_worker_envs
+            }
             assert None not in nested_workspaces
             assert len(nested_workspaces) == 2
             assert all(

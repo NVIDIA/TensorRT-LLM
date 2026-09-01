@@ -32,6 +32,17 @@ _FLASHINFER_MANAGED_ENV = "TRTLLM_FLASHINFER_WORKSPACE_MANAGED"
 pytestmark = pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_flashinfer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        _FLASHINFER_WORKSPACE_ENV,
+        _FLASHINFER_CUBIN_ENV,
+        _FLASHINFER_ISOLATION_ENV,
+        _FLASHINFER_MANAGED_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _worker_flashinfer_env() -> tuple[str | None, str | None]:
     mpi_session.mpi4py.MPI.COMM_WORLD.barrier()
     return (os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV))
