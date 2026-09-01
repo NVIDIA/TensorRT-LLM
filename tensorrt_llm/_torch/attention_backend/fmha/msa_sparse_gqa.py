@@ -268,7 +268,47 @@ def run_msa_paged_gqa(
             "no request; see msa_decode_span_bounds."
         )
 
-    if kv_block_indexes is not None and ported:
+    # Only a full pure-decode sparse batch is eligible for the configurable
+    # MSA route. Mixed batches retain the Triton generation suffix because
+    # their MSA plan covers only the context prefix.
+    sparse_gqa_decode_backend = getattr(
+        getattr(attn, "sparse_params", None), "sparse_gqa_decode_backend", "triton"
+    )
+    pure_sparse_decode = kv_block_indexes is not None and ported and gen_tok0 == 0
+    if sparse_gqa_decode_backend not in ("triton", "msa", "adaptive"):
+        raise ValueError(
+            f"Unsupported MiniMax-M3 sparse GQA decode backend: {sparse_gqa_decode_backend!r}."
+        )
+    use_msa_decode = pure_sparse_decode and sparse_gqa_decode_backend == "msa"
+    if use_msa_decode and plan is None:
+        raise RuntimeError(
+            "MiniMax-M3 selected the MSA sparse decode backend but no preplanned "
+            "GQA plan is available; metadata preparation and dispatch disagree."
+        )
+
+    if pure_sparse_decode and sparse_gqa_decode_backend == "adaptive":
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.sparse_decode_autotuner import (
+            run_adaptive_sparse_decode,
+        )
+
+        stable_tactic = run_adaptive_sparse_decode(
+            q_view,
+            k_paged,
+            v_paged,
+            kv_block_indexes,
+            metadata.msa_block_table[gen_row0:gen_row1],
+            metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
+            out_view,
+            sm_scale=sm_scale,
+            decode_query_len=decode_query_len,
+            plan=plan,
+            is_cuda_graph_metadata=metadata.is_cuda_graph,
+        )
+        if stable_tactic is not None and metadata.is_cuda_graph:
+            metadata.record_adaptive_sparse_gqa_tactic(stable_tactic)
+        return
+
+    if kv_block_indexes is not None and ported and not use_msa_decode:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
             minimax_m3_sparse_attn_decode,
         )
@@ -343,7 +383,7 @@ def run_msa_paged_gqa(
         # layer's plan and, on a pure-decode step, the flattened page table the
         # call below reads. Fail loudly: running on with a stale msa_kv_indices
         # would silently attend the wrong pages.
-        if ported:
+        if ported and not use_msa_decode:
             raise RuntimeError(
                 "MiniMax-M3 paged GQA reached fmha_sm100 with no plan for a "
                 f"{'sparse' if kv_block_indexes is not None else 'dense'} layer. "
@@ -382,7 +422,12 @@ def run_msa_paged_gqa(
         k_paged,
         v_paged,
         None if kv_block_indexes is None else kv_block_indexes[:fmha_tokens],
-        kv_indices=metadata.msa_kv_indices,
+        # Pure sparse decode uses a plan whose page bases have the persistent
+        # 2-D table's fixed stride. Avoid rebuilding/copying a compact table on
+        # every step; eager and mixed paths retain that representation.
+        kv_indices=(
+            metadata.msa_block_table.flatten() if use_msa_decode else metadata.msa_kv_indices
+        ),
         sm_scale=sm_scale,
         qo_lens_cpu=rows_of(metadata.msa_qo_lens_cpu),
         kv_lens_cpu=rows_of(metadata.msa_kv_lens_cpu),

@@ -134,6 +134,33 @@ _MSA_DENSE_LENGTH_KEYS = ("kv_segment_lens", "qo_offset")
 _MSA_SPARSE_LENGTH_KEYS = ("seqused_k",)
 
 
+def _msa_fixed_stride_page_indptr(
+    qo_lens_cpu: torch.Tensor, page_table_stride: int
+) -> torch.Tensor:
+    """Page-table row bases for an expanded sparse plan over a 2-D table.
+
+    MSA expands every request into one plan row per query token. Every such row
+    must point at the same physical-page-table row for its request. The final
+    sentinel may cover the padded tail because sparse mode uses only the row
+    base plus its selected logical block; live lengths bound masking.
+
+    This is built once per CUDA-graph batch/DQL key. The table stride and query
+    lengths are part of the worklist-cache signature, so it is invariant over
+    every later replay even as KV lengths change.
+    """
+    qo = qo_lens_cpu.to(dtype=torch.long, device="cpu")
+    if qo.ndim != 1:
+        raise ValueError(f"MSA qo_lens must be 1-D, got shape {tuple(qo.shape)}.")
+    if page_table_stride <= 0:
+        raise ValueError(f"MSA fixed page-table stride must be positive, got {page_table_stride}.")
+    batch = int(qo.shape[0])
+    token_rows = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
+    out = torch.empty(int(token_rows.shape[0]) + 1, dtype=torch.int32)
+    out[:-1].copy_((token_rows * page_table_stride).to(torch.int32))
+    out[-1] = batch * page_table_stride
+    return maybe_pin_memory(out)
+
+
 def _msa_plan_length_keys(sub_plan: dict) -> tuple:
     """The length mirrors to patch in one fmha_sm100 sub-plan.
 
@@ -197,8 +224,21 @@ class _MsaGraphSafePlan:
     def __init__(self, metadata, name: str, *, max_batch: int, num_ctas: int, capture_graph: bool):
         buffers = metadata.cuda_graph_buffers
         self._buf = {}
+        # CUDA-graph metadata instances share one global Buffers pool. Most
+        # metadata tensors can safely share a named backing block because they
+        # are refreshed before every replay. A cached plan deliberately skips
+        # that refresh, so each owner needs private backing storage; otherwise
+        # capturing another batch bucket overwrites this owner's worklist while
+        # its local signature still reports a cache hit.
+        buffer_namespace = f"{name}_{id(self):x}"
         # Set by refresh(), read through the plan property.
         self._plan: Optional[tuple] = None
+        # A graph metadata instance belongs to one batch/DQL capture key. The
+        # sparse decode worklist can therefore be retained after its first
+        # build and reactivated after reset(), provided the full scheduling
+        # signature still matches.
+        self._cached_plan: Optional[tuple] = None
+        self._cached_signature: Optional[tuple] = None
         # cute_workspace_buffer must keep a fixed address across steps for the
         # captured graph to replay correctly. Pin it on first use and fail if
         # it moves.
@@ -216,7 +256,7 @@ class _MsaGraphSafePlan:
             self._buf[key] = metadata.get_empty(
                 buffers,
                 shape,
-                cache_name=f"{name}_{key}",
+                cache_name=f"{buffer_namespace}_{key}",
                 dtype=dtype,
                 capture_graph=capture_graph,
             )
@@ -230,7 +270,13 @@ class _MsaGraphSafePlan:
         """Drop the live plan tuple (e.g. for a prefill/mixed or captured step)."""
         self._plan = None
 
-    def refresh(self, plan_tuple) -> tuple:
+    def refresh(
+        self,
+        plan_tuple,
+        *,
+        cache_signature: Optional[tuple] = None,
+        stable_overrides: Optional[dict[str, torch.Tensor]] = None,
+    ) -> tuple:
         has_mixed, split, batch, decode, prefill = plan_tuple
         if has_mixed:
             raise RuntimeError(
@@ -253,8 +299,9 @@ class _MsaGraphSafePlan:
                     "is not CUDA-graph safe."
                 )
         rebuilt = dict(decode)
+        stable_overrides = stable_overrides or {}
         for key in _MSA_PLAN_STABLE_KEYS:
-            src = decode.get(key)
+            src = stable_overrides.get(key, decode.get(key))
             if src is None:
                 continue
             n = int(src.shape[0])
@@ -266,6 +313,29 @@ class _MsaGraphSafePlan:
             dst[:n].copy_(src, non_blocking=True)
             rebuilt[key] = dst[:n]
         self._plan = (has_mixed, split, batch, rebuilt, prefill)
+        if cache_signature is not None:
+            self._cached_plan = self._plan
+            self._cached_signature = cache_signature
+        return self._plan
+
+    def reuse_sparse_decode(self, signature: tuple) -> Optional[tuple]:
+        """Reactivate a cached fixed-stride sparse plan without host work.
+
+        Returns ``None`` when this owner has not cached the requested geometry,
+        telling the caller to run the vendor planner once and refresh normally.
+
+        The cached page indptr uses the persistent 2-D block-table stride, and
+        the paged sparse kernel does not consume ``kv_segment_offsets``. The
+        existing captured ``on_update_kv_lens()`` path patches the only two
+        live fields (``kv_segment_lens`` and ``qo_offset``) on device before
+        every forward, so no per-step Python reconstruction belongs here.
+        """
+        if self._cached_plan is None or self._cached_signature != signature:
+            return None
+        has_mixed, split, batch, decode, prefill = self._cached_plan
+        if has_mixed or prefill is not None:
+            raise RuntimeError("Only a single pure-decode MSA plan may be cached.")
+        self._plan = (has_mixed, split, batch, decode, prefill)
         return self._plan
 
 
@@ -363,9 +433,47 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # First resolution seen by a CUDA-graph metadata, which every later step
     # replaying that graph must match. See _check_capture_stable_resolution.
     _msa_captured_resolution: Optional[tuple] = None
+    # Graph-local aggregate learned during the real CUDA-graph warmup. None
+    # keeps the MSA GQA plan available for tuning; False means every stable
+    # tactic observed by this graph owner was Triton; True is sticky once any
+    # sparse layer selects MSA, because all layers share one metadata plan.
+    _msa_adaptive_gqa_plan_required: Optional[bool] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # create_cuda_graph_metadata() shallow-copies the eager metadata before
+        # calling this hook. Per-instance cached plans and live step state must
+        # never survive that copy: a graph key owns its plan cache and captured
+        # resolution independently.
+        self.msa_out_cache_loc = None
+        self.msa_kv_indices = None
+        self.msa_max_score = None
+        self.msa_n_valid_blocks = None
+        self.msa_block_table = None
+        self.msa_seq_lens_cuda = None
+        self.msa_subpage_block_table = None
+        self.msa_kv_lens_staged = None
+        self.msa_req_to_token = None
+        self.msa_q_batch_row = None
+        self.msa_q_intra = None
+        self.msa_qo_lens_dev = None
+        self._msa_subpages_per_slot = 0
+        self._msa_prewritten_layer = None
+        self._msa_buffers_ready = False
+        self._msa_fields_ready = False
+        self._msa_proxy_plan = None
+        self._msa_gqa_plan = None
+        self._msa_dense_plan = None
+        self._msa_eager_proxy_plan = None
+        self._msa_eager_gqa_plan = None
+        self._msa_eager_dense_plan = None
+        self._msa_eager_n_valid_buf = None
+        self._msa_eager_n_valid_blocks = None
+        self._msa_decode_span = None
+        self._msa_max_kv_len = 0
+        self._msa_worst_case_max_k_tiles = 0
+        self._msa_captured_resolution = None
+        self._msa_adaptive_gqa_plan_required = None
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         # See on_update_kv_lens.
@@ -938,18 +1046,47 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _msa_runs_no_fmha(self) -> bool:
         """Whether nothing at all this step reaches fmha_sm100.
 
-        When True the whole of its per-step preparation is dead: the three
-        plans, the graph-safe mirrors of their worklists, the length mirrors
-        on_update_kv_lens patches into them, and the flattened msa_kv_indices
-        page table.
-
-        That is every pure-decode step, since the ported kernels own all of its
-        rows. A mixed step never qualifies: they own only the generation span,
-        so fmha_sm100 still runs the context prefix and needs its plans and page
-        table.
+        On pure decode, the CuTe scorer and trtllm-gen dense kernel already own
+        their layers. When the sparse GQA policy also selects Triton, no work is
+        left for fmha_sm100. Prefill and mixed steps always retain MSA work.
         """
         span = self._msa_decode_span
-        return span is not None and not span.is_mixed
+        return (
+            span is not None and not span.is_mixed and not self._msa_uses_fixed_stride_page_table()
+        )
+
+    def record_adaptive_sparse_gqa_tactic(self, tactic: str) -> None:
+        """Record whether this graph owner still needs its shared MSA plan.
+
+        The adaptive runner calls this only for a stable, cached tactic. A
+        model forward can contain multiple sparse layers and therefore
+        multiple exact tuning keys. Triton keeps the aggregate False only
+        while every observed key selects it; one MSA selection makes the plan
+        requirement sticky for the graph's lifetime.
+        """
+        if tactic not in ("triton", "msa"):
+            raise ValueError(f"Unsupported MiniMax-M3 sparse decode tactic: {tactic!r}.")
+        if tactic == "msa":
+            self._msa_adaptive_gqa_plan_required = True
+        elif self._msa_adaptive_gqa_plan_required is None:
+            self._msa_adaptive_gqa_plan_required = False
+
+    def _msa_uses_fixed_stride_page_table(self) -> bool:
+        """Whether sparse fmha_sm100 can consume ``msa_block_table`` directly.
+
+        A pure-decode step selected for MSA runs only sparse GQA through
+        fmha_sm100; its selected logical blocks can index a fixed-stride
+        flattened 2-D table. Adaptive keeps this path while unresolved and if
+        any sparse layer selected MSA. A graph owner whose stable tactics are
+        all Triton leaves no fmha_sm100 work to prepare.
+        """
+        span = self._msa_decode_span
+        params = self._msa_params
+        backend = params.sparse_gqa_decode_backend if params is not None else "triton"
+        needs_msa_plan = backend == "msa" or (
+            backend == "adaptive" and self._msa_adaptive_gqa_plan_required is not False
+        )
+        return span is not None and not span.is_mixed and needs_msa_plan
 
     def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:
         """Batch rows this step's fmha_sm100 plans must cover.
@@ -960,7 +1097,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         * no span: the whole batch, as fmha_sm100 runs every row;
         * a mixed span: the context prefix only, since the span takes the
           generation suffix;
-        * a pure-decode span: None, no rows left to plan.
+        * a pure-decode span: the whole batch when sparse GQA selects MSA,
+          otherwise None because all three decode paths are ported kernels.
 
         The range always starts at batch row 0, since fmha_sm100 keeps the batch
         prefix and the ported kernels take the suffix. It is returned as a range
@@ -971,7 +1109,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         span = self._msa_decode_span
         if span is None:
             return (0, self._msa_live_batch)
-        return (0, span.row_first) if span.is_mixed else None
+        if span.is_mixed:
+            return (0, span.row_first)
+        return (0, self._msa_live_batch) if self._msa_uses_fixed_stride_page_table() else None
 
     def _msa_index_kv_dtype(self) -> torch.dtype:
         """dtype of the paged index-K cache, which index Q is cast to.
@@ -1157,14 +1297,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
           captured), so the plans are stored as plain tuples (msa_eager_*_plan)
           that every sparse and dense layer reuses.
 
-        Each plan covers only the rows fmha_sm100 still owns (see
-        _msa_fmha_plan_rows). A pure-decode step is not planned at all, since
-        the ported kernels took every row: planning is host work on the critical
-        path, and the plan tuple, its graph-safe mirror and the per-step length
-        patching in on_update_kv_lens all fall away with it. A mixed step is
-        planned over the context prefix, which is also the half fmha_sm100 would
-        have planned into its own sub-plan (see _mixed_batch_split in
-        fmha_sm100/api.py).
+        Each plan covers only the rows its consumer still owns (see
+        _msa_fmha_plan_rows). On pure decode the CuTe scorer and trtllm-gen
+        dense kernel remain ported; sparse GQA either uses Triton too or builds
+        only the GQA plan for MSA, according to the configured decode policy.
+        A mixed step keeps the existing split: ported kernels take the
+        generation suffix and all MSA plans cover the context prefix.
         """
         # Drop any plan tuples from the previous step; the msa_decode_*_plan and
         # msa_eager_*_plan properties then report None until rebuilt below.
@@ -1228,23 +1366,37 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
-        proxy_plan = plan_for(
-            num_qo_heads=num_index_heads,
-            num_kv_heads=1,
-            output_maxscore=True,
+        proxy_plan = (
+            None
+            if is_decode
+            else plan_for(
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
+                output_maxscore=True,
+            )
         )
-        # Sparse-layer plan: kv_block_num=topk limits attention to top-k blocks.
-        gqa_plan = plan_for(
-            num_qo_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            kv_block_num=topk,
-            use_fp8_kvcache=use_fp8,
+        # Eager sparse GQA needs an ordinary per-step plan. Pure decode builds
+        # its graph-stable plan below, but only when the configured policy may
+        # actually select MSA.
+        gqa_plan = (
+            None
+            if is_decode
+            else plan_for(
+                num_qo_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                kv_block_num=topk,
+                use_fp8_kvcache=use_fp8,
+            )
         )
         # Dense-layer plan: no kv_block_num, so it attends the full page table.
-        dense_plan = plan_for(
-            num_qo_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            use_fp8_kvcache=use_fp8,
+        dense_plan = (
+            None
+            if is_decode
+            else plan_for(
+                num_qo_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                use_fp8_kvcache=use_fp8,
+            )
         )
 
         if not is_decode:
@@ -1284,47 +1436,55 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             ),
         )
 
-        # Allocate the graph-safe plan owners once per metadata; later steps
-        # only refresh their contents below. The plan worklists are sized per
-        # expanded row (the planner splits qo_len > 1 requests into per-token
-        # rows under speculative multi-token verify), so use the worst-case
-        # decode-step token count rather than the batch size.
-        if self._msa_proxy_plan is None:
-            max_plan_rows = max(max_batch, self._msa_max_decode_tokens())
-            num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-            self._msa_proxy_plan = _MsaGraphSafePlan(
-                self,
-                "msa_proxy_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
+        if plan_rows is not None:
+            # The decode planner schedules against topk * page_size and
+            # produces a KV-length-invariant worklist. The persistent 2-D page
+            # table makes its page bases invariant too, so a matching graph
+            # bucket can reactivate the plan without steady-state host work.
+            page_table_stride = int(self.msa_block_table.shape[1])
+            gqa_cache_signature = (
+                tuple(int(value) for value in qo_lens_cpu.tolist()),
+                int(num_q_heads),
+                int(num_kv_heads),
+                int(topk),
+                int(page_size),
+                bool(use_fp8),
+                page_table_stride,
             )
-            self._msa_gqa_plan = _MsaGraphSafePlan(
-                self,
-                "msa_gqa_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
-            self._msa_dense_plan = _MsaGraphSafePlan(
-                self,
-                "msa_dense_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
+            gqa_reused = False
+            if self._msa_gqa_plan is not None:
+                gqa_plan = self._msa_gqa_plan.reuse_sparse_decode(gqa_cache_signature)
+                gqa_reused = gqa_plan is not None
+            if gqa_plan is None:
+                gqa_plan = plan_for(
+                    num_qo_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    kv_block_num=topk,
+                    use_fp8_kvcache=use_fp8,
+                )
 
-        # refresh() stores each plan tuple on its owner, surfaced by the
-        # msa_decode_*_plan properties. A skipped plan leaves its owner reset,
-        # so both that property and _msa_live_plans keep reporting None and the
-        # graph-safe mirror copies never run.
-        for owner, plan in (
-            (self._msa_proxy_plan, proxy_plan),
-            (self._msa_gqa_plan, gqa_plan),
-            (self._msa_dense_plan, dense_plan),
-        ):
-            if plan is not None:
-                owner.refresh(plan)
+            # Pure decode keeps proxy and dense on ported kernels, so allocate
+            # only the sparse-GQA owner, and only for a policy that may use it.
+            if self._msa_gqa_plan is None:
+                max_plan_rows = max(max_batch, self._msa_max_decode_tokens())
+                num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+                self._msa_gqa_plan = _MsaGraphSafePlan(
+                    self,
+                    "msa_gqa_plan",
+                    max_batch=max_plan_rows,
+                    num_ctas=num_ctas,
+                    capture_graph=capture_graph,
+                )
+            if not gqa_reused:
+                self._msa_gqa_plan.refresh(
+                    gqa_plan,
+                    cache_signature=gqa_cache_signature,
+                    stable_overrides={
+                        "kv_page_indptr": _msa_fixed_stride_page_indptr(
+                            qo_lens_cpu, page_table_stride
+                        )
+                    },
+                )
 
         n_valid = per_token_valid_blocks(
             qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
@@ -1377,10 +1537,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         req_to_token = mapping.req_to_token
         out_cache_loc = mapping.out_cache_loc
-        # Only fmha_sm100 reads the flattened page table (the ported kernels
-        # index msa_block_table directly), so a step with no fmha_sm100 work
-        # left skips building and staging it.
-        needs_flat_page_table = not self._msa_runs_no_fmha()
+        # Pure decode points sparse MSA directly at the already-staged 2-D
+        # block table with a fixed row stride. Only eager/mixed fmha_sm100 work
+        # still needs the compact flattened page table.
+        needs_flat_page_table = (
+            not self._msa_runs_no_fmha() and not self._msa_uses_fixed_stride_page_table()
+        )
         kv_indices = (
             # Comes from the same host block ids the mapping was built from,
             # so it costs no device work.

@@ -5158,3 +5158,38 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
          out.copy_(result)
          return out, None
      return result, None
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+@@ -216,6 +216,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
+   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+-// #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-//     asm volatile("griddepcontrol.wait;");
+-// #endif
+-
++#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    // PDL may start FMHA before its stream predecessor flushes selector output.
++    cudaGridDependencySynchronize();
++#endif
++
+     GPU_TRACE_INIT;
+diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+--- a/python/fmha_sm100/jit.py
++++ b/python/fmha_sm100/jit.py
+@@ -11,0 +12 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
++import hashlib
+@@ -43 +44,13 @@
+-CACHE_BASE = _compute_cache_base()
++def _compute_csrc_fingerprint() -> str:
++    """Fingerprint sources embedded in cached JIT artifacts."""
++    csrc_dir = Path(__file__).resolve().parent / "csrc"
++    digest = hashlib.sha256()
++    for path in sorted(p for p in csrc_dir.rglob("*") if p.is_file()):
++        digest.update(path.relative_to(csrc_dir).as_posix().encode())
++        digest.update(b"\0")
++        digest.update(path.read_bytes())
++    return digest.hexdigest()[:16]
++
++
++# A package upgrade must not load cubins compiled from older headers.
++CACHE_BASE = _compute_cache_base() / f"source-{_compute_csrc_fingerprint()}"

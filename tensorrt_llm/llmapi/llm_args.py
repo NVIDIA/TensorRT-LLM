@@ -764,6 +764,16 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "the fmha_sm100 package, and sparse_block_size == 128.",
         status="prototype",
     )
+    sparse_gqa_decode_backend: Literal["triton", "msa", "adaptive"] = Field(
+        default="adaptive",
+        description=
+        "Sparse GQA backend for pure-decode batches under the MSA implementation. "
+        "'triton' uses the reference decode kernel, 'msa' always uses the "
+        "preplanned fmha_sm100 route, and the default 'adaptive' policy profiles "
+        "both routes once per exact CUDA-graph shape and caches the faster tactic. "
+        "Mixed batches keep their existing Triton generation suffix.",
+        status="prototype",
+    )
 
     @model_validator(mode="after")
     def _validate_msa_block_size(self):
@@ -804,6 +814,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
+            sparse_gqa_decode_backend=self.sparse_gqa_decode_backend,
             indexer_kv_dtype=self.indexer_kv_dtype,
             fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
@@ -836,6 +847,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             num_index_heads=self.sparse_num_index_heads,
             topk=self.sparse_topk_blocks,
             fuse_qkv_index_projection=self.fuse_qkv_index_projection,
+            sparse_gqa_decode_backend=self.sparse_gqa_decode_backend,
         )
 
 
