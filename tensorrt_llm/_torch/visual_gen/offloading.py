@@ -143,6 +143,18 @@ class ModuleOffloadManager:
         return tensor.numel() * tensor.element_size()
 
     @staticmethod
+    def _is_non_overlapping_and_dense(tensor: torch.Tensor) -> bool:
+        """Return whether ``tensor`` densely covers its storage in any dimension order."""
+        expected_stride = 1
+        for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
+            if size <= 1:
+                continue
+            if stride != expected_stride:
+                return False
+            expected_stride *= size
+        return True
+
+    @staticmethod
     def _storage_key(tensor: torch.Tensor) -> tuple[int, int] | None:
         if tensor.numel() == 0:
             return None
@@ -179,9 +191,9 @@ class ModuleOffloadManager:
         offset: int,
     ) -> _FlatTensorSpec:
         display_name = f"{stage_name}.{qualified_name}"
-        if not tensor.is_contiguous():
+        if not self._is_non_overlapping_and_dense(tensor):
             raise ValueError(
-                f"Cannot offload non-contiguous tensor '{display_name}' "
+                f"Cannot offload overlapping or non-dense tensor '{display_name}' "
                 f"with stride {tuple(tensor.stride())}"
             )
 
@@ -291,7 +303,10 @@ class ModuleOffloadManager:
                 continue
             try:
                 tensor = getattr(spec.owner, spec.name).detach()
-                tensor_bytes = tensor.reshape(-1).view(torch.uint8).cpu()
+                # Copy physical storage order so rebinding with the original stride is lossless.
+                tensor_bytes = (
+                    tensor.as_strided((tensor.numel(),), (1,)).view(torch.uint8).cpu()
+                )
                 layout.cpu_storage.narrow(0, spec.offset, spec.nbytes).copy_(tensor_bytes)
             except RuntimeError as e:
                 raise RuntimeError(
