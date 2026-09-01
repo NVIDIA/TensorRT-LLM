@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _cutedsl_score
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3_kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
@@ -38,7 +38,7 @@ def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> to
     The production helper concatenates the valid prefix of each request's
     block-id row according to its KV length.
     """
-    return build_kv_page_indices(block_table.cpu(), kv_lens_cpu, PAGE_SIZE)
+    return build_kv_page_indices(block_table.cpu().to(torch.int32), kv_lens_cpu, PAGE_SIZE)
 
 
 def _runner():

@@ -20,6 +20,8 @@ from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
+from .msa_decode import MsaDecodeFmha
+from .msa_prefill import MsaPrefillFmha
 from .prims_ts import PrimsTSFmha
 from .triton_custom_mask import TritonCustomMaskFmha
 
@@ -34,13 +36,16 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     without an import cycle.
     """
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
-    from .msa_sparse_gqa import MsaSparseGqaFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 
     return {
         "triton_custom_mask": TritonCustomMaskFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
-        "msa_sparse_gqa": MsaSparseGqaFmha,
+        # A pair, not a priority: msa_decode serves a MiniMax-M3 MSA layer's
+        # generation phase and msa_prefill its context phase, and neither will
+        # take the other's.
+        "msa_decode": MsaDecodeFmha,
+        "msa_prefill": MsaPrefillFmha,
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "prims_ts": PrimsTSFmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,

@@ -39,7 +39,7 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.fmha.msa_sparse_gqa import run_msa_sparse_gqa
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_sparse_gqa
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
