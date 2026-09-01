@@ -716,6 +716,7 @@ class CutlassFusedMoE(MoEImplBase):
             "host_request_types": _slice(lora_params["host_request_types"]),
             "host_context_lengths": _slice(lora_params["prompt_lens_cpu"]),
             "lora_max_low_rank": active_max_rank,
+            "lora_dtype": lora_params.get("data_type"),
         }
 
     def _extract_moe_lora_tensors_cuda_graph(
@@ -782,6 +783,8 @@ class CutlassFusedMoE(MoEImplBase):
             token_to_slot,
             "lora_max_low_rank":
             max_rank,
+            "lora_dtype":
+            lora_params.get("data_type"),
         }
 
     def _check_configs(self):

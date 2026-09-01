@@ -102,7 +102,8 @@ struct MoeLoraGemmGroupArrays
 //                    per-token rank so the GEMM lands at a known offset.
 //                    The out-GEMM's ldb_out[i] is the per-token rank (adapter B
 //                    is stored [out_hidden_size, rank]), not out_hidden_size.
-//   dtype_bytes:     scalar size in bytes (2 for bf16/fp16, 4 for fp32).
+//   dtype_bytes:     input/weight scalar size (1 for fp8, 2 for bf16/fp16, 4 for fp32).
+//   output_dtype_bytes: output scalar size in bytes (must be positive).
 //   splitk_slices:   split-K factor for the in-GEMM; drives the per-problem
 //                    split-K scratch stride.
 //
@@ -111,7 +112,7 @@ struct MoeLoraGemmGroupArrays
 void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_dev, void const* input_base,
     void* lowrank_workspace, void* output_base, int64_t num_permuted_tokens, int64_t in_hidden_size,
     int64_t out_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
-    MoeLoraGemmGroupArrays const& out, cudaStream_t stream);
+    MoeLoraGemmGroupArrays const& out, cudaStream_t stream, int64_t output_dtype_bytes);
 
 } // namespace kernels::cutlass_kernels
 
