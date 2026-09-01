@@ -1384,6 +1384,7 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
 def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
+    mgr._shared_prefix_points = {}
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(
@@ -1410,6 +1411,7 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
 def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
+    mgr._shared_prefix_points = {}
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(
@@ -2161,6 +2163,7 @@ def _build_v2_hybrid_with_mamba_layer(
     max_num_turns=1,
     periodic_snapshot_interval=0,
     additional_snapshot_offsets_from_end=None,
+    snapshot_on_shared_prefix=False,
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
@@ -2189,6 +2192,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
+            snapshot_on_shared_prefix=snapshot_on_shared_prefix,
         ),
         dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
     )
@@ -2515,23 +2519,7 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         mgr.shutdown()
 
 
-@pytest.mark.parametrize(
-    ("rank", "expected_log_count"),
-    [
-        pytest.param(
-            0,
-            1,
-            marks=pytest.mark.xfail(
-                reason="MambaHybridCacheManagerV2 on this branch does not "
-                "override _create_kv_cache with the rank-0 prefix-reuse "
-                "debug log yet. Runtime-side logging is a follow-up "
-                "(TRTLLM-14813).",
-                strict=True,
-            ),
-        ),
-        (3, 0),
-    ],
-)
+@pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
 def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
@@ -2569,6 +2557,226 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
             "longest_attention_match_tokens=96 "
             "latest_recurrent_snapshot_tokens=64"
         )
+
+
+def _make_v2_promotion_manager(tokens_per_block=32):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.tokens_per_block = tokens_per_block
+    mgr._snapshot_on_shared_prefix = True
+    mgr._shared_prefix_points = {}
+    mgr.kv_cache_map = {}
+    return mgr
+
+
+@pytest.mark.parametrize(
+    ("attention_match", "position", "promoted"),
+    [
+        (112, 64, 96),  # divergence >= one block: promote the floored point
+        (95, 64, None),  # divergence below one block
+        (97, 96, None),  # floored point not past the current position
+    ],
+)
+def test_v2_hybrid_shared_prefix_promotion(attention_match, position, promoted):
+    mgr = _make_v2_promotion_manager()
+    mgr.kv_cache_map[7] = SimpleNamespace(
+        _get_num_tokens_before_hybrid_pruning=lambda: attention_match,
+        num_committed_tokens=64,
+    )
+    req = SimpleNamespace(
+        py_request_id=7, context_current_position=position, expect_snapshot_points=[64, 128]
+    )
+
+    mgr._maybe_promote_shared_prefix_point(req)
+
+    if promoted is None:
+        assert mgr._shared_prefix_points == {}
+        assert req.expect_snapshot_points == [64, 128]
+    else:
+        assert mgr._shared_prefix_points == {7: promoted}
+        assert req.expect_snapshot_points == [64, promoted, 128]
+
+
+@pytest.mark.parametrize("first_chunk", [True, False])
+def test_v2_hybrid_prepare_context_promotes_only_on_first_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+    first_chunk: bool,
+) -> None:
+    monkeypatch.setattr(KVCacheManagerV2, "prepare_context", MagicMock(return_value=True))
+    mgr = _make_v2_promotion_manager()
+    mgr.enable_block_reuse = True
+    mgr.is_draft = False
+    mgr.local_num_mamba_layers = 1
+    mgr.kv_cache_map[7] = SimpleNamespace(
+        _get_num_tokens_before_hybrid_pruning=lambda: 112,
+        num_committed_tokens=64,
+    )
+    req = SimpleNamespace(
+        py_request_id=7,
+        is_first_context_chunk=first_chunk,
+        is_dummy_request=False,
+        context_current_position=64,
+        expect_snapshot_points=[64, 128],
+    )
+
+    assert mgr.prepare_context(req)
+
+    assert (7 in mgr._shared_prefix_points) == first_chunk
+
+
+def test_v2_hybrid_reinjects_promoted_points_each_iteration():
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.enable_block_reuse = True
+    mgr._shared_prefix_points = {1: 96}
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+    )
+    promoted = SimpleNamespace(py_request_id=1, prompt_len=150, expect_snapshot_points=[])
+    other = SimpleNamespace(py_request_id=2, prompt_len=150, expect_snapshot_points=[])
+
+    mgr.prepare_expect_snapshot_points([promoted, other])
+
+    assert promoted.expect_snapshot_points == [64, 96, 128]
+    assert other.expect_snapshot_points == [64, 128]
+
+
+def test_snapshot_on_shared_prefix_requires_v2():
+    with pytest.raises(ValueError, match="use_kv_cache_manager_v2"):
+        KvCacheConfig(
+            use_kv_cache_manager_v2=False,
+            mamba_state_config=MambaStateConfig(snapshot_on_shared_prefix=True),
+        )
+
+
+def test_snapshot_on_shared_prefix_disabled_for_conversations():
+    config = KvCacheConfig(
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
+        mamba_state_config=MambaStateConfig(snapshot_on_shared_prefix=True),
+    )
+
+    assert not config.mamba_state_config.snapshot_on_shared_prefix
+
+
+def test_model_loader_requires_static_source_for_shared_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
+
+    monkeypatch.setattr(model_loader_module, "is_hybrid_linear", lambda _: True)
+    llm_args = SimpleNamespace(
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            mamba_state_config=MambaStateConfig(snapshot_on_shared_prefix=True),
+        ),
+        pipeline_parallel_size=1,
+    )
+
+    with pytest.raises(ValueError, match="static snapshot source"):
+        model_loader_module._validate_and_adjust_mamba_snapshot_config(
+            SimpleNamespace(pretrained_config=None), llm_args
+        )
+
+
+def test_model_loader_disables_shared_prefix_for_pipeline_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
+
+    monkeypatch.setattr(model_loader_module, "is_hybrid_linear", lambda _: True)
+    llm_args = SimpleNamespace(
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=64,
+                snapshot_on_shared_prefix=True,
+            ),
+        ),
+        pipeline_parallel_size=2,
+    )
+
+    model_loader_module._validate_and_adjust_mamba_snapshot_config(
+        SimpleNamespace(pretrained_config=None), llm_args
+    )
+
+    assert not llm_args.kv_cache_config.mamba_state_config.snapshot_on_shared_prefix
+    assert llm_args.kv_cache_config.enable_block_reuse
+
+
+def _make_v2_request(request_id: int, tokens: list[int]) -> LlmRequest:
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+
+
+def _finish_v2_hybrid_context_at_snapshot_points(
+    manager: MambaHybridCacheManagerV2,
+    request: LlmRequest,
+) -> None:
+    """Advance a context request in FORCE_CHUNK-style snapshot-point chunks."""
+    while request.context_remaining_length > 0:
+        manager.prepare_expect_snapshot_points([request])
+        position = request.context_current_position
+        next_point = min(
+            (point for point in request.expect_snapshot_points if point > position),
+            default=request.prompt_len,
+        )
+        chunk = min(next_point, request.prompt_len) - position
+        assert manager.resize_context(request, num_tokens=chunk)
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        manager.prepare_resources(batch)
+        request.context_current_position = position + chunk
+        manager.update_context_resources(batch)
+
+
+@skip_no_cuda
+def test_v2_hybrid_shared_prefix_snapshot_second_hit():
+    """r1 leaves interval snapshots, r2's divergence promotes a junction
+    snapshot at 96, r3 reuses it (cache on second hit)."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        periodic_snapshot_interval=64,
+        additional_snapshot_offsets_from_end=[0],
+        snapshot_on_shared_prefix=True,
+    )
+    try:
+        shared = list(range(1000, 1096))
+
+        r1 = _make_v2_request(1, shared + list(range(2000, 2016)))
+        mgr.prepare_expect_snapshot_points([r1])
+        assert mgr.prepare_context(r1)
+        assert r1.context_current_position == 0
+        assert 1 not in mgr._shared_prefix_points
+        _finish_v2_hybrid_context_at_snapshot_points(mgr, r1)
+        mgr.free_resources(r1)
+
+        # Attention match (96) extends past the last snapshot (64):
+        # promote 96 and deposit a state there while recomputing.
+        r2 = _make_v2_request(2, shared + list(range(3000, 3016)))
+        mgr.prepare_expect_snapshot_points([r2])
+        assert mgr.prepare_context(r2)
+        assert r2.context_current_position == 64
+        assert mgr._shared_prefix_points[2] == 96
+        assert 96 in r2.expect_snapshot_points
+        _finish_v2_hybrid_context_at_snapshot_points(mgr, r2)
+        mgr.free_resources(r2)
+        assert 2 not in mgr._shared_prefix_points
+
+        # Full hybrid reuse up to the junction; no further promotion.
+        r3 = _make_v2_request(3, shared + list(range(4000, 4016)))
+        mgr.prepare_expect_snapshot_points([r3])
+        assert mgr.prepare_context(r3)
+        assert r3.context_current_position == 96
+        assert 3 not in mgr._shared_prefix_points
+        _finish_v2_hybrid_context_at_snapshot_points(mgr, r3)
+        mgr.free_resources(r3)
+    finally:
+        mgr.shutdown()
 
 
 @pytest.mark.xfail(

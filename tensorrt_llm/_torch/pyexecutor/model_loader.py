@@ -100,6 +100,32 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
             "the model configuration.")
 
     has_periodic_snapshots = state_config.periodic_snapshot_interval > 0
+    if state_config.snapshot_on_shared_prefix:
+        if kv_cache_config.use_kv_cache_manager_v2 is not True:
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.snapshot_on_shared_prefix "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True after "
+                "resolving the model configuration.")
+        if llm_args.pipeline_parallel_size > 1:
+            # The divergence signal is rank-local, so per-rank promoted
+            # points would desynchronize forced chunk sizes across PP ranks.
+            logger.warning(
+                "Disabling "
+                "kv_cache_config.mamba_state_config.snapshot_on_shared_prefix "
+                "because it is not supported with pipeline parallelism.")
+            kv_cache_config.mamba_state_config = state_config.model_copy(
+                update={"snapshot_on_shared_prefix": False})
+        elif not has_periodic_snapshots and not has_additional_snapshots:
+            # Without static points, attention blocks never enter the radix
+            # tree under PER_REQUEST reuse, so the divergence signal that
+            # drives promotion can never appear.
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.snapshot_on_shared_prefix "
+                "requires a static snapshot source: set "
+                "kv_cache_config.mamba_state_config.periodic_snapshot_interval "
+                "to a positive value (recommended) and/or provide "
+                "kv_cache_config.mamba_state_config."
+                "additional_snapshot_offsets_from_start/_from_end.")
     if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
             and not has_additional_snapshots):
         logger.warning(

@@ -1111,7 +1111,11 @@ class _KVCache:
         return len(self._committed_tokens)
 
     def _get_num_tokens_before_hybrid_pruning(self) -> int:
-        """Return the pre-hybrid-pruning prefix for internal diagnostics."""
+        """Return the pre-hybrid-pruning (attention-only) match length.
+
+        Consumed by MambaHybridCacheManagerV2 for shared-prefix snapshot
+        promotion and the rank-0 prefix-reuse log.
+        """
         return self._num_tokens_before_hybrid_pruning
 
     @property

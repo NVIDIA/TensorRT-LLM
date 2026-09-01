@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-294 captured fields.
+295 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -140,6 +140,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_state_config.snapshot_on_shared_prefix` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.max_attention_window` | `Optional[List[int]]` | `value` |  |  |
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |

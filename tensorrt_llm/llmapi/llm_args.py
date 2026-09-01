@@ -3898,6 +3898,19 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    snapshot_on_shared_prefix: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description=
+        "Take a Mamba state snapshot at the boundary where a request's "
+        "attention-KV prefix hit extends past its recurrent-state hit "
+        "(cache on second hit). The request's prefill is chunked to stop "
+        "at that boundary so the state is deposited for later requests "
+        "sharing the prefix. Requires KV cache manager V2 and at least "
+        "one static snapshot source (periodic interval or additional "
+        "offsets).")
+
 
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
@@ -4287,6 +4300,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})
+        if (self.block_reuse_config.policy == "per_conversation"
+                and self.mamba_state_config.snapshot_on_shared_prefix):
+            logger.warning(
+                "'kv_cache_config.mamba_state_config.snapshot_on_shared_prefix' "
+                "is ignored because "
+                "'kv_cache_config.block_reuse_config.policy=per_conversation' "
+                "drop plans are not validated against prompt-interior "
+                "snapshots; setting it to False.")
+            self.mamba_state_config = self.mamba_state_config.model_copy(
+                update={"snapshot_on_shared_prefix": False})
         return self
 
     @model_validator(mode='after')
@@ -4312,6 +4335,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.mamba_state_config additional snapshot "
                 "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        if (state_config.snapshot_on_shared_prefix
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.snapshot_on_shared_prefix "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')

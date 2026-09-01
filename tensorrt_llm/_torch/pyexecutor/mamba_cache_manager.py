@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Union)
+                    Optional, Sequence, Tuple, Union)
 
 import torch
 import triton
@@ -3075,6 +3075,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
 
+        # Demand-driven snapshot promotion (cache on second hit). PP is
+        # gated off because the divergence signal is rank-local.
+        self._snapshot_on_shared_prefix = (
+            kv_cache_config.mamba_state_config.snapshot_on_shared_prefix
+            and mapping.pp_size == 1)
+        # request_id -> promoted shared-prefix snapshot point (in tokens).
+        self._shared_prefix_points: Dict[int, int] = {}
+
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
         self.cuda_state_indices = torch.zeros([state_index_capacity],
@@ -3613,7 +3621,90 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.try_commit_blocks(request, kv_cache)
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
+        self._shared_prefix_points.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
+
+    def _create_kv_cache(
+        self,
+        request_id: int,
+        lora_task_id: Optional[int],
+        input_tokens: Optional[Sequence],
+        *,
+        cache_salt: Optional[str] = None,
+        is_dummy: bool = False,
+        enable_request_stats: bool = False,
+        expected_prompt_length: Optional[int] = None,
+    ):
+        kv_cache = super()._create_kv_cache(
+            request_id,
+            lora_task_id,
+            input_tokens,
+            cache_salt=cache_salt,
+            is_dummy=is_dummy,
+            enable_request_stats=enable_request_stats,
+            expected_prompt_length=expected_prompt_length,
+        )
+        # Rank-0 observability for hybrid prefix reuse (TRTLLM-14813): how
+        # far the attention-KV match extends vs the recurrent-state match.
+        if (kv_cache is not None and not is_dummy and self.mapping.rank == 0
+                and self.local_num_mamba_layers > 0
+                and expected_prompt_length is not None):
+            logger.debug(f"[MambaHybridCacheManagerV2] prefix reuse rank=0 "
+                         f"request_id={request_id} "
+                         f"request_total_tokens={expected_prompt_length + 1} "
+                         f"longest_attention_match_tokens="
+                         f"{kv_cache._get_num_tokens_before_hybrid_pruning()} "
+                         f"latest_recurrent_snapshot_tokens="
+                         f"{kv_cache.num_committed_tokens}")
+        return kv_cache
+
+    def prepare_context(self, req: LlmRequest) -> bool:
+        is_first_chunk = req.is_first_context_chunk
+        ok = super().prepare_context(req)
+        if (ok and is_first_chunk and self._snapshot_on_shared_prefix
+                and self.enable_block_reuse and not self.is_draft
+                and self.local_num_mamba_layers > 0 and not req.is_dummy_request
+                and req.py_request_id not in self._shared_prefix_points):
+            self._maybe_promote_shared_prefix_point(req)
+        return ok
+
+    def _maybe_promote_shared_prefix_point(self, req: LlmRequest) -> None:
+        """Promote the shared-prefix boundary to a snapshot point.
+
+        An attention-KV match extending past the recurrent-state match
+        proves the prefix is shared; a forced chunk boundary there lets
+        try_commit_blocks deposit a state at it (cache on second hit).
+        Eviction repair is automatic: the divergence is recomputed at
+        every admission.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return
+        attention_match = kv_cache._get_num_tokens_before_hybrid_pruning()
+        divergence = attention_match - kv_cache.num_committed_tokens
+        if divergence < self.tokens_per_block:
+            return
+        # Block-floor keeps chunk ends block-aligned.
+        point = (attention_match // self.tokens_per_block *
+                 self.tokens_per_block)
+        if point <= req.context_current_position:
+            return
+        self._shared_prefix_points[req.py_request_id] = point
+        req.expect_snapshot_points = sorted(
+            set(req.expect_snapshot_points) | {point})
+
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        super().prepare_expect_snapshot_points(requests)
+        # The static list is rebuilt every iteration; re-inject promoted
+        # points until their commit happens.
+        if not self.enable_block_reuse or not self._shared_prefix_points:
+            return
+        for request in requests:
+            point = self._shared_prefix_points.get(request.py_request_id)
+            if point is not None:
+                request.expect_snapshot_points = sorted(
+                    set(request.expect_snapshot_points) | {point})
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)

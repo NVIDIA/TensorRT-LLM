@@ -120,7 +120,13 @@ configuration files should use the nested field. The prototype
 `additional_snapshot_offsets_from_end` options add fixed boundaries. Start
 offsets count tokens from the beginning of the prompt. End offsets count
 backward from the prompt end, and an end offset of `0` selects the final
-prompt boundary. The `per_conversation` block reuse policy disables periodic
+prompt boundary. The prototype `snapshot_on_shared_prefix` option adds
+demand-driven boundaries: when a request's attention-KV prefix hit extends
+past its recurrent-state hit, a snapshot is deposited at that shared-prefix
+boundary so later requests get a full hybrid hit (cache on second hit). It
+requires KV cache manager V2 plus at least one static snapshot source, and is
+ignored under the `per_conversation` policy and pipeline parallelism. The
+`per_conversation` block reuse policy disables periodic
 Mamba snapshots, so configure one or more explicit stable boundaries (usually
 an end offset of `0`) when using it with a hybrid Mamba model. For example:
 
