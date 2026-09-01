@@ -1124,13 +1124,27 @@ def main(args: argparse.Namespace):
                 print(f"Time Breakdown {span} {stat} (ms): "
                       f"{span_stats[span][stat]:.4f}")
 
+        # Printing first is only half of it: an unwritable output_stem or a missing
+        # plotly would otherwise raise out of main() and make the client exit
+        # non-zero, which the harness reads as a failed benchmark even though the
+        # lines above already carried the whole measurement. Report and continue.
+        # span_stats is passed in so the reduction is not run a second time over
+        # every request.
         stats_filename = f"{output_stem}-time_breakdown_stats.json"
-        analyzer.export_statistics_json(timing_data, stats_filename)
-        print(f"Span statistics saved to: {stats_filename}")
+        try:
+            analyzer.export_statistics_json(timing_data,
+                                            stats_filename,
+                                            span_stats=span_stats)
+            print(f"Span statistics saved to: {stats_filename}")
+        except OSError as exc:
+            print(f"Could not write {stats_filename}: {exc}")
 
         diagram_filename = f"{output_stem}-time_diagram.html"
-        analyzer.create_timing_diagram(timing_data, diagram_filename)
-        print(f"Time diagram saved to: {diagram_filename}")
+        try:
+            analyzer.create_timing_diagram(timing_data, diagram_filename)
+            print(f"Time diagram saved to: {diagram_filename}")
+        except (OSError, ImportError) as exc:
+            print(f"Could not write {diagram_filename}: {exc}")
 
 
 if __name__ == "__main__":

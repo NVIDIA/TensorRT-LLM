@@ -2085,6 +2085,17 @@ class DisaggTestCmds(NamedTuple):
         # is not a method here. Calling the method on self would raise
         # AttributeError after the whole benchmark has already run.
         breakdown_dir = self.perf_metrics_output_dir
+        # Globbed once: the JSONLs are lane-scoped, not client-scoped, so every
+        # record would rediscover the identical set. _parse_disagg_config_file
+        # rejects a multi-client time_breakdown lane, so this loop is normally a
+        # single iteration anyway.
+        paths = discover_perf_metrics_files(breakdown_dir)
+        if not paths:
+            print_info(
+                f"No perf_metrics-*.jsonl under {breakdown_dir}; "
+                "skipping time breakdown aggregation"
+            )
+            return
         for record in pending_time_breakdown:
             # The benchmark mode *is* the parser's case type now that the
             # time_breakdown modifier is a separate id segment. Checked rather
@@ -2097,13 +2108,6 @@ class DisaggTestCmds(NamedTuple):
                 print_info(
                     f"No time breakdown groups defined for benchmark mode {case_type!r}; "
                     "skipping aggregation"
-                )
-                continue
-            paths = discover_perf_metrics_files(breakdown_dir)
-            if not paths:
-                print_info(
-                    f"No perf_metrics-*.jsonl under {breakdown_dir}; "
-                    "skipping time breakdown aggregation"
                 )
                 continue
             try:
@@ -2427,8 +2431,14 @@ class DisaggTestCmds(NamedTuple):
             # those sentinels (bounded independently of the whole-test timeout),
             # then parse each benchmark client's gen-worker device step time a
             # single time. A timeout falls back to the current log contents.
-            # Only gen_only runs populate this queue; other modes skip both the
-            # sentinel wait and device-step-time parsing.
+            # Every mode in DEVICE_STEP_TIME_MODES (gen_only, e2e) populates this
+            # queue, so e2e now pays the sentinel wait too. That is bounded and
+            # small: slurm_launch_draft.sh touches gen_server_{i}.done for every
+            # disagg mode (only the *ctx* server loop is gated on gen_only), so no
+            # mode waits out GEN_LOG_SENTINEL_TIMEOUT for a sentinel that is never
+            # written, and the parse itself seeks to this client's byte window
+            # instead of rescanning the log. Modes outside the tuple leave the
+            # queue empty and skip both steps.
             self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
             self._append_time_breakdown_metrics(pending_time_breakdown, outputs)
 
@@ -2862,6 +2872,21 @@ class PerfSanityTestConfig:
                     f"benchmark.{unsupported}; "
                     "only tensorrt_llm.serve.scripts.benchmark_serving can emit the "
                     "per-request time breakdown"
+                )
+            # One client only. Every client in a lane hits the same servers, which
+            # append every client's requests to one set of perf_metrics JSONLs, and
+            # the aggregation runs once after the whole lane. Two clients would
+            # therefore both receive the same whole-lane breakdown, so neither row
+            # would describe its own concurrency -- and the numbers look perfectly
+            # healthy, so nothing downstream could notice. The device-step-time
+            # family avoids this with per-client byte windows into the gen log; the
+            # JSONLs have no equivalent bound yet, so refuse the case instead.
+            if len(concurrency_values) > 1:
+                raise ValueError(
+                    f"The {TIME_BREAKDOWN_MODIFIER} modifier supports exactly one client, "
+                    f"but benchmark.concurrency_list has {len(concurrency_values)} values "
+                    f"({concurrency_values}); every client would be uploaded the same "
+                    "whole-lane breakdown. Split them into one case per concurrency."
                 )
 
         if benchmark_mode == "ctx_only":

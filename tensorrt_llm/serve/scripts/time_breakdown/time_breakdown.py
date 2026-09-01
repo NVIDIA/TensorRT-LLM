@@ -2192,12 +2192,21 @@ class RequestTimeBreakdown:
             }
         return stats
 
-    def export_statistics_json(self, timing_data: List[Dict],
-                               output_path: str) -> Dict[str, Any]:
-        """Write :meth:`compute_statistics` output to ``output_path`` as JSON."""
+    def export_statistics_json(
+            self,
+            timing_data: List[Dict],
+            output_path: str,
+            span_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Write :meth:`compute_statistics` output to ``output_path`` as JSON.
+
+        Pass ``span_stats`` when the caller has already reduced ``timing_data``,
+        so the reduction is not repeated over every request.
+        """
         payload = {
-            'total_requests': len(timing_data),
-            'spans': self.compute_statistics(timing_data),
+            'total_requests':
+            len(timing_data),
+            'spans': (self.compute_statistics(timing_data)
+                      if span_stats is None else span_stats),
         }
         with open(output_path, 'w', encoding='utf-8') as out_file:
             json.dump(payload, out_file, indent=2, sort_keys=True)

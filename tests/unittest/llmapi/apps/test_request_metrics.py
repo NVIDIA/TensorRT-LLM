@@ -324,9 +324,21 @@ def test_jsonl_record_keeps_header_derived_kv_transfer_timestamps():
     assert timing["kv_cache_transfer_end"] == pytest.approx(_LIFECYCLE["kv_end"])
 
 
-def test_jsonl_record_still_strips_absent_kv_transfer_timestamps():
-    """A request that never transferred KV must not gain zero-width KV fields."""
-    timing = _jsonl_perf_metrics(_record()["phases"]["server"])["timing_metrics"]
+@pytest.mark.parametrize("absent", [None, 0, 0.0])
+def test_jsonl_record_still_strips_absent_kv_transfer_timestamps(absent):
+    """A request that never transferred KV must not gain zero-width KV fields.
+
+    ``0`` is not hypothetical: the aggregated path reads these off a default-
+    initialised C++ duration (``timing_metrics.kv_cache_transfer_start
+    .total_seconds()``), so a non-transferring request arrives as ``0.0`` rather
+    than ``None``. Both encodings must be stripped, or a consumer testing for
+    presence rather than truthiness reads a zero-width transfer as a measurement.
+    """
+    record = _record()
+    phase = record["phases"]["server"]
+    phase["timing_metrics"]["kv_cache_transfer_start"] = absent
+    phase["timing_metrics"]["kv_cache_transfer_end"] = absent
+    timing = _jsonl_perf_metrics(phase)["timing_metrics"]
 
     assert "kv_cache_transfer_start" not in timing
     assert "kv_cache_transfer_end" not in timing

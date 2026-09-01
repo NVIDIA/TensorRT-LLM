@@ -439,30 +439,43 @@ def compute_time_breakdown_metrics(
             gen_workers.append((path, records))
 
     # ---- groups 1, 4, 5: one value per request --------------------------------------
-    # Prefer the combined record: group 5 spans are cross-role and need the join. For
-    # ctx_only there is no combined file, so group 1 comes from the lone worker file.
-    stage_records = combined if combined else [r for _, rs in ctx_workers for r in rs]
-    for raw in stage_records:
-        view = _RecordView(raw)
-        if 1 in groups:
-            ctm = _timing(view.ctx)
+    # Prefer the combined record: group 5 spans are cross-role and need the join. Without
+    # it each stage falls back to the workers *of its own role* -- never to the other
+    # role's. _RecordView aliases both .ctx and .gen to the raw record for a single-role
+    # worker file, so driving group 4 off ctx workers would compute gen_preprocessing /
+    # gen_queue / gen_postprocessing from the context worker's timestamps and upload
+    # plausible millisecond values for the wrong phase. Resolving per role instead makes
+    # a missing combined file cost the affected group its samples (a visible zero) rather
+    # than silently mislabelling another role's.
+    ctx_stage_records = combined or [r for _, rs in ctx_workers for r in rs]
+    gen_stage_records = combined or [r for _, rs in gen_workers for r in rs]
+    if 1 in groups:
+        for raw in ctx_stage_records:
+            ctm = _timing(_RecordView(raw).ctx)
             for name, start_f, end_f in CTX_STAGE_SPANS:
                 val = _span_ms(_ts(ctm, start_f), _ts(ctm, end_f))
                 if val is not None:
                     per_request[name].append(val)
-        if 4 in groups:
-            gtm = _timing(view.gen)
+    if 4 in groups:
+        for raw in gen_stage_records:
+            gtm = _timing(_RecordView(raw).gen)
             for name, start_f, end_f in GEN_STAGE_SPANS:
                 val = _span_ms(_ts(gtm, start_f), _ts(gtm, end_f))
                 if val is not None:
                     per_request[name].append(val)
-        if 5 in groups and view.is_combined:
+    if 5 in groups:
+        # Cross-role by construction, so only the combined record can carry it.
+        for raw in combined:
+            view = _RecordView(raw)
+            if not view.is_combined:
+                continue
             sides = {"ctx": _timing(view.ctx), "gen": _timing(view.gen), "disagg": raw}
             for name, s_side, s_field, e_side, e_field in DISAGG_STAGE_SPANS:
                 val = _span_ms(_ts(sides[s_side], s_field), _ts(sides[e_side], e_field))
                 if val is not None:
                     per_request[name].append(val)
-    counts["stage_records"] = len(stage_records)
+    counts["ctx_stage_records"] = len(ctx_stage_records)
+    counts["gen_stage_records"] = len(gen_stage_records)
 
     # ---- group 2: per-chunk, from every context worker ------------------------------
     if 2 in groups:

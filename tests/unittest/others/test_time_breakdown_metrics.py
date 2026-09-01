@@ -14,23 +14,44 @@
 # limitations under the License.
 """Unit tests for perf-sanity time_breakdown metric aggregation."""
 
+import importlib.util
 import json
 import os
-import sys
 
 import pytest
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "..", "integration", "defs", "perf")
+pytestmark = pytest.mark.cpu_only
+
+# Loaded by path rather than via sys.path.insert: the perf defs directory holds modules
+# whose names collide with top-level ones (_model_paths, perf_regression_utils), and a
+# module-level insert is never undone, so it would shadow them for every test collected
+# later in the same process. The sibling test_perf_sanity_time_breakdown.py does the same.
+# No import stubs are needed here because time_breakdown_metrics is stdlib-only.
+_MODULE_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "integration",
+    "defs",
+    "perf",
+    "time_breakdown_metrics.py",
 )
 
-from time_breakdown_metrics import (  # noqa: E402  isort:skip
-    ALL_METRICS,
-    GROUP_METRICS,
-    MODE_GROUPS,
-    STATS,
-    compute_time_breakdown_metrics,
-)
+
+def _load_time_breakdown_metrics():
+    spec = importlib.util.spec_from_file_location("perf_time_breakdown_metrics", _MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_tbm = _load_time_breakdown_metrics()
+
+ALL_METRICS = _tbm.ALL_METRICS
+GROUP_METRICS = _tbm.GROUP_METRICS
+MODE_GROUPS = _tbm.MODE_GROUPS
+STATS = _tbm.STATS
+compute_time_breakdown_metrics = _tbm.compute_time_breakdown_metrics
 
 
 def _chunk(base, *, fwd=0.100, upd=0.002, smp=0.001, post=0.010, gpu_fwd=110.0):
@@ -85,6 +106,12 @@ def _write(tmp_path, name, records):
     path = tmp_path / name
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     return str(path)
+
+
+def _read(path):
+    """Read a JSONL back without leaking the handle into the test's teardown."""
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
 
 
 def _ctx_file(tmp_path, name="perf_metrics-server-hostA-1-t.jsonl", n=5, offset=0.0):
@@ -172,11 +199,48 @@ def test_mode_gating_zeroes_unsupported_groups(tmp_path, mode):
 def test_ctx_only_needs_no_disagg_server(tmp_path):
     """ctx_only runs the ctx worker in aggregated mode, so there is no combined file."""
     metrics, info = compute_time_breakdown_metrics([_ctx_file(tmp_path)], "ctx_only")
-    assert info["counts"]["stage_records"] == 5
+    assert info["counts"]["ctx_stage_records"] == 5
     assert metrics["d_tb_ctx_processing_mean"] == pytest.approx(497.0, abs=1.0)
     # Non-chunked prefill is still reported as a single chunk (group 2 populated).
     assert info["sample_counts"]["chunk_forward"] == 5
     assert metrics["d_tb_chunk_forward_mean"] > 0.0
+
+
+def test_stage_groups_never_borrow_the_other_roles_records(tmp_path):
+    """Without a combined file each stage must fall back to its *own* role's workers.
+
+    _RecordView aliases both .ctx and .gen to the raw record for a single-role worker
+    file, so a shared fallback list would compute the group 4 gen spans from the context
+    worker's timestamps and upload plausible values for the wrong phase. Losing the
+    samples is the correct failure: a zero is visible, a mislabelled span is not.
+    """
+    ctx = _ctx_file(tmp_path)
+    gen = _gen_file(tmp_path, "perf_metrics-server-hostB-2-t.jsonl")
+
+    # Both roles present, still no combined file: each group reads its own role.
+    metrics, info = compute_time_breakdown_metrics([ctx, gen], "e2e")
+    assert info["counts"]["ctx_stage_records"] == 5
+    assert info["counts"]["gen_stage_records"] == 4
+    assert metrics["d_tb_ctx_processing_mean"] == pytest.approx(497.0, abs=1.0)
+    # Only a gen record carries kv_cache_transfer_*, so a non-zero value here proves
+    # group 4 was computed from the gen worker and not from the ctx worker.
+    assert metrics["d_tb_gen_kv_transfer_mean"] == pytest.approx(20.0, abs=1e-6)
+    assert metrics["d_tb_gen_queue_wait_mean"] == pytest.approx(9.0, abs=1e-6)
+    # Group 5 is cross-role, so it stays empty without the join.
+    for name in GROUP_METRICS[5]:
+        assert metrics[f"d_tb_{name}_mean"] == 0.0
+
+    # Only a ctx worker: group 4 must be empty rather than a copy of group 1.
+    ctx_only_metrics, _ = compute_time_breakdown_metrics([ctx], "e2e")
+    for name in GROUP_METRICS[4]:
+        assert ctx_only_metrics[f"d_tb_{name}_mean"] == 0.0, f"{name} borrowed ctx timestamps"
+    assert ctx_only_metrics["d_tb_ctx_preprocessing_mean"] > 0.0
+
+    # Mirror image: only a gen worker, so group 1 must be empty.
+    gen_only_metrics, _ = compute_time_breakdown_metrics([gen], "e2e")
+    for name in GROUP_METRICS[1]:
+        assert gen_only_metrics[f"d_tb_{name}_mean"] == 0.0, f"{name} borrowed gen timestamps"
+    assert gen_only_metrics["d_tb_gen_kv_transfer_mean"] == pytest.approx(20.0, abs=1e-6)
 
 
 def test_chunk_spans_tile_ctx_processing(tmp_path):
@@ -243,9 +307,9 @@ def test_multi_worker_clock_offsets_are_corrected_per_worker(tmp_path):
         path = _gen_file(
             tmp_path, f"perf_metrics-server-host{widx}-{widx}-t.jsonl", n=per_worker, offset=off
         )
-        gen_records.extend(json.loads(line) for line in open(path))
+        gen_records.extend(_read(path))
     ctx_path = _ctx_file(tmp_path, n=len(gen_records))
-    ctx_records = [json.loads(line) for line in open(ctx_path)]
+    ctx_records = _read(ctx_path)
     # Round-robin assignment, so consecutive records come from different workers -- exactly the
     # interleaving that makes a single pooled offset estimate look plausible but be wrong.
     gen_servers = [f"genhost{i}:1" for i in range(len(offsets))]
@@ -299,7 +363,7 @@ def test_unverifiable_clock_offset_drops_the_crossing_span_not_guesses(tmp_path)
 
 def test_zero_and_nan_timestamps_are_excluded_not_counted_as_zero_spans(tmp_path):
     """0 / NaN mean 'endpoint not recorded'; they must not become zero-width spans."""
-    records = [json.loads(line) for line in open(_ctx_file(tmp_path, n=4))]
+    records = _read(_ctx_file(tmp_path, n=4))
     records[0]["perf_metrics"]["timing_metrics"]["server_arrival_time"] = 0
     records[1]["perf_metrics"]["timing_metrics"]["server_arrival_time"] = float("nan")
     path = _write(tmp_path, "perf_metrics-server-hostC-3-t.jsonl", records)
