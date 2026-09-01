@@ -13,4 +13,4 @@ l0_gb300_multi_nodes_node4_gpu16:
       stage: post_merge
       backend: pytorch
   tests:
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_adp16_cutedsl TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_adp16_cutedsl TIMEOUT (90)
