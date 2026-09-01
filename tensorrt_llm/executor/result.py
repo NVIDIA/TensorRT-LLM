@@ -186,6 +186,7 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        self.cached_tokens_by_tier = {}
         self.per_pos_drafted = None
         self.per_pos_accepted = None
         # Cumulative (accepted, drafted) draft-token totals attached by the
@@ -576,6 +577,8 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.cached_tokens_by_tier = getattr(response_result,
+                                                 'cached_tokens_by_tier', {})
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
@@ -594,6 +597,18 @@ class GenerationResultBase:
                     self._disaggregated_params or DisaggregatedParams(),
                     ctx_usage=ctx_usage,
                 )
+                if not self.cached_tokens_by_tier:
+                    details = ctx_usage.get("prompt_tokens_details") if isinstance(
+                        ctx_usage, dict) else getattr(ctx_usage, "prompt_tokens_details", None)
+                    tier_breakdown = None
+                    if isinstance(details, dict):
+                        tier_breakdown = details.get("cached_tokens_by_tier")
+                    elif details is not None:
+                        tier_breakdown = getattr(details, "cached_tokens_by_tier", None)
+                    if tier_breakdown:
+                        self.cached_tokens_by_tier = tier_breakdown
+                    elif self.cached_tokens > 0:
+                        self.cached_tokens_by_tier = {"remote": self.cached_tokens}
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
@@ -724,6 +739,10 @@ class GenerationResultBase:
         if output.finish_reason and sequence_index == 0:
             metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
                 self.cached_tokens
+            if self.cached_tokens_by_tier:
+                metrics_stats[
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER] = \
+                    self.cached_tokens_by_tier
 
             spec_dec_logged = False
             if self.per_pos_drafted is not None and any(

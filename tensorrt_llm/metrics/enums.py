@@ -27,6 +27,7 @@ class MetricNames(Enum):
     PROMPT_TOKENS = "prompt_tokens"
     GENERATION_TOKENS = "generation_tokens"
     PROMPT_CACHE_CACHED_TOKENS = "prompt_cache_cached_tokens"
+    PROMPT_CACHE_CACHED_TOKENS_BY_TIER = "prompt_cache_cached_tokens_by_tier"
     SPEC_DEC_ACCEPTED_PER_POS = "spec_dec_accepted_per_pos"
     SPEC_DEC_DRAFTED_PER_POS = "spec_dec_drafted_per_pos"
     PREFILL_PERPLEXITY = "prefill_perplexity"

@@ -2568,6 +2568,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                req.cached_tokens = kv_cache.num_committed_tokens
+                req.cached_tokens_by_tier = getattr(
+                    kv_cache, "reused_tokens_by_tier", {}
+                )
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;

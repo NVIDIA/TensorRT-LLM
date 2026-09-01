@@ -1079,6 +1079,8 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens_by_tier = getattr(
+                    request, 'cached_tokens_by_tier', {})
                 self._maybe_attach_ctx_usage(request, response)
                 # Buffer the response instead of enqueueing immediately.
                 # With ADP, _enqueue_responses does a tp_gather collective.
@@ -8363,6 +8365,8 @@ class PyExecutor:
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens_by_tier = getattr(
+                request, 'cached_tokens_by_tier', {})
             self._maybe_attach_ctx_usage(request, response)
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot

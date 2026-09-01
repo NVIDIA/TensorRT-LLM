@@ -34,6 +34,7 @@ from .._common import (
     BlockOrdinal,
     BlockOrdinalT,
     CacheLevel,
+    CacheTier,
     CudaStream,
     PageIndex,
     PageIndexMode,
@@ -358,6 +359,12 @@ class _KVCache:
         )
         self._enable_request_stats = enable_request_stats
         self._pending_stats = _PendingStats()
+        self._reused_tokens_by_tier = {
+            "gpu": 0,
+            "host": 0,
+            "disk": 0,
+            "remote": 0,
+        }
         self._status = self.Status.SUSPENDED
         if reuse_match is not None:
             self._setup_for_reuse(reuse_match)
@@ -1109,6 +1116,14 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    @property
+    def reused_tokens_by_tier(self) -> dict[str, int]:
+        return getattr(
+            self,
+            "_reused_tokens_by_tier",
+            {"gpu": len(self._committed_tokens), "host": 0, "disk": 0, "remote": 0}
+        )
 
     def _get_num_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
@@ -2125,6 +2140,35 @@ class _KVCache:
                 for block in matched
             ],
         )
+
+        self._reused_tokens_by_tier = {"gpu": 0, "host": 0, "disk": 0, "remote": 0}
+        attn_lc_idx = None
+        for lc_idx, lc in life_cycles.items():
+            if isinstance(lc, AttnLifeCycle):
+                attn_lc_idx = lc_idx
+                break
+
+        if attn_lc_idx is not None and matched:
+            for ordinal in range(len(matched)):
+                tokens_in_block = min(
+                    tokens_per_block,
+                    num_tokens - ordinal * tokens_per_block
+                )
+                if tokens_in_block <= 0:
+                    break
+                page = matched[ordinal].get_page(attn_lc_idx)
+                if page is not None and getattr(page, "cache_level", None) is not None:
+                    tier = manager.cache_tier_list[page.cache_level]
+                    if tier == CacheTier.HOST_MEM:
+                        self._reused_tokens_by_tier["host"] += tokens_in_block
+                    elif tier == CacheTier.DISK:
+                        self._reused_tokens_by_tier["disk"] += tokens_in_block
+                    else:
+                        self._reused_tokens_by_tier["gpu"] += tokens_in_block
+                else:
+                    self._reused_tokens_by_tier["gpu"] += tokens_in_block
+        elif num_tokens > 0:
+            self._reused_tokens_by_tier["gpu"] += num_tokens
 
         beam_idx = DEFAULT_BEAM_INDEX
 

@@ -412,11 +412,20 @@ class MetricsCollector:
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
 
-        # Prompt cache hit tracking
+        # Prompt cache hit tracking by storage tier
+        self.labelname_cache_tier = "cache_tier"
+        self.labels_with_cache_tier = {
+            **self.labels, self.labelname_cache_tier: ""
+        }
         self.counter_tokens_cached_prompt = Counter(
             name=self.metric_prefix + "prompt_cached_tokens_total",
-            documentation="Total prompt tokens served from KV cache.",
-            labelnames=self.labels.keys())
+            documentation=
+            "Total prompt tokens served from KV cache by storage tier.",
+            labelnames=self.labels_with_cache_tier.keys())
+        for tier in ("gpu", "host", "disk", "remote"):
+            self.counter_tokens_cached_prompt.labels(
+                **{**self.labels, self.labelname_cache_tier: tier}
+            )
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -610,12 +619,45 @@ class MetricsCollector:
                     MetricNames.GENERATION_TOKENS, 0):
                 self._log_counter(self.counter_generation_tokens, {},
                                   generation_tokens)
-            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict:
-                cached_tokens = metrics_dict[
-                    MetricNames.PROMPT_CACHE_CACHED_TOKENS]
-                if cached_tokens > 0:
-                    self._log_counter(self.counter_tokens_cached_prompt,
-                                      self.labels, cached_tokens)
+            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict or MetricNames.PROMPT_CACHE_CACHED_TOKENS.value in metrics_dict:
+                raw_cached = metrics_dict.get(
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS)
+                if raw_cached is None:
+                    raw_cached = metrics_dict.get(
+                        MetricNames.PROMPT_CACHE_CACHED_TOKENS.value)
+
+                cached_tokens_by_tier = metrics_dict.get(
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER)
+                if cached_tokens_by_tier is None and hasattr(
+                        MetricNames, "PROMPT_CACHE_CACHED_TOKENS_BY_TIER"):
+                    cached_tokens_by_tier = metrics_dict.get(
+                        MetricNames.PROMPT_CACHE_CACHED_TOKENS_BY_TIER.value)
+
+                if isinstance(raw_cached, dict):
+                    cached_tokens_by_tier = raw_cached
+                    cached_tokens = sum(cached_tokens_by_tier.values())
+                else:
+                    cached_tokens = int(raw_cached or 0)
+
+                if cached_tokens_by_tier:
+                    accounted_tokens = 0
+                    for tier, count in cached_tokens_by_tier.items():
+                        if count > 0:
+                            tier_str = tier.value if hasattr(
+                                tier, "value") else str(tier).lower()
+                            self._log_counter(
+                                self.counter_tokens_cached_prompt,
+                                {self.labelname_cache_tier: tier_str}, count)
+                            accounted_tokens += count
+                    if cached_tokens > accounted_tokens:
+                        self._log_counter(
+                            self.counter_tokens_cached_prompt,
+                            {self.labelname_cache_tier: "gpu"},
+                            cached_tokens - accounted_tokens)
+                elif cached_tokens > 0:
+                    self._log_counter(
+                        self.counter_tokens_cached_prompt,
+                        {self.labelname_cache_tier: "gpu"}, cached_tokens)
                 self._log_histogram(self.histogram_tokens_cached_prompt,
                                     cached_tokens)
 

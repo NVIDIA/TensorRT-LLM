@@ -1117,6 +1117,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self._cached_tokens = value
             self._cached_tokens_set = True
 
+    @property
+    def cached_tokens_by_tier(self) -> dict[str, int]:
+        return getattr(self, "_cached_tokens_by_tier", {})
+
+    @cached_tokens_by_tier.setter
+    def cached_tokens_by_tier(self, value: dict[str, int]):
+        self._cached_tokens_by_tier = value
+
     def _initialize_execution_state(self,
                                     *,
                                     seq_slot: Optional[int],
@@ -1168,6 +1176,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.py_ctx_pre_resize_cap = None
         self._cached_tokens = 0
+        self._cached_tokens_by_tier = {}
         self._cached_tokens_set = False
 
     def reset_for_recompute(self, max_input_len: int) -> None:
