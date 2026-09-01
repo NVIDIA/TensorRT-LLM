@@ -4211,7 +4211,7 @@ def launchTestListCheck(pipeline)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             // --validate --parity: after --l0/--qa generate the collectable lists, assert every
             // statically-verified parametrize ID is actually collectable (validate<->collection parity).
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.08 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
