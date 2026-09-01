@@ -291,7 +291,7 @@ def run_msa_paged_gqa(
             run_adaptive_sparse_decode,
         )
 
-        run_adaptive_sparse_decode(
+        stable_tactic = run_adaptive_sparse_decode(
             q_view,
             k_paged,
             v_paged,
@@ -304,6 +304,8 @@ def run_msa_paged_gqa(
             plan=plan,
             is_cuda_graph_metadata=metadata.is_cuda_graph,
         )
+        if stable_tactic is not None and metadata.is_cuda_graph:
+            metadata.record_adaptive_sparse_gqa_tactic(stable_tactic)
         return
 
     if kv_block_indexes is not None and ported and not use_msa_decode:

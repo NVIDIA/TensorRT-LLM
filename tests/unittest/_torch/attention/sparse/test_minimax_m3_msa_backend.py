@@ -81,6 +81,7 @@ def test_cuda_graph_plan_state_is_isolated(monkeypatch):
     source._msa_eager_gqa_plan = sentinel
     source._msa_decode_span = sentinel
     source._msa_captured_resolution = sentinel
+    source._msa_adaptive_gqa_plan_required = sentinel
 
     graph_metadata = copy.copy(source)
     graph_metadata.__post_init__()
@@ -90,6 +91,7 @@ def test_cuda_graph_plan_state_is_isolated(monkeypatch):
     assert graph_metadata._msa_eager_gqa_plan is None
     assert graph_metadata._msa_decode_span is None
     assert graph_metadata._msa_captured_resolution is None
+    assert graph_metadata._msa_adaptive_gqa_plan_required is None
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
@@ -795,6 +797,7 @@ def _resolution_metadata(
     metadata.kv_cache_params = None
     metadata.is_cuda_graph = is_cuda_graph
     metadata._msa_captured_resolution = None
+    metadata._msa_adaptive_gqa_plan_required = None
     metadata.kv_cache_manager = SimpleNamespace(
         tokens_per_block=page_size,
         indexer_kv_dtype="bf16",
@@ -1016,6 +1019,22 @@ def test_fmha_plan_rows_narrow_to_the_context_prefix(monkeypatch):
     decode._resolve_decode_kernels()
     # Sparse GQA uses the whole-batch decode plan; proxy and dense remain ported.
     assert decode._msa_fmha_plan_rows() == (0, 2)
+
+    adaptive = _resolution_metadata()
+    adaptive._msa_params = MiniMaxM3SparseAttentionConfig(
+        implementation="msa", sparse_gqa_decode_backend="adaptive"
+    ).to_sparse_metadata_params()
+    adaptive._msa_live_batch = 2
+    adaptive._resolve_decode_kernels()
+    # Unresolved graph warmup retains the plan so both tactics can be timed.
+    assert adaptive._msa_fmha_plan_rows() == (0, 2)
+    adaptive.record_adaptive_sparse_gqa_tactic("triton")
+    # A stable all-Triton graph owner has no fmha_sm100 work left.
+    assert adaptive._msa_fmha_plan_rows() is None
+    assert adaptive._msa_runs_no_fmha() is True
+    adaptive.record_adaptive_sparse_gqa_tactic("msa")
+    # One MSA layer makes the shared-plan requirement sticky.
+    assert adaptive._msa_fmha_plan_rows() == (0, 2)
 
     prefill = _resolution_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
     prefill._msa_live_batch = 2

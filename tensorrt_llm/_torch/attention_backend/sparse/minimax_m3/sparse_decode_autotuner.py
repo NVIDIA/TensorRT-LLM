@@ -76,7 +76,7 @@ class MiniMaxM3SparseDecodeRunner(TunableRunner):
         inputs: list[torch.Tensor],
         *,
         tactic: str | int = -1,
-        plan: tuple,
+        plan: tuple | None,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
@@ -100,6 +100,11 @@ class MiniMaxM3SparseDecodeRunner(TunableRunner):
             )
             return output
         if tactic == "msa":
+            if plan is None:
+                raise RuntimeError(
+                    "MiniMax-M3 selected the MSA sparse decode tactic without "
+                    "a preplanned GQA plan."
+                )
             from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
 
             use_fp8 = k_paged.dtype == torch.float8_e4m3fn
@@ -134,9 +139,9 @@ def run_adaptive_sparse_decode(
     *,
     sm_scale: float,
     decode_query_len: int,
-    plan: tuple,
+    plan: tuple | None,
     is_cuda_graph_metadata: bool,
-) -> None:
+) -> str | None:
     """Profile once per exact shape, cache the winner, and run it.
 
     Only a non-capturing call made with CUDA-graph metadata may seed the cache.
@@ -144,11 +149,9 @@ def run_adaptive_sparse_decode(
     sequence lengths, so allowing them to profile could poison the tactic later
     embedded in the graph.  During capture, a cache miss deliberately takes
     AutoTuner's Triton fallback instead of attempting nested profiling; the
-    captured graph therefore never changes tactic across replays.
+    captured graph therefore never changes tactic across replays. Returns the
+    stable cached tactic, or None when the call used an uncached fallback.
     """
-    if plan is None:
-        raise RuntimeError("MiniMax-M3 adaptive sparse decode requires a preplanned MSA GQA plan.")
-
     inputs = [q, k_paged, v_paged, block_indexes, block_table, seq_lens, output]
     runner = MiniMaxM3SparseDecodeRunner(
         decode_query_len=decode_query_len,
@@ -157,18 +160,22 @@ def run_adaptive_sparse_decode(
     )
     tuner = AutoTuner.get()
     input_shapes = tuple(tensor.size() for tensor in inputs)
-    cache_hit, _, _, _ = tuner.profiling_cache.search_cache(
+    cache_hit, _, cached_tactic, _ = tuner.profiling_cache.search_cache(
         _CUSTOM_OP,
         [runner],
         input_shapes,
         runner.tuning_config,
     )
+    if cache_hit and cached_tactic == "msa" and plan is None:
+        raise RuntimeError(
+            "MiniMax-M3 cached the MSA sparse decode tactic without a preplanned GQA plan."
+        )
     if not cache_hit and not is_cuda_graph_metadata:
         # An eager startup warmup is intentionally ineligible to seed a tactic.
         # Bypass choose_one() on its miss so AutoTuner does not report the
         # expected Triton fallback as a graph-setup cache failure.
         runner(inputs, tactic=-1, plan=plan)
-        return
+        return None
 
     tuning_key = tuner.profiling_cache.get_cache_key(
         _CUSTOM_OP,
@@ -192,6 +199,11 @@ def run_adaptive_sparse_decode(
         and not tuner.is_tuning_mode
     )
     if should_profile:
+        if plan is None:
+            raise RuntimeError(
+                "MiniMax-M3 adaptive sparse decode cannot profile MSA without "
+                "a preplanned GQA plan."
+            )
         _attempted_tuning_keys.add(tuning_key)
 
     tune_context = autotune() if should_profile else contextlib.nullcontext()
@@ -203,13 +215,20 @@ def run_adaptive_sparse_decode(
             inputs,
             plan=plan,
         )
-    selected_tactic = "triton" if tactic == -1 else tactic
-    if cache_hit or should_profile:
+    stable_cache_hit, _, stable_tactic, _ = tuner.profiling_cache.search_cache(
+        _CUSTOM_OP,
+        [runner],
+        input_shapes,
+        runner.tuning_config,
+    )
+    if stable_cache_hit:
+        stable_tactic = "triton" if stable_tactic == -1 else stable_tactic
         logger.info_once(
             "MiniMax-M3 adaptive sparse decode selected "
-            f"{selected_tactic} for B={int(block_table.shape[0])}, "
+            f"{stable_tactic} for B={int(block_table.shape[0])}, "
             f"DQL={decode_query_len}, total_q={int(q.shape[0])}, "
             f"local HQ/HKV={int(q.shape[1])}/{int(k_paged.shape[1])}.",
-            key=(_CUSTOM_OP, tuning_key, selected_tactic),
+            key=(_CUSTOM_OP, tuning_key, stable_tactic),
         )
     runner(inputs, tactic=tactic, plan=plan)
+    return stable_tactic if stable_cache_hit else None

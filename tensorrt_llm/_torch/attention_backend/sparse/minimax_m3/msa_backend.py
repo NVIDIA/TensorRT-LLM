@@ -433,6 +433,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # First resolution seen by a CUDA-graph metadata, which every later step
     # replaying that graph must match. See _check_capture_stable_resolution.
     _msa_captured_resolution: Optional[tuple] = None
+    # Graph-local aggregate learned during the real CUDA-graph warmup. None
+    # keeps the MSA GQA plan available for tuning; False means every stable
+    # tactic observed by this graph owner was Triton; True is sticky once any
+    # sparse layer selects MSA, because all layers share one metadata plan.
+    _msa_adaptive_gqa_plan_required: Optional[bool] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -468,6 +473,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_max_kv_len = 0
         self._msa_worst_case_max_k_tiles = 0
         self._msa_captured_resolution = None
+        self._msa_adaptive_gqa_plan_required = None
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         # See on_update_kv_lens.
@@ -1049,21 +1055,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             span is not None and not span.is_mixed and not self._msa_uses_fixed_stride_page_table()
         )
 
+    def record_adaptive_sparse_gqa_tactic(self, tactic: str) -> None:
+        """Record whether this graph owner still needs its shared MSA plan.
+
+        The adaptive runner calls this only for a stable, cached tactic. A
+        model forward can contain multiple sparse layers and therefore
+        multiple exact tuning keys. Triton keeps the aggregate False only
+        while every observed key selects it; one MSA selection makes the plan
+        requirement sticky for the graph's lifetime.
+        """
+        if tactic not in ("triton", "msa"):
+            raise ValueError(f"Unsupported MiniMax-M3 sparse decode tactic: {tactic!r}.")
+        if tactic == "msa":
+            self._msa_adaptive_gqa_plan_required = True
+        elif self._msa_adaptive_gqa_plan_required is None:
+            self._msa_adaptive_gqa_plan_required = False
+
     def _msa_uses_fixed_stride_page_table(self) -> bool:
         """Whether sparse fmha_sm100 can consume ``msa_block_table`` directly.
 
         A pure-decode step selected for MSA runs only sparse GQA through
         fmha_sm100; its selected logical blocks can index a fixed-stride
-        flattened 2-D table. Triton decode, mixed, and prefill steps retain
-        their existing representations.
+        flattened 2-D table. Adaptive keeps this path while unresolved and if
+        any sparse layer selected MSA. A graph owner whose stable tactics are
+        all Triton leaves no fmha_sm100 work to prepare.
         """
         span = self._msa_decode_span
-        return (
-            span is not None
-            and not span.is_mixed
-            and self._msa_params is not None
-            and self._msa_params.sparse_gqa_decode_backend != "triton"
+        params = self._msa_params
+        backend = params.sparse_gqa_decode_backend if params is not None else "triton"
+        needs_msa_plan = backend == "msa" or (
+            backend == "adaptive" and self._msa_adaptive_gqa_plan_required is not False
         )
+        return span is not None and not span.is_mixed and needs_msa_plan
 
     def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:
         """Batch rows this step's fmha_sm100 plans must cover.
@@ -1517,7 +1540,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Pure decode points sparse MSA directly at the already-staged 2-D
         # block table with a fixed row stride. Only eager/mixed fmha_sm100 work
         # still needs the compact flattened page table.
-        needs_flat_page_table = not self._msa_uses_fixed_stride_page_table()
+        needs_flat_page_table = (
+            not self._msa_runs_no_fmha() and not self._msa_uses_fixed_stride_page_table()
+        )
         kv_indices = (
             # Comes from the same host block ids the mapping was built from,
             # so it costs no device work.

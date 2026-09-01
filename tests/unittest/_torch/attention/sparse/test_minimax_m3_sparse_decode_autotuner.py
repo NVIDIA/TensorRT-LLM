@@ -24,9 +24,17 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(monkeypatch):
         def stride(self):
             return self._stride
 
+    cached_tactic = None
+
+    def search_cache(*args, **kwargs):
+        del args, kwargs
+        if cached_tactic is None:
+            return False, 0, -1, float("inf")
+        return True, 0, cached_tactic, 1.0
+
     tuner = SimpleNamespace(
         profiling_cache=SimpleNamespace(
-            search_cache=lambda *args, **kwargs: (False, None, None, None),
+            search_cache=search_cache,
             get_cache_key=lambda *args, **kwargs: ("sparse-decode",),
         ),
         mapping=SimpleNamespace(has_pp=lambda: False),
@@ -41,8 +49,11 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(monkeypatch):
         return contextlib.nullcontext()
 
     def choose_one(*args, **kwargs):
+        nonlocal cached_tactic
         choose_calls.append(True)
-        return args[1][0], -1
+        if cached_tactic is None:
+            cached_tactic = "triton"
+        return args[1][0], cached_tactic
 
     monkeypatch.setattr(sparse_decode_autotuner.AutoTuner, "get", lambda: tuner)
     tuner.choose_one = choose_one
@@ -67,8 +78,8 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(monkeypatch):
     seq_lens = FakeTensor((2,), torch.int32)
     output = FakeTensor((2, 4, 128), torch.bfloat16)
 
-    def run(is_cuda_graph_metadata):
-        sparse_decode_autotuner.run_adaptive_sparse_decode(
+    def run(is_cuda_graph_metadata, plan=object()):
+        return sparse_decode_autotuner.run_adaptive_sparse_decode(
             q,
             k_paged,
             v_paged,
@@ -78,18 +89,20 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(monkeypatch):
             output,
             sm_scale=128**-0.5,
             decode_query_len=1,
-            plan=object(),
+            plan=plan,
             is_cuda_graph_metadata=is_cuda_graph_metadata,
         )
 
-    run(False)
+    assert run(False) is None
     assert fallback_tactics == [-1]
     assert not tuning_calls
     assert not choose_calls
     assert not sparse_decode_autotuner._attempted_tuning_keys
 
-    run(True)
-    assert fallback_tactics == [-1, -1]
+    assert run(True) == "triton"
+    # Once Triton is cached, dispatch no longer requires an MSA plan.
+    assert run(True, plan=None) == "triton"
+    assert fallback_tactics == [-1, "triton", "triton"]
     assert len(tuning_calls) == 1
-    assert len(choose_calls) == 1
+    assert len(choose_calls) == 2
     assert len(sparse_decode_autotuner._attempted_tuning_keys) == 1
