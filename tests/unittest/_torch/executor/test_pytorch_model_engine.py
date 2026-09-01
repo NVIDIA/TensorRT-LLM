@@ -637,6 +637,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
         runner._get_seq_len_mode.return_value = True
+        runner._ragged_verify_bucket.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -664,6 +665,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.config = SimpleNamespace(is_draft_model=False)
         runner.max_beam_width = 1
         runner._get_seq_len_mode.return_value = False
+        runner._ragged_verify_bucket.return_value = None
         context = _make_request_stub(1)
         context.encoder_output_len = 7
         context.py_skip_cross_kv_projection = False
@@ -687,6 +689,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
         runner._get_seq_len_mode.return_value = False
+        runner._ragged_verify_bucket.return_value = None
         first_context = _make_request_stub(1)
         first_context.encoder_output_len = 7
         first_context.py_skip_cross_kv_projection = False
@@ -733,6 +736,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
         runner._get_seq_len_mode.return_value = False
+        runner._ragged_verify_bucket.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -751,6 +755,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_dtype_change_falls_back_to_eager(self) -> None:
         runner = Mock()
         runner.enabled = True
+        runner._dspark_confidence_enabled = False
         runner.config = SimpleNamespace(
             enable_attention_dp=False,
             use_mrope=False,
@@ -790,6 +795,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
         runner._get_seq_len_mode.return_value = False
+        runner._ragged_verify_bucket.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -833,6 +839,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
         runner.enabled = True
+        runner._dspark_confidence_enabled = False
         runner.config = SimpleNamespace(
             enable_attention_dp=False,
             use_mrope=False,
