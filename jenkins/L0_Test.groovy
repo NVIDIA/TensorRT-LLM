@@ -290,14 +290,6 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
-def sshRemoteCmd(Map remote, String remoteCommand) {
-    String portOpt = remote.port ? "-p ${remote.port} " : ""
-    if (remote.privateKeyPath) {
-        return "ssh -i ${remote.privateKeyPath} ${portOpt}${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} \"${remoteCommand}\""
-    }
-    return "sshpass -p '${remote.passwd}' ssh ${portOpt}${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} \"${remoteCommand}\""
-}
-
 // Print the last `lines` lines of the remote Slurm job log file to the console when the Slurm job fails.
 // If the log file does not exist, print a message to the console.
 def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 200) {
