@@ -526,34 +526,6 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", ContextPhaseParamsGetState)
         .def("__setstate__", ContextPhaseParamsSetState);
 
-    auto EagleDecodingConfigGetstate = [](tle::EagleConfig const& self)
-    {
-        return nb::make_tuple(self.getEagleChoices(), self.isGreedySampling(), self.getPosteriorThreshold(),
-            self.useDynamicTree(), self.getDynamicTreeMaxTopK());
-    };
-    auto EagleDecodingConfigSetstate = [](tle::EagleConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 5)
-        {
-            throw std::runtime_error("Invalid EagleConfig state!");
-        }
-        new (&self) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]), nb::cast<bool>(state[1]),
-            nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
-            nb::cast<std::optional<SizeType32>>(state[4]));
-    };
-    nb::class_<tle::EagleConfig>(m, "EagleConfig")
-        .def(nb::init<std::optional<tle::EagleChoices>, bool, std::optional<float>, bool, std::optional<SizeType32>>(),
-            nb::arg("eagle_choices") = nb::none(), nb::arg("greedy_sampling") = true,
-            nb::arg("posterior_threshold") = nb::none(), nb::arg("use_dynamic_tree") = false,
-            nb::arg("dynamic_tree_max_topK") = nb::none())
-        .def_prop_ro("eagle_choices", &tle::EagleConfig::getEagleChoices)
-        .def_prop_ro("greedy_sampling", &tle::EagleConfig::isGreedySampling)
-        .def_prop_ro("posterior_threshold", &tle::EagleConfig::getPosteriorThreshold)
-        .def_prop_ro("use_dynamic_tree", &tle::EagleConfig::useDynamicTree)
-        .def_prop_ro("dynamic_tree_max_topK", &tle::EagleConfig::getDynamicTreeMaxTopK)
-        .def("__getstate__", EagleDecodingConfigGetstate)
-        .def("__setstate__", EagleDecodingConfigSetstate);
-
     // Guided decoding params
     auto pyGuidedDecodingParams = nb::class_<tle::GuidedDecodingParams>(m, "GuidedDecodingParams");
 
@@ -603,12 +575,12 @@ void initRequestBindings(nb::module_& m)
             self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
             self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
             self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
-            self.getEagleConfig(), self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams(),
-            self.getDisaggRequestId(), self.getCacheSalt());
+            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams(), self.getDisaggRequestId(),
+            self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 34)
+        if (state.size() != 33)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -642,10 +614,9 @@ void initRequestBindings(nb::module_& m)
             nb::cast<tle::PriorityType>(state[23]), nb::cast<tle::RequestType>(state[24]),
             nb::cast<std::optional<tle::ContextPhaseParams>>(state[25]),
             nb::cast<std::optional<tle::Tensor>>(state[26]), nb::cast<std::optional<SizeType32>>(state[27]),
-            nb::cast<std::optional<tle::Tensor>>(state[28]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[29]),
-            nb::cast<std::optional<tle::Tensor>>(state[30]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[31]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[32]), nb::cast<std::optional<std::string>>(state[33]));
+            nb::cast<std::optional<tle::Tensor>>(state[28]), 1, nb::cast<std::optional<tle::Tensor>>(state[29]),
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[30]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[31]), nb::cast<std::optional<std::string>>(state[32]));
     };
 
     // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
@@ -691,7 +662,7 @@ void initRequestBindings(nb::module_& m)
                 std::optional<tle::ContextPhaseParams> context_phase_params,
                 std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
                 std::optional<tle::Tensor> cross_attention_mask, SizeType32 num_return_sequences,
-                std::optional<tle::EagleConfig> eagle_config, std::optional<tle::Tensor> skip_cross_attn_blocks,
+                std::optional<tle::Tensor> skip_cross_attn_blocks,
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
@@ -705,9 +676,9 @@ void initRequestBindings(nb::module_& m)
                     std::move(logits_post_processor_name), std::move(logits_post_processor),
                     std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
                     std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
-                    std::move(cross_attention_mask), num_return_sequences, std::move(eagle_config),
-                    std::move(skip_cross_attn_blocks), std::move(guided_decoding_params), language_adapter_uid,
-                    allotted_time_ms, disagg_request_id, std::move(cache_salt));
+                    std::move(cross_attention_mask), num_return_sequences, std::move(skip_cross_attn_blocks),
+                    std::move(guided_decoding_params), language_adapter_uid, allotted_time_ms, disagg_request_id,
+                    std::move(cache_salt));
             },
             // clang-format off
         nb::arg("input_token_ids"),
@@ -741,7 +712,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("encoder_output_length") = nb::none(),
         nb::arg("cross_attention_mask") = nb::none(),
         nb::arg("num_return_sequences") = 1,
-        nb::arg("eagle_config") = nb::none(),
         nb::arg("skip_cross_attn_blocks") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
@@ -783,7 +753,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
         .def_prop_rw("cross_attention_mask", &tle::Request::getCrossAttentionMask, &tle::Request::setCrossAttentionMask)
-        .def_prop_rw("eagle_config", &tle::Request::getEagleConfig, &tle::Request::setEagleConfig)
         .def_prop_rw(
             "skip_cross_attn_blocks", &tle::Request::getSkipCrossAttnBlocks, &tle::Request::setSkipCrossAttnBlocks)
         .def_prop_rw(

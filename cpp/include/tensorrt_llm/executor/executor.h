@@ -396,42 +396,6 @@ private:
     SizeType32 mVerificationSetSize;
 };
 
-struct EagleConfig
-{
-    explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt, bool greedySampling = true,
-        std::optional<float> posteriorThreshold = std::nullopt, bool useDynamicTree = false,
-        std::optional<SizeType32> dynamicTreeMaxTopK = std::nullopt);
-
-    bool operator==(EagleConfig const& other) const;
-    [[nodiscard]] std::optional<EagleChoices> getEagleChoices() const;
-    [[nodiscard]] std::optional<float> getPosteriorThreshold() const;
-    [[nodiscard]] bool isGreedySampling() const;
-    [[nodiscard]] bool useDynamicTree() const;
-    [[nodiscard]] std::optional<SizeType32> getDynamicTreeMaxTopK() const;
-
-private:
-    std::optional<float> const& checkPosteriorValue(std::optional<float> const& value);
-
-private:
-    friend class Serialization;
-
-    /// @brief choices forming tree for EAGLE-1.
-    std::optional<EagleChoices> mEagleChoices;
-
-    /// @brief Flag to use greedy or typical acceptance.
-    bool mGreedySampling;
-    /// @brief Minimum token probability of the typical acceptance.
-    /// Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.
-    /// Default is 0.09f.
-    std::optional<float> mPosteriorThreshold;
-
-    /// @brief Flag to use Eagle-2
-    bool mUseDynamicTree;
-
-    /// @brief Number of draft tokens expand for each node in Eagle-2
-    std::optional<SizeType32> mDynamicTreeMaxTopK;
-};
-
 class ContextPhaseParams
 {
 public:
@@ -706,7 +670,7 @@ public:
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
-        std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
+        std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
@@ -753,7 +717,6 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
-    [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
@@ -789,7 +752,6 @@ public:
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setCrossAttentionMask(Tensor crossAttentionMask);
-    void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
@@ -1162,125 +1124,6 @@ private:
     SizeType32 mCudaGraphCacheSize;
 };
 
-/// @brief Configuration class for debugging output
-class DebugConfig
-{
-    using StringVec = std::vector<std::string>;
-
-public:
-    explicit DebugConfig(bool debugInputTensors = false, bool debugOutputTensors = false,
-        StringVec debugTensorNames = {}, SizeType32 debugTensorsMaxIterations = 0);
-
-    bool operator==(DebugConfig const& other) const;
-
-    [[nodiscard]] bool getDebugInputTensors() const;
-    [[nodiscard]] bool getDebugOutputTensors() const;
-    [[nodiscard]] StringVec const& getDebugTensorNames() const;
-    [[nodiscard]] SizeType32 getDebugTensorsMaxIterations() const;
-
-    void setDebugInputTensors(bool debugInputTensors);
-    void setDebugOutputTensors(bool debugOutputTensors);
-    void setDebugTensorNames(StringVec const& debugTensorNames);
-    void setDebugTensorsMaxIterations(SizeType32 debugTensorsMaxIterations);
-
-private:
-    friend class Serialization;
-
-    /// @brief If true, debug all input tensors.
-    bool mDebugInputTensors;
-    /// @brief If true, debug all output tensors.
-    bool mDebugOutputTensors;
-    /// @brief If not empty, only debug tensors in this list.
-    StringVec mDebugTensorNames;
-    /// @brief If > 0, provide debug tensors for at most debugTensorsMaxIterations past iterations,
-    /// else dump them to files.
-    SizeType32 mDebugTensorsMaxIterations;
-};
-
-/// @brief Configuration for the orchestrator communication mode.
-/// @deprecated Orchestrator mode is non-functional: the worker binary it spawned
-/// (executorWorker) was removed together with the TensorRT backend. This class is
-/// retained only for serialization and Python-binding compatibility and is a
-/// candidate for removal in a follow-up (needs API-stability review).
-class OrchestratorConfig
-{
-public:
-    explicit OrchestratorConfig(bool isOrchestrator = true, std::string workerExecutablePath = "",
-        std::shared_ptr<mpi::MpiComm> orchLeaderComm = nullptr, bool spawnProcesses = true);
-
-    [[nodiscard]] bool getIsOrchestrator() const;
-    [[nodiscard]] std::string getWorkerExecutablePath() const;
-    [[nodiscard]] std::shared_ptr<mpi::MpiComm> getOrchLeaderComm() const;
-    [[nodiscard]] bool getSpawnProcesses() const;
-
-    void setIsOrchestrator(bool isOrchestrator);
-    void setWorkerExecutablePath(std::string const& workerExecutablePath);
-    void setOrchLeaderComm(std::shared_ptr<mpi::MpiComm> const& orchLeaderComm);
-    void setSpawnProcesses(bool spawnProcesses);
-
-private:
-    bool mIsOrchestrator;
-    std::string mWorkerExecutablePath;
-    std::shared_ptr<mpi::MpiComm> mOrchLeaderComm;
-    bool mSpawnProcesses;
-};
-
-/// @brief A configuration class for the parallel execution parameters
-///        Currently only supports commType = CommunicationType::kMPI
-class ParallelConfig
-{
-public:
-    /// @brief Constructor
-    /// @param commType The communication type. See CommunicationType.
-    /// @param commMode The communication mode. See CommunicationMode.
-    /// @param deviceIds The IDs of the GPUs involved in the execution of the model
-    /// @param participantIds The participant IDs (MPI ranks if commType == kMPI) involved in the execution of the
-    /// model. The first participant is considered to be the leader.
-    /// @param orchestratorConfig The orchestrator configuration. See OrchestratorConfig.
-    /// @param numNodes The number of nodes to use for execution. Default is 1.
-    explicit ParallelConfig(CommunicationType commType = CommunicationType::kMPI,
-        CommunicationMode commMode = CommunicationMode::kLEADER,
-        std::optional<std::vector<SizeType32>> deviceIds = std::nullopt,
-        std::optional<std::vector<SizeType32>> participantIds = std::nullopt,
-        std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt,
-        std::optional<SizeType32> numNodes = std::nullopt);
-
-    [[nodiscard]] CommunicationType getCommunicationType() const;
-    [[nodiscard]] CommunicationMode getCommunicationMode() const;
-    [[nodiscard]] std::optional<std::vector<SizeType32>> getDeviceIds() const;
-    [[nodiscard]] std::optional<std::vector<SizeType32>> getParticipantIds() const;
-    [[nodiscard]] std::optional<OrchestratorConfig> getOrchestratorConfig() const;
-    [[nodiscard]] std::optional<SizeType32> getNumNodes() const;
-
-    void setCommunicationType(CommunicationType type);
-    void setCommunicationMode(CommunicationMode mode);
-    void setDeviceIds(std::vector<SizeType32> const& deviceIds);
-    void setParticipantIds(std::vector<SizeType32> const& participantIds);
-    void setOrchestratorConfig(OrchestratorConfig const& orchestratorConfig);
-    void setNumNodes(SizeType32 numNodes);
-
-private:
-    friend class Serialization;
-
-    /// @brief The type of communication protocol used. Default is MPI.
-    CommunicationType mCommType;
-
-    /// @brief The mode of communication. See CommunicationMode.
-    CommunicationMode mCommMode;
-
-    /// @brief The GPU device ids to use for executing this model
-    std::optional<std::vector<SizeType32>> mDeviceIds;
-
-    /// @brief The participant ids (MPI ranks for example) used for executing this model
-    std::optional<std::vector<SizeType32>> mParticipantIds;
-
-    /// @brief Optional orchestrator configuration
-    std::optional<OrchestratorConfig> mOrchestratorConfig;
-
-    /// @brief The number of nodes to use for execution. Default is 1.
-    std::optional<SizeType32> mNumNodes;
-};
-
 /// @brief config for PeftCacheManager
 class PeftCacheConfig
 {
@@ -1349,8 +1192,7 @@ class DecodingConfig
 public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt,
-        std::optional<EagleConfig> eagleConfig = std::nullopt);
+        std::optional<MedusaChoices> medusaChoices = std::nullopt);
 
     bool operator==(DecodingConfig const& other) const;
 
@@ -1373,8 +1215,6 @@ public:
 
     // EAGLE methods.
     /// @brief Sets eagle mode and config.
-    void setEagleConfig(EagleConfig const&);
-    [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
 
 private:
     friend class Serialization;
@@ -1386,7 +1226,6 @@ private:
     // Medusa params.
     std::optional<MedusaChoices> mMedusaChoices;
     // Eagle config.
-    std::optional<EagleConfig> mEagleConfig;
     // The max number of requests that can support running with lookahead decoding
     static constexpr SizeType32 mLookaheadDecodingMaxNumRequest = 8;
 };
@@ -1442,29 +1281,6 @@ private:
     std::optional<std::string> mTokenizerStr;
     /// @brief Stop token ids. If not provided, it can be automatically detected.
     std::optional<std::vector<TokenIdType>> mStopTokenIds;
-};
-
-class LogitsPostProcessorConfig
-{
-public:
-    explicit LogitsPostProcessorConfig(std::optional<LogitsPostProcessorMap> processorMap = std::nullopt,
-        std::optional<LogitsPostProcessorBatched> processorBatched = std::nullopt, bool replicate = true);
-
-    [[nodiscard]] std::optional<LogitsPostProcessorMap> getProcessorMap() const;
-    [[nodiscard]] std::optional<LogitsPostProcessorBatched> getProcessorBatched() const;
-    [[nodiscard]] bool getReplicate() const;
-
-    void setProcessorMap(LogitsPostProcessorMap const& processorMap);
-    void setProcessorBatched(LogitsPostProcessorBatched const& processorBatched);
-    void setReplicate(bool replicate);
-
-private:
-    /// @brief mapping from post processor names to non-batched post processors
-    std::optional<LogitsPostProcessorMap> mProcessorMap;
-    /// @brief single batched post processor
-    std::optional<LogitsPostProcessorBatched> mProcessorBatched;
-    /// @brief If set to true, logits post processor will run on all TP ranks in last PP rank
-    bool mReplicate;
 };
 
 class CacheTransceiverConfig
@@ -1534,14 +1350,11 @@ public:
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
         std::optional<SizeType32> maxNumTokens = std::nullopt,
-        std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
-        std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig = std::nullopt,
         std::optional<DecodingConfig> decodingConfig = std::nullopt, bool useGpuDirectStorage = false,
         float gpuWeightsPercent = 1, std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
-        std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
-        uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
+        SizeType32 recvPollPeriodMs = 0, uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
@@ -1563,15 +1376,12 @@ public:
     [[nodiscard]] BatchingType getBatchingType() const;
     [[nodiscard]] std::optional<SizeType32> getMaxBatchSize() const;
     [[nodiscard]] std::optional<SizeType32> getMaxNumTokens() const;
-    [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
-    [[nodiscard]] std::optional<LogitsPostProcessorConfig> getLogitsPostProcessorConfig() const;
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] bool getUseGpuDirectStorage() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
     [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
     [[nodiscard]] ExtendedRuntimePerfKnobConfig getExtendedRuntimePerfKnobConfig() const;
-    [[nodiscard]] std::optional<DebugConfig> getDebugConfig() const;
     [[nodiscard]] SizeType32 getRecvPollPeriodMs() const;
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
@@ -1592,15 +1402,12 @@ public:
     void setIterStatsMaxIterations(SizeType32 iterStatsMaxIterations);
     void setRequestStatsMaxIterations(SizeType32 requestStatsMaxIterations);
     void setBatchingType(BatchingType batchingType);
-    void setParallelConfig(ParallelConfig const& parallelConfig);
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
-    void setLogitsPostProcessorConfig(LogitsPostProcessorConfig const& logitsPostProcessorConfig);
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setUseGpuDirectStorage(bool const& useGpuDirectStorage);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
     void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
-    void setDebugConfig(DebugConfig const& debugConfig);
     void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
     void setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
@@ -1647,11 +1454,9 @@ private:
     std::optional<SizeType32> mMaxNumTokens;
 
     /// @brief The parallel execution configuration.
-    std::optional<ParallelConfig> mParallelConfig;
     std::optional<PeftCacheConfig> mPeftCacheConfig;
 
     /// @brief Logits post processor configuration
-    std::optional<LogitsPostProcessorConfig> mLogitsPostProcessorConfig;
 
     /// @brief Decoding configuration.
     std::optional<DecodingConfig> mDecodingConfig;
@@ -1669,7 +1474,6 @@ private:
     ExtendedRuntimePerfKnobConfig mExtendedRuntimePerfKnobConfig;
 
     /// @brief Debugging configuration.
-    std::optional<DebugConfig> mDebugConfig;
 
     /// @brief The time in ms between polls for new communication in orchestrator mode. Use 0 for busy loop.
     SizeType32 mRecvPollPeriodMs;

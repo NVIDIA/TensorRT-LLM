@@ -37,7 +37,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
     std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
-    SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
+    SizeType32 numReturnSequences, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
     std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
     std::optional<std::string> cacheSalt)
@@ -47,7 +47,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
         priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        crossAttentionMask, numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams),
+        crossAttentionMask, numReturnSequences, skipCrossAttnBlocks, std::move(guidedDecodingParams),
         languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
@@ -227,11 +227,6 @@ std::optional<Tensor> Request::getCrossAttentionMask() const
     return mImpl->getCrossAttentionMask();
 }
 
-std::optional<EagleConfig> Request::getEagleConfig() const
-{
-    return mImpl->getEagleConfig();
-}
-
 std::optional<Tensor> Request::getSkipCrossAttnBlocks() const
 {
     return mImpl->getSkipCrossAttnBlocks();
@@ -390,11 +385,6 @@ void Request::setEncoderOutputLength(SizeType32 encoderOutputLength)
 void Request::setCrossAttentionMask(Tensor crossAttentionMask)
 {
     mImpl->setCrossAttentionMask(crossAttentionMask);
-}
-
-void Request::setEagleConfig(std::optional<EagleConfig> const& eagleConfig)
-{
-    mImpl->setEagleConfig(eagleConfig);
 }
 
 void Request::setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)

@@ -118,7 +118,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         getLlmRequestType(),                                       //
         std::nullopt,                                              // inputTokenExtraIds
         mNumReturnSequences,                                       //
-        mEagleConfig,                                              //
         from_torch(mSkipCrossAttnBlocks),                          //
         false,                                                     // returnPerfMetrics
         mGuidedDecodingParams,                                     //

@@ -171,59 +171,6 @@ void initConfigBindings(nb::module_& m)
         .def("__getstate__", kvCacheConfigGetstate)
         .def("__setstate__", kvCacheConfigSetstate);
 
-    // Deprecated: orchestrator mode is non-functional (its executorWorker binary was
-    // removed with the TensorRT backend); binding kept for compatibility, removal is a
-    // follow-up pending API-stability review.
-    nb::class_<tle::OrchestratorConfig>(m, "OrchestratorConfig")
-        .def(nb::init<bool, std::string, std::shared_ptr<mpi::MpiComm>, bool>(), nb::arg("is_orchestrator") = true,
-            nb::arg("worker_executable_path") = "", nb::arg("orch_leader_comm").none() = nullptr,
-            nb::arg("spawn_processes") = true)
-        .def_prop_rw(
-            "is_orchestrator", &tle::OrchestratorConfig::getIsOrchestrator, &tle::OrchestratorConfig::setIsOrchestrator)
-        .def_prop_rw("worker_executable_path", &tle::OrchestratorConfig::getWorkerExecutablePath,
-            &tle::OrchestratorConfig::setWorkerExecutablePath)
-        .def_prop_rw("orch_leader_comm", &tle::OrchestratorConfig::getOrchLeaderComm,
-            &tle::OrchestratorConfig::setOrchLeaderComm)
-        .def_prop_rw("spawn_processes", &tle::OrchestratorConfig::getSpawnProcesses,
-            &tle::OrchestratorConfig::setSpawnProcesses);
-
-    auto parallelConfigGetstate = [](tle::ParallelConfig const& self)
-    {
-        return nb::make_tuple(self.getCommunicationType(), self.getCommunicationMode(), self.getDeviceIds(),
-            self.getParticipantIds(), self.getOrchestratorConfig(), self.getNumNodes());
-    };
-    auto parallelConfigSetstate = [](tle::ParallelConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 6)
-        {
-            throw std::runtime_error("Invalid state!");
-        }
-        new (&self) tle::ParallelConfig(nb::cast<tle::CommunicationType>(state[0]),
-            nb::cast<tle::CommunicationMode>(state[1]), nb::cast<std::optional<std::vector<SizeType32>>>(state[2]),
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[3]),
-            nb::cast<std::optional<tle::OrchestratorConfig>>(state[4]), nb::cast<std::optional<SizeType32>>(state[5]));
-    };
-    nb::class_<tle::ParallelConfig>(m, "ParallelConfig")
-        .def(nb::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType32>> const&,
-                 std::optional<std::vector<SizeType32>> const&, std::optional<tle::OrchestratorConfig> const&,
-                 std::optional<SizeType32> const&>(),
-            nb::arg("communication_type") = tle::CommunicationType::kMPI,
-            nb::arg("communication_mode") = tle::CommunicationMode::kLEADER, nb::arg("device_ids") = nb::none(),
-            nb::arg("participant_ids") = nb::none(), nb::arg("orchestrator_config") = nb::none(),
-            nb::arg("num_nodes") = nb::none())
-        .def_prop_rw("communication_type", &tle::ParallelConfig::getCommunicationType,
-            &tle::ParallelConfig::setCommunicationType)
-        .def_prop_rw("communication_mode", &tle::ParallelConfig::getCommunicationMode,
-            &tle::ParallelConfig::setCommunicationMode)
-        .def_prop_rw("device_ids", &tle::ParallelConfig::getDeviceIds, &tle::ParallelConfig::setDeviceIds)
-        .def_prop_rw(
-            "participant_ids", &tle::ParallelConfig::getParticipantIds, &tle::ParallelConfig::setParticipantIds)
-        .def_prop_rw("orchestrator_config", &tle::ParallelConfig::getOrchestratorConfig,
-            &tle::ParallelConfig::setOrchestratorConfig)
-        .def_prop_rw("num_nodes", &tle::ParallelConfig::getNumNodes, &tle::ParallelConfig::setNumNodes)
-        .def("__getstate__", parallelConfigGetstate)
-        .def("__setstate__", parallelConfigSetstate);
-
     auto peftCacheConfigSetstate = [](tle::PeftCacheConfig& self, nb::tuple const& state)
     {
         if (state.size() != 11)
@@ -269,90 +216,28 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", peftCacheConfigSetstate);
 
     auto decodingConfigGetstate = [](tle::DecodingConfig const& self)
-    {
-        return nb::make_tuple(
-            self.getDecodingMode(), self.getLookaheadDecodingConfig(), self.getMedusaChoices(), self.getEagleConfig());
-    };
+    { return nb::make_tuple(self.getDecodingMode(), self.getLookaheadDecodingConfig(), self.getMedusaChoices()); };
     auto decodingConfigSetstate = [](tle::DecodingConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid state!");
         }
         new (&self) tle::DecodingConfig(nb::cast<std::optional<tle::DecodingMode>>(state[0]), // DecodingMode
             nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[1]),                  // LookaheadDecodingConfig
-            nb::cast<std::optional<tle::MedusaChoices>>(state[2]),                            // MedusaChoices
-            nb::cast<std::optional<tle::EagleConfig>>(state[3])                               // EagleConfig
-        );
+            nb::cast<std::optional<tle::MedusaChoices>>(state[2]));                           // MedusaChoices
     };
     nb::class_<tle::DecodingConfig>(m, "DecodingConfig")
         .def(nb::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>,
-                 std::optional<tle::MedusaChoices>, std::optional<tle::EagleConfig>>(),
+                 std::optional<tle::MedusaChoices>>(),
             nb::arg("decoding_mode") = nb::none(), nb::arg("lookahead_decoding_config") = nb::none(),
-            nb::arg("medusa_choices") = nb::none(), nb::arg("eagle_config") = nb::none())
+            nb::arg("medusa_choices") = nb::none())
         .def_prop_rw("decoding_mode", &tle::DecodingConfig::getDecodingMode, &tle::DecodingConfig::setDecodingMode)
         .def_prop_rw("lookahead_decoding_config", &tle::DecodingConfig::getLookaheadDecodingConfig,
             &tle::DecodingConfig::setLookaheadDecodingConfig)
         .def_prop_rw("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices)
-        .def_prop_rw("eagle_config", &tle::DecodingConfig::getEagleConfig, &tle::DecodingConfig::setEagleConfig)
         .def("__getstate__", decodingConfigGetstate)
         .def("__setstate__", decodingConfigSetstate);
-
-    auto debugConfigGetstate = [](tle::DebugConfig const& self)
-    {
-        return nb::make_tuple(self.getDebugInputTensors(), self.getDebugOutputTensors(), self.getDebugTensorNames(),
-            self.getDebugTensorsMaxIterations());
-    };
-    auto debugConfigSetstate = [](tle::DebugConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 4)
-        {
-            throw std::runtime_error("Invalid state!");
-        }
-        new (&self) tle::DebugConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
-            nb::cast<std::vector<std::string>>(state[2]), nb::cast<SizeType32>(state[3]));
-    };
-    nb::class_<tle::DebugConfig>(m, "DebugConfig")
-        .def(nb::init<bool, bool, std::vector<std::string>, SizeType32>(), nb::arg("debug_input_tensors") = false,
-            nb::arg("debug_output_tensors") = false, nb::arg("debug_tensor_names") = nb::none(),
-            nb::arg("debug_tensors_max_iterations") = false)
-        .def_prop_rw(
-            "debug_input_tensors", &tle::DebugConfig::getDebugInputTensors, &tle::DebugConfig::setDebugInputTensors)
-        .def_prop_rw(
-            "debug_output_tensors", &tle::DebugConfig::getDebugOutputTensors, &tle::DebugConfig::setDebugOutputTensors)
-        .def_prop_rw(
-            "debug_tensor_names", &tle::DebugConfig::getDebugTensorNames, &tle::DebugConfig::setDebugTensorNames)
-        .def_prop_rw("debug_tensors_max_iterations", &tle::DebugConfig::getDebugTensorsMaxIterations,
-            &tle::DebugConfig::setDebugTensorsMaxIterations)
-        .def("__getstate__", debugConfigGetstate)
-        .def("__setstate__", debugConfigSetstate);
-
-    auto logitsPostProcessorConfigGetstate = [](tle::LogitsPostProcessorConfig const& self)
-    { return nb::make_tuple(self.getProcessorMap(), self.getProcessorBatched(), self.getReplicate()); };
-
-    auto logitsPostProcessorConfigSetstate = [](tle::LogitsPostProcessorConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 3)
-        {
-            throw std::runtime_error("Invalid LogitsPostProcessorConfig state!");
-        }
-        new (&self) tle::LogitsPostProcessorConfig(nb::cast<std::optional<tle::LogitsPostProcessorMap>>(state[0]),
-            nb::cast<std::optional<tle::LogitsPostProcessorBatched>>(state[1]), nb::cast<bool>(state[2]));
-    };
-
-    nb::class_<tle::LogitsPostProcessorConfig>(m, "LogitsPostProcessorConfig")
-        .def(nb::init<std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
-                 bool>(),
-            nb::arg("processor_map") = nb::none(), nb::arg("processor_batched") = nb::none(),
-            nb::arg("replicate") = true)
-        .def_prop_rw("processor_map", &tle::LogitsPostProcessorConfig::getProcessorMap,
-            &tle::LogitsPostProcessorConfig::setProcessorMap)
-        .def_prop_rw("processor_batched", &tle::LogitsPostProcessorConfig::getProcessorBatched,
-            &tle::LogitsPostProcessorConfig::setProcessorBatched)
-        .def_prop_rw(
-            "replicate", &tle::LogitsPostProcessorConfig::getReplicate, &tle::LogitsPostProcessorConfig::setReplicate)
-        .def("__getstate__", logitsPostProcessorConfigGetstate)
-        .def("__setstate__", logitsPostProcessorConfigSetstate);
 
     auto extendedRuntimePerfKnobConfigSetstate = [](tle::ExtendedRuntimePerfKnobConfig& self, nb::tuple const& state)
     {
@@ -490,9 +375,8 @@ void initConfigBindings(nb::module_& m)
         auto cpp_states = nb::make_tuple(c.getMaxBeamWidth(), c.getSchedulerConfig(), c.getKvCacheConfig(),
             c.getEnableChunkedContext(), c.getNormalizeLogProbs(), c.getIterStatsMaxIterations(),
             c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
-            c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
-            c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
-            c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
+            c.getPeftCacheConfig(), c.getDecodingConfig(), c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(),
+            c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getGuidedDecodingConfig(), c.getAdditionalModelOutputs(),
             c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(), c.getPromptTableOffloading(),
             c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
@@ -508,42 +392,39 @@ void initConfigBindings(nb::module_& m)
         }
 
         auto cpp_states = nb::cast<nb::tuple>(state[0]);
-        if (cpp_states.size() != 28)
+        if (cpp_states.size() != 25)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
 
         // Restore C++ data
         tle::ExecutorConfig* cpp_self = nb::inst_ptr<tle::ExecutorConfig>(self);
-        new (cpp_self) tle::ExecutorConfig(                                          //
-            nb::cast<SizeType32>(cpp_states[0]),                                     // MaxBeamWidth
-            nb::cast<tle::SchedulerConfig>(cpp_states[1]),                           // SchedulerConfig
-            nb::cast<tle::KvCacheConfig>(cpp_states[2]),                             // KvCacheConfig
-            nb::cast<bool>(cpp_states[3]),                                           // EnableChunkedContext
-            nb::cast<bool>(cpp_states[4]),                                           // NormalizeLogProbs
-            nb::cast<SizeType32>(cpp_states[5]),                                     // IterStatsMaxIterations
-            nb::cast<SizeType32>(cpp_states[6]),                                     // RequestStatsMaxIterations
-            nb::cast<tle::BatchingType>(cpp_states[7]),                              // BatchingType
-            nb::cast<std::optional<SizeType32>>(cpp_states[8]),                      // MaxBatchSize
-            nb::cast<std::optional<SizeType32>>(cpp_states[9]),                      // MaxNumTokens
-            nb::cast<std::optional<tle::ParallelConfig>>(cpp_states[10]),            // ParallelConfig
-            nb::cast<std::optional<tle::PeftCacheConfig>>(cpp_states[11]),           // PeftCacheConfig
-            nb::cast<std::optional<tle::LogitsPostProcessorConfig>>(cpp_states[12]), // LogitsPostProcessorConfig
-            nb::cast<std::optional<tle::DecodingConfig>>(cpp_states[13]),            // DecodingConfig
-            nb::cast<bool>(cpp_states[14]),                                          // UseGpuDirectStorage
-            nb::cast<float>(cpp_states[15]),                                         // GpuWeightsPercent
-            nb::cast<std::optional<SizeType32>>(cpp_states[16]),                     // MaxQueueSize
-            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]),            // ExtendedRuntimePerfKnobConfig
-            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),               // DebugConfig
-            nb::cast<SizeType32>(cpp_states[19]),                                    // RecvPollPeriodMs
-            nb::cast<uint64_t>(cpp_states[20]),                                      // MaxSeqIdleMicroseconds
-            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[21]),      // GuidedDecodingConfig
-            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[22]), // AdditionalModelOutputs
-            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[23]),             // CacheTransceiverConfig
-            nb::cast<bool>(cpp_states[24]),                                                   // GatherGenerationLogits
-            nb::cast<bool>(cpp_states[25]),                                                   // PromptTableOffloading
-            nb::cast<bool>(cpp_states[26]),                                                   // EnableTrtOverlap
-            nb::cast<bool>(cpp_states[27]) // FailFastOnAttentionWindowTooLarge
+        new (cpp_self) tle::ExecutorConfig(                                     //
+            nb::cast<SizeType32>(cpp_states[0]),                                // MaxBeamWidth
+            nb::cast<tle::SchedulerConfig>(cpp_states[1]),                      // SchedulerConfig
+            nb::cast<tle::KvCacheConfig>(cpp_states[2]),                        // KvCacheConfig
+            nb::cast<bool>(cpp_states[3]),                                      // EnableChunkedContext
+            nb::cast<bool>(cpp_states[4]),                                      // NormalizeLogProbs
+            nb::cast<SizeType32>(cpp_states[5]),                                // IterStatsMaxIterations
+            nb::cast<SizeType32>(cpp_states[6]),                                // RequestStatsMaxIterations
+            nb::cast<tle::BatchingType>(cpp_states[7]),                         // BatchingType
+            nb::cast<std::optional<SizeType32>>(cpp_states[8]),                 // MaxBatchSize
+            nb::cast<std::optional<SizeType32>>(cpp_states[9]),                 // MaxNumTokens
+            nb::cast<std::optional<tle::PeftCacheConfig>>(cpp_states[10]),      // PeftCacheConfig
+            nb::cast<std::optional<tle::DecodingConfig>>(cpp_states[11]),       // DecodingConfig
+            nb::cast<bool>(cpp_states[12]),                                     // UseGpuDirectStorage
+            nb::cast<float>(cpp_states[13]),                                    // GpuWeightsPercent
+            nb::cast<std::optional<SizeType32>>(cpp_states[14]),                // MaxQueueSize
+            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[15]),       // ExtendedRuntimePerfKnobConfig
+            nb::cast<SizeType32>(cpp_states[16]),                               // RecvPollPeriodMs
+            nb::cast<uint64_t>(cpp_states[17]),                                 // MaxSeqIdleMicroseconds
+            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[18]), // GuidedDecodingConfig
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[19]), // AdditionalModelOutputs
+            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[20]),             // CacheTransceiverConfig
+            nb::cast<bool>(cpp_states[21]),                                                   // GatherGenerationLogits
+            nb::cast<bool>(cpp_states[22]),                                                   // PromptTableOffloading
+            nb::cast<bool>(cpp_states[23]),                                                   // EnableTrtOverlap
+            nb::cast<bool>(cpp_states[24]) // FailFastOnAttentionWindowTooLarge
         );
 
         // Restore Python data
@@ -565,15 +446,12 @@ void initConfigBindings(nb::module_& m)
                  tle::BatchingType,                                      // BatchingType
                  std::optional<SizeType32>,                              // MaxBatchSize
                  std::optional<SizeType32>,                              // MaxNumTokens
-                 std::optional<tle::ParallelConfig>,                     // ParallelConfig
                  tle::PeftCacheConfig const&,                            // PeftCacheConfig
-                 std::optional<tle::LogitsPostProcessorConfig>,          // LogitsPostProcessorConfig
                  std::optional<tle::DecodingConfig>,                     // DecodingConfig
                  bool,                                                   // UseGpuDirectStorage
                  float,                                                  // GpuWeightsPercent
                  std::optional<SizeType32>,                              // MaxQueueSize
                  tle::ExtendedRuntimePerfKnobConfig const&,              // ExtendedRuntimePerfKnobConfig
-                 std::optional<tle::DebugConfig>,                        // DebugConfig
                  SizeType32,                                             // RecvPollPeriodMs
                  uint64_t,                                               // MaxSeqIdleMicroseconds
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
@@ -590,12 +468,11 @@ void initConfigBindings(nb::module_& m)
             nb::arg("iter_stats_max_iterations") = tle::ExecutorConfig::kDefaultIterStatsMaxIterations,
             nb::arg("request_stats_max_iterations") = tle::ExecutorConfig::kDefaultRequestStatsMaxIterations,
             nb::arg("batching_type") = tle::BatchingType::kINFLIGHT, nb::arg("max_batch_size") = nb::none(),
-            nb::arg("max_num_tokens") = nb::none(), nb::arg("parallel_config") = nb::none(),
-            nb::arg("peft_cache_config") = tle::PeftCacheConfig(), nb::arg("logits_post_processor_config") = nb::none(),
+            nb::arg("max_num_tokens") = nb::none(), nb::arg("peft_cache_config") = tle::PeftCacheConfig(),
             nb::arg("decoding_config") = nb::none(), nb::arg("use_gpu_direct_storage") = false,
             nb::arg("gpu_weights_percent") = 1.0, nb::arg("max_queue_size") = nb::none(),
             nb::arg("extended_runtime_perf_knob_config") = tle::ExtendedRuntimePerfKnobConfig(),
-            nb::arg("debug_config") = nb::none(), nb::arg("recv_poll_period_ms") = 0,
+            nb::arg("recv_poll_period_ms") = 0,
             nb::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             nb::arg("guided_decoding_config") = nb::none(), nb::arg("additional_model_outputs") = nb::none(),
             nb::arg("cache_transceiver_config") = nb::none(), nb::arg("gather_generation_logits") = false,
@@ -618,11 +495,7 @@ void initConfigBindings(nb::module_& m)
             &tle::ExecutorConfig::setRequestStatsMaxIterations)
         .def_prop_rw("batching_type", &tle::ExecutorConfig::getBatchingType, &tle::ExecutorConfig::setBatchingType)
         .def_prop_rw(
-            "parallel_config", &tle::ExecutorConfig::getParallelConfig, &tle::ExecutorConfig::setParallelConfig)
-        .def_prop_rw(
             "peft_cache_config", &tle::ExecutorConfig::getPeftCacheConfig, &tle::ExecutorConfig::setPeftCacheConfig)
-        .def_prop_rw("logits_post_processor_config", &tle::ExecutorConfig::getLogitsPostProcessorConfig,
-            &tle::ExecutorConfig::setLogitsPostProcessorConfig)
         .def_prop_rw(
             "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig)
         .def_prop_rw("use_gpu_direct_storage", &tle::ExecutorConfig::getUseGpuDirectStorage,
@@ -632,7 +505,6 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
         .def_prop_rw("extended_runtime_perf_knob_config", &tle::ExecutorConfig::getExtendedRuntimePerfKnobConfig,
             &tle::ExecutorConfig::setExtendedRuntimePerfKnobConfig)
-        .def_prop_rw("debug_config", &tle::ExecutorConfig::getDebugConfig, &tle::ExecutorConfig::setDebugConfig)
         .def_prop_rw(
             "recv_poll_period_ms", &tle::ExecutorConfig::getRecvPollPeriodMs, &tle::ExecutorConfig::setRecvPollPeriodMs)
         .def_prop_rw("max_seq_idle_microseconds", &tle::ExecutorConfig::getMaxSeqIdleMicroseconds,

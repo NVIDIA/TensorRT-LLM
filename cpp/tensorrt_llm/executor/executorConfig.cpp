@@ -25,11 +25,9 @@ namespace tensorrt_llm::executor
 ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedulerConfig, KvCacheConfig kvCacheConfig,
     bool enableChunkedContext, bool normalizeLogProbs, SizeType32 iterStatsMaxIterations,
     SizeType32 requestStatsMaxIterations, BatchingType batchingType, std::optional<SizeType32> maxBatchSize,
-    std::optional<SizeType32> maxNumTokens, std::optional<ParallelConfig> parallelConfig,
-    std::optional<PeftCacheConfig> const& peftCacheConfig,
-    std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig, std::optional<DecodingConfig> decodingConfig,
-    bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
-    ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
+    std::optional<SizeType32> maxNumTokens, std::optional<PeftCacheConfig> const& peftCacheConfig,
+    std::optional<DecodingConfig> decodingConfig, bool useGpuDirectStorage, float gpuWeightPercent,
+    std::optional<SizeType32> maxQueueSize, ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
@@ -45,15 +43,12 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mBatchingType(batchingType)
     , mMaxBatchSize(maxBatchSize)
     , mMaxNumTokens(maxNumTokens)
-    , mParallelConfig(std::move(parallelConfig))
     , mPeftCacheConfig(peftCacheConfig)
-    , mLogitsPostProcessorConfig(std::move(logitsPostProcessorConfig))
     , mDecodingConfig(std::move(decodingConfig))
     , mUseGpuDirectStorage((useGpuDirectStorage))
     , mGpuWeightsPercent(gpuWeightPercent)
     , mMaxQueueSize(maxQueueSize)
     , mExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
-    , mDebugConfig(std::move(debugConfig))
     , mRecvPollPeriodMs(recvPollPeriodMs)
     , mMaxSeqIdleMicroseconds(maxSeqIdleMicroseconds)
     , mGuidedDecodingConfig(std::move(guidedDecodingConfig))
@@ -132,19 +127,9 @@ std::optional<SizeType32> ExecutorConfig::getMaxNumTokens() const
     return mMaxNumTokens;
 }
 
-std::optional<ParallelConfig> ExecutorConfig::getParallelConfig() const
-{
-    return mParallelConfig;
-}
-
 std::optional<PeftCacheConfig> ExecutorConfig::getPeftCacheConfig() const
 {
     return mPeftCacheConfig;
-}
-
-std::optional<LogitsPostProcessorConfig> ExecutorConfig::getLogitsPostProcessorConfig() const
-{
-    return mLogitsPostProcessorConfig;
 }
 
 std::optional<DecodingConfig> ExecutorConfig::getDecodingConfig() const
@@ -170,11 +155,6 @@ std::optional<SizeType32> ExecutorConfig::getMaxQueueSize() const
 ExtendedRuntimePerfKnobConfig ExecutorConfig::getExtendedRuntimePerfKnobConfig() const
 {
     return mExtendedRuntimePerfKnobConfig;
-}
-
-std::optional<DebugConfig> ExecutorConfig::getDebugConfig() const
-{
-    return mDebugConfig;
 }
 
 SizeType32 ExecutorConfig::getRecvPollPeriodMs() const
@@ -279,19 +259,9 @@ void ExecutorConfig::setBatchingType(BatchingType batchingType)
     mBatchingType = batchingType;
 }
 
-void ExecutorConfig::setParallelConfig(ParallelConfig const& parallelConfig)
-{
-    mParallelConfig = parallelConfig;
-}
-
 void ExecutorConfig::setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig)
 {
     mPeftCacheConfig = peftCacheConfig;
-}
-
-void ExecutorConfig::setLogitsPostProcessorConfig(LogitsPostProcessorConfig const& logitsPostProcessorConfig)
-{
-    mLogitsPostProcessorConfig = logitsPostProcessorConfig;
 }
 
 void ExecutorConfig::setDecodingConfig(DecodingConfig const& decodingConfig)
@@ -318,11 +288,6 @@ void ExecutorConfig::setExtendedRuntimePerfKnobConfig(
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig)
 {
     mExtendedRuntimePerfKnobConfig = extendedRuntimePerfKnobConfig;
-}
-
-void ExecutorConfig::setDebugConfig(DebugConfig const& debugConfig)
-{
-    mDebugConfig = debugConfig;
 }
 
 void ExecutorConfig::setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs)

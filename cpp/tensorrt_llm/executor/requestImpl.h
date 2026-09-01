@@ -59,7 +59,7 @@ public:
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-        std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
+        std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
         std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
@@ -93,7 +93,6 @@ public:
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
         , mNumReturnSequences(numReturnSequences)
-        , mEagleConfig(std::move(eagleConfig))
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
@@ -291,11 +290,6 @@ public:
         return mSamplingConfig.getNumReturnSequences();
     }
 
-    [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const
-    {
-        return mEagleConfig;
-    }
-
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const
     {
         return mSkipCrossAttnBlocks;
@@ -465,11 +459,6 @@ public:
         mSamplingConfig.setNumReturnSequences(numReturnSequences);
     }
 
-    void setEagleConfig(std::optional<EagleConfig> eagleConfig)
-    {
-        mEagleConfig = std::move(eagleConfig);
-    }
-
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
     {
         mSkipCrossAttnBlocks = skipCrossAttnBlocks;
@@ -567,7 +556,6 @@ private:
         lambda(mEncoderOutputLength);
         lambda(mCrossAttentionMask);
         lambda(mNumReturnSequences);
-        lambda(mEagleConfig);
         lambda(mSkipCrossAttnBlocks);
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
@@ -606,7 +594,6 @@ private:
     std::optional<SizeType32> mEncoderOutputLength;
     std::optional<Tensor> mCrossAttentionMask;
     SizeType32 mNumReturnSequences;
-    std::optional<EagleConfig> mEagleConfig;
     std::optional<Tensor> mSkipCrossAttnBlocks;
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;

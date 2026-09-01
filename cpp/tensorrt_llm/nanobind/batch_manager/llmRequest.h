@@ -79,7 +79,6 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         tb::LlmRequestType llmRequestType = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1,
-        std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,

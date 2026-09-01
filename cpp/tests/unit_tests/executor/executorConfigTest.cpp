@@ -61,8 +61,7 @@ TEST(ExecutorConfigTest, ctorValidInputs)
 
 void testInvalid(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
     KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false, bool normalizeLogProbs = true,
-    SizeType32 iterStatsMaxIterations = 1000, BatchingType batchingType = BatchingType::kINFLIGHT,
-    std::optional<ParallelConfig> parallelConfig = std::nullopt)
+    SizeType32 iterStatsMaxIterations = 1000, BatchingType batchingType = BatchingType::kINFLIGHT)
 {
     try
     {
@@ -88,25 +87,8 @@ TEST(ExecutorConfigTest, ctorInvalidInputs)
     SchedulerConfig schedulerConfig;
     KvCacheConfig kvCacheConfig;
 
-    // Empty device ids
-    try
-    {
-        ParallelConfig parallelConfigInvalid;
-        parallelConfigInvalid.setDeviceIds({});
-        FAIL() << "Expected TllmException";
-    }
-    catch (TllmException& e)
-    {
-        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
-    }
-    catch (std::exception const& e)
-    {
-        FAIL() << "Expected TllmException";
-    }
-
     // iter stats below the unlimited sentinel
-    ParallelConfig parallelConfigValid;
-    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -2, BatchingType::kINFLIGHT, parallelConfigValid);
+    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -2, BatchingType::kINFLIGHT);
 
     // request stats below the unlimited sentinel
     try

@@ -149,8 +149,8 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
-        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
+        SizeType32 numReturnSequences = 1, std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt,
+        bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
@@ -214,7 +214,6 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
-        , mEagleConfig(std::move(eagleConfig))
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
@@ -325,7 +324,6 @@ public:
         , mFinishReasons(mSamplingConfig.getBeamWidth())
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
-        , mEagleConfig(req.getEagleConfig())
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
@@ -1090,16 +1088,6 @@ public:
     void setKvCacheRetentionConfig(executor::KvCacheRetentionConfig config)
     {
         mKvCacheRetentionConfig = config;
-    }
-
-    [[nodiscard]] std::optional<executor::EagleConfig> getEagleConfig() const
-    {
-        return mEagleConfig;
-    }
-
-    void setEagleConfig(executor::EagleConfig config)
-    {
-        mEagleConfig = config;
     }
 
     [[nodiscard]] std::optional<executor::GuidedDecodingParams> getGuidedDecodingParams() const
@@ -2203,7 +2191,6 @@ protected:
     SizeType32 mNumReturnSequences{1};
 
     // Config for Eagle speculative decoding.
-    std::optional<executor::EagleConfig> mEagleConfig{std::nullopt};
 
     SizeType32 mSequenceIndex{0};
 
@@ -2424,7 +2411,6 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1,
-        std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
@@ -2466,9 +2452,8 @@ public:
             std::move(crossAttentionMask), llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, arrivalTime,
-            std::move(agent_hierarchy),
+            numReturnSequences, skipCrossAttnBlocks, returnPerfMetrics, std::move(guidedDecodingParams),
+            languageAdapterUid, allottedTimeMs, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),

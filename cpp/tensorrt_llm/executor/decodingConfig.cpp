@@ -100,69 +100,11 @@ bool LookaheadDecodingConfig::isLE(LookaheadDecodingConfig const& that) const
         && mVerificationSetSize <= that.mVerificationSetSize;
 }
 
-EagleConfig::EagleConfig(std::optional<EagleChoices> eagleChoices, bool greedySampling,
-    std::optional<float> posteriorThreshold, bool useDynamicTree, std::optional<SizeType32> dynamicTreeMaxTopK)
-    : mEagleChoices(std::move(eagleChoices))
-    , mGreedySampling(greedySampling)
-    , mPosteriorThreshold(checkPosteriorValue(posteriorThreshold))
-    , mUseDynamicTree(useDynamicTree)
-    , mDynamicTreeMaxTopK(dynamicTreeMaxTopK)
-{
-    if (useDynamicTree)
-    {
-        TLLM_CHECK_WITH_INFO(eagleChoices.has_value() == false,
-            "When dynamic tree is enabled (for Eagle-2), eagle choices should not be set.");
-    }
-}
-
-bool EagleConfig::operator==(EagleConfig const& other) const
-{
-    return mEagleChoices == other.mEagleChoices && mGreedySampling == other.mGreedySampling
-        && mPosteriorThreshold == other.mPosteriorThreshold && mUseDynamicTree == other.mUseDynamicTree
-        && mDynamicTreeMaxTopK == other.mDynamicTreeMaxTopK;
-}
-
-std::optional<EagleChoices> EagleConfig::getEagleChoices() const
-{
-    return mEagleChoices;
-}
-
-std::optional<float> EagleConfig::getPosteriorThreshold() const
-{
-    return mPosteriorThreshold;
-}
-
-bool EagleConfig::isGreedySampling() const
-{
-    return mGreedySampling;
-}
-
-std::optional<float> const& EagleConfig::checkPosteriorValue(std::optional<float> const& value)
-{
-    if (value.has_value())
-    {
-        TLLM_CHECK(0.f <= value.value() && value.value() < 1.f);
-    }
-    return value;
-}
-
-bool EagleConfig::useDynamicTree() const
-{
-    return mUseDynamicTree;
-}
-
-std::optional<SizeType32> EagleConfig::getDynamicTreeMaxTopK() const
-{
-    return mDynamicTreeMaxTopK;
-}
-
 DecodingConfig::DecodingConfig(std::optional<DecodingMode> decodingMode,
-    std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig, std::optional<MedusaChoices> medusaChoices,
-    std::optional<EagleConfig> eagleConfig)
+    std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig, std::optional<MedusaChoices> medusaChoices)
     : mDecodingMode{decodingMode}
     , mLookaheadDecodingConfig{lookaheadDecodingConfig}
     , mMedusaChoices{std::move(medusaChoices)}
-    , mEagleConfig{std::move(eagleConfig)}
 {
     if (mLookaheadDecodingConfig)
     {
@@ -176,18 +118,12 @@ DecodingConfig::DecodingConfig(std::optional<DecodingMode> decodingMode,
         TLLM_CHECK_WITH_INFO(
             mDecodingMode.value().isMedusa(), "MedusaChoices are set, but DecodingMode is not set to Medusa");
     }
-    if (mEagleConfig)
-    {
-        TLLM_CHECK_WITH_INFO(mDecodingMode, "EagleConfig is set, but DecodingMode is not set");
-        TLLM_CHECK_WITH_INFO(
-            mDecodingMode.value().isEagle(), "EagleConfig is set, but DecodingMode is not set to Eagle");
-    }
 }
 
 bool DecodingConfig::operator==(DecodingConfig const& other) const
 {
     return mDecodingMode == other.mDecodingMode && mLookaheadDecodingConfig == other.mLookaheadDecodingConfig
-        && mMedusaChoices == other.mMedusaChoices && mEagleConfig == other.mEagleConfig;
+        && mMedusaChoices == other.mMedusaChoices;
 }
 
 std::optional<DecodingMode> DecodingConfig::getDecodingMode() const
@@ -240,17 +176,6 @@ void DecodingConfig::setMedusaChoices(MedusaChoices const& medusaChoices)
 {
     mMedusaChoices = medusaChoices;
     mDecodingMode = DecodingMode::Medusa();
-}
-
-std::optional<EagleConfig> DecodingConfig::getEagleConfig() const
-{
-    return mEagleConfig;
-}
-
-void DecodingConfig::setEagleConfig(EagleConfig const& eagleConfig)
-{
-    mEagleConfig = eagleConfig;
-    mDecodingMode = DecodingMode::Eagle();
 }
 
 } // namespace tensorrt_llm::executor
