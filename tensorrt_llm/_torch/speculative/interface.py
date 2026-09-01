@@ -1452,6 +1452,40 @@ class SpecMetadata:
         self._sampling_params_signature[0] = None
         self._sampling_params_signature[1] = None
 
+    def remap_expanded_sampling_params(self, req_idx: torch.Tensor,
+                                       num_tokens: int) -> None:
+        """Repack per-logits-row sampling state after device window selection.
+
+        Device window selection can redistribute a fixed token budget among
+        requests immediately before replay. The expanded sampling buffers must
+        follow the resulting token owners.
+        """
+        if num_tokens <= 0:
+            return
+        owners = req_idx[:num_tokens].to(torch.long)
+        pairs = (
+            (self.request_temperatures, self.temperatures),
+            (self.request_top_ks, self.top_ks),
+            (self.request_top_ps, self.top_ps),
+            (self.request_seeds, self.seeds),
+            (self.request_offsets, self.offsets),
+        )
+        for request_values, expanded_values in pairs:
+            if request_values is None or expanded_values is None:
+                continue
+            if expanded_values.numel() < num_tokens:
+                raise RuntimeError(
+                    "device-selected DSpark layout exceeds the captured "
+                    "sampling-parameter buffer")
+            torch.index_select(request_values,
+                               0,
+                               owners,
+                               out=expanded_values[:num_tokens])
+
+        # The expanded cache now follows the device-selected layout. Force the
+        # next host-prepared iteration to restore its own row expansion.
+        self._sampling_params_signature[1] = None
+
 
 class AuxiliarySpeculativeStateHandler(Protocol):
     """Model-side state that verification writes once per draft token.
