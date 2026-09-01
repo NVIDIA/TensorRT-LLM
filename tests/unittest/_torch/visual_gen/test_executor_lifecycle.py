@@ -15,6 +15,7 @@
 
 import asyncio
 import ctypes
+import errno
 import os
 import signal
 import sys
@@ -145,6 +146,25 @@ def _delayed_watchdog_worker(
     _pause()
 
 
+def _forced_polling_parent_bound_worker(
+    parent_pid: int,
+    lifecycle_context: SpawnProcessContext,
+    pidfd_error_code: int,
+    **_kwargs,
+) -> None:
+    from tensorrt_llm.bindings.internal.testing import start_coordinator_watchdog_with_pidfd_error
+
+    warning = start_coordinator_watchdog_with_pidfd_error(parent_pid, pidfd_error_code)
+    lifecycle_context.send(
+        "watchdog",
+        {
+            "pid": os.getpid(),
+            "warning": warning,
+        },
+    )
+    _pause()
+
+
 def _lightweight_background(client: DiffusionRemoteClient) -> None:
     client.event_loop_ready.set()
     client.shutdown_event.wait()
@@ -152,13 +172,14 @@ def _lightweight_background(client: DiffusionRemoteClient) -> None:
 
 def _run_temporary_constructor_coordinator(
     lifecycle_context: SpawnProcessContext,
+    worker_entrypoint: Callable[..., None] = _parent_bound_worker,
 ) -> None:
     context = executor_module._get_mp_context("spawn")
     args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
     startup_error = []
     clients = []
     worker_target = partial(
-        _parent_bound_worker,
+        worker_entrypoint,
         lifecycle_context=lifecycle_context,
     )
 
@@ -409,6 +430,10 @@ def test_worker_starts_native_watchdog_before_initialization() -> None:
 
     def start_coordinator_watchdog(parent_pid):
         events.append(("coordinator_watchdog", parent_pid))
+        return "using parent-PID polling fallback"
+
+    def log_warning(message):
+        events.append(("warning", message))
 
     def set_log_level(log_level):
         events.append(("log_level", log_level))
@@ -420,6 +445,7 @@ def test_worker_starts_native_watchdog_before_initialization() -> None:
             "_start_coordinator_watchdog",
             side_effect=start_coordinator_watchdog,
         ),
+        patch.object(executor_module.logger, "warning", side_effect=log_warning),
         patch.object(executor_module.logger, "set_level", side_effect=set_log_level),
         pytest.raises(StopWorker),
     ):
@@ -436,6 +462,10 @@ def test_worker_starts_native_watchdog_before_initialization() -> None:
 
     assert events == [
         ("coordinator_watchdog", 123),
+        (
+            "warning",
+            "VisualGen worker coordinator watchdog: using parent-PID polling fallback",
+        ),
         ("log_level", "info"),
     ]
 
@@ -445,10 +475,10 @@ def test_worker_watchdog_failure_is_fatal_before_initialization() -> None:
         patch.object(
             executor_module,
             "_start_coordinator_watchdog",
-            side_effect=RuntimeError("pidfd unavailable"),
+            side_effect=RuntimeError("watchdog thread unavailable"),
         ),
         patch.object(executor_module.logger, "set_level") as set_log_level,
-        pytest.raises(RuntimeError, match="pidfd unavailable"),
+        pytest.raises(RuntimeError, match="watchdog thread unavailable"),
     ):
         executor_module.run_diffusion_worker(
             rank=0,
@@ -489,7 +519,7 @@ def test_worker_failure_propagates_to_external_launcher() -> None:
     print_exc.assert_called_once_with()
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_worker_is_killed_when_coordinator_is_sigkilled() -> None:
     worker_pid = None
     try:
@@ -505,7 +535,57 @@ def test_worker_is_killed_when_coordinator_is_sigkilled() -> None:
             os.kill(worker_pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+@pytest.mark.parametrize(
+    ("pidfd_error_code", "error_name"),
+    [
+        (errno.ENOSYS, "ENOSYS"),
+        (errno.EPERM, "EPERM"),
+    ],
+)
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
+def test_worker_uses_polling_watchdog_when_pidfd_is_unavailable(
+    pidfd_error_code: int,
+    error_name: str,
+) -> None:
+    worker_pid = None
+    worker_target = partial(
+        _forced_polling_parent_bound_worker,
+        pidfd_error_code=pidfd_error_code,
+    )
+    try:
+        with spawn_process(_run_temporary_constructor_coordinator, worker_target) as coordinator:
+            messages = coordinator.receive_many("constructor", "watchdog")
+            watchdog = messages["watchdog"]
+            worker_pid = watchdog["pid"]
+            assert error_name in watchdog["warning"]
+            assert "native 1-second parent-PID polling fallback" in watchdog["warning"]
+
+            # Both the finite worker-spawner thread and the temporary client
+            # constructor thread have exited. Parent-PID polling follows the
+            # coordinator process, so neither thread exit may kill the worker.
+            # Wait through more than one polling interval before asserting.
+            time.sleep(2.0)
+            assert coordinator.is_alive
+            assert _process_is_running(worker_pid)
+
+            coordinator.kill()
+            assert coordinator.wait() == -signal.SIGKILL
+
+            _wait_for_process_exit(worker_pid)
+    finally:
+        if worker_pid is not None and _process_is_running(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
+def test_worker_watchdog_does_not_hide_unexpected_pidfd_errors() -> None:
+    from tensorrt_llm.bindings.internal.testing import start_coordinator_watchdog_with_pidfd_error
+
+    with pytest.raises(RuntimeError, match="pidfd_open for VisualGen coordinator failed"):
+        start_coordinator_watchdog_with_pidfd_error(os.getppid(), errno.EMFILE)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_native_watchdog_does_not_require_python_gil() -> None:
     worker_pid = None
     try:
@@ -525,7 +605,7 @@ def test_native_watchdog_does_not_require_python_gil() -> None:
             os.kill(worker_pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_worker_exits_if_coordinator_dies_before_watchdog_registration() -> None:
     worker_pid = None
     try:
@@ -545,7 +625,7 @@ def test_worker_exits_if_coordinator_dies_before_watchdog_registration() -> None
 
 
 @pytest.mark.parametrize("killed_worker_count", [1, 2])
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_sigkill_workers_contains_remaining_group(killed_worker_count: int) -> None:
     context = executor_module._get_mp_context("spawn")
     begin_monitoring = context.Event()
@@ -591,7 +671,7 @@ def test_sigkill_workers_contains_remaining_group(killed_worker_count: int) -> N
                 os.kill(worker_pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_sigkill_worker_and_coordinator_kills_remaining_workers() -> None:
     worker_pids = []
     try:
@@ -611,7 +691,7 @@ def test_sigkill_worker_and_coordinator_kills_remaining_workers() -> None:
                 os.kill(worker_pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd monitoring is Linux-specific")
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_temporary_constructor_thread_does_not_kill_worker() -> None:
     _assert_temporary_constructor_worker_lifecycle()
 
@@ -933,7 +1013,10 @@ def test_worker_failure_shutdown_does_not_wait_for_thread_timeout() -> None:
 
 
 @pytest.mark.gpu4
-@pytest.mark.skipif(sys.platform != "linux", reason="pidfd and /proc are Linux-specific")
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="native parent monitoring and /proc are Linux-specific",
+)
 def test_sigkill_one_worker_contains_real_multi_gpu_group() -> None:
     world_size = 4
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:

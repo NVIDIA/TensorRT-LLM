@@ -18,10 +18,13 @@
 #include "tensorrt_llm/nanobind/visual_gen/coordinatorWatchdog.h"
 
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 
@@ -39,6 +42,8 @@ namespace
 {
 
 #if defined(__linux__)
+constexpr auto kParentPollInterval = std::chrono::seconds{1};
+
 [[noreturn]] void terminateWorker(pid_t workerPid) noexcept
 {
     ::kill(workerPid, SIGKILL);
@@ -68,13 +73,21 @@ void watchCoordinator(int coordinatorFd, pid_t workerPid) noexcept
     ::close(coordinatorFd);
     terminateWorker(workerPid);
 }
-#endif
 
-} // namespace
-
-void startCoordinatorWatchdog(std::int64_t coordinatorPid)
+void watchCoordinatorByParentPid(pid_t expectedParentPid, pid_t workerPid) noexcept
 {
-#if defined(__linux__)
+    ::pthread_setname_np(::pthread_self(), "visualgen-watch");
+    while (::getppid() == expectedParentPid)
+    {
+        std::this_thread::sleep_for(kParentPollInterval);
+    }
+    terminateWorker(workerPid);
+}
+
+using OpenPidfd = std::function<int(pid_t)>;
+
+std::optional<std::string> startCoordinatorWatchdogImpl(std::int64_t coordinatorPid, OpenPidfd const& openPidfd)
+{
     if (coordinatorPid <= 0 || coordinatorPid > std::numeric_limits<pid_t>::max())
     {
         throw std::invalid_argument("coordinator PID is outside the pid_t range");
@@ -90,7 +103,24 @@ void startCoordinatorWatchdog(std::int64_t coordinatorPid)
     if (coordinatorFd < 0)
     {
         int const errorCode = errno;
-        throw std::system_error(errorCode, std::generic_category(), "pidfd_open for VisualGen coordinator failed");
+        if (errorCode != ENOSYS && errorCode != EPERM)
+        {
+            throw std::system_error(errorCode, std::generic_category(), "pidfd_open for VisualGen coordinator failed");
+        }
+
+        // A seccomp profile may reject pidfd_open even on a recent kernel. A
+        // native polling thread preserves supervision without depending on
+        // the Python GIL. One getppid() call per worker per second is
+        // negligible compared with model serving and bounds detection to one
+        // second.
+        if (::getppid() != expectedParentPid)
+        {
+            terminateWorker(::getpid());
+        }
+        std::thread(watchCoordinatorByParentPid, expectedParentPid, ::getpid()).detach();
+        auto const* errorName = errorCode == ENOSYS ? "ENOSYS" : "EPERM";
+        return "pidfd_open for VisualGen coordinator failed with " + std::string(errorName) + " ("
+            + std::generic_category().message(errorCode) + "); using the native 1-second parent-PID polling fallback";
     }
 
     // pidfd_open() and the parent check must be paired. If the coordinator
@@ -111,10 +141,41 @@ void startCoordinatorWatchdog(std::int64_t coordinatorPid)
         ::close(coordinatorFd);
         throw;
     }
+    return std::nullopt;
+}
+#endif
+
+} // namespace
+
+std::optional<std::string> startCoordinatorWatchdog(std::int64_t coordinatorPid)
+{
+#if defined(__linux__)
+    return startCoordinatorWatchdogImpl(coordinatorPid, openPidfd);
 #else
     static_cast<void>(coordinatorPid);
-    throw std::runtime_error("VisualGen coordinator supervision requires Linux pidfds");
+    throw std::runtime_error("VisualGen coordinator supervision requires Linux");
 #endif
 }
+
+namespace testing
+{
+
+std::optional<std::string> startCoordinatorWatchdogWithPidfdError(std::int64_t coordinatorPid, int pidfdErrorCode)
+{
+#if defined(__linux__)
+    return startCoordinatorWatchdogImpl(coordinatorPid,
+        [pidfdErrorCode](pid_t)
+        {
+            errno = pidfdErrorCode;
+            return -1;
+        });
+#else
+    static_cast<void>(coordinatorPid);
+    static_cast<void>(pidfdErrorCode);
+    throw std::runtime_error("VisualGen coordinator supervision requires Linux");
+#endif
+}
+
+} // namespace testing
 
 } // namespace tensorrt_llm::nanobind::visual_gen

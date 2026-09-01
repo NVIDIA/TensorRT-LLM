@@ -18,11 +18,22 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <string>
 
 namespace tensorrt_llm::nanobind::visual_gen
 {
 
 //! Start a detached native thread that terminates this process when its coordinator exits.
-void startCoordinatorWatchdog(std::int64_t coordinatorPid);
+//! Returns a warning when pidfd_open is unavailable and parent-PID polling is used instead.
+std::optional<std::string> startCoordinatorWatchdog(std::int64_t coordinatorPid);
+
+namespace testing
+{
+
+//! Exercise the pidfd_open error path without changing the process seccomp policy.
+std::optional<std::string> startCoordinatorWatchdogWithPidfdError(std::int64_t coordinatorPid, int pidfdErrorCode);
+
+} // namespace testing
 
 } // namespace tensorrt_llm::nanobind::visual_gen

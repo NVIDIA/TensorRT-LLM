@@ -630,12 +630,15 @@ def run_diffusion_worker(
     environment here, the env writes below make every worker look external.
     """
     # This native watchdog starts before CUDA, distributed, or model
-    # initialization and does not depend on the Python GIL. The pidfd follows
-    # the coordinator process, regardless of which coordinator thread spawned
-    # this worker.
+    # initialization and does not depend on the Python GIL. It follows the
+    # coordinator process with a pidfd where available and otherwise polls the
+    # parent relationship, regardless of which coordinator thread spawned this
+    # worker.
     if parent_pid is not None:
         try:
-            _start_coordinator_watchdog(parent_pid)
+            watchdog_warning = _start_coordinator_watchdog(parent_pid)
+            if watchdog_warning is not None:
+                logger.warning(f"VisualGen worker coordinator watchdog: {watchdog_warning}")
         except Exception as e:
             logger.error(f"VisualGen worker could not supervise its coordinator: {e}")
             raise
@@ -728,9 +731,11 @@ class DiffusionRemoteClient:
         ``VisualGen`` is called from an ordinary Python script.
         ``DiffusionRemoteClient`` spawns all worker processes locally via
         ``mp.Process`` with ``master_addr=127.0.0.1``. Each worker starts a
-        native pidfd watchdog before model initialization and exits if this
-        coordinator process dies. The coordinator also monitors worker
-        liveness and terminates the remaining local ranks after one exits.
+        native coordinator watchdog before model initialization and exits if
+        this coordinator process dies. The watchdog uses a pidfd where
+        available and falls back to low-frequency parent-PID polling. The
+        coordinator also monitors worker liveness and terminates the remaining
+        local ranks after one exits.
 
     **Multi-node (external launcher)**
         The script is launched by ``torchrun`` or ``srun --ntasks-per-node=GPUS``.
@@ -876,7 +881,7 @@ class DiffusionRemoteClient:
                 # finite spawn batch away from Python's signal-handling thread
                 # so shutdown can remain bounded. This thread exits as soon as
                 # spawning finishes; worker lifetime follows the coordinator
-                # process through the native pidfd watchdog instead.
+                # process through the native watchdog instead.
                 self._worker_spawner = _WorkerProcessSpawner(self.worker_processes)
                 self._worker_spawner.start()
                 self._worker_spawner.wait_for_spawn(

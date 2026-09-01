@@ -145,6 +145,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     mInternal.def("start_coordinator_watchdog", &tensorrt_llm::nanobind::visual_gen::startCoordinatorWatchdog,
         nb::arg("coordinator_pid"), "Terminate this process when its coordinator exits.");
+    mInternalTesting.def("start_coordinator_watchdog_with_pidfd_error",
+        &tensorrt_llm::nanobind::visual_gen::testing::startCoordinatorWatchdogWithPidfdError,
+        nb::arg("coordinator_pid"), nb::arg("pidfd_error_code"),
+        "Test coordinator supervision when pidfd_open returns an error.");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
