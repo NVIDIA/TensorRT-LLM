@@ -57,27 +57,33 @@ class _StubRequest:
         return None if value is None else _StubTensor(value)
 
 
-def _load_helpers():
+_MODEL_DIR_HOLDER = {"dir": ""}
+
+_LLMAPI_MODEL_DIR = (Path(__file__).resolve().parents[3] / "triton_backend" /
+                     "all_models" / "llmapi" / "tensorrt_llm" / "1")
+
+
+def _load_by_path(name, path):
     if "triton_python_backend_utils" not in sys.modules:
         stub = types.ModuleType("triton_python_backend_utils")
         stub.TritonModelException = _StubTritonModelException
         stub.get_input_tensor_by_name = (
             lambda request, name: request.get_tensor(name))
+        stub.get_model_dir = lambda: _MODEL_DIR_HOLDER["dir"]
         stub.Logger = types.SimpleNamespace(
-            log_warning=lambda *_args, **_kwargs: None)
+            log_warning=lambda *_args, **_kwargs: None,
+            log_info=lambda *_args, **_kwargs: None,
+            log_error=lambda *_args, **_kwargs: None)
         sys.modules["triton_python_backend_utils"] = stub
 
-    helpers_path = (Path(__file__).resolve().parents[3] / "triton_backend" /
-                    "all_models" / "llmapi" / "tensorrt_llm" / "1" /
-                    "helpers.py")
-    spec = importlib.util.spec_from_file_location("llmapi_triton_helpers",
-                                                  helpers_path)
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-helpers = _load_helpers()
+helpers = _load_by_path("llmapi_triton_helpers",
+                        _LLMAPI_MODEL_DIR / "helpers.py")
 
 _TritonModelException = sys.modules[
     "triton_python_backend_utils"].TritonModelException
@@ -182,3 +188,42 @@ def test_get_logits_post_processor_from_request_unknown_name():
     with pytest.raises(_TritonModelException, match="none configured"):
         helpers.get_logits_post_processor_from_request(
             _name_request(b"missing"), {})
+
+
+def test_model_yaml_plumbing(tmp_path):
+    """Execute the exact model.py initialize() composition: build the
+    processor registry from model.yaml and keep the section out of the LLM
+    engine args."""
+    # model.py does `from helpers import ...`
+    sys.modules.setdefault("helpers", helpers)
+    model = _load_by_path("llmapi_triton_model", _LLMAPI_MODEL_DIR / "model.py")
+    _MODEL_DIR_HOLDER["dir"] = str(tmp_path)
+
+    (tmp_path / "model.yaml").write_text(
+        "model: TinyLlama/TinyLlama-1.1B-Chat-v1.0\n"
+        "backend: pytorch\n"
+        "logits_post_processors:\n"
+        f"  biaser: {_FAKE_MODULE_NAME}:FakeProcessor\n"
+        "triton_config: {max_batch_size: 0, decoupled: false}\n")
+
+    registry = helpers.load_logits_post_processors(
+        model.get_model_config("model.yaml",
+                               include_keys=["logits_post_processors"
+                                             ]).get("logits_post_processors"))
+    assert sorted(registry) == ["biaser"]
+    assert isinstance(registry["biaser"], FakeProcessor)
+
+    engine_args = model.get_model_config(
+        "model.yaml", exclude_keys=["triton_config", "logits_post_processors"])
+    assert "logits_post_processors" not in engine_args
+    assert "triton_config" not in engine_args
+    assert engine_args["model"] == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    # absent section degrades to an empty registry
+    (tmp_path / "model.yaml").write_text(
+        "model: x\ntriton_config: {max_batch_size: 0, decoupled: false}\n")
+    registry = helpers.load_logits_post_processors(
+        model.get_model_config("model.yaml",
+                               include_keys=["logits_post_processors"
+                                             ]).get("logits_post_processors"))
+    assert registry == {}
