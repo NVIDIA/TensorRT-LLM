@@ -3666,67 +3666,21 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        free_started = time.monotonic()
-        logger.info(
-            f"[KVCM V2 free] start: request_id={request.py_request_id}, "
-            f"pin_on_release={pin_on_release}"
-        )
         if self.conversation_manager is not None:
-            logger.info(
-                f"[KVCM V2 free] request_id={request.py_request_id} conversation finish start"
-            )
             self.conversation_manager.finish_request(request)
-            logger.info(
-                f"[KVCM V2 free] request_id={request.py_request_id} conversation finish complete"
-            )
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
-        logger.info(f"[KVCM V2 free] request_id={request.py_request_id} KV cache map removal start")
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
-            logger.info(
-                f"[KVCM V2 free] request_id={request.py_request_id} has no KV cache; "
-                f"stats exclusion cleanup start"
-            )
             self.impl.clear_stats_excluded(request.py_request_id)
-            logger.info(
-                f"[KVCM V2 free] complete without KV cache: request_id={request.py_request_id}, "
-                f"elapsed={time.monotonic() - free_started:.3f}s"
-            )
             return
-        logger.info(
-            f"[KVCM V2 free] request_id={request.py_request_id} KV cache close start: "
-            f"cache_id={kv_cache.id}, capacity={kv_cache.capacity}, "
-            f"history_length={kv_cache.history_length}, "
-            f"committed_tokens={kv_cache.num_committed_tokens}, blocks={kv_cache.num_blocks}"
-        )
         kv_cache.discard_pending_stats()
-        logger.info(f"[KVCM V2 free] request_id={request.py_request_id} pending stats discarded")
         kv_cache.close()
-        logger.info(
-            f"[KVCM V2 free] request_id={request.py_request_id} KV cache close complete: "
-            f"elapsed={time.monotonic() - free_started:.3f}s"
-        )
-        logger.info(
-            f"[KVCM V2 free] request_id={request.py_request_id} stats exclusion cleanup start"
-        )
         self.impl.clear_stats_excluded(request.py_request_id)
-        logger.info(
-            f"[KVCM V2 free] request_id={request.py_request_id} stats exclusion cleanup complete"
-        )
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
-            logger.info(
-                f"[KVCM V2 free] request_id={request.py_request_id} index slot was already released"
-            )
         else:
-            logger.info(f"[KVCM V2 free] request_id={request.py_request_id} index removal start")
             self.index_mapper.remove_sequence(request.py_request_id)
-            logger.info(f"[KVCM V2 free] request_id={request.py_request_id} index removal complete")
-        logger.info(
-            f"[KVCM V2 free] complete: request_id={request.py_request_id}, "
-            f"elapsed={time.monotonic() - free_started:.3f}s"
-        )
 
     def get_layer_page_index_scale(self, layer_idx: int) -> int:
         """Page-index scale of this layer's KV buffer. Layers in one pool can

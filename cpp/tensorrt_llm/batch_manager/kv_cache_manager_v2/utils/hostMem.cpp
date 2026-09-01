@@ -201,30 +201,16 @@ HostMem::HostMem(size_t size)
     TLLM_LOG_INFO("[KVCM V2 host] allocation start: bytes=%zu, gib=%.2f, thp=%d", size,
         static_cast<double>(size) / static_cast<double>(1ULL << 30), static_cast<int>(mUseThp));
     mAddr = hostMmap(size);
-    TLLM_LOG_INFO(
-        "[KVCM V2 host] mmap complete: address=%p, elapsed_ms=%lld", reinterpret_cast<void*>(mAddr), elapsedMs());
     TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
     mSize = size;
     try
     {
         madvisePageMode();
-        TLLM_LOG_INFO("[KVCM V2 host] page-mode madvise complete: address=%p, elapsed_ms=%lld",
-            reinterpret_cast<void*>(mAddr), elapsedMs());
         int const prefaultThreads = hostPrefaultThreads();
         if (prefaultThreads > 0)
         {
-            TLLM_LOG_INFO("[KVCM V2 host] prefault start: address=%p, bytes=%zu, threads=%d",
-                reinterpret_cast<void*>(mAddr), mSize, prefaultThreads);
             parallelPrefault(prefaultThreads);
-            TLLM_LOG_INFO("[KVCM V2 host] prefault complete: address=%p, elapsed_ms=%lld",
-                reinterpret_cast<void*>(mAddr), elapsedMs());
         }
-        else
-        {
-            TLLM_LOG_INFO("[KVCM V2 host] prefault disabled: address=%p", reinterpret_cast<void*>(mAddr));
-        }
-        TLLM_LOG_INFO(
-            "[KVCM V2 host] CUDA registration start: address=%p, bytes=%zu", reinterpret_cast<void*>(mAddr), mSize);
         registerToCuda();
         TLLM_LOG_INFO(
             "[KVCM V2 host] allocation complete: address=%p, bytes=%zu, registered_chunks=%d, "
@@ -270,12 +256,8 @@ void HostMem::destroy()
     {
         return;
     }
-    TLLM_LOG_INFO("[KVCM V2 host] destroy start: address=%p, bytes=%zu, registered_chunks=%d",
-        reinterpret_cast<void*>(mAddr), mSize, mNumRegisteredChunks);
     unregisterFromCuda();
-    TLLM_LOG_INFO("[KVCM V2 host] CUDA unregister complete: address=%p", reinterpret_cast<void*>(mAddr));
     hostMunmap(mAddr, mSize);
-    TLLM_LOG_INFO("[KVCM V2 host] munmap complete: address=%p, bytes=%zu", reinterpret_cast<void*>(mAddr), mSize);
     mAddr = 0;
     mSize = 0;
 }
@@ -348,14 +330,10 @@ void HostMem::registerToCuda()
     for (size_t offset = 0; offset < mSize; offset += chunkSize)
     {
         size_t sz = std::min(chunkSize, mSize - offset);
-        TLLM_LOG_INFO("[KVCM V2 host] cuMemHostRegister start: address=%p, offset=%zu, bytes=%zu, chunk=%d",
-            reinterpret_cast<void*>(mAddr), offset, sz, mNumRegisteredChunks);
         CUresult res = cuMemHostRegister(
             reinterpret_cast<void*>(mAddr + offset), sz, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
         cuCheck(res);
         ++mNumRegisteredChunks;
-        TLLM_LOG_INFO("[KVCM V2 host] cuMemHostRegister complete: address=%p, offset=%zu, bytes=%zu, chunk=%d",
-            reinterpret_cast<void*>(mAddr), offset, sz, mNumRegisteredChunks - 1);
     }
 }
 
@@ -365,12 +343,8 @@ void HostMem::unregisterFromCuda()
     size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
     for (size_t offset = 0; offset < mSize && mNumRegisteredChunks > 0; offset += chunkSize)
     {
-        TLLM_LOG_INFO("[KVCM V2 host] cuMemHostUnregister start: address=%p, offset=%zu, remaining_chunks=%d",
-            reinterpret_cast<void*>(mAddr), offset, mNumRegisteredChunks);
         cuMemHostUnregister(reinterpret_cast<void*>(mAddr + offset));
         --mNumRegisteredChunks;
-        TLLM_LOG_INFO("[KVCM V2 host] cuMemHostUnregister complete: address=%p, offset=%zu, remaining_chunks=%d",
-            reinterpret_cast<void*>(mAddr), offset, mNumRegisteredChunks);
     }
     TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
 }

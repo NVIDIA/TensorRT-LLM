@@ -47,6 +47,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -79,6 +80,10 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
+
+_FORWARD_DIAGNOSTICS_ENABLED = os.environ.get(
+    "TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS") == "1"
+_MAX_DIAGNOSTIC_FORWARDS = 32
 
 
 @triton.jit
@@ -1452,8 +1457,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        diagnostic_forward_id: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        diagnostics_enabled = diagnostic_forward_id is not None
         if residual is None:
             residual = hidden_states
             if self.input_layernorm.nvfp4_scale is not None:
@@ -1466,7 +1473,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                      return_norm_out=True)[0]
             else:
                 hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
+        if diagnostics_enabled:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=attention start")
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1475,6 +1485,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        if diagnostics_enabled:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=attention submitted")
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
@@ -1487,6 +1501,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                diagnostic_forward_id=diagnostic_forward_id,
             )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
@@ -1497,6 +1512,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                diagnostic_forward_id=diagnostic_forward_id,
             )
 
     def forward_MoE(
@@ -1505,7 +1521,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        diagnostic_forward_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        diagnostics_enabled = diagnostic_forward_id is not None
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -1521,6 +1540,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_moe_allreduce start")
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1530,10 +1553,23 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.post_attention_layernorm.variance_epsilon,
                     trigger_completion_at_end=False,
                 ))
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_moe_allreduce submitted"
+                )
         else:
             # No fusion
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_moe_norm start")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_moe_norm submitted")
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1542,12 +1578,26 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
+        if diagnostics_enabled:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=routed_moe start, do_finalize={do_finalize}"
+            )
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
                                  do_finalize=do_finalize)
+        if diagnostics_enabled:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=routed_moe submitted")
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
+                if diagnostics_enabled:
+                    logger.info(
+                        f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                        f"layer={self.layer_idx}, phase=post_moe_allreduce start"
+                    )
                 hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -1557,6 +1607,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         eps=self.next_layer_layernorm.variance_epsilon,
                         trigger_completion_at_end=False,
                     ))
+                if diagnostics_enabled:
+                    logger.info(
+                        f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                        f"layer={self.layer_idx}, phase=post_moe_allreduce submitted"
+                    )
             else:
                 assert len(
                     hidden_states) == 4, "hidden_states must have 4 elements"
@@ -1575,15 +1630,33 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.next_layer_layernorm.variance_epsilon,
                     is_cutlass_min_latency=False,
                 )
+                if diagnostics_enabled:
+                    logger.info(
+                        f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                        f"layer={self.layer_idx}, phase=post_moe_fused_allreduce start"
+                    )
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
+                if diagnostics_enabled:
+                    logger.info(
+                        f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                        f"layer={self.layer_idx}, phase=post_moe_fused_allreduce submitted"
+                    )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=post_moe_norm start")
             hidden_states, residual = self._apply_next_layer_layernorm(
                 hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=post_moe_norm submitted")
 
         return hidden_states, residual
 
@@ -1609,9 +1682,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        diagnostic_forward_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        diagnostics_enabled = diagnostic_forward_id is not None
         if self.fusion_config.PRE_MLP_FUSION:
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_dense_mlp_allreduce start"
+                )
             if self.mlp.gate_up_proj.has_nvfp4:
                 act_fp4, act_sf, residual = self.allreduce(
                     hidden_states,
@@ -1635,26 +1715,62 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         eps=self.post_attention_layernorm.variance_epsilon,
                     ),
                 )
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_dense_mlp_allreduce submitted"
+                )
         elif self.post_attention_layernorm.nvfp4_scale is not None:
             # Attention-DP path (no allreduce): post_attention_layernorm folds
             # the dense MLP's NVFP4 gate_up_proj input-quant into one kernel via
             # its attached .nvfp4_scale (RMSNorm.forward), mirroring the
             # PRE_MLP_FUSION quant but without the allreduce.
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_dense_mlp_norm start")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_dense_mlp_norm submitted"
+                )
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_dense_mlp_norm start")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=pre_dense_mlp_norm submitted"
+                )
 
+        if diagnostics_enabled:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=dense_mlp_projection start")
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)),
         )
+        if diagnostics_enabled:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"layer={self.layer_idx}, phase=dense_mlp_projection submitted")
 
         if self.fusion_config.POST_MLP_FUSION:
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=post_dense_mlp_allreduce start"
+                )
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1664,13 +1780,27 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.next_layer_layernorm.variance_epsilon,
                 ),
             )
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=post_dense_mlp_allreduce submitted"
+                )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=post_dense_mlp_norm start")
             hidden_states, residual = self._apply_next_layer_layernorm(
                 hidden_states, residual)
+            if diagnostics_enabled:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={self.layer_idx}, phase=post_dense_mlp_norm submitted"
+                )
 
         return hidden_states, residual
 
@@ -1835,6 +1965,7 @@ class DeepseekV3Model(DecoderModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.mapping_with_cp = mapping_with_cp
+        self._diagnostic_forward_id = 0
         aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
@@ -1880,20 +2011,50 @@ class DeepseekV3Model(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
+        diagnostic_forward_id = None
+        if (_FORWARD_DIAGNOSTICS_ENABLED and not attn_metadata.is_cuda_graph):
+            next_diagnostic_forward_id = self._diagnostic_forward_id
+            self._diagnostic_forward_id += 1
+            if next_diagnostic_forward_id < _MAX_DIAGNOSTIC_FORWARDS:
+                diagnostic_forward_id = next_diagnostic_forward_id
+                batch_size = (attn_metadata.seq_lens.shape[0]
+                              if attn_metadata.seq_lens is not None else None)
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"phase=model start, tokens={hidden_states.shape[0]}, "
+                    f"batch_size={batch_size}, num_contexts={attn_metadata.num_contexts}"
+                )
 
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
+            if diagnostic_forward_id is not None:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={idx}, phase=layer start")
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                diagnostic_forward_id=diagnostic_forward_id,
             )
+            if diagnostic_forward_id is not None:
+                logger.info(
+                    f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                    f"layer={idx}, phase=layer submitted")
 
+        if diagnostic_forward_id is not None:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"phase=final_allgather start")
         hidden_states = maybe_allgather_for_helix_cp(hidden_states,
                                                      attn_metadata,
                                                      self.mapping_with_cp)
+        if diagnostic_forward_id is not None:
+            logger.info(
+                f"[DeepseekV3 forward diagnostic] forward={diagnostic_forward_id}, "
+                f"phase=model submitted")
         return hidden_states
 
 

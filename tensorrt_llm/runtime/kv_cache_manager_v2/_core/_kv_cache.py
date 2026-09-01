@@ -16,7 +16,6 @@
 import array
 import enum
 import math
-import time
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,7 +42,6 @@ from .._common import (
     TokenIdExt,
 )
 from .._copy_engine import CopyTask, batched_copy
-from .._event_manager import logger
 from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import (
     AttnLifeCycle,
@@ -87,8 +85,6 @@ from .._utils import (
 )
 from ._moving_average import Average
 from ._pending_stats import _PendingStats
-
-_CLOSE_PROGRESS_INTERVAL = 256
 
 if TYPE_CHECKING:
     from ._kv_cache_manager import KVCacheManager, ScratchDesc
@@ -617,25 +613,8 @@ class _KVCache:
         assert NDEBUG or self._check_sanity()
         if self.status == self.Status.CLOSED:
             return
-        close_started = time.monotonic()
-        logger.info(
-            f"[KVCM V2 close] start: cache_id={self.id}, status={self.status}, "
-            f"commit_state={self._commit_state}, capacity={self.capacity}, "
-            f"history_length={self.history_length}, committed_tokens={self.num_committed_tokens}, "
-            f"blocks={self.num_blocks}, cuda_stream_set={self._cuda_stream is not None}"
-        )
         self.discard_pending_stats()
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} pending stats discarded: "
-            f"elapsed={time.monotonic() - close_started:.3f}s"
-        )
-        logger.info(f"[KVCM V2 close] cache_id={self.id} stop_committing start")
         self.stop_committing()
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} stop_committing complete: "
-            f"commit_state={self._commit_state}, blocks={self.num_blocks}, "
-            f"elapsed={time.monotonic() - close_started:.3f}s"
-        )
         assert NDEBUG or self._check_sanity()
         manager = self.manager
         # Dummy/warmup caches are reserved at the model's full declared context,
@@ -649,28 +628,10 @@ class _KVCache:
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} statistics update complete: "
-            f"elapsed={time.monotonic() - close_started:.3f}s"
-        )
-        logger.info(f"[KVCM V2 close] cache_id={self.id} CUDA finish-event creation start")
         with self._record_event():
-            logger.info(
-                f"[KVCM V2 close] cache_id={self.id} CUDA finish-event creation complete: "
-                f"elapsed={time.monotonic() - close_started:.3f}s"
-            )
             self._clear_blocks()
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} block cleanup context complete: "
-            f"elapsed={time.monotonic() - close_started:.3f}s"
-        )
         self._status = self.Status.CLOSED
-        logger.info(f"[KVCM V2 close] cache_id={self.id} living-cache removal start")
         manager._living_kv_caches.remove(self.__rawref__)
-        logger.info(
-            f"[KVCM V2 close] complete: cache_id={self.id}, "
-            f"elapsed={time.monotonic() - close_started:.3f}s"
-        )
 
     def __del__(self) -> None:
         self.close()
@@ -2231,66 +2192,20 @@ class _KVCache:
 
     def _free_scratch_slots(self) -> None:
         """Free all scratch slots back to the storage manager."""
-        total_slots = sum(len(locks) for locks in self._scratch_slots)
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} scratch release start: "
-            f"life_cycles={len(self._scratch_slots)}, slots={total_slots}"
-        )
         for lc in typed_range(self.manager._life_cycles.size):
-            locks = self._scratch_slots[lc]
-            life_cycle_slots = len(locks)
-            if life_cycle_slots:
-                logger.info(
-                    f"[KVCM V2 close] cache_id={self.id} releasing scratch life_cycle={lc}: "
-                    f"slots={life_cycle_slots}"
-                )
-            for lock_idx, lock in enumerate(locks):
-                if lock_idx > 0 and lock_idx % _CLOSE_PROGRESS_INTERVAL == 0:
-                    logger.info(
-                        f"[KVCM V2 close] cache_id={self.id} scratch progress: "
-                        f"life_cycle={lc}, released={lock_idx}, "
-                        f"remaining={life_cycle_slots - lock_idx}"
-                    )
+            for lock in self._scratch_slots[lc]:
                 lock.unlock()
-            locks.clear()
-            if life_cycle_slots:
-                logger.info(f"[KVCM V2 close] cache_id={self.id} scratch life_cycle={lc} complete")
-        logger.info(f"[KVCM V2 close] cache_id={self.id} scratch release complete")
+            self._scratch_slots[lc].clear()
 
     def _clear_blocks(self) -> None:
-        initial_blocks = len(self._blocks)
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} block release start: "
-            f"blocks={initial_blocks}, tokens_per_block={self.tokens_per_block}"
-        )
         # drop the last block first
-        released_blocks = 0
         while self._blocks:
-            if released_blocks == 0 or released_blocks % _CLOSE_PROGRESS_INTERVAL == 0:
-                logger.info(
-                    f"[KVCM V2 close] cache_id={self.id} block release progress before pop: "
-                    f"released={released_blocks}, remaining={len(self._blocks)}"
-                )
             self._blocks.pop()
-            released_blocks += 1
-            if released_blocks == 1:
-                logger.info(
-                    f"[KVCM V2 close] cache_id={self.id} first block released: "
-                    f"remaining={len(self._blocks)}"
-                )
-        logger.info(
-            f"[KVCM V2 close] cache_id={self.id} block release complete: released={released_blocks}"
-        )
         self._free_scratch_slots()
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         if ssm_lc_id is not None:
-            logger.info(
-                f"[KVCM V2 close] cache_id={self.id} SSM block release start: "
-                f"beams={len(self._ssm_blocks)}, life_cycle={ssm_lc_id}"
-            )
             for beam_block in self._ssm_blocks:
                 beam_block[ssm_lc_id] = None
-            logger.info(f"[KVCM V2 close] cache_id={self.id} SSM block release complete")
 
     @contextmanager
     def _record_event(self) -> Iterator[None]:

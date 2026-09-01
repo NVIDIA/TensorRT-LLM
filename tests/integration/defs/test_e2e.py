@@ -50,6 +50,12 @@ _MINIMAX_M3_EVAL_CONFIG = {
     "max_seq_len": 4096,
 }
 
+_KIMI_K2_EVAL_DIAGNOSTIC_CONFIG = {
+    # Diagnostic only: preserve the inherited 262K context and KVCM V2 while
+    # isolating the overlap scheduler's interaction with TP16/EP16 MGMN MoE.
+    "disable_overlap_scheduler": True,
+}
+
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
@@ -1677,7 +1683,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  marks=skip_pre_blackwell,
                  id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
     pytest.param('Kimi-K2-Thinking-NVFP4',
-                 None,
+                 _KIMI_K2_EVAL_DIAGNOSTIC_CONFIG,
                  marks=skip_pre_blackwell,
                  id='Kimi-K2-Thinking-NVFP4'),
     pytest.param('MiniMax-M3',
@@ -1714,12 +1720,16 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
         run_cmd.append(f"--config={config_path}")
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
+    run_env = os.environ.copy()
+    if "Kimi" in model_path:
+        run_env["TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS"] = "1"
 
     try:
         # run the command with trtllm-llmapi-launch pytest wrapper
         output = subprocess.check_output(run_cmd,
                                          text=True,
                                          stderr=subprocess.STDOUT,
+                                         env=run_env,
                                          timeout=5400)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print_warning(f"eval failed: {e.returncode}")
