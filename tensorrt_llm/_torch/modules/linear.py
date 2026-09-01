@@ -34,7 +34,6 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
 from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
