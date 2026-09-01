@@ -8328,6 +8328,7 @@ class PyExecutor:
                     response.result.cached_tokens = req.cached_tokens
                     response.result.cached_tokens_by_tier = getattr(
                         req, 'cached_tokens_by_tier', {})
+                    self._maybe_attach_ctx_usage(req, response)
                     if logits_snapshot is not None:
                         response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
