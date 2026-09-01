@@ -24,6 +24,7 @@ server or GPU.
 import importlib.util
 import sys
 import types
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -36,23 +37,23 @@ class _StubTritonModelException(Exception):
 
 class _StubTensor:
 
-    def __init__(self, array):
+    def __init__(self, array: np.ndarray) -> None:
         self._array = array
 
-    def as_numpy(self):
+    def as_numpy(self) -> np.ndarray:
         return self._array
 
-    def is_cpu(self):
+    def is_cpu(self) -> bool:
         return True
 
 
 class _StubRequest:
     """Request stub: maps input-tensor names to numpy arrays."""
 
-    def __init__(self, tensors=None):
+    def __init__(self, tensors: dict | None = None) -> None:
         self._tensors = tensors or {}
 
-    def get_tensor(self, name):
+    def get_tensor(self, name: str) -> "_StubTensor | None":
         value = self._tensors.get(name)
         return None if value is None else _StubTensor(value)
 
@@ -63,7 +64,7 @@ _LLMAPI_MODEL_DIR = (Path(__file__).resolve().parents[3] / "triton_backend" /
                      "all_models" / "llmapi" / "tensorrt_llm" / "1")
 
 
-def _load_by_path(name, path):
+def _load_by_path(name: str, path: Path) -> types.ModuleType:
     if "triton_python_backend_utils" not in sys.modules:
         stub = types.ModuleType("triton_python_backend_utils")
         stub.TritonModelException = _StubTritonModelException
@@ -92,7 +93,8 @@ _TritonModelException = sys.modules[
 class FakeProcessor:
     """Stands in for a tensorrt_llm.sampling_params.LogitsProcessor."""
 
-    def __call__(self, req_id, logits, ids, stream_ptr, client_id):
+    def __call__(self, req_id: object, logits: object, ids: object,
+                 stream_ptr: object, client_id: object) -> None:
         return None
 
 
@@ -100,7 +102,7 @@ _FAKE_MODULE_NAME = "_llmapi_helpers_test_processors"
 
 
 @pytest.fixture(autouse=True)
-def fake_processor_module():
+def fake_processor_module() -> Iterator[types.ModuleType]:
     module = types.ModuleType(_FAKE_MODULE_NAME)
     module.FakeProcessor = FakeProcessor
     module.processor_instance = FakeProcessor()
@@ -111,12 +113,12 @@ def fake_processor_module():
     del sys.modules[_FAKE_MODULE_NAME]
 
 
-def test_load_logits_post_processors_empty():
+def test_load_logits_post_processors_empty() -> None:
     assert helpers.load_logits_post_processors(None) == {}
     assert helpers.load_logits_post_processors({}) == {}
 
 
-def test_load_logits_post_processors_class_and_instance():
+def test_load_logits_post_processors_class_and_instance() -> None:
     processors = helpers.load_logits_post_processors({
         "from_class":
         f"{_FAKE_MODULE_NAME}:FakeProcessor",
@@ -145,6 +147,15 @@ def test_load_logits_post_processors_class_and_instance():
             "p": "definitely_missing_module_xyz:attr"
         }, "cannot import"),
         ({
+            "p": ":attr_only"
+        }, "module.path:attribute"),
+        ({
+            "p": f"{_FAKE_MODULE_NAME}:"
+        }, "module.path:attribute"),
+        ({
+            "p": f"{_FAKE_MODULE_NAME}:nested..processor"
+        }, "module.path:attribute"),
+        ({
             "p": f"{_FAKE_MODULE_NAME}:missing_attr"
         }, "no attribute"),
         ({
@@ -152,19 +163,19 @@ def test_load_logits_post_processors_class_and_instance():
         }, "non-callable"),
     ],
 )
-def test_load_logits_post_processors_errors(specs, match):
+def test_load_logits_post_processors_errors(specs: object, match: str) -> None:
     with pytest.raises(_TritonModelException, match=match):
         helpers.load_logits_post_processors(specs)
 
 
-def _name_request(name):
+def _name_request(name: bytes) -> _StubRequest:
     return _StubRequest({
         "sampling_param_logits_post_processor_name":
         np.asarray([name], dtype=object),
     })
 
 
-def test_get_logits_post_processor_from_request_absent():
+def test_get_logits_post_processor_from_request_absent() -> None:
     processors = {"biaser": FakeProcessor()}
     assert helpers.get_logits_post_processor_from_request(
         _StubRequest(), processors) is None
@@ -173,14 +184,14 @@ def test_get_logits_post_processor_from_request_absent():
         _name_request(b""), processors) is None
 
 
-def test_get_logits_post_processor_from_request_lookup():
+def test_get_logits_post_processor_from_request_lookup() -> None:
     processor = FakeProcessor()
     resolved = helpers.get_logits_post_processor_from_request(
         _name_request(b"biaser"), {"biaser": processor})
     assert resolved is processor
 
 
-def test_get_logits_post_processor_from_request_unknown_name():
+def test_get_logits_post_processor_from_request_unknown_name() -> None:
     with pytest.raises(_TritonModelException, match="Unknown logits"):
         helpers.get_logits_post_processor_from_request(
             _name_request(b"missing"), {"biaser": FakeProcessor()})
@@ -190,14 +201,16 @@ def test_get_logits_post_processor_from_request_unknown_name():
             _name_request(b"missing"), {})
 
 
-def test_model_yaml_plumbing(tmp_path):
+def test_model_yaml_plumbing(tmp_path: Path,
+                             monkeypatch: pytest.MonkeyPatch) -> None:
     """Execute the exact model.py initialize() composition: build the
     processor registry from model.yaml and keep the section out of the LLM
     engine args."""
-    # model.py does `from helpers import ...`
-    sys.modules.setdefault("helpers", helpers)
+    # model.py does `from helpers import ...`; monkeypatch restores both the
+    # alias and the model-dir holder after the test.
+    monkeypatch.setitem(sys.modules, "helpers", helpers)
     model = _load_by_path("llmapi_triton_model", _LLMAPI_MODEL_DIR / "model.py")
-    _MODEL_DIR_HOLDER["dir"] = str(tmp_path)
+    monkeypatch.setitem(_MODEL_DIR_HOLDER, "dir", str(tmp_path))
 
     (tmp_path / "model.yaml").write_text(
         "model: TinyLlama/TinyLlama-1.1B-Chat-v1.0\n"

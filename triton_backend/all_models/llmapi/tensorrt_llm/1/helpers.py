@@ -24,8 +24,11 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import annotations
+
 import importlib
 import os
+from collections.abc import Callable, Mapping
 
 import numpy as np
 import torch
@@ -180,7 +183,8 @@ def get_lora_request_from_request(request, batch_size=1, batch_index=0):
                        lora_ckpt_source=lora_ckpt_source)
 
 
-def load_logits_post_processors(specs):
+def load_logits_post_processors(
+        specs: Mapping[str, str] | None) -> dict[str, Callable]:
     """Import and instantiate named logits post-processors.
 
     ``specs`` is the optional ``logits_post_processors`` section of
@@ -209,19 +213,24 @@ def load_logits_post_processors(specs):
                 f"logits_post_processors['{name}'] must be an import spec "
                 f"of the form 'module.path:attribute', got {spec!r}")
         module_name, _, attr_path = spec.partition(":")
+        if (not module_name or not attr_path
+                or any(not attr for attr in attr_path.split("."))):
+            raise pb_utils.TritonModelException(
+                f"logits_post_processors['{name}'] must be an import spec "
+                f"of the form 'module.path:attribute', got {spec!r}")
         try:
             obj = importlib.import_module(module_name)
         except ImportError as e:
             raise pb_utils.TritonModelException(
                 f"logits_post_processors['{name}']: cannot import module "
-                f"'{module_name}': {e}")
+                f"'{module_name}': {e}") from e
         for attr in attr_path.split("."):
             try:
                 obj = getattr(obj, attr)
-            except AttributeError:
+            except AttributeError as e:
                 raise pb_utils.TritonModelException(
                     f"logits_post_processors['{name}']: module "
-                    f"'{module_name}' has no attribute '{attr_path}'")
+                    f"'{module_name}' has no attribute '{attr_path}'") from e
         if isinstance(obj, type):
             obj = obj()
         if not callable(obj):
@@ -233,10 +242,11 @@ def load_logits_post_processors(specs):
     return processors
 
 
-def get_logits_post_processor_from_request(request,
-                                           processors,
-                                           batch_size=1,
-                                           batch_index=0):
+def get_logits_post_processor_from_request(
+        request: pb_utils.InferenceRequest,
+        processors: Mapping[str, Callable],
+        batch_size: int = 1,
+        batch_index: int = 0) -> Callable | None:
     """Resolve the request's named logits post-processor, if any.
 
     Reads the optional ``sampling_param_logits_post_processor_name`` input
