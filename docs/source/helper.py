@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib.util
 import logging
 import os
@@ -5,9 +8,15 @@ import re
 from dataclasses import dataclass
 from itertools import chain, groupby
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import pygit2
+
+if TYPE_CHECKING:
+    from sphinx.application import Sphinx
+
+
+LLMAPI_REFERENCE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def underline(title: str, character: str = "=") -> str:
@@ -382,6 +391,7 @@ def generate_llmapi():
 """
     content += ".. toctree::\n"
     content += "    :maxdepth: 1\n\n"
+    search_content = ""
 
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
@@ -407,8 +417,42 @@ def generate_llmapi():
 
         content += f"    reference/{cls_name}\n"
 
+        # Keep class signatures and class-level documentation on the landing
+        # page so browser find can search parameters without loading the full
+        # member and inheritance trees rendered on the detail pages.
+        search_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
+        search_content += "    :no-index:\n\n"
+        search_content += (
+            f":doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
+        )
+
+    content += "\n" + underline("Search the full LLM API", "~") + "\n\n"
+    content += (
+        "Use your browser's find command to search API names and parameters "
+        "on this page. Follow the link after each entry for complete member "
+        "and inheritance documentation.\n\n"
+    )
+    content += search_content
+
     with open(doc_path, "w+") as f:
         f.write(content)
+
+
+def check_llmapi_reference_size(app: "Sphinx",
+                                exception: Optional[Exception]) -> None:
+    """Prevent the searchable LLM API landing page from growing too large."""
+    if exception is not None or app.builder.name != "html":
+        return
+
+    reference_path = Path(app.outdir) / "llm-api/reference.html"
+    if not reference_path.is_file():
+        return
+
+    reference_size = reference_path.stat().st_size
+    if reference_size > LLMAPI_REFERENCE_MAX_BYTES:
+        raise RuntimeError(
+            f"{reference_path} is {reference_size} bytes; the maximum is "
+            f"{LLMAPI_REFERENCE_MAX_BYTES} bytes")
 
 
 def update_version():
