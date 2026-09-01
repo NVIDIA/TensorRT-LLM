@@ -542,6 +542,39 @@ def test_serialize_item_sequence_container_agnostic():
     assert serialize_item((1, 2.0, b"x")) == serialize_item([1, 2.0, b"x"])
 
 
+@pytest.mark.parametrize(
+    "item,expected",
+    [
+        (
+            torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+            "a58f461450a5e0d040e65f5ca33b3650bedf25115dfcd795b47c15c3e3ef96ec",
+        ),
+        (
+            np.arange(24, dtype=np.int16).reshape(4, 6)[:, ::2],
+            "488e181d756628893937686d1747e77723733d9a2a73cdda99b8a8d6c7900b11",
+        ),
+        (
+            Image.new("RGB", (5, 3), (10, 20, 30)),
+            "65fa5adbfedf9a284d2a3979d5d2781d42034243ede81b4bd382fa1a17abf2b9",
+        ),
+        (
+            {
+                "frames": [np.arange(6, dtype=np.uint8).reshape(2, 3)],
+                "fps": np.float32(2),
+            },
+            "a2dffa10413eb3fef1f2d7499e69cb4df2c017b79d162ad7eae3086df9198cf9",
+        ),
+    ],
+    ids=["tensor", "noncontiguous_array", "pil_image", "nested"],
+)
+def test_streamed_multimodal_hash_preserves_serialized_identity(item, expected):
+    from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+
+    actual, _ = apply_mm_hashes({"image": [item]})
+
+    assert actual["image"] == [expected]
+
+
 def test_apply_mm_hashes_audio_data_deterministic():
     """AudioData hashes are deterministic and include sample rate."""
     audio_a = AudioData(samples=np.array([0.0, 0.25, -0.5], dtype=np.float32),
