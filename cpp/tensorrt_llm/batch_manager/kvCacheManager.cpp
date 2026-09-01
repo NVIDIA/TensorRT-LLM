@@ -4110,41 +4110,6 @@ void KVCacheManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, S
     }
 }
 
-std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
-    runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config)
-{
-    auto const freeMemFraction
-        = config.getFreeGpuMemoryFraction().value_or(executor::KvCacheConfig::kDefaultGpuMemFraction);
-    TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
-        "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
-    if (config.getMaxTokens().has_value())
-    {
-        if (config.getFreeGpuMemoryFraction().has_value())
-        {
-            TLLM_LOG_WARNING(
-                "Both freeGpuMemoryFraction (aka kv_cache_free_gpu_mem_fraction) "
-                "and maxTokens (aka max_tokens_in_paged_kv_cache) "
-                "are set (to %f and %ld, respectively). The smaller value will be used.",
-                freeMemFraction, (int64_t) config.getMaxTokens().value());
-        }
-    }
-
-    TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
-    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.getUseUvm());
-    auto const finalFreeMem = freeMem + bufferManager.memoryPoolFree();
-    TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB",
-        totalMem / static_cast<double>(1 << 30), finalFreeMem / static_cast<double>(1 << 30));
-    TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
-
-    auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
-    auto const freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
-
-    TLLM_LOG_DEBUG("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
-        freePrimaryMemBytes, freeSecondaryMemBytes);
-
-    return std::make_tuple(freePrimaryMemBytes, freeSecondaryMemBytes);
-}
-
 namespace
 {
 bool isSortedVectorIdenticalAcrossAllRanks(WorldConfig const& worldConfig, std::vector<SizeType32> const& vector)

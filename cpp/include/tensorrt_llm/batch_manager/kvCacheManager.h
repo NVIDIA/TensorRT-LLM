@@ -2200,13 +2200,6 @@ public:
     [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> groupLayersByWindowSize(
         std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 numLayers);
 
-    /// @brief Calculate the free memory available for KV cache allocation.
-    /// @param bufferManager Buffer manager for memory operations
-    /// @param config KV cache configuration parameters
-    /// @return Tuple containing the {.freePrimaryMemBytes, .freeSecondaryMemBytes}
-    [[nodiscard]] static std::tuple<uint64_t, uint64_t> calculateFreeMemBytes(
-        runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config);
-
     /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
     /// @details This function computes how many blocks each WindowBlockManager should receive based on the weighted
     /// share
